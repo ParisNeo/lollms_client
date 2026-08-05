@@ -29,6 +29,9 @@ from typing import Any, Callable, Dict, List, Optional, Union, TYPE_CHECKING
 
 from ascii_colors import ASCIIColors, trace_exception
 
+from lollms_client.lollms_personality.skill import Skill
+from lollms_client.lollms_personality.skills_manager import SkillsManager
+
 if TYPE_CHECKING:
     from lollms_client.lollms_core import LollmsClient
     from lollms_client.lollms_personality.lollms_personality import LollmsPersonality
@@ -72,365 +75,7 @@ class AgentRole:
     FREEFORM        = "freeform"
 
 
-# ===========================================================================
-# Skill — A single skill data structure
-# ===========================================================================
-
-@dataclass
-class Skill:
-    """Represents a single skill loaded from a SKILL.md file."""
-    title: str
-    description: str
-    category: str
-    tags: List[str]
-    content: str
-    file_path: Optional[Path] = None
-    always_visible: bool = False
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "title": self.title,
-            "description": self.description,
-            "category": self.category,
-            "tags": self.tags,
-            "always_visible": self.always_visible,
-            "file_path": str(self.file_path) if self.file_path else None,
-        }
-
-
-# ===========================================================================
-# SkillsManager — Loads and manages SKILL.md files from external directories
-# ===========================================================================
-
 _DEFAULT_SKILLS_DIR = Path.home() / ".lollms_hub" / "agent_skills"
-
-
-def _parse_skill_md(file_path: Path, default_always_visible: bool = False) -> Optional[Skill]:
-    """Parses a SKILL.md file into a Skill object. Supports YAML frontmatter and plain markdown."""
-    try:
-        raw_content = file_path.read_text(encoding="utf-8")
-    except Exception:
-        return None
-
-    title = file_path.stem
-    description = ""
-    category = ""
-    tags: List[str] = []
-    body = raw_content
-    fm_always_visible = None  # Track frontmatter always_visible override
-
-    # Try YAML frontmatter
-    if raw_content.startswith("---"):
-        fm_match = re.match(r'^---\n(.*?)\n---\n(.*)', raw_content, re.DOTALL)
-        if fm_match:
-            fm_text = fm_match.group(1)
-            body = fm_match.group(2)
-            for line in fm_text.splitlines():
-                line = line.strip()
-                if line.startswith("title:"):
-                    title = line.split(":", 1)[1].strip().strip('"\'')
-                elif line.startswith("description:"):
-                    description = line.split(":", 1)[1].strip().strip('"\'')
-                elif line.startswith("category:"):
-                    category = line.split(":", 1)[1].strip().strip('"\'')
-                elif line.startswith("tags:"):
-                    tags_str = line.split(":", 1)[1].strip()
-                    if tags_str.startswith("[") and tags_str.endswith("]"):
-                        tags_str = tags_str[1:-1]
-                    tags = [t.strip().strip('"\'') for t in tags_str.split(",") if t.strip()]
-                elif line.startswith("always_visible:"):
-                    val = line.split(":", 1)[1].strip().lower()
-                    if val in ("true", "1", "yes"):
-                        fm_always_visible = True
-                    elif val in ("false", "0", "no"):
-                        fm_always_visible = False
-        else:
-            # Malformed frontmatter, treat as plain markdown
-            pass
-    else:
-        # Plain markdown: first H1 as title, first paragraph as description
-        h1_match = re.match(r'^#\s+(.+)', raw_content)
-        if h1_match:
-            title = h1_match.group(1).strip()
-            rest = raw_content[h1_match.end():].strip()
-            desc_match = re.match(r'^([^\n#]+)', rest)
-            if desc_match:
-                description = desc_match.group(1).strip()
-
-    return Skill(
-        title=title,
-        description=description,
-        category=category,
-        tags=tags,
-        content=body.strip(),
-        file_path=file_path,
-        always_visible=fm_always_visible if fm_always_visible is not None else default_always_visible,
-    )
-
-
-class SkillsManager:
-    """
-    Manages SKILL.md files from external directories (not the workspace).
-
-    Modes:
-        - "always_visible": All skill contents are injected into the system prompt.
-        - "loadable": Only skill titles/descriptions are listed; the agent loads content on-demand.
-        - "mixed": Always-visible skills are fully injected; loadable skills are listed by title only.
-    """
-
-    def __init__(
-        self,
-        skills_dirs: Optional[List[Union[str, Path]]] = None,
-        skills_files: Optional[List[Union[str, Path]]] = None,
-        mode: str = "loadable",
-        default_skills_dir: Optional[Union[str, Path]] = None,
-    ):
-        self.mode = mode
-        self._default_dir = Path(default_skills_dir) if default_skills_dir else _DEFAULT_SKILLS_DIR
-        self._skills_dirs: List[Path] = []
-        self._skills_files: List[Path] = []
-        self.skills: Dict[str, Skill] = {}
-
-        # Collect directories
-        if skills_dirs:
-            for d in skills_dirs:
-                p = Path(d)
-                if p.exists() and p.is_dir():
-                    self._skills_dirs.append(p.resolve())
-
-        # Always include default directory
-        self._default_dir.mkdir(parents=True, exist_ok=True)
-        if self._default_dir not in self._skills_dirs:
-            self._skills_dirs.append(self._default_dir.resolve())
-
-        # Collect explicit files
-        if skills_files:
-            for f in skills_files:
-                p = Path(f)
-                if p.exists() and p.is_file() and p.suffix.lower() == ".md":
-                    self._skills_files.append(p.resolve())
-
-        self.reload()
-
-    def reload(self):
-        """Reloads all skills from configured directories and files."""
-        self.skills.clear()
-        seen_paths = set()
-
-        # Load from explicit files first
-        for fp in self._skills_files:
-            if fp in seen_paths:
-                continue
-            seen_paths.add(fp)
-            skill = _parse_skill_md(fp, default_always_visible=(self.mode == "always_visible"))
-            if skill:
-                self.skills[skill.title.lower()] = skill
-
-        # Load from directories
-        for d in self._skills_dirs:
-            self._scan_directory(d, seen_paths)
-
-    def _scan_directory(self, directory: Path, seen_paths: set):
-        """Scans a directory for SKILL.md files (either directly or in subdirectories)."""
-        if not directory.exists() or not directory.is_dir():
-            return
-
-        # Check for SKILL.md directly in this directory
-        direct_skill = directory / "SKILL.md"
-        if direct_skill.exists() and direct_skill.resolve() not in seen_paths:
-            seen_paths.add(direct_skill.resolve())
-            skill = _parse_skill_md(direct_skill, default_always_visible=(self.mode == "always_visible"))
-            if skill:
-                self.skills[skill.title.lower()] = skill
-            return  # This directory IS a skill, don't scan deeper
-
-        # Scan subdirectories for SKILL.md files
-        for item in sorted(directory.iterdir()):
-            if item.is_dir():
-                skill_file = item / "SKILL.md"
-                if skill_file.exists() and skill_file.resolve() not in seen_paths:
-                    seen_paths.add(skill_file.resolve())
-                    skill = _parse_skill_md(skill_file, default_always_visible=(self.mode == "always_visible"))
-                    if skill:
-                        self.skills[skill.title.lower()] = skill
-            elif item.is_file() and item.suffix.lower() == ".md" and item.name != "README.md":
-                if item.resolve() not in seen_paths:
-                    seen_paths.add(item.resolve())
-                    skill = _parse_skill_md(item, default_always_visible=(self.mode == "always_visible"))
-                    if skill:
-                        self.skills[skill.title.lower()] = skill
-
-    def get_visible_skills_context(self) -> str:
-        """Builds the system prompt context for always-visible skills."""
-        visible = [s for s in self.skills.values() if s.always_visible]
-        if not visible:
-            return ""
-        lines = ["=== ACTIVE SKILLS (Always Visible) ==="]
-        for skill in visible:
-            lines.append(f"\n--- Skill: {skill.title} ---")
-            if skill.description:
-                lines.append(f"Description: {skill.description}")
-            if skill.category:
-                lines.append(f"Category: {skill.category}")
-            lines.append(f"\n{skill.content}")
-            lines.append(f"--- End Skill: {skill.title} ---")
-        lines.append("=== END ACTIVE SKILLS ===")
-        return "\n".join(lines)
-
-    def get_loadable_skills_index(self) -> str:
-        """Builds a compact index of loadable skills for the system prompt."""
-        loadable = [s for s in self.skills.values() if not s.always_visible]
-        if not loadable:
-            return ""
-        lines = ["=== AVAILABLE SKILLS (Loadable on Demand) ==="]
-        lines.append("Use the `tool_load_skill` tool to load the full content of any skill listed below.")
-        lines.append("")
-        for skill in loadable:
-            desc = skill.description or "No description"
-            cat = f" [{skill.category}]" if skill.category else ""
-            lines.append(f"- **{skill.title}**{cat}: {desc}")
-        lines.append("=== END AVAILABLE SKILLS ===")
-        return "\n".join(lines)
-
-    def get_mixed_context(self) -> str:
-        """Builds context for mixed mode: visible skills full + loadable skills index."""
-        parts = []
-        visible_ctx = self.get_visible_skills_context()
-        if visible_ctx:
-            parts.append(visible_ctx)
-        loadable_ctx = self.get_loadable_skills_index()
-        if loadable_ctx:
-            parts.append(loadable_ctx)
-        return "\n\n".join(parts) if parts else ""
-
-    def build_context(self) -> str:
-        """Builds the skills context for the system prompt based on the current mode."""
-        if self.mode == "always_visible":
-            return self.get_visible_skills_context()
-        elif self.mode == "loadable":
-            return self.get_loadable_skills_index()
-        else:  # mixed
-            return self.get_mixed_context()
-
-    def search_skills(self, query: str) -> List[Skill]:
-        """Searches skills by title, description, tags, or content."""
-        query_lower = query.lower()
-        results = []
-        for skill in self.skills.values():
-            score = 0
-            if query_lower in skill.title.lower():
-                score += 3
-            if query_lower in skill.description.lower():
-                score += 2
-            if any(query_lower in tag.lower() for tag in skill.tags):
-                score += 2
-            if query_lower in skill.content.lower():
-                score += 1
-            if score > 0:
-                results.append((score, skill))
-        results.sort(key=lambda x: x[0], reverse=True)
-        return [s for _, s in results]
-
-    def load_skill(self, title: str) -> Optional[str]:
-        """Loads the full content of a skill by title."""
-        skill = self.skills.get(title.lower())
-        if skill:
-            return f"--- Skill: {skill.title} ---\n{skill.content}\n--- End Skill: {skill.title} ---"
-        # Fuzzy search
-        matches = self.search_skills(title)
-        if matches:
-            skill = matches[0]
-            return f"--- Skill: {skill.title} ---\n{skill.content}\n--- End Skill: {skill.title} ---"
-        return None
-
-    def list_skills(self) -> List[Dict[str, Any]]:
-        """Returns a list of all skills with metadata."""
-        return [s.to_dict() for s in self.skills.values()]
-
-    def add_skill(
-        self,
-        title: str,
-        description: str,
-        category: str,
-        content: str,
-        tags: Optional[List[str]] = None,
-        always_visible: bool = False,
-    ) -> Dict[str, Any]:
-        """Creates a new SKILL.md file in the default skills directory."""
-        tags = tags or []
-        safe_title = re.sub(r'[^\w\-_]', '_', title)
-        skill_dir = self._default_dir / safe_title
-        skill_dir.mkdir(parents=True, exist_ok=True)
-        skill_file = skill_dir / "SKILL.md"
-
-        fm_lines = ["---"]
-        fm_lines.append(f'title: "{title}"')
-        fm_lines.append(f'description: "{description}"')
-        fm_lines.append(f'category: "{category}"')
-        fm_lines.append(f'tags: [{", ".join(tags)}]')
-        fm_lines.append(f'always_visible: {str(always_visible).lower()}')
-        fm_lines.append("---")
-        fm_lines.append("")
-        fm_lines.append(content)
-
-        skill_file.write_text("\n".join(fm_lines), encoding="utf-8")
-
-        # Reload to register the new skill
-        self.reload()
-
-        return {
-            "success": True,
-            "output": f"Skill '{title}' created successfully at {skill_file}.",
-            "file_path": str(skill_file),
-        }
-
-    def update_skill(self, title: str, new_content: str) -> Dict[str, Any]:
-        """Updates the content of an existing skill."""
-        skill = self.skills.get(title.lower())
-        if not skill:
-            matches = self.search_skills(title)
-            if matches:
-                skill = matches[0]
-            else:
-                return {"success": False, "error": f"Skill '{title}' not found."}
-
-        if not skill.file_path or not skill.file_path.exists():
-            return {"success": False, "error": f"Skill file for '{title}' not found on disk."}
-
-        # Read existing file to preserve frontmatter
-        raw = skill.file_path.read_text(encoding="utf-8")
-        if raw.startswith("---"):
-            fm_match = re.match(r'^---\n(.*?)\n---\n(.*)', raw, re.DOTALL)
-            if fm_match:
-                updated = f"---\n{fm_match.group(1)}\n---\n\n{new_content}"
-            else:
-                updated = new_content
-        else:
-            updated = new_content
-
-        skill.file_path.write_text(updated, encoding="utf-8")
-        self.reload()
-
-        return {"success": True, "output": f"Skill '{title}' updated successfully."}
-
-    def delete_skill(self, title: str) -> Dict[str, Any]:
-        """Deletes a skill and its file."""
-        skill = self.skills.get(title.lower())
-        if not skill:
-            return {"success": False, "error": f"Skill '{title}' not found."}
-
-        if skill.file_path and skill.file_path.exists():
-            skill.file_path.unlink()
-            # Also remove the parent directory if it's empty (except default dir)
-            parent = skill.file_path.parent
-            if parent != self._default_dir and parent.exists():
-                try:
-                    parent.rmdir()  # Only works if empty
-                except OSError:
-                    pass
-
-        self.reload()
-        return {"success": True, "output": f"Skill '{title}' deleted."}
 
 
 # ===========================================================================
@@ -2252,7 +1897,6 @@ class Agent:
         if self.skills_manager is None:
             object.__setattr__(self, 'skills_manager', SkillsManager(
                 skills_dirs=self.skills_dirs,
-                skills_files=self.skills_files,
                 mode=self.capabilities.skills_mode,
             ))
 
@@ -2522,14 +2166,10 @@ class Agent:
         binding_tools = BindingToolsBuilder.build_tools(self.lc, self.capabilities, self._resolved_workspace)
         active_tools.update(binding_tools)
 
-        # 3. Skills tools (load, list, create, update, delete)
+        # 3. Skills tools (load, search)
         if self.capabilities.enable_skill_loading:
-            active_tools["tool_load_skill"] = self._make_load_skill_tool()
+            active_tools.update(self.skills_manager.build_skill_tools())
             active_tools["tool_list_skills"] = self._make_list_skills_tool()
-        if self.capabilities.enable_skill_creation:
-            active_tools["tool_create_skill"] = self._make_create_skill_tool()
-            active_tools["tool_update_skill"] = self._make_update_skill_tool()
-            active_tools["tool_delete_skill"] = self._make_delete_skill_tool()
 
         # 4. Sub-agent tool
         if self.capabilities.enable_sub_agents and self._parent_depth < self.capabilities.max_sub_agent_depth:
@@ -2580,29 +2220,6 @@ class Agent:
 
     # ---------------------------------------------------------------- skill tools builders
 
-    def _make_load_skill_tool(self) -> Dict[str, Any]:
-        def tool_load_skill(title: str) -> dict:
-            """
-            Load the full content of a skill by title. Use this to access detailed instructions
-            or knowledge capsules that are not always visible in your context.
-
-            Args:
-                title (str): The title of the skill to load (case-insensitive).
-            """
-            content = self.skills_manager.load_skill(title)
-            if content:
-                return {"success": True, "output": content}
-            return {"success": False, "error": f"Skill '{title}' not found."}
-
-        return {
-            "name": "tool_load_skill",
-            "description": "Load the full content of a skill by title. Skills contain reusable knowledge, instructions, and best practices.",
-            "parameters": [
-                {"name": "title", "type": "str", "description": "The title of the skill to load."}
-            ],
-            "callable": tool_load_skill,
-        }
-
     def _make_list_skills_tool(self) -> Dict[str, Any]:
         def tool_list_skills() -> dict:
             """
@@ -2613,7 +2230,7 @@ class Agent:
                 return {"success": True, "output": "No skills available."}
             lines = []
             for s in skills_list:
-                vis = " [always visible]" if s.get("always_visible") else ""
+                vis = " [visible]" if s.get("visibility") == "visible" else ""
                 cat = f" [{s.get('category', '')}]" if s.get("category") else ""
                 lines.append(f"- {s['title']}{cat}{vis}: {s.get('description', 'No description')}")
             return {"success": True, "output": "\n".join(lines)}
@@ -2623,75 +2240,6 @@ class Agent:
             "description": "List all available skills with their titles, descriptions, and categories.",
             "parameters": [],
             "callable": tool_list_skills,
-        }
-
-    def _make_create_skill_tool(self) -> Dict[str, Any]:
-        def tool_create_skill(title: str, description: str, category: str, content: str, tags: str = "") -> dict:
-            """
-            Create a new skill (knowledge capsule) that persists across sessions.
-            Skills are stored outside the workspace in a dedicated skills directory.
-
-            Args:
-                title (str): A clear, descriptive title for the skill.
-                description (str): A one-line summary of what the skill covers.
-                category (str): Domain or category (e.g., 'python', 'data_analysis', 'debugging').
-                content (str): The full skill content (Markdown with instructions, examples, rules).
-                tags (str, optional): Comma-separated tags for searchability.
-            """
-            tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
-            return self.skills_manager.add_skill(title, description, category, content, tag_list)
-
-        return {
-            "name": "tool_create_skill",
-            "description": "Create a new persistent skill (knowledge capsule) that survives across sessions. Use this to save reusable knowledge, methodologies, or best practices.",
-            "parameters": [
-                {"name": "title", "type": "str", "description": "Clear, descriptive title for the skill."},
-                {"name": "description", "type": "str", "description": "One-line summary of the skill."},
-                {"name": "category", "type": "str", "description": "Domain or category (e.g., 'python', 'data_analysis')."},
-                {"name": "content", "type": "str", "description": "Full skill content in Markdown (instructions, examples, rules)."},
-                {"name": "tags", "type": "str", "description": "Comma-separated tags for searchability.", "optional": True},
-            ],
-            "callable": tool_create_skill,
-        }
-
-    def _make_update_skill_tool(self) -> Dict[str, Any]:
-        def tool_update_skill(title: str, new_content: str) -> dict:
-            """
-            Update the content of an existing skill. The skill's metadata (title, description) is preserved.
-
-            Args:
-                title (str): The title of the skill to update.
-                new_content (str): The new full content for the skill.
-            """
-            return self.skills_manager.update_skill(title, new_content)
-
-        return {
-            "name": "tool_update_skill",
-            "description": "Update the content of an existing skill. Use this to refine or evolve your knowledge capsules.",
-            "parameters": [
-                {"name": "title", "type": "str", "description": "Title of the skill to update."},
-                {"name": "new_content", "type": "str", "description": "The new full content for the skill."},
-            ],
-            "callable": tool_update_skill,
-        }
-
-    def _make_delete_skill_tool(self) -> Dict[str, Any]:
-        def tool_delete_skill(title: str) -> dict:
-            """
-            Delete a skill permanently.
-
-            Args:
-                title (str): The title of the skill to delete.
-            """
-            return self.skills_manager.delete_skill(title)
-
-        return {
-            "name": "tool_delete_skill",
-            "description": "Delete a skill permanently. Use with caution.",
-            "parameters": [
-                {"name": "title", "type": "str", "description": "Title of the skill to delete."},
-            ],
-            "callable": tool_delete_skill,
         }
 
     # ---------------------------------------------------------------- sub-agent tool builder

@@ -4,7 +4,8 @@ lollms_code — Autonomous CLI Coding Agent
 ==========================================
 
 A production-grade CLI tool that turns a single prompt into a full autonomous
-coding session. It uses the lollms_client Agent system to:
+coding session. It uses the LollmsPersonality system and the Handbag architecture
+to autonomously:
   1. Analyze the target codebase (workspace context injection)
   2. Plan the implementation strategy
   3. Write code, execute tests, and fix failures iteratively
@@ -37,17 +38,19 @@ from ascii_colors import questionary
 
 from lollms_client.lollms_config_cli_env import get_client_from_env
 from lollms_client import LollmsClient
-from lollms_client.lollms_agent import Agent, AgentRole, CapabilityFlags, SkillsManager
-from lollms_client.lollms_personality.lollms_personality import LollmsPersonality
+from lollms_client.lollms_personality import LollmsPersonality, PersonalityBundle
+from lollms_client.lollms_personality.skills_manager import SkillsManager
+from lollms_client.lollms_agent.lollms_agent import CapabilityFlags
 from lollms_client.lollms_types import MSG_TYPE
 
 APP_NAME = "lollms_code"
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0.0"
 APP_CONFIG_DIR = Path.home() / ".lollms_hub" / "lollms_code"
 APP_CONFIG_FILE = APP_CONFIG_DIR / "config.json"
 APP_DEFAULT_WORKSPACE = Path.cwd()
 APP_DEFAULT_SKILLS_DIR = APP_CONFIG_DIR / "skills"
 APP_DEFAULT_MEMORY_DB = APP_CONFIG_DIR / "memory.db"
+APP_DEFAULT_HANDSAG_DIR = APP_CONFIG_DIR / "handbags"
 
 CODING_SYSTEM_PROMPT = """\
 You are lollms_code, an elite autonomous software engineering agent.
@@ -167,6 +170,7 @@ class CodeAgentConfig:
         self.workspace_path: str = str(APP_DEFAULT_WORKSPACE)
         self.skills_dir: str = str(APP_DEFAULT_SKILLS_DIR)
         self.memory_db: str = f"sqlite:///{APP_DEFAULT_MEMORY_DB}"
+        self.handbag_path: str = str(APP_DEFAULT_HANDSAG_DIR / "default_coder")
         self.show_tool_calls: bool = True
         self.show_workspace_changes: bool = True
         self.show_skills: bool = True
@@ -238,6 +242,8 @@ class CodeAgentConfig:
             config.enable_memory = False
         if cli_args.skills_dir:
             config.skills_dir = str(Path(cli_args.skills_dir).resolve())
+        if cli_args.handbag_path:
+            config.handbag_path = str(Path(cli_args.handbag_path).resolve())
 
         return config
 
@@ -291,80 +297,63 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
     return client
 
 
-def create_memory_manager(config: CodeAgentConfig) -> Optional[Any]:
-    if not config.enable_memory:
-        return None
-    try:
-        from lollms_client.lollms_memory import LollmsMemoryManager, MemoryConfig
-        db_file = config.memory_db.replace("sqlite:///", "")
-        Path(db_file).parent.mkdir(parents=True, exist_ok=True)
-        mem_config = MemoryConfig(working_token_budget=2000)
-        manager = LollmsMemoryManager(
-            db_path=config.memory_db,
-            owner_id=f"lollms_code_{Path(config.workspace_path).name}",
-            config=mem_config,
-        )
-        return manager
-    except Exception as e:
-        ASCIIColors.warning(f"Failed to initialize memory manager: {e}")
-        return None
+def ensure_handbag_structure(config: CodeAgentConfig):
+    """Ensures that the handbag directory and SOUL.md exist."""
+    handbag_path = Path(config.handbag_path)
+    handbag_path.mkdir(parents=True, exist_ok=True)
+    
+    soul_path = handbag_path / "SOUL.md"
+    if not soul_path.exists():
+        metadata = {
+            "name": "lollms_code",
+            "author": "ParisNeo",
+            "category": "software_engineering",
+            "description": "An elite autonomous software engineering agent that writes, tests, and fixes code iteratively.",
+            "temperature": str(config.temperature)
+        }
+        yaml_lines = [f"{k}: {v}" for k, v in metadata.items()]
+        soul_content = f"---\n{chr(10).join(yaml_lines)}\n---\n\n{CODING_SYSTEM_PROMPT}"
+        soul_path.write_text(soul_content, encoding="utf-8")
+        
+    coworkers_dir = handbag_path / "coworkers"
+    coworkers_dir.mkdir(exist_ok=True)
+    
+    tools_dir = handbag_path / "tools"
+    tools_dir.mkdir(exist_ok=True)
+    
+    skills_dir = handbag_path / "skills"
+    skills_dir.mkdir(exist_ok=True)
+    
+    memory_dir = handbag_path / "memory"
+    memory_dir.mkdir(exist_ok=True)
+    
+    workspace_dir = handbag_path / "workspace"
+    workspace_dir.mkdir(exist_ok=True)
 
 
-def create_coding_personality() -> LollmsPersonality:
-    return LollmsPersonality(
-        name="lollms_code",
-        author="ParisNeo",
-        category="software_engineering",
-        description="An elite autonomous software engineering agent that writes, tests, and fixes code iteratively.",
-        system_prompt=CODING_SYSTEM_PROMPT,
-    )
+def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> LollmsPersonality:
+    """Creates a coding personality from the handbag structure, injecting client and capabilities."""
+    ensure_handbag_structure(config)
 
-
-def create_agent(
-    config: CodeAgentConfig,
-    client: LollmsClient,
-    personality: LollmsPersonality,
-    memory_manager: Optional[Any],
-) -> Agent:
-    workspace = Path(config.workspace_path)
-    workspace.mkdir(parents=True, exist_ok=True)
-    skills_dir = Path(config.skills_dir)
-    skills_dir.mkdir(parents=True, exist_ok=True)
-
-    capabilities = CapabilityFlags(
+    caps = CapabilityFlags(
         enable_code_execution=config.enable_code_execution,
-        enable_external_file_access=False,
-        enable_networking=False,
-        enable_image_generation=False,
-        enable_image_editing=False,
-        enable_tts=False,
-        enable_stt=False,
-        enable_ttm=False,
-        enable_ttv=False,
         enable_sub_agents=config.enable_sub_agents,
         enable_model_switching=config.enable_model_switching,
         enable_skill_creation=config.enable_skill_creation,
         enable_skill_loading=config.enable_skill_loading,
+        enable_workspace_tools=True,
         skills_mode=config.skills_mode,
         max_sub_agent_depth=config.max_sub_agent_depth,
-        max_sub_agents_per_turn=config.max_sub_agents_per_turn,
-        enable_workspace_tools=True,
+        max_sub_agents_per_turn=config.max_sub_agents_per_turn
     )
 
-    agent = Agent(
-        lc=client,
-        personality=personality,
-        name="lollms_code",
-        role=AgentRole.IMPLEMENTER,
-        workspace_path=str(workspace.resolve()),
-        capabilities=capabilities,
-        skills_dirs=[str(skills_dir.resolve())],
-        model_params={"temperature": config.temperature},
-        max_tokens_per_turn=config.max_tokens_per_turn,
-        memory_manager=memory_manager,
-        metadata={"version": APP_VERSION, "workspace": str(workspace.resolve())},
-    )
-    return agent
+    personality = LollmsPersonality.from_handbag(config.handbag_path)
+    personality.lollms_client = client
+    personality.workspace_path = Path(config.workspace_path)
+    personality.capabilities = caps
+    personality.max_tokens_per_turn = config.max_tokens_per_turn
+
+    return personality
 
 
 class StreamRenderer:
@@ -401,9 +390,9 @@ def display_result(result: Dict[str, Any], config: CodeAgentConfig, elapsed: flo
     summary_table = ASCIIColors.table(
         "Metric", "Value",
         rows=[
-            ["Total rounds", str(result['rounds'])],
-            ["Tool calls", str(len(result['tool_calls']))],
-            ["Was cancelled", str(result['was_cancelled'])],
+            ["Total rounds", str(result.get('rounds', 0))],
+            ["Tool calls", str(len(result.get('tool_calls', [])))],
+            ["Was cancelled", str(result.get('was_cancelled', False))],
             ["Elapsed time", f"{elapsed:.1f}s"]
         ],
         title="[bold]Execution Summary[/bold]",
@@ -423,8 +412,8 @@ def display_result(result: Dict[str, Any], config: CodeAgentConfig, elapsed: flo
     if config.show_skills and (result.get("skills_created") or result.get("skills_updated")):
         skills_table = ASCIIColors.table(
             "Action", "Skill",
-            rows=([["Created", s] for s in result["skills_created"]] + 
-                  [["Updated", s] for s in result["skills_updated"]]),
+            rows=([["Created", s] for s in result.get("skills_created", [])] + 
+                  [["Updated", s] for s in result.get("skills_updated", [])]),
             title="[bold yellow]🎓 Skills Activity[/bold yellow]",
             box="round"
         )
@@ -437,7 +426,7 @@ def display_result(result: Dict[str, Any], config: CodeAgentConfig, elapsed: flo
         ASCIIColors.blue(f"  🔄 Model switches: {result['model_switches']}")
 
 
-def run_single_prompt(agent: Agent, prompt: str, config: CodeAgentConfig) -> int:
+def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prompt: str, config: CodeAgentConfig) -> int:
     renderer = StreamRenderer(config)
 
     config_panel_content = (
@@ -459,22 +448,26 @@ def run_single_prompt(agent: Agent, prompt: str, config: CodeAgentConfig) -> int
 
     def _signal_handler(sig, frame):
         ASCIIColors.yellow("\n\n⚠️  Interrupt received. Cancelling generation...")
-        agent.cancel_generation()
+        if hasattr(client, 'cancel'):
+            client.cancel()
 
     signal.signal(signal.SIGINT, _signal_handler)
 
     try:
-        result = agent.chat(
+        result = personality.chat(
             prompt=prompt,
+            lollms_client=client,
             streaming_callback=renderer,
             max_reasoning_steps=config.max_reasoning_steps,
             temperature=config.temperature,
             n_predict=config.max_tokens_per_turn,
-            enable_memory=config.enable_memory,
+            enable_code_execution=config.enable_code_execution,
+            enable_artefacts=True,
             use_internal_history=False,
         )
     except KeyboardInterrupt:
-        agent.cancel_generation()
+        if hasattr(client, 'cancel'):
+            client.cancel()
         ASCIIColors.yellow("\n\n⚠️  Generation cancelled by user.")
         return 130
     except Exception as e:
@@ -489,7 +482,7 @@ def run_single_prompt(agent: Agent, prompt: str, config: CodeAgentConfig) -> int
     return 0 if not result.get("was_cancelled") else 130
 
 
-def run_interactive(agent: Agent, config: CodeAgentConfig) -> int:
+def run_interactive(personality: LollmsPersonality, client: LollmsClient, config: CodeAgentConfig) -> int:
     renderer = StreamRenderer(config)
 
     ASCIIColors.panel(
@@ -511,35 +504,26 @@ def run_interactive(agent: Agent, config: CodeAgentConfig) -> int:
             ASCIIColors.cyan("👋 Goodbye!")
             return 0
         if user_input.lower() == "skills":
-            skills = agent.list_skills()
-            if not skills:
-                ASCIIColors.yellow("  No skills learned yet.")
+            if personality.skills_manager:
+                skills = personality.skills_manager.list_skills()
+                if not skills:
+                    ASCIIColors.yellow("  No skills learned yet.")
+                else:
+                    skills_table = ASCIIColors.table(
+                        "Title", "Category", "Description",
+                        rows=[[s['title'], s.get('category', ''), s.get('description', '')] for s in skills],
+                        title="[bold yellow]📚 Learned Skills[/bold yellow]",
+                        box="round"
+                    )
+                    ASCIIColors.rich_print(skills_table)
             else:
-                skills_table = ASCIIColors.table(
-                    "Title", "Category", "Description",
-                    rows=[[s['title'], s.get('category', ''), s.get('description', '')] for s in skills],
-                    title="[bold yellow]📚 Learned Skills[/bold yellow]",
-                    box="round"
-                )
-                ASCIIColors.rich_print(skills_table)
+                ASCIIColors.yellow("  Skills manager not initialized.")
             continue
         if user_input.lower() == "clear":
-            agent.clear_conversation()
             ASCIIColors.green("  Conversation history cleared.")
             continue
         if user_input.lower() == "models":
-            models = agent.list_available_models()
-            current = agent.get_current_model()
-            if not models:
-                ASCIIColors.yellow("  No models available for switching.")
-            else:
-                models_table = ASCIIColors.table(
-                    "Model", "Status",
-                    rows=[[m, "← current" if m == current else ""] for m in models],
-                    title="[bold blue]📋 Available Models[/bold blue]",
-                    box="round"
-                )
-                ASCIIColors.rich_print(models_table)
+            ASCIIColors.yellow("  Model switching is managed via LollmsClient profiles in this version.")
             continue
         if user_input.lower() == "config":
             from lollms_client.lollms_config_cli_env import run_wizard_and_save
@@ -551,17 +535,20 @@ def run_interactive(agent: Agent, config: CodeAgentConfig) -> int:
 
         start_time = time.time()
         try:
-            result = agent.chat(
+            result = personality.chat(
                 prompt=user_input,
+                lollms_client=client,
                 streaming_callback=renderer,
                 max_reasoning_steps=config.max_reasoning_steps,
                 temperature=config.temperature,
                 n_predict=config.max_tokens_per_turn,
-                enable_memory=config.enable_memory,
+                enable_code_execution=config.enable_code_execution,
+                enable_artefacts=True,
                 use_internal_history=True,
             )
         except KeyboardInterrupt:
-            agent.cancel_generation()
+            if hasattr(client, 'cancel'):
+                client.cancel()
             ASCIIColors.yellow("\n\n⚠️  Cancelled.")
             continue
         except Exception as e:
@@ -569,7 +556,7 @@ def run_interactive(agent: Agent, config: CodeAgentConfig) -> int:
             continue
 
         elapsed = time.time() - start_time
-        ASCIIColors.rich_print(f"\n[dim]⏱️  {elapsed:.1f}s | Rounds: {result['rounds']} | Tools: {len(result['tool_calls'])}[/dim]")
+        ASCIIColors.rich_print(f"\n[dim]⏱️  {elapsed:.1f}s | Rounds: {result.get('rounds', 0)} | Tools: {len(result.get('tool_calls', []))}[/dim]")
 
 
 def list_skills(config: CodeAgentConfig):
@@ -578,7 +565,7 @@ def list_skills(config: CodeAgentConfig):
         ASCIIColors.yellow("No skills directory found. Run a task first to generate skills.")
         return
 
-    mgr = SkillsManager(skills_dirs=[str(skills_dir)], mode="loadable", default_skills_dir=str(skills_dir))
+    mgr = SkillsManager(skills_dirs=[str(skills_dir)], mode="loadable")
     skills = mgr.list_skills()
     if not skills:
         ASCIIColors.yellow("No skills learned yet.")
@@ -611,6 +598,7 @@ Examples:
     parser.add_argument("prompt", nargs="?", default=None, help="The task prompt for the autonomous agent.")
     parser.add_argument("-i", "--interactive", action="store_true", help="Start in interactive REPL mode.")
     parser.add_argument("--workspace", type=str, default=None, help="Path to the workspace directory.")
+    parser.add_argument("--handbag-path", type=str, default=None, help="Path to the Handbag folder containing agent resources.")
     parser.add_argument("--model", type=str, default=None, help="Model name to use.")
     parser.add_argument("--llm-binding", type=str, default=None, help="LLM binding name.")
     parser.add_argument("--host", type=str, default=None, help="Host address for remote bindings.")
@@ -674,16 +662,14 @@ def main():
         ASCIIColors.red(f"Failed to create LollmsClient: {e}")
         return 1
 
-    personality = create_coding_personality()
-    memory_manager = create_memory_manager(config)
-    agent = create_agent(config, client, personality, memory_manager)
+    personality = create_coding_personality(config, client)
 
     config.save()
 
     if mode == "single":
-        return run_single_prompt(agent, args.prompt, config)
+        return run_single_prompt(personality, client, args.prompt, config)
     else:
-        return run_interactive(agent, config)
+        return run_interactive(personality, client, config)
 
 
 if __name__ == "__main__":

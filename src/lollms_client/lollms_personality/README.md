@@ -1,31 +1,36 @@
-# 🧠 LollmsPersonality & Bundle Architecture
+# 🧠 LollmsPersonality & The Handbag Architecture
 
-The `LollmsPersonality` system provides a sovereign, null-safe, and self-contained architecture for defining AI personas, attaching tools, and managing Retrieval-Augmented Generation (RAG) data sources. 
-
-With the introduction of **Personality Bundles**, agents can now be fully packaged into structured folders, making them portable, shareable, and easy to version control.
+The `LollmsPersonality` is the **sovereign universal execution unit** in `lollms_client`. It replaces the legacy bifurcation between stateless "prompt wrappers" and stateful "autonomous agents". A single `LollmsPersonality` scales progressively from a simple 5-line system prompt to a fully-armed, stateful, multi-persona **Crew Handbag** with tools, memory, skills, and multimodal assets.
 
 ---
 
-## 📦 1. The Personality Bundle Format
+## 📦 1. The Handbag (Portable Resource Folder)
 
-A Personality Bundle is a standard directory containing a `SOUL.md` file and optional resource folders. The folder name should be the `snake_case` representation of the agent's name.
+The **Handbag** is a self-contained, portable directory that carries ALL of a personality's resources. It allows you to package multiple personas, tools, skills, RAG knowledge, memory, and multimodal assets into a single folder.
 
-### Directory Structure
+### Folder Structure
 ```text
-my_cinema_agent/
-├── SOUL.md                  # Core identity & system prompt (Hugging Face format)
-├── tools/                   # Optional: Custom LCP Tools
-│   ├── tool_pitch_writer.py # Single-file tool format
-│   └── tool_scanner/        # Folder-based tool format
-│       └── TOOL.py
-├── skills/                  # Optional: Persistent AI skills
-│   └── script_analysis/
+my_handbag/
+├── SOUL.md                  # Primary personality (YAML frontmatter + Markdown body)
+├── handbag.yaml             # Optional manifest (memory scope, default settings)
+├── coworkers/               # Multi-persona support (Crew Handbag)
+│   ├── coder/
+│   │   └── SOUL.md
+│   └── researcher/
+│       └── SOUL.md
+├── tools/                   # LCP toolsets (one .py file per toolset library)
+│   ├── python_execution.py
+│   └── web_search.py
+├── skills/                  # SKILL.md files (tiered visibility)
+│   ├── python_patterns/
+│   │   └── SKILL.md
+│   └── advanced_algorithms/
 │       └── SKILL.md
-├── knowledge/               # Optional: Safestore RAG database
-│   └── knowledge.db
-└── assets/                  # Optional: Media assets
-    ├── logo.png             # Agent icon
-    └── voice.wav            # TTS voice sample
+├── assets/                  # Multimodal assets (icons, voice samples, 3D models)
+│   ├── logo.png
+│   └── voice.wav
+└── memory/                  # Optional: Independent Life memory database
+    └── memory.db
 ```
 
 ### The `SOUL.md` File
@@ -47,79 +52,69 @@ Act as the Cinematic Storyteller, an imaginative and resourceful artist who brea
 
 ---
 
-## 🔄 2. Import & Export Workflow
+## 🔄 2. The Grand Unification Architecture
 
 ```mermaid
 flowchart LR
-    subgraph Bundle[Personality Bundle Folder]
+    subgraph Handbag[Handbag Folder]
         direction TB
         SOUL[SOUL.md]
         Tools[tools/]
         Skills[skills/]
-        Knowledge[knowledge/]
+        Memory[memory/]
+        Coworkers[coworkers/]
     end
 
     subgraph Runtime[Lollms Client Runtime]
         direction TB
         LP[LollmsPersonality Object]
         LCP[LCP Tool Binding]
-        RAG[Safestore RAG]
+        SM[SkillsManager]
+        MM[LollmsMemoryManager]
     end
 
-    PersonalityBundle.import_bundle --> LP
+    LollmsPersonality.from_handbag --> LP
     Tools --> LCP
-    Knowledge --> RAG
-    Skills --> LP
+    Memory --> MM
+    Skills --> SM
     SOUL --> LP
+    Coworkers --> LP
     
     LP -- chat() --> LollmsDiscussion
 ```
 
-### Importing a Bundle
+### Progressive Enhancement
+A personality does not require a full Handbag. It scales progressively:
+1. **Simple Personality**: Created in code. Stateless. Contains a `SOUL` string and optional inline tools.
+2. **Handbag Personality**: Created from a folder via `from_handbag()`. Stateful. Lazily instantiates `SkillsManager`, `LollmsMemoryManager`, and `LCPBinding` based on the folder structure.
 
-To load a personality from a folder, use `PersonalityBundle.import_bundle`. It automatically parses the `SOUL.md`, mounts tools, loads skills, and initializes the RAG database.
+### Loading a Handbag
+
+To load a personality from a folder, use the `LollmsPersonality.from_handbag()` factory. It automatically parses the `SOUL.md`, mounts tools, loads skills, and initializes the memory database.
 
 ```python
-from lollms_client.lollms_personality import PersonalityBundle
-from lollms_client import LollmsClient
+from lollms_client.lollms_personality import LollmsPersonality
 
-client = LollmsClient(llm_binding_name="ollama", ...)
+# Load a multi-persona handbag with its own persistent memory
+crew_pers = LollmsPersonality.from_handbag("./my_crew_handbag")
 
-# Load the bundle
-personality = PersonalityBundle.import_bundle(
-    bundle_path="./personalities/my_cinema_agent",
-    lollms_client=client
-)
-
-# Use it in a discussion
-response = discussion.chat(
-    user_message="Pitch me a sci-fi movie about time travel.",
-    personality=personality
-)
+# The primary persona is active. It has memory, tools, and skills.
+# It can dynamically switch to "coder" using tool_switch_persona.
+response = discussion.chat(user_message="Build a Python script.", personality=crew_pers)
 ```
 
-### Exporting a Bundle
+### The Crew Handbag (Multi-Persona Routing)
 
-You can serialize an existing `LollmsPersonality` object back into a folder structure.
+A single Handbag can contain a `coworkers/` directory with subdirectories for each crewmate. When loaded, the primary `LollmsPersonality` object acts as a router.
+
+All crewmates share the **same** Handbag tools, memory, and assets, but they have different system prompts (`SOUL.md`).
 
 ```python
-from lollms_client.lollms_personality import PersonalityBundle, LollmsPersonality
+# List all available personas in the crew
+print("Available crewmates:", crew_pers.list_crewmates())
 
-# 1. Create a personality programmatically
-personality = LollmsPersonality(
-    name="Code Reviewer",
-    author="DevTeam",
-    category="development",
-    description="Reviews code for bugs and style.",
-    system_prompt="You are an expert code reviewer..."
-)
-
-# 2. Export to disk
-bundle_path = PersonalityBundle.export_bundle(
-    personality=personality,
-    output_dir="./exported_personalities"
-)
-print(f"Exported to: {bundle_path}")
+# Dynamically switch the active persona (tools and memory remain shared)
+crew_pers.switch_crewmate("coder")
 ```
 
 ---
@@ -153,61 +148,29 @@ The `data_source` parameter accepts `None`, a static `str`, or a `Callable`. Dur
 }
 ```
 
-### Safestore RAG Integration
-If a `knowledge/` folder containing a `knowledge.db` is found, the importer dynamically installs `safestore` via `pipmaster` (if not already installed) and wraps the search functionality into a standardized `data_source` callable.
+### Memory Scoping (Independent vs. System-Managed Life)
+The `LollmsPersonality` supports two distinct memory paradigms:
+1. **Independent Life**: If the Handbag contains a `memory/` folder, `from_handbag()` instantiates a `LollmsMemoryManager` and stores it in `personality.memory_manager`. The personality evolves continuously across any host application.
+2. **System-Managed Life**: If the Handbag has no `memory/` folder, `personality.memory_manager` is `None`. The host application (`LollmsDiscussion`) provides its own `MemoryManager`. The personality resets to its baseline `SOUL.md` in new discussions, but the discussion itself remembers the user's interactions.
 
-```python
-# Internal RAG wrapper generated by PersonalityBundle
-def _rag_query(query: str) -> Dict[str, Any]:
-    try:
-        results = store.search(query, top_k=3)
-        sources = []
-        for r in results:
-            sources.append({
-                "content": r.get("text", ""),
-                "score": float(r.get("score", 1.0)),
-                "source": "knowledge_base"
-            })
-        return {
-            "success": True,
-            "sources": sources,
-            "count": len(sources),
-            "query": query
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "sources": [],
-            "count": 0,
-            "query": query,
-            "error": str(e)
-        }
-```
+### Skill Efficiency (Tiered Visibility)
+Skills are `SKILL.md` files managed by the `SkillsManager`. They use a tiered visibility system to manage context budget across personalities with 1 to 10,000 skills:
+*   **`visible`**: Automatically loaded into the system prompt. Costs 0 turns.
+*   **`loadable`**: Listed in the prompt (name + description). The LLM uses `tool_load_skill` to pull the full content (Costs 1 turn).
+*   **`searchable`**: Hidden from the prompt entirely. The LLM uses `tool_search_skills` then `tool_load_skill` (Costs 2 turns). Used for massive skill banks.
+
+The `SkillsManager.build_skill_tools()` method dynamically registers `tool_load_skill` and `tool_search_skills` based on the presence of `loadable` and `searchable` skills.
 
 ---
 
 ## 📚 4. API Reference
 
-### `PersonalityBundle`
-
-#### `PersonalityBundle.import_bundle(bundle_path, lollms_client=None) -> LollmsPersonality`
-Imports a personality from a directory.
-- **`bundle_path`**: Path to the personality folder.
-- **`lollms_client`**: Optional client instance. Required for initializing Safestore RAG connections.
-- **Returns**: A configured `LollmsPersonality` instance.
-
-#### `PersonalityBundle.export_bundle(personality, output_dir) -> Path`
-Exports a personality object to a directory.
-- **`personality`**: The `LollmsPersonality` object to export.
-- **`output_dir`**: The parent directory where the personality folder will be created.
-- **Returns**: The `Path` to the newly created bundle folder.
-
-#### `PersonalityBundle.parse_soul_md(soul_content) -> tuple[dict, str]`
-Parses raw `SOUL.md` text into metadata and a system prompt.
-- **`soul_content`**: The raw string content of the `SOUL.md` file.
-- **Returns**: A tuple containing `(metadata_dict, system_prompt_str)`.
-
 ### `LollmsPersonality`
+
+#### `LollmsPersonality.from_handbag(path: Union[str, Path]) -> 'LollmsPersonality'`
+Factory to construct a personality from a Handbag folder.
+- **`path`**: Path to the Handbag directory.
+- **Returns**: A configured `LollmsPersonality` instance with lazily instantiated stateful components.
 
 #### `__init__(...)`
 - **`name`**: Display name of the agent.
@@ -215,22 +178,17 @@ Parses raw `SOUL.md` text into metadata and a system prompt.
 - **`category`**: Classification (e.g., `art_writing`, `development`).
 - **`description`**: Human-readable summary.
 - **`system_prompt`**: The core instructions for the LLM.
-- **`icon`**: Path or URL to the agent's icon.
+- **`metadata`**: YAML frontmatter from `SOUL.md`.
 - **`tools`**: `None`, `LollmsToolBinding`, or `List[str]` of tool names.
 - **`data_source`**: `None`, `str` (static context), or `Callable` (RAG function).
-- **`data_files`**: Optional list of file paths for RAG vectorization.
-- **`vectorize_chunk_callback`**: Optional callable for custom chunk vectorization.
-- **`is_vectorized_callback`**: Optional callable to check if data is already vectorized.
-- **`query_rag_callback`**: Legacy callable for RAG queries (used as fallback if `data_source` is None).
-- **`script`**: Optional Python script string to execute custom logic.
-- **`personality_id`**: Optional unique identifier (auto-generated if not provided).
+- **`handbag_path`**: Path to the Handbag folder (if loaded from one).
+- **`skills_manager`**: `SkillsManager` instance (if loaded from Handbag).
+- **`memory_manager`**: `LollmsMemoryManager` instance (Independent Life).
+- **`workspace_path`**: Optional workspace path for standalone mode.
+- **`enable_git_management`**: If `True`, dynamically mounts Git Manager Toolset if `.git` is detected.
 
 #### `tool_specs(client_binding=None, **discover_kwargs) -> Dict[str, Dict[str, Any]]`
 Resolves the tool allowlist against the available binding and returns the tool specifications formatted for the `LollmsDiscussion.chat()` method.
-- **`client_binding`**: The host application's tool binding (typically `lollmsClient.tools`). If not provided, falls back to the personality's internal binding.
-
-#### `attach_tool_binding(binding: Any) -> None`
-Attaches a real `LollmsToolBinding` after construction. Useful when the personality was built with a `List[str]` of MCP names and the binding is only available after app initialization.
 
 #### `query_data(query: str) -> Dict[str, Any]`
 Queries the attached RAG data source. Always returns a normalized dictionary, never raises an exception.
@@ -238,14 +196,16 @@ Queries the attached RAG data source. Always returns a normalized dictionary, ne
 #### `has_data` (property)
 Returns `True` when any data source or RAG callback is configured.
 
-#### `run_script(entry_point: str = "run", **kwargs) -> Any`
-Calls a named function in the loaded custom script module. Returns `None` if the script is not loaded or the function doesn't exist.
+### `PersonalityBundle`
 
-#### `to_dict() -> Dict[str, Any]`
-Serializes the personality's configuration into a dictionary. Note that callbacks and bindings are not serialized.
+#### `PersonalityBundle.import_bundle(bundle_path, lollms_client=None) -> LollmsPersonality`
+Imports a legacy personality bundle from a directory. (Note: `from_handbag()` is the modern equivalent).
 
-#### `from_dict(cls, data: Dict[str, Any], **kwargs) -> LollmsPersonality`
-Reconstructs a `LollmsPersonality` from a `to_dict()` snapshot. Callbacks and bindings must be re-injected via `kwargs` or `attach_tool_binding()`.
+#### `PersonalityBundle.export_bundle(personality, output_dir) -> Path`
+Exports a personality object to a directory.
+
+#### `PersonalityBundle.parse_soul_md(soul_content) -> tuple[dict, str]`
+Parses raw `SOUL.md` text into metadata and a system prompt.
 
 ### `NullPersonality`
 A no-op personality substituted when `personality=None` is passed to `chat()`. It bypasses the full `__init__` to avoid side-effects and evaluates to `False` when used in boolean contexts.

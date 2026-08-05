@@ -670,93 +670,71 @@ discussion.chat(
 
 ---
 
-## 🧠 The High-Grade Agent System (`lollms_agent`)
+## 👜 The Unified LollmsPersonality & Handbag System
 
-The `Agent` class is the flagship autonomous execution engine. Unlike `LollmsDiscussion` (optimized for ~20 conversational turns), the Agent is designed for **long-horizon autonomous tasks** (50–200 reasoning rounds) such as build→test→fix loops and multi-file refactoring.
+In `lollms_client`, the **`LollmsPersonality`** is the sovereign unit of execution. It replaces the legacy bifurcation between stateless "prompt wrappers" and stateful "autonomous agents". A single `LollmsPersonality` scales progressively from a simple 5-line `SOUL.md` to a fully-armed, stateful, multi-persona **Crew Handbag** with tools, memory, skills, and multimodal assets.
 
-### Core Subsystems
+### 1. The Two Tiers of Personality
 
-| Subsystem | Purpose |
-|---|---|
-| **CapabilityFlags** | Boolean security gates (`enable_code_execution`, `enable_sub_agents`, `enable_model_switching`). Dangerous defaults are `False`. |
-| **SubAgentSpawner** | Spawns focused child agents with depth/count limits. Children cannot spawn further sub-agents. |
-| **SkillsManager** | Loads `SKILL.md` files. Supports "always_visible", "loadable", and "mixed" modes for cross-session learning. |
-| **_AgentStreamState** | Transactional stream parser that intercepts `<tool>` and `<done/>` tags during generation. |
-| **Handbag** | A unified, portable folder containing all agent resources (personalities, tools, skills, RAG, memory). |
-
-### Autonomous Build → Test → Fix Loop
+#### Tier 1: The Simple Personality (Stateless)
+A simple personality is just a system prompt and an optional RAG data source. It has no memory, no workspace, and no tools. It is 100% backward compatible with all legacy `LollmsDiscussion.chat(personality=...)` calls.
 
 ```python
-from lollms_client import LollmsClient
-from lollms_client.lollms_agent import Agent, AgentRole, CapabilityFlags
+from lollms_client import LollmsClient, LollmsDiscussion, LollmsDataManager
 from lollms_client.lollms_personality import LollmsPersonality
 
-client = LollmsClient(
-    llm_binding_name="ollama",
-    llm_binding_config={"model_name": "qwen3:32b", "host_address": "http://localhost:11434"},
+client = LollmsClient(llm_binding_name="ollama", llm_binding_config={"model_name": "llama3"})
+db_manager = LollmsDataManager("sqlite:///discussion.db")
+discussion = LollmsDiscussion.create_new(lollms_client=client, db_manager=db_manager)
+
+# A simple, stateless personality
+simple_pers = LollmsPersonality(
+    name="MathTutor",
+    author="user",
+    category="general",
+    description="A helpful math tutor.",
+    system_prompt="You are a helpful math tutor. Explain concepts simply."
 )
 
-personality = LollmsPersonality(
-    name="AutonomousEngineer",
-    author="system",
-    category="engineering",
-    description="An autonomous software engineer.",
-    system_prompt=(
-        "You are an Autonomous Software Engineer.\n"
-        "1. WRITE the code (using tool_write_file)\n"
-        "2. WRITE unit tests\n"
-        "3. EXECUTE the tests (using tool_execute_python_code)\n"
-        "4. If tests FAIL, FIX the code and RE-EXECUTE.\n"
-        "5. When ALL tests pass, emit <done/>."
-    ),
-)
-
-caps = CapabilityFlags(
-    enable_code_execution=True,
-    enable_workspace_tools=True,
-    enable_skill_creation=True,
-)
-
-agent = Agent(
-    lc=client,
-    personality=personality,
-    name="BuildTestFixBot",
-    role=AgentRole.IMPLEMENTER,
-    workspace_path="./workspace",
-    capabilities=caps,
-    max_tokens_per_turn=8192,
-)
-
-result = agent.chat(
-    prompt="Build a Python module `string_utils.py` with `reverse_string` and `count_vowels`, write tests, and run them until they pass.",
-    max_reasoning_steps=100,
-    temperature=0.2,
-)
-
-print(f"Rounds: {result['rounds']}, Tool calls: {len(result['tool_calls'])}")
+# Drops directly into a discussion
+discussion.chat(user_message="Explain Pythagoras' theorem.", personality=simple_pers)
 ```
 
-### The Handbag (Portable Agent Resources)
+#### Tier 2: The Handbag Personality (Stateful)
+A Handbag Personality is created by pointing a `LollmsPersonality` to a **Handbag** folder. This lazily instantiates a `SkillsManager`, a `MemoryManager`, and a `ToolRegistry`. It can be dropped into a `LollmsDiscussion` just like a simple personality, but it brings state and capabilities.
 
-The **Handbag** is a self-contained, portable folder that carries ALL of an agent's resources. It allows you to package personalities, tools, skills, RAG knowledge, memory, and an isolated workspace into a single directory. When you point an `Agent` to a handbag path, it automatically discovers and loads these resources.
+```python
+from lollms_client.lollms_personality import LollmsPersonality
 
-#### 1. Folder Structure
+# A complex, stateful personality loaded from a Handbag folder
+# Memory, Skills, and Tools are lazily instantiated upon loading.
+autonomous_pers = LollmsPersonality.from_handbag("./my_research_handbag")
 
-A Handbag follows a strict, convention-based directory structure:
+# It still drops directly into a discussion!
+# The LollmsDiscussion loop will automatically detect the stateful components
+# and inject the memory, skills, and tools into the active turn.
+discussion.chat(user_message="Refactor the utils file.", personality=autonomous_pers)
+```
+
+### 2. The Handbag (Portable Resource Folder)
+
+The **Handbag** is a self-contained, portable folder that carries ALL of a personality's resources. It allows you to package multiple personas, tools, skills, RAG knowledge, memory, and multimodal assets (like 3D models or voice samples) into a single directory.
+
+#### Folder Structure
 
 ```text
 my_handbag/
 ├── handbag.yaml              # Optional manifest (name, default_personality, skills_mode)
-├── personalities/            # Personality bundles (subdirs with SOUL.md)
+├── personalities/            # Multiple SOUL.md bundles (The Crew)
 │   ├── researcher/
 │   │   └── SOUL.md
 │   └── coder/
 │       └── SOUL.md
-├── tools/                    # Extra LCP tools (.py files or subdirs)
+├── tools/                    # Shared LCP tools (.py files or subdirs)
 │   ├── my_custom_tool.py
 │   └── another_tool/
 │       └── another_tool.py
-├── skills/                   # SKILL.md files (agent creates/updates these)
+├── skills/                   # SKILL.md files (personality creates/updates these)
 │   ├── python_patterns/
 │   │   └── SKILL.md
 │   └── ...
@@ -765,32 +743,32 @@ my_handbag/
 │   └── doc2.md
 ├── memory/                   # Memory database
 │   └── memory.db
-└── workspace/                # Optional isolated workspace
+└── assets/                   # Multimodal assets (icons, voice samples, 3D models)
+    ├── logo.png
+    └── voice.wav
 ```
 
-#### 2. Creating a Handbag
+#### Creating a Handbag
 
-You can automatically scaffold a new, empty Handbag folder using the `Handbag.create_structure()` helper. This creates all required subdirectories and a default `handbag.yaml` manifest.
+You can automatically scaffold a new, empty Handbag folder using the `Handbag.create_structure()` helper.
 
 ```python
 from lollms_client.lollms_agent.handbag import Handbag
 
-# Scaffolds the complete folder structure at the specified path
+# Scaffolds the complete folder structure
 hb_path = Handbag.create_structure("./my_research_handbag", name="Research Handbag")
-print(f"Handbag created at: {hb_path}")
 ```
 
-#### 3. Populating the Handbag
+#### Populating the Handbag
 
-Once the structure is created, you populate the folders with your resources:
-
-*   **Personalities (`personalities/`)**: Create a subdirectory for each personality. Inside each, place a `SOUL.md` file containing the system prompt and YAML frontmatter (name, author, category, etc.).
-*   **Tools (`tools/`)**: Place LCP tool scripts (`.py` files) directly in this folder, or create a subdirectory with a `.py` file matching the directory name.
+*   **Personalities (`personalities/`)**: Create a subdirectory for each persona. Inside each, place a `SOUL.md` file. This forms your **Crew**.
+*   **Tools (`tools/`)**: Place LCP tool scripts (`.py` files) here. All personas in the Handbag share this tool pool.
 *   **Skills (`skills/`)**: Create subdirectories for each skill, each containing a `SKILL.md` file.
-*   **RAG (`rag/`)**: Place any text files (`.txt`, `.md`, `.pdf`, etc.) here. The Handbag will automatically index them. If `safestore` is installed, it uses semantic search; otherwise, it falls back to keyword-based scoring.
-*   **Memory (`memory/`)**: A `memory.db` SQLite file will be automatically created here when the agent starts.
+*   **RAG (`rag/`)**: Place text files here. The Handbag automatically indexes them.
+*   **Memory (`memory/`)**: A `memory.db` SQLite file will be automatically created here.
+*   **Assets (`assets/`)**: Store custom graphics, audio, or 3D models for NPC-style applications.
 
-You can optionally configure the `handbag.yaml` manifest to set a default personality or skills mode:
+You can optionally configure the `handbag.yaml` manifest:
 
 ```yaml
 name: Research Handbag
@@ -800,60 +778,49 @@ default_personality: researcher  # Name of the folder in personalities/
 skills_mode: always_visible      # "always_visible", "loadable", or "mixed"
 ```
 
-#### 4. Using the Handbag in an Agent
+### 3. The Crew Handbag (Multi-Persona Routing)
 
-When you pass `handbag_path` to the `Agent` constructor, it automatically loads the resources as defaults. Explicit constructor parameters (like `personality` or `workspace_path`) always override the Handbag's values.
+A single Handbag can contain multiple `SOUL.md` files (e.g., `personalities/coder/` and `personalities/researcher/`). When loaded, the primary `LollmsPersonality` object acts as a router.
+
+All crewmates share the **same** Handbag tools, memory, and assets, but they have different system prompts and RAG data sources.
 
 ```python
-from lollms_client import LollmsClient
-from lollms_client.lollms_agent import Agent, AgentRole, CapabilityFlags
+from lollms_client.lollms_personality import LollmsPersonality
 
-client = LollmsClient(llm_binding_name="ollama", llm_binding_config={"model_name": "llama3"})
+# Load the Crew Handbag
+crew_pers = LollmsPersonality.from_handbag("./my_crew_handbag")
 
-# The Agent automatically loads the default personality, tools, skills, RAG, and memory
-agent = Agent(
-    lc=client,
-    handbag_path="./my_research_handbag",
-    name="ResearchBot",
-    role=AgentRole.DOMAIN_EXPERT,
-    capabilities=CapabilityFlags(enable_code_execution=True),
-)
+# The primary personality is determined by handbag.yaml (e.g., "researcher")
+print(f"Active persona: {crew_pers.name}")
 
-# You can switch between personalities loaded from the handbag
-print("Available personalities:", agent.list_handbag_personalities())
-agent.switch_handbag_personality("coder")
+# List all available personas in the crew
+print("Available crewmates:", crew_pers.list_crewmates())
 
-# Run the agent
-result = agent.chat("Analyze the latest trends in AI.")
+# Dynamically switch the active persona (tools and memory remain shared)
+crew_pers.switch_crewmate("coder")
+
+# Use it in a discussion
+discussion.chat(user_message="Write a Python script.", personality=crew_pers)
 ```
 
-#### 5. Using the Handbag in a Discussion
+### 4. Workspace Sovereignty
 
-The Handbag's resources can also be accessed directly for use in a standard `LollmsDiscussion`. This is useful when you want the rich RAG and memory features of the Handbag without the full autonomous Agent loop.
+The host application (via `LollmsDiscussion` or direct instantiation) dictates the working directory. The `Handbag` provides the *resources* (tools, memory, skills), but **does not force its own workspace path**. 
+
+If you use a Handbag-backed Personality inside a `LollmsDiscussion`, the Discussion's `workspace_path` is used for file operations. If you use the Handbag's standalone workspace, you must explicitly pass it to the Discussion.
 
 ```python
-from lollms_client import LollmsClient, LollmsDiscussion, LollmsDataManager
-from lollms_client.lollms_agent.handbag import Handbag
+# The Discussion dictates the workspace
+discussion = LollmsDiscussion.create_new(
+    lollms_client=client, 
+    db_manager=db_manager,
+    workspace_path="./my_project_workspace" # Explicit workspace
+)
 
-client = LollmsClient(llm_binding_name="ollama", llm_binding_config={"model_name": "llama3"})
-db_manager = LollmsDataManager("sqlite:///discussion.db")
-discussion = LollmsDiscussion.create_new(lollms_client=client, db_manager=db_manager)
-
-# Load the handbag directly
-handbag = Handbag("./my_research_handbag")
-
-# Get the default personality (with RAG automatically attached)
-personality = handbag.get_default_personality()
-
-# Get the memory manager
-memory_manager = handbag.create_memory_manager()
-
-# Use them in a discussion chat
+# The personality brings tools and memory, but uses the discussion's workspace
 discussion.chat(
-    user_message="What does the knowledge base say about recursion?",
-    personality=personality,
-    memory_manager=memory_manager,
-    tools=handbag.get_tool_files() # Pass the handbag's tools
+    user_message="Analyze the data.", 
+    personality=autonomous_pers
 )
 ```
 

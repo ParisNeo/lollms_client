@@ -32,17 +32,16 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from lollms_client.lollms_agent.lollms_agent import (
     Agent,
     AgentRole,
-    Skill,
-    SkillsManager,
     CapabilityFlags,
     SubAgentSpawner,
     ModelSwitcher,
     BindingToolsBuilder,
     ToolsManager,
     _AgentStreamState,
-    _parse_skill_md,
     _DEFAULT_SKILLS_DIR,
 )
+from lollms_client.lollms_personality.skill import Skill, parse_skill_md
+from lollms_client.lollms_personality.skills_manager import SkillsManager
 from lollms_client.lollms_types import MSG_TYPE
 
 
@@ -139,7 +138,7 @@ class TestSkillsManager(unittest.TestCase):
 
     def test_load_skill_with_frontmatter(self):
         self._create_skill_file("my_skill", "My Test Skill", description="A test skill", content="Do X then Y")
-        mgr = SkillsManager(skills_dirs=[self.tmp_skills_dir], mode="loadable", default_skills_dir=self.tmp_skills_dir)
+        mgr = SkillsManager(skills_dirs=[self.tmp_skills_dir], mode="loadable")
         skills = mgr.list_skills()
         self.assertEqual(len(skills), 1)
         self.assertEqual(skills[0]["title"], "My Test Skill")
@@ -151,21 +150,21 @@ class TestSkillsManager(unittest.TestCase):
         skill_dir.mkdir(parents=True, exist_ok=True)
         (skill_dir / "SKILL.md").write_text("# Plain Skill\n\nThis is a plain markdown skill.\n", encoding="utf-8")
 
-        mgr = SkillsManager(skills_dirs=[self.tmp_skills_dir], mode="loadable", default_skills_dir=self.tmp_skills_dir)
+        mgr = SkillsManager(skills_dirs=[self.tmp_skills_dir], mode="loadable")
         skills = mgr.list_skills()
         self.assertTrue(any(s["title"] == "Plain Skill" for s in skills))
 
     def test_loadable_mode_context(self):
         self._create_skill_file("skill_a", "Skill A", description="Desc A")
-        mgr = SkillsManager(skills_dirs=[self.tmp_skills_dir], mode="loadable", default_skills_dir=self.tmp_skills_dir)
+        mgr = SkillsManager(skills_dirs=[self.tmp_skills_dir], mode="loadable")
         ctx = mgr.build_context()
         self.assertIn("Skill A", ctx)
         self.assertIn("Desc A", ctx)
         self.assertIn("tool_load_skill", ctx)
 
-    def test_always_visible_mode_context(self):
+    def test_visible_mode_context(self):
         self._create_skill_file("skill_a", "Skill A", description="Desc A", content="Full content here", always_visible=True)
-        mgr = SkillsManager(skills_dirs=[self.tmp_skills_dir], mode="always_visible", default_skills_dir=self.tmp_skills_dir)
+        mgr = SkillsManager(skills_dirs=[self.tmp_skills_dir], mode="visible")
         ctx = mgr.build_context()
         self.assertIn("Full content here", ctx)
         self.assertIn("ACTIVE SKILLS", ctx)
@@ -173,7 +172,7 @@ class TestSkillsManager(unittest.TestCase):
     def test_mixed_mode_context(self):
         self._create_skill_file("vis_skill", "Visible Skill", content="Visible content", always_visible=True)
         self._create_skill_file("load_skill", "Loadable Skill", description="Loadable desc")
-        mgr = SkillsManager(skills_dirs=[self.tmp_skills_dir], mode="mixed", default_skills_dir=self.tmp_skills_dir)
+        mgr = SkillsManager(skills_dirs=[self.tmp_skills_dir], mode="mixed")
         ctx = mgr.build_context()
         self.assertIn("Visible content", ctx)
         self.assertIn("Loadable Skill", ctx)
@@ -181,14 +180,14 @@ class TestSkillsManager(unittest.TestCase):
 
     def test_load_skill_by_title(self):
         self._create_skill_file("my_skill", "My Skill", content="The content")
-        mgr = SkillsManager(skills_dirs=[self.tmp_skills_dir], mode="loadable", default_skills_dir=self.tmp_skills_dir)
+        mgr = SkillsManager(skills_dirs=[self.tmp_skills_dir], mode="loadable")
         content = mgr.load_skill("My Skill")
         self.assertIsNotNone(content)
         self.assertIn("The content", content)
 
     def test_load_skill_fuzzy_search(self):
         self._create_skill_file("python_debug", "Python Debugging", content="Debug tips")
-        mgr = SkillsManager(skills_dirs=[self.tmp_skills_dir], mode="loadable", default_skills_dir=self.tmp_skills_dir)
+        mgr = SkillsManager(skills_dirs=[self.tmp_skills_dir], mode="loadable")
         content = mgr.load_skill("python debug")
         self.assertIsNotNone(content)
         self.assertIn("Debug tips", content)
@@ -196,37 +195,14 @@ class TestSkillsManager(unittest.TestCase):
     def test_search_skills(self):
         self._create_skill_file("py_skill", "Python Best Practices", description="Python tips", tags=["python", "coding"])
         self._create_skill_file("data_skill", "Data Analysis", description="Data tips", tags=["data", "pandas"])
-        mgr = SkillsManager(skills_dirs=[self.tmp_skills_dir], mode="loadable", default_skills_dir=self.tmp_skills_dir)
+        mgr = SkillsManager(skills_dirs=[self.tmp_skills_dir], mode="loadable")
         results = mgr.search_skills("python")
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].title, "Python Best Practices")
 
-    def test_add_skill_creates_file(self):
-        mgr = SkillsManager(skills_dirs=[self.tmp_skills_dir], mode="loadable", default_skills_dir=self.tmp_skills_dir)
-        result = mgr.add_skill("New Skill", "A new skill", "general", "New content here", ["new"])
-        self.assertTrue(result["success"])
-        skills = mgr.list_skills()
-        self.assertTrue(any(s["title"] == "New Skill" for s in skills))
-
-    def test_update_skill(self):
-        self._create_skill_file("my_skill", "My Skill", content="Original content")
-        mgr = SkillsManager(skills_dirs=[self.tmp_skills_dir], mode="loadable", default_skills_dir=self.tmp_skills_dir)
-        result = mgr.update_skill("My Skill", "Updated content")
-        self.assertTrue(result["success"])
-        content = mgr.load_skill("My Skill")
-        self.assertIn("Updated content", content)
-
-    def test_delete_skill(self):
-        self._create_skill_file("my_skill", "My Skill", content="Content to delete")
-        mgr = SkillsManager(skills_dirs=[self.tmp_skills_dir], mode="loadable", default_skills_dir=self.tmp_skills_dir)
-        self.assertEqual(len(mgr.list_skills()), 1)
-        result = mgr.delete_skill("My Skill")
-        self.assertTrue(result["success"])
-        self.assertEqual(len(mgr.list_skills()), 0)
-
     def test_reload_skills(self):
         self._create_skill_file("skill_a", "Skill A")
-        mgr = SkillsManager(skills_dirs=[self.tmp_skills_dir], mode="loadable", default_skills_dir=self.tmp_skills_dir)
+        mgr = SkillsManager(skills_dirs=[self.tmp_skills_dir], mode="loadable")
         self.assertEqual(len(mgr.list_skills()), 1)
         self._create_skill_file("skill_b", "Skill B")
         mgr.reload()
@@ -719,7 +695,7 @@ class TestAgentChat(unittest.TestCase):
         tool_names = [tc["name"] for tc in result["tool_calls"]]
         self.assertIn("tool_list_files", tool_names)
 
-    def test_skills_created_tracking(self):
+    def test_skill_creation_unavailable_in_legacy_agent(self):
         self.client.round_scripts = [
             ['<tool>{"name": "tool_create_skill", "parameters": {"title": "Test Skill", "description": "A test", "category": "test", "content": "Content here"}}</tool>'],
             ["Skill created.\n<done/>"],
@@ -729,8 +705,10 @@ class TestAgentChat(unittest.TestCase):
             max_reasoning_steps=5,
             use_internal_history=False,
         )
-        self.assertEqual(len(result["skills_created"]), 1)
-        self.assertEqual(result["skills_created"][0], "Test Skill")
+        # The Agent wrapper no longer supports runtime skill mutation.
+        # It should gracefully intercept the phantom tool and fail safely.
+        self.assertEqual(len(result["tool_calls"]), 0)
+        self.assertNotIn("tool_create_skill", result["tool_calls"])
 
     def test_cancellation(self):
         self.client.round_scripts = [
@@ -874,17 +852,31 @@ class TestAgentToolDiscovery(unittest.TestCase):
         self.assertIn("tool_list_files", tools)
 
     def test_skill_tools_included_when_enabled(self):
+        # Create a temporary skills directory with a loadable SKILL.md file
+        skills_dir = Path(self.tmp_ws) / "skills"
+        skills_dir.mkdir(parents=True, exist_ok=True)
+        skill_dir = skills_dir / "test_skill"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\ntitle: Test Skill\ndescription: A test\nvisibility: loadable\n---\nContent",
+            encoding="utf-8"
+        )
+
         agent = Agent(
             lc=self.client,
             personality=self.personality,
             workspace_path=self.tmp_ws,
             capabilities=CapabilityFlags(enable_skill_loading=True, enable_skill_creation=True),
+            skills_dirs=[str(skills_dir)],
         )
         tools = agent._discover_tools(None, None, False)
         self.assertIn("tool_load_skill", tools)
         self.assertIn("tool_list_skills", tools)
-        self.assertIn("tool_create_skill", tools)
-        self.assertIn("tool_update_skill", tools)
+        # The hardcoded CRUD wrappers for skills were removed from the Agent 
+        # to align with the deprecation of runtime skill mutation.
+        self.assertNotIn("tool_create_skill", tools)
+        self.assertNotIn("tool_update_skill", tools)
+        self.assertNotIn("tool_delete_skill", tools)
 
     def test_skill_tools_excluded_when_disabled(self):
         agent = Agent(

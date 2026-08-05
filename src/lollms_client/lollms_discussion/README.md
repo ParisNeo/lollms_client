@@ -160,11 +160,12 @@ This protocol works in tandem with the **Anti-Mimicry Defense**. Because older m
 ### Detailed Phase Breakdown
 
 1.  **Pre-Hydration**:
-    * Memory Decay & Associative Pull (SQLite).
+    * **Memory Scoping**: If the `personality` has its own `memory_manager` (Independent Life), it is used. Otherwise, the Discussion's `memory_manager` (System-Managed Life) is used. Memory decay and associative pull are applied to the resolved manager.
     * RAG Injection (if personality has data).
     * **Dynamic Tool Mounting**: If data files exist in workspace AND `enable_data_tools=True`, `semantic_data_engineer` is auto-mounted.
 2.  **Context Assembly**:
     * System Prompt + Rules (including `<done/>` protocol instructions).
+    * **Progressive Skill Enhancement**: If the `personality` has a `skills_manager`, its context (visible/loadable/searchable tiers) is injected into the system prompt.
     * **Active Artefacts**: Injects `.lam` content (Logical Twins) for all active files.
     * Memory Handles.
     * **Context Size Resolution**: The system queries `lc.get_ctx_size()` to determine the token budget. This uses the 4-layer protocol (Forced > Binding > Hardcoded > Default) to accurately identify the maximum context window before assembling the prompt.
@@ -288,7 +289,7 @@ def chat(
 
 The tool registry follows a **Strict Sovereign Opt-In Doctrine**. The system will NEVER automatically expose all default LCP tools to the LLM. Tools are only activated if they are explicitly requested via one of the following mechanisms:
 
-1.  **Personality Handbag Tools**: If the `personality` object contains a `handbag` or `tools` attribute, those tools are automatically registered for the turn.
+1.  **Personality Handbag Tools**: If the unified `personality` object was loaded via `from_handbag()` and contains an `LCPBinding` in its `tools` attribute, those tool specifications are automatically discovered and registered for the turn.
 2.  **Explicit `tools` parameter**: The `tools` argument to `chat()` accepts two types of values:
     *   **Dictionary of Callables**: A mapping of tool names to their specification dictionaries (containing `name`, `description`, `parameters`, `callable`). This is used for injecting custom, session-specific functions.
     *   **List of Default Tool Names**: A list of strings matching the names of tools available in the `LCPBinding`'s discovered registry (e.g., `["tool_execute_python_code", "tool_query_database_sql"]`). The orchestrator will resolve these names to their specs and register them. If a requested name is not found in the LCP registry, it is ignored.
@@ -393,7 +394,7 @@ discussion.chat(user_message="Search for apples", tools=explicit_tools)
 *   `tolerance_level` (`Optional[str]`): Sets the execution tolerance for downstream tools (e.g., `strict` or `lax` for Python data queries).
 
 **Memory & RAG**
-*   `memory_manager` (`Optional[Any]`): The LollmsMemoryManager instance for tiered persistent memory. If `None`, memory features are disabled.
+*   `memory_manager` (`Optional[Any]`): The fallback LollmsMemoryManager instance for tiered persistent memory (System-Managed Life). If the active `personality` provides its own `memory_manager` (Independent Life), that takes precedence and this parameter is ignored.
 *   `enable_memory` (`bool`): Master switch for SQLite memory ingestion and retrieval.
 *   `enable_deep_memory_pulling` (`bool`): If `True`, performs associative deep memory pull based on the `user_message` before generation.
 *   `enable_auto_dream` (`bool`): If `True`, triggers a subconscious dream consolidation pass after the turn completes.

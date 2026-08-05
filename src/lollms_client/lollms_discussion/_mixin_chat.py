@@ -19,6 +19,7 @@ from lollms_client.lollms_types import MSG_TYPE
 from ._message import LollmsMessage
 from lollms_client.lollms_artefact import ArtefactType, make_image_id, ArtefactVisibility, ArtefactStatus
 from lollms_client.lollms_memory import FailureMemory
+from lollms_client.lollms_personality.lollms_personality import _is_tool_binding
 _MAX_BRACKET_BUF = 256
 
 _HEARTBEAT_MESSAGES = [
@@ -2491,7 +2492,12 @@ class ChatMixin:
         temperature = kwargs.get("temperature")
 
         # ── 1. Safe SQLite Memory Ingestion ──
-        _mm = self._get_memory_manager(memory_manager) if enable_memory else None
+        # Memory Scoping: If personality has its own memory_manager (Independent Life), use it.
+        # Otherwise, fallback to the Discussion's memory_manager (System-Managed Life).
+        if enable_memory and personality and hasattr(personality, "memory_manager") and personality.memory_manager:
+            _mm = personality.memory_manager
+        else:
+            _mm = self._get_memory_manager(memory_manager) if enable_memory else None
         _counter = self.lollmsClient.count_tokens if self.lollmsClient else None
 
         if _mm:
@@ -2530,6 +2536,12 @@ class ChatMixin:
 
         # ── 3. Build Dynamic System Prompt ──
         sys_prompt = (personality.system_prompt if personality else None) or self.system_prompt or ""
+
+        # Inject Skills Context (Progressive Enhancement)
+        if personality and hasattr(personality, "skills_manager") and personality.skills_manager:
+            skills_ctx = personality.skills_manager.build_context()
+            if skills_ctx:
+                sys_prompt += "\n" + skills_ctx
         
         # Veracity and Formatting Rules
         rules = (
@@ -2657,9 +2669,18 @@ class ChatMixin:
         active_tools = {}
 
         # 1. Personality Handbag Tools
-        if personality and hasattr(personality, "handbag") and personality.handbag:
-            active_tools.update(personality.handbag.tools)
-        if personality and hasattr(personality, "tools") and isinstance(personality.tools, dict):
+        if personality and hasattr(personality, "handbag_path") and personality.handbag_path:
+            # The personality was loaded from a handbag. We need to mount the tool files.
+            # The LCPBinding is already attached to personality.tools if it exists.
+            pass
+
+        if personality and hasattr(personality, "tools") and _is_tool_binding(personality.tools):
+            try:
+                pers_tools = personality.tools.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
+                active_tools.update(pers_tools)
+            except Exception as ex:
+                trace_exception(ex)
+        elif personality and hasattr(personality, "tools") and isinstance(personality.tools, dict):
             active_tools.update(personality.tools)
 
         # 2. Explicit User-Supplied Tools (Callables or Default Tool Names)
