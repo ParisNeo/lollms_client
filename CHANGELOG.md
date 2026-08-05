@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-08-05 18:53]
+
+- fix(personality): resolve issue in lollms_personality module
+
 ## [2026-08-05 18:46]
 
 - refactor: unify LollmsPersonality and Handbag systems across agent and discussion modules

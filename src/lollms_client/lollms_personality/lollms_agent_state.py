@@ -231,11 +231,13 @@ class _AgentStreamState:
         self.callback = callback
         self.content = ""
         self.tool_trigger = False
+        self.artifact_trigger = False
         self.tool_json_data = ""
         self._done_detected = False
         self._action_dispatched = False
 
         self._is_accumulating_tool = False
+        self._is_accumulating_artifact = False
         self._tool_buffer = ""
         self._pending_buffer = ""
 
@@ -263,27 +265,29 @@ class _AgentStreamState:
 
         self._pending_buffer += chunk
 
-        if not self._is_accumulating_tool and not self._in_code_fence and not self._in_inline_code:
+        if not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence and not self._in_inline_code:
             done_match = re.search(r'(?m)^\s*<done\s*/?>', self._pending_buffer, re.IGNORECASE)
             if done_match:
                 self._done_detected = True
                 self._pending_buffer = re.sub(r'(?m)^\s*<done\s*/?>', '', self._pending_buffer, flags=re.IGNORECASE)
                 return False
 
-        if not self._is_accumulating_tool and not self._in_code_fence and not self._in_inline_code:
+        if not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence and not self._in_inline_code:
             proc_match = re.search(r'(?m)^\s*<processing', self._pending_buffer, re.IGNORECASE)
             if proc_match:
                 self._pending_buffer = re.sub(r'(?m)^\s*<processing[^>]*>', '', self._pending_buffer, flags=re.IGNORECASE)
                 return False
 
-        if not self._is_accumulating_tool:
+        if not self._is_accumulating_tool and not self._is_accumulating_artifact:
             if "```" in self._pending_buffer:
                 self._code_fence_buffer += self._pending_buffer
                 self._pending_buffer = ""
+
                 while "```" in self._code_fence_buffer:
                     idx = self._code_fence_buffer.find("```")
                     before = self._code_fence_buffer[:idx]
                     self._code_fence_buffer = self._code_fence_buffer[idx + 3:]
+
                     if not self._in_code_fence:
                         self._in_code_fence = True
                         self.content += before + "```"
@@ -299,6 +303,7 @@ class _AgentStreamState:
                             self._cb(before)
                         self.content += "```"
                         self._cb("```")
+
                 if self._in_code_fence:
                     self._code_fence_hold_buffer += self._code_fence_buffer
                     self._code_fence_buffer = ""
@@ -311,7 +316,7 @@ class _AgentStreamState:
                 self._pending_buffer = ""
                 return True
 
-        if not self._is_accumulating_tool and not self._in_code_fence:
+        if not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence:
             if "`" in self._pending_buffer:
                 if self._in_inline_code:
                     idx = self._pending_buffer.find("`")
@@ -363,6 +368,13 @@ class _AgentStreamState:
                 return False
             return True
 
+        if self._is_accumulating_artifact:
+            self._tool_buffer += self._pending_buffer
+            self._pending_buffer = ""
+            if self._try_complete_artifact():
+                return False
+            return True
+
         if not self._in_code_fence and not self._in_inline_code:
             tool_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<tool>', self._pending_buffer, re.IGNORECASE)
             if tool_match:
@@ -371,15 +383,33 @@ class _AgentStreamState:
                 if text_before:
                     self.content += text_before
                     self._cb(text_before)
+
                 self._is_accumulating_tool = True
                 self._tool_buffer = self._pending_buffer[tag_start_idx:]
                 self._pending_buffer = ""
+                
                 if self._try_complete_tool():
                     return False
                 return True
 
+            artifact_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<art(?:ifact|efact)\b', self._pending_buffer, re.IGNORECASE)
+            if artifact_match:
+                tag_start_idx = artifact_match.start()
+                text_before = self._pending_buffer[:tag_start_idx]
+                if text_before:
+                    self.content += text_before
+                    self._cb(text_before)
+
+                self._is_accumulating_artifact = True
+                self._tool_buffer = self._pending_buffer[tag_start_idx:]
+                self._pending_buffer = ""
+
+                if self._try_complete_artifact():
+                    return False
+                return True
+            
         def _ends_with_partial_tag(buffer: str) -> int:
-            tags_to_check = ["<tool", "<done"]
+            tags_to_check = ["<tool", "<done", "<artifact", "<artefact"]
             for tag in tags_to_check:
                 for i in range(1, len(tag)):
                     if buffer.endswith(tag[:i]):
@@ -410,11 +440,14 @@ class _AgentStreamState:
         close_match = re.search(r'</tool>\s*', self._tool_buffer, re.IGNORECASE)
         if not close_match:
             return False
+
         end_idx = close_match.start()
         end_len = len(close_match.group(0))
+
         full_tool_call = self._tool_buffer[:end_idx + end_len]
         json_body = re.sub(r'^<tool>', '', full_tool_call, flags=re.IGNORECASE)
         json_body = re.sub(r'</tool>\s*$', '', json_body, flags=re.IGNORECASE).strip()
+
         self._is_accumulating_tool = False
         remaining = self._tool_buffer[end_idx + end_len:]
         self._tool_buffer = ""
@@ -458,6 +491,26 @@ class _AgentStreamState:
         self._action_dispatched = True
         return True
 
+    def _try_complete_artifact(self) -> bool:
+        close_match = re.search(r'</art(?:ifact|efact)>\s*', self._tool_buffer, re.IGNORECASE)
+        if not close_match:
+            return False
+
+        end_idx = close_match.start()
+        end_len = len(close_match.group(0))
+
+        full_artifact_call = self._tool_buffer[:end_idx + end_len]
+        
+        self._is_accumulating_artifact = False
+        remaining = self._tool_buffer[end_idx + end_len:]
+        self._tool_buffer = full_artifact_call
+        if remaining:
+            self._pending_buffer = remaining + self._pending_buffer
+
+        self.artifact_trigger = True
+        self._action_dispatched = True
+        return True
+
     def flush_remaining_buffer(self):
         if self._in_code_fence:
             self._in_code_fence = False
@@ -471,15 +524,36 @@ class _AgentStreamState:
             self._pending_buffer = ""
             if not self._try_complete_tool():
                 full_tool_call = self._tool_buffer
-                json_body = re.sub(r'^<tool>', '', full_tool_call, flags=re.IGNORECASE).strip()
+                json_body = re.sub(r'^<tool>', '', full_tool_call, flags=re.IGNORECASE)
+                json_body = re.sub(r'</tool>\s*$', '', json_body, flags=re.IGNORECASE).strip()
+
                 self._is_accumulating_tool = False
                 self._tool_buffer = ""
+
                 try:
                     raw_data = json.loads(json_body)
-                except Exception:
-                    raw_data = None
+                except json.JSONDecodeError:
+                    repaired = json_body
+                    while repaired.count('{') > repaired.count('}'):
+                        repaired += '}'
+                    while repaired.count('[') > repaired.count(']'):
+                        repaired += ']'
+                    try:
+                        raw_data = json.loads(repaired)
+                        json_body = repaired
+                    except json.JSONDecodeError:
+                        raw_data = None
+
                 if isinstance(raw_data, dict):
                     if "parameters" in raw_data and isinstance(raw_data["parameters"], dict):
+                        if not raw_data.get("name"):
+                            params_dict = raw_data["parameters"]
+                            nested_name = params_dict.get("tool_name") or params_dict.get("name")
+                            if nested_name:
+                                params_cleaned = {k: v for k, v in params_dict.items() if k not in ("tool_name", "name")}
+                                normalized = {"name": nested_name, "parameters": params_cleaned}
+                                self.tool_json_data = json.dumps(normalized)
+                                return
                         self.tool_json_data = json_body
                     else:
                         tool_name = raw_data.get("name", "")
@@ -488,7 +562,19 @@ class _AgentStreamState:
                         self.tool_json_data = json.dumps(normalized)
                 else:
                     self.tool_json_data = json_body
+
                 self.tool_trigger = True
+                self._action_dispatched = True
+            return
+
+        if self._is_accumulating_artifact:
+            self._tool_buffer += self._pending_buffer
+            self._pending_buffer = ""
+            if not self._try_complete_artifact():
+                full_artifact_call = self._tool_buffer
+                self._is_accumulating_artifact = False
+                self._tool_buffer = full_artifact_call
+                self.artifact_trigger = True
                 self._action_dispatched = True
             return
 
@@ -505,6 +591,9 @@ class _AgentStreamState:
 
     def get_tool_call_json(self) -> Optional[str]:
         return self.tool_json_data if self.tool_trigger else None
+
+    def get_artifact_xml(self) -> Optional[str]:
+        return self._tool_buffer if self.artifact_trigger else None
 
     def get_clean_text(self) -> str:
         return self.content

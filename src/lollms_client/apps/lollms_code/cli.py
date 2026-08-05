@@ -135,10 +135,15 @@ For every task, follow this structured pipeline:
 - After completing a task, ALWAYS create or update a skill.
 - Skills are your long-term memory — they make you better over time.
 
-## MEMORY AWARENESS
-- The system injects active memories into your context automatically.
-- Use these memories as background knowledge.
-- Do NOT output memory markers like `[MEMORY_CONTEXT]` — they are infrastructure.
+## PERSISTENT MEMORY SYSTEM (CRITICAL FOR CONTINUITY)
+You have access to a persistent memory database that survives across sessions.
+1. **STORE FACTS**: When the user shares personal information (name, preferences, project details), you MUST save it immediately:
+   <mem_new content="The user's name is Saif" tags="identity,user_profile" level="2" />
+2. **UPDATE FACTS**: If information changes, update the memory:
+   <mem_update id="memory_id" content="New information" />
+3. **AUTOMATIC RECALL**: Relevant memories are automatically injected into your context. You do not need to query them manually.
+4. **MANDATORY**: Always use memory tags for non-trivial user facts. If the user tells you their name, you MUST emit `<mem_new>` in your response.
+5. **USE MEMORIES**: When asked "do you remember my name?", check the ACTIVE MEMORIES section in your context. If the user's name is there, use it.
 """
 
 
@@ -285,15 +290,27 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
     if "verify_ssl_certificate" not in llm_config:
         llm_config["verify_ssl_certificate"] = config.verify_ssl
 
-    default_tools_path = PROJECT_ROOT / "src" / "lollms_client" / "tools_bindings" / "lcp" / "default_tools"
+    import lollms_client
+    package_root = Path(lollms_client.__file__).resolve().parent
+    default_tools_path = package_root / "tools_bindings" / "lcp" / "default_tools"
+
+    tools_folders = [str(default_tools_path)] if default_tools_path.exists() else []
+
     client = LollmsClient(
         llm_binding_name=config.llm_binding,
         llm_binding_config=llm_config,
         tools_binding_name="lcp",
         tools_binding_config={
-            "tools_folders": [str(default_tools_path)] if default_tools_path.exists() else []
+            "tools_folders": tools_folders
         },
     )
+
+    if config.enable_code_execution and client.tools:
+        try:
+            client.tools.mount_tool_library('execute_python_code')
+        except Exception as e:
+            ASCIIColors.warning(f"Failed to pre-mount execute_python_code library: {e}")
+
     return client
 
 
@@ -386,15 +403,25 @@ class StreamRenderer:
 
 def display_result(result: Dict[str, Any], config: CodeAgentConfig, elapsed: float):
     ASCIIColors.rule("[bold cyan]📊 SESSION REPORT[/bold cyan]")
-    
+
+    summary_rows = [
+        ["Total rounds", str(result.get('rounds', 0))],
+        ["Tool calls", str(len(result.get('tool_calls', [])))],
+        ["Was cancelled", str(result.get('was_cancelled', False))],
+        ["Elapsed time", f"{elapsed:.1f}s"]
+    ]
+
+    ctx_health = result.get("context_health")
+    if ctx_health and ctx_health.get("max_tokens", 0) > 0:
+        used = ctx_health.get("used_tokens", 0)
+        max_t = ctx_health.get("max_tokens", 0)
+        pct = ctx_health.get("fill_percentage", 0.0)
+        summary_rows.append(["Context used", f"{used:,} / {max_t:,} tokens"])
+        summary_rows.append(["Context fill", f"{pct:.1f}%"])
+
     summary_table = ASCIIColors.table(
         "Metric", "Value",
-        rows=[
-            ["Total rounds", str(result.get('rounds', 0))],
-            ["Tool calls", str(len(result.get('tool_calls', [])))],
-            ["Was cancelled", str(result.get('was_cancelled', False))],
-            ["Elapsed time", f"{elapsed:.1f}s"]
-        ],
+        rows=summary_rows,
         title="[bold]Execution Summary[/bold]",
         box="round"
     )
@@ -556,7 +583,11 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
             continue
 
         elapsed = time.time() - start_time
-        ASCIIColors.rich_print(f"\n[dim]⏱️  {elapsed:.1f}s | Rounds: {result.get('rounds', 0)} | Tools: {len(result.get('tool_calls', []))}[/dim]")
+        ctx_h = result.get("context_health", {})
+        ctx_str = ""
+        if ctx_h and ctx_h.get("max_tokens", 0) > 0:
+            ctx_str = f" | Ctx: {ctx_h.get('fill_percentage', 0.0):.1f}%"
+        ASCIIColors.rich_print(f"\n[dim]⏱️  {elapsed:.1f}s | Rounds: {result.get('rounds', 0)} | Tools: {len(result.get('tool_calls', []))}{ctx_str}[/dim]")
 
 
 def list_skills(config: CodeAgentConfig):

@@ -192,11 +192,16 @@ class LCPBinding(LollmsToolBinding):
         This allows the system to auto-load specialized tools (e.g., semantic_data_engineer)
         when context conditions are met (e.g., data files detected).
 
+        If the default_tools folder was already scanned during LCPBinding construction,
+        the tools from this library may already be in self.discovered_tools. In that case,
+        this method recognizes them as already registered and returns True (idempotent).
+
         Args:
             library_name: The name of the folder inside default_tools (e.g., 'semantic_data_engineer').
 
         Returns:
-            True if successfully mounted and discovered, False otherwise.
+            True if successfully mounted or already registered, False only if the library
+            folder doesn't exist or contains no valid tool files.
         """
         base_dir = Path(__file__).parent / "default_tools"
         lib_path = base_dir / library_name
@@ -205,15 +210,43 @@ class LCPBinding(LollmsToolBinding):
             ASCIIColors.warning(f"[LCP Mount] Library '{library_name}' not found at {lib_path}")
             return False
 
-        if lib_path in self.tools_folders:
-            ASCIIColors.info(f"[LCP Mount] Library '{library_name}' already mounted.")
-            return True
+        # Determine which tools this library SHOULD provide by scanning its files
+        # for tool_ functions, regardless of whether they're already registered.
+        expected_tool_names: set = set()
+        for item in lib_path.iterdir():
+            py_file = None
+            if item.is_dir():
+                py_file = item / f"{item.name}.py"
+                if not py_file.exists():
+                    sub_py_files = [f for f in item.iterdir() if f.is_file() and f.suffix == ".py" and f.stem != "__init__"]
+                    for fallback_py in sub_py_files:
+                        expected_tool_names.update(self._extract_tool_names_from_file(fallback_py))
+                    continue
+            elif item.suffix == ".py" and item.stem != "__init__":
+                py_file = item
 
-        self.tools_folders.append(lib_path)
+            if py_file and py_file.exists():
+                expected_tool_names.update(self._extract_tool_names_from_file(py_file))
+
+        if not expected_tool_names:
+            ASCIIColors.warning(f"[LCP Mount] ⚠️ Library '{library_name}' contains no tool definitions.")
+            return False
+
+        # Check which expected tools are already registered
+        already_registered = {
+            t.get("name") for t in self.discovered_tools
+            if t.get("name") in expected_tool_names
+        }
+
+        if lib_path not in self.tools_folders:
+            self.tools_folders.append(lib_path)
+
+        if len(already_registered) == len(expected_tool_names):
+            ASCIIColors.info(f"[LCP Mount] ✅ Library '{library_name}' already registered ({len(already_registered)} tools). Idempotent mount.")
+            return True
 
         initial_tool_count = len(self.discovered_tools)
 
-        # Scan the specific library directory for tool files
         for item in lib_path.iterdir():
             py_file = None
             if item.is_dir():
@@ -237,9 +270,25 @@ class LCPBinding(LollmsToolBinding):
         if new_tool_count > 0:
             ASCIIColors.success(f"[LCP Mount] ✅ Successfully mounted '{library_name}': {new_tool_count} tools registered (lazy init).")
             return True
+        elif len(already_registered) > 0:
+            ASCIIColors.info(f"[LCP Mount] ✅ Library '{library_name}' already registered ({len(already_registered)} tools). Idempotent mount.")
+            return True
         else:
             ASCIIColors.warning(f"[LCP Mount] ⚠️ Library '{library_name}' mounted but no tools discovered.")
             return False
+
+    def _extract_tool_names_from_file(self, py_file: Path) -> set:
+        """Extracts all tool_ function names from a Python file via AST without executing it."""
+        names: set = set()
+        try:
+            code_text = py_file.read_text(encoding="utf-8")
+            tree = ast.parse(code_text)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef) and node.name.startswith("tool_"):
+                    names.add(node.name)
+        except Exception:
+            pass
+        return names
 
     def _discover_local_tools(self):
         self.discovered_tools = []

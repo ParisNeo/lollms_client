@@ -14,28 +14,24 @@ from __future__ import annotations
 
 from __future__ import annotations
 
-import ast
-import base64
 import hashlib
+import importlib
 import importlib.util
 import inspect
 import json
 import os
 import re
-import sys
 import traceback
-import uuid
-from dataclasses import dataclass, field
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import  SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from ascii_colors import ASCIIColors, trace_exception
 
-from .skill import Skill
 from .skills_manager import SkillsManager
 from .handbag import Handbag
 from .lollms_agent_state import _AgentStreamState, _sanitize_tool_result, _ToolsManager
+
 
 try:
     from lollms_client.lollms_types import MSG_TYPE
@@ -931,6 +927,7 @@ class LollmsPersonality:
     def _init_artefact_system(self):
         try:
             from lollms_client.lollms_artefact import ArtefactManager, ArtefactVisibility
+            from lollms_client.lollms_artefact.export import LollmsArtefactPatchApplier
             import uuid as _uuid
             ws_path = self._resolved_workspace
             if not ws_path:
@@ -954,6 +951,7 @@ class LollmsPersonality:
             am = _VersionlessArtefactManager(proxy)
             object.__setattr__(self, '_artefact_manager', am)
             object.__setattr__(self, '_artefact_proxy', proxy)
+            object.__setattr__(self, '_patch_applier', LollmsArtefactPatchApplier(self.lollms_client))
 
             if ws_path.exists():
                 for f_path in sorted(ws_path.rglob("*")):
@@ -986,14 +984,21 @@ class LollmsPersonality:
 
         def _artifact_anchor(match: re.Match) -> str:
             attrs_str = match.group(0)
+            body_content = match.group(1) if match.groups() else ""
+
+            if "<<<<<<< SEARCH" in body_content:
+                title_match = re.search(r'(?:name|title)=["\']([^"\']*)["\']', attrs_str, re.IGNORECASE)
+                title = title_match.group(1) if title_match else "artifact"
+                return f"[🔧 SEARCH/REPLACE attempted on: {title}]\n{body_content}\n[/SEARCH/REPLACE]"
+
             title_match = re.search(r'(?:name|title)=["\']([^"\']*)["\']', attrs_str, re.IGNORECASE)
             type_match = re.search(r'type=["\']([^"\']*)["\']', attrs_str, re.IGNORECASE)
             title = title_match.group(1) if title_match else "artifact"
             atype = type_match.group(1) if type_match else "code"
             return f"[🔒artefact tag called, content stripped for brievety, do not mimic:{title}|{atype}]"
 
-        text = re.sub(r'<artifact[^>]*>.*?(?:</artifact>|$)', _artifact_anchor, text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r'<artefact[^>]*>.*?(?:</artefact>|$)', _artifact_anchor, text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<artifact[^>]*>(.*?)</artifact>', _artifact_anchor, text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<artefact[^>]*>(.*?)</artefact>', _artifact_anchor, text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r'<lollms_artifact[^/]*/>', '', text, flags=re.IGNORECASE)
         text = re.sub(r'<artefact_image[^/]*/>', '', text, flags=re.IGNORECASE)
 
@@ -1002,9 +1007,9 @@ class LollmsPersonality:
     def _discover_tools(self, explicit_tools: Optional[Dict], tool_files: Optional[List], enable_code_execution: bool) -> Dict[str, Dict[str, Any]]:
         active_tools = {}
 
+        # Always include file I/O tools when workspace is active to allow the LLM to read files for SEARCH/REPLACE validation
         if self._resolved_workspace and self.capabilities and self.capabilities.enable_workspace_tools:
-            include_file_io = not getattr(self, 'enable_artefact_system', False)
-            active_tools.update(_get_builtin_workspace_tools(include_file_io=include_file_io))
+            active_tools.update(_get_builtin_workspace_tools(include_file_io=True))
 
         if BindingToolsBuilder and self.lollms_client and self.capabilities:
             binding_tools = BindingToolsBuilder.build_tools(self.lollms_client, self.capabilities, self._resolved_workspace)
@@ -1032,7 +1037,8 @@ class LollmsPersonality:
         if lcp_binding is None and (tool_files or self._resolved_workspace):
             try:
                 from lollms_client.tools_bindings.lcp import LCPBinding
-                default_tools = Path(__file__).parent.parent / "tools_bindings" / "lcp" / "default_tools"
+                pkg_root = Path(lollms_client.__file__).resolve().parent
+                default_tools = pkg_root / "tools_bindings" / "lcp" / "default_tools"
                 lcp_binding = LCPBinding(tools_folders=[str(default_tools)] if default_tools.exists() else [])
             except Exception:
                 lcp_binding = None
@@ -1062,10 +1068,61 @@ class LollmsPersonality:
 
     def _build_system_prompt(self, active_tools: Dict, enable_code_execution: bool) -> str:
         sys_prompt = self.system_prompt or ""
-
         rules = (
-            "\n=== ACTION EXECUTION & TERMINATION PROTOCOL (CRITICAL) ===\n"
-            "1. **INTENT ≠ EXECUTION**: Stating 'I will search...' in text DOES NOT execute the action. You MUST output the `<tool>` tag.\n"
+           "\n=== ACTION EXECUTION & TERMINATION PROTOCOL (CRITICAL) ===\n"
+           "1. **INTENT ≠ EXECUTION**: Stating 'I will search...' in text DOES NOT execute the action. You MUST output the `<tool>` tag.\n"
+           "2. **MANDATORY TAG EMISSION**: To execute an action, you MUST output the `<tool>` tag immediately.\n"
+           "3. **EXPLICIT TERMINATION WITH `<done/>`**: When all objectives are met and tests pass, end with a `<done/>` tag on a new line.\n"
+           "4. **SAME-SESSION CONTINUATION**: When executing a sequence, emit the next action's tag in your IMMEDIATE NEXT response.\n"
+           "5. **AGENTIC TRIGGER**: If the user requests code generation, file modification, testing, or multi-step work, you MUST enter the agentic loop and use `<tool>` or `<artifact>` tags. Do NOT write code directly in conversational prose.\n"
+           "6. **ROUND 1 SHORT-CIRCUIT**: If the user's request is purely conversational (e.g., greetings, simple questions), respond conversationally without `<done/>` or tool tags.\n"
+            "\n=== TOOL CALLING DISCIPLINE (CRITICAL) ===\n"
+            "1. **Tool Results ≠ Tool Calls**: When a tool returns JSON, it's a RESULT, not a new call.\n"
+            "2. **One Call Per Task**: Once a tool succeeds, analyze and answer.\n"
+            "3. **Loop Prevention**: Repeating a successful tool call with identical parameters is a CRITICAL ERROR.\n"
+            "4. **File Outputs**: When a tool returns a file, it's ALREADY saved. Do NOT call it again.\n"
+            "\n=== FILE EDITING PROTOCOL (AIDER SEARCH/REPLACE) ===\n"
+            "For surgical updates to existing files, you MUST use the `<artifact>` tag with SEARCH/REPLACE blocks.\n"
+            "The system automatically applies fuzzy matching and auto-correction if the exact search string isn't found.\n"
+            "Syntax:\n"
+            "<artifact name=\"filename.ext\" type=\"code\" language=\"python\">\n"
+            "<<<<<<< SEARCH\n"
+            "// exact lines to find\n"
+            "=======\n"
+            "// new lines to replace with\n"
+            ">>>>>>> REPLACE\n"
+            "</artifact>\n"
+            "If a patch fails, the system will return the error. You MUST read the error, re-read the file using `tool_read_file`, and correct your SEARCH block.\n"
+            "\n=== SKILLS SYSTEM ===\n"
+            "Skills are persistent knowledge capsules stored outside the workspace. They survive across sessions.\n"
+            "Use `tool_list_skills` to see available skills, and `tool_load_skill` to load their full content.\n"
+            "If you discover a reusable methodology or best practice, use `tool_create_skill` to save it for future use.\n"
+            "Use `tool_update_skill` to refine existing skills as you learn more.\n"
+            "\n=== SUB-AGENT DELEGATION ===\n"
+            "If `tool_spawn_sub_agent` is available, you can delegate complex sub-tasks to a focused child agent.\n"
+            "The child shares your workspace but cannot spawn further sub-agents.\n"
+            "Use this for heavy tasks like writing large scripts, researching topics, or designing presentations.\n"
+            "\n=== THINKING & REASONING CONSTRAINT ===\n"
+            "If you output thoughts enclosed in  tags, you MUST output all functional XML tags AFTER the closing tag.\n"
+            "\n=== ANTI-MIMICRY PROTOCOL (CRITICAL) ===\n"
+            "1. **NEVER OUTPUT SYSTEM MARKERS**: You are STRICTLY FORBIDDEN from generating `<processing>` blocks or `[SYSTEM:` markers.\n"
+            "2. **USE REAL TAGS**: To call tools, use the actual `<tool>` XML tags.\n"
+        )
+
+        memory_instructions = ""
+        if self.memory_manager:
+            memory_instructions = (
+                "\n=== PERSISTENT MEMORY SYSTEM (CRITICAL FOR CONTINUITY) ===\n"
+                "You have access to a persistent memory database. You can store and retrieve information across sessions.\n"
+                "1. **STORE FACTS**: When the user shares personal information (e.g., name, preferences, project details), you MUST save it using:\n"
+                "   <mem_new content=\"The user's name is Saif\" tags=\"identity,user_profile\" level=\"2\" />\n"
+                "2. **UPDATE FACTS**: If information changes, use:\n"
+                "   <mem_update id=\"memory_id\" content=\"New information\" />\n"
+                "3. **AUTOMATIC RECALL**: Relevant memories are automatically injected into your context. You do not need to query them manually.\n"
+                "4. **MANDATORY**: Always use memory tags for non-trivial user facts. If the user tells you their name, you MUST emit `<mem_new>` immediately.\n"
+            )
+
+        workspace_ctx = (""
             "2. **MANDATORY TAG EMISSION**: To execute an action, you MUST output the `<tool>` tag immediately.\n"
             "3. **EXPLICIT TERMINATION WITH `<done/>`**: When finished, end with a `<done/>` tag on a new line.\n"
             "4. **SAME-SESSION CONTINUATION**: When executing a sequence, emit the next action's tag in your IMMEDIATE NEXT response.\n"
@@ -1075,6 +1132,18 @@ class LollmsPersonality:
             "2. **One Call Per Task**: Once a tool succeeds, analyze and answer.\n"
             "3. **Loop Prevention**: Repeating a successful tool call with identical parameters is a CRITICAL ERROR.\n"
             "4. **File Outputs**: When a tool returns a file, it's ALREADY saved. Do NOT call it again.\n"
+            "\n=== FILE EDITING PROTOCOL (AIDER SEARCH/REPLACE) ===\n"
+            "For surgical updates to existing files, you MUST use the `<artifact>` tag with SEARCH/REPLACE blocks.\n"
+            "The system automatically applies fuzzy matching and auto-correction if the exact search string isn't found.\n"
+            "Syntax:\n"
+            "<artifact name=\"filename.ext\" type=\"code\" language=\"python\">\n"
+            "<<<<<<< SEARCH\n"
+            "// exact lines to find\n"
+            "=======\n"
+            "// new lines to replace with\n"
+            ">>>>>>> REPLACE\n"
+            "</artifact>\n"
+            "If a patch fails, the system will return the error. You MUST read the error, re-read the file using `tool_read_file`, and correct your SEARCH block.\n"
             "\n=== SKILLS SYSTEM ===\n"
             "Skills are persistent knowledge capsules stored outside the workspace. They survive across sessions.\n"
             "Use `tool_list_skills` to see available skills, and `tool_load_skill` to load their full content.\n"
@@ -1152,9 +1221,8 @@ class LollmsPersonality:
             tool_def = active_tools.get(tool_name, {})
 
             if "callable" in tool_def:
-                import inspect as _inspect
                 call_kwargs = dict(sanitized_params)
-                _tool_sig = _inspect.signature(tool_def["callable"]).parameters
+                _tool_sig = inspect.signature(tool_def["callable"]).parameters
                 if "discussion_instance" in _tool_sig:
                     call_kwargs["discussion_instance"] = getattr(self, '_artefact_proxy', None)
                 if "lollms_client_instance" in _tool_sig:
@@ -1229,6 +1297,23 @@ class LollmsPersonality:
 
         active_tools = self._discover_tools(tools, tool_files or [], code_exec)
         full_system_prompt = self._build_system_prompt(active_tools, code_exec)
+
+        # ── Pre-Turn Memory Hydration ──
+        # Pull relevant memories from the LollmsMemoryManager and inject them into the system prompt
+        # so the LLM can "remember" facts across sessions (e.g., the user's name).
+        if self.memory_manager:
+            try:
+                # Pull deep memories relevant to the current prompt
+                if hasattr(self.memory_manager, 'auto_pull_deep_memories'):
+                    self.memory_manager.auto_pull_deep_memories(prompt)
+
+                # Build the memory context block and append it to the system prompt
+                if hasattr(self.memory_manager, 'build_working_zone'):
+                    mem_zone = self.memory_manager.build_working_zone()
+                    if mem_zone:
+                        full_system_prompt += "\n=== ACTIVE MEMORIES (PERSISTENT ACROSS SESSIONS) ===\n" + mem_zone + "\n=== END MEMORIES ===\n"
+            except Exception as mem_ex:
+                ASCIIColors.warning(f"[{self.name}] Failed to hydrate memories: {mem_ex}")
 
         if use_internal_history:
             base_conversation = list(self._conversation)
@@ -1371,24 +1456,173 @@ class LollmsPersonality:
                     except Exception as e:
                         final_response = f"[Tool execution error: {e}]"
                         break
+            elif ss.artifact_trigger:
+                raw_artifact_xml = ss.get_artifact_xml()
+                if not raw_artifact_xml:
+                    final_response = ss.get_clean_text()
+                    break
+
+                virtual_history.append(SimpleNamespace(sender_type="assistant", content=raw_artifact_xml))
+
+                try:
+                    attrs_match = re.search(r'<art(?:ifact|efact)[^>]*>', raw_artifact_xml, re.IGNORECASE)
+                    attrs_str = attrs_match.group(0) if attrs_match else ""
+                    body_match = re.search(r'<art(?:ifact|efact)[^>]*>(.*)</art(?:ifact|efact)>', raw_artifact_xml, re.DOTALL | re.IGNORECASE)
+                    body_content = body_match.group(1).strip() if body_match else ""
+
+                    title = "artifact"
+                    lang = "python"
+                    for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
+                        if m.group(1).lower() in ("name", "title"):
+                            title = m.group(2)
+                        elif m.group(1).lower() == "language":
+                            lang = m.group(2)
+
+                    if "<<<<<<< SEARCH" in body_content:
+                        if not hasattr(self, '_patch_applier') or not self._patch_applier:
+                            user_part = "[SYSTEM ERROR] Patch applier not initialized. Cannot apply SEARCH/REPLACE."
+                            virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
+                            continue
+
+                        file_path = self._resolved_workspace / title
+                        if not file_path.exists():
+                            user_part = f"[SYSTEM ERROR] File '{title}' not found. Cannot apply patch."
+                            virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
+                            continue
+
+                        original_content = file_path.read_text(encoding="utf-8", errors="ignore")
+                        result = self._patch_applier.apply_aider_patch(original_content, body_content, file_name=title, language=lang)
+
+                        if result.get("success"):
+                            file_path.write_text(result["patched_content"], encoding="utf-8")
+                            user_part = f"✅ SEARCH/REPLACE applied successfully to {title}."
+                            if self._artefact_manager:
+                                self._artefact_manager.update(title=title, new_content=result["patched_content"], language=lang, bump_version=True, active=True)
+                        else:
+                            user_part = f"❌ SEARCH/REPLACE FAILED for {title}.\nError: {result.get('error')}\n\nPlease read the file using tool_read_file and correct your SEARCH block."
+
+                        virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
+                        continue
+                    else:
+                        if self._artefact_manager:
+                            self._artefact_manager.add(title=title, artefact_type="code", content=body_content, language=lang, active=True)
+                        file_path = self._resolved_workspace / title
+                        file_path.write_text(body_content, encoding="utf-8")
+                        user_part = f"✅ File {title} created/updated successfully."
+                        virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
+                        continue
+                except Exception as e:
+                    user_part = f"[SYSTEM ERROR] Failed to process artifact tag: {e}"
+                    virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
+                    continue
             else:
-                final_response = ss.get_clean_text()
+                raw_round_text = ss.get_clean_text()
+                done_match = re.search(r'(?m)^\s*<done\s*/?>\s*$', raw_round_text.strip())
+                if done_match:
+                    final_response = re.sub(r'(?m)^\s*<done\s*/?>\s*$', '', raw_round_text, flags=re.MULTILINE).strip()
+                    break
+
+                # 🛑 CONTINUATION MANDATE (NO <done/>)
+                if len(tool_calls_this_turn) > 0:
+                    ASCIIColors.info("[LollmsPersonality.chat] Tool previously executed but no <done/> detected. Injecting continuation mandate.")
+                    clean_history_text = self._sanitize_history_for_context(raw_round_text)
+                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text))
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content="[SYSTEM: You stopped generation without emitting a <done/> tag. If your task is complete, output a final conversational summary and end it with a <done/> tag on a new line. If you need to continue working, emit the next functional tag now.]"
+                    ))
+                    continue
+
+                # 🛑 INTENT DETECTION (Migrated from LollmsDiscussion)
+                # If the LLM states an intent to use a tool but stops without emitting the tag, force a continuation.
+                intent_pattern = re.compile(r'(let me|now i|next i|i will|i need to|we need to).*(query|get|fetch|build|create|analyze|summarize|aggregate|plot|explore|check|read|list|write|update|fix|run|execute)', re.IGNORECASE)
+                intent_match = intent_pattern.search(raw_round_text)
+                has_intent = False
+                if intent_match:
+                    matched_line = intent_match.group(0)
+                    line_end_idx = raw_round_text.find(matched_line) + len(matched_line)
+                    line_end_char = raw_round_text[line_end_idx] if line_end_idx < len(raw_round_text) else ""
+                    line_start_idx = raw_round_text.rfind('\n', 0, intent_match.start()) + 1
+                    line_start = raw_round_text[line_start_idx:intent_match.start()].strip().lower()
+                    is_question = line_end_char == '?' or line_start.startswith(("would you", "do you", "shall i", "should i", "could you"))
+                    if not is_question:
+                        has_intent = True
+
+                has_tool_tag = "<tool>" in raw_round_text.lower()
+
+                if has_intent and not has_tool_tag and not was_cancelled and round_count < max_reasoning_steps:
+                    ASCIIColors.info(f"[LollmsPersonality.chat] Detected pending tool intent without XML tag. Forcing continuation...")
+
+                    clean_history_text = self._sanitize_history_for_context(raw_round_text)
+                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text))
+
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content="[SYSTEM: CRITICAL. You stopped generation before executing your stated intent. Output the <tool> or <artifact> tag NOW. Do not write any more prose.]"
+                    ))
+
+                    continue
+
+                final_response = raw_round_text
                 break
 
         if use_internal_history and not was_cancelled:
             self._conversation.append({"role": "user", "content": prompt})
             self._conversation.append({"role": "assistant", "content": final_response})
 
+        # ── 12. Memory Post-Processing ──
+        if self.memory_manager:
+            try:
+                if hasattr(self.memory_manager, 'process_llm_output'):
+                    cleaned_response, mem_report = self.memory_manager.process_llm_output(final_response)
+                    if cleaned_response != final_response:
+                        final_response = cleaned_response
+ 
+                # Save episodic memory (interaction history)
+                if hasattr(self.memory_manager, 'add'):
+                    from datetime import datetime
+                    clean_ai = re.sub(r'<[^>]+>', '', final_response).strip()
+                    clean_user = prompt.strip()
+                    if clean_user and clean_ai and len(clean_user) > 5 and len(clean_ai) > 5:
+                        episode = f"Event/Interaction on {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC:\nUser asked: \"{clean_user}\"\nAI responded: \"{clean_ai}\""
+                        self.memory_manager.add(content=episode, importance=0.6, tags=["episode", "interaction"], level=1)
+            except Exception as mem_ex:
+                ASCIIColors.warning(f"[{self.name}] Failed to process memory tags: {mem_ex}")
+
+        # ── 13. Context Health Telemetry ──
+        context_health = {"used_tokens": 0, "max_tokens": 0, "fill_percentage": 0.0}
+        try:
+            if self.lollms_client and hasattr(self.lollms_client, 'get_ctx_size'):
+                max_ctx = self.lollms_client.get_ctx_size() or 0
+                if max_ctx > 0:
+                    total_used = 0
+                    if hasattr(self.lollms_client, 'count_tokens'):
+                        total_used = self.lollms_client.count_tokens(full_system_prompt)
+                        if use_internal_history:
+                            for msg in self._conversation:
+                                total_used += self.lollms_client.count_tokens(msg.get("content", ""))
+                        for vh in virtual_history:
+                            total_used += self.lollms_client.count_tokens(vh.content)
+                        total_used += self.lollms_client.count_tokens(final_response)
+                    context_health = {
+                        "used_tokens": total_used,
+                        "max_tokens": max_ctx,
+                        "fill_percentage": round((total_used / max_ctx) * 100, 1)
+                    }
+        except Exception:
+            pass
+
         self._reset_cancel_state()
 
         return {
-            "response": final_response,
-            "tool_calls": tool_calls_this_turn,
-            "tool_results": tool_results_this_turn,
-            "rounds": round_count,
-            "workspace_changes": workspace_changes,
-            "was_cancelled": was_cancelled
-        }
+           "response": final_response,
+           "tool_calls": tool_calls_this_turn,
+           "tool_results": tool_results_this_turn,
+           "rounds": round_count,
+           "workspace_changes": workspace_changes,
+           "was_cancelled": was_cancelled,
+           "context_health": context_health
+       }
 
 
 # ---------------------------------------------------------------------------
