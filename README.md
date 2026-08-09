@@ -21,8 +21,8 @@ Whether you're connecting to a remote LoLLMs server, an Ollama instance, the Ope
 
 `lollms_client` is not just another API wrapper. It is a highly optimized, production-grade coordination engine built to grant Large Language Models true local and hybrid autonomy.
 
-### 🧠 Biological-Inspired 4-Tier Memory System (Memory Level 1-4)
-*   **Persistent Multi-Level Storage**: Features an advanced, cognitive hierarchical storage system consisting of **Working Memory** (directly injected into prompt space), **Deep Memory** (stubbed as handles to prevent context bloating), **Archived Memory** (historical backup), and **Episodic Memory** (immutable step-by-step trace of interactions).
+### 🧠 Biological-Inspired 5-Tier Memory System (Memory Level 0-4)
+*   **Persistent Multi-Level Storage**: Features an advanced, cognitive hierarchical storage system consisting of **Volatile Scratchpad** (single-turn intermediate reasoning), **Working Memory** (directly injected into prompt space), **Deep Memory** (stubbed as handles to prevent context bloating), **Archived Memory** (historical backup), and **Episodic Memory** (immutable step-by-step trace of interactions).
 *   **Memory Decay & Consolidation**: Memories decay logarithmically over time. Frequently referenced concepts are automatically reinforced.
 *   **AI-Assisted Dreaming (`dream()`)**: During idle cycles, an automated "dream consolidation pass" cleans up old data. Important rules and architecture patterns are maintained, while low-importance noise is forgotten.
 
@@ -724,8 +724,9 @@ The **Handbag** is a self-contained, portable folder that carries ALL of a perso
 
 ```text
 my_handbag/
+├── SOUL.md                   # Primary personality (YAML frontmatter + Markdown body)
 ├── handbag.yaml              # Optional manifest (name, default_personality, skills_mode)
-├── personalities/            # Multiple SOUL.md bundles (The Crew)
+├── coworkers/                # Multi-persona support (Crew Handbag)
 │   ├── researcher/
 │   │   └── SOUL.md
 │   └── coder/
@@ -761,7 +762,7 @@ hb_path = Handbag.create_structure("./my_research_handbag", name="Research Handb
 
 #### Populating the Handbag
 
-*   **Personalities (`personalities/`)**: Create a subdirectory for each persona. Inside each, place a `SOUL.md` file. This forms your **Crew**.
+*   **Personalities (`coworkers/`)**: Create a subdirectory for each persona. Inside each, place a `SOUL.md` file. This forms your **Crew**.
 *   **Tools (`tools/`)**: Place LCP tool scripts (`.py` files) here. All personas in the Handbag share this tool pool.
 *   **Skills (`skills/`)**: Create subdirectories for each skill, each containing a `SKILL.md` file.
 *   **RAG (`rag/`)**: Place text files here. The Handbag automatically indexes them.
@@ -780,7 +781,7 @@ skills_mode: always_visible      # "always_visible", "loadable", or "mixed"
 
 ### 3. The Crew Handbag (Multi-Persona Routing)
 
-A single Handbag can contain multiple `SOUL.md` files (e.g., `personalities/coder/` and `personalities/researcher/`). When loaded, the primary `LollmsPersonality` object acts as a router.
+A single Handbag can contain multiple `SOUL.md` files (e.g., `coworkers/coder/` and `coworkers/researcher/`). When loaded, the primary `LollmsPersonality` object acts as a router.
 
 All crewmates share the **same** Handbag tools, memory, and assets, but they have different system prompts and RAG data sources.
 
@@ -828,7 +829,17 @@ discussion.chat(
 
 ## 🧠 LollmsDiscussion: Cognitive Sessions & Artefacts
 
-`LollmsDiscussion` is a stateful, thread-safe conversational engine that bridges transient LLM tokens and permanent, versioned knowledge storage. It implements the **Agentic State Machine** and the **Dual-Stream Artefact System**.
+`LollmsDiscussion` is a stateful, thread-safe conversational engine that bridges transient LLM tokens and permanent, versioned knowledge storage. It implements the **Agentic State Machine** and the **Dual-Stream Artefact System**. It is composed of nine orthogonal mixins:
+
+1.  **`CoreMixin`**: Lifecycle, ORM proxy, message CRUD, and thread-safe DB commits.
+2.  **`ChatMixin`**: The agentic reasoning loop, tool execution orchestration, and stream parsing.
+3.  **`UtilsMixin`**: Branch management, export normalization, and context token auditing.
+4.  **`PromptMixin`**: System prompt construction and XML tag post-processing.
+5.  **`MemoryMixin`**: Integration with `LollmsMemoryManager` for tiered persistent memory, episodic memory saving, and graph relationship traversal.
+6.  **`FileImportMixin`**: Multi-modal ingestion (PDF, DOCX, Data) and Dual-Stream storage.
+7.  **`InternetImportMixin`**: Web content extraction and quality scoring for internet-based RAG.
+8.  **`ExportMixin`**: Standalone Artefact Archive (`.laa`) and Linked Artefact Bundle (`.lab`) export/import protocols.
+9.  **`BranchMixin`**: Directed Acyclic Graph (DAG) branch discovery, navigation, forking, and merging.
 
 ### The Dual-Stream Artefact System (.lam Protocol)
 
@@ -863,6 +874,92 @@ response = discussion.chat(
 )
 ```
 
+### The `chat()` Method API
+
+The `chat()` method is the primary entry point for the `LollmsDiscussion` session. It orchestrates the entire agentic loop, including pre-hydration, multi-step reasoning, tool execution, and self-healing file restoration.
+
+```python
+def chat(
+    self,
+    user_message: str,
+    personality=None,
+    branch_tip_id=None,
+    tools=None,
+    add_user_message: bool = True,
+    images=None,
+    debug: bool = False,
+    remove_thinking_blocks: bool = True,
+    enable_image_generation: bool = True,
+    enable_image_editing:    bool = True,
+    auto_activate_artefacts: bool = True,
+    enable_inline_widgets:        bool = False,
+    enable_notes:                 bool = True,
+    enable_skills:                bool = True,
+    enable_forms:                 bool = True,
+    enable_books:                 bool = False,
+    enable_presentations:         bool = False,
+    memory_manager=None,
+    enable_artefacts:             bool = True,
+    enable_memory:                bool = True,
+    enable_auto_dream:            bool = True,
+    enable_deep_memory_pulling:   bool = True,
+    prehydrate_rag:               bool = True,
+    max_reasoning_steps:          int = 20,
+    enable_in_message_status:     bool = False,
+    enable_sub_agents:            bool = False,
+    forward_artefact_chunks:      bool = False,
+    fast_artefact_replicas:       Optional[List[str]] = None,
+    tolerance_level:              Optional[str] = "strict",
+    allow_dynamic_tools:          bool = False,
+    enable_data_tools:            bool = True,
+    enable_code_execution:        bool = False,
+    suppress_images:              bool = False,
+    debug_export:                 bool = False,
+    **kwargs
+) -> Dict[str, Any]:
+```
+
+**Key Parameters:**
+
+*   **Core Conversation**: `user_message`, `personality`, `branch_tip_id`, `add_user_message`, `images`, `suppress_images` (set `True` for non-vision LLMs).
+*   **Feature Flags**: `enable_artefacts`, `enable_inline_widgets`, `enable_notes`, `enable_skills`, `enable_forms`, `enable_books`, `enable_presentations`, `enable_image_generation`, `enable_image_editing`.
+*   **Security Gates**: `allow_dynamic_tools` (LLM writes its own tools), `enable_code_execution` (arbitrary Python string execution), `enable_data_tools` (auto-mounts `semantic_data_engineer` if data files exist).
+*   **Memory & RAG**: `memory_manager`, `enable_memory`, `enable_deep_memory_pulling`, `enable_auto_dream`, `prehydrate_rag`.
+*   **Debugging & UI**: `debug`, `debug_export`, `enable_in_message_status`, `remove_thinking_blocks`, `event_mode` (see Event Modes below).
+
+**Return Value:**
+Returns a dictionary containing the complete result of the conversational turn:
+
+```python
+{
+    "user_message": LollmsMessage,  # The user message object
+    "ai_message": LollmsMessage,    # The final AI message object
+    "sources": List[Dict],          # RAG sources retrieved
+    "artefacts": List[Dict],        # Artifacts created/modified this turn
+    "memory_report": Dict,          # Memory operations report
+    "dream_report": Optional[Dict], # Auto-dream consolidation report
+    "was_cancelled": bool           # Cancellation status
+}
+```
+
+### Event Modes & Streaming Protocol
+
+The `chat()` method supports multiple event reporting strategies via the `event_mode` parameter (using the `EventMode` enum from `lollms_client.lollms_types`). This allows host applications to choose between parsing raw text tags or consuming structured callback events.
+
+| Mode | Behavior | Use Case |
+| :--- | :--- | :--- |
+| **`EventMode.PROCESSING_TAG_MODE`** (Default) | Injects `<processing>` tags into the `MSG_TYPE_CHUNK` stream. | Simple text-based UIs, CLIs. |
+| **`EventMode.FULL_CALLBACK_MODE`** | Emits specific `MSG_TYPE_*` events via the callback with structured metadata. No `<processing>` tags in text. | Rich UI applications that render dedicated panels. |
+| **`EventMode.MIXED_MODE`** | Emits both `<processing>` tags and structured `MSG_TYPE_*` events. | Debugging or transitioning applications. |
+| **`EventMode.SILENT_MODE`** | Suppresses all event reporting. Only final text is streamed. | Background tasks. |
+
+**Structured Events in `FULL_CALLBACK_MODE`:**
+*   `MSG_TYPE_TOOL_START`: Meta `{"tool_name": str, "parameters": dict}`
+*   `MSG_TYPE_TOOL_END`: Meta `{"tool_name": str, "success": bool, "output": str, "error": str|None}`
+*   `MSG_TYPE_ARTEFACT_BUILD_START`: Meta `{"title": str, "art_type": str, "language": str|None, "is_patch": bool}`
+*   `MSG_TYPE_ARTEFACT_BUILD_END`: Meta `{"title": str, "art_type": str, "version": int, "success": bool, "error": str|None}`
+*   `MSG_TYPE_CONTEXT_UPDATE`: Meta `{"action": str, "files": list[str], "status": str}`
+
 ### Multi-Source Tool Orchestration (LCP)
 
 The `chat()` method enforces a **Strict Sovereign Opt-In Doctrine**. Tools are ONLY activated if explicitly requested:
@@ -878,6 +975,107 @@ discussion.chat(
     enable_code_execution=True
 )
 ```
+
+**LCP Tool Agnosticism Doctrine:**
+LCP tools are strictly agnostic by default. They must **NEVER** accept `discussion_instance` or `lollms_client_instance` as input parameters (unless explicitly required for advanced patterns like recursive sub-agent spawning). The LCP AST parser filters these internal parameters out when building the JSON schema for the LLM. Tools must rely on CWD for file resolution and communicate results back solely via their return dictionary.
+
+### Cognitive Checkpoint System
+
+To prevent context window bloat and preserve the LLM's cognitive state across turns, the `ChatMixin` implements three core mechanisms:
+
+1.  **Smart Tool Output Offloading**: When a tool returns >1500 tokens, the output is intercepted before entering context. Structured data is replaced with compact markers; unstructured text is saved to a `.log` file and registered as a `TREE_UNLOCKABLE` artifact.
+2.  **Unfinished Intent Interceptor**: If the LLM stops generating before emitting a functional tag but its text matches an intent pattern (e.g., "Let me query..."), the system intercepts and forces a correction round.
+3.  **Cognitive Scratchpad Protocol**: The LLM maintains a `scratchpad.md` artifact for intermediate hypotheses during multi-step analysis, preventing contradictory context accumulation.
+
+### Cancellation & Interrupt Protocol
+
+The `chat()` method implements a **Thread-Safe Cancellation Protocol** using a boolean flag, ensuring long-running loops can be interrupted without database corruption.
+
+```python
+# Start generation in a background thread
+import threading
+def run_chat():
+    response = discussion.chat(user_message="Analyze this 1GB CSV...")
+    print(response["was_cancelled"])
+
+thread = threading.Thread(target=run_chat)
+thread.start()
+
+# User clicks "Stop"
+discussion.cancel_generation()
+
+# Check status
+if discussion.is_generation_cancelled():
+    print("Stopping...")
+
+# The cancel state is automatically reset after chat() returns.
+```
+
+The loop checks the flag at four critical safe points: start of reasoning round, during streaming, post-generation, and tool cleanup. Partial messages are saved with a `"[Generation cancelled by user]"` marker.
+
+### Tool Failure Visibility & Anti-Loop Protocol
+
+The system ensures the LLM **always sees error details** when a tool fails, implementing a three-pronged defense against infinite retry loops:
+
+1.  **Raw Dict Failure Detection**: Checks for `success: False` or non-200 `status_code` before examining sanitized text.
+2.  **Error-Aware Sanitization**: Includes the actual `error` message in the text fed back to the LLM.
+3.  **`FailureMemory` Loop Guard**: A signature-based interceptor (`tool_name::params`). The first failure is recorded and the LLM is allowed to retry. A second identical call is **blocked** and the loop breaks, preventing token waste.
+
+### File Import Modes & Conflict Resolution
+
+The `import_file` method supports 6 ingestion modes: `text`, `text_images`, `images_only`, `ocr`, `data` (Dual-Stream), and `data_bundle` (Schema Fusion).
+
+When importing, 4 conflict resolution strategies are available via `on_conflict`:
+*   `suffix` (default): Renames new file (e.g., `README_1.md`).
+*   `version`: Updates existing artifact and bumps version.
+*   `overwrite`: Replaces content without version bump.
+*   `replace`: Purges all history and creates fresh `v1`.
+
+### Decoupled Artefact Protocols (`.laa` & `.lab`)
+
+Artefacts are fully decoupled from discussions via two standalone archive formats:
+*   **`.laa` (Standalone Artefact Archive)**: Exports a single artefact with its entire version history.
+*   **`.lab` (Linked Artefact Bundle)**: Exports multiple artefacts preserving relative folder structure.
+
+```python
+# Export/Import single artefact
+discussion.artefacts.export_artefact_to_archive("main.py", "main.laa")
+discussion.artefacts.import_artefact_from_archive("main.laa")
+
+# Export/Import bundle
+discussion.artefacts.export_artefact_bundle(["main.py", "index.html"], "app.lab")
+discussion.artefacts.import_artefact_bundle("app.lab")
+```
+
+A **Global Artefact Library** (`data_workspace/standalone_artefacts/`) exists for cross-discussion sharing.
+
+### External Workspace Access
+
+If your host application needs to execute an artifact directly without the LLM loop, use the built-in path getters and sync method:
+
+```python
+import subprocess
+
+script_path = discussion.get_active_file_path("my_script.py")
+ws_data_path = discussion.get_workspace_data_path()
+
+if script_path:
+    result = subprocess.run(
+        ["python", script_path],
+        capture_output=True, text=True,
+        cwd=ws_data_path  # 🛡️ MANDATORY: Set CWD so relative paths resolve!
+    )
+    # Sync new files created by the script back to the artefact system
+    sync_report = discussion.sync_workspace_to_artefacts()
+```
+
+### Interactive Widgets (`<lollms_inline>`)
+
+Widgets are **ephemeral, in-context, interactive educational demonstrations** rendered inside the chat bubble. They are strictly constrained to **600x400px** and are for teaching/visualizing concepts only (not for building apps). The backend passes raw HTML/CSS/JS to the UI via streaming events (`MSG_TYPE_WIDGET_CHUNK`, `MSG_TYPE_WIDGET_DONE`). The host application must render them inside a sandboxed `<iframe>` using the Blob URL protocol.
+
+### Interactive Forms (`<lollms_form>`)
+
+Forms allow the LLM to request structured data from the user mid-generation. When the LLM emits a `<lollms_form>` tag, the system parses it, fires `MSG_TYPE_FORM_READY`, and **pauses the generation loop**. The host application renders the form, collects answers, and calls `discussion.submit_form_response(form_id, answers)` to resume. Supported field types: `text`, `textarea`, `number`, `range`, `select`, `radio`, `checkbox`, `rating`, `section`.
 
 ---
 
@@ -1145,7 +1343,8 @@ print(f"Auto-detected Context Size: {lc.get_ctx_size()}") # Output: 8192 (from h
 
 ### Human-Inspired Multi-Level Memory System
 
-`LollmsDiscussion` incorporates a biological-inspired persistent memory system (`LollmsMemoryManager`) consisting of four hierarchical layers:
+`LollmsDiscussion` incorporates a biological-inspired persistent memory system (`LollmsMemoryManager`) consisting of five hierarchical layers (Levels 0-4):
+- **Level 0 — Volatile Scratchpad**: Appended before the last user prompt for single-turn intermediate reasoning. Cleared after the turn.
 - **Level 1 — Working Memory**: Active, high-importance facts currently in focus. Injected directly into the conversation context. Capped by a token budget; excess memories are automatically demoted to Deep Memory.
 - **Level 2 — Deep Memory**: Long-term memories that have faded due to lack of use. Not injected in full. Instead, compact *handles* (stubs) are displayed in the context so the LLM knows they exist and can call `<mem_load id="XXXXXXXX" />` to load them back to active Working Memory.
 - **Level 3 — Archived Memory**: Extremely old or low-importance memories. Never loaded automatically. Subject to automatic pruning or re-activation during the periodic dream consolidation pass.
@@ -2582,6 +2781,29 @@ To prevent context window exhaustion, the Artefact System enforces a strict visi
 | **TREE_UNLOCKABLE** | `[U]` | Listed in the directory index, but excluded from context. **The default state.** |
 | **TREE_LOCKED** | `[L]` | Excluded from context. The LLM **cannot** unlock this. |
 | **HIDDEN** | — | Completely excluded from both context and the directory tree. |
+
+### State Transition Matrix
+
+The system enforces a strict state machine for artifact visibility. The LLM can trigger transitions using XML tags, while the host application or system orchestrator can trigger transitions via API calls or background processes.
+
+| Current State | Target State | Trigger / Mechanism | Description |
+| :--- | :--- | :--- | :--- |
+| **`[U]` TREE_UNLOCKABLE** | **`[C]` FULL** | `<unlock_file>` tag | LLM requests to load file content into context. |
+| **`[U]` TREE_UNLOCKABLE** | **`[L]` TREE_LOCKED** | `<lock_file>` tag | LLM requests to lock the file. |
+| **`[U]` TREE_UNLOCKABLE** | **`HIDDEN`** | `<hide_file>` tag | LLM removes file from awareness. |
+| **`[C]` FULL** | **`[L]` TREE_LOCKED** | `<lock_file>` tag | LLM requests to lock the file. |
+| **`[C]` FULL** | **`HIDDEN`** | `<hide_file>` tag | LLM removes file from awareness. |
+| **`[L]` TREE_LOCKED** | **`HIDDEN`** | `<hide_file>` tag | LLM removes file from awareness. |
+| **`[M]` METADATA** | **`[C]` FULL** | `<unlock_file>` tag | LLM promotes from metadata to full content. |
+| **`[M]` METADATA** | **`[L]` TREE_LOCKED** | `<lock_file>` tag | LLM requests to lock the file. |
+| **`[M]` METADATA** | **`HIDDEN`** | `<hide_file>` tag | LLM removes file from awareness. |
+| **`HIDDEN`** | **`[C]` FULL** | Host Application API | User or host app explicitly activates the artifact. |
+| **`HIDDEN`** | **`[U]` TREE_UNLOCKABLE** | System Auto-Sync | New file detected on disk or external tool modifies hidden file. |
+| **`[L]` TREE_LOCKED** | **`[C]` FULL** | Host Application API | User or host app explicitly unlocks the file. |
+| **`[C]` FULL** | **`[U]` TREE_UNLOCKABLE** | System Auto-Prune | Context management demotes file to save tokens. |
+| **`[C]` FULL** | **`[M]` METADATA** | System Auto-Prune | Context management demotes to metadata-only. |
+
+> **Note**: The LLM **cannot** unlock a `[L]` (Locked) file. Once locked, it remains locked unless the host application intervenes.
 
 ### LLM Control Tags
 
