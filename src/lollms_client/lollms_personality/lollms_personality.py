@@ -1026,22 +1026,19 @@ class LollmsPersonality:
             if not ws_path or not ws_path.exists():
                 return
 
-            # 1. Load all known files and hashes from SQLite
             conn = _sqlite3.connect(str(self._state_db_path))
             cursor = conn.cursor()
             
-            # Ensure hash column exists
             try:
                 cursor.execute("ALTER TABLE file_states ADD COLUMN hash TEXT")
             except _sqlite3.OperationalError:
-                pass # Column already exists
+                pass 
 
             cursor.execute("SELECT title, visibility, hash FROM file_states")
             db_rows = cursor.fetchall()
             db_files = {row[0]: {"visibility": row[1], "hash": row[2]} for row in db_rows}
             conn.close()
 
-            # 2. Scan current filesystem
             current_files = set()
             all_arts = self._artefact_manager._get_all_raw()
             dirty = False
@@ -1072,11 +1069,8 @@ class LollmsPersonality:
                             rel_path_str = str(item.relative_to(ws_path)).replace("\\", "/")
                             current_files.add(rel_path_str)
 
-                            # Compute hash
                             try:
-                                # Fast hash: use mtime and size for speed, fallback to content hash for small files
                                 stat = item.stat()
-                                # For text files < 1MB, do a content hash. For larger, use stat.
                                 if stat.st_size < 1024 * 1024:
                                     content = item.read_bytes()
                                     file_hash = _hashlib.md5(content).hexdigest()
@@ -1087,23 +1081,19 @@ class LollmsPersonality:
 
                             db_info = db_files.get(rel_path_str)
                             if not db_info:
-                                # New file discovered on disk
                                 dirty = True
                                 if getattr(self, 'debug_mode', False):
                                     ASCIIColors.info(f"[{self.name}] 📄 New file detected: {rel_path_str}")
 
-                                # Add to ArtefactManager
-                                atype = "code" if item.suffix.lower() in _TEXT_EXTS else "document"
                                 self._artefact_manager.add(
                                     title=rel_path_str,
-                                    artefact_type=atype,
+                                    artefact_type="code" if item.suffix.lower() in _TEXT_EXTS else "document",
                                     content="",
                                     active=False,
                                     visibility=ArtefactVisibility.TREE_UNLOCKABLE,
                                     skip_disk_sync=True
                                 )
 
-                                # Persist to DB
                                 conn = _sqlite3.connect(str(self._state_db_path))
                                 cur = conn.cursor()
                                 cur.execute("INSERT OR REPLACE INTO file_states (title, visibility, hash) VALUES (?, ?, ?)", 
@@ -1112,7 +1102,6 @@ class LollmsPersonality:
                                 conn.close()
 
                             elif db_info.get("hash") != file_hash:
-                                # File content changed
                                 dirty = True
                                 if getattr(self, 'debug_mode', False):
                                     ASCIIColors.info(f"[{self.name}] ✏️ File changed: {rel_path_str}")
@@ -1146,7 +1135,7 @@ class LollmsPersonality:
                                         title=rel_path_str,
                                         artefact_type=atype,
                                         content="",
-                                        active=False,
+                                        active=(resolved_vis == ArtefactVisibility.FULL),
                                         visibility=resolved_vis,
                                         skip_disk_sync=True
                                     )
@@ -1156,13 +1145,17 @@ class LollmsPersonality:
                                         cur.execute("UPDATE file_states SET visibility = ? WHERE title = ?", (resolved_vis, rel_path_str))
                                         conn.commit()
                                         conn.close()
+                                else:
+                                    if art.get("visibility") != db_info.get("visibility"):
+                                        dirty = True
+                                        art["visibility"] = db_info.get("visibility")
+                                        art["active"] = (db_info.get("visibility") == ArtefactVisibility.FULL)
 
                 except Exception as dir_err:
                     ASCIIColors.warning(f"[{self.name}] Failed to scan directory {directory}: {dir_err}")
 
             _scan_dir(ws_path)
 
-            # 3. Prune deleted files
             deleted_files = set(db_files.keys()) - current_files
             if deleted_files:
                 dirty = True
@@ -1176,7 +1169,6 @@ class LollmsPersonality:
                 conn.commit()
                 conn.close()
 
-            # Remove from in-memory artefact list if any were deleted
             if deleted_files:
                 surviving_arts = [
                     art for art in all_arts 
@@ -1190,7 +1182,8 @@ class LollmsPersonality:
         except Exception as e:
             if getattr(self, 'debug_mode', False):
                 ASCIIColors.warning(f"[{self.name}] Disk sync/prune failed: {e}")
-            
+                
+                         
     def _refresh_workspace_context_in_prompt(self, current_prompt: str, new_ws_block: str) -> str:
         ws_boundary = "=== WORKSPACE CONTEXT BOUNDARY ==="
         boundary_idx = current_prompt.find(ws_boundary)
@@ -1347,6 +1340,116 @@ JSON:"""
             ASCIIColors.warning(f"[{self.name}] Context cleanup generation failed: {e}")
 
         return user_prompt
+
+    def _calculate_context_telemetry(self, stable_prompt: str, history: List[Dict], ws_ctx: str, virtual_history: List) -> Dict[str, int]:
+        """Calculates token consumption per context segment using the LLM client's tokenizer."""
+        telemetry = {
+            "system_prompt": 0,
+            "history": 0,
+            "workspace_tree": 0,
+            "loaded_contents": 0,
+            "virtual_history": 0,
+            "total": 0
+        }
+        if not self.lollms_client or not hasattr(self.lollms_client, 'count_tokens'):
+            return telemetry
+
+        try:
+            telemetry["system_prompt"] = self.lollms_client.count_tokens(stable_prompt)
+
+            for msg in history:
+                telemetry["history"] += self.lollms_client.count_tokens(msg.get("content", ""))
+
+            if ws_ctx:
+                telemetry["workspace_tree"] = self.lollms_client.count_tokens(ws_ctx)
+
+                if "## Fully Loaded File Contents [C]" in ws_ctx:
+                    parts = ws_ctx.split("## Fully Loaded File Contents [C]", 1)
+                    if len(parts) == 2:
+                        telemetry["loaded_contents"] = self.lollms_client.count_tokens(parts[1])
+                        telemetry["workspace_tree"] = self.lollms_client.count_tokens(parts[0])
+
+            for vh in virtual_history:
+                telemetry["virtual_history"] += self.lollms_client.count_tokens(vh.content)
+
+            telemetry["total"] = sum(telemetry.values())
+        except Exception:
+            pass
+
+        return telemetry
+
+    def _build_telemetry_block(self, telemetry: Dict[str, int]) -> str:
+        """Formats the telemetry dictionary into a readable string for the LLM."""
+        total = telemetry.get("total", 0)
+        if total == 0:
+            return ""
+
+        def _fmt(val):
+            return f"{val:,}"
+
+        lines = [
+            "=== CONTEXT TELEMETRY (LIVE TOKEN BUDGET) ===",
+            f"- System Prompt: {_fmt(telemetry.get('system_prompt', 0))} tokens",
+            f"- Conversation History: {_fmt(telemetry.get('history', 0))} tokens",
+            f"- Workspace Tree: {_fmt(telemetry.get('workspace_tree', 0))} tokens",
+            f"- Loaded File Contents [C]: {_fmt(telemetry.get('loaded_contents', 0))} tokens",
+            f"- Virtual History (Tools/Actions this turn): {_fmt(telemetry.get('virtual_history', 0))} tokens",
+            f"TOTAL CONSUMED: {_fmt(total)} tokens",
+            "If 'History' or 'Virtual History' is too high, consider emitting `<refactor_history></refactor_history>` to compress it.",
+            "=== END CONTEXT TELEMETRY ==="
+        ]
+        return "\n".join(lines)
+
+    def _autonomous_history_refactoring(self, base_conversation: List[Dict[str, str]], streaming_callback: Optional[Callable]) -> List[Dict[str, str]]:
+        """
+        Autonomously summarizes the base_conversation history to free up context space.
+        Replaces verbose multi-turn history with a single dense system message.
+        """
+        if not base_conversation or not self.lollms_client:
+            return base_conversation
+
+        if streaming_callback:
+            compaction_msg = '\n<processing type="history_refactoring" title="Autonomous History Refactoring">\n* 🧹 Refactoring conversation history to free up context space...\n</processing>\n'
+            try:
+                streaming_callback(compaction_msg, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            except Exception:
+                pass
+
+        history_text = "\n\n".join([f"[{msg.get('role', 'user').upper()}]: {msg.get('content', '')}" for msg in base_conversation])
+
+        summary_prompt = (
+            "You are a history refactoring engine. Summarize the following conversation history into a dense, factual summary.\n"
+            "Focus on retaining: user goals, key decisions, file names created/modified, and final conclusions.\n"
+            "Discard: conversational pleasantries, intermediate reasoning steps, and verbose tool outputs.\n"
+            "Output ONLY the summary paragraph, no conversational filler.\n\n"
+            f"=== HISTORY TO COMPACT ===\n{history_text}\n=== END HISTORY ==="
+        )
+
+        try:
+            summary = self.lollms_client.generate_text(
+                prompt=summary_prompt,
+                temperature=0.1,
+                n_predict=1024
+            )
+            if not isinstance(summary, str) or not summary.strip():
+                return base_conversation
+
+            compacted_history = [{
+                "role": "system",
+                "content": f"[SYSTEM: AUTONOMOUS HISTORY REFACTORING]\nThe previous conversation has been summarized to save context. Use this summary as your working history:\n\n{summary.strip()}"
+            }]
+
+            if streaming_callback:
+                success_msg = f'\n<processing type="history_refactoring" title="Autonomous History Refactoring">\n* ✅ History refactored successfully. Context freed.\n</processing>\n'
+                try:
+                    streaming_callback(success_msg, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                except Exception:
+                    pass
+
+            return compacted_history
+        except Exception as e:
+            ASCIIColors.warning(f"[{self.name}] History refactoring failed: {e}")
+            return base_conversation
 
     def _compact_virtual_history(self, virtual_history: List, streaming_callback: Optional[Callable]) -> List:
         """
@@ -1644,6 +1747,39 @@ JSON:"""
             "=== END PROFILE ===\n"
         )
 
+    def _execute_scratchpad_clear(self) -> str:
+        """Clears the persistent scratchpad back to its default empty state."""
+        if not getattr(self, '_scratchpad_path', None):
+            return "[SYSTEM ERROR] Scratchpad not initialized."
+
+        try:
+            default_content = "# Agent Persistent Scratchpad\n\nUse this space to store critical state, file lists, and architectural decisions.\n"
+            self._scratchpad_path.write_text(default_content, encoding="utf-8")
+            return "✅ Scratchpad cleared successfully."
+        except Exception as e:
+            return f"[SYSTEM ERROR] Failed to clear scratchpad: {e}"
+
+    def _execute_user_profile_clear(self) -> str:
+        """Clears the global user profile back to its default template."""
+        if not getattr(self, '_user_profile_path', None):
+            return "[SYSTEM ERROR] User profile not initialized."
+
+        try:
+            default_content = (
+                "# 👤 Global User Profile\n"
+                "This file contains universal information about the user. It is loaded into the agent's context at the start of every session.\n"
+                "The agent can update this file using `<user_profile_update>` tags.\n"
+                "CRITICAL: Do not store project-specific information here. Use the workspace scratchpad for project state.\n\n"
+                "## Identity\n- Name: \n- Occupation: \n\n"
+                "## Global Constraints & Preferences\n- \n\n"
+                "## Frequently Used Tools & Workflows\n- \n"
+            )
+            self._user_profile_path.write_text(default_content, encoding="utf-8")
+            object.__setattr__(self, '_user_profile_content', default_content)
+            return "✅ Global user profile cleared successfully."
+        except Exception as e:
+            return f"[SYSTEM ERROR] Failed to clear user profile: {e}"
+
     def _execute_scratchpad_update(self, tag_name: str, body: str) -> str:
         """Executes append or patch operations on the scratchpad file."""
         if not getattr(self, '_scratchpad_path', None):
@@ -1722,6 +1858,21 @@ JSON:"""
             "If `tool_spawn_sub_agent` is available, you can delegate complex sub-tasks to a focused child agent.\n"
             "The child shares your workspace but cannot spawn further sub-agents.\n"
             "Use this for heavy tasks like writing large scripts, researching topics, or designing presentations.\n"
+            "\n=== OPERATIONAL SAFETY & STATE MANAGEMENT DOCTRINE (CRITICAL) ===\n"
+            "1. **GIT BRANCHING PROTOCOL**: Before modifying any existing file, you MUST create a new git branch (e.g., `git checkout -b fix/login-bug`).\n"
+            "   Work exclusively in this branch. Only merge back to `main` after all tests pass.\n"
+            "2. **DANGEROUS OPERATIONS (HUMAN-IN-THE-LOOP)**: Operations that are destructive or irreversible REQUIRE explicit user confirmation.\n"
+            "   Examples: `git push --force`, `rm -rf`, dropping database tables, modifying system configs.\n"
+            "   Before executing such a command via a tool, you MUST output a message like:\n"
+            "   \"⚠️ DANGER: I am about to run `git push --force`. This will overwrite remote history. Do you approve? (yes/no)\"\n"
+            "   Wait for the user's response before emitting the tool tag.\n"
+            "3. **AUTONOMOUS DEBUGGING LOOPS**: Fixing failing tests, resolving merge conflicts, and iterating on code during a debug cycle is EXEMPT from the confirmation rule.\n"
+            "   If tests fail, autonomously read the logs, fix the code, and re-run tests until they pass. Do NOT ask the user for help.\n"
+            "4. **STATE & MEMORY SEGREGATION**:\n"
+            "   - **Scratchpad**: Use `<scratchpad_append>` for SHORT-TERM, SENSITIVE data (e.g., temporary file paths, session tokens, intermediate calculations). Clear it when the task is done using `<scratchpad_clear></scratchpad_clear>`.\n"
+            "   - **Memory**: Use `<mem_new>` for LONG-TERM project facts, architectural decisions, and learned methodologies.\n"
+            "   - **User Profile**: ALWAYS study the user's coding style, naming conventions, and preferences. If you discover a universal preference (e.g., 'The user prefers 4-space indentation'), update the profile using `<user_profile_update>`. You can clear the profile using `<user_profile_clear></user_profile_clear>`.\n"
+            "=== END OPERATIONAL SAFETY DOCTRINE ===\n"
             "\n=== THINKING & REASONING CONSTRAINT ===\n"
             "If you output thoughts enclosed in  tags, you MUST output all functional XML tags AFTER the closing tag.\n"
             "\n=== TOOL CALLING DISCIPLINE (CRITICAL) ===\n"
@@ -1763,6 +1914,7 @@ JSON:"""
             "   1. `<scratchpad_append>content to add</scratchpad_append>`\n"
             "   2. `<scratchpad_patch>` with Aider SEARCH/REPLACE blocks to surgically update sections.\n"
             "4. **Active Memories**: Relevant memories hydrated from your persistent database.\n"
+            "5. **Context Telemetry**: A live breakdown of token consumption per segment (System, History, Tree, Contents, Virtual History).\n"
             "\n**CONTEXT VISIBILITY OPERATIONS**\n"
             "To manage your context budget, you can emit the following tags:\n"
             "- `<unlock_file>filename.py</unlock_file>`: Loads a file into your context (changes [U] to [C]).\n"
@@ -1776,6 +1928,12 @@ JSON:"""
             "    file2.py,\n"
             "    file3.py\n"
             "  </unlock_file>\n"
+            "\n**AUTONOMOUS HISTORY REFACTORING**\n"
+            "If the Context Telemetry indicates that `History` or `Virtual History` is consuming an excessive amount of tokens (e.g., > 40% of total context),\n"
+            "or if the user explicitly asks to refactor, summarize, or compress the conversation history, you MUST emit:\n"
+            "<refactor_history></refactor_history>\n"
+            "This will trigger an autonomous background process that summarizes the older conversation history into a dense, factual block,\n"
+            "freeing up massive amounts of context space without losing critical state.\n"
         )
 
         memory_instructions = ""
@@ -1840,7 +1998,6 @@ JSON:"""
             if xml_bodies:
                 clean_body = "\n".join(xml_bodies)
 
-        # Split by newlines, commas, or semicolons to support batch operations
         raw_targets = re.split(r'[\n,;]+', clean_body)
         targets = [t.strip().replace("\\", "/") for t in raw_targets if t.strip()]
 
@@ -1853,7 +2010,6 @@ JSON:"""
         all_arts = self._artefact_manager._get_all_raw()
 
         for t_target in targets:
-            # Handle folder operations
             if tag_name in ("collapse_folder", "uncollapse_folder"):
                 folder_prefix = t_target.rstrip('/') + '/'
                 matched_arts = [a for a in all_arts if a.get("physical_path", "").replace("\\", "/").startswith(folder_prefix)]
@@ -1875,8 +2031,6 @@ JSON:"""
                         processed_files.append(art["title"])
                 continue
 
-            # Handle individual file operations
-            # First, try exact match, then fallback to fuzzy match
             art = self._artefact_manager.get(t_target)
             if not art:
                 best_match = self._artefact_manager._find_best_title_match(t_target, [a["title"] for a in all_arts])
@@ -1889,7 +2043,6 @@ JSON:"""
             elif art.get("visibility") == target_visibility:
                 already_in_state.append(t_target)
             elif target_visibility == ArtefactVisibility.FULL:
-                # Use the artefact's title to construct the path to ensure consistency
                 file_path = self._resolved_workspace / art["title"]
                 token_count = 0
                 content = ""
@@ -1921,7 +2074,6 @@ JSON:"""
                 processed_files.append(art["title"])
 
         try:
-            # Persist to SQLite state DB
             if hasattr(self, '_state_db_path') and hasattr(self, '_artefact_manager'):
                 import sqlite3 as _sqlite3
                 conn = _sqlite3.connect(str(self._state_db_path))
@@ -1952,6 +2104,23 @@ JSON:"""
                 f"Use a tool (SQL query, grep, or Python script) to extract "
                 f"specific data from this file instead of loading it fully."
             )
+
+        # ── AGGREGATE CONTEXT STATE REPORT ──
+        active_files_list = []
+        if hasattr(self, '_artefact_manager') and self._artefact_manager:
+            current_arts = self._artefact_manager._get_all_raw()
+            active_files_list = [
+                a.get("title", "") for a in current_arts
+                if a.get("visibility") == ArtefactVisibility.FULL
+                and not a.get("title", "").endswith("::images")
+            ]
+        
+        if active_files_list:
+            status_parts.append("\n📂 Currently Loaded in Context [C]:")
+            for f_name in sorted(active_files_list):
+                status_parts.append(f"  - {f_name}")
+        else:
+            status_parts.append("\n📂 No files are currently loaded in context.")
 
         status_meta = "failure" if (not_found and not processed_files) or blocked_files else "success"
 
@@ -2061,6 +2230,7 @@ JSON:"""
             raise RuntimeError(f"[{self.name}] Independent chat requires a lollms_client instance.")
 
         self._reset_cancel_state()
+        object.__setattr__(self, '_consecutive_empty_responses', 0)
 
         if self._sub_agent_spawner:
             self._sub_agent_spawner.reset_turn()
@@ -2120,12 +2290,17 @@ JSON:"""
             except Exception as mem_ex:
                 ASCIIColors.warning(f"[{self.name}] Failed to hydrate memories: {mem_ex}")
 
-        dynamic_suffix = "\n\n".join(dynamic_suffix_parts)
-
         if use_internal_history:
             base_conversation = list(self._conversation)
         else:
             base_conversation = []
+
+        telemetry = self._calculate_context_telemetry(stable_system_prompt, base_conversation, ws_ctx or "", [])
+        telemetry_block = self._build_telemetry_block(telemetry)
+        if telemetry_block:
+            dynamic_suffix_parts.append(telemetry_block)
+
+        dynamic_suffix = "\n\n".join(dynamic_suffix_parts)
 
         # Fuse the dynamic suffix with the user's prompt for Round 1
         if dynamic_suffix:
@@ -2151,6 +2326,9 @@ JSON:"""
                 break
 
             round_count += 1
+
+            if getattr(self, 'debug_mode', False):
+                ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} START ===")
 
             if hasattr(self.lollms_client, 'llm') and hasattr(self.lollms_client.llm, 'reset_cancel'):
                 try:
@@ -2271,6 +2449,8 @@ JSON:"""
             if ss.was_done_detected():
                 final_response = ss.get_clean_text()
                 final_response = re.sub(r'(?m)^\s*<done\s*/?>', '', final_response, flags=re.IGNORECASE).strip()
+                if getattr(self, 'debug_mode', False):
+                    ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: <done/> detected ===")
                 break
 
             if ss.tool_trigger:
@@ -2289,12 +2469,18 @@ JSON:"""
                             virtual_history.append(SimpleNamespace(sender_type="user", content=f"Tool '{tool_name}' not available. Use one of: {list(active_tools.keys())}"))
                             continue
 
-                        param_sig = json.dumps(tool_params, sort_keys=True, default=str)
-                        context_aware_sig = f"{tool_name}::{param_sig}"
+                        is_shell_tool = tool_name == "tool_execute_shell_command"
+                        if is_shell_tool:
+                            command_str = str(tool_params.get("command", "")).strip()
+                            context_aware_sig = f"{tool_name}::{command_str}"
+                        else:
+                            param_sig = json.dumps(tool_params, sort_keys=True, default=str)
+                            context_aware_sig = f"{tool_name}::{param_sig}"
+
                         if context_aware_sig in successful_tool_signatures:
                             virtual_history.append(SimpleNamespace(
                                 sender_type="user",
-                                content=f"Repetitive call to '{tool_name}' blocked. Output already in context. Finish with <done/>."
+                                content=f"Repetitive call to '{tool_name}' with identical parameters blocked. Output already in context. If you need to run a different command, do so now; otherwise finish with <done/>."
                             ))
                             continue
 
@@ -2355,7 +2541,24 @@ JSON:"""
                         continue
                     except Exception as e:
                         final_response = f"[Tool execution error: {e}]"
+                        if getattr(self, 'debug_mode', False):
+                            ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Tool execution error ===")
                         break
+            elif ss.was_refactor_triggered():
+                ASCIIColors.info(f"[{self.name}] 🧹 [Refactor Trigger] History refactoring requested by LLM.")
+                raw_round_text = ss.get_clean_text()
+                virtual_history.append(SimpleNamespace(sender_type="assistant", content=raw_round_text if raw_round_text.strip() else "[Assistant requested history refactoring]"))
+
+                base_conversation = self._autonomous_history_refactoring(base_conversation, streaming_callback)
+
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content="[SYSTEM: History refactoring complete. The conversation history has been compressed. Please continue your task or emit <done/> if finished.]"
+                ))
+                if getattr(self, 'debug_mode', False):
+                    ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Refactor triggered ===")
+                continue
+
             elif ss.context_trigger or (ss.was_action_dispatched() and ("<unlock_file" in ss.get_clean_text().lower() or "<collapse_folder" in ss.get_clean_text().lower() or "<scratchpad_" in ss.get_clean_text().lower())):
                 raw_round_text = ss.get_clean_text()
                 tag_xml = ss.get_context_tag_xml() or ""
@@ -2365,7 +2568,7 @@ JSON:"""
                 def _extract_robust_tags(text: str) -> list:
                     tags = []
                     pattern = re.compile(
-                        r'(<(unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|user_profile_update)\b[^>]*?/?>)',
+                        r'(<(unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|user_profile_update|user_profile_clear)\b[^>]*?/?>)',
                         re.IGNORECASE
                     )
                     for m in pattern.finditer(text):
@@ -2431,7 +2634,17 @@ JSON:"""
                         tag_name = tag_tuple[1].lower()
                         body_content = tag_tuple[2]
 
-                        ASCIIColors.info(f"[{self.name}] 🔓 [Context Trigger] Executing tag: {tag_name} with body: {body_content[:50]}...")
+                        ASCIIColors.info(f"[{self.name}] 🔓 [Context Trigger] Executing tag: {tag_name} with body: {body_content[:50]}......")
+
+                        if tag_name == "scratchpad_clear":
+                            user_part = self._execute_scratchpad_clear()
+                            virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
+                            continue
+
+                        if tag_name == "user_profile_clear":
+                            user_part = self._execute_user_profile_clear()
+                            virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
+                            continue
 
                         if "scratchpad" in tag_name:
                             user_part = self._execute_scratchpad_update(tag_name, body_content)
@@ -2504,7 +2717,7 @@ JSON:"""
                         else:
                             virtual_history.append(SimpleNamespace(
                                 sender_type="user",
-                                content="[SYSTEM: Context visibility operations applied, but no new file contents were loaded. The files may have been locked, hidden, or already in the target state. Do not emit <unlock_file> again. Acknowledge the user and emit <done/>.]"
+                                content="[SYSTEM: Context visibility operations applied successfully. The workspace index has been updated. NOTE: Due to KV-Cache optimization, historical messages are not rewritten. The file content may still appear in older messages, but it has been logically removed from your active context and will NOT appear in future turns. Do NOT emit the lock/unlock tag again. Acknowledge the user and emit <done/>.]"
                             ))
                     elif already_loaded_intercept:
                         virtual_history.append(SimpleNamespace(
@@ -2615,16 +2828,34 @@ JSON:"""
                         sender_type="user",
                         content="[SYSTEM: Context has been compacted. Please continue your task based on the summarized history. If you were finished, output your final answer and <done/>.]"
                     ))
+                    if getattr(self, 'debug_mode', False):
+                        ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Context compaction triggered ===")
                     continue
 
                 if len(tool_calls_this_turn) > 0 or getattr(ss, 'context_trigger', False) or getattr(ss, 'artifact_trigger', False):
+                    if not raw_round_text.strip():
+                        empty_response_count = getattr(self, '_consecutive_empty_responses', 0) + 1
+                        object.__setattr__(self, '_consecutive_empty_responses', empty_response_count)
+
+                        if empty_response_count >= 2:
+                            ASCIIColors.warning(f"[{self.name}] Consecutive empty LLM responses detected ({empty_response_count}). Terminating loop to prevent spin.")
+                            final_response = "[Terminated: LLM stopped generating without completing the task.]"
+                            break
+
+                        ASCIIColors.warning(f"[{self.name}] Empty LLM response detected after action (attempt {empty_response_count}). Injecting continuation mandate.")
+                    else:
+                        object.__setattr__(self, '_consecutive_empty_responses', 0)
+
                     ASCIIColors.info("[LollmsPersonality.chat] Action previously executed but no <done/> detected. Injecting continuation mandate.")
+
                     clean_history_text = self._sanitize_history_for_context(raw_round_text)
-                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text))
+                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant provided no output]"))
                     virtual_history.append(SimpleNamespace(
                         sender_type="user",
                         content="[SYSTEM: You stopped generation without emitting a <done/> tag. If your task is complete, output a final conversational summary and end it with a <done/> tag on a new line. If you need to continue working, emit the next functional tag now.]"
                     ))
+                    if getattr(self, 'debug_mode', False):
+                        ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: No <done/> detected, injecting continuation mandate ===")
                     continue
 
                 if "<tool" in raw_round_text.lower() or "<art" in raw_round_text.lower():
@@ -2639,8 +2870,12 @@ JSON:"""
                             "Output the corrected tag NOW.]"
                         )
                     ))
+                    if getattr(self, 'debug_mode', False):
+                        ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Malformed tag detected, injecting format correction ===")
                     continue
 
+                if getattr(self, 'debug_mode', False):
+                    ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Clean exit ===")
                 break
 
         if use_internal_history and not was_cancelled:

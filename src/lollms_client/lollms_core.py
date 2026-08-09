@@ -980,8 +980,10 @@ class LollmsClient():
                 self._ctx_size_cache[cache_key] = 32000
                 return 32000
             except Exception:
-                self._ctx_size_cache[cache_key] = 32000
-                return 4096
+                if cache_key not in self._ctx_size_cache:
+                    self._ctx_size_cache[cache_key] = 32000
+                    return 32000
+                return self._ctx_size_cache[cache_key]
         return 4096
 
     def list_models(self):

@@ -57,7 +57,7 @@ def tool_execute_shell_command(
                     timeout=120
                 )
             else:
-                safe_commands = ["dir", "echo", "type", "cd", "pip", "python", "git", "ls", "pwd", "cat", "head", "tail"]
+                safe_commands = ["dir", "echo", "type", "cd", "pip", "python", "git", "git diff", "git status", "git log", "git add", "git commit", "git push", "ls", "pwd", "cat", "head", "tail"]
                 if not any(command.lower().strip().startswith(cmd) for cmd in safe_commands):
                     return {
                         "success": False,

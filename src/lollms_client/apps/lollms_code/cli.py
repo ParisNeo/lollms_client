@@ -166,6 +166,12 @@ You have access to the `tool_execute_shell_command` tool. This is your PRIMARY a
 4. **PACKAGE MANAGEMENT**: If a package is missing, use `pip install package_name`.
 5. **TESTING**: Run tests using `python -m pytest` or `python -m unittest`.
 
+### GIT OPERATIONS (HIGH-EFFICIENCY PROTOCOL)
+When asked to "commit", "push", or perform any git operation, you MUST follow this 2-round protocol:
+- **Round 1**: Run `git diff` (or `git diff --stat` for large changes) to inspect what changed. DO NOT unlock or load any files into context.
+- **Round 2**: Run `git add -A && git commit -m "message"` with a meaningful message based on the diff. Then emit `<done/>`.
+You are STRICTLY FORBIDDEN from using `<unlock_file>` before a git commit. The diff output is sufficient to write a commit message.
+
 ### SAFETY
 - The host application controls the autonomy level of the shell tool.
 - If a command is blocked because it requires elevated privileges, inform the user that they need to adjust the `system_shell` configuration in the host application settings.
@@ -1153,84 +1159,174 @@ def _prompt_with_history(history: PersistentHistory) -> Optional[str]:
     """
     Custom prompt that intercepts Up/Down arrows to navigate history.
     Returns the selected string, or None if the user cancels (Ctrl+C/D).
+    Uses built-in `msvcrt` (Windows) or `termios` (Unix) for raw key capture.
     """
+    import sys
+
+    def _native_prompt_unix(prompt_text: str) -> Optional[str]:
+        import termios
+        import tty
+        
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        buffer = ""
+        cursor_pos = 0
+        history_idx = len(history.entries)
+        current_input = ""
+
+        def _redraw():
+            sys.stdout.write(f"\r\033[K{prompt_text}{buffer}")
+            if cursor_pos < len(buffer):
+                sys.stdout.write(f"\033[{len(prompt_text) + cursor_pos + 1}G")
+            sys.stdout.flush()
+
+        try:
+            tty.setraw(fd)
+            sys.stdout.write(prompt_text)
+            sys.stdout.flush()
+
+            while True:
+                ch = sys.stdin.read(1)
+                
+                if ch == '\x03':  # Ctrl+C
+                    sys.stdout.write("\n")
+                    return None
+                elif ch == '\x04':  # Ctrl+D
+                    sys.stdout.write("\n")
+                    return None
+                elif ch in ('\r', '\n'):  # Enter
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    return buffer
+                elif ch in ('\x7f', '\b'):  # Backspace
+                    if cursor_pos > 0:
+                        buffer = buffer[:cursor_pos-1] + buffer[cursor_pos:]
+                        cursor_pos -= 1
+                        _redraw()
+                elif ch == '\x1b':  # Escape sequence (Arrows)
+                    ch2 = sys.stdin.read(1)
+                    ch3 = sys.stdin.read(1)
+                    if ch2 == '[':
+                        if ch3 == 'A':  # Up
+                            if history.entries:
+                                if history_idx == len(history.entries):
+                                    current_input = buffer
+                                history_idx = max(0, history_idx - 1)
+                                buffer = history.entries[history_idx]
+                                cursor_pos = len(buffer)
+                                _redraw()
+                        elif ch3 == 'B':  # Down
+                            if history_idx < len(history.entries):
+                                history_idx += 1
+                                if history_idx == len(history.entries):
+                                    buffer = current_input
+                                else:
+                                    buffer = history.entries[history_idx]
+                                cursor_pos = len(buffer)
+                                _redraw()
+                        elif ch3 == 'C':  # Right
+                            if cursor_pos < len(buffer):
+                                cursor_pos += 1
+                                sys.stdout.write("\033[C")
+                                sys.stdout.flush()
+                        elif ch3 == 'D':  # Left
+                            if cursor_pos > 0:
+                                cursor_pos -= 1
+                                sys.stdout.write("\033[D")
+                                sys.stdout.flush()
+                elif len(ch) == 1 and ch.isprintable():
+                    buffer = buffer[:cursor_pos] + ch + buffer[cursor_pos:]
+                    cursor_pos += 1
+                    _redraw()
+        except Exception:
+            return None
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    def _native_prompt_windows(prompt_text: str) -> Optional[str]:
+        import msvcrt
+        
+        buffer = ""
+        cursor_pos = 0
+        history_idx = len(history.entries)
+        current_input = ""
+
+        def _redraw():
+            sys.stdout.write(f"\r\033[K{prompt_text}{buffer}")
+            if cursor_pos < len(buffer):
+                sys.stdout.write(f"\033[{len(prompt_text) + cursor_pos + 1}G")
+            sys.stdout.flush()
+
+        sys.stdout.write(prompt_text)
+        sys.stdout.flush()
+
+        while True:
+            if not msvcrt.kbhit():
+                continue
+                
+            ch = msvcrt.getwch()
+            
+            if ch in ('\x03', '\x1b'):  # Ctrl+C or Esc
+                sys.stdout.write("\n")
+                return None
+            elif ch in ('\r', '\n'):  # Enter
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return buffer
+            elif ch in ('\x08', '\x7f'):  # Backspace
+                if cursor_pos > 0:
+                    buffer = buffer[:cursor_pos-1] + buffer[cursor_pos:]
+                    cursor_pos -= 1
+                    _redraw()
+            elif ch == '\x00' or ch == '\xe0':  # Special key prefix
+                ch2 = msvcrt.getwch()
+                
+                if ch2 == 'H':  # Up arrow
+                    if history.entries:
+                        if history_idx == len(history.entries):
+                            current_input = buffer
+                        history_idx = max(0, history_idx - 1)
+                        buffer = history.entries[history_idx]
+                        cursor_pos = len(buffer)
+                        _redraw()
+                elif ch2 == 'P':  # Down arrow
+                    if history_idx < len(history.entries):
+                        history_idx += 1
+                        if history_idx == len(history.entries):
+                            buffer = current_input
+                        else:
+                            buffer = history.entries[history_idx]
+                        cursor_pos = len(buffer)
+                        _redraw()
+                elif ch2 == 'M':  # Right arrow
+                    if cursor_pos < len(buffer):
+                        cursor_pos += 1
+                        sys.stdout.write("\033[C")
+                        sys.stdout.flush()
+                elif ch2 == 'K':  # Left arrow
+                    if cursor_pos > 0:
+                        cursor_pos -= 1
+                        sys.stdout.write("\033[D")
+                        sys.stdout.flush()
+            elif ch.isprintable():
+                buffer = buffer[:cursor_pos] + ch + buffer[cursor_pos:]
+                cursor_pos += 1
+                _redraw()
+
     try:
-        import readchar
-    except ImportError:
+        if sys.platform == 'win32':
+            return _native_prompt_windows("👤 You> ")
+        else:
+            return _native_prompt_unix("👤 You> ")
+    except (KeyboardInterrupt, EOFError):
+        sys.stdout.write("\n")
+        return None
+    except Exception:
         try:
             return input("👤 You> ")
         except (EOFError, KeyboardInterrupt):
             sys.stdout.write("\n")
             return None
-
-    prompt_text = "👤 You> "
-    sys.stdout.write(prompt_text)
-    sys.stdout.flush()
-
-    buffer = ""
-    cursor_pos = 0
-    history_idx = len(history.entries)
-    current_input = ""
-
-    while True:
-        try:
-            key = readchar.readkey()
-        except (KeyboardInterrupt, EOFError):
-            sys.stdout.write("\n")
-            return None
-
-        if key == readchar.key.CTRL_C:
-            sys.stdout.write("\n")
-            return None
-        elif key == readchar.key.ENTER:
-            sys.stdout.write("\n")
-            return buffer
-        elif key == readchar.key.UP:
-            if history.entries:
-                if history_idx == len(history.entries):
-                    current_input = buffer
-                history_idx = max(0, history_idx - 1)
-                buffer = history.entries[history_idx]
-                cursor_pos = len(buffer)
-                
-                sys.stdout.write(f"\r\033[K{prompt_text}{buffer}")
-                sys.stdout.flush()
-        elif key == readchar.key.DOWN:
-            if history_idx < len(history.entries):
-                history_idx += 1
-                if history_idx == len(history.entries):
-                    buffer = current_input
-                else:
-                    buffer = history.entries[history_idx]
-                cursor_pos = len(buffer)
-                
-                sys.stdout.write(f"\r\033[K{prompt_text}{buffer}")
-                sys.stdout.flush()
-        elif key == readchar.key.BACKSPACE:
-            if cursor_pos > 0:
-                buffer = buffer[:cursor_pos-1] + buffer[cursor_pos:]
-                cursor_pos -= 1
-                sys.stdout.write(f"\r\033[K{prompt_text}{buffer}")
-                sys.stdout.write(f"\033[{len(prompt_text) + cursor_pos + 1}G")
-                sys.stdout.flush()
-        elif key == readchar.key.LEFT:
-            if cursor_pos > 0:
-                cursor_pos -= 1
-                sys.stdout.write(f"\033[D")
-                sys.stdout.flush()
-        elif key == readchar.key.RIGHT:
-            if cursor_pos < len(buffer):
-                cursor_pos += 1
-                sys.stdout.write(f"\033[C")
-                sys.stdout.flush()
-        else:
-            if len(key) == 1 and key.isprintable():
-                buffer = buffer[:cursor_pos] + key + buffer[cursor_pos:]
-                cursor_pos += 1
-                sys.stdout.write(f"\r\033[K{prompt_text}{buffer}")
-                sys.stdout.write(f"\033[{len(prompt_text) + cursor_pos + 1}G")
-                sys.stdout.flush()
-
 
 def run_interactive(personality: LollmsPersonality, client: LollmsClient, config: CodeAgentConfig) -> int:
     if config.debug:

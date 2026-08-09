@@ -242,7 +242,8 @@ class _AgentStreamState:
         self._is_accumulating_context = False
         self._context_tag_name = ""
         self.context_trigger = False        
-        
+        self.refactor_trigger = False
+
         self._tool_buffer = ""
         self._pending_buffer = ""
 
@@ -420,6 +421,23 @@ class _AgentStreamState:
                     return False
                 return True
 
+            refactor_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<refactor_history\b', self._pending_buffer, re.IGNORECASE)
+            if refactor_match:
+                tag_start_idx = refactor_match.start()
+                text_before = self._pending_buffer[:tag_start_idx]
+                if text_before:
+                    self.content += text_before
+                    self._cb(text_before)
+
+                self._is_accumulating_context = True
+                self._context_tag_name = "refactor_history"
+                self._tool_buffer = self._pending_buffer[tag_start_idx:]
+                self._pending_buffer = ""
+
+                if self._try_complete_context_tag():
+                    return False
+                return True
+
             context_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<(unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch)\b', self._pending_buffer, re.IGNORECASE)
             if context_match:
                 tag_start_idx = context_match.start()
@@ -437,9 +455,9 @@ class _AgentStreamState:
                 if self._try_complete_context_tag():
                     return False
                 return True
-            
+
         def _ends_with_partial_tag(buffer: str) -> int:
-            tags_to_check = ["<tool", "<done", "<artifact", "<artefact", "<unlock_file", "<lock_file", "<hide_file"]
+            tags_to_check = ["<tool", "<done", "<artifact", "<artefact", "<unlock_file", "<lock_file", "<hide_file", "<refactor_history"]
             for tag in tags_to_check:
                 for i in range(1, len(tag)):
                     if buffer.endswith(tag[:i]):
@@ -453,7 +471,7 @@ class _AgentStreamState:
             return -1
 
         def _ends_with_partial_tag_anywhere(buffer: str) -> int:
-            tags_to_check = ["<tool", "<done", "<artifact", "<artefact", "<unlock_file", "<lock_file", "<hide_file"]
+            tags_to_check = ["<tool", "<done", "<artifact", "<artefact", "<unlock_file", "<lock_file", "<hide_file", "<refactor_history"]
             for tag in tags_to_check:
                 for i in range(1, len(tag)):
                     if buffer.endswith(tag[:i]):
@@ -474,7 +492,7 @@ class _AgentStreamState:
             return True
 
         def _ends_with_partial_folder_tag(buffer: str) -> int:
-            tags_to_check = ["<collapse_folder", "<uncollapse_folder", "<scratchpad_append", "<scratchpad_patch", "<user_profile_update"]
+            tags_to_check = ["<collapse_folder", "<uncollapse_folder", "<scratchpad_append", "<scratchpad_patch", "<user_profile_update", "<refactor_history"]
             for tag in tags_to_check:
                 for i in range(1, len(tag)):
                     if buffer.endswith(tag[:i]):
@@ -590,6 +608,14 @@ class _AgentStreamState:
         self._is_accumulating_context = False
         remaining = self._tool_buffer[end_idx + end_len:]
 
+        if self._context_tag_name == "refactor_history":
+            self.refactor_trigger = True
+            self._action_dispatched = True
+            self._tool_buffer = ""
+            if remaining.strip():
+                self._pending_buffer = remaining + self._pending_buffer
+            return True
+
         if not hasattr(self, '_context_tags_buffer'):
             self._context_tags_buffer = ""
         self._context_tags_buffer += full_tag_call + "\n"
@@ -603,6 +629,9 @@ class _AgentStreamState:
             if re.search(r'(?m)^\s*(?!`)(?!.*\|)<(unlock_file|lock_file|hide_file)\b', remaining, re.IGNORECASE):
                 return False
         return True
+
+    def was_refactor_triggered(self) -> bool:
+        return self.refactor_trigger
 
     def get_context_tag_xml(self) -> Optional[str]:
         if not self.context_trigger:
@@ -684,12 +713,18 @@ class _AgentStreamState:
             if not self._try_complete_context_tag():
                 full_tag_call = self._tool_buffer
                 self._is_accumulating_context = False
-                
+
+                if self._context_tag_name == "refactor_history":
+                    self.refactor_trigger = True
+                    self._action_dispatched = True
+                    self._tool_buffer = ""
+                    return
+
                 if not hasattr(self, '_context_tags_buffer'):
                     self._context_tags_buffer = ""
                 self._context_tags_buffer += full_tag_call + "\n"
                 self._tool_buffer = ""
-                
+
                 self.context_trigger = True
                 self._action_dispatched = True
             return
