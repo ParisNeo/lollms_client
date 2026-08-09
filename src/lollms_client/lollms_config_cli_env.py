@@ -3,6 +3,7 @@ lollms_config_cli_env.py
 ========================
 Interactive configuration wizard for Lollms Client.
 Scans available LLM bindings and writes a standardized .env file.
+Uses ascii_colors.Menu for native, flicker-free UI rendering.
 """
 import os
 import json
@@ -10,7 +11,6 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
 from ascii_colors import ASCIIColors, Menu
-from ascii_colors import questionary
 
 def resolve_env_file(cli_env_path: Optional[str] = None) -> Tuple[Optional[Path], bool]:
     if cli_env_path:
@@ -101,6 +101,54 @@ def _convert_value(raw: str, param_type: str) -> Any:
     else:
         return raw
 
+def _format_env_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+def _safe_input(prompt: str, default: str = "") -> str:
+    """Standard input fallback with default value."""
+    try:
+        val = input(f"{prompt} [{default}]: ").strip()
+        return val if val else default
+    except EOFError:
+        return default
+
+def _safe_select(prompt: str, choices: List[str]) -> Optional[str]:
+    """Native Menu-based selection with input() fallback."""
+    try:
+        menu = Menu(prompt, mode=Menu.MODE_RETURN)
+        menu.set_intro(f"Use arrow keys to navigate. Select an option and press Enter.")
+        for choice in choices:
+            menu.add_choice(choice, value=choice)
+        result = menu.run()
+        return result
+    except Exception:
+        ASCIIColors.yellow(f"\n(Fallback mode) {prompt}")
+        for i, choice in enumerate(choices):
+            ASCIIColors.cyan(f"  {i+1}. {choice}")
+        raw = _safe_input("Enter number", "1")
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(choices):
+                return choices[idx]
+        except ValueError:
+            pass
+        return None
+
+def _safe_confirm(prompt: str, default: bool = False) -> bool:
+    """Native Menu-based confirmation with input() fallback."""
+    try:
+        menu = Menu(prompt, mode=Menu.MODE_RETURN)
+        menu.set_intro("Select Yes or No.")
+        menu.add_choice("Yes", value=True)
+        menu.add_choice("No", value=False)
+        result = menu.run()
+        return result if result is not None else default
+    except Exception:
+        raw = _safe_input(f"{prompt} (y/n)", "y" if default else "n")
+        return raw.lower().startswith("y")
+
 def _prompt_param(name: str, desc: str, ptype: str, mandatory: bool, default: Any) -> Any:
     ASCIIColors.rich_print(f"\n[bold cyan]── {name} ──[/bold cyan]")
     if desc:
@@ -111,31 +159,16 @@ def _prompt_param(name: str, desc: str, ptype: str, mandatory: bool, default: An
     ASCIIColors.rich_print(f"Type: [yellow]{ptype}[/yellow] {mandatory_str}")
 
     if ptype == "bool":
-        answer = questionary.confirm(f"Enter yes/no:", default=default).ask()
-        if answer is None:
-            return default
+        answer = _safe_confirm("Enter yes/no:", default if isinstance(default, bool) else False)
         return answer
     else:
-        if default is not None and default != "":
-            answer = questionary.text(f"Enter value [{default}]:").ask()
-            if answer is None:
-                return default
-            if not answer.strip():
-                return default
-            return _convert_value(answer, ptype)
-        else:
-            answer = questionary.text(f"Enter value:").ask()
-            if answer is None:
-                answer = ""
-            if not answer.strip() and mandatory:
-                ASCIIColors.red("  ⚠ This parameter is required. Please enter a value.")
-                return _prompt_param(name, desc, ptype, mandatory, default)
-            return _convert_value(answer, ptype)
-
-def _format_env_value(value: Any) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    return str(value)
+        default_str = str(default) if default is not None and default != "" else ""
+        answer = _safe_input("Enter value", default_str)
+        
+        if not answer.strip() and mandatory:
+            ASCIIColors.red("  ⚠ This parameter is required. Please enter a value.")
+            return _prompt_param(name, desc, ptype, mandatory, default)
+        return _convert_value(answer, ptype)
 
 def _fetch_available_models(binding_type: str, binding_name: str, config_map: Dict[str, str]) -> List[str]:
     try:
@@ -250,56 +283,60 @@ def _get_profile_keys(binding_type: str, alias: str, config_map: Dict[str, str])
 
 def _edit_binding_keys_menu(binding_type: str, alias: str, config_map: Dict[str, str]):
     while True:
-        menu = Menu(f"Edit {binding_type.upper()} Binding: {alias}", mode='execute')
-        
         keys = _get_binding_keys(binding_type, alias, config_map)
         if not keys:
             ASCIIColors.yellow(f"\n  No configuration keys found for binding '{alias}'.")
             return
 
+        menu = Menu(f"Edit {binding_type.upper()} Binding: {alias}", mode=Menu.MODE_EXECUTE)
+        menu.set_intro("Select a key to edit or go back.")
+        
         for k, v in keys.items():
             display_val = v if len(v) <= 40 else v[:37] + "..."
             menu.add_action(f"Edit {k}: {display_val}", lambda k=k: _edit_single_key(binding_type, "BINDINGS", alias, k, config_map))
             
         menu.add_action("➕ Add custom key", lambda: _add_custom_key(binding_type, "BINDINGS", alias, config_map))
-        menu.add_action("⏎ Back to Bindings List", lambda: None)
-        menu.run()
+        result = menu.run()
+        if result is None:
+            break
 
 def _edit_profile_keys_menu(binding_type: str, alias: str, config_map: Dict[str, str]):
     while True:
-        menu = Menu(f"Edit {binding_type.upper()} Profile: {alias}", mode='execute')
-        
         keys = _get_profile_keys(binding_type, alias, config_map)
         if not keys:
             ASCIIColors.yellow(f"\n  No configuration keys found for profile '{alias}'.")
             return
 
+        menu = Menu(f"Edit {binding_type.upper()} Profile: {alias}", mode=Menu.MODE_EXECUTE)
+        menu.set_intro("Select a key to edit or go back.")
+        
         for k, v in keys.items():
             display_val = v if len(v) <= 40 else v[:37] + "..."
             menu.add_action(f"Edit {k}: {display_val}", lambda k=k: _edit_single_key(binding_type, "PROFILES", alias, k, config_map))
             
         menu.add_action("➕ Add custom key", lambda: _add_custom_key(binding_type, "PROFILES", alias, config_map))
-        menu.add_action("⏎ Back to Profiles List", lambda: None)
-        menu.run()
+        result = menu.run()
+        if result is None:
+            break
 
 def _edit_single_key(binding_type: str, category: str, alias: str, key_name: str, config_map: Dict[str, str]):
     full_key = f"{binding_type.upper()}_{category}_{alias}_{key_name}"
     current_val = config_map.get(full_key, "")
     
     ASCIIColors.cyan(f"\nEditing key: {key_name}")
-    new_val = questionary.text(f"Enter new value:", default=current_val).ask()
+    new_val = _safe_input("Enter new value", current_val)
     
     if new_val is not None:
         config_map[full_key] = new_val
         ASCIIColors.green(f"  ✓ Updated {key_name}")
 
 def _add_custom_key(binding_type: str, category: str, alias: str, config_map: Dict[str, str]):
-    new_key = questionary.text("Enter the name of the new key (e.g., SERVICE_KEY):").ask()
+    new_key = _safe_input("Enter the name of the new key (e.g., SERVICE_KEY)", "")
     if not new_key:
         return
     
     new_key = new_key.strip().upper()
-    new_val = questionary.text(f"Enter value for {new_key}:").ask()
+    new_val = _safe_input(f"Enter value for {new_key}", "")
     
     if new_val is not None:
         full_key = f"{binding_type.upper()}_{category}_{alias}_{new_key}"
@@ -308,7 +345,8 @@ def _add_custom_key(binding_type: str, category: str, alias: str, config_map: Di
 
 def _bindings_menu(binding_type: str, config_map: Dict[str, str]):
     while True:
-        menu = Menu(f"{binding_type.upper()} Bindings Configuration", mode='execute')
+        menu = Menu(f"{binding_type.upper()} Bindings Configuration", mode=Menu.MODE_EXECUTE)
+        menu.set_intro("Add a new binding or edit an existing one.")
         menu.add_action("Add new binding", lambda: _add_binding_flow(binding_type, config_map))
         
         configured = _get_configured_aliases(binding_type, config_map, "BINDINGS")
@@ -317,8 +355,9 @@ def _bindings_menu(binding_type: str, config_map: Dict[str, str]):
             b_name = keys.get("BINDING_NAME", "unknown")
             menu.add_action(f"Edit binding: {alias} ({b_name})", lambda a=alias: _edit_binding_keys_menu(binding_type, a, config_map))
             
-        menu.add_action("⏎ Back to Modality Menu", lambda: None)
-        menu.run()
+        result = menu.run()
+        if result is None:
+            break
 
 def _add_binding_flow(binding_type: str, config_map: Dict[str, str], edit_alias: Optional[str] = None):
     bindings = _list_bindings_by_type(binding_type)
@@ -326,16 +365,13 @@ def _add_binding_flow(binding_type: str, config_map: Dict[str, str], edit_alias:
         ASCIIColors.yellow(f"\n  ⚠️ No {binding_type.upper()} bindings found.")
         return
 
-    selected = questionary.select(
-        f"Select a {binding_type.upper()} binding to configure:",
-        choices=bindings
-    ).ask()
+    selected = _safe_select(f"Select a {binding_type.upper()} binding to configure:", bindings)
 
     if not selected:
         return
 
     default_alias = edit_alias if edit_alias else "master"
-    alias = questionary.text(f"Enter an alias for this binding:", default=default_alias).ask()
+    alias = _safe_input("Enter an alias for this binding", default_alias)
     if not alias:
         return
     
@@ -350,10 +386,10 @@ def _configure_profile_instance(binding_type: str, alias: str, config_map: Dict[
         ASCIIColors.yellow(f"\n  ⚠️ No {binding_type.upper()} bindings configured. Please add a binding first.")
         return
 
-    selected_binding_alias = questionary.select(
+    selected_binding_alias = _safe_select(
         f"Select binding for profile '{alias}':",
-        choices=configured
-    ).ask()
+        configured
+    )
 
     if not selected_binding_alias:
         return
@@ -369,47 +405,47 @@ def _configure_profile_instance(binding_type: str, alias: str, config_map: Dict[
             available_models = _fetch_available_models(binding_type, binding_name, binding_config_map)
 
         if available_models:
-            model_choice = questionary.select(
+            model_choice = _safe_select(
                 f"Select {binding_type.upper()} Model for '{alias}':",
-                choices=available_models
-            ).ask()
+                available_models
+            )
             if model_choice:
                 config_map[profile_prefix + "MODEL_NAME"] = model_choice
         else:
             ASCIIColors.yellow(f"  ⚠️ Could not fetch models automatically for {binding_name}.")
-            p_model_name = questionary.text("Enter model name manually:").ask()
+            p_model_name = _safe_input("Enter model name manually", "")
             if p_model_name:
                 config_map[profile_prefix + "MODEL_NAME"] = p_model_name
 
-    is_default = questionary.confirm(f"Make '{alias}' the default profile?", default=(alias == "master")).ask()
+    is_default = _safe_confirm(f"Make '{alias}' the default profile?", default=(alias == "master"))
     if is_default:
         config_map[profile_prefix + "IS_DEFAULT"] = "true"
 
     if binding_type == "llm":
-        vision_enabled = questionary.confirm(f"Does profile '{alias}' support vision?", default=False).ask()
+        vision_enabled = _safe_confirm(f"Does profile '{alias}' support vision?", default=False)
         if vision_enabled:
             config_map[profile_prefix + "VISION_ENABLED"] = "true"
 
-        forced_ctx = questionary.text("Force context size? (leave blank for auto)", default="").ask()
+        forced_ctx = _safe_input("Force context size? (leave blank for auto)", "")
         if forced_ctx.strip():
             config_map[profile_prefix + "FORCED_CONTEXT_SIZE"] = forced_ctx.strip()
 
         ASCIIColors.rich_print("\n[bold magenta]── Smart Router Metadata ──[/bold magenta]")
         ASCIIColors.rich_print("[dim]Used by the 'smart_router' binding to route prompts intelligently.[/dim]")
         
-        r_desc = questionary.text("Routing description (keywords for this model):", default="").ask()
+        r_desc = _safe_input("Routing description (keywords for this model)", "")
         if r_desc:
             config_map[profile_prefix + "ROUTING_DESCRIPTION"] = r_desc
             
-        r_cost = questionary.text("Cost per 1k tokens (0.0 for local):", default="0.0").ask()
+        r_cost = _safe_input("Cost per 1k tokens (0.0 for local)", "0.0")
         if r_cost:
             config_map[profile_prefix + "ROUTING_COST"] = r_cost
             
-        r_latency = questionary.text("Average latency (ms):", default="100").ask()
+        r_latency = _safe_input("Average latency (ms)", "100")
         if r_latency:
             config_map[profile_prefix + "ROUTING_LATENCY"] = r_latency
             
-        r_complexity = questionary.select("Complexity tier (1=simple, 3=complex):", choices=["1", "2", "3"]).ask()
+        r_complexity = _safe_select("Complexity tier (1=simple, 3=complex)", ["1", "2", "3"])
         if r_complexity:
             config_map[profile_prefix + "ROUTING_COMPLEXITY"] = r_complexity
 
@@ -417,7 +453,8 @@ def _configure_profile_instance(binding_type: str, alias: str, config_map: Dict[
 
 def _profiles_menu(binding_type: str, config_map: Dict[str, str]):
     while True:
-        menu = Menu(f"{binding_type.upper()} Profiles Configuration", mode='execute')
+        menu = Menu(f"{binding_type.upper()} Profiles Configuration", mode=Menu.MODE_EXECUTE)
+        menu.set_intro("Add a new profile or edit an existing one.")
         menu.add_action("Add new profile", lambda: _add_profile_flow(binding_type, config_map))
         
         configured = _get_configured_aliases(binding_type, config_map, "PROFILES")
@@ -427,12 +464,13 @@ def _profiles_menu(binding_type: str, config_map: Dict[str, str]):
             m_name = keys.get("MODEL_NAME", "unknown")
             menu.add_action(f"Edit profile: {alias} ({b_alias}/{m_name})", lambda a=alias: _edit_profile_keys_menu(binding_type, a, config_map))
             
-        menu.add_action("⏎ Back to Modality Menu", lambda: None)
-        menu.run()
+        result = menu.run()
+        if result is None:
+            break
 
 def _add_profile_flow(binding_type: str, config_map: Dict[str, str], edit_alias: Optional[str] = None):
     default_alias = edit_alias if edit_alias else "master"
-    alias = questionary.text(f"Enter alias for the profile:", default=default_alias).ask()
+    alias = _safe_input("Enter alias for the profile", default_alias)
     if not alias:
         return
     alias = alias.strip().upper()
@@ -440,11 +478,33 @@ def _add_profile_flow(binding_type: str, config_map: Dict[str, str], edit_alias:
 
 def _modality_menu(binding_type: str, config_map: Dict[str, str]):
     while True:
-        menu = Menu(f"{binding_type.upper()} Configuration", mode='execute')
+        menu = Menu(f"{binding_type.upper()} Configuration", mode=Menu.MODE_EXECUTE)
+        menu.set_intro(f"Configure {binding_type.upper()} Bindings and Profiles.")
         menu.add_action(f"Configure {binding_type.upper()} Bindings", lambda: _bindings_menu(binding_type, config_map))
         menu.add_action(f"Configure {binding_type.upper()} Profiles", lambda: _profiles_menu(binding_type, config_map))
-        menu.add_action("⏎ Back to Main Menu", lambda: None)
-        menu.run()
+        result = menu.run()
+        if result is None:
+            break
+
+def _load_existing_env_to_map() -> Dict[str, str]:
+    """Loads the active .env file into a config_map dictionary."""
+    env_path, _ = resolve_env_file()
+    config_map = {}
+
+    if not env_path or not env_path.exists():
+        return config_map
+
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    config_map[key.strip()] = value.strip().strip("'\"")
+    except Exception as e:
+        ASCIIColors.warning(f"Failed to load existing .env for wizard: {e}")
+
+    return config_map
 
 def _save_and_validate(config_map: Dict[str, str]):
     ASCIIColors.rule("[bold cyan]Validating Connections[/bold cyan]")
@@ -507,10 +567,13 @@ def run_wizard_and_save():
         border_style="magenta"
     )
 
-    config_map = {}
+    config_map = _load_existing_env_to_map()
+    if config_map:
+        ASCIIColors.green(f"✅ Loaded existing configuration from .env file.")
 
     while True:
-        menu = Menu("Lollms Client Main Menu", mode='execute')
+        menu = Menu("Lollms Client Main Menu", mode=Menu.MODE_EXECUTE)
+        menu.set_intro("Select a modality to configure or save and exit.")
         
         def _llm(): _modality_menu("llm", config_map)
         def _tti(): _modality_menu("tti", config_map)
@@ -527,7 +590,6 @@ def run_wizard_and_save():
         menu.add_action("🎵 Configure TTM", _ttm)
         menu.add_action("🎬 Configure TTV", _ttv)
         menu.add_action("💾 Save & Validate", _save)
-        menu.add_action("🚪 Exit", lambda: None)
         
         choice = menu.run()
         if choice is None:
@@ -659,36 +721,30 @@ def _extract_profiles_from_env(prefix: str, bindings: Dict[str, Dict[str, Any]])
     resolved_profiles = {}
     for p_alias, p_data in profiles.items():
         b_alias = p_data.get("binding_alias")
-        if b_alias and b_alias in bindings:
-            b_info = bindings[b_alias]
-            resolved_profiles[p_alias] = {
-                "binding_name": b_info.get("binding_name"),
-                "binding_config": {
-                    **b_info.get("binding_config", {}),
-                    "model_name": p_data.get("model_name", b_info.get("binding_config", {}).get("model_name", ""))
-                },
-                "is_default": p_data.get("is_default", False),
-                "vision_enabled": p_data.get("vision_enabled", False),
-                "forced_context_size": p_data.get("forced_context_size"),
-                "routing_profile": p_data.get("routing_profile", {})
-            }
-        elif b_alias is None and "binding_name" in p_data:
-            binding_config = {}
-            for k, v in p_data.items():
-                if k not in _RESERVED_PROFILE_KEYS:
-                    binding_config[k] = v
-            
-            if "model_name" in p_data:
-                binding_config["model_name"] = p_data["model_name"]
+        b_info = bindings.get(b_alias, {}) if b_alias else {}
 
-            resolved_profiles[p_alias] = {
-                "binding_name": p_data.get("binding_name"),
-                "binding_config": binding_config,
-                "is_default": p_data.get("is_default", False),
-                "vision_enabled": p_data.get("vision_enabled", False),
-                "forced_context_size": p_data.get("forced_context_size"),
-                "routing_profile": p_data.get("routing_profile", {})
-            }
+        binding_name = p_data.get("binding_name") or b_info.get("binding_name")
+        if not binding_name:
+            continue
+
+        base_binding_config = b_info.get("binding_config", {})
+        profile_binding_config = {
+            k: v for k, v in p_data.items() 
+            if k not in _RESERVED_PROFILE_KEYS
+        }
+
+        resolved_binding_config = {**base_binding_config, **profile_binding_config}
+        if "model_name" in p_data:
+            resolved_binding_config["model_name"] = p_data["model_name"]
+
+        resolved_profiles[p_alias] = {
+            "binding_name": binding_name,
+            "binding_config": resolved_binding_config,
+            "is_default": p_data.get("is_default", False),
+            "vision_enabled": p_data.get("vision_enabled", False),
+            "forced_context_size": p_data.get("forced_context_size"),
+            "routing_profile": p_data.get("routing_profile", {})
+        }
 
     return resolved_profiles
 
@@ -744,24 +800,30 @@ def get_client_from_env(
         prefix = b_type.upper() + "_"
         binding_name = os.getenv(prefix + "BINDING_NAME")
 
+        bindings = _extract_bindings_from_env(prefix)
+        profiles = _extract_profiles_from_env(prefix, bindings)
+        if profiles:
+            kwargs[f"{b_type}_profiles"] = profiles
+
         if not binding_name:
             if b_type == "llm":
-                if run_wizard_if_fail:
-                    ASCIIColors.yellow(f"⚠️ Missing {prefix}BINDING_NAME. Starting wizard...")
-                    try:
-                        run_wizard_and_save()
-                        home_env = Path.home() / ".lollms-client" / ".env"
-                        if home_env.exists():
-                            load_env_file(home_env)
-                            binding_name = os.getenv(prefix + "BINDING_NAME")
-                            if not binding_name:
-                                raise ValueError(f"Wizard completed but {prefix}BINDING_NAME is still missing.")
-                        else:
-                            raise ValueError("Wizard did not generate a configuration file.")
-                    except Exception as e:
-                        raise ValueError(f"Configuration wizard failed: {e}")
-                else:
-                    raise ValueError(f"Configuration is incomplete. Missing {prefix}BINDING_NAME.")
+                if not profiles:
+                    if run_wizard_if_fail:
+                        ASCIIColors.yellow(f"⚠️ Missing {prefix}BINDING_NAME. Starting wizard...")
+                        try:
+                            run_wizard_and_save()
+                            home_env = Path.home() / ".lollms-client" / ".env"
+                            if home_env.exists():
+                                load_env_file(home_env)
+                                binding_name = os.getenv(prefix + "BINDING_NAME")
+                                if not binding_name:
+                                    raise ValueError(f"Wizard completed but {prefix}BINDING_NAME is still missing.")
+                            else:
+                                raise ValueError("Wizard did not generate a configuration file.")
+                        except Exception as e:
+                            raise ValueError(f"Configuration wizard failed: {e}")
+                    else:
+                        raise ValueError(f"Configuration is incomplete. Missing {prefix}BINDING_NAME.")
             else:
                 continue
 
@@ -801,8 +863,12 @@ def get_client_from_env(
                         else:
                             binding_config[config_key] = val
 
-        kwargs[f"{b_type}_binding_name"] = binding_name
-        kwargs[f"{b_type}_binding_config"] = binding_config
+        if binding_name:
+            kwargs[f"{b_type}_binding_name"] = binding_name
+            kwargs[f"{b_type}_binding_config"] = binding_config
+        elif not profiles:
+            kwargs[f"{b_type}_binding_name"] = binding_name
+            kwargs[f"{b_type}_binding_config"] = binding_config
 
     return LollmsClient(**kwargs)
 

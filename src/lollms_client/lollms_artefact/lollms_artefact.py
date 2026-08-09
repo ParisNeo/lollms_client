@@ -19,6 +19,7 @@ class ArtefactVisibility:
     HIDDEN          = "hidden"           # Level 0: Invisible to LLM
     TREE_LOCKED     = "tree_locked"      # Level 1: In tree, cannot be unlocked
     TREE_UNLOCKABLE = "tree_unlockable"  # Level 2: In tree, can be unlocked by LLM
+    FOLDER_COLLAPSED= "folder_collapsed" # Level 2.5: Hidden because parent folder is collapsed
     METADATA        = "metadata"         # Level 3: Visible with schema/signatures only
     FULL            = "full"             # Level 4: Fully loaded in context
 
@@ -77,7 +78,7 @@ def sanitize_artifact_filename(title: str) -> str:
     """
     Sanitizes an artifact title into a valid cross-platform filename.
 
-    Strips URL schemes, replaces all invalid Windows/POSIX filename characters
+    Replaces all invalid Windows/POSIX filename characters
     (:, /, \\, ?, *, ", <, >, |) with underscores, and truncates to 200 chars.
 
     The DB title is preserved as-is for LLM context; only the physical
@@ -92,8 +93,6 @@ def sanitize_artifact_filename(title: str) -> str:
     clean = _re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', clean)
     # Collapse multiple consecutive underscores
     clean = _re.sub(r'_+', '_', clean)
-    # Strip leading/trailing underscores, dots, and spaces
-    clean = clean.strip('._ ')
     # Truncate to safe length (leave room for extension)
     if len(clean) > 200:
         clean = clean[:200]
@@ -182,13 +181,9 @@ def _extract_file_metadata_and_signature(art: Dict[str, Any]) -> str:
     title = art["title"]
     lang = art.get("language")
 
-    size_chars = len(content)
-    line_count = len(content.splitlines())
-
     summary = [
-        f"### [Partial Metadata] {title}",
-        f"- Format Type: {atype.upper()} {f'({lang})' if lang else ''}",
-        f"- Size: {size_chars:,} characters | {line_count:,} lines"
+        f"### {title}",
+        f"- Type: {atype.upper()} {f'({lang})' if lang else ''}"
     ]
 
     if atype == ArtefactType.DATA:
@@ -582,6 +577,7 @@ class ArtefactManager:
         physical_data:     Optional[bytes] = None,
         logical_content:   Optional[str] = None,
         create_new_version: bool = True,
+        skip_disk_sync:    bool = False,
         **extra_data
     ) -> Dict[str, Any]:
         title = self._sanitize_path_segments(title)
@@ -731,7 +727,7 @@ class ArtefactManager:
         artefacts.append(new_artefact)
         self._save_all(artefacts)
 
-        if resolved_visibility != ArtefactVisibility.HIDDEN:
+        if resolved_visibility != ArtefactVisibility.HIDDEN and not skip_disk_sync:
             self._sync_to_disk_workspace(
                 title, content, version, artefact_type, language, file_ext,
                 physical_data=physical_data, physical_path=physical_path,
@@ -1675,6 +1671,7 @@ class ArtefactManager:
         visible_artifacts = [
             a for a in all_raw 
             if a.get("visibility", ArtefactVisibility.HIDDEN) != ArtefactVisibility.HIDDEN 
+            and a.get("visibility", ArtefactVisibility.HIDDEN) != ArtefactVisibility.FOLDER_COLLAPSED
             and not a.get("title", "").endswith("::images")
         ]
 
@@ -1683,40 +1680,43 @@ class ArtefactManager:
 
         tree_lines = ["  workspace/"]
         root_node = {"files": [], "folders": {}}
-    
+
         for a in visible_artifacts:
             display_path = a.get("physical_path") or a["title"]
             if a.get("type") == "data" and a.get("file_ext"):
                 if not display_path.lower().endswith(a["file_ext"].lower()):
                     display_path = f"{display_path}{a['file_ext']}"
- 
+
             parts = display_path.split("/")
             curr = root_node
             for i in range(len(parts) - 1):
                  folder = parts[i]
                  curr = curr["folders"].setdefault(folder, {"files": [], "folders": {}})
             curr["files"].append({**a, "display_path": display_path})
- 
+
         def _traverse_tree_prompt(node, depth=1):
             lines = []
             indent = "  " * depth
             for f_name, f_node in sorted(node["folders"].items()):
-                lines.append(f"{indent}├── {f_name}/")
-                lines.extend(_traverse_tree_prompt(f_node, depth + 1))
-            for a in sorted(node["files"], key=lambda x: x.get("title", "")):
+                # Check if all children in this folder are collapsed. If so, hide them.
+                all_collapsed = all(
+                    c.get("visibility") == ArtefactVisibility.FOLDER_COLLAPSED 
+                    for c in (f_node["files"] + [fc for sub_f in f_node["folders"].values() for fc in sub_f["files"]])
+                )
+                if all_collapsed and (f_node["files"] or f_node["folders"]):
+                    lines.append(f"{indent}├── {f_name}/ [X]")
+                else:
+                    lines.append(f"{indent}├── {f_name}/")
+                    lines.extend(_traverse_tree_prompt(f_node, depth + 1))
+
+            for a in sorted(node["files"], key=lambda x: x.get("physical_path", x.get("title", ""))):
                 v_tier = a.get("visibility", ArtefactVisibility.FULL)
-                status = a.get("status", ArtefactStatus.STABLE).upper()
                 marker = "[L]"
                 if v_tier == ArtefactVisibility.FULL: marker = "[C]"
                 elif v_tier == ArtefactVisibility.METADATA: marker = "[M]"
                 elif v_tier == ArtefactVisibility.TREE_UNLOCKABLE: marker = "[U]"
                 f_name = a.get("display_path", a.get("title", "")).split("/")[-1]
-                atype = a.get("type", "document")
-                if atype == ArtefactType.DATA:
-                    lines.append(f"{indent}├── {f_name}  {marker}  ({status})")
-                else:
-                    version = a.get("version", 1)
-                    lines.append(f"{indent}├── {f_name}  {marker}  v{version} ({status})")
+                lines.append(f"{indent}├── {f_name}  {marker}")
             return lines
 
         tree_lines.extend(_traverse_tree_prompt(root_node))
@@ -1729,12 +1729,11 @@ class ArtefactManager:
             v_tier = item.get("visibility", ArtefactVisibility.FULL)
             atype = item.get("type", ArtefactType.DOCUMENT)
             lang = item.get("language")
-            fence = f"```{lang}" if lang else "```"
 
-            display_title = item["title"]
+            display_path = item.get("physical_path") or item["title"]
             if atype == ArtefactType.DATA and item.get("file_ext"):
-                if not display_title.lower().endswith(item["file_ext"].lower()):
-                    display_title = f"{display_title}{item['file_ext']}"
+                if not display_path.lower().endswith(item["file_ext"].lower()):
+                    display_path = f"{display_path}{item['file_ext']}"
 
             if v_tier == ArtefactVisibility.FULL:
                 if item.get("type") == ArtefactType.DATA:
@@ -1755,7 +1754,7 @@ class ArtefactManager:
                     content_text = content_text[:_MAX_FULL_CONTENT_CHARS]
                     was_truncated = True
 
-                header = f"### [Full File: '{display_path}']"
+                header = f'<file path="{display_path}">'
                 if was_truncated:
                     header += f"\n⚠️ **CONTEXT BUDGET LIMIT**: File truncated to {_MAX_FULL_CONTENT_CHARS:,} chars (original: {original_size:,}). Use a tool to access the full content."
 
@@ -1764,16 +1763,13 @@ class ArtefactManager:
                 if display_path in deactivated_contents:
                     seq_summaries = getattr(self._discussion, "sequential_summaries", {})
                     summary_text = seq_summaries.get(display_path, "Detailed summary not available.")
-                    full_visible_parts.append(f"{header}\n[SEQUENTIAL COMPRESSED DATA DUE TO BUDGET CONSTRAINTS]:\n{summary_text}")
+                    full_visible_parts.append(f"{header}\n[SEQUENTIAL COMPRESSED DATA DUE TO BUDGET CONSTRAINTS]:\n{summary_text}\n</file>")
                 else:
                     if atype == ArtefactType.DATA:
-                        schema_desc = content_text
-                        schema_desc = f"**FILENAME FOR TOOLS:** `{display_path}`\n\n{schema_desc}"
-                        full_visible_parts.append(f"{header}\n{schema_desc}")
-                    elif atype == ArtefactType.CODE or (lang and not _ARTEFACT_IMAGE_TAG_RE.search(content_text)):
-                        full_visible_parts.append(f"{header}\n{fence}\n{content_text}\n```")
+                        schema_desc = f"**FILENAME FOR TOOLS:** `{display_path}`\n\n{content_text}"
+                        full_visible_parts.append(f"{header}\n{schema_desc}\n</file>")
                     else:
-                        full_visible_parts.append(f"{header}\n{content_text}")
+                        full_visible_parts.append(f"{header}\n{content_text}\n</file>")
 
             elif v_tier == ArtefactVisibility.METADATA:
                 partial_desc = _extract_file_metadata_and_signature(item)
@@ -1782,11 +1778,6 @@ class ArtefactManager:
 
         context_parts = [
             "## Workspace Directory Tree Index",
-            "This index displays all files in your workspace directory tree with their context state markers:",
-            "  - [C] Fully Loaded in Context (Verbatim text/code is read-ready below)",
-            "  - [M] Signature / Metadata Only (Exposes schemas, layouts, or code signatures below)",
-            "  - [U] Inactive/Unlockable (Excluded from context, but you can unlock/load it to [C] by calling <add_files_to_context>)",
-            "  - [L] Locked in Tree (Excluded from context and cannot be unlocked)\n",
             tree_text
         ]
 

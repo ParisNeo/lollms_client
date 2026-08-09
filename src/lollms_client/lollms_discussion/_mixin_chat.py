@@ -2325,6 +2325,41 @@ class ChatMixin:
                             ai_msg_local.content += f'\n\n{tag}\n'
                         self.commit()
 
+    def wipe_all_memories(self) -> bool:
+        """
+        Permanently deletes all episodic and associative memories from the database.
+        This includes working, deep, and archived memory tiers.
+        """
+        if not hasattr(self, 'memory_manager') or not self.memory_manager:
+            ASCIIColors.warning("[ChatMixin] No memory manager attached. Cannot wipe memories.")
+            return False
+
+        try:
+            import sqlite3
+            db_path = self.memory_manager.db_path.replace("sqlite:///", "")
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+            existing_tables = {row[0] for row in cursor.fetchall()}
+
+            if "memories" in existing_tables:
+                cursor.execute("DELETE FROM memories")
+            if "memory_embeddings" in existing_tables:
+                cursor.execute("DELETE FROM memory_embeddings")
+            if "memory_decay_history" in existing_tables:
+                cursor.execute("DELETE FROM memory_decay_history")
+
+            conn.commit()
+            conn.close()
+
+            ASCIIColors.success("[ChatMixin] ✅ All memories wiped successfully.")
+            return True
+        except Exception as e:
+            trace_exception(e)
+            ASCIIColors.error(f"[ChatMixin] Failed to wipe memories: {e}")
+            return False
+
     def _get_spinoff_agent_tools(self, current_prompt: str, images: list, **kwargs) -> Dict[str, Dict[str, Any]]:
         """
         Dynamically registers specialized sub-agents as executable in-process tools.
@@ -3580,8 +3615,12 @@ class ChatMixin:
                             return hashes
 
                         current_file_hashes = _get_file_hashes(tool_params)
-                        # Create a signature that includes the file hashes so it changes if files change
-                        context_aware_signature = f"{full_signature}::{json.dumps(current_file_hashes, sort_keys=True)}"
+                        has_real_file_hashes = any(v is not None for v in current_file_hashes.values())
+
+                        if has_real_file_hashes:
+                            context_aware_signature = f"{full_signature}::{json.dumps(current_file_hashes, sort_keys=True)}"
+                        else:
+                            context_aware_signature = full_signature
 
                         ASCIIColors.info(f"[ChatMixin] Success-loop check: tool='{tool_name}', sig='{context_aware_signature[:120]}...', in_set={context_aware_signature in successful_tool_signatures}, set_size={len(successful_tool_signatures)}")
 

@@ -2920,7 +2920,12 @@ class Agent:
                                     current_file_hashes[k] = hashlib.md5(content).hexdigest()
                                 except Exception:
                                     pass
-                    context_aware_signature = f"{full_signature}::{json.dumps(current_file_hashes, sort_keys=True)}"
+                    has_real_file_hashes = any(v is not None for v in current_file_hashes.values())
+
+                    if has_real_file_hashes:
+                        context_aware_signature = f"{full_signature}::{json.dumps(current_file_hashes, sort_keys=True)}"
+                    else:
+                        context_aware_signature = full_signature
 
                     if context_aware_signature in successful_tool_signatures and tool_name not in ["tool_execute_python", "tool_execute_python_code"]:
                         ASCIIColors.warning(f"[Agent.chat] Repetitive SUCCESS loop blocked for '{tool_name}'.")

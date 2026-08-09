@@ -238,6 +238,11 @@ class _AgentStreamState:
 
         self._is_accumulating_tool = False
         self._is_accumulating_artifact = False
+        
+        self._is_accumulating_context = False
+        self._context_tag_name = ""
+        self.context_trigger = False        
+        
         self._tool_buffer = ""
         self._pending_buffer = ""
 
@@ -375,6 +380,13 @@ class _AgentStreamState:
                 return False
             return True
 
+        if self._is_accumulating_context:
+            self._tool_buffer += self._pending_buffer
+            self._pending_buffer = ""
+            if self._try_complete_context_tag():
+                return False
+            return True
+
         if not self._in_code_fence and not self._in_inline_code:
             tool_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<tool>', self._pending_buffer, re.IGNORECASE)
             if tool_match:
@@ -407,9 +419,27 @@ class _AgentStreamState:
                 if self._try_complete_artifact():
                     return False
                 return True
+
+            context_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<(unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch)\b', self._pending_buffer, re.IGNORECASE)
+            if context_match:
+                tag_start_idx = context_match.start()
+                tag_name = context_match.group(1).lower()
+                text_before = self._pending_buffer[:tag_start_idx]
+                if text_before:
+                    self.content += text_before
+                    self._cb(text_before)
+
+                self._is_accumulating_context = True
+                self._context_tag_name = tag_name
+                self._tool_buffer = self._pending_buffer[tag_start_idx:]
+                self._pending_buffer = ""
+
+                if self._try_complete_context_tag():
+                    return False
+                return True
             
         def _ends_with_partial_tag(buffer: str) -> int:
-            tags_to_check = ["<tool", "<done", "<artifact", "<artefact"]
+            tags_to_check = ["<tool", "<done", "<artifact", "<artefact", "<unlock_file", "<lock_file", "<hide_file"]
             for tag in tags_to_check:
                 for i in range(1, len(tag)):
                     if buffer.endswith(tag[:i]):
@@ -422,6 +452,7 @@ class _AgentStreamState:
                         return start_idx
             return -1
 
+
         partial_idx = _ends_with_partial_tag(self._pending_buffer)
         if partial_idx != -1:
             text_before = self._pending_buffer[:partial_idx]
@@ -429,6 +460,29 @@ class _AgentStreamState:
                 self.content += text_before
                 self._cb(text_before)
             self._pending_buffer = self._pending_buffer[partial_idx:]
+            return True
+
+        def _ends_with_partial_folder_tag(buffer: str) -> int:
+            tags_to_check = ["<collapse_folder", "<uncollapse_folder", "<scratchpad_append", "<scratchpad_patch", "<user_profile_update"]
+            for tag in tags_to_check:
+                for i in range(1, len(tag)):
+                    if buffer.endswith(tag[:i]):
+                        start_idx = len(buffer) - i
+                        j = start_idx - 1
+                        while j >= 0 and buffer[j] != '\n':
+                            if not buffer[j].isspace():
+                                return -1
+                            j -= 1
+                        return start_idx
+            return -1
+
+        folder_partial_idx = _ends_with_partial_folder_tag(self._pending_buffer)
+        if folder_partial_idx != -1:
+            text_before = self._pending_buffer[:folder_partial_idx]
+            if text_before:
+                self.content += text_before
+                self._cb(text_before)
+            self._pending_buffer = self._pending_buffer[folder_partial_idx:]
             return True
 
         self.content += self._pending_buffer
@@ -500,7 +554,7 @@ class _AgentStreamState:
         end_len = len(close_match.group(0))
 
         full_artifact_call = self._tool_buffer[:end_idx + end_len]
-        
+
         self._is_accumulating_artifact = False
         remaining = self._tool_buffer[end_idx + end_len:]
         self._tool_buffer = full_artifact_call
@@ -510,6 +564,41 @@ class _AgentStreamState:
         self.artifact_trigger = True
         self._action_dispatched = True
         return True
+
+    def _try_complete_context_tag(self) -> bool:
+        closing_tag = f"</{self._context_tag_name}>"
+        close_match = re.search(re.escape(closing_tag) + r'\s*', self._tool_buffer, re.IGNORECASE)
+        if not close_match:
+            return False
+
+        end_idx = close_match.start()
+        end_len = len(close_match.group(0))
+
+        full_tag_call = self._tool_buffer[:end_idx + end_len]
+
+        self._is_accumulating_context = False
+        remaining = self._tool_buffer[end_idx + end_len:]
+
+        if not hasattr(self, '_context_tags_buffer'):
+            self._context_tags_buffer = ""
+        self._context_tags_buffer += full_tag_call + "\n"
+        self._tool_buffer = ""
+
+        self.context_trigger = True
+        self._action_dispatched = True
+
+        if remaining.strip():
+            self._pending_buffer = remaining + self._pending_buffer
+            if re.search(r'(?m)^\s*(?!`)(?!.*\|)<(unlock_file|lock_file|hide_file)\b', remaining, re.IGNORECASE):
+                return False
+        return True
+
+    def get_context_tag_xml(self) -> Optional[str]:
+        if not self.context_trigger:
+            return None
+        if hasattr(self, '_context_tags_buffer') and self._context_tags_buffer:
+            return self._context_tags_buffer.strip()
+        return self._tool_buffer if self._tool_buffer else None
 
     def flush_remaining_buffer(self):
         if self._in_code_fence:
@@ -575,6 +664,22 @@ class _AgentStreamState:
                 self._is_accumulating_artifact = False
                 self._tool_buffer = full_artifact_call
                 self.artifact_trigger = True
+                self._action_dispatched = True
+            return
+
+        if self._is_accumulating_context:
+            self._tool_buffer += self._pending_buffer
+            self._pending_buffer = ""
+            if not self._try_complete_context_tag():
+                full_tag_call = self._tool_buffer
+                self._is_accumulating_context = False
+                
+                if not hasattr(self, '_context_tags_buffer'):
+                    self._context_tags_buffer = ""
+                self._context_tags_buffer += full_tag_call + "\n"
+                self._tool_buffer = ""
+                
+                self.context_trigger = True
                 self._action_dispatched = True
             return
 

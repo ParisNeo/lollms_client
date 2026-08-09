@@ -9,12 +9,18 @@ import numpy as np
 import uuid
 import hashlib
 import time
+import warnings
 from pathlib import Path
 from enum import Enum
 from typing import List, Optional, Callable, Union, Dict, Any
 from dataclasses import dataclass, field
+import urllib3
 import ascii_colors as logging
 from ascii_colors import ASCIIColors, trace_exception
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+warnings.filterwarnings("ignore", message="Unverified HTTPS request is being made")
+logging.getLogger("urllib3").setLevel(logging.ERROR)
 from lollms_client.lollms_types import MSG_TYPE, ELF_COMPLETION_FORMAT
 from lollms_client.lollms_utilities import robust_json_parser, build_image_dicts, dict_to_markdown
 from lollms_client.lollms_llm_binding import LollmsLLMBinding, LollmsLLMBindingManager
@@ -86,11 +92,8 @@ class LollmsClient():
         debug: Optional[bool] = True,
         cooperative_vram_management: Optional[bool] = False,
         
-       # Multi-Binding Configurations (Legacy)
-       extra_llms: Optional[Dict[str, Dict[str, Any]]] = None,
-
        # 🧠 Modern Lazy Profiles (Universal across all modalities)
-      llm_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
+     llm_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
       tti_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
       tts_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
       stt_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
@@ -140,13 +143,28 @@ class LollmsClient():
         self._active_ttv_alias: Optional[str] = None
         self._active_ttm_alias: Optional[str] = None
 
-       # 🧠 Profile Registries (Declarative Configs - Universal)
+        # 🧠 Profile Registries (Declarative Configs - Universal)
         self.llm_profiles_registry: Dict[str, LollmsBindingProfile] = {}
         self.tti_profiles_registry: Dict[str, LollmsBindingProfile] = {}
         self.tts_profiles_registry: Dict[str, LollmsBindingProfile] = {}
         self.stt_profiles_registry: Dict[str, LollmsBindingProfile] = {}
         self.ttv_profiles_registry: Dict[str, LollmsBindingProfile] = {}
         self.ttm_profiles_registry: Dict[str, LollmsBindingProfile] = {}
+
+        # Pre-register profiles early so we can infer llm_binding_name if missing
+        self._register_profiles(llm_profiles, self.llm_profiles_registry, "LLM", callback)
+        self._register_profiles(tti_profiles, self.tti_profiles_registry, "TTI")
+        self._register_profiles(tts_profiles, self.tts_profiles_registry, "TTS")
+        self._register_profiles(stt_profiles, self.stt_profiles_registry, "STT")
+        self._register_profiles(ttv_profiles, self.ttv_profiles_registry, "TTV")
+        self._register_profiles(ttm_profiles, self.ttm_profiles_registry, "TTM")
+
+        # Infer primary binding names from default profiles if not explicitly provided
+        if not llm_binding_name:
+            default_llm_profile = next((p for p in self.llm_profiles_registry.values() if p.is_default), None)
+            if default_llm_profile:
+                llm_binding_name = default_llm_profile.binding_name
+                llm_binding_config = default_llm_profile.binding_config
 
         # User and AI names are important for prompt construction
         self.user_name = user_name
@@ -262,37 +280,11 @@ class LollmsClient():
                 if callback: callback(f"❌ Error initializing MCP: {e}", MSG_TYPE.MSG_TYPE_ERROR, {})   
 
         # ── 🧠 LAZY PROFILE REGISTRATION ──
-        # 1. Register Legacy Primary Bindings as "master" profiles
-        if llm_binding_name:
-            self.llm_profiles_registry["master"] = LollmsModelProfile(
-                name="master",
-                binding_name=llm_binding_name,
-                binding_config=llm_binding_config or {},
-                is_default=True
-            )
-
-        # 2. Register Legacy extra_llms (converted to profiles)
-        if extra_llms:
-            for alias, cfg in extra_llms.items():
-                if alias == "master": continue
-                profile = LollmsModelProfile(
-                    name=alias,
-                    binding_name=cfg.get("binding_name"),
-                    binding_config=cfg.get("binding_config", {}) or {}
-                )
-                self.llm_profiles_registry[alias] = profile
-
-                # 🛡️ BACKWARD COMPATIBILITY: Eagerly instantiate legacy extra_llms
-                # The old behavior expected these to be immediately available in self.llms.
-                new_binding = self._instantiate_binding_from_profile(
-                    alias, profile, self.llm_binding_manager, "llm", callback
-                )
-                if new_binding:
-                    self.llms[alias] = new_binding
-                    if callback: callback(f"✅ Mounted extra LLM: `{alias}`", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
-
-        # 3. Register Modern profiles (overrides any legacy duplicates)
-        self._register_profiles(llm_profiles, self.llm_profiles_registry, "LLM")
+        # 2. Register Modern profiles (overrides any legacy duplicates)
+        # Note: Profiles were pre-registered above to infer binding names.
+        # We call it again to safely handle any legacy `extra_llms` that may 
+        # have been converted, ensuring no duplicates are lost.
+        self._register_profiles(llm_profiles, self.llm_profiles_registry, "LLM", callback)
         self._register_profiles(tti_profiles, self.tti_profiles_registry, "TTI")
         self._register_profiles(tts_profiles, self.tts_profiles_registry, "TTS")
         self._register_profiles(stt_profiles, self.stt_profiles_registry, "STT")
@@ -307,6 +299,25 @@ class LollmsClient():
                 switch_method(default_alias, callback=callback)
             elif "master" in registry:
                 switch_method("master", callback=callback)
+
+        # 3. Register Legacy Primary Bindings as "master" profiles
+        if llm_binding_name:
+            self.llm_profiles_registry["master"] = LollmsModelProfile(
+                name="master",
+                binding_name=llm_binding_name,
+                binding_config=llm_binding_config or {},
+                is_default=True
+            )
+        if tts_binding_name:
+            self.tts_profiles_registry["master"] = LollmsBindingProfile(name="master", binding_name=tts_binding_name, is_default=True)
+        if tti_binding_name:
+            self.tti_profiles_registry["master"] = LollmsBindingProfile(name="master", binding_name=tti_binding_name, is_default=True)
+        if stt_binding_name:
+            self.stt_profiles_registry["master"] = LollmsBindingProfile(name="master", binding_name=stt_binding_name, is_default=True)
+        if ttv_binding_name:
+            self.ttv_profiles_registry["master"] = LollmsBindingProfile(name="master", binding_name=ttv_binding_name, is_default=True)
+        if ttm_binding_name:
+            self.ttm_profiles_registry["master"] = LollmsBindingProfile(name="master", binding_name=ttm_binding_name, is_default=True)
 
         # 4. Eagerly instantiate ONLY the default profiles for all modalities
         _eagerly_instantiate_default(self.llm_profiles_registry, self.switch_model, "LLM")
@@ -332,8 +343,8 @@ class LollmsClient():
              self.ttm_profiles_registry["master"] = LollmsBindingProfile(name="master", binding_name=self.ttm.binding_name, is_default=True)
         _eagerly_instantiate_default(self.ttm_profiles_registry, self.switch_ttm, "TTM")
 
-    def _register_profiles(self, profiles_dict: Optional[Dict], registry: Dict[str, LollmsBindingProfile], modality_name: str):
-        """Helper method to safely register binding profiles."""
+    def _register_profiles(self, profiles_dict: Optional[Dict], registry: Dict[str, LollmsBindingProfile], modality_name: str, callback=None):
+        """Helper method to safely register binding profiles. Eagerly instantiates legacy extra_llms."""
         if not profiles_dict: 
             return
 
@@ -342,9 +353,14 @@ class LollmsClient():
                 ASCIIColors.warning(f"Alias 'master' is reserved for {modality_name}. Skipping explicit master profile.")
                 continue
 
+            is_legacy_extra_llm = False
             if isinstance(p_data, LollmsBindingProfile):
                 profile = p_data
             else:
+                # Detect legacy `extra_llms` dictionary format
+                if "binding_name" in p_data and "binding_config" in p_data and len(p_data) == 2:
+                    is_legacy_extra_llm = True
+
                 profile = LollmsBindingProfile(
                     name=alias,
                     binding_name=p_data.get("binding_name"),
@@ -354,7 +370,17 @@ class LollmsClient():
                     forced_context_size=p_data.get("forced_context_size"),
                     routing_config=p_data.get("routing_config")
                 )
+
             registry[alias] = profile
+
+            # 🛡️ BACKWARD COMPATIBILITY: Eagerly instantiate legacy extra_llms
+            if is_legacy_extra_llm and modality_name == "LLM":
+                new_binding = self._instantiate_binding_from_profile(
+                    alias, profile, self.llm_binding_manager, "llm", callback
+                )
+                if new_binding:
+                    self.llms[alias] = new_binding
+                    if callback: callback(f"✅ Mounted extra LLM: `{alias}`", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
 
     def _instantiate_binding_from_profile(self, alias: str, profile: LollmsBindingProfile, manager: Any, modality: str, callback=None) -> Optional[Any]:
         """Instantiates any binding from its profile using the provided manager."""
@@ -937,7 +963,25 @@ class LollmsClient():
         Delegates directly to the active LLM binding.
         """
         if self.llm:
-            return self.llm.get_ctx_size(model_name)
+            active_model = model_name or getattr(self.llm, "model_name", "default")
+            cache_key = f"ctx_size_{active_model}"
+
+            if not hasattr(self, "_ctx_size_cache"):
+                self._ctx_size_cache = {}
+
+            if cache_key in self._ctx_size_cache:
+                return self._ctx_size_cache[cache_key]
+
+            try:
+                ctx_size = self.llm.get_ctx_size(model_name)
+                if ctx_size and ctx_size > 0:
+                    self._ctx_size_cache[cache_key] = ctx_size
+                    return ctx_size
+                self._ctx_size_cache[cache_key] = 32000
+                return 32000
+            except Exception:
+                self._ctx_size_cache[cache_key] = 32000
+                return 4096
         return 4096
 
     def list_models(self):

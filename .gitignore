@@ -162,6 +162,7 @@ cython_debug/
 
 # Lollms vscoder folder and vscode folder
 .lollms
+.lollms_code
 .vscode
 
 # personal code examples (not shared)

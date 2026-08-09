@@ -737,8 +737,13 @@ class LollmsBinding(LollmsLLMBinding):
         if not target_model:
             return self.default_ctx_size
 
+        if not hasattr(self, "_ctx_size_failures"):
+            self._ctx_size_failures = 0
+
+        if self._ctx_size_failures >= 2:
+            return 32000
+
         try:
-            # Construct the lollms specific v1 endpoint URL
             url = f"{self.lollms_host_address}/context_size"
 
             headers = {}
@@ -752,13 +757,30 @@ class LollmsBinding(LollmsLLMBinding):
                 data = response.json()
                 if "context_size" in data:
                     size = int(data["context_size"])
-                    ASCIIColors.warning(f"Using remote context size for model '{target_model}': {size}")
+                    self._ctx_size_failures = 0
                     return size
         except Exception as e:
-            trace_exception(e)
-            ASCIIColors.warning(f"Could not retrieve remote context size for '{target_model}': {e}. Falling back to default.")
+            self._ctx_size_failures += 1
+            if self._ctx_size_failures == 1:
+                ASCIIColors.warning(f"Could not retrieve remote context size for '{target_model}': {e}. Falling back to default. Further failures will be silent.")
+            return 4096
 
-        return super().get_ctx_size(model_name)
+        return 4096
+
+    def get_ctx_size(self, model_name: Optional[str] = None) -> Optional[int]:
+        target_model = model_name or self.model_name
+        if not hasattr(self, "_ctx_size_cache"):
+            self._ctx_size_cache = {}
+
+        if target_model in self._ctx_size_cache:
+            return self._ctx_size_cache[target_model]
+
+        ctx_size = self._get_ctx_size(target_model)
+        if ctx_size and ctx_size > 0:
+            self._ctx_size_cache[target_model] = ctx_size
+            return ctx_size
+
+        return 4096
 
         
     def embed(self, text: str, **kwargs) -> list:

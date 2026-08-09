@@ -34,38 +34,28 @@ from .lollms_agent_state import _AgentStreamState, _sanitize_tool_result, _Tools
 
 
 try:
-    from lollms_client.lollms_types import MSG_TYPE
+    from lollms_client.lollms_types import MSG_TYPE, EventMode
 except ImportError:
     class MSG_TYPE:
         MSG_TYPE_CHUNK = "chunk"
         MSG_TYPE_INFO = "info"
         MSG_TYPE_NEW_MESSAGE = "new_message"
         MSG_TYPE_THOUGHT_CHUNK = "thought"
+        MSG_TYPE_TOOL_START = 50
+        MSG_TYPE_TOOL_END = 51
+        MSG_TYPE_ARTEFACT_BUILD_START = 52
+        MSG_TYPE_ARTEFACT_BUILD_END = 53
+        MSG_TYPE_CONTEXT_UPDATE = 54
 
-try:
-    from lollms_client.lollms_memory import FailureMemory
-except ImportError:
-    class FailureMemory:
-        def __init__(self):
-            self.failures = []
-            self._signatures = set()
-        def record_failure_by_signature(self, sig, error):
-            self.failures.append({"signature": sig, "error": error})
-            self._signatures.add(sig)
+    class EventMode:
+        PROCESSING_TAG_MODE = 0
+        FULL_CALLBACK_MODE = 1
+        MIXED_MODE = 2
+        SILENT_MODE = 3
 
-try:
-    from lollms_client.lollms_agent.lollms_agent import CapabilityFlags, SubAgentSpawner, ModelSwitcher, BindingToolsBuilder, _build_workspace_context, _normalize_messages, _get_builtin_workspace_tools, _IGNORED_WS_DIRS, _IGNORED_WS_EXTS, _TEXT_EXTS
-except ImportError:
-    CapabilityFlags = None
-    SubAgentSpawner = None
-    ModelSwitcher = None
-    BindingToolsBuilder = None
-    _build_workspace_context = lambda *args, **kwargs: ""
-    _normalize_messages = lambda msgs: msgs
-    _get_builtin_workspace_tools = lambda *args, **kwargs: {}
-    _IGNORED_WS_DIRS = set()
-    _IGNORED_WS_EXTS = set()
-    _TEXT_EXTS = set()
+from lollms_client.lollms_memory import FailureMemory
+from lollms_client.lollms_agent.lollms_agent import CapabilityFlags, SubAgentSpawner, ModelSwitcher, BindingToolsBuilder, _build_workspace_context, _normalize_messages, _get_builtin_workspace_tools, _IGNORED_WS_DIRS, _IGNORED_WS_EXTS, _TEXT_EXTS
+from lollms_client.lollms_artefact import ArtefactVisibility, ArtefactManager
 
 
 _TEXT_RAG_EXTS = {
@@ -434,6 +424,7 @@ class LollmsPersonality:
         self.handbag_path = Path(handbag_path) if handbag_path else None
         self.skills_manager = skills_manager
         self.memory_manager = memory_manager
+        self._workspace_path: Optional[Path] = None
         self.workspace_path = Path(workspace_path) if workspace_path else None
         self.enable_git_management = enable_git_management
         self.coworkers: Dict[str, 'LollmsPersonality'] = {}
@@ -453,9 +444,14 @@ class LollmsPersonality:
         # Initialize workspace
         if self.workspace_path:
             self.workspace_path.mkdir(parents=True, exist_ok=True)
-            self._resolved_workspace = self.workspace_path.resolve()
+            self._resolved_workspace = Path(self.workspace_path).resolve()
         else:
             self._resolved_workspace = None
+
+        # INSTRUMENTATION: Debug mode flag for context dumping
+        self.debug_mode: bool = False
+
+        self._workspace_path: Optional[Path] = None
 
         # Initialize SubAgentSpawner and ModelSwitcher if client is provided
         if SubAgentSpawner and ModelSwitcher and self.lollms_client:
@@ -692,6 +688,19 @@ class LollmsPersonality:
         )
 
     @property
+    def workspace_path(self) -> Optional[Path]:
+        return self._workspace_path
+
+    @workspace_path.setter
+    def workspace_path(self, value: Optional[Union[str, Path]]) -> None:
+        self._workspace_path = Path(value) if value else None
+        if self._workspace_path:
+            self._workspace_path.mkdir(parents=True, exist_ok=True)
+            object.__setattr__(self, '_resolved_workspace', self._workspace_path.resolve())
+        else:
+            object.__setattr__(self, '_resolved_workspace', None)
+
+    @property
     def data_source(self) -> Optional[Union[str, Callable]]:
         return self._raw_data_source
 
@@ -924,63 +933,556 @@ class LollmsPersonality:
 
     # ------------------------------------------------------------------ Independent Agentic Chat
 
+    def wipe_all_memories(self) -> bool:
+        """
+        Permanently deletes all episodic and associative memories from the personality's 
+        independent memory database. This includes working, deep, and archived memory tiers.
+        """
+        if not hasattr(self, 'memory_manager') or not self.memory_manager:
+            ASCIIColors.warning(f"[{self.name}] No independent memory manager attached. Cannot wipe memories.")
+            return False
+
+        try:
+            import sqlite3
+            db_path = self.memory_manager.db_path.replace("sqlite:///", "")
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+            existing_tables = {row[0] for row in cursor.fetchall()}
+
+            if "memories" in existing_tables:
+                cursor.execute("DELETE FROM memories")
+            if "memory_embeddings" in existing_tables:
+                cursor.execute("DELETE FROM memory_embeddings")
+            if "memory_decay_history" in existing_tables:
+                cursor.execute("DELETE FROM memory_decay_history")
+
+            conn.commit()
+            conn.close()
+
+            ASCIIColors.success(f"[{self.name}] ✅ All independent memories wiped successfully.")
+            return True
+        except Exception as e:
+            trace_exception(e)
+            ASCIIColors.error(f"[{self.name}] Failed to wipe memories: {e}")
+            return False
+
+    def _build_workspace_context_block(self) -> str:
+        import time as _time
+        current_time = _time.time()
+        if hasattr(self, '_last_ws_sync_time') and (current_time - self._last_ws_sync_time < 5.0):
+            if getattr(self, '_artefact_manager', None):
+                try:
+                    zone = self._artefact_manager.build_artefacts_context_zone()
+                    if zone:
+                        return "\n" + zone
+                    if self._resolved_workspace:
+                        return "\n" + _build_workspace_context(self._resolved_workspace)
+                except Exception:
+                    pass
+            elif self._resolved_workspace:
+                return "\n" + _build_workspace_context(self._resolved_workspace)
+            return ""
+
+        object.__setattr__(self, '_last_ws_sync_time', current_time)
+
+        if getattr(self, '_artefact_manager', None):
+            try:
+                self._sync_artefact_index_with_disk()
+                zone = self._artefact_manager.build_artefacts_context_zone()
+                if zone:
+                    return "\n" + zone
+                # Fallback if artefact manager returns empty string but workspace exists
+                if self._resolved_workspace:
+                    return "\n" + _build_workspace_context(self._resolved_workspace)
+            except Exception as e:
+                ASCIIColors.warning(f"[{self.name}] Failed to build workspace context: {e}")
+                if self._resolved_workspace:
+                    return "\n" + _build_workspace_context(self._resolved_workspace)
+        elif self._resolved_workspace:
+            return "\n" + _build_workspace_context(self._resolved_workspace)
+        return ""
+    
+    
+    def _sync_artefact_index_with_disk(self):
+        """
+        Performs a high-performance delta sync between the filesystem and the artefact index.
+        Uses file hashes stored in the SQLite state DB to detect content changes.
+        Only updates the in-memory index if a file is added, removed, or its hash changes.
+        """
+        if not hasattr(self, '_artefact_manager') or not self._artefact_manager:
+            return
+
+        try:
+            import sqlite3 as _sqlite3
+            import hashlib as _hashlib
+            
+            if not hasattr(self, '_state_db_path'):
+                ASCIIColors.warning(f"[{self.name}] State DB path missing, cannot delta sync.")
+                return
+
+            ws_path = self._resolved_workspace
+            if not ws_path or not ws_path.exists():
+                return
+
+            # 1. Load all known files and hashes from SQLite
+            conn = _sqlite3.connect(str(self._state_db_path))
+            cursor = conn.cursor()
+            
+            # Ensure hash column exists
+            try:
+                cursor.execute("ALTER TABLE file_states ADD COLUMN hash TEXT")
+            except _sqlite3.OperationalError:
+                pass # Column already exists
+
+            cursor.execute("SELECT title, visibility, hash FROM file_states")
+            db_rows = cursor.fetchall()
+            db_files = {row[0]: {"visibility": row[1], "hash": row[2]} for row in db_rows}
+            conn.close()
+
+            # 2. Scan current filesystem
+            current_files = set()
+            all_arts = self._artefact_manager._get_all_raw()
+            dirty = False
+
+            _BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".zip", ".tar", ".gz", ".pdf", ".docx", ".pptx", ".mp3", ".wav", ".mp4"}
+
+            def _is_noise_directory(dir_name: str) -> bool:
+                _COLLAPSED_DIRS = {"data_workspace", "env", ".venv", "venv", ".git", ".idea", ".vscode", "node_modules", ".lollms", "build", "dist", ".next", "__pycache__", ".lollms_metadata", ".lollms_code", "egg-info", "dist-info", ".pytest_cache", ".mypy_cache", ".ruff_cache", "htmlcov", "site-packages", "artefacts_metadata", "discussions"}
+                lower_name = dir_name.lower()
+                if lower_name in _COLLAPSED_DIRS: return True
+                if lower_name.endswith(".egg-info") or lower_name.endswith(".dist-info"): return True
+                return False
+
+            def _scan_dir(directory: Path):
+                nonlocal dirty
+                try:
+                    for item in sorted(directory.iterdir()):
+                        if item.is_dir():
+                            if _is_noise_directory(item.name):
+                                continue
+                            _scan_dir(item)
+                        elif item.is_file():
+                            if item.suffix.lower() in _IGNORED_WS_EXTS:
+                                continue
+                            if item.name == "__init__.py":
+                                continue
+
+                            rel_path_str = str(item.relative_to(ws_path)).replace("\\", "/")
+                            current_files.add(rel_path_str)
+
+                            # Compute hash
+                            try:
+                                # Fast hash: use mtime and size for speed, fallback to content hash for small files
+                                stat = item.stat()
+                                # For text files < 1MB, do a content hash. For larger, use stat.
+                                if stat.st_size < 1024 * 1024:
+                                    content = item.read_bytes()
+                                    file_hash = _hashlib.md5(content).hexdigest()
+                                else:
+                                    file_hash = f"{stat.st_mtime}:{stat.st_size}"
+                            except Exception:
+                                file_hash = None
+
+                            db_info = db_files.get(rel_path_str)
+                            if not db_info:
+                                # New file discovered on disk
+                                dirty = True
+                                if getattr(self, 'debug_mode', False):
+                                    ASCIIColors.info(f"[{self.name}] 📄 New file detected: {rel_path_str}")
+
+                                # Add to ArtefactManager
+                                atype = "code" if item.suffix.lower() in _TEXT_EXTS else "document"
+                                self._artefact_manager.add(
+                                    title=rel_path_str,
+                                    artefact_type=atype,
+                                    content="",
+                                    active=False,
+                                    visibility=ArtefactVisibility.TREE_UNLOCKABLE,
+                                    skip_disk_sync=True
+                                )
+
+                                # Persist to DB
+                                conn = _sqlite3.connect(str(self._state_db_path))
+                                cur = conn.cursor()
+                                cur.execute("INSERT OR REPLACE INTO file_states (title, visibility, hash) VALUES (?, ?, ?)", 
+                                            (rel_path_str, ArtefactVisibility.TREE_UNLOCKABLE, file_hash))
+                                conn.commit()
+                                conn.close()
+
+                            elif db_info.get("hash") != file_hash:
+                                # File content changed
+                                dirty = True
+                                if getattr(self, 'debug_mode', False):
+                                    ASCIIColors.info(f"[{self.name}] ✏️ File changed: {rel_path_str}")
+
+                                art = self._artefact_manager.get(rel_path_str)
+                                if art and art.get("visibility") == ArtefactVisibility.FULL:
+                                    art["content"] = ""
+
+                                conn = _sqlite3.connect(str(self._state_db_path))
+                                cur = conn.cursor()
+                                cur.execute("UPDATE file_states SET hash = ? WHERE title = ?", (file_hash, rel_path_str))
+                                conn.commit()
+                                conn.close()
+                            else:
+                                art = self._artefact_manager.get(rel_path_str)
+                                if not art:
+                                    dirty = True
+                                    atype = "code" if item.suffix.lower() in _TEXT_EXTS else "document"
+
+                                    db_vis = db_info.get("visibility", ArtefactVisibility.TREE_UNLOCKABLE)
+                                    resolved_vis = db_vis
+                                    if db_vis == ArtefactVisibility.FULL:
+                                        try:
+                                            stat = item.stat()
+                                            if stat.st_size > 51200:
+                                                resolved_vis = ArtefactVisibility.TREE_UNLOCKABLE
+                                        except Exception:
+                                            resolved_vis = ArtefactVisibility.TREE_UNLOCKABLE
+
+                                    self._artefact_manager.add(
+                                        title=rel_path_str,
+                                        artefact_type=atype,
+                                        content="",
+                                        active=False,
+                                        visibility=resolved_vis,
+                                        skip_disk_sync=True
+                                    )
+                                    if db_vis != resolved_vis:
+                                        conn = _sqlite3.connect(str(self._state_db_path))
+                                        cur = conn.cursor()
+                                        cur.execute("UPDATE file_states SET visibility = ? WHERE title = ?", (resolved_vis, rel_path_str))
+                                        conn.commit()
+                                        conn.close()
+
+                except Exception as dir_err:
+                    ASCIIColors.warning(f"[{self.name}] Failed to scan directory {directory}: {dir_err}")
+
+            _scan_dir(ws_path)
+
+            # 3. Prune deleted files
+            deleted_files = set(db_files.keys()) - current_files
+            if deleted_files:
+                dirty = True
+                conn = _sqlite3.connect(str(self._state_db_path))
+                cur = conn.cursor()
+                for d_file in deleted_files:
+                    if not d_file.endswith("::images"):
+                        if getattr(self, 'debug_mode', False):
+                            ASCIIColors.info(f"[{self.name}] 🗑️ Pruned deleted file: {d_file}")
+                        cur.execute("DELETE FROM file_states WHERE title = ?", (d_file,))
+                conn.commit()
+                conn.close()
+
+            # Remove from in-memory artefact list if any were deleted
+            if deleted_files:
+                surviving_arts = [
+                    art for art in all_arts 
+                    if art.get("title") not in deleted_files or art.get("title", "").endswith("::images")
+                ]
+                self._artefact_manager._save_all(surviving_arts)
+
+            if not dirty and getattr(self, 'debug_mode', False):
+                ASCIIColors.success(f"[{self.name}] ✅ Workspace index is up-to-date (0 changes).")
+
+        except Exception as e:
+            if getattr(self, 'debug_mode', False):
+                ASCIIColors.warning(f"[{self.name}] Disk sync/prune failed: {e}")
+            
+    def _refresh_workspace_context_in_prompt(self, current_prompt: str, new_ws_block: str) -> str:
+        ws_boundary = "=== WORKSPACE CONTEXT BOUNDARY ==="
+        boundary_idx = current_prompt.find(ws_boundary)
+
+        if boundary_idx == -1:
+            return current_prompt + "\n" + new_ws_block.strip()
+
+        base_prompt = current_prompt[:boundary_idx + len(ws_boundary)]
+        return base_prompt + "\n" + new_ws_block.strip()
+
+    def _calculate_context_fill(self, full_system_prompt: str, base_conversation: List[Dict], virtual_history: List, final_response: str = "") -> Dict[str, Any]:
+        """Calculates the current context window fill percentage."""
+        try:
+            if self.lollms_client and hasattr(self.lollms_client, 'get_ctx_size'):
+                max_ctx = self.lollms_client.get_ctx_size() or 0
+                if max_ctx > 0 and hasattr(self.lollms_client, 'count_tokens'):
+                    total_used = self.lollms_client.count_tokens(full_system_prompt)
+                    for msg in base_conversation:
+                        total_used += self.lollms_client.count_tokens(msg.get("content", ""))
+                    for vh in virtual_history:
+                        total_used += self.lollms_client.count_tokens(vh.content)
+                    total_used += self.lollms_client.count_tokens(final_response)
+
+                    if total_used <= 0:
+                        return {"used_tokens": 0, "max_tokens": max_ctx, "fill_percentage": 0.0}
+
+                    return {
+                        "used_tokens": total_used,
+                        "max_tokens": max_ctx,
+                        "fill_percentage": round((total_used / max_ctx) * 100, 1)
+                    }
+        except Exception:
+            pass
+        return {"used_tokens": 0, "max_tokens": 0, "fill_percentage": 0.0}
+
+    def _autonomous_memory_consolidation(self, user_prompt: str, ai_response: str):
+        """
+        Evaluates the conversation turn and extracts high-density architectural facts 
+        or user constraints to commit to long-term associative memory.
+        Trivial interactions (greetings, simple lookups) are discarded to prevent context bloat.
+        """
+        if not self.lollms_client or not hasattr(self.memory_manager, 'add'):
+            return
+
+        try:
+            clean_ai = re.sub(r'<[^>]+>', '', ai_response).strip()
+            clean_user = user_prompt.strip()
+
+            if not clean_user or not clean_ai or len(clean_user) < 10 or len(clean_ai) < 10:
+                return
+
+            consolidation_prompt = f"""Analyze the following interaction between a User and an AI Engineer.
+Determine if a CRITICAL FACT, ARCHITECTURAL RULE, or USER PREFERENCE was established.
+Ignore greetings, trivial progress updates, and conversational filler.
+
+User: "{clean_user}"
+AI: "{clean_ai}"
+
+If a high-density fact was established, output EXACTLY a JSON object with:
+{{"save_memory": true, "content": "The specific fact/rule", "tags": ["relevant", "tags"], "importance": 0.0-1.0}}
+If the interaction is trivial, output:
+{{"save_memory": false}}
+
+JSON:"""
+
+            reflection = self.lollms_client.generate_text(
+                prompt=consolidation_prompt,
+                temperature=0.1,
+                n_predict=256
+            )
+
+            import json as _json
+            json_match = re.search(r'\{.*\}', reflection, re.DOTALL)
+            if json_match:
+                data = _json.loads(json_match.group(0))
+                if data.get("save_memory"):
+                    self.memory_manager.add(
+                        content=data.get("content", ""),
+                        importance=float(data.get("importance", 0.8)),
+                        tags=data.get("tags", ["architectural", "fact"]),
+                        level=2
+                    )
+                    ASCIIColors.success(f"[{self.name}] 💾 Consolidated high-density memory: {data.get('content', '')[:50]}...")
+
+        except Exception as e:
+            ASCIIColors.warning(f"[{self.name}] Memory consolidation failed: {e}")
+
+    def _autonomous_context_cleanup(self, user_prompt: str) -> str:
+        """
+        Evaluates the active [C] (Fully Loaded) artifacts against the user's prompt.
+        Asks the LLM to emit <lock_file> tags for irrelevant files to free up context space
+        before the main generation begins.
+        """
+        from lollms_client.lollms_artefact import ArtefactVisibility
+
+        if not hasattr(self, '_artefact_manager') or not self._artefact_manager:
+            return user_prompt
+
+        all_arts = self._artefact_manager._get_all_raw()
+        loaded_files = [
+            a.get("physical_path") or a.get("title", "")
+            for a in all_arts 
+            if a.get("visibility") == ArtefactVisibility.FULL and not a.get("title", "").endswith("::images")
+        ]
+
+        if not loaded_files:
+            return user_prompt
+
+        ASCIIColors.info(f"[{self.name}] 🧹 Triggering autonomous context cleanup for {len(loaded_files)} loaded files...")
+
+        cleanup_prompt = (
+            "You are a context window manager. Your goal is to minimize context usage.\n"
+            f"The user just asked: \"{user_prompt}\"\n\n"
+            f"The following files are currently FULLY LOADED in your context:\n{', '.join(loaded_files)}\n\n"
+            "Which of these files are COMPLETELY IRRELEVANT to the user's request?\n"
+            "Output ONLY the XML tags to lock the irrelevant files. Do not output any conversational text.\n"
+            "Example:\n"
+            "<lock_file>irrelevant_file1.py</lock_file>\n"
+            "<lock_file>irrelevant_file2.py</lock_file>\n"
+        )
+
+        try:
+            cleanup_response = self.lollms_client.generate_text(
+                prompt=cleanup_prompt,
+                temperature=0.1,
+                n_predict=512
+            )
+
+            if not isinstance(cleanup_response, str) or not cleanup_response.strip():
+                return user_prompt
+
+            # Execute any <lock_file> tags found in the response
+            import re
+            lock_tags = re.findall(r'<lock_file>(.*?)</lock_file>', cleanup_response, re.DOTALL | re.IGNORECASE)
+
+            if lock_tags:
+                locked_count = 0
+                for body in lock_tags:
+                    files_to_lock = [f.strip().replace("\\", "/") for f in re.split(r'[\n,;]+', body) if f.strip()]
+                    for f_name in files_to_lock:
+                        # Use the same visibility execution logic as the main chat loop
+                        result = self._execute_context_visibility("lock_file", f_name)
+                        if "✅ Locking" in result:
+                            locked_count += 1
+
+                if locked_count > 0:
+                    ASCIIColors.success(f"[{self.name}] 🧹 Autonomously locked {locked_count} irrelevant file(s) to free context.")
+                else:
+                    ASCIIColors.info(f"[{self.name}] 🧹 No files locked (either none were irrelevant or already locked).")
+            else:
+                ASCIIColors.info(f"[{self.name}] 🧹 LLM decided no files need to be locked.")
+
+        except Exception as e:
+            ASCIIColors.warning(f"[{self.name}] Context cleanup generation failed: {e}")
+
+        return user_prompt
+
+    def _compact_virtual_history(self, virtual_history: List, streaming_callback: Optional[Callable]) -> List:
+        """
+        Autonomously summarizes the virtual history to free up context space.
+        Replaces verbose tool outputs and intermediate reasoning with a dense summary.
+        """
+        if not virtual_history or not self.lollms_client:
+            return virtual_history
+
+        # Notify the UI of the autonomous compaction
+        if streaming_callback:
+            compaction_msg = '\n<processing type="context_compaction" title="Autonomous Context Compaction">\n* 🧹 Context window approaching limit. Summarizing history to free up space...\n</processing>\n'
+            try:
+                streaming_callback(compaction_msg, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            except Exception:
+                pass
+
+        # Build a summarization prompt from the virtual history
+        history_text = "\n\n".join([f"[{vh.sender_type}]: {vh.content}" for vh in virtual_history])
+
+        summary_prompt = (
+            "You are a context compaction engine. Summarize the following conversation history into a dense, factual summary.\n"
+            "Focus on retaining: user goals, key data retrieved from tools, file names created/modified, and final conclusions.\n"
+            "Discard: conversational pleasantries, intermediate reasoning steps, and verbose tool outputs.\n\n"
+            f"=== HISTORY TO COMPACT ===\n{history_text}\n=== END HISTORY ==="
+        )
+
+        try:
+            # Use a low temperature for deterministic, factual summarization
+            summary = self.lollms_client.generate_text(
+                prompt=summary_prompt,
+                temperature=0.1,
+                n_predict=1024
+            )
+            if not isinstance(summary, str) or not summary.strip():
+                return virtual_history
+
+            # Replace the verbose history with a single dense system message
+            compacted_history = [SimpleNamespace(
+                sender_type="user",
+                content=f"[SYSTEM: AUTONOMOUS CONTEXT COMPACTION]\nThe previous history has been summarized to save space. Use this summary as your working context:\n\n{summary.strip()}"
+            )]
+
+            if streaming_callback:
+                success_msg = f'\n<processing type="context_compaction" title="Autonomous Context Compaction">\n* ✅ History compacted successfully. Context freed.\n</processing>\n'
+                try:
+                    streaming_callback(success_msg, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                except Exception:
+                    pass
+
+            return compacted_history
+
+        except Exception as e:
+            ASCIIColors.warning(f"[{self.name}] Context compaction failed: {e}")
+            return virtual_history
+
     def _init_artefact_system(self):
         try:
             from lollms_client.lollms_artefact import ArtefactManager, ArtefactVisibility
-            from lollms_client.lollms_artefact.export import LollmsArtefactPatchApplier
             import uuid as _uuid
+            import sqlite3 as _sqlite3
+            import hashlib as _hashlib
+
             ws_path = self._resolved_workspace
             if not ws_path:
                 return
+
+            # Use .lollms_code for persistent state index
+            state_dir = ws_path / ".lollms_code"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            state_db_path = state_dir / "context_state.db"
+
+            # Initialize SQLite state DB with hash column for delta sync
+            conn = _sqlite3.connect(str(state_db_path))
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS file_states (
+                    title TEXT PRIMARY KEY,
+                    visibility TEXT NOT NULL,
+                    hash TEXT
+                )
+            """)
+            # Migration for existing DBs
+            try:
+                cursor.execute("ALTER TABLE file_states ADD COLUMN hash TEXT")
+            except _sqlite3.OperationalError:
+                pass
+            conn.commit()
+            conn.close()
+
+            metadata_dir = state_dir / "artefacts_metadata"
+            metadata_dir.mkdir(parents=True, exist_ok=True)
 
             proxy = SimpleNamespace(
                 id=f"pers_{self.personality_id[:8]}",
                 workspace_path=str(ws_path),
                 workspace_data_path=str(ws_path),
-                artefacts_metadata_path=str(ws_path / "artefacts_metadata"),
+                artefacts_metadata_path=str(metadata_dir),
                 lollmsClient=self.lollms_client, 
                 metadata={},
                 _is_db_backed=False,
                 commit=lambda: None,
-                disable_artefact_versioning=True
+                disable_artefact_versioning=True,
+                _skip_physical_sync=True
             )
 
-            class _VersionlessArtefactManager(ArtefactManager):
-                pass
+            class _IndexOnlyArtefactManager(ArtefactManager):
+                def _sync_to_disk_workspace(self, *args, **kwargs):
+                    return
 
-            am = _VersionlessArtefactManager(proxy)
+            am = _IndexOnlyArtefactManager(proxy)
             object.__setattr__(self, '_artefact_manager', am)
             object.__setattr__(self, '_artefact_proxy', proxy)
-            object.__setattr__(self, '_patch_applier', LollmsArtefactPatchApplier(self.lollms_client))
+            object.__setattr__(self, '_state_db_path', state_db_path)
 
-            if ws_path.exists():
-                for f_path in sorted(ws_path.rglob("*")):
-                    if f_path.is_file():
-                        rel_parts = f_path.relative_to(ws_path).parts
-                        if any(part in _IGNORED_WS_DIRS for part in rel_parts):
-                            continue
-                        if f_path.suffix.lower() in _IGNORED_WS_EXTS:
-                            continue
-                        try:
-                            content = f_path.read_text(encoding="utf-8", errors="ignore")
-                            am.add(
-                                title=f_path.name,
-                                artefact_type="code" if f_path.suffix.lower() in _TEXT_EXTS else "document",
-                                content=content,
-                                active=False,
-                                visibility=ArtefactVisibility.TREE_UNLOCKABLE
-                            )
-                        except Exception:
-                            pass
+            # Delegate the initial population and hash computation to the delta sync engine.
+            # This prevents reading/hashing every file on startup if the DB already knows them.
+            self._sync_artefact_index_with_disk()
+
         except Exception as e:
             ASCIIColors.warning(f"[{self.name}] Failed to initialise artefact system: {e}")
             object.__setattr__(self, '_artefact_manager', None)
             object.__setattr__(self, '_artefact_proxy', None)
-
+            
+            
+            
     def _sanitize_history_for_context(self, text: str) -> str:
         text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r'<!-- status:[^>]*-->', '', text, flags=re.IGNORECASE)
         text = re.sub(r'</processing>', '', text, flags=re.IGNORECASE)
+
+        def _visibility_anchor(match: re.Match) -> str:
+            tag_name = match.group(1).lower()
+            return f"[Assistant executed {tag_name} tag]"
+        text = re.sub(r'<(unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|user_profile_update)\b[^>]*>.*?</\1>', _visibility_anchor, text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<(unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|user_profile_update)\b[^>]*/>', _visibility_anchor, text, flags=re.DOTALL | re.IGNORECASE)
 
         def _artifact_anchor(match: re.Match) -> str:
             attrs_str = match.group(0)
@@ -1004,12 +1506,11 @@ class LollmsPersonality:
 
         return text.strip()
 
-    def _discover_tools(self, explicit_tools: Optional[Dict], tool_files: Optional[List], enable_code_execution: bool) -> Dict[str, Dict[str, Any]]:
+    def _discover_tools(self, explicit_tools: Optional[Dict], tool_files: Optional[List]) -> Dict[str, Dict[str, Any]]:
         active_tools = {}
 
-        # Always include file I/O tools when workspace is active to allow the LLM to read files for SEARCH/REPLACE validation
-        if self._resolved_workspace and self.capabilities and self.capabilities.enable_workspace_tools:
-            active_tools.update(_get_builtin_workspace_tools(include_file_io=True))
+        # Sovereign Tool Opt-In Doctrine: File I/O is strictly handled by the Artefact System (<unlock_file>, <artifact>).
+        # We DO NOT mount generic tool_read_file or tool_write_file to prevent context pollution and architectural drift.
 
         if BindingToolsBuilder and self.lollms_client and self.capabilities:
             binding_tools = BindingToolsBuilder.build_tools(self.lollms_client, self.capabilities, self._resolved_workspace)
@@ -1043,15 +1544,25 @@ class LollmsPersonality:
             except Exception:
                 lcp_binding = None
 
-        if lcp_binding:
+        if lcp_binding and hasattr(lcp_binding, 'mount_tool_library'):
+            # Auto-mount essential discovery and execution tools
+            _ESSENTIAL_LIBRARIES = ["system_shell", "grep_files", "find_files"]
+            for lib_name in _ESSENTIAL_LIBRARIES:
+                try:
+                    lcp_binding.mount_tool_library(lib_name)
+                except Exception as e:
+                    ASCIIColors.warning(f"[LollmsPersonality] Failed to mount LCP tool library '{lib_name}': {e}")
+
             try:
-                if enable_code_execution and hasattr(lcp_binding, 'mount_tool_library'):
-                    lcp_binding.mount_tool_library('execute_python_code')
-                    lcp_tools = lcp_binding.to_chat_tool_specs()
-                    code_tool = {k: v for k, v in lcp_tools.items() if k == 'tool_execute_python_code'}
-                    active_tools.update(code_tool)
-            except Exception:
-                pass
+                lcp_tools = lcp_binding.to_chat_tool_specs()
+                # Expose all tools from the essential libraries (system_shell, grep, find)
+                for t_name, t_spec in lcp_tools.items():
+                    if t_name.startswith("tool_execute_shell_command") or \
+                       t_name.startswith("tool_grep_") or \
+                       t_name.startswith("tool_find_"):
+                        active_tools[t_name] = t_spec
+            except Exception as e:
+                ASCIIColors.warning(f"[LollmsPersonality] Failed to extract LCP tool specs: {e}")
 
         if tool_files:
             try:
@@ -1066,7 +1577,121 @@ class LollmsPersonality:
 
         return active_tools
 
-    def _build_system_prompt(self, active_tools: Dict, enable_code_execution: bool) -> str:
+    def _init_scratchpad(self):
+        """Initializes the persistent scratchpad file in the .lollms_code directory."""
+        if not self._resolved_workspace:
+            object.__setattr__(self, '_scratchpad_path', None)
+            return
+
+        sandbox_dir = self._resolved_workspace / ".lollms_code"
+        sandbox_dir.mkdir(parents=True, exist_ok=True)
+        scratch_path = sandbox_dir / "scratchpad.md"
+
+        if not scratch_path.exists():
+            scratch_path.write_text("# Agent Persistent Scratchpad\n\nUse this space to store critical state, file lists, and architectural decisions.\n", encoding="utf-8")
+
+        object.__setattr__(self, '_scratchpad_path', scratch_path)
+
+    def _init_user_profile(self, profile_path: Optional[Path]):
+        """Initializes the global user profile manager."""
+        if profile_path is None:
+            object.__setattr__(self, '_user_profile_path', None)
+            object.__setattr__(self, '_user_profile_content', "")
+            return
+
+        try:
+            profile_path.parent.mkdir(parents=True, exist_ok=True)
+            if not profile_path.exists():
+                default_content = (
+                    "# 👤 Global User Profile\n"
+                    "This file contains universal information about the user. It is loaded into the agent's context at the start of every session.\n"
+                    "The agent can update this file using `<user_profile_update>` tags.\n"
+                    "CRITICAL: Do not store project-specific information here. Use the workspace scratchpad for project state.\n\n"
+                    "## Identity\n- Name: \n- Occupation: \n\n"
+                    "## Global Constraints & Preferences\n- \n\n"
+                    "## Frequently Used Tools & Workflows\n- \n"
+                )
+                profile_path.write_text(default_content, encoding="utf-8")
+
+            content = profile_path.read_text(encoding="utf-8", errors="ignore")
+            object.__setattr__(self, '_user_profile_path', profile_path)
+            object.__setattr__(self, '_user_profile_content', content)
+        except Exception as e:
+            ASCIIColors.warning(f"[{self.name}] Failed to initialize user profile: {e}")
+            object.__setattr__(self, '_user_profile_path', None)
+            object.__setattr__(self, '_user_profile_content', "")
+
+    def _build_scratchpad_context(self) -> str:
+        """Reads the scratchpad content for injection into the dynamic suffix."""
+        if not getattr(self, '_scratchpad_path', None) or not self._scratchpad_path.exists():
+            return ""
+
+        try:
+            content = self._scratchpad_path.read_text(encoding="utf-8", errors="ignore")
+            if not content.strip():
+                return ""
+            return f"=== SCRATCHPAD CONTENT ===\n{content}\n=== END SCRATCHPAD ==="
+        except Exception:
+            return ""
+
+    def _build_user_profile_context(self) -> str:
+        """Injects the global user profile into the system prompt."""
+        if not getattr(self, '_user_profile_content', ""):
+            return ""
+
+        return (
+            "\n=== GLOBAL USER PROFILE (IDENTITY & PREFERENCES) ===\n"
+            "This is the universal profile of the user. It applies to ALL projects and sessions.\n"
+            "If you learn a new universal fact about the user (e.g., their name, a global coding standard they follow), you MUST update this file.\n"
+            "To update it, emit: `<user_profile_update>` with Aider SEARCH/REPLACE blocks inside.\n"
+            "CRITICAL: Do NOT store project-specific facts (like 'the current project uses FastAPI') here. Use the Scratchpad for project state.\n"
+            "=== PROFILE CONTENT ===\n"
+            f"{self._user_profile_content}\n"
+            "=== END PROFILE ===\n"
+        )
+
+    def _execute_scratchpad_update(self, tag_name: str, body: str) -> str:
+        """Executes append or patch operations on the scratchpad file."""
+        if not getattr(self, '_scratchpad_path', None):
+            return "[SYSTEM ERROR] Scratchpad not initialized."
+
+        try:
+            current_content = self._scratchpad_path.read_text(encoding="utf-8", errors="ignore")
+
+            if tag_name == "scratchpad_append":
+                new_content = current_content + "\n" + body.strip() + "\n"
+                self._scratchpad_path.write_text(new_content, encoding="utf-8")
+                return "✅ Content appended to scratchpad successfully."
+
+            elif tag_name == "scratchpad_patch":
+                # Reuse the robust Aider patch logic from ArtefactManager
+                from lollms_client.lollms_artefact import ArtefactManager
+                patched_content = ArtefactManager.apply_aider_patch(current_content, body)
+                self._scratchpad_path.write_text(patched_content, encoding="utf-8")
+                return "✅ Scratchpad patched successfully."
+
+            return "[SYSTEM ERROR] Unknown scratchpad operation."
+        except Exception as e:
+            return f"[SYSTEM ERROR] Failed to update scratchpad: {e}"
+
+    def _execute_user_profile_update(self, body: str) -> str:
+        """Executes a patch operation on the global user profile file."""
+        if not getattr(self, '_user_profile_path', None):
+            return "[SYSTEM ERROR] User profile not initialized."
+
+        try:
+            current_content = self._user_profile_path.read_text(encoding="utf-8", errors="ignore")
+            from lollms_client.lollms_artefact import ArtefactManager
+            patched_content = ArtefactManager.apply_aider_patch(current_content, body)
+            self._user_profile_path.write_text(patched_content, encoding="utf-8")
+
+            # Update the in-memory cache so the next system prompt build reflects the change
+            object.__setattr__(self, '_user_profile_content', patched_content)
+            return "✅ Global user profile updated successfully."
+        except Exception as e:
+            return f"[SYSTEM ERROR] Failed to update user profile: {e}"
+
+    def _build_system_prompt(self, active_tools: Dict) -> str:
         sys_prompt = self.system_prompt or ""
         rules = (
            "\n=== ACTION EXECUTION & TERMINATION PROTOCOL (CRITICAL) ===\n"
@@ -1092,7 +1717,7 @@ class LollmsPersonality:
             "// new lines to replace with\n"
             ">>>>>>> REPLACE\n"
             "</artifact>\n"
-            "If a patch fails, the system will return the error. You MUST read the error, re-read the file using `tool_read_file`, and correct your SEARCH block.\n"
+            "If a patch fails, the system will return the error. You MUST read the error carefully. The file content is already available in your context under the `## Fully Loaded File Contents [C]` section. Concentrate on the exact text, fix your SEARCH block, and re-emit the `<artifact>` tag. Do not attempt to use a `tool_read_file` tool, as it does not exist.\n"
             "\n=== SKILLS SYSTEM ===\n"
             "Skills are persistent knowledge capsules stored outside the workspace. They survive across sessions.\n"
             "Use `tool_list_skills` to see available skills, and `tool_load_skill` to load their full content.\n"
@@ -1104,9 +1729,53 @@ class LollmsPersonality:
             "Use this for heavy tasks like writing large scripts, researching topics, or designing presentations.\n"
             "\n=== THINKING & REASONING CONSTRAINT ===\n"
             "If you output thoughts enclosed in  tags, you MUST output all functional XML tags AFTER the closing tag.\n"
+            "\n=== TOOL CALLING DISCIPLINE (CRITICAL) ===\n"
+            "1. **EXACT CLOSING TAG**: The closing tag is `</tool>`. You MUST NOT write ``` or any other variation.\n"
+            "2. **NEW LINE ONLY**: The `<tool>` tag MUST start on a brand new line.\n"
+            "3. **NO PROSE AROUND IT**: Do NOT write introductory text before the tag, and do NOT write text after it on the same line.\n"
+            "4. **EXACT JSON FORMAT**: The content inside the `<tool>` tag MUST be a valid JSON object with `name` and `parameters` keys.\n"
+            "\nExample of CORRECT behavior:\n"
+            "<tool>{\"name\": \"tool_search_files\", \"parameters\": {\"pattern\": \"TODO\"}}</tool>\n\n"
+            "Example of WRONG (XML attributes, forbidden):\n"
+            "<tool_execute_shell_command command=\"type ..\\README.md\" />\n\n"
+            "=== END TOOL CALLING DISCIPLINE ===\n"
             "\n=== ANTI-MIMICRY PROTOCOL (CRITICAL) ===\n"
             "1. **NEVER OUTPUT SYSTEM MARKERS**: You are STRICTLY FORBIDDEN from generating `<processing>` blocks or `[SYSTEM:` markers.\n"
             "2. **USE REAL TAGS**: To call tools, use the actual `<tool>` XML tags.\n"
+            "\n=== GLOBAL USER PROFILE MANAGEMENT ===\n"
+            "You have access to a universal user profile that persists across ALL projects and sessions.\n"
+            "It contains the user's identity, global constraints, and universal preferences.\n"
+            "CRITICAL: Do NOT store project-specific information (like 'this project uses React') in the user profile. Use the Scratchpad for project state.\n"
+            "To update the user profile when you learn a new universal fact, emit:\n"
+            "<user_profile_update>\n"
+            "<<<<<<< SEARCH\n"
+            "// exact lines to find\n"
+            "=======\n"
+            "// new lines to replace with\n"
+            ">>>>>>> REPLACE\n"
+            "</user_profile_update>\n"
+            "\n=== WORKSPACE CONTEXT & DYNAMIC STATE PROTOCOL (CRITICAL) ===\n"
+            "You operate inside a workspace. At the beginning of EVERY turn, the user's prompt will be suffixed with a dynamic context block.\n"
+            "This block contains:\n"
+            "1. **Workspace Directory Tree**: A list of all files with markers indicating their state.\n"
+            "   - [C] Fully Loaded in Context (Verbatim text/code is provided below the tree)\n"
+            "   - [M] Signature / Metadata Only (Exposes schemas, layouts, or code signatures)\n"
+            "   - [U] Inactive/Unlockable (Excluded from context, but you can unlock it to [C] by calling <unlock_file>)\n"
+            "   - [L] Locked in Tree (Excluded from context and cannot be unlocked)\n"
+            "2. **Fully Loaded File Contents**: The raw text of any files marked [C].\n"
+            "3. **Persistent Scratchpad**: Your long-term notes for state recovery across sessions.\n"
+            "   To update it, use:\n"
+            "   1. `<scratchpad_append>content to add</scratchpad_append>`\n"
+            "   2. `<scratchpad_patch>` with Aider SEARCH/REPLACE blocks to surgically update sections.\n"
+            "4. **Active Memories**: Relevant memories hydrated from your persistent database.\n"
+            "\n**CONTEXT VISIBILITY OPERATIONS**\n"
+            "To manage your context budget, you can emit the following tags:\n"
+            "- `<unlock_file>filename.py</unlock_file>`: Loads a file into your context (changes [U] to [C]).\n"
+            "- `<lock_file>filename.py</lock_file>`: Removes a file from your context (changes [C] to [U]).\n"
+            "- `<hide_file>filename.py</hide_file>`: Completely removes a file from your view.\n"
+            "- `<collapse_folder>folder_name</collapse_folder>`: Hides all files within a folder.\n"
+            "- `<uncollapse_folder>folder_name</uncollapse_folder>`: Restores a collapsed folder.\n"
+            "- Batch operations are supported (separate files with newlines, commas, or semicolons).\n"
         )
 
         memory_instructions = ""
@@ -1121,55 +1790,6 @@ class LollmsPersonality:
                 "3. **AUTOMATIC RECALL**: Relevant memories are automatically injected into your context. You do not need to query them manually.\n"
                 "4. **MANDATORY**: Always use memory tags for non-trivial user facts. If the user tells you their name, you MUST emit `<mem_new>` immediately.\n"
             )
-
-        workspace_ctx = (""
-            "2. **MANDATORY TAG EMISSION**: To execute an action, you MUST output the `<tool>` tag immediately.\n"
-            "3. **EXPLICIT TERMINATION WITH `<done/>`**: When finished, end with a `<done/>` tag on a new line.\n"
-            "4. **SAME-SESSION CONTINUATION**: When executing a sequence, emit the next action's tag in your IMMEDIATE NEXT response.\n"
-            "5. **ROUND 1 SHORT-CIRCUIT**: If the user's request is purely conversational, respond conversationally without `<done/>`.\n"
-            "\n=== TOOL CALLING DISCIPLINE (CRITICAL) ===\n"
-            "1. **Tool Results ≠ Tool Calls**: When a tool returns JSON, it's a RESULT, not a new call.\n"
-            "2. **One Call Per Task**: Once a tool succeeds, analyze and answer.\n"
-            "3. **Loop Prevention**: Repeating a successful tool call with identical parameters is a CRITICAL ERROR.\n"
-            "4. **File Outputs**: When a tool returns a file, it's ALREADY saved. Do NOT call it again.\n"
-            "\n=== FILE EDITING PROTOCOL (AIDER SEARCH/REPLACE) ===\n"
-            "For surgical updates to existing files, you MUST use the `<artifact>` tag with SEARCH/REPLACE blocks.\n"
-            "The system automatically applies fuzzy matching and auto-correction if the exact search string isn't found.\n"
-            "Syntax:\n"
-            "<artifact name=\"filename.ext\" type=\"code\" language=\"python\">\n"
-            "<<<<<<< SEARCH\n"
-            "// exact lines to find\n"
-            "=======\n"
-            "// new lines to replace with\n"
-            ">>>>>>> REPLACE\n"
-            "</artifact>\n"
-            "If a patch fails, the system will return the error. You MUST read the error, re-read the file using `tool_read_file`, and correct your SEARCH block.\n"
-            "\n=== SKILLS SYSTEM ===\n"
-            "Skills are persistent knowledge capsules stored outside the workspace. They survive across sessions.\n"
-            "Use `tool_list_skills` to see available skills, and `tool_load_skill` to load their full content.\n"
-            "If you discover a reusable methodology or best practice, use `tool_create_skill` to save it for future use.\n"
-            "Use `tool_update_skill` to refine existing skills as you learn more.\n"
-            "\n=== SUB-AGENT DELEGATION ===\n"
-            "If `tool_spawn_sub_agent` is available, you can delegate complex sub-tasks to a focused child agent.\n"
-            "The child shares your workspace but cannot spawn further sub-agents.\n"
-            "Use this for heavy tasks like writing large scripts, researching topics, or designing presentations.\n"
-            "\n=== THINKING & REASONING CONSTRAINT ===\n"
-            "If you output thoughts enclosed in  tags, you MUST output all functional XML tags AFTER the closing tag.\n"
-            "\n=== ANTI-MIMICRY PROTOCOL (CRITICAL) ===\n"
-            "1. **NEVER OUTPUT SYSTEM MARKERS**: You are STRICTLY FORBIDDEN from generating `<processing>` blocks or `[SYSTEM:` markers.\n"
-            "2. **USE REAL TAGS**: To call tools, use the actual `<tool>` XML tags.\n"
-        )
-
-        workspace_ctx = ""
-        if getattr(self, '_artefact_manager', None):
-            try:
-                zone = self._artefact_manager.build_artefacts_context_zone()
-                if zone:
-                    workspace_ctx = "\n" + zone
-            except Exception:
-                pass
-        elif self._resolved_workspace:
-            workspace_ctx = "\n" + _build_workspace_context(self._resolved_workspace)
 
         skills_ctx = ""
         if self.skills_manager:
@@ -1186,7 +1806,158 @@ class LollmsPersonality:
                 param_desc = ", ".join([f"{p['name']}: {p['type']}" for p in params_list])
                 tool_desc += f"- {t_name}({param_desc}): {desc}\n"
 
-        return sys_prompt + "\n" + rules + workspace_ctx + skills_ctx + tool_desc
+        # 🛡️ KV-CACHE OPTIMIZATION: Workspace context is strictly kept OUT of the system prompt.
+        # It is injected as a dynamic suffix at the very end of the messages array.
+        return sys_prompt + "\n" + rules + skills_ctx + tool_desc
+    
+    def _execute_context_visibility(self, tag_name: str, body: str) -> str:
+        if not hasattr(self, '_artefact_manager') or not self._artefact_manager:
+            return "[SYSTEM ERROR] Artefact system not initialized. Cannot manage file visibility."
+
+        try:
+            from lollms_client.lollms_artefact import ArtefactVisibility
+        except ImportError:
+            return "[SYSTEM ERROR] ArtefactVisibility module not available."
+
+        target_visibility = ArtefactVisibility.FULL
+        action_verb = "Unlocking"
+        if tag_name == "lock_file":
+            target_visibility = ArtefactVisibility.TREE_LOCKED
+            action_verb = "Locking"
+        elif tag_name == "hide_file":
+            target_visibility = ArtefactVisibility.HIDDEN
+            action_verb = "Hiding"
+        elif tag_name == "collapse_folder":
+            target_visibility = ArtefactVisibility.FOLDER_COLLAPSED
+            action_verb = "Collapsing"
+        elif tag_name == "uncollapse_folder":
+            target_visibility = ArtefactVisibility.TREE_UNLOCKABLE
+            action_verb = "Uncollapsing"
+
+        clean_body = body
+        if "<" in body and ">" in body:
+            xml_bodies = re.findall(r'<[^>]+>(.*?)</[^>]+>', body, re.DOTALL)
+            if xml_bodies:
+                clean_body = "\n".join(xml_bodies)
+
+        # Split by newlines, commas, or semicolons to support batch operations
+        raw_targets = re.split(r'[\n,;]+', clean_body)
+        targets = [t.strip().replace("\\", "/") for t in raw_targets if t.strip()]
+
+        processed_files = []
+        already_in_state = []
+        not_found = []
+        blocked_files = []
+
+        _MAX_UNLOCK_TOKENS = 50000
+        all_arts = self._artefact_manager._get_all_raw()
+
+        for t_target in targets:
+            # Handle folder operations
+            if tag_name in ("collapse_folder", "uncollapse_folder"):
+                folder_prefix = t_target.rstrip('/') + '/'
+                matched_arts = [a for a in all_arts if a.get("physical_path", "").replace("\\", "/").startswith(folder_prefix)]
+
+                if not matched_arts:
+                    not_found.append(t_target)
+                    continue
+
+                for art in matched_arts:
+                    if art.get("visibility") == target_visibility:
+                        already_in_state.append(art["title"])
+                    else:
+                        art["visibility"] = target_visibility
+                        if target_visibility == ArtefactVisibility.FULL:
+                            art["active"] = True
+                        else:
+                            art["active"] = False
+                            art["content"] = ""
+                        processed_files.append(art["title"])
+                continue
+
+            # Handle individual file operations
+            art = self._artefact_manager.get(t_target)
+            if not art:
+                best_match = self._artefact_manager._find_best_title_match(t_target, [a["title"] for a in all_arts])
+                if best_match:
+                    art = self._artefact_manager.get(best_match)
+                    t_target = best_match
+
+            if not art:
+                not_found.append(t_target)
+            elif art.get("visibility") == target_visibility:
+                already_in_state.append(t_target)
+            elif target_visibility == ArtefactVisibility.FULL:
+                file_path = self._resolved_workspace / t_target
+                token_count = 0
+                content = ""
+
+                if file_path.exists():
+                    try:
+                        content = file_path.read_text(encoding="utf-8", errors="ignore")
+                        token_count = len(content) // 4
+                    except Exception:
+                        pass
+
+                if token_count > _MAX_UNLOCK_TOKENS:
+                    ASCIIColors.warning(
+                        f"[ContextBudgetGuard] Blocked unlock of '{t_target}': "
+                        f"~{token_count:,} tokens exceeds limit of {_MAX_UNLOCK_TOKENS:,}."
+                    )
+                    blocked_files.append((t_target, token_count))
+                else:
+                    art["content"] = content
+                    art["token_count"] = token_count
+                    art["content_source"] = "db"
+                    art["visibility"] = ArtefactVisibility.FULL
+                    art["active"] = True
+                    processed_files.append(t_target)
+            else:
+                art["visibility"] = target_visibility
+                art["active"] = False
+                art["content"] = ""
+                processed_files.append(t_target)
+
+        try:
+            # Persist to SQLite state DB
+            if hasattr(self, '_state_db_path') and hasattr(self, '_artefact_manager'):
+                import sqlite3 as _sqlite3
+                conn = _sqlite3.connect(str(self._state_db_path))
+                cursor = conn.cursor()
+                for t_file in processed_files + already_in_state:
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO file_states (title, visibility) VALUES (?, ?)",
+                        (t_file, target_visibility)
+                    )
+                conn.commit()
+                conn.close()
+        except Exception as commit_err:
+            ASCIIColors.warning(f"[LollmsPersonality] Failed to persist visibility state: {commit_err}")
+
+        status_parts = []
+        if processed_files:
+            status_parts.append(f"✅ {action_verb}: {', '.join(processed_files)}")
+        if already_in_state:
+            status_parts.append(f"⚠️ Already in target state: {', '.join(already_in_state)}")
+        if not_found:
+            status_parts.append(f"❌ Not found: {', '.join(not_found)}")
+        if blocked_files:
+            blocked_desc = "; ".join(
+                f"{bf} (~{tc:,} tokens)" for bf, tc in blocked_files
+            )
+            status_parts.append(
+                f"🛑 BLOCKED (too large for context): {blocked_desc}. "
+                f"Use a tool (SQL query, grep, or Python script) to extract "
+                f"specific data from this file instead of loading it fully."
+            )
+
+        status_meta = "failure" if (not_found and not processed_files) or blocked_files else "success"
+
+        if processed_files or already_in_state:
+            object.__setattr__(self, '_last_ws_sync_time', 0.0)
+
+        return f"{action_verb} context files...\nContext Update:\n{'; '.join(status_parts)}\nstatus:{status_meta}"
+
 
     def _execute_tool(self, tool_name: str, tool_params: Dict[str, Any], active_tools: Dict) -> Dict[str, Any]:
         old_cwd = os.getcwd()
@@ -1266,13 +2037,13 @@ class LollmsPersonality:
         max_reasoning_steps: int = 20,
         temperature: float = 0.7,
         n_predict: int = 4096,
-        enable_code_execution: Optional[bool] = None,
         enable_artefacts: bool = True,
         use_internal_history: bool = True,
         **kwargs
     ) -> Dict[str, Any]:
         """
         Independent agentic chat loop. Used when the personality operates outside of a LollmsDiscussion.
+        Implements KV-Cache optimized prompt assembly (Append-Only Context Protocol).
         """
         if lollms_client is not None:
             self.lollms_client = lollms_client
@@ -1285,41 +2056,75 @@ class LollmsPersonality:
         if self._sub_agent_spawner:
             self._sub_agent_spawner.reset_turn()
 
-        code_exec = enable_code_execution if enable_code_execution is not None else (self.capabilities.enable_code_execution if self.capabilities else False)
-
         if self._failure_memory and hasattr(self._failure_memory, '_signatures'):
             self._failure_memory._signatures.clear()
             if hasattr(self._failure_memory, 'failures'):
                 self._failure_memory.failures = []
 
-        if self._resolved_workspace and enable_artefacts and not hasattr(self, '_artefact_manager'):
-            self._init_artefact_system()
+        if enable_artefacts:
+            if not self.workspace_path:
+                ASCIIColors.warning(f"[{self.name}] Workspace path is not set. Artefact system disabled.")
+            else:
+                object.__setattr__(self, '_resolved_workspace', Path(self.workspace_path).resolve())
+                if getattr(self, '_artefact_manager', None) is None:
+                    self._init_artefact_system()
+                    ASCIIColors.info(f"[{self.name}] ✅ Artefact system initialized for workspace: {self._resolved_workspace}")
 
-        active_tools = self._discover_tools(tools, tool_files or [], code_exec)
-        full_system_prompt = self._build_system_prompt(active_tools, code_exec)
+        self._init_scratchpad()
 
-        # ── Pre-Turn Memory Hydration ──
-        # Pull relevant memories from the LollmsMemoryManager and inject them into the system prompt
-        # so the LLM can "remember" facts across sessions (e.g., the user's name).
+        cleaned_prompt = prompt
+        if enable_artefacts and hasattr(self, '_artefact_manager') and self._artefact_manager:
+            try:
+                cleaned_prompt = self._autonomous_context_cleanup(prompt)
+            except Exception as clean_err:
+                ASCIIColors.warning(f"[{self.name}] Autonomous context cleanup failed: {clean_err}")
+
+        active_tools = self._discover_tools(tools, tool_files or [])
+
+        # ── 🛡️ KV-CACHE OPTIMIZATION: STABLE SYSTEM PROMPT (IMMUTABLE) ──
+        # The stable system prompt contains ONLY the base instructions and the user profile.
+        # It MUST NOT contain the scratchpad or dynamic memories, as those can change between rounds.
+        stable_system_prompt = self._build_system_prompt(active_tools)
+        stable_system_prompt += self._build_user_profile_context()
+
+        # ── Build the Dynamic Suffix (Tree + Scratchpad + Memories) ──
+        # This will be injected ONLY at Round 1, appended directly to the user's prompt.
+        dynamic_suffix_parts = []
+
+        ws_ctx = self._build_workspace_context_block()
+        if ws_ctx:
+            dynamic_suffix_parts.append(ws_ctx.strip())
+
+        scratchpad_ctx = self._build_scratchpad_context()
+        if scratchpad_ctx:
+            dynamic_suffix_parts.append(scratchpad_ctx.strip())
+
         if self.memory_manager:
             try:
-                # Pull deep memories relevant to the current prompt
                 if hasattr(self.memory_manager, 'auto_pull_deep_memories'):
-                    self.memory_manager.auto_pull_deep_memories(prompt)
+                    self.memory_manager.auto_pull_deep_memories(cleaned_prompt)
 
-                # Build the memory context block and append it to the system prompt
                 if hasattr(self.memory_manager, 'build_working_zone'):
                     mem_zone = self.memory_manager.build_working_zone()
                     if mem_zone:
-                        full_system_prompt += "\n=== ACTIVE MEMORIES (PERSISTENT ACROSS SESSIONS) ===\n" + mem_zone + "\n=== END MEMORIES ===\n"
+                        dynamic_suffix_parts.append("=== ACTIVE MEMORIES (PERSISTENT ACROSS SESSIONS) ===\n" + mem_zone + "\n=== END MEMORIES ===")
             except Exception as mem_ex:
                 ASCIIColors.warning(f"[{self.name}] Failed to hydrate memories: {mem_ex}")
+
+        dynamic_suffix = "\n\n".join(dynamic_suffix_parts)
 
         if use_internal_history:
             base_conversation = list(self._conversation)
         else:
             base_conversation = []
-        base_conversation.append({"role": "user", "content": prompt})
+
+        # Fuse the dynamic suffix with the user's prompt for Round 1
+        if dynamic_suffix:
+            fused_prompt = f"=== CURRENT WORKSPACE CONTEXT ===\n{dynamic_suffix}\n=== END WORKSPACE CONTEXT ===\n\n{cleaned_prompt}"
+        else:
+            fused_prompt = cleaned_prompt
+
+        base_conversation.append({"role": "user", "content": fused_prompt})
 
         virtual_history: List[SimpleNamespace] = []
         tool_calls_this_turn: List[Dict[str, Any]] = []
@@ -1344,12 +2149,69 @@ class LollmsPersonality:
                 except Exception:
                     pass
 
-            messages = [{"role": "system", "content": full_system_prompt}]
+            # ── 🛡️ KV-CACHE OPTIMIZATION: APPEND-ONLY CONTEXT PROTOCOL ──
+            # 1. Start with the STABLE system prompt (never changes between rounds)
+            messages = [{"role": "system", "content": stable_system_prompt}]
+            
+            # 2. Add the OLD, stable history
             messages.extend(base_conversation)
+
+            # 3. Add the VIRTUAL HISTORY (append-only tool calls/results from this turn)
+            # Context compaction is strictly deferred to the fallback block where the actual
+            # context fill percentage can be measured accurately.
 
             for vh in virtual_history:
                 role = "user" if vh.sender_type == "user" else "assistant"
                 messages.append({"role": role, "content": vh.content})
+
+            # 4. APPEND-ONLY DYNAMIC SUFFIX PROTOCOL
+            # The dynamic context was already fused into the user's prompt in base_conversation.
+            # We do NOT modify the messages array here. In Round 2+, we rely strictly on 
+            # appending virtual_history (tool results) to the end of the array.
+            if round_count > 1:
+                if not virtual_history or virtual_history[-1].sender_type == "assistant":
+                    messages.append({"role": "user", "content": "[SYSTEM: Continue your task.]"})
+
+            # ── 🐛 DEBUG INSTRUMENTATION: CONTEXT DUMP TO FILE ──
+            if getattr(self, 'debug_mode', False):
+                try:
+                    debug_dir = self._resolved_workspace / ".lollms_code" / "_debug_dumps"
+                    debug_dir.mkdir(parents=True, exist_ok=True)
+                    debug_log_path = debug_dir / f"prompt_dump_round_{round_count}.log"
+
+                    with open(debug_log_path, "w", encoding="utf-8") as f:
+                        f.write("="*80 + "\n")
+                        f.write(f"🐛 [DEBUG] ROUND {round_count} - PROMPT MESSAGES DUMP\n")
+                        f.write("="*80 + "\n")
+                        for i, msg in enumerate(messages):
+                            role = msg.get("role", "unknown").upper()
+                            content = msg.get("content", "")
+                            f.write(f"\n--- MSG [{i}] ROLE: {role} ---\n")
+                            f.write(content + "\n")
+                        f.write("\n" + "="*80 + "\n")
+                except Exception as debug_err:
+                    ASCIIColors.warning(f"Failed to write debug log: {debug_err}")
+
+            # ── 🐛 DEBUG INSTRUMENTATION: SHORTENED CONTEXT DUMP ──
+            if getattr(self, 'debug_mode', False):
+                try:
+                    debug_dir = self._resolved_workspace / ".lollms_code" / "_debug_dumps"
+                    debug_dir.mkdir(parents=True, exist_ok=True)
+                    short_log_path = debug_dir / f"prompt_dump_round_{round_count}_shortened.md"
+
+                    with open(short_log_path, "w", encoding="utf-8") as f:
+                        f.write(f"# 🐛 Round {round_count} - Shortened Prompt Dump\n\n")
+                        for i, msg in enumerate(messages):
+                            role = msg.get("role", "unknown").upper()
+                            content = msg.get("content", "")
+                            if len(content) > 1000:
+                                short_content = content[:500] + "\n\n[... truncated ...]\n\n" + content[-500:]
+                            else:
+                                short_content = content
+                            f.write(f"## MSG [{i}] - {role}\n\n")
+                            f.write(f"```\n{short_content}\n```\n\n")
+                except Exception as debug_err:
+                    ASCIIColors.warning(f"Failed to write shortened debug log: {debug_err}")
 
             messages = _normalize_messages(messages)
 
@@ -1377,6 +2239,11 @@ class LollmsPersonality:
                     streaming_callback=_inline_relay,
                     **gen_kwargs
                 )
+                if hasattr(self.lollms_client, 'llm') and hasattr(self.lollms_client.llm, 'flush_stream'):
+                    try:
+                        self.lollms_client.llm.flush_stream()
+                    except Exception:
+                        pass
             except Exception as gen_err:
                 if self.is_generation_cancelled():
                     was_cancelled = True
@@ -1438,6 +2305,17 @@ class LollmsPersonality:
                         tool_results_this_turn.append({"round": round_count, "name": tool_name, "result": tool_res, "success": tool_success})
                         clean_result_str = _sanitize_tool_result(tool_res)
 
+                        event_mode = kwargs.get("event_mode", EventMode.PROCESSING_TAG_MODE)
+                        if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                            try:
+                                if streaming_callback:
+                                    streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_START, {
+                                        "tool_name": tool_name,
+                                        "parameters": tool_params
+                                    })
+                            except Exception:
+                                pass
+
                         if tool_success:
                             user_part = (
                                 f"=== ✅ TOOL RESULT: {tool_name} ===\n"
@@ -1451,11 +2329,175 @@ class LollmsPersonality:
                                 f"<tool_result name=\"{tool_name}\" status=\"FAILED\">\n{clean_result_str}\n</tool_result>\n"
                                 f"Analyze the error and try a different approach, or emit <done/> if stuck."
                             )
+
+                        if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                            try:
+                                if streaming_callback:
+                                    streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_END, {
+                                        "tool_name": tool_name,
+                                        "success": tool_success,
+                                        "output": clean_result_str if tool_success else None,
+                                        "error": None if tool_success else clean_result_str
+                                    })
+                            except Exception:
+                                pass
+
                         virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
                         continue
                     except Exception as e:
                         final_response = f"[Tool execution error: {e}]"
                         break
+            elif ss.context_trigger or (ss.was_action_dispatched() and ("<unlock_file" in ss.get_clean_text().lower() or "<collapse_folder" in ss.get_clean_text().lower() or "<scratchpad_" in ss.get_clean_text().lower())):
+                raw_round_text = ss.get_clean_text()
+                tag_xml = ss.get_context_tag_xml() or ""
+                full_extraction_text = raw_round_text + "\n" + tag_xml
+                ASCIIColors.info(f"[{self.name}] 🔍 [Context Trigger] Intercepted raw text: {full_extraction_text[:200]}...")
+
+                def _extract_robust_tags(text: str) -> list:
+                    tags = []
+                    pattern = re.compile(
+                        r'(<(unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|user_profile_update)\b[^>]*?/?>)',
+                        re.IGNORECASE
+                    )
+                    for m in pattern.finditer(text):
+                        full_tag = m.group(1)
+                        tag_name = m.group(2).lower()
+
+                        if full_tag.strip().endswith("/>"):
+                            tags.append((full_tag, tag_name, ""))
+                            continue
+
+                        close_tag = f"</{tag_name}>"
+                        close_idx = text.find(close_tag, m.end())
+                        if close_idx != -1:
+                            body = text[m.end():close_idx].strip()
+                            full_match = text[m.start():close_idx + len(close_tag)]
+                            tags.append((full_match, tag_name, body))
+                        else:
+                            body = text[m.end():].strip()
+                            tags.append((full_tag, tag_name, body))
+                    return tags
+
+                all_tags = _extract_robust_tags(full_extraction_text)
+
+                _VALID_VISIBILITY_TAGS = ("unlock_file", "lock_file", "hide_file", "collapse_folder", "uncollapse_folder", "scratchpad_append", "scratchpad_patch", "user_profile_update")
+                has_tag_marker = any(f"<{tag}" in raw_round_text.lower() for tag in _VALID_VISIBILITY_TAGS)
+
+                if not all_tags and not has_tag_marker:
+                    clean_history_text = self._sanitize_history_for_context(raw_round_text)
+                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant executed a context visibility tag]"))
+                    continue
+
+                if not all_tags and raw_round_text.strip():
+                    ASCIIColors.warning(f"[{self.name}] ⚠️ [Context Trigger] Malformed tag detected. Injecting format correction.")
+                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=raw_round_text))
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content="[SYSTEM: You emitted a partial or malformed context visibility tag. No action was taken. If you intended to unlock a file, ensure the tag is properly closed (e.g., <unlock_file>path/to/file.py</unlock_file>).]"
+                    ))
+                    continue
+
+                if not all_tags:
+                    continue
+
+                clean_history_text = raw_round_text
+                for tag_tuple in all_tags:
+                    clean_history_text = clean_history_text.replace(tag_tuple[0], "")
+                clean_history_text = clean_history_text.strip()
+
+                virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text else "[Assistant executed a context visibility tag]"))
+
+                try:
+                    processed_files = []
+                    already_loaded_intercept = False
+
+                    all_arts = self._artefact_manager._get_all_raw() if self._artefact_manager else []
+                    loaded_files = [
+                        a.get("title", "") for a in all_arts 
+                        if a.get("visibility") == ArtefactVisibility.FULL
+                    ]
+
+                    for tag_tuple in all_tags:
+                        full_tag_str = tag_tuple[0]
+                        tag_name = tag_tuple[1].lower()
+                        body_content = tag_tuple[2]
+
+                        ASCIIColors.info(f"[{self.name}] 🔓 [Context Trigger] Executing tag: {tag_name} with body: {body_content[:50]}...")
+
+                        if "scratchpad" in tag_name:
+                            user_part = self._execute_scratchpad_update(tag_name, body_content)
+                            virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
+                            continue
+
+                        if "user_profile_update" in tag_name:
+                            user_part = self._execute_user_profile_update(body_content)
+                            virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
+                            continue
+
+                        if tag_name == "unlock_file":
+                            target_files = [t.strip().replace("\\", "/") for t in re.split(r'[\n,;]+', body_content) if t.strip()]
+                            if all(tf in loaded_files for tf in target_files):
+                                ASCIIColors.info(f"[{self.name}] ⚡ [Context Trigger] Perception-loop detected: Files {target_files} are already loaded.")
+                                already_loaded_intercept = True
+                                user_part = "[SYSTEM: The requested file(s) are ALREADY fully loaded in your context (marked [C]). Do not emit <unlock_file> again. Acknowledge the user that the file is loaded and emit <done/> to finish the turn.]"
+                                virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
+                                continue
+
+                        user_part = self._execute_context_visibility(tag_name, body_content)
+                        virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
+
+                        if "✅ Unlocking:" in user_part:
+                            extracted_files = re.findall(r'✅ Unlocking: (.*?)\s*(?:\n|$)', user_part)
+                            processed_files.extend([f.strip().replace(" ", "") for f in extracted_files if f.strip()])
+
+                    try:
+                        if hasattr(self, '_artefact_proxy') and hasattr(self._artefact_proxy, 'commit'):
+                            self._artefact_proxy.commit()
+                            ASCIIColors.info(f"[{self.name}] 🔄 [Context Trigger] Persisted artefact visibility changes to proxy.")
+                    except Exception as commit_err:
+                        ASCIIColors.warning(f"[{self.name}] Failed to commit proxy state after visibility change: {commit_err}")
+
+                    if not already_loaded_intercept and processed_files:
+                        loaded_contents = []
+                        all_arts = self._artefact_manager._get_all_raw() if self._artefact_manager else []
+                        for t_file in processed_files:
+                            art = next((a for a in all_arts if a.get("title") == t_file), None)
+                            if not art:
+                                continue
+                            content_val = art.get("content")
+                            if not content_val and hasattr(self, '_resolved_workspace'):
+                                file_path = self._resolved_workspace / art.get("title", t_file)
+                                if file_path.exists():
+                                    try:
+                                        content_val = file_path.read_text(encoding="utf-8", errors="ignore")
+                                        art["content"] = content_val
+                                    except Exception:
+                                        pass
+                            if content_val:
+                                loaded_contents.append(f'<file path="{art.get("title", t_file)}">\n{content_val}\n</file>')
+
+                        if loaded_contents:
+                            content_str = "\n\n".join(loaded_contents)
+                            virtual_history.append(SimpleNamespace(
+                                sender_type="user",
+                                content=f"System infos: The file was loaded successfully.\nLoaded file content:\n{content_str}\nPlease inform the user about that and when you're done doing the task, issue a <done/> tag at the end of your answer"
+                            ))
+                        else:
+                            virtual_history.append(SimpleNamespace(
+                                sender_type="user",
+                                content="[SYSTEM: Context visibility operations applied, but no new file contents were loaded. The files may have been locked, hidden, or already in the target state. Do not emit <unlock_file> again. Acknowledge the user and emit <done/>.]"
+                            ))
+                    elif already_loaded_intercept:
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="user",
+                            content="[SYSTEM: The requested file(s) are ALREADY fully loaded in your context (marked [C]). Do not emit <unlock_file> again. Acknowledge the user that the file is loaded and emit <done/> to finish the turn.]"
+                        ))
+                    continue
+                except Exception as e:
+                    ASCIIColors.error(f"[{self.name}] ❌ [Context Trigger] Exception during execution: {e}")
+                    user_part = f"[SYSTEM ERROR] Failed to process context visibility tag: {e}"
+                    virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
+                    continue
             elif ss.artifact_trigger:
                 raw_artifact_xml = ss.get_artifact_xml()
                 if not raw_artifact_xml:
@@ -1479,11 +2521,6 @@ class LollmsPersonality:
                             lang = m.group(2)
 
                     if "<<<<<<< SEARCH" in body_content:
-                        if not hasattr(self, '_patch_applier') or not self._patch_applier:
-                            user_part = "[SYSTEM ERROR] Patch applier not initialized. Cannot apply SEARCH/REPLACE."
-                            virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
-                            continue
-
                         file_path = self._resolved_workspace / title
                         if not file_path.exists():
                             user_part = f"[SYSTEM ERROR] File '{title}' not found. Cannot apply patch."
@@ -1491,7 +2528,17 @@ class LollmsPersonality:
                             continue
 
                         original_content = file_path.read_text(encoding="utf-8", errors="ignore")
-                        result = self._patch_applier.apply_aider_patch(original_content, body_content, file_name=title, language=lang)
+                        try:
+                            patched_content = ArtefactManager.apply_aider_patch(original_content, body_content)
+                            file_path.write_text(patched_content, encoding="utf-8")
+                            user_part = f"✅ SEARCH/REPLACE applied successfully to {title}."
+                            if self._artefact_manager:
+                                self._artefact_manager.update(title=title, new_content=patched_content, language=lang, bump_version=True, active=True)
+                        except Exception as patch_err:
+                            user_part = f"❌ SEARCH/REPLACE FAILED for {title}.\nError: {patch_err}\n\nPlease read the file using tool_read_file and correct your SEARCH block."
+
+                        virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
+                        continue
 
                         if result.get("success"):
                             file_path.write_text(result["patched_content"], encoding="utf-8")
@@ -1522,7 +2569,20 @@ class LollmsPersonality:
                     final_response = re.sub(r'(?m)^\s*<done\s*/?>\s*$', '', raw_round_text, flags=re.MULTILINE).strip()
                     break
 
-                # 🛑 CONTINUATION MANDATE (NO <done/>)
+                ctx_health = self._calculate_context_fill(stable_system_prompt, base_conversation, virtual_history, raw_round_text)
+
+                if ctx_health["fill_percentage"] > 85.0 and len(virtual_history) > 0 and not getattr(self, '_compaction_triggered_this_turn', False):
+                    ASCIIColors.warning(f"[{self.name}] Context fill at {ctx_health['fill_percentage']}%. Triggering autonomous compaction.")
+                    object.__setattr__(self, '_compaction_triggered_this_turn', True)
+
+                    virtual_history = self._compact_virtual_history(virtual_history, streaming_callback)
+
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content="[SYSTEM: Context has been compacted. Please continue your task based on the summarized history. If you were finished, output your final answer and <done/>.]"
+                    ))
+                    continue
+
                 if len(tool_calls_this_turn) > 0:
                     ASCIIColors.info("[LollmsPersonality.chat] Tool previously executed but no <done/> detected. Injecting continuation mandate.")
                     clean_history_text = self._sanitize_history_for_context(raw_round_text)
@@ -1533,8 +2593,6 @@ class LollmsPersonality:
                     ))
                     continue
 
-                # 🛑 INTENT DETECTION (Migrated from LollmsDiscussion)
-                # If the LLM states an intent to use a tool but stops without emitting the tag, force a continuation.
                 intent_pattern = re.compile(r'(let me|now i|next i|i will|i need to|we need to).*(query|get|fetch|build|create|analyze|summarize|aggregate|plot|explore|check|read|list|write|update|fix|run|execute)', re.IGNORECASE)
                 intent_match = intent_pattern.search(raw_round_text)
                 has_intent = False
@@ -1564,32 +2622,50 @@ class LollmsPersonality:
                     continue
 
                 final_response = raw_round_text
+
+                if len(tool_calls_this_turn) > 0 or getattr(ss, 'context_trigger', False) or getattr(ss, 'artifact_trigger', False):
+                    ASCIIColors.info("[LollmsPersonality.chat] Action previously dispatched but no <done/> detected. Injecting continuation mandate.")
+                    clean_history_text = self._sanitize_history_for_context(raw_round_text)
+                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text))
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content="[SYSTEM: You stopped generation without emitting a <done/> tag. If your task is complete, output a final conversational summary and end it with a <done/> tag on a new line. If you need to continue working, emit the next functional tag now.]"
+                    ))
+                    continue
+
+                if "<tool" in raw_round_text.lower() or "<art" in raw_round_text.lower():
+                    ASCIIColors.warning("[LollmsPersonality.chat] Malformed functional tag detected. Injecting format correction.")
+                    clean_history_text = self._sanitize_history_for_context(raw_round_text)
+                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text))
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content=(
+                            "[SYSTEM: CRITICAL FORMAT ERROR. You emitted a functional tag with the wrong syntax (e.g., using XML attributes instead of JSON). "
+                            "You MUST use the exact format: `<tool>{\"name\": \"...\", \"parameters\": {...}}</tool>`. "
+                            "Output the corrected tag NOW.]"
+                        )
+                    ))
+                    continue
+
                 break
 
         if use_internal_history and not was_cancelled:
             self._conversation.append({"role": "user", "content": prompt})
             self._conversation.append({"role": "assistant", "content": final_response})
 
-        # ── 12. Memory Post-Processing ──
+        object.__setattr__(self, '_compaction_triggered_this_turn', False)
+
         if self.memory_manager:
             try:
                 if hasattr(self.memory_manager, 'process_llm_output'):
                     cleaned_response, mem_report = self.memory_manager.process_llm_output(final_response)
                     if cleaned_response != final_response:
                         final_response = cleaned_response
- 
-                # Save episodic memory (interaction history)
-                if hasattr(self.memory_manager, 'add'):
-                    from datetime import datetime
-                    clean_ai = re.sub(r'<[^>]+>', '', final_response).strip()
-                    clean_user = prompt.strip()
-                    if clean_user and clean_ai and len(clean_user) > 5 and len(clean_ai) > 5:
-                        episode = f"Event/Interaction on {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC:\nUser asked: \"{clean_user}\"\nAI responded: \"{clean_ai}\""
-                        self.memory_manager.add(content=episode, importance=0.6, tags=["episode", "interaction"], level=1)
+
+                self._autonomous_memory_consolidation(prompt, final_response)
             except Exception as mem_ex:
                 ASCIIColors.warning(f"[{self.name}] Failed to process memory tags: {mem_ex}")
 
-        # ── 13. Context Health Telemetry ──
         context_health = {"used_tokens": 0, "max_tokens": 0, "fill_percentage": 0.0}
         try:
             if self.lollms_client and hasattr(self.lollms_client, 'get_ctx_size'):
@@ -1597,7 +2673,7 @@ class LollmsPersonality:
                 if max_ctx > 0:
                     total_used = 0
                     if hasattr(self.lollms_client, 'count_tokens'):
-                        total_used = self.lollms_client.count_tokens(full_system_prompt)
+                        total_used = self.lollms_client.count_tokens(stable_system_prompt)
                         if use_internal_history:
                             for msg in self._conversation:
                                 total_used += self.lollms_client.count_tokens(msg.get("content", ""))
@@ -1623,8 +2699,6 @@ class LollmsPersonality:
            "was_cancelled": was_cancelled,
            "context_health": context_health
        }
-
-
 # ---------------------------------------------------------------------------
 # NullPersonality  — drop-in default so chat() never needs ``if personality:``
 # ---------------------------------------------------------------------------

@@ -127,6 +127,44 @@ class MSG_TYPE(Enum):
     MSG_TYPE_CODING_PLAN_CHUNK          = 48 # streaming chunk of a coding/update plan
     MSG_TYPE_CODING_PLAN_DONE           = 49 # complete coding plan ready for execution
 
+    # ── FULL_CALLBACK_MODE Events ─────────────────────────────────────────────
+    # These events provide granular, structured telemetry for tool executions,
+    # artifact builds, and context updates without injecting <processing> tags
+    # into the LLM's conversational text buffer.
+    #
+    # Contract
+    # --------
+    # When EventMode.FULL_CALLBACK_MODE is active, ChatMixin emits these events
+    # with structured metadata instead of (or alongside, in MIXED_MODE) processing tags.
+    #
+    # meta dict shapes
+    # ----------------
+    # MSG_TYPE_TOOL_START: {"tool_name": str, "parameters": dict}
+    # MSG_TYPE_TOOL_END:   {"tool_name": str, "success": bool, "output": str, "error": str|None}
+    #
+    # MSG_TYPE_ARTEFACT_BUILD_START: {"title": str, "art_type": str, "language": str|None, "is_patch": bool}
+    # MSG_TYPE_ARTEFACT_BUILD_END:   {"title": str, "art_type": str, "version": int, "success": bool, "error": str|None}
+    #
+    # MSG_TYPE_CONTEXT_UPDATE: {"action": str ("unlock"|"lock"|"hide"), "files": list[str], "status": str}
+
+    MSG_TYPE_TOOL_START                = 50 # a tool execution has begun
+    MSG_TYPE_TOOL_END                  = 51 # a tool execution has completed
+
+    MSG_TYPE_ARTEFACT_BUILD_START      = 52 # an artifact is being built or patched
+    MSG_TYPE_ARTEFACT_BUILD_END        = 53 # an artifact has been successfully built or patched
+
+    MSG_TYPE_CONTEXT_UPDATE            = 54 # context visibility has been updated (unlock/lock/hide)
+
+
+class EventMode(Enum):
+    """
+    Defines how the ChatMixin or LollmsPersonality reports execution events to the UI/callback.
+    """
+    PROCESSING_TAG_MODE = 0  # Default: Injects <processing> tags into the message stream.
+    FULL_CALLBACK_MODE  = 1  # Emits specific MSG_TYPE_* events via callback. No <processing> tags in stream.
+    MIXED_MODE          = 2  # Emits both <processing> tags AND specific MSG_TYPE_* events.
+    SILENT_MODE         = 3  # Suppresses all event reporting. Only final conversational text is streamed.
+
 
 class LCPResult:
     """

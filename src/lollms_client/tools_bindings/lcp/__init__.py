@@ -24,10 +24,14 @@ class LCPBinding(LollmsToolBinding):
     - Tools do NOT know about discussions, artifacts, or clients.
     - Tools operate on files in the current working directory.
     - The Binding handles environment setup (CWD, sync) transparently.
+    - Host-Configurable parameters are invisible to the LLM and enforced by the host app.
     """
 
-    def __init__(self, **kwargs: Any):
+    def __init__(self, host_tool_configs: Optional[Dict[str, Dict[str, Any]]] = None, **kwargs: Any):
         super().__init__(binding_name="LCP")
+        
+        # Host-provided configurations for tools (e.g., {"system_shell": {"autonomy_level": "safe"}})
+        self.host_tool_configs: Dict[str, Dict[str, Any]] = host_tool_configs or {}
         
         # Resolve Multi-Folder Config
         self.tools_folders: List[Path] = []
@@ -60,10 +64,6 @@ class LCPBinding(LollmsToolBinding):
         return self.tools_folders[0] if self.tools_folders else None
 
     def _parse_tool_via_ast(self, py_file_path: Path) -> List[Dict[str, Any]]:
-        """
-        Extracts name, description, and schema from ALL tool_ functions in a file using AST.
-        Returns a LIST of tool definitions to support Multi-Tool Files.
-        """
         try:
             code_text = py_file_path.read_text(encoding="utf-8")
             tree = ast.parse(code_text)
@@ -88,7 +88,6 @@ class LCPBinding(LollmsToolBinding):
             return None
 
     def _extract_single_tool_schema(self, func_node: ast.FunctionDef, file_stem: str) -> Optional[Dict[str, Any]]:
-        """Helper to extract schema for a single function."""
         tool_name = func_node.name
         docstring = ast.get_docstring(func_node) or ""
         description = docstring.strip().split("\n\n")[0].strip() if docstring else "No description provided."
@@ -136,7 +135,6 @@ class LCPBinding(LollmsToolBinding):
             else:
                 required.append(arg_name)
 
-        # Fallback to docstring if no annotations
         if not properties and docstring:
             for line in docstring.splitlines():
                 m = re.match(r'^(?:[-\*\d\.]+\s*)?([a-zA-Z0-9_]+)\s*(?:\(([^)]+)\))?\s*[:\-]\s*(.+)', line.strip())
@@ -163,7 +161,7 @@ class LCPBinding(LollmsToolBinding):
                 "properties": properties,
                 "required": required
             },
-            "_python_file_path": str(Path(__file__).parent / "default_tools" / file_stem / f"{file_stem}.py") # Store path for execution
+            "_python_file_path": str(Path(__file__).parent / "default_tools" / file_stem / f"{file_stem}.py")
         }
 
     def _load_tool_file(self, py_file: Path) -> int:
@@ -187,22 +185,6 @@ class LCPBinding(LollmsToolBinding):
         return count
 
     def mount_tool_library(self, library_name: str) -> bool:
-        """
-        Dynamically mounts a tool library from the default_tools directory at runtime.
-        This allows the system to auto-load specialized tools (e.g., semantic_data_engineer)
-        when context conditions are met (e.g., data files detected).
-
-        If the default_tools folder was already scanned during LCPBinding construction,
-        the tools from this library may already be in self.discovered_tools. In that case,
-        this method recognizes them as already registered and returns True (idempotent).
-
-        Args:
-            library_name: The name of the folder inside default_tools (e.g., 'semantic_data_engineer').
-
-        Returns:
-            True if successfully mounted or already registered, False only if the library
-            folder doesn't exist or contains no valid tool files.
-        """
         base_dir = Path(__file__).parent / "default_tools"
         lib_path = base_dir / library_name
 
@@ -210,8 +192,12 @@ class LCPBinding(LollmsToolBinding):
             ASCIIColors.warning(f"[LCP Mount] Library '{library_name}' not found at {lib_path}")
             return False
 
-        # Determine which tools this library SHOULD provide by scanning its files
-        # for tool_ functions, regardless of whether they're already registered.
+        if lib_path in self.tools_folders:
+            for t in self.discovered_tools:
+                py_path = t.get('_python_file_path')
+                if py_path and lib_path in Path(py_path).resolve().parents:
+                    return True
+
         expected_tool_names: set = set()
         for item in lib_path.iterdir():
             py_file = None
@@ -232,7 +218,6 @@ class LCPBinding(LollmsToolBinding):
             ASCIIColors.warning(f"[LCP Mount] ⚠️ Library '{library_name}' contains no tool definitions.")
             return False
 
-        # Check which expected tools are already registered
         already_registered = {
             t.get("name") for t in self.discovered_tools
             if t.get("name") in expected_tool_names
@@ -278,7 +263,6 @@ class LCPBinding(LollmsToolBinding):
             return False
 
     def _extract_tool_names_from_file(self, py_file: Path) -> set:
-        """Extracts all tool_ function names from a Python file via AST without executing it."""
         names: set = set()
         try:
             code_text = py_file.read_text(encoding="utf-8")
@@ -330,50 +314,31 @@ class LCPBinding(LollmsToolBinding):
         return self.discover_tools(**kwargs)
 
     def register_tool_from_code(self, tool_name_prefix: str, code: str) -> bool:
-        """
-        Dynamically registers a tool from raw Python code in memory.
-        Used for LLM-generated tool artifacts.
-        """
         try:
             module_name = f"dynamic_tool_{tool_name_prefix}_{uuid.uuid4().hex[:8]}"
             module = types.ModuleType(module_name)
-            
-            # Execute code in the module's namespace
             exec(compile(code, "<dynamic_tool>", "exec"), module.__dict__)
-            
-            # Find tool_ functions
             tree = ast.parse(code)
             registered_count = 0
             
             for node in ast.walk(tree):
                 if isinstance(node, ast.FunctionDef) and node.name.startswith("tool_"):
                     tool_name = node.name
-                    
-                    # Remove old version if exists
                     self.discovered_tools = [t for t in self.discovered_tools if t.get("name") != tool_name]
-                    
-                    # Extract schema
                     tool_def = self._extract_single_tool_schema(node, tool_name_prefix)
                     if tool_def:
-                        # Store the module and function reference for execution
                         tool_def["_dynamic_module"] = module
-                        tool_def["_python_file_path"] = None  # Mark as dynamic
+                        tool_def["_python_file_path"] = None
                         self.discovered_tools.append(tool_def)
                         registered_count += 1
                         ASCIIColors.success(f"[LCP Dynamic] Registered tool '{tool_name}' from artefact '{tool_name_prefix}'")
-            
             return registered_count > 0
-            
         except Exception as e:
             ASCIIColors.error(f"[LCP Dynamic] Failed to register tool from code: {e}")
             trace_exception(e)
             return False
 
     def unregister_tools_by_prefix(self, tool_name_prefix: str) -> int:
-        """
-        Removes dynamically registered tools matching a prefix.
-        Returns the count of removed tools.
-        """
         initial_count = len(self.discovered_tools)
         self.discovered_tools = [
             t for t in self.discovered_tools 
@@ -385,10 +350,6 @@ class LCPBinding(LollmsToolBinding):
         return removed
 
     def execute_tool(self, tool_name: str, params: Dict[str, Any], discussion_instance=None, **kwargs) -> Dict[str, Any]:
-        """
-        Executes a specific tool function from a potentially multi-tool file.
-        Handles lazy initialization of the tool module on first call.
-        """
         ASCIIColors.info(f"[LCP execute_tool] Calling: '{tool_name}'")
 
         tool_def = next((t for t in self.discovered_tools if t.get("name") == tool_name), None)
@@ -397,7 +358,6 @@ class LCPBinding(LollmsToolBinding):
 
         python_file_path = Path(tool_def.get('_python_file_path')) if tool_def.get('_python_file_path') else None
 
-        # Ingest Schema Defaults
         input_schema = tool_def.get("input_schema", {})
         for prop_name, prop_info in input_schema.get("properties", {}).items():
             if prop_name not in params and isinstance(prop_info, dict) and "default" in prop_info:
@@ -407,10 +367,6 @@ class LCPBinding(LollmsToolBinding):
             if python_file_path:
                 module_name = f"lollms_client.tools_bindings.lcp.persistent_{python_file_path.stem}"
 
-                # ── 🛡️ LAZY INITIALIZATION ──
-                # If the module is not yet loaded, import it and run init_tools_library()
-                # ONLY when the tool is actually being called. This prevents eager loading
-                # of heavy dependencies (like pandas, numpy) at startup.
                 if module_name not in sys.modules:
                     try:
                         spec = importlib.util.spec_from_file_location(module_name, str(python_file_path.resolve()))
@@ -421,9 +377,12 @@ class LCPBinding(LollmsToolBinding):
                         sys.modules[module_name] = tool_module
                         spec.loader.exec_module(tool_module)
 
+                        # ── 🛡️ HOST CONFIGURATION INJECTION ──
                         if hasattr(tool_module, "init_tools_library") and callable(tool_module.init_tools_library):
-                            tool_module.init_tools_library()
-                            ASCIIColors.success(f"[LCP Lazy Init] ✅ Initialized library for '{python_file_path.stem}'")
+                            library_name = python_file_path.stem
+                            host_config = self.host_tool_configs.get(library_name, {})
+                            tool_module.init_tools_library(host_config)
+                            ASCIIColors.success(f"[LCP Lazy Init] ✅ Initialized library for '{library_name}' with host configs.")
                     except Exception as init_ex:
                         ASCIIColors.error(f"[LCP execute_tool] ❌ Toolset '{python_file_path.stem}' FAILED lazy init: {init_ex}")
                         if module_name in sys.modules:
@@ -432,19 +391,15 @@ class LCPBinding(LollmsToolBinding):
                 else:
                     tool_module = sys.modules[module_name]
             else:
-                # Use the dynamically loaded module
                 tool_module = tool_def.get("_dynamic_module")
                 if not tool_module:
                     return {"error": f"Dynamic module missing for '{tool_name}'.", "status_code": 500}
 
-            # CRITICAL FIX: Execute the EXACT function name requested (e.g., tool_get_table_schema)
             if not hasattr(tool_module, tool_name):
                 return {"error": f"Function '{tool_name}' not found in module.", "status_code": 500}
 
             execute_function = getattr(tool_module, tool_name)
 
-            # Execute with CLEAN params
-            # Only pass parameters that are explicitly accepted by the tool signature, OR are generic *args/**kwargs
             import inspect
             sig = inspect.signature(execute_function)
             clean_params = {}
@@ -452,11 +407,8 @@ class LCPBinding(LollmsToolBinding):
                 if k in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
                     clean_params[k] = v
 
-            # 🚀 PERFORMANCE FIX: Execute instantly. 
-            # CWD switching and artifact syncing are handled by the ChatMixin orchestrator.
             result = execute_function(**clean_params)
 
-            # ── 🛡️ ERROR TRACKING: Enrich tool-returned errors with tracebacks ──
             if isinstance(result, dict) and result.get("success") is False and result.get("error"):
                 tb_str = "".join(traceback.format_stack())
                 result["traceback"] = f"Explicit tool failure captured during execution:\n{tb_str}"
@@ -465,7 +417,6 @@ class LCPBinding(LollmsToolBinding):
             return {"output": result, "status_code": 200}
 
         except Exception as e:
-            # ── 🛡️ ERROR TRACKING: Capture full traceback for unexpected crashes ──
             tb_str = traceback.format_exc()
             trace_exception(e)
             ASCIIColors.error(f"[LCP Error Tracking] Unexpected crash executing '{tool_name}':\n{tb_str}")

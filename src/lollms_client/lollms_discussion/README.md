@@ -405,7 +405,55 @@ discussion.chat(user_message="Search for apples", tools=explicit_tools)
 *   `debug_export` (`bool`): Dumps the exact `virtual_history` (LLM context) and `ai_msg.content` (UI context) to a JSON file in the workspace to verify context separation.
 *   `enable_in_message_status` (`bool`): If `True`, emits detailed status comments inside `<processing>` blocks for UI rendering.
 *   `remove_thinking_blocks` (`bool`): If `True`, strips `_EDEFAULT` or `INSTRUCTION` blocks from the final saved message content.
+*   `event_mode` (`EventMode`): Controls how execution telemetry (tool calls, artifact builds, context updates) is reported to the `streaming_callback`. Defaults to `EventMode.PROCESSING_TAG_MODE`.
 *   `**kwargs`: Additional keyword arguments passed directly to the LLM binding's `generate_from_messages` call (e.g., `temperature`, `streaming_callback`).
+
+### 📡 Event Modes & Streaming Protocol
+
+The `ChatMixin` supports multiple event reporting strategies via the `event_mode` parameter (using the `EventMode` enum from `lollms_client.lollms_types`). This allows host applications to choose between parsing raw text tags or consuming structured callback events.
+
+| Mode | Behavior | Use Case |
+| :--- | :--- | :--- |
+| **`EventMode.PROCESSING_TAG_MODE`** (Default) | Injects `<processing type="...">` tags and `<!-- status:... -->` comments directly into the `MSG_TYPE_CHUNK` stream. | Simple text-based UIs, CLIs, or applications that parse the chat stream as raw text. |
+| **`EventMode.FULL_CALLBACK_MODE`** | Emits specific `MSG_TYPE_*` events (e.g., `MSG_TYPE_TOOL_START`) via the callback with structured metadata. **No `<processing>` tags are injected into the text stream.** | Rich UI applications (like web frontends or `lollms_code`) that render dedicated panels for tool execution and artifact building based on structured event types. |
+| **`EventMode.MIXED_MODE`** | Emits both `<processing>` tags in the text stream AND specific `MSG_TYPE_*` events. | Transitioning applications or debugging environments where both raw text and structured panels are needed. |
+| **`EventMode.SILENT_MODE`** | Suppresses all event reporting. Only the final conversational text is streamed. | Background tasks or silent processing where telemetry is irrelevant. |
+
+#### Structured Events in `FULL_CALLBACK_MODE`
+
+When `EventMode.FULL_CALLBACK_MODE` is active, the `streaming_callback` receives the following structured events instead of `<processing>` tags:
+
+*   **`MSG_TYPE_TOOL_START`**: Fired when a tool execution begins.
+    *   Meta: `{"tool_name": str, "parameters": dict}`
+*   **`MSG_TYPE_TOOL_END`**: Fired when a tool execution completes.
+    *   Meta: `{"tool_name": str, "success": bool, "output": str, "error": str|None}`
+*   **`MSG_TYPE_ARTEFACT_BUILD_START`**: Fired when an artifact is being created or patched.
+    *   Meta: `{"title": str, "art_type": str, "language": str|None, "is_patch": bool}`
+*   **`MSG_TYPE_ARTEFACT_BUILD_END`**: Fired when an artifact has been successfully built or patched.
+    *   Meta: `{"title": str, "art_type": str, "version": int, "success": bool, "error": str|None}`
+*   **`MSG_TYPE_CONTEXT_UPDATE`**: Fired when context visibility is updated (unlock/lock/hide).
+    *   Meta: `{"action": str ("unlock"|"lock"|"hide"), "files": list[str], "status": str}`
+
+**Example: Using `FULL_CALLBACK_MODE`**
+```python
+from lollms_client.lollms_types import MSG_TYPE, EventMode
+
+def my_callback(chunk: str, msg_type: MSG_TYPE, meta: dict) -> bool:
+    if msg_type == MSG_TYPE.MSG_TYPE_TOOL_START:
+        print(f"\n[Tool Started] {meta['tool_name']} with params: {meta['parameters']}")
+    elif msg_type == MSG_TYPE.MSG_TYPE_TOOL_END:
+        print(f"\n[Tool Finished] {meta['tool_name']} - Success: {meta['success']}")
+    elif msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
+        # In FULL_CALLBACK_MODE, this will ONLY contain conversational text, no <processing> tags.
+        print(chunk, end="", flush=True)
+    return True
+
+discussion.chat(
+    user_message="Analyze the data in data.csv",
+    streaming_callback=my_callback,
+    event_mode=EventMode.FULL_CALLBACK_MODE
+)
+```
 
 #### Return Value
 

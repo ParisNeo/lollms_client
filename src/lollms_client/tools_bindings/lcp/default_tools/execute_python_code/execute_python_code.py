@@ -13,10 +13,17 @@ TOOL_LIBRARY_ICON = "🐍"
 
 def init_tools_library() -> None:
     import pipmaster as pm
-    pm.ensure_packages(["pandas", "numpy", "matplotlib", "openpyxl"])
+    pm.ensure_packages(["matplotlib"])
     global matplotlib
     import matplotlib
     matplotlib.use('Agg')
+
+def _safe_import(module_name: str, package_name: str = None):
+    try:
+        return __import__(module_name)
+    except Exception as e:
+        ASCIIColors.warning(f"[execute_python_code] Optional dependency '{module_name}' failed to import: {e}")
+        return None
 
 def tool_execute_python_code(
     code: str = ""
@@ -47,7 +54,7 @@ def tool_execute_python_code(
 
     local_vars = {
         "Path": Path,
-        "pd": __import__("pandas"),
+        "pd": _safe_import("pandas"),
         "np": np,
         "plt": plt,
         "__builtins__": __builtins__

@@ -209,3 +209,54 @@ Parses raw `SOUL.md` text into metadata and a system prompt.
 
 ### `NullPersonality`
 A no-op personality substituted when `personality=None` is passed to `chat()`. It bypasses the full `__init__` to avoid side-effects and evaluates to `False` when used in boolean contexts.
+
+---
+
+## 📡 5. Event Modes & Streaming Protocol
+
+When using the independent `LollmsPersonality.chat()` method (outside of a `LollmsDiscussion`), you can control how execution telemetry is reported to the `streaming_callback` using the `event_mode` parameter.
+
+### The `event_mode` Parameter
+The `event_mode` parameter accepts an `EventMode` enum value (imported from `lollms_client.lollms_types`).
+
+| Mode | Behavior | Use Case |
+| :--- | :--- | :--- |
+| **`EventMode.PROCESSING_TAG_MODE`** (Default) | Injects `<processing>` tags into the conversational text stream (`MSG_TYPE_CHUNK`). | CLI applications or simple text renderers that parse `<processing>` blocks to display tool execution. |
+| **`EventMode.FULL_CALLBACK_MODE`** | Emits specific `MSG_TYPE_*` events (e.g., `MSG_TYPE_TOOL_START`) via the callback with structured metadata. **No `<processing>` tags are injected into the text stream.** | Rich UI applications (like `lollms_code`) that render dedicated panels for tool execution and artifact building based on structured event types. |
+| **`EventMode.MIXED_MODE`** | Emits both `<processing>` tags in the text stream AND specific `MSG_TYPE_*` events. | Transitioning applications or debugging environments where both raw text and structured panels are needed. |
+| **`EventMode.SILENT_MODE`** | Suppresses all event reporting. Only the final conversational text is streamed. | Background tasks or silent processing where telemetry is irrelevant. |
+
+### Structured Events in `FULL_CALLBACK_MODE`
+When `EventMode.FULL_CALLBACK_MODE` is active, the `streaming_callback` receives the following structured events:
+
+*   **`MSG_TYPE_TOOL_START`**: Fired when a tool execution begins.
+    *   Meta: `{"tool_name": str, "parameters": dict}`
+*   **`MSG_TYPE_TOOL_END`**: Fired when a tool execution completes.
+    *   Meta: `{"tool_name": str, "success": bool, "output": str, "error": str|None}`
+*   **`MSG_TYPE_ARTEFACT_BUILD_START`**: Fired when an artifact is being created or patched.
+    *   Meta: `{"title": str, "art_type": str, "language": str|None, "is_patch": bool}`
+*   **`MSG_TYPE_ARTEFACT_BUILD_END`**: Fired when an artifact has been successfully built or patched.
+    *   Meta: `{"title": str, "art_type": str, "version": int, "success": bool, "error": str|None}`
+*   **`MSG_TYPE_CONTEXT_UPDATE`**: Fired when context visibility is updated (unlock/lock/hide).
+    *   Meta: `{"action": str ("unlock"|"lock"|"hide"), "files": list[str], "status": str}`
+
+**Example: Using `FULL_CALLBACK_MODE` in a standalone script**
+```python
+from lollms_client.lollms_types import MSG_TYPE, EventMode
+
+def my_callback(chunk: str, msg_type: MSG_TYPE, meta: dict) -> bool:
+    if msg_type == MSG_TYPE.MSG_TYPE_TOOL_START:
+        print(f"\n[Tool Started] {meta['tool_name']} with params: {meta['parameters']}")
+    elif msg_type == MSG_TYPE.MSG_TYPE_TOOL_END:
+        print(f"\n[Tool Finished] {meta['tool_name']} - Success: {meta['success']}")
+    elif msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
+        # In FULL_CALLBACK_MODE, this will ONLY contain conversational text, no <processing> tags.
+        print(chunk, end="", flush=True)
+    return True
+
+personality.chat(
+    prompt="Analyze the data in data.csv",
+    streaming_callback=my_callback,
+    event_mode=EventMode.FULL_CALLBACK_MODE
+)
+```
