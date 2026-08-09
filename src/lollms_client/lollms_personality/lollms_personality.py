@@ -1478,12 +1478,6 @@ JSON:"""
         text = re.sub(r'<!-- status:[^>]*-->', '', text, flags=re.IGNORECASE)
         text = re.sub(r'</processing>', '', text, flags=re.IGNORECASE)
 
-        def _visibility_anchor(match: re.Match) -> str:
-            tag_name = match.group(1).lower()
-            return f"[Assistant executed {tag_name} tag]"
-        text = re.sub(r'<(unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|user_profile_update)\b[^>]*>.*?</\1>', _visibility_anchor, text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r'<(unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|user_profile_update)\b[^>]*/>', _visibility_anchor, text, flags=re.DOTALL | re.IGNORECASE)
-
         def _artifact_anchor(match: re.Match) -> str:
             attrs_str = match.group(0)
             body_content = match.group(1) if match.groups() else ""
@@ -1694,13 +1688,14 @@ JSON:"""
     def _build_system_prompt(self, active_tools: Dict) -> str:
         sys_prompt = self.system_prompt or ""
         rules = (
-           "\n=== ACTION EXECUTION & TERMINATION PROTOCOL (CRITICAL) ===\n"
-           "1. **INTENT ≠ EXECUTION**: Stating 'I will search...' in text DOES NOT execute the action. You MUST output the `<tool>` tag.\n"
-           "2. **MANDATORY TAG EMISSION**: To execute an action, you MUST output the `<tool>` tag immediately.\n"
-           "3. **EXPLICIT TERMINATION WITH `<done/>`**: When all objectives are met and tests pass, end with a `<done/>` tag on a new line.\n"
-           "4. **SAME-SESSION CONTINUATION**: When executing a sequence, emit the next action's tag in your IMMEDIATE NEXT response.\n"
-           "5. **AGENTIC TRIGGER**: If the user requests code generation, file modification, testing, or multi-step work, you MUST enter the agentic loop and use `<tool>` or `<artifact>` tags. Do NOT write code directly in conversational prose.\n"
-           "6. **ROUND 1 SHORT-CIRCUIT**: If the user's request is purely conversational (e.g., greetings, simple questions), respond conversationally without `<done/>` or tool tags.\n"
+          "\n=== ACTION EXECUTION & TERMINATION PROTOCOL (CRITICAL) ===\n"
+          "1. **INTENT ≠ EXECUTION**: Stating 'I will search...' in text DOES NOT execute the action. You MUST output the `<tool>` tag.\n"
+          "2. **MANDATORY TAG EMISSION**: To execute an action, you MUST output the `<tool>` tag immediately.\n"
+          "3. **EXPLICIT TERMINATION WITH `<done/>`**: When all objectives are met and tests pass, end with a `<done/>` tag on a new line.\n"
+          "4. **SAME-SESSION CONTINUATION**: When executing a sequence, emit the next action's tag in your IMMEDIATE NEXT response.\n"
+          "5. **AGENTIC TRIGGER**: If the user requests code generation, file modification, testing, or multi-step work, you MUST enter the agentic loop and use `<tool>` or `<artifact>` tags. Do NOT write code directly in conversational prose.\n"
+          "6. **ROUND 1 SHORT-CIRCUIT**: If the user's request is purely conversational (e.g., greetings, simple questions), respond conversationally without `<done/>` or tool tags.\n"
+          "7. **NO PROSE BEFORE TOOLS**: DO NOT write introductory text like 'Let me check the git status' before a tool call. Output the `<tool>` tag as the VERY FIRST token of your response.\n"
             "\n=== TOOL CALLING DISCIPLINE (CRITICAL) ===\n"
             "1. **Tool Results ≠ Tool Calls**: When a tool returns JSON, it's a RESULT, not a new call.\n"
             "2. **One Call Per Task**: Once a tool succeeds, analyze and answer.\n"
@@ -1775,7 +1770,12 @@ JSON:"""
             "- `<hide_file>filename.py</hide_file>`: Completely removes a file from your view.\n"
             "- `<collapse_folder>folder_name</collapse_folder>`: Hides all files within a folder.\n"
             "- `<uncollapse_folder>folder_name</uncollapse_folder>`: Restores a collapsed folder.\n"
-            "- Batch operations are supported (separate files with newlines, commas, or semicolons).\n"
+            "- Batch operations are supported and encouraged. You can list multiple files separated by newlines, commas, or semicolons inside a single tag:\n"
+            "  <unlock_file>\n"
+            "    file1.py,\n"
+            "    file2.py,\n"
+            "    file3.py\n"
+            "  </unlock_file>\n"
         )
 
         memory_instructions = ""
@@ -1876,6 +1876,7 @@ JSON:"""
                 continue
 
             # Handle individual file operations
+            # First, try exact match, then fallback to fuzzy match
             art = self._artefact_manager.get(t_target)
             if not art:
                 best_match = self._artefact_manager._find_best_title_match(t_target, [a["title"] for a in all_arts])
@@ -1888,7 +1889,8 @@ JSON:"""
             elif art.get("visibility") == target_visibility:
                 already_in_state.append(t_target)
             elif target_visibility == ArtefactVisibility.FULL:
-                file_path = self._resolved_workspace / t_target
+                # Use the artefact's title to construct the path to ensure consistency
+                file_path = self._resolved_workspace / art["title"]
                 token_count = 0
                 content = ""
 
@@ -1901,22 +1903,22 @@ JSON:"""
 
                 if token_count > _MAX_UNLOCK_TOKENS:
                     ASCIIColors.warning(
-                        f"[ContextBudgetGuard] Blocked unlock of '{t_target}': "
+                        f"[ContextBudgetGuard] Blocked unlock of '{art['title']}': "
                         f"~{token_count:,} tokens exceeds limit of {_MAX_UNLOCK_TOKENS:,}."
                     )
-                    blocked_files.append((t_target, token_count))
+                    blocked_files.append((art["title"], token_count))
                 else:
                     art["content"] = content
                     art["token_count"] = token_count
                     art["content_source"] = "db"
                     art["visibility"] = ArtefactVisibility.FULL
                     art["active"] = True
-                    processed_files.append(t_target)
+                    processed_files.append(art["title"])
             else:
                 art["visibility"] = target_visibility
                 art["active"] = False
                 art["content"] = ""
-                processed_files.append(t_target)
+                processed_files.append(art["title"])
 
         try:
             # Persist to SQLite state DB
@@ -1956,7 +1958,14 @@ JSON:"""
         if processed_files or already_in_state:
             object.__setattr__(self, '_last_ws_sync_time', 0.0)
 
-        return f"{action_verb} context files...\nContext Update:\n{'; '.join(status_parts)}\nstatus:{status_meta}"
+        status_str = f"{action_verb} context files...\nContext Update:\n{'; '.join(status_parts)}\nstatus:{status_meta}"
+        return {
+            "status_str": status_str,
+            "processed_files": processed_files,
+            "already_in_state": already_in_state,
+            "not_found": not_found,
+            "blocked_files": blocked_files
+        }
 
 
     def _execute_tool(self, tool_name: str, tool_params: Dict[str, Any], active_tools: Dict) -> Dict[str, Any]:
@@ -2443,12 +2452,14 @@ JSON:"""
                                 virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
                                 continue
 
-                        user_part = self._execute_context_visibility(tag_name, body_content)
-                        virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
+                        vis_result = self._execute_context_visibility(tag_name, body_content)
+                        if isinstance(vis_result, dict):
+                            user_part = vis_result.get("status_str", "")
+                            processed_files.extend(vis_result.get("processed_files", []))
+                        else:
+                            user_part = vis_result
 
-                        if "✅ Unlocking:" in user_part:
-                            extracted_files = re.findall(r'✅ Unlocking: (.*?)\s*(?:\n|$)', user_part)
-                            processed_files.extend([f.strip().replace(" ", "") for f in extracted_files if f.strip()])
+                        virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
 
                     try:
                         if hasattr(self, '_artefact_proxy') and hasattr(self._artefact_proxy, 'commit'):
@@ -2461,9 +2472,16 @@ JSON:"""
                         loaded_contents = []
                         all_arts = self._artefact_manager._get_all_raw() if self._artefact_manager else []
                         for t_file in processed_files:
+                            # Use fuzzy matching to find the artefact if exact match fails
                             art = next((a for a in all_arts if a.get("title") == t_file), None)
                             if not art:
+                                best_match = self._artefact_manager._find_best_title_match(t_file, [a["title"] for a in all_arts])
+                                if best_match:
+                                    art = next((a for a in all_arts if a.get("title") == best_match), None)
+
+                            if not art:
                                 continue
+
                             content_val = art.get("content")
                             if not content_val and hasattr(self, '_resolved_workspace'):
                                 file_path = self._resolved_workspace / art.get("title", t_file)
@@ -2471,6 +2489,7 @@ JSON:"""
                                     try:
                                         content_val = file_path.read_text(encoding="utf-8", errors="ignore")
                                         art["content"] = content_val
+                                        art["content_source"] = "disk"
                                     except Exception:
                                         pass
                             if content_val:
@@ -2520,7 +2539,22 @@ JSON:"""
                         elif m.group(1).lower() == "language":
                             lang = m.group(2)
 
-                    if "<<<<<<< SEARCH" in body_content:
+                    is_patch = "<<<<<<< SEARCH" in body_content
+
+                    event_mode = kwargs.get("event_mode", EventMode.PROCESSING_TAG_MODE)
+                    if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                        try:
+                            if streaming_callback:
+                                streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {
+                                    "title": title,
+                                    "art_type": "code",
+                                    "language": lang,
+                                    "is_patch": is_patch
+                                })
+                        except Exception:
+                            pass
+
+                    if is_patch:
                         file_path = self._resolved_workspace / title
                         if not file_path.exists():
                             user_part = f"[SYSTEM ERROR] File '{title}' not found. Cannot apply patch."
@@ -2583,48 +2617,8 @@ JSON:"""
                     ))
                     continue
 
-                if len(tool_calls_this_turn) > 0:
-                    ASCIIColors.info("[LollmsPersonality.chat] Tool previously executed but no <done/> detected. Injecting continuation mandate.")
-                    clean_history_text = self._sanitize_history_for_context(raw_round_text)
-                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text))
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="user",
-                        content="[SYSTEM: You stopped generation without emitting a <done/> tag. If your task is complete, output a final conversational summary and end it with a <done/> tag on a new line. If you need to continue working, emit the next functional tag now.]"
-                    ))
-                    continue
-
-                intent_pattern = re.compile(r'(let me|now i|next i|i will|i need to|we need to).*(query|get|fetch|build|create|analyze|summarize|aggregate|plot|explore|check|read|list|write|update|fix|run|execute)', re.IGNORECASE)
-                intent_match = intent_pattern.search(raw_round_text)
-                has_intent = False
-                if intent_match:
-                    matched_line = intent_match.group(0)
-                    line_end_idx = raw_round_text.find(matched_line) + len(matched_line)
-                    line_end_char = raw_round_text[line_end_idx] if line_end_idx < len(raw_round_text) else ""
-                    line_start_idx = raw_round_text.rfind('\n', 0, intent_match.start()) + 1
-                    line_start = raw_round_text[line_start_idx:intent_match.start()].strip().lower()
-                    is_question = line_end_char == '?' or line_start.startswith(("would you", "do you", "shall i", "should i", "could you"))
-                    if not is_question:
-                        has_intent = True
-
-                has_tool_tag = "<tool>" in raw_round_text.lower()
-
-                if has_intent and not has_tool_tag and not was_cancelled and round_count < max_reasoning_steps:
-                    ASCIIColors.info(f"[LollmsPersonality.chat] Detected pending tool intent without XML tag. Forcing continuation...")
-
-                    clean_history_text = self._sanitize_history_for_context(raw_round_text)
-                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text))
-
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="user",
-                        content="[SYSTEM: CRITICAL. You stopped generation before executing your stated intent. Output the <tool> or <artifact> tag NOW. Do not write any more prose.]"
-                    ))
-
-                    continue
-
-                final_response = raw_round_text
-
                 if len(tool_calls_this_turn) > 0 or getattr(ss, 'context_trigger', False) or getattr(ss, 'artifact_trigger', False):
-                    ASCIIColors.info("[LollmsPersonality.chat] Action previously dispatched but no <done/> detected. Injecting continuation mandate.")
+                    ASCIIColors.info("[LollmsPersonality.chat] Action previously executed but no <done/> detected. Injecting continuation mandate.")
                     clean_history_text = self._sanitize_history_for_context(raw_round_text)
                     virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text))
                     virtual_history.append(SimpleNamespace(

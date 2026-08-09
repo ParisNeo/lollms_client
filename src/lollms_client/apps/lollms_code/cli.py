@@ -1008,8 +1008,7 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
                 title="[bold]Pre-loaded Context Files [C][/bold]",
                 box="round"
             )
-            ASCIIColors.rich_print(files_table)
-
+            
     ASCIIColors.rule("[bold]🤖 Agent output[/bold]")
 
     start_time = time.time()

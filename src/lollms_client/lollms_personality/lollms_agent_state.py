@@ -452,8 +452,19 @@ class _AgentStreamState:
                         return start_idx
             return -1
 
+        def _ends_with_partial_tag_anywhere(buffer: str) -> int:
+            tags_to_check = ["<tool", "<done", "<artifact", "<artefact", "<unlock_file", "<lock_file", "<hide_file"]
+            for tag in tags_to_check:
+                for i in range(1, len(tag)):
+                    if buffer.endswith(tag[:i]):
+                        return len(buffer) - i
+            return -1
+
 
         partial_idx = _ends_with_partial_tag(self._pending_buffer)
+        if partial_idx == -1:
+            partial_idx = _ends_with_partial_tag_anywhere(self._pending_buffer)
+
         if partial_idx != -1:
             text_before = self._pending_buffer[:partial_idx]
             if text_before:
