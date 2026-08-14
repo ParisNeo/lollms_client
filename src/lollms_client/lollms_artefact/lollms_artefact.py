@@ -86,17 +86,14 @@ def sanitize_artifact_filename(title: str) -> str:
     """
     if not title:
         return "untitled"
-    # Strip URL scheme prefix (http://, https://, ftp://, etc.)
     import re as _re
     clean = _re.sub(r'^[a-zA-Z]+://', '', title)
-    # Replace all invalid filename characters with underscore
     clean = _re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', clean)
-    # Collapse multiple consecutive underscores
-    clean = _re.sub(r'_+', '_', clean)
-    # Truncate to safe length (leave room for extension)
+    clean = _re.sub(r'_{3,}', '__', clean)
     if len(clean) > 200:
         clean = clean[:200]
     return clean if clean else "untitled"
+
 
 def make_image_id(artefact_title: str, index: int) -> str:
     return f"{artefact_title}{_IMAGE_ID_SEP}{index}"

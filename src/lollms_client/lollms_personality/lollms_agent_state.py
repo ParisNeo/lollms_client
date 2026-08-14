@@ -154,6 +154,20 @@ def _sanitize_tool_result(tool_res: Any, max_chars: int = _MAX_TOOL_RESULT_CHARS
         return obj
 
     sanitized = _walk(_replace_none(unwrapped))
+    
+    if isinstance(tool_res, dict) and "files" in tool_res and tool_res["files"]:
+        files_list = tool_res["files"]
+        if isinstance(files_list, list):
+            files_str = "\n".join(files_list[:50])
+            if isinstance(sanitized, str):
+                sanitized = sanitized + f"\nMatching Files:\n{files_str}"
+            else:
+                try:
+                    sanitized_str = json.dumps(sanitized, indent=2, default=str, ensure_ascii=False)
+                    sanitized = sanitized_str + f"\nMatching Files:\n{files_str}"
+                except Exception:
+                    pass
+
     if isinstance(sanitized, str):
         if len(sanitized) > max_chars:
             return sanitized[:max_chars] + f"\n... [truncated, {len(sanitized) - max_chars} more chars]"
@@ -167,7 +181,6 @@ def _sanitize_tool_result(tool_res: Any, max_chars: int = _MAX_TOOL_RESULT_CHARS
     if len(text) > max_chars:
         text = text[:max_chars] + f"\n... [truncated, {len(text) - max_chars} more chars]"
     return text
-
 
 class _ToolsManager:
     SYSTEM_TOOLS_DIR = Path("app/tools")
@@ -252,6 +265,7 @@ class _AgentStreamState:
         self.artifact_trigger = False
         self.tool_trigger = False
         self.live_artifact_meta: Optional[Dict[str, Any]] = None
+        self._done_intercepted: bool = False
 
     def _cb(self, text: str, msg_type=None, meta: Optional[Dict] = None):
         if self.callback is None:
@@ -272,8 +286,14 @@ class _AgentStreamState:
         if not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence and not self._in_inline_code:
             done_match = re.search(r'(?m)^\s*<done\s*/?>', self._pending_buffer, re.IGNORECASE)
             if done_match:
-                self._pending_buffer = re.sub(r'(?m)^\s*<done\s*/?>', '', self._pending_buffer, flags=re.IGNORECASE)
-                self._cb("[SYSTEM: <done/> tag detected. Terminating generation.]", MSG_TYPE.MSG_TYPE_INFO, {"done_intercepted": True})
+                text_before = self._pending_buffer[:done_match.start()].strip()
+                if text_before:
+                    self.content += text_before
+                    self._cb(text_before)
+
+                self._pending_buffer = ""
+                self._done_intercepted = True
+                self._cb("", MSG_TYPE.MSG_TYPE_INFO, {"done_intercepted": True})
                 return False
 
         if not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence and not self._in_inline_code:
@@ -493,7 +513,7 @@ class _AgentStreamState:
                 return True
 
         def _ends_with_partial_tag(buffer: str) -> int:
-            tags_to_check = ["<tool", "<done", "<artifact", "<artefact", "<unlock_file", "<lock_file", "<hide_file", "<refactor_history"]
+            tags_to_check = ["<tool", "<done", "<artifact", "<artefact", "<unlock_file", "<lock_file", "<hide_file", "<refactor_history", "<collapse_folder", "<uncollapse_folder", "<scratchpad_append", "<scratchpad_patch", "<scratchpad_clear", "<user_profile_update", "<user_profile_clear", "<mem_new", "<mem_update"]
             for tag in tags_to_check:
                 for i in range(1, len(tag)):
                     if buffer.endswith(tag[:i]):
@@ -507,7 +527,7 @@ class _AgentStreamState:
             return -1
 
         def _ends_with_partial_tag_anywhere(buffer: str) -> int:
-            tags_to_check = ["<tool", "<done", "<artifact", "<artefact", "<unlock_file", "<lock_file", "<hide_file", "<refactor_history"]
+            tags_to_check = ["<tool", "<done", "<artifact", "<artefact", "<unlock_file", "<lock_file", "<hide_file", "<refactor_history", "<collapse_folder", "<uncollapse_folder", "<scratchpad_append", "<scratchpad_patch", "<scratchpad_clear", "<user_profile_update", "<user_profile_clear", "<mem_new", "<mem_update"]
             for tag in tags_to_check:
                 for i in range(1, len(tag)):
                     if buffer.endswith(tag[:i]):
@@ -524,29 +544,6 @@ class _AgentStreamState:
                 self.content += text_before
                 self._cb(text_before)
             self._pending_buffer = self._pending_buffer[partial_idx:]
-            return True
-
-        def _ends_with_partial_folder_tag(buffer: str) -> int:
-            tags_to_check = ["<collapse_folder", "<uncollapse_folder", "<scratchpad_append", "<scratchpad_patch", "<user_profile_update", "<refactor_history"]
-            for tag in tags_to_check:
-                for i in range(1, len(tag)):
-                    if buffer.endswith(tag[:i]):
-                        start_idx = len(buffer) - i
-                        j = start_idx - 1
-                        while j >= 0 and buffer[j] != '\n':
-                            if not buffer[j].isspace():
-                                return -1
-                            j -= 1
-                        return start_idx
-            return -1
-
-        folder_partial_idx = _ends_with_partial_folder_tag(self._pending_buffer)
-        if folder_partial_idx != -1:
-            text_before = self._pending_buffer[:folder_partial_idx]
-            if text_before:
-                self.content += text_before
-                self._cb(text_before)
-            self._pending_buffer = self._pending_buffer[folder_partial_idx:]
             return True
 
         self.content += self._pending_buffer
@@ -569,20 +566,18 @@ class _AgentStreamState:
         self._is_accumulating_tool = False
         remaining = self._tool_buffer[end_idx + end_len:]
         self._tool_buffer = ""
+
         if remaining:
-            self._pending_buffer = remaining + self._pending_buffer
+            self._pending_buffer = remaining
 
-        if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
-            try:
-                self._cb("", MSG_TYPE.MSG_TYPE_TOOL_END, {"tool_name": "pending", "success": True, "output": None, "error": None, "stream_complete": True})
-            except Exception:
-                pass
-
-        if self._event_mode == EventMode.PROCESSING_TAG_MODE:
-            self._cb('\n</processing>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-
+        raw_data = None
+        resolved_tool_name = "pending"
+        resolved_params = {}
         try:
             raw_data = json.loads(json_body)
+            if isinstance(raw_data, dict):
+                resolved_tool_name = raw_data.get("name", "pending")
+                resolved_params = raw_data.get("parameters", {})
         except json.JSONDecodeError:
             repaired = json_body
             while repaired.count('{') > repaired.count('}'):
@@ -592,8 +587,20 @@ class _AgentStreamState:
             try:
                 raw_data = json.loads(repaired)
                 json_body = repaired
+                if isinstance(raw_data, dict):
+                    resolved_tool_name = raw_data.get("name", "pending")
+                    resolved_params = raw_data.get("parameters", {})
             except json.JSONDecodeError:
                 raw_data = None
+
+        if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+            try:
+                self._cb("", MSG_TYPE.MSG_TYPE_TOOL_START, {"tool_name": resolved_tool_name, "parameters": resolved_params, "stream_complete": True})
+            except Exception:
+                pass
+
+        if self._event_mode == EventMode.PROCESSING_TAG_MODE:
+            self._cb('\n</processing>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
         normalized_json = json_body
         if isinstance(raw_data, dict):
@@ -631,8 +638,9 @@ class _AgentStreamState:
         self._is_accumulating_artifact = False
         remaining = self._tool_buffer[end_idx + end_len:]
         self._tool_buffer = ""
+
         if remaining:
-            self._pending_buffer = remaining + self._pending_buffer
+            self._pending_buffer = remaining
 
         if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
             try:
@@ -644,6 +652,8 @@ class _AgentStreamState:
             self._cb('\n</processing>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
         self.completed_actions.append({"type": "artifact", "xml": full_artifact_call})
+        
+         
 
     def _try_complete_context_tag(self) -> None:
         closing_tag = f"</{self._context_tag_name}>"
@@ -659,8 +669,9 @@ class _AgentStreamState:
         self._is_accumulating_context = False
         remaining = self._tool_buffer[end_idx + end_len:]
         self._tool_buffer = ""
+
         if remaining:
-            self._pending_buffer = remaining + self._pending_buffer
+            self._pending_buffer = remaining
 
         if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
             try:
@@ -673,6 +684,7 @@ class _AgentStreamState:
 
         self.completed_actions.append({"type": "context", "tag_name": self._context_tag_name, "xml": full_tag_call})
         
+         
         
     def flush_remaining_buffer(self):
         if self._in_code_fence:
@@ -707,13 +719,16 @@ class _AgentStreamState:
             return
 
         if self._pending_buffer:
-            self.content += self._pending_buffer
-            self._cb(self._pending_buffer)
+            cleaned_buffer = re.sub(r'<done\s*/?>\s*$', '', self._pending_buffer, flags=re.IGNORECASE).strip()
+            if cleaned_buffer:
+                self.content += cleaned_buffer
+                self._cb(cleaned_buffer)
             self._pending_buffer = ""
-            
-            
+                
+                 
+             
     def was_done_detected(self) -> bool:
-        return not self._pending_buffer and not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._is_accumulating_context
+        return self._done_intercepted
 
     def get_clean_text(self) -> str:
         return self.content 

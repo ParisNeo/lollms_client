@@ -942,6 +942,14 @@ class StreamRenderer:
                 border_style="yellow"
             )
 
+
+    def flush(self):
+        """Flushes any pending buffers, rendering unclosed tags as raw text."""
+        if self._in_processing and self._processing_buffer:
+            ASCIIColors.rich_print(self._processing_buffer, end="")
+            self._processing_buffer = ""
+            self._in_processing = False
+
     def __call__(self, chunk: str, msg_type: Any = None, meta: Optional[Dict] = None) -> bool:
         if msg_type == MSG_TYPE.MSG_TYPE_NEW_MESSAGE:
             ASCIIColors.rich_print("\n[bold green]🤖 Generating...[/bold green]")
@@ -994,7 +1002,7 @@ class StreamRenderer:
                 return True
             else:
                 ASCIIColors.rich_print(f"\n[blue][INFO] {chunk}[/blue]")
-            return True
+                return True
     
 
 def display_result(result: Dict[str, Any], config: CodeAgentConfig, elapsed: float):
@@ -1113,6 +1121,9 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
         ASCIIColors.red(f"\n\n💥 Fatal error: {e}")
         return 1
 
+    # Flush the renderer to ensure any unclosed tags are printed
+    renderer.flush()
+
     elapsed = time.time() - start_time
     display_result(result, config, elapsed)
 
@@ -1132,6 +1143,15 @@ def get_context_fill_status(personality: LollmsPersonality, client: LollmsClient
         full_system_prompt = personality._build_system_prompt(active_tools)
 
         used_tokens = client.count_tokens(full_system_prompt) or 0
+        
+        ws_ctx = personality._build_workspace_context_block()
+        if ws_ctx:
+            used_tokens += client.count_tokens(ws_ctx) or 0
+            
+        scratchpad_ctx = personality._build_scratchpad_context()
+        if scratchpad_ctx:
+            used_tokens += client.count_tokens(scratchpad_ctx) or 0
+
         fill_pct = round((used_tokens / max_ctx) * 100, 1)
 
         return {
@@ -1141,7 +1161,9 @@ def get_context_fill_status(personality: LollmsPersonality, client: LollmsClient
         }
     except Exception:
         return None
-
+    
+    
+    
 def dump_startup_context(personality: LollmsPersonality, client: LollmsClient):
     """
     🐛 DEBUG INSTRUMENTATION: Writes the initial system prompt and active tools
@@ -1625,12 +1647,15 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
             ASCIIColors.red(f"\n💥 Error: {e}")
             continue
 
+        # Flush the renderer to ensure any unclosed tags are printed
+        renderer.flush()
+
         if hasattr(client, 'llm') and hasattr(client.llm, 'flush_stream'):
             try:
                 client.llm.flush_stream()
             except Exception:
                 pass
-
+            
         elapsed = time.time() - start_time
         ctx_h = result.get("context_health", {})
         ctx_str = ""
