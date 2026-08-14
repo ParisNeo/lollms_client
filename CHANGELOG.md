@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-08-14 23:42]
+
+- feat(agent): handle think blocks in stream parsing
+
 ## [2026-08-14 12:45]
 
 - feat(cli): enhance autonomous workflow with state/memory segregation and stream buffering

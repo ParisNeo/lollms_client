@@ -261,6 +261,9 @@ class _AgentStreamState:
         self._code_fence_hold_buffer = ""
         self._in_inline_code = False
 
+        self._in_think_block = False
+        self._think_buffer = ""
+
         self.context_trigger = False
         self.artifact_trigger = False
         self.tool_trigger = False
@@ -282,6 +285,27 @@ class _AgentStreamState:
 
         self._raw_stream_buffer += chunk
         self._pending_buffer += chunk
+
+        if "<think>" in self._pending_buffer and not self._in_think_block:
+            idx = self._pending_buffer.find("<think>")
+            text_before = self._pending_buffer[:idx]
+            if text_before:
+                self.content += text_before
+                self._cb(text_before)
+            self._pending_buffer = self._pending_buffer[idx + 7:]
+            self._in_think_block = True
+            self._think_buffer = ""
+
+        if self._in_think_block:
+            close_idx = self._pending_buffer.find("</think>")
+            if close_idx != -1:
+                self._think_buffer += self._pending_buffer[:close_idx]
+                self._pending_buffer = self._pending_buffer[close_idx + 8:]
+                self._in_think_block = False
+            else:
+                self._think_buffer += self._pending_buffer
+                self._pending_buffer = ""
+                return True
 
         if not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence and not self._in_inline_code:
             done_match = re.search(r'(?m)^\s*<done\s*/?>', self._pending_buffer, re.IGNORECASE)
@@ -513,7 +537,7 @@ class _AgentStreamState:
                 return True
 
         def _ends_with_partial_tag(buffer: str) -> int:
-            tags_to_check = ["<tool", "<done", "<artifact", "<artefact", "<unlock_file", "<lock_file", "<hide_file", "<refactor_history", "<collapse_folder", "<uncollapse_folder", "<scratchpad_append", "<scratchpad_patch", "<scratchpad_clear", "<user_profile_update", "<user_profile_clear", "<mem_new", "<mem_update"]
+            tags_to_check = ["<tool", "<done", "<artifact", "<artefact", "<unlock_file", "<lock_file", "<hide_file", "<refactor_history", "<collapse_folder", "<uncollapse_folder", "<scratchpad_append", "<scratchpad_patch", "<scratchpad_clear", "<user_profile_update", "<user_profile_clear", "<mem_new", "<mem_update", "<think"]
             for tag in tags_to_check:
                 for i in range(1, len(tag)):
                     if buffer.endswith(tag[:i]):
@@ -527,7 +551,7 @@ class _AgentStreamState:
             return -1
 
         def _ends_with_partial_tag_anywhere(buffer: str) -> int:
-            tags_to_check = ["<tool", "<done", "<artifact", "<artefact", "<unlock_file", "<lock_file", "<hide_file", "<refactor_history", "<collapse_folder", "<uncollapse_folder", "<scratchpad_append", "<scratchpad_patch", "<scratchpad_clear", "<user_profile_update", "<user_profile_clear", "<mem_new", "<mem_update"]
+            tags_to_check = ["<tool", "<done", "<artifact", "<artefact", "<unlock_file", "<lock_file", "<hide_file", "<refactor_history", "<collapse_folder", "<uncollapse_folder", "<scratchpad_append", "<scratchpad_patch", "<scratchpad_clear", "<user_profile_update", "<user_profile_clear", "<mem_new", "<mem_update", "<think"]
             for tag in tags_to_check:
                 for i in range(1, len(tag)):
                     if buffer.endswith(tag[:i]):
@@ -550,6 +574,7 @@ class _AgentStreamState:
         self._cb(self._pending_buffer)
         self._pending_buffer = ""
         return True
+
 
     def _try_complete_tool(self) -> None:
         close_match = re.search(r'</tool>\s*', self._tool_buffer, re.IGNORECASE)
