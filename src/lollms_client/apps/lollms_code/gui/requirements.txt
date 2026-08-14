@@ -1,0 +1,2 @@
+nicegui>=1.4
+pywebview>=4.4

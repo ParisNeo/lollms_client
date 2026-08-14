@@ -1698,7 +1698,6 @@ class ArtefactManager:
             lines = []
             indent = "  " * depth
             for f_name, f_node in sorted(node["folders"].items()):
-                # Check if all children in this folder are collapsed. If so, hide them.
                 all_collapsed = all(
                     c.get("visibility") == ArtefactVisibility.FOLDER_COLLAPSED 
                     for c in (f_node["files"] + [fc for sub_f in f_node["folders"].values() for fc in sub_f["files"]])
@@ -1745,6 +1744,9 @@ class ArtefactManager:
                         content_text = (item.get("content") or "").strip()
 
                 if not content_text:
+                    content_text = self._read_content_from_disk(item).strip()
+
+                if not content_text:
                     continue
 
                 _MAX_FULL_CONTENT_CHARS = 200_000
@@ -1787,6 +1789,7 @@ class ArtefactManager:
             context_parts.append("\n## Fully Loaded File Contents [C]\n" + "\n\n---\n\n".join(full_visible_parts))
 
         return "\n\n".join(context_parts)
+    
     
     def get_context_images(self) -> List[Dict[str, Any]]:
         result: List[Dict[str, Any]] = []

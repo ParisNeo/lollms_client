@@ -718,6 +718,29 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
     return personality
 
 
+def _format_bytes(size: int) -> str:
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size < 1024.0:
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} PB"
+
+def _render_files_table(files_data: List[Dict[str, Any]], title: str):
+    from rich.console import Console
+    from rich.table import Table
+    console = Console()
+    sorted_files = sorted(
+        files_data, 
+        key=lambda x: x.get("size", 0), 
+        reverse=True
+    )
+    files_table = Table(title=f"[bold]{title}[/bold]", box=None)
+    files_table.add_column("Size", style="cyan", no_wrap=True)
+    files_table.add_column("Relative Path", style="white")
+    for f in sorted_files:
+        files_table.add_row(_format_bytes(f["size"]), f["path"])
+    console.print(files_table)
+
 def get_workspace_stats(personality: LollmsPersonality) -> Dict[str, Any]:
     """
     Calculates statistics about the indexed workspace files.
@@ -740,15 +763,26 @@ def get_workspace_stats(personality: LollmsPersonality) -> Dict[str, Any]:
         
         for art in all_arts:
             if art.get("visibility") == ArtefactVisibility.FULL:
-                # Extract relative path. physical_path is usually already relative.
                 rel_path = art.get("physical_path") or art.get("title", "")
                 if rel_path:
-                    # Clean up any potential absolute paths just in case
                     ws_root = str(personality._resolved_workspace)
                     if rel_path.startswith(ws_root):
                         rel_path = rel_path[len(ws_root):].lstrip("\\/")
-                    stats["loaded_files"].append(rel_path)
-                    
+
+                    file_size = art.get("size", 0)
+                    if not file_size:
+                        try:
+                            abs_path = personality._resolved_workspace / rel_path
+                            if abs_path.exists() and abs_path.is_file():
+                                file_size = abs_path.stat().st_size
+                        except Exception:
+                            file_size = 0
+
+                    stats["loaded_files"].append({
+                        "path": rel_path,
+                        "size": file_size
+                    })
+
         stats["total_loaded"] = len(stats["loaded_files"])
     except Exception as e:
         ASCIIColors.warning(f"Failed to calculate workspace stats: {e}")
@@ -881,16 +915,38 @@ class StreamRenderer:
 
         elif msg_type == MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE:
             action = meta.get("action", "update")
-            files = meta.get("files", [])
             status = meta.get("status", "")
 
+            # Suppress intermediate stream events; only render the final execution event
+            if status in ("streaming", "stream_complete"):
+                return
+
+            files = meta.get("files", [])
+            error = meta.get("error")
+
+            if not files and error:
+                files_display = f"[red]{error}[/red]"
+            elif not files:
+                files_display = "[dim]No files specified[/dim]"
+            else:
+                files_display = "\n".join(f"  - {f}" for f in files)
+
+            status_color = "green" if status == "success" else "red"
+            panel_content = f"[cyan]Files:[/cyan]\n{files_display}\n\n[cyan]Status:[/cyan] [{status_color}]{status}[/{status_color}]"
+            if error:
+                panel_content += f"\n[cyan]Error:[/cyan] [red]{error}[/red]"
+
             ASCIIColors.panel(
-                f"[cyan]Files:[/cyan] {', '.join(files)}\n[cyan]Status:[/cyan] {status}",
-                title=f"[bold yellow]📂 Context {action.capitalize()}[/bold yellow]",
+                panel_content,
+                title=f"[bold yellow]📂 Context {action.replace('_', ' ').capitalize()}[/bold yellow]",
                 border_style="yellow"
             )
 
     def __call__(self, chunk: str, msg_type: Any = None, meta: Optional[Dict] = None) -> bool:
+        if msg_type == MSG_TYPE.MSG_TYPE_NEW_MESSAGE:
+            ASCIIColors.rich_print("\n[bold green]🤖 Generating...[/bold green]")
+            return True
+
         if msg_type in [
             MSG_TYPE.MSG_TYPE_TOOL_START,
             MSG_TYPE.MSG_TYPE_TOOL_END,
@@ -898,6 +954,9 @@ class StreamRenderer:
             MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END,
             MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE
         ]:
+            # Reset processing buffer state to prevent UI bleeding between rapid events
+            self._processing_buffer = ""
+            self._in_processing = False
             self._render_callback_event(msg_type, meta)
             return True
 
@@ -915,7 +974,14 @@ class StreamRenderer:
                     except Exception as e:
                         ASCIIColors.rich_print(self._processing_buffer, end="")
                     self._processing_buffer = ""
+            elif meta and (meta.get("live_tool_chunk") or meta.get("live_artifact_chunk")):
+                # Suppress raw JSON/XML chunks of tools and artifacts to prevent UI bleeding.
+                return True
             else:
+                # Intercept and suppress <done/> tags from raw text stream
+                if "<done" in chunk and "/>" in chunk:
+                    return True
+
                 if self._in_processing:
                     self._processing_buffer += chunk
                 else:
@@ -923,9 +989,13 @@ class StreamRenderer:
         elif msg_type == MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK:
             ASCIIColors.rich_print(f"[dim]{chunk}[/dim]", end="")
         elif msg_type == MSG_TYPE.MSG_TYPE_INFO:
-            ASCIIColors.rich_print(f"\n[blue][INFO] {chunk}[/blue]")
-        return True
-
+            if meta and meta.get("done_intercepted"):
+                ASCIIColors.rule("[bold green]✅ Task Completed (<done/>)[/bold green]")
+                return True
+            else:
+                ASCIIColors.rich_print(f"\n[blue][INFO] {chunk}[/blue]")
+            return True
+    
 
 def display_result(result: Dict[str, Any], config: CodeAgentConfig, elapsed: float):
     ASCIIColors.rule("[bold cyan]📊 SESSION REPORT[/bold cyan]")
@@ -1008,13 +1078,8 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
         ASCIIColors.panel(stats_content, title="[bold blue]📂 Workspace Telemetry[/bold blue]", border_style="blue")
         
         if ws_stats["loaded_files"]:
-            files_table = ASCIIColors.table(
-                "Relative Path",
-                rows=[[f] for f in ws_stats["loaded_files"]],
-                title="[bold]Pre-loaded Context Files [C][/bold]",
-                box="round"
-            )
-            
+            _render_files_table(ws_stats["loaded_files"], "Pre-loaded Context Files [C]")
+
     ASCIIColors.rule("[bold]🤖 Agent output[/bold]")
 
     start_time = time.time()
@@ -1155,175 +1220,251 @@ def dump_startup_context(personality: LollmsPersonality, client: LollmsClient):
     except Exception as e:
         ASCIIColors.warning(f"[CLI] Failed to dump startup context: {e}")
 
-def _prompt_with_history(history: PersistentHistory) -> Optional[str]:
+def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optional[str]:
     """
-    Custom prompt that intercepts Up/Down arrows to navigate history.
-    Returns the selected string, or None if the user cancels (Ctrl+C/D).
-    Uses built-in `msvcrt` (Windows) or `termios` (Unix) for raw key capture.
+    Cross-platform raw key-capture prompt with Ghost-Text Autocomplete.
+    - Type '/': shows '/exit' in gray. Cursor stays after '/'.
+    - Type 'f': shows '/files' in gray. Cursor stays after 'f'.
+    - Press Tab or Right Arrow: accepts the gray suggestion.
+    - Press Up/Down: cycles through matching commands (or history if no match).
     """
     import sys
 
-    def _native_prompt_unix(prompt_text: str) -> Optional[str]:
+    PROMPT_TEXT = "👤 You> "
+    PROMPT_LEN = len(PROMPT_TEXT)
+
+    def _draw_line(buffer: str, cursor_pos: int, ghost: str = ""):
+        sys.stdout.write("\r\033[K")
+        if ghost:
+            sys.stdout.write(f"{PROMPT_TEXT}{buffer}\033[90m{ghost}\033[0m")
+        else:
+            sys.stdout.write(f"{PROMPT_TEXT}{buffer}")
+
+        # Move cursor back to correct position
+        if cursor_pos < len(buffer + ghost):
+            # +1 because terminal positions are 1-based
+            target_col = PROMPT_LEN + cursor_pos + 1
+            sys.stdout.write(f"\033[{target_col}G")
+        sys.stdout.flush()
+
+    def _native_prompt_unix() -> Optional[str]:
         import termios
         import tty
-        
+
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
         buffer = ""
         cursor_pos = 0
         history_idx = len(history.entries)
         current_input = ""
+        active_suggestion_idx = -1
 
-        def _redraw():
-            sys.stdout.write(f"\r\033[K{prompt_text}{buffer}")
-            if cursor_pos < len(buffer):
-                sys.stdout.write(f"\033[{len(prompt_text) + cursor_pos + 1}G")
-            sys.stdout.flush()
+        def get_suggestions():
+            if not buffer.startswith("/"):
+                return []
+            return [c for c in commands if c.startswith(buffer)]
 
         try:
             tty.setraw(fd)
-            sys.stdout.write(prompt_text)
+            sys.stdout.write(PROMPT_TEXT)
             sys.stdout.flush()
 
             while True:
                 ch = sys.stdin.read(1)
-                
-                if ch == '\x03':  # Ctrl+C
+                sugg = get_suggestions()
+                ghost_text = ""
+
+                if ch == '\x03' or ch == '\x04':
                     sys.stdout.write("\n")
                     return None
-                elif ch == '\x04':  # Ctrl+D
-                    sys.stdout.write("\n")
-                    return None
-                elif ch in ('\r', '\n'):  # Enter
+                elif ch in ('\r', '\n'):
                     sys.stdout.write("\n")
                     sys.stdout.flush()
                     return buffer
-                elif ch in ('\x7f', '\b'):  # Backspace
+                elif ch in ('\x7f', '\b'):
                     if cursor_pos > 0:
                         buffer = buffer[:cursor_pos-1] + buffer[cursor_pos:]
                         cursor_pos -= 1
-                        _redraw()
-                elif ch == '\x1b':  # Escape sequence (Arrows)
+                        active_suggestion_idx = -1
+                        sugg = get_suggestions()
+                        ghost_text = sugg[0][len(buffer):] if sugg and sugg[0].startswith(buffer) else ""
+                        _draw_line(buffer, cursor_pos, ghost_text)
+                elif ch == '\t':  # Tab accepts ghost text
+                    if sugg:
+                        buffer = sugg[0]
+                        cursor_pos = len(buffer)
+                        active_suggestion_idx = -1
+                        _draw_line(buffer, cursor_pos)
+                elif ch in ('\r', '\n'):
+                    sugg = get_suggestions()
+                    if sugg and sugg[0].startswith(buffer):
+                        buffer = sugg[0]
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    return buffer
+                elif ch == '\x1b':
                     ch2 = sys.stdin.read(1)
                     ch3 = sys.stdin.read(1)
                     if ch2 == '[':
                         if ch3 == 'A':  # Up
-                            if history.entries:
+                            if sugg:
+                                active_suggestion_idx = (active_suggestion_idx - 1) % len(sugg)
+                                buffer = sugg[active_suggestion_idx]
+                                cursor_pos = len(buffer)
+                                _draw_line(buffer, cursor_pos)
+                            elif history.entries:
                                 if history_idx == len(history.entries):
                                     current_input = buffer
                                 history_idx = max(0, history_idx - 1)
                                 buffer = history.entries[history_idx]
                                 cursor_pos = len(buffer)
-                                _redraw()
+                                _draw_line(buffer, cursor_pos)
                         elif ch3 == 'B':  # Down
-                            if history_idx < len(history.entries):
+                            if sugg:
+                                active_suggestion_idx = (active_suggestion_idx + 1) % len(sugg)
+                                buffer = sugg[active_suggestion_idx]
+                                cursor_pos = len(buffer)
+                                _draw_line(buffer, cursor_pos)
+                            elif history_idx < len(history.entries):
                                 history_idx += 1
                                 if history_idx == len(history.entries):
                                     buffer = current_input
                                 else:
                                     buffer = history.entries[history_idx]
                                 cursor_pos = len(buffer)
-                                _redraw()
-                        elif ch3 == 'C':  # Right
-                            if cursor_pos < len(buffer):
+                                _draw_line(buffer, cursor_pos)
+                        elif ch3 == 'C':  # Right accepts ghost text
+                            if sugg and cursor_pos == len(buffer):
+                                buffer = sugg[0]
+                                cursor_pos = len(buffer)
+                                active_suggestion_idx = -1
+                                _draw_line(buffer, cursor_pos)
+                            elif cursor_pos < len(buffer):
                                 cursor_pos += 1
-                                sys.stdout.write("\033[C")
-                                sys.stdout.flush()
+                                _draw_line(buffer, cursor_pos, ghost_text)
                         elif ch3 == 'D':  # Left
                             if cursor_pos > 0:
                                 cursor_pos -= 1
-                                sys.stdout.write("\033[D")
-                                sys.stdout.flush()
+                                _draw_line(buffer, cursor_pos, ghost_text)
                 elif len(ch) == 1 and ch.isprintable():
                     buffer = buffer[:cursor_pos] + ch + buffer[cursor_pos:]
                     cursor_pos += 1
-                    _redraw()
+                    active_suggestion_idx = -1
+                    sugg = get_suggestions()
+                    ghost_text = sugg[0][len(buffer):] if sugg and sugg[0].startswith(buffer) else ""
+                    _draw_line(buffer, cursor_pos, ghost_text)
         except Exception:
             return None
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
-    def _native_prompt_windows(prompt_text: str) -> Optional[str]:
+    def _native_prompt_windows() -> Optional[str]:
         import msvcrt
-        
+
         buffer = ""
         cursor_pos = 0
         history_idx = len(history.entries)
         current_input = ""
+        active_suggestion_idx = -1
 
-        def _redraw():
-            sys.stdout.write(f"\r\033[K{prompt_text}{buffer}")
-            if cursor_pos < len(buffer):
-                sys.stdout.write(f"\033[{len(prompt_text) + cursor_pos + 1}G")
-            sys.stdout.flush()
+        def get_suggestions():
+            if not buffer.startswith("/"):
+                return []
+            return [c for c in commands if c.startswith(buffer)]
 
-        sys.stdout.write(prompt_text)
+        sys.stdout.write(PROMPT_TEXT)
         sys.stdout.flush()
 
         while True:
             if not msvcrt.kbhit():
                 continue
-                
+
             ch = msvcrt.getwch()
-            
-            if ch in ('\x03', '\x1b'):  # Ctrl+C or Esc
+            sugg = get_suggestions()
+            ghost_text = ""
+
+            if ch in ('\x03', '\x1b'):
                 sys.stdout.write("\n")
                 return None
-            elif ch in ('\r', '\n'):  # Enter
+            elif ch in ('\r', '\n'):
                 sys.stdout.write("\n")
                 sys.stdout.flush()
                 return buffer
-            elif ch in ('\x08', '\x7f'):  # Backspace
+            elif ch in ('\x08', '\x7f'):
                 if cursor_pos > 0:
                     buffer = buffer[:cursor_pos-1] + buffer[cursor_pos:]
                     cursor_pos -= 1
-                    _redraw()
-            elif ch == '\x00' or ch == '\xe0':  # Special key prefix
+                    active_suggestion_idx = -1
+                    sugg = get_suggestions()
+                    ghost_text = sugg[0][len(buffer):] if sugg and sugg[0].startswith(buffer) else ""
+                    _draw_line(buffer, cursor_pos, ghost_text)
+            elif ch == '\t':
+                if sugg:
+                    buffer = sugg[0]
+                    cursor_pos = len(buffer)
+                    active_suggestion_idx = -1
+                    _draw_line(buffer, cursor_pos)
+            elif ch in ('\r', '\n'):
+                sugg = get_suggestions()
+                if sugg and sugg[0].startswith(buffer):
+                    buffer = sugg[0]
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return buffer
+            elif ch == '\x00' or ch == '\xe0':
                 ch2 = msvcrt.getwch()
-                
-                if ch2 == 'H':  # Up arrow
-                    if history.entries:
-                        if history_idx == len(history.entries):
-                            current_input = buffer
+                if ch2 == 'H': # Up
+                    if sugg:
+                        active_suggestion_idx = (active_suggestion_idx - 1) % len(sugg)
+                        buffer = sugg[active_suggestion_idx]
+                        cursor_pos = len(buffer)
+                        _draw_line(buffer, cursor_pos)
+                    elif history.entries:
+                        if history_idx == len(history.entries): current_input = buffer
                         history_idx = max(0, history_idx - 1)
                         buffer = history.entries[history_idx]
                         cursor_pos = len(buffer)
-                        _redraw()
-                elif ch2 == 'P':  # Down arrow
-                    if history_idx < len(history.entries):
-                        history_idx += 1
-                        if history_idx == len(history.entries):
-                            buffer = current_input
-                        else:
-                            buffer = history.entries[history_idx]
+                        _draw_line(buffer, cursor_pos)
+                elif ch2 == 'P': # Down
+                    if sugg:
+                        active_suggestion_idx = (active_suggestion_idx + 1) % len(sugg)
+                        buffer = sugg[active_suggestion_idx]
                         cursor_pos = len(buffer)
-                        _redraw()
-                elif ch2 == 'M':  # Right arrow
-                    if cursor_pos < len(buffer):
+                        _draw_line(buffer, cursor_pos)
+                    elif history_idx < len(history.entries):
+                        history_idx += 1
+                        buffer = current_input if history_idx == len(history.entries) else history.entries[history_idx]
+                        cursor_pos = len(buffer)
+                        _draw_line(buffer, cursor_pos)
+                elif ch2 == 'M': # Right
+                    if sugg and cursor_pos == len(buffer):
+                        buffer = sugg[0]
+                        cursor_pos = len(buffer)
+                        active_suggestion_idx = -1
+                        _draw_line(buffer, cursor_pos)
+                    elif cursor_pos < len(buffer):
                         cursor_pos += 1
-                        sys.stdout.write("\033[C")
-                        sys.stdout.flush()
-                elif ch2 == 'K':  # Left arrow
+                        _draw_line(buffer, cursor_pos, ghost_text)
+                elif ch2 == 'K': # Left
                     if cursor_pos > 0:
                         cursor_pos -= 1
-                        sys.stdout.write("\033[D")
-                        sys.stdout.flush()
+                        _draw_line(buffer, cursor_pos, ghost_text)
             elif ch.isprintable():
                 buffer = buffer[:cursor_pos] + ch + buffer[cursor_pos:]
                 cursor_pos += 1
-                _redraw()
+                active_suggestion_idx = -1
+                sugg = get_suggestions()
+                ghost_text = sugg[0][len(buffer):] if sugg and sugg[0].startswith(buffer) else ""
+                _draw_line(buffer, cursor_pos, ghost_text)
 
     try:
         if sys.platform == 'win32':
-            return _native_prompt_windows("👤 You> ")
+            return _native_prompt_windows()
         else:
-            return _native_prompt_unix("👤 You> ")
-    except (KeyboardInterrupt, EOFError):
-        sys.stdout.write("\n")
-        return None
+            return _native_prompt_unix()
     except Exception:
         try:
-            return input("👤 You> ")
+            return input(PROMPT_TEXT)
         except (EOFError, KeyboardInterrupt):
             sys.stdout.write("\n")
             return None
@@ -1335,6 +1476,8 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
     renderer = StreamRenderer(config)
     history = PersistentHistory(APP_HISTORY_FILE)
 
+    slash_commands = ["/exit", "/quit", "/help", "/config", "/forget", "/skills", "/clear", "/models", "/files"]
+    
     # Display a safe, truncated workspace path to the user
     ws_path_display = Path(config.workspace_path).resolve()
     try:
@@ -1374,36 +1517,30 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
         ASCIIColors.panel(stats_content, title="[bold blue]📂 Workspace Telemetry[/bold blue]", border_style="blue")
         
         if ws_stats["loaded_files"]:
-            files_table = ASCIIColors.table(
-                "Relative Path",
-                rows=[[f] for f in ws_stats["loaded_files"]],
-                title="[bold]Pre-loaded Context Files [C][/bold]",
-                box="round"
-            )
-            ASCIIColors.rich_print(files_table)
+            _render_files_table(ws_stats["loaded_files"], "Pre-loaded Context Files [C]")
 
     while True:
         try:
-            user_input = _prompt_with_history(history)
+            user_input = _advanced_prompt(history, slash_commands)
         except (EOFError, KeyboardInterrupt):
             ASCIIColors.cyan("\n👋 Goodbye!")
             return 0
 
         if not user_input:
             continue
-        if user_input.lower() in ("exit", "quit", ":q"):
+        if user_input.lower() in ("/exit", "/quit"):
             ASCIIColors.cyan("👋 Goodbye!")
             return 0
-        
-        if user_input.lower() == "help":
+
+        if user_input.lower() == "/help":
             show_interactive_help()
             continue
 
-        if user_input.lower() in ("forget", "wipe", "wipe-memory"):
+        if user_input.lower() == "/forget":
             ASCIIColors.red("\n  ⚠️  WARNING: You are about to PERMANENTLY DELETE ALL agent memories.")
             ASCIIColors.red("  This includes user preferences, learned facts, and episodic history.")
             ASCIIColors.yellow("  Type 'CONFIRM WIPE' to proceed, or anything else to abort.")
-            
+
             try:
                 confirm = input("  ❓ Confirmation> ").strip()
             except (EOFError, KeyboardInterrupt):
@@ -1422,7 +1559,7 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                 ASCIIColors.green("  ✅ Wipe aborted. Memories are safe.")
             continue
 
-        if user_input.lower() == "skills":
+        if user_input.lower() == "/skills":
             if personality.skills_manager:
                 skills = personality.skills_manager.list_skills()
                 if not skills:
@@ -1438,18 +1575,30 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
             else:
                 ASCIIColors.yellow("  Skills manager not initialized.")
             continue
-        if user_input.lower() == "clear":
+
+        if user_input.lower() == "/clear":
+            personality._conversation = []
             ASCIIColors.green("  Conversation history cleared.")
             continue
-        if user_input.lower() == "models":
+
+        if user_input.lower() == "/models":
             ASCIIColors.yellow("  Model switching is managed via LollmsClient profiles in this version.")
             continue
-        if user_input.lower() == "config":
+
+        if user_input.lower() == "/config":
             from lollms_client.lollms_config_cli_env import run_wizard_and_save
             run_wizard_and_save()
             ASCIIColors.green("  Configuration updated. Restart lollms-code for changes to take effect.")
             continue
 
+        if user_input.lower() == "/files":
+            ws_stats = get_workspace_stats(personality)
+            if not ws_stats["loaded_files"]:
+                ASCIIColors.yellow("  No files are currently loaded in context [C].")
+            else:
+                _render_files_table(ws_stats["loaded_files"], "Loaded Context Files [C]")
+            continue
+        
         history.add(user_input)
         ASCIIColors.rule("[bold green]🤖 Agent[/bold green]")
         ASCIIColors.rich_print("") # Ensure output starts on a new line

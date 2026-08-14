@@ -1014,6 +1014,9 @@ class LollmsPersonality:
         if not hasattr(self, '_artefact_manager') or not self._artefact_manager:
             return
 
+        if not hasattr(self, '_discussion') or not self._discussion:
+            return
+
         try:
             import sqlite3 as _sqlite3
             import hashlib as _hashlib
@@ -1040,7 +1043,6 @@ class LollmsPersonality:
             conn.close()
 
             current_files = set()
-            all_arts = self._artefact_manager._get_all_raw()
             dirty = False
 
             _BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".zip", ".tar", ".gz", ".pdf", ".docx", ".pptx", ".mp3", ".wav", ".mp4"}
@@ -1123,13 +1125,6 @@ class LollmsPersonality:
 
                                     db_vis = db_info.get("visibility", ArtefactVisibility.TREE_UNLOCKABLE)
                                     resolved_vis = db_vis
-                                    if db_vis == ArtefactVisibility.FULL:
-                                        try:
-                                            stat = item.stat()
-                                            if stat.st_size > 51200:
-                                                resolved_vis = ArtefactVisibility.TREE_UNLOCKABLE
-                                        except Exception:
-                                            resolved_vis = ArtefactVisibility.TREE_UNLOCKABLE
 
                                     self._artefact_manager.add(
                                         title=rel_path_str,
@@ -1171,18 +1166,19 @@ class LollmsPersonality:
 
             if deleted_files:
                 surviving_arts = [
-                    art for art in all_arts 
+                    art for art in self._artefact_manager._get_all_raw()
                     if art.get("title") not in deleted_files or art.get("title", "").endswith("::images")
                 ]
                 self._artefact_manager._save_all(surviving_arts)
+            elif not self._discussion.metadata.get("_artefacts"):
+                self._artefact_manager._save_all(self._artefact_manager._get_all_raw())
 
             if not dirty and getattr(self, 'debug_mode', False):
                 ASCIIColors.success(f"[{self.name}] ✅ Workspace index is up-to-date (0 changes).")
 
         except Exception as e:
             if getattr(self, 'debug_mode', False):
-                ASCIIColors.warning(f"[{self.name}] Disk sync/prune failed: {e}")
-                
+                ASCIIColors.warning(f"[{self.name}] Disk sync/prune failed: {e}")          
                          
     def _refresh_workspace_context_in_prompt(self, current_prompt: str, new_ws_block: str) -> str:
         ws_boundary = "=== WORKSPACE CONTEXT BOUNDARY ==="
@@ -1563,6 +1559,7 @@ JSON:"""
             am = _IndexOnlyArtefactManager(proxy)
             object.__setattr__(self, '_artefact_manager', am)
             object.__setattr__(self, '_artefact_proxy', proxy)
+            object.__setattr__(self, '_discussion', proxy)
             object.__setattr__(self, '_state_db_path', state_db_path)
 
             # Delegate the initial population and hash computation to the delta sync engine.
@@ -1821,8 +1818,53 @@ JSON:"""
         except Exception as e:
             return f"[SYSTEM ERROR] Failed to update user profile: {e}"
 
+    def _build_onboarding_block(self) -> str:
+        """Injects a mandatory first-run onboarding protocol if the user profile is empty."""
+        profile_content = getattr(self, '_user_profile_content', "")
+        import re as _re
+        name_match = _re.search(r'## Identity\s*\n+\s*- Name:\s*(\S+)', profile_content)
+        if name_match and name_match.group(1).strip():
+            return ""
+
+        return (
+            "\n=== FIRST-RUN ONBOARDING PROTOCOL (MANDATORY) ===\n"
+            "The user's profile is empty. You MUST conduct a brief onboarding interview before doing any work.\n"
+            "Ask the following questions one by one, wait for the user's response, and then save them to your profile.\n"
+            "1. What is your name?\n"
+            "2. What programming language are we primarily working in?\n"
+            "3. Do you have any specific coding style preferences (e.g., tabs vs spaces, type hints)?\n"
+            "After gathering all answers, use `<user_profile_update>` to save them, then emit `<done/>`.\n"
+            "=== END ONBOARDING PROTOCOL ===\n"
+        )
+
+    def _enforce_git_safety(self, title: str, is_overwrite: bool) -> Optional[str]:
+        """
+        Programmatic guard for destructive file writes.
+        Returns an error message string if the write is blocked, or None if allowed.
+        """
+        if not is_overwrite or not self._resolved_workspace:
+            return None
+
+        try:
+            git_dir = self._resolved_workspace / ".git"
+            if not git_dir.exists():
+                return None
+
+            if getattr(self, '_git_autonomy_granted', False) or "Git Autonomy: Granted" in getattr(self, '_user_profile_content', ''):
+                return None
+
+            return (
+                f"❌ GIT SAFETY BLOCK: You are about to overwrite '{title}'.\n"
+                f"This workspace is a git repository. You MUST ask the user for permission.\n"
+                f"Output EXACTLY: \"⚠️ I am about to modify `{title}`. This action will be executed on a new git branch. Do you approve? (yes/no)\"\n"
+                f"Do NOT emit the `<artifact>` tag again until the user replies 'yes'."
+            )
+        except Exception:
+            return None
+
     def _build_system_prompt(self, active_tools: Dict) -> str:
         sys_prompt = self.system_prompt or ""
+        onboarding_block = self._build_onboarding_block()
         rules = (
           "\n=== ACTION EXECUTION & TERMINATION PROTOCOL (CRITICAL) ===\n"
           "1. **INTENT ≠ EXECUTION**: Stating 'I will search...' in text DOES NOT execute the action. You MUST output the `<tool>` tag.\n"
@@ -1832,6 +1874,20 @@ JSON:"""
           "5. **AGENTIC TRIGGER**: If the user requests code generation, file modification, testing, or multi-step work, you MUST enter the agentic loop and use `<tool>` or `<artifact>` tags. Do NOT write code directly in conversational prose.\n"
           "6. **ROUND 1 SHORT-CIRCUIT**: If the user's request is purely conversational (e.g., greetings, simple questions), respond conversationally without `<done/>` or tool tags.\n"
           "7. **NO PROSE BEFORE TOOLS**: DO NOT write introductory text like 'Let me check the git status' before a tool call. Output the `<tool>` tag as the VERY FIRST token of your response.\n"
+            "8. **SAME-RESPONSE EXECUTION (CRITICAL)**: If you state an intent to perform an action (e.g., 'Let me unlock file X', 'I will now patch Y'), you MUST execute that action's tag (`<unlock_file>`, `<lock_file>`, `<artifact>`, `<tool>`) IN THE SAME RESPONSE. Stating intent and then emitting `<done/>` without the tag is a CRITICAL ERROR. Never split an intent and its execution across two turns.\n"
+            "9. **BATCH CONTEXT OPERATIONS (MANDATORY)**: When locking, unlocking, or hiding multiple files, you MUST use a SINGLE tag containing all files separated by newlines. DO NOT emit multiple sequential tags for batch operations.\n"
+            "   Example:\n"
+            "   <lock_file>\n"
+            "   file1.py\n"
+            "   file2.py\n"
+            "   file3.py\n"
+            "   </lock_file>\n"
+            "10. **DEPENDENCY SEPARATION (CRITICAL)**: You MAY emit multiple independent `<tool>` or `<artifact>` tags in a single response. They will be buffered and executed sequentially.\n"
+            "    HOWEVER, if you need the RESULT of Tool A to construct the parameters for Tool B, they MUST be executed in separate rounds.\n"
+            "    - Do NOT guess the output of Tool A. Emit Tool A, end your turn, and wait for the system to return the result.\n"
+            "    - Once you have the result, emit Tool B in your next response.\n"
+            "    - Example of WRONG behavior: `<tool>{\"name\": \"find_file\", \"parameters\": {\"pattern\": \"config.yml\"}}</tool>` followed by `<tool>{\"name\": \"read_file\", \"parameters\": {\"path\": \"./config.yml\"}}</tool>` (The path is guessed).\n"
+            "    - Example of CORRECT behavior: Emit `<tool>{\"name\": \"find_file\", \"parameters\": {\"pattern\": \"config.yml\"}}</tool>` and end your turn. In the next turn, use the returned path to call `read_file`.\n"
             "\n=== TOOL CALLING DISCIPLINE (CRITICAL) ===\n"
             "1. **Tool Results ≠ Tool Calls**: When a tool returns JSON, it's a RESULT, not a new call.\n"
             "2. **One Call Per Task**: Once a tool succeeds, analyze and answer.\n"
@@ -1851,7 +1907,11 @@ JSON:"""
             "If a patch fails, the system will return the error. You MUST read the error carefully. The file content is already available in your context under the `## Fully Loaded File Contents [C]` section. Concentrate on the exact text, fix your SEARCH block, and re-emit the `<artifact>` tag. Do not attempt to use a `tool_read_file` tool, as it does not exist.\n"
             "\n=== SKILLS SYSTEM ===\n"
             "Skills are persistent knowledge capsules stored outside the workspace. They survive across sessions.\n"
-            "Use `tool_list_skills` to see available skills, and `tool_load_skill` to load their full content.\n"
+            "They are categorized by visibility:\n"
+            "1. **Visible**: Automatically loaded in your system prompt. Costs 0 turns.\n"
+            "2. **Loadable**: Listed in your context block. Use `tool_load_skill` to pull the full content (Costs 1 turn).\n"
+            "3. **Searchable**: Hidden from your context block. Use `tool_search_skills` then `tool_load_skill` (Costs 2 turns).\n"
+            "Use `tool_list_skills` to programmatically list all skills and their tiers.\n"
             "If you discover a reusable methodology or best practice, use `tool_create_skill` to save it for future use.\n"
             "Use `tool_update_skill` to refine existing skills as you learn more.\n"
             "\n=== SUB-AGENT DELEGATION ===\n"
@@ -1859,8 +1919,15 @@ JSON:"""
             "The child shares your workspace but cannot spawn further sub-agents.\n"
             "Use this for heavy tasks like writing large scripts, researching topics, or designing presentations.\n"
             "\n=== OPERATIONAL SAFETY & STATE MANAGEMENT DOCTRINE (CRITICAL) ===\n"
-            "1. **GIT BRANCHING PROTOCOL**: Before modifying any existing file, you MUST create a new git branch (e.g., `git checkout -b fix/login-bug`).\n"
-            "   Work exclusively in this branch. Only merge back to `main` after all tests pass.\n"
+            "1. **GIT BRANCHING & CONFIRMATION PROTOCOL (MANDATORY)**: \n"
+            "   Before modifying, overwriting, or deleting ANY existing file in the workspace, you MUST follow this protocol:\n"
+            "   a. Check if a `.git` directory exists in the workspace root.\n"
+            "   b. If it exists, you MUST ask the user for explicit permission to proceed.\n"
+            "      Example: \"⚠️ I am about to modify `critic.md`. This action will be executed on a new git branch. Do you approve? (yes/no)\"\n"
+            "   c. Upon receiving 'yes', you MUST create and checkout a new branch before emitting any `<artifact>` tags.\n"
+            "      Use the shell tool: `git checkout -b update/<short-branch-name>`.\n"
+            "      Work exclusively in this branch. Only merge back to `main` after all tests pass.\n"
+            "   d. If no `.git` directory exists, you may proceed with modifications, but you should still inform the user before overwriting large files.\n"
             "2. **DANGEROUS OPERATIONS (HUMAN-IN-THE-LOOP)**: Operations that are destructive or irreversible REQUIRE explicit user confirmation.\n"
             "   Examples: `git push --force`, `rm -rf`, dropping database tables, modifying system configs.\n"
             "   Before executing such a command via a tool, you MUST output a message like:\n"
@@ -1873,6 +1940,7 @@ JSON:"""
             "   - **Memory**: Use `<mem_new>` for LONG-TERM project facts, architectural decisions, and learned methodologies.\n"
             "   - **User Profile**: ALWAYS study the user's coding style, naming conventions, and preferences. If you discover a universal preference (e.g., 'The user prefers 4-space indentation'), update the profile using `<user_profile_update>`. You can clear the profile using `<user_profile_clear></user_profile_clear>`.\n"
             "=== END OPERATIONAL SAFETY DOCTRINE ===\n"
+            f"{onboarding_block}"
             "\n=== THINKING & REASONING CONSTRAINT ===\n"
             "If you output thoughts enclosed in  tags, you MUST output all functional XML tags AFTER the closing tag.\n"
             "\n=== TOOL CALLING DISCIPLINE (CRITICAL) ===\n"
@@ -1955,6 +2023,15 @@ JSON:"""
             if skills_ctx_str:
                 skills_ctx = "\n" + skills_ctx_str
 
+            if len(self.skills_manager.skills) == 0:
+                skills_ctx += (
+                    "\n=== SKILLS SYSTEM STATUS ===\n"
+                    "The skills library is currently EMPTY. There are 0 skills available.\n"
+                    "Do NOT attempt to call `tool_list_skills` or `tool_search_skills` as they will return nothing.\n"
+                    "If you discover a reusable methodology or best practice during your task, use `tool_create_skill` to save it for future use.\n"
+                    "=== END SKILLS SYSTEM STATUS ==="
+                )
+
         tool_desc = ""
         if active_tools:
             tool_desc = "\n=== TOOLS AVAILABLE ===\nTo use a tool, emit `<tool>{\"name\": \"...\", \"parameters\": {...}}</tool>`.\n\nAvailable tools:\n"
@@ -1973,7 +2050,7 @@ JSON:"""
             return "[SYSTEM ERROR] Artefact system not initialized. Cannot manage file visibility."
 
         try:
-            from lollms_client.lollms_artefact import ArtefactVisibility
+            from lollms_client.lollms_artefact import ArtefactVisibility, _find_best_title_match
         except ImportError:
             return "[SYSTEM ERROR] ArtefactVisibility module not available."
 
@@ -1998,16 +2075,47 @@ JSON:"""
             if xml_bodies:
                 clean_body = "\n".join(xml_bodies)
 
+        all_arts = self._artefact_manager._get_all_raw()
+
         raw_targets = re.split(r'[\n,;]+', clean_body)
         targets = [t.strip().replace("\\", "/") for t in raw_targets if t.strip()]
+
+        expanded_targets = []
+        all_arts_titles = [a.get("title", "") for a in all_arts if not a.get("title", "").endswith("::images")]
+        for target in targets:
+            target_lower = target.lower()
+            if "all files" in target_lower or "all" == target_lower:
+                exceptions = []
+                if "except" in target_lower:
+                    exceptions_part = target_lower.split("except", 1)[1]
+                    exceptions = [e.strip().replace("\\", "/") for e in re.split(r'[\n,;]+', exceptions_part) if e.strip()]
+                for title in all_arts_titles:
+                    if not any(ex.lower() in title.lower() for ex in exceptions):
+                        expanded_targets.append(title)
+            else:
+                expanded_targets.append(target)
+
+        targets = expanded_targets
 
         processed_files = []
         already_in_state = []
         not_found = []
         blocked_files = []
+        loaded_contents = {}
 
-        _MAX_UNLOCK_TOKENS = 50000
-        all_arts = self._artefact_manager._get_all_raw()
+        max_ctx = 0
+        if self.lollms_client and hasattr(self.lollms_client, 'get_ctx_size'):
+            try:
+                max_ctx = self.lollms_client.get_ctx_size() or 0
+            except Exception:
+                max_ctx = 0
+
+        if max_ctx > 0:
+            _MAX_UNLOCK_TOKENS = int(max_ctx * 0.95)
+        else:
+            _MAX_UNLOCK_TOKENS = 50000
+
+        _BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".zip", ".tar", ".gz", ".pdf", ".docx", ".pptx", ".mp3", ".wav", ".mp4"}
 
         for t_target in targets:
             if tag_name in ("collapse_folder", "uncollapse_folder"):
@@ -2031,19 +2139,32 @@ JSON:"""
                         processed_files.append(art["title"])
                 continue
 
-            art = self._artefact_manager.get(t_target)
+            def _norm_path(p: str) -> str:
+                p = p.replace("\\", "/").strip()
+                if p.startswith("./"):
+                    p = p[2:]
+                return p.lower()
+
+            target_norm = _norm_path(t_target)
+            art = next((a for a in all_arts if _norm_path(a.get("title", "")) == target_norm), None)
+
             if not art:
-                best_match = self._artefact_manager._find_best_title_match(t_target, [a["title"] for a in all_arts])
+                best_match = _find_best_title_match(t_target, [a["title"] for a in all_arts])
                 if best_match:
                     art = self._artefact_manager.get(best_match)
                     t_target = best_match
 
             if not art:
                 not_found.append(t_target)
+                if getattr(self, 'debug_mode', False):
+                    ASCIIColors.warning(f"[ContextUnlock] File not found in index: {t_target}")
+                    ASCIIColors.warning(f"[ContextUnlock] Indexed titles sample: {all_arts_titles[:5]}")
+                continue
             elif art.get("visibility") == target_visibility:
                 already_in_state.append(t_target)
             elif target_visibility == ArtefactVisibility.FULL:
                 file_path = self._resolved_workspace / art["title"]
+
                 token_count = 0
                 content = ""
 
@@ -2051,8 +2172,13 @@ JSON:"""
                     try:
                         content = file_path.read_text(encoding="utf-8", errors="ignore")
                         token_count = len(content) // 4
-                    except Exception:
-                        pass
+                    except Exception as read_err:
+                        ASCIIColors.warning(f"[ContextUnlock] Failed to read {art['title']}: {read_err}")
+                        blocked_files.append((art["title"], 0))
+                        continue
+                else:
+                    not_found.append(t_target)
+                    continue
 
                 if token_count > _MAX_UNLOCK_TOKENS:
                     ASCIIColors.warning(
@@ -2067,11 +2193,33 @@ JSON:"""
                     art["visibility"] = ArtefactVisibility.FULL
                     art["active"] = True
                     processed_files.append(art["title"])
+                    if content:
+                        loaded_contents[art["title"]] = content
+
+                    try:
+                        if hasattr(self, '_state_db_path'):
+                            import sqlite3 as _sqlite3
+                            import hashlib as _hashlib
+                            file_hash = _hashlib.md5(content.encode('utf-8', errors='ignore')).hexdigest()
+                            conn = _sqlite3.connect(str(self._state_db_path))
+                            cursor = conn.cursor()
+                            cursor.execute(
+                                "UPDATE file_states SET hash = ? WHERE title = ?",
+                                (file_hash, art["title"])
+                            )
+                            conn.commit()
+                            conn.close()
+                    except Exception:
+                        pass
             else:
                 art["visibility"] = target_visibility
                 art["active"] = False
                 art["content"] = ""
                 processed_files.append(art["title"])
+
+        if processed_files or already_in_state:
+            self._artefact_manager._save_all(all_arts)
+            object.__setattr__(self, '_last_ws_sync_time', 0.0)
 
         try:
             if hasattr(self, '_state_db_path') and hasattr(self, '_artefact_manager'):
@@ -2085,6 +2233,18 @@ JSON:"""
                     )
                 conn.commit()
                 conn.close()
+
+                if target_visibility in (ArtefactVisibility.TREE_LOCKED, ArtefactVisibility.HIDDEN):
+                    current_arts = self._artefact_manager._get_all_raw()
+                    for art in current_arts:
+                        if art.get("title") in processed_files:
+                            art["content"] = ""
+                            art["active"] = False
+                            art["visibility"] = target_visibility
+                    self._artefact_manager._save_all(current_arts)
+
+                    object.__setattr__(self, '_last_ws_sync_time', 0.0)
+
         except Exception as commit_err:
             ASCIIColors.warning(f"[LollmsPersonality] Failed to persist visibility state: {commit_err}")
 
@@ -2097,15 +2257,14 @@ JSON:"""
             status_parts.append(f"❌ Not found: {', '.join(not_found)}")
         if blocked_files:
             blocked_desc = "; ".join(
-                f"{bf} (~{tc:,} tokens)" for bf, tc in blocked_files
+                f"{bf} (~{tc:,} tokens)" if tc > 0 else f"{bf} (Binary/Read Error)" for bf, tc in blocked_files
             )
             status_parts.append(
-                f"🛑 BLOCKED (too large for context): {blocked_desc}. "
+                f"🛑 BLOCKED: {blocked_desc}. "
                 f"Use a tool (SQL query, grep, or Python script) to extract "
                 f"specific data from this file instead of loading it fully."
             )
 
-        # ── AGGREGATE CONTEXT STATE REPORT ──
         active_files_list = []
         if hasattr(self, '_artefact_manager') and self._artefact_manager:
             current_arts = self._artefact_manager._get_all_raw()
@@ -2114,7 +2273,7 @@ JSON:"""
                 if a.get("visibility") == ArtefactVisibility.FULL
                 and not a.get("title", "").endswith("::images")
             ]
-        
+
         if active_files_list:
             status_parts.append("\n📂 Currently Loaded in Context [C]:")
             for f_name in sorted(active_files_list):
@@ -2122,10 +2281,14 @@ JSON:"""
         else:
             status_parts.append("\n📂 No files are currently loaded in context.")
 
-        status_meta = "failure" if (not_found and not processed_files) or blocked_files else "success"
+        status_meta = "failure" if (not_found or blocked_files) else "success"
 
         if processed_files or already_in_state:
             object.__setattr__(self, '_last_ws_sync_time', 0.0)
+
+        error_str = None
+        if status_meta == "failure":
+            error_str = "\n".join([p for p in status_parts if "❌" in p or "🛑" in p])
 
         status_str = f"{action_verb} context files...\nContext Update:\n{'; '.join(status_parts)}\nstatus:{status_meta}"
         return {
@@ -2133,10 +2296,11 @@ JSON:"""
             "processed_files": processed_files,
             "already_in_state": already_in_state,
             "not_found": not_found,
-            "blocked_files": blocked_files
-        }
-
-
+            "blocked_files": blocked_files,
+            "error": error_str,
+            "loaded_contents": loaded_contents
+        }   
+        
     def _execute_tool(self, tool_name: str, tool_params: Dict[str, Any], active_tools: Dict) -> Dict[str, Any]:
         old_cwd = os.getcwd()
         if self._resolved_workspace:
@@ -2219,10 +2383,6 @@ JSON:"""
         use_internal_history: bool = True,
         **kwargs
     ) -> Dict[str, Any]:
-        """
-        Independent agentic chat loop. Used when the personality operates outside of a LollmsDiscussion.
-        Implements KV-Cache optimized prompt assembly (Append-Only Context Protocol).
-        """
         if lollms_client is not None:
             self.lollms_client = lollms_client
 
@@ -2252,22 +2412,11 @@ JSON:"""
         self._init_scratchpad()
 
         cleaned_prompt = prompt
-        if enable_artefacts and hasattr(self, '_artefact_manager') and self._artefact_manager:
-            try:
-                cleaned_prompt = self._autonomous_context_cleanup(prompt)
-            except Exception as clean_err:
-                ASCIIColors.warning(f"[{self.name}] Autonomous context cleanup failed: {clean_err}")
-
         active_tools = self._discover_tools(tools, tool_files or [])
 
-        # ── 🛡️ KV-CACHE OPTIMIZATION: STABLE SYSTEM PROMPT (IMMUTABLE) ──
-        # The stable system prompt contains ONLY the base instructions and the user profile.
-        # It MUST NOT contain the scratchpad or dynamic memories, as those can change between rounds.
         stable_system_prompt = self._build_system_prompt(active_tools)
         stable_system_prompt += self._build_user_profile_context()
 
-        # ── Build the Dynamic Suffix (Tree + Scratchpad + Memories) ──
-        # This will be injected ONLY at Round 1, appended directly to the user's prompt.
         dynamic_suffix_parts = []
 
         ws_ctx = self._build_workspace_context_block()
@@ -2302,7 +2451,6 @@ JSON:"""
 
         dynamic_suffix = "\n\n".join(dynamic_suffix_parts)
 
-        # Fuse the dynamic suffix with the user's prompt for Round 1
         if dynamic_suffix:
             fused_prompt = f"=== CURRENT WORKSPACE CONTEXT ===\n{dynamic_suffix}\n=== END WORKSPACE CONTEXT ===\n\n{cleaned_prompt}"
         else:
@@ -2320,6 +2468,14 @@ JSON:"""
         final_response = ""
         workspace_changes: List[Dict[str, Any]] = []
 
+        event_mode = kwargs.get("event_mode", EventMode.PROCESSING_TAG_MODE)
+        ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
+        successful_context_signatures: set = set()
+
+        event_mode = kwargs.get("event_mode", EventMode.PROCESSING_TAG_MODE)
+        ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
+        successful_context_signatures: set = set()
+
         while round_count < max_reasoning_steps:
             if self.is_generation_cancelled():
                 was_cancelled = True
@@ -2336,30 +2492,32 @@ JSON:"""
                 except Exception:
                     pass
 
-            # ── 🛡️ KV-CACHE OPTIMIZATION: APPEND-ONLY CONTEXT PROTOCOL ──
-            # 1. Start with the STABLE system prompt (never changes between rounds)
-            messages = [{"role": "system", "content": stable_system_prompt}]
-            
-            # 2. Add the OLD, stable history
-            messages.extend(base_conversation)
+            if round_count > 1 and ss.completed_actions:
+                ss.completed_actions.clear()
+                ss.tool_trigger = False
+                ss.artifact_trigger = False
+                ss.context_trigger = False
+                ss._is_accumulating_tool = False
+                ss._is_accumulating_artifact = False
+                ss._is_accumulating_context = False
 
-            # 3. Add the VIRTUAL HISTORY (append-only tool calls/results from this turn)
-            # Context compaction is strictly deferred to the fallback block where the actual
-            # context fill percentage can be measured accurately.
+            messages = [{"role": "system", "content": stable_system_prompt}]
+            messages.extend(base_conversation)
 
             for vh in virtual_history:
                 role = "user" if vh.sender_type == "user" else "assistant"
                 messages.append({"role": role, "content": vh.content})
 
-            # 4. APPEND-ONLY DYNAMIC SUFFIX PROTOCOL
-            # The dynamic context was already fused into the user's prompt in base_conversation.
-            # We do NOT modify the messages array here. In Round 2+, we rely strictly on 
-            # appending virtual_history (tool results) to the end of the array.
             if round_count > 1:
                 if not virtual_history or virtual_history[-1].sender_type == "assistant":
                     messages.append({"role": "user", "content": "[SYSTEM: Continue your task.]"})
 
-            # ── 🐛 DEBUG INSTRUMENTATION: CONTEXT DUMP TO FILE ──
+            if streaming_callback:
+                try:
+                    streaming_callback("", MSG_TYPE.MSG_TYPE_NEW_MESSAGE, {"round": round_count})
+                except Exception:
+                    pass
+
             if getattr(self, 'debug_mode', False):
                 try:
                     debug_dir = self._resolved_workspace / ".lollms_code" / "_debug_dumps"
@@ -2379,7 +2537,6 @@ JSON:"""
                 except Exception as debug_err:
                     ASCIIColors.warning(f"Failed to write debug log: {debug_err}")
 
-            # ── 🐛 DEBUG INSTRUMENTATION: SHORTENED CONTEXT DUMP ──
             if getattr(self, 'debug_mode', False):
                 try:
                     debug_dir = self._resolved_workspace / ".lollms_code" / "_debug_dumps"
@@ -2402,8 +2559,6 @@ JSON:"""
 
             messages = _normalize_messages(messages)
 
-            ss = _AgentStreamState(callback=streaming_callback)
-
             def _inline_relay(chunk, msg_type=None, meta=None):
                 if self.is_generation_cancelled():
                     return False
@@ -2415,7 +2570,7 @@ JSON:"""
                     return ss.feed(chunk)
                 return True
 
-            gen_kwargs = {k: v for k, v in kwargs.items() if k not in ("streaming_callback", "temperature", "n_predict", "stream")}
+            gen_kwargs = {k: v for k, v in kwargs.items() if k not in ("streaming_callback", "temperature", "n_predict", "stream", "event_mode")}
             gen_kwargs["n_predict"] = min(n_predict, self.max_tokens_per_turn)
             gen_kwargs["temperature"] = temperature
 
@@ -2446,437 +2601,463 @@ JSON:"""
 
             ss.flush_remaining_buffer()
 
+            if getattr(self, 'debug_mode', False):
+                try:
+                    debug_dir = self._resolved_workspace / ".lollms_code" / "_debug_dumps"
+                    debug_dir.mkdir(parents=True, exist_ok=True)
+                    raw_log_path = debug_dir / f"raw_output_round_{round_count}.log"
+
+                    with open(raw_log_path, "w", encoding="utf-8") as f:
+                        f.write("=" * 80 + "\n")
+                        f.write(f"🐛 [DEBUG] ROUND {round_count} - RAW LLM OUTPUT (FULL FIDELITY)\n")
+                        f.write("=" * 80 + "\n")
+                        f.write(ss._raw_stream_buffer + "\n")
+                        f.write("\n" + "=" * 80 + "\n")
+                        f.write(f"🐛 [DEBUG] ROUND {round_count} - PARSED ACTIONS\n")
+                        f.write("=" * 80 + "\n")
+                        for action in ss.completed_actions:
+                            f.write(f"- Type: {action.get('type')}\n")
+                            if action.get("type") == "tool":
+                                f.write(f"  JSON: {action.get('json')}\n")
+                            elif action.get("type") == "artifact":
+                                f.write(f"  XML Length: {len(action.get('xml', ''))}\n")
+                            elif action.get("type") == "context":
+                                f.write(f"  Tag: {action.get('tag_name')}\n")
+                            f.write("\n")
+                except Exception as debug_err:
+                    ASCIIColors.warning(f"Failed to write raw debug log: {debug_err}")
+
             if ss.was_done_detected():
                 final_response = ss.get_clean_text()
-                final_response = re.sub(r'(?m)^\s*<done\s*/?>', '', final_response, flags=re.IGNORECASE).strip()
-                if getattr(self, 'debug_mode', False):
-                    ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: <done/> detected ===")
+                if ss.completed_actions:
+                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=final_response))
+                    virtual_history.append(SimpleNamespace(sender_type="user", content="[SYSTEM: You emitted <done/> but there are pending buffered actions. Executing them now. Please analyze the results and provide your final summary.]"))
+                    final_response = ""
+
+                if not final_response.strip() and round_count == 1 and not ss.completed_actions and not virtual_history:
+                    ASCIIColors.warning(f"[{self.name}] 🚫 Empty response with <done/> detected on round 1. Forcing continuation.")
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content="[SYSTEM: Your previous response was completely empty. You MUST provide a substantive response or use a tool. Do NOT output an empty response. If you are analyzing code, state your findings. If you are writing code, emit the `<artifact>` tag. Do not emit `<done/>` until you have actually produced output.]"
+                    ))
+                    continue
+                
+                if not ss.completed_actions:
+                    if getattr(self, 'debug_mode', False):
+                        ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: <done/> detected ===")
+                    break
+
+            if ss.completed_actions:
+                raw_round_text = ss.get_clean_text()
+                clean_history_text = self._sanitize_history_for_context(raw_round_text)
+                virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant executed batched actions]"))
+
+                files_before = self._take_workspace_snapshot()
+
+                action_reports = []
+                for action in ss.completed_actions:
+                    if action["type"] == "tool":
+                        tool_call_json_str = action["json"]
+                        try:
+                            call_data = json.loads(tool_call_json_str)
+                            tool_name = call_data.get("name", "")
+                            tool_params = call_data.get("parameters", {})
+
+                            if not active_tools or tool_name not in active_tools:
+                                action_reports.append(f"Tool '{tool_name}' not available. Use one of: {list(active_tools.keys())}")
+                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                    streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_END, {"tool_name": tool_name, "success": False, "error": "Tool not available", "output": None})
+                                if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                    streaming_callback(f'<status>failure</status>\n<error>Tool {tool_name} not available</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                continue
+
+                            is_shell_tool = tool_name == "tool_execute_shell_command"
+                            if is_shell_tool:
+                                command_str = str(tool_params.get("command", "")).strip()
+                                context_aware_sig = f"{tool_name}::{command_str}"
+                            else:
+                                param_sig = json.dumps(tool_params, sort_keys=True, default=str)
+                                context_aware_sig = f"{tool_name}::{param_sig}"
+
+                            if context_aware_sig in successful_tool_signatures:
+                                action_reports.append(f"Repetitive call to '{tool_name}' with identical parameters blocked. Output already in context.")
+                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                    streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_END, {"tool_name": tool_name, "success": False, "error": "Repetitive call blocked", "output": None})
+                                if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                    streaming_callback(f'<status>failure</status>\n<error>Repetitive call blocked</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                continue
+
+                            if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_START, {"tool_name": tool_name, "parameters": tool_params, "executing": True})
+
+                            tool_res = self._execute_tool(tool_name, tool_params, active_tools)
+
+                            tool_success = isinstance(tool_res, dict) and tool_res.get("success", True) is not False
+                            if tool_success:
+                                successful_tool_signatures.add(context_aware_sig)
+
+                            tool_calls_this_turn.append({"round": round_count, "name": tool_name, "parameters": tool_params})
+                            tool_results_this_turn.append({"round": round_count, "name": tool_name, "result": tool_res, "success": tool_success})
+                            clean_result_str = _sanitize_tool_result(tool_res)
+
+                            if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_END, {
+                                    "tool_name": tool_name,
+                                    "success": tool_success,
+                                    "output": clean_result_str if tool_success else None,
+                                    "error": None if tool_success else clean_result_str
+                                })
+
+                            if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                if tool_success:
+                                    streaming_callback(f'<status>success</status>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                else:
+                                    streaming_callback(f'<status>failure</status>\n<error>{clean_result_str}</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                            if tool_success:
+                                report_part = f"=== ✅ TOOL RESULT: {tool_name} ===\n<tool_result name=\"{tool_name}\" status=\"SUCCESS\">\n{clean_result_str}\n</tool_result>"
+                            else:
+                                report_part = f"=== ❌ TOOL FAILED: {tool_name} ===\n<tool_result name=\"{tool_name}\" status=\"FAILED\">\n{clean_result_str}\n</tool_result>"
+
+                            action_reports.append(report_part)
+                        except Exception as e:
+                            action_reports.append(f"[Tool execution error: {e}]")
+                            if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_END, {"tool_name": "unknown", "success": False, "error": str(e), "output": None})
+                            if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                streaming_callback(f'<status>failure</status>\n<error>{str(e)}</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                    elif action["type"] == "artifact":
+                        raw_artifact_xml = action["xml"]
+                        try:
+                            attrs_match = re.search(r'<art(?:ifact|efact)[^>]*>', raw_artifact_xml, re.IGNORECASE)
+                            attrs_str = attrs_match.group(0) if attrs_match else ""
+                            body_match = re.search(r'<art(?:ifact|efact)[^>]*>(.*)</art(?:ifact|efact)>', raw_artifact_xml, re.DOTALL | re.IGNORECASE)
+                            body_content = body_match.group(1).strip() if body_match else ""
+
+                            title = "artifact"
+                            lang = "python"
+                            for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
+                                if m.group(1).lower() in ("name", "title"):
+                                    title = m.group(2)
+                                elif m.group(1).lower() == "language":
+                                    lang = m.group(2)
+
+                            is_patch = "<<<<<<< SEARCH" in body_content
+
+                            file_path = self._resolved_workspace / title
+                            is_overwrite = file_path.exists()
+
+                            git_block = self._enforce_git_safety(title, is_overwrite)
+                            if git_block:
+                                action_reports.append(git_block)
+                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                    streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {"title": title, "art_type": "code", "success": False, "error": git_block})
+                                if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                    streaming_callback(f'<status>failure</status>\n<error>{git_block}</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                continue
+
+                            if is_patch:
+                                if not file_path.exists():
+                                    err_msg = f"File '{title}' not found. Cannot apply patch."
+                                    action_reports.append(f"[SYSTEM ERROR] {err_msg}")
+                                    if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                        streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {"title": title, "art_type": "code", "success": False, "error": err_msg})
+                                    if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                        streaming_callback(f'<status>failure</status>\n<error>{err_msg}</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                    continue
+
+                                stripped_body = body_content.strip()
+                                if not stripped_body:
+                                    err_msg = f"Empty patch body for {title}."
+                                    action_reports.append(f"❌ SEARCH/REPLACE BLOCKED. {err_msg}")
+                                    if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                        streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {"title": title, "art_type": "code", "success": False, "error": err_msg})
+                                    if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                        streaming_callback(f'<status>failure</status>\n<error>{err_msg}</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                    continue
+
+                                original_content = file_path.read_text(encoding="utf-8", errors="ignore")
+                                try:
+                                    patched_content = ArtefactManager.apply_aider_patch(original_content, body_content)
+                                    file_path.write_text(patched_content, encoding="utf-8")
+                                    success_msg = f"✅ SEARCH/REPLACE applied successfully to {title}."
+                                    action_reports.append(success_msg)
+                                    if self._artefact_manager:
+                                        self._artefact_manager.update(title=title, new_content=patched_content, language=lang, bump_version=True, active=True)
+                                    if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                        streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {"title": title, "art_type": "code", "version": 1, "success": True, "error": None})
+                                    if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                        streaming_callback(f'<status>success</status>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                except Exception as patch_err:
+                                    err_msg = f"SEARCH/REPLACE FAILED for {title}. Error: {patch_err}"
+                                    action_reports.append(f"❌ {err_msg}")
+                                    if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                        streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {"title": title, "art_type": "code", "success": False, "error": str(patch_err)})
+                                    if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                        streaming_callback(f'<status>failure</status>\n<error>{str(patch_err)}</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                            else:
+                                stripped_body = body_content.strip()
+                                if not stripped_body:
+                                    err_msg = f"Empty artifact body for {title}."
+                                    action_reports.append(f"❌ FILE WRITE BLOCKED. {err_msg}")
+                                    if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                        streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {"title": title, "art_type": "code", "success": False, "error": err_msg})
+                                    if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                        streaming_callback(f'<status>failure</status>\n<error>{err_msg}</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                    continue
+
+                                if self._artefact_manager:
+                                    self._artefact_manager.add(title=title, artefact_type="code", content=body_content, language=lang, active=True)
+                                file_path = self._resolved_workspace / title
+                                file_path.write_text(body_content, encoding="utf-8")
+                                success_msg = f"✅ File {title} created/updated successfully."
+                                action_reports.append(success_msg)
+                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                    streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {"title": title, "art_type": "code", "version": 1, "success": True, "error": None})
+                                if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                    streaming_callback(f'<status>success</status>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        except Exception as e:
+                            err_msg = f"Failed to process artifact tag: {e}"
+                            action_reports.append(f"[SYSTEM ERROR] {err_msg}")
+                            if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {"title": "unknown", "art_type": "code", "success": False, "error": str(e)})
+                            if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                streaming_callback(f'<status>failure</status>\n<error>{str(e)}</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                    elif action["type"] == "context":
+                        tag_name = action["tag_name"]
+                        raw_xml = action["xml"]
+                        try:
+                            if tag_name == "scratchpad_clear":
+                                res_msg = self._execute_scratchpad_clear()
+                                action_reports.append(res_msg)
+                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                    streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "success" if "✅" in res_msg else "failure", "error": None if "✅" in res_msg else res_msg})
+                                if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                    if "✅" in res_msg: streaming_callback(f'<status>success</status>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                    else: streaming_callback(f'<status>failure</status>\n<error>{res_msg}</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                continue
+                            if tag_name == "user_profile_clear":
+                                res_msg = self._execute_user_profile_clear()
+                                action_reports.append(res_msg)
+                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                    streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "success" if "✅" in res_msg else "failure", "error": None if "✅" in res_msg else res_msg})
+                                if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                    if "✅" in res_msg: streaming_callback(f'<status>success</status>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                    else: streaming_callback(f'<status>failure</status>\n<error>{res_msg}</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                continue
+                            if "scratchpad" in tag_name:
+                                body_match = re.search(r'<scratchpad_(?:append|patch)>(.*?)</scratchpad_(?:append|patch)>', raw_xml, re.DOTALL | re.IGNORECASE)
+                                body_content = body_match.group(1).strip() if body_match else ""
+                                res_msg = self._execute_scratchpad_update(tag_name, body_content)
+                                action_reports.append(res_msg)
+                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                    streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "success" if "✅" in res_msg else "failure", "error": None if "✅" in res_msg else res_msg})
+                                if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                    if "✅" in res_msg: streaming_callback(f'<status>success</status>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                    else: streaming_callback(f'<status>failure</status>\n<error>{res_msg}</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                continue
+                            if "user_profile_update" in tag_name:
+                                body_match = re.search(r'<user_profile_update>(.*?)</user_profile_update>', raw_xml, re.DOTALL | re.IGNORECASE)
+                                body_content = body_match.group(1).strip() if body_match else ""
+                                res_msg = self._execute_user_profile_update(body_content)
+                                action_reports.append(res_msg)
+                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                    streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "success" if "✅" in res_msg else "failure", "error": None if "✅" in res_msg else res_msg})
+                                if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                    if "✅" in res_msg: streaming_callback(f'<status>success</status>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                    else: streaming_callback(f'<status>failure</status>\n<error>{res_msg}</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                continue
+                            if tag_name in ("mem_new", "mem_update"):
+                                if not self.memory_manager:
+                                    err_msg = "Memory manager not initialized."
+                                    action_reports.append(f"[SYSTEM ERROR] {err_msg}")
+                                    if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                        streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "failure", "error": err_msg})
+                                    if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                        streaming_callback(f'<status>failure</status>\n<error>{err_msg}</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                    continue
+                                if tag_name == "mem_new":
+                                    content_match = re.search(r'content="([^"]*)"', raw_xml)
+                                    tags_match = re.search(r'tags="([^"]*)"', raw_xml)
+                                    level_match = re.search(r'level="([^"]*)"', raw_xml)
+                                    body_match = re.search(r'<mem_new[^>]*>(.*?)</mem_new>', raw_xml, re.DOTALL | re.IGNORECASE)
+                                    mem_content = content_match.group(1) if content_match else (body_match.group(1).strip() if body_match else "")
+                                    mem_tags = tags_match.group(1).split(",") if tags_match else []
+                                    mem_level = int(level_match.group(1)) if level_match else 2
+                                    self.memory_manager.add(content=mem_content, tags=mem_tags, importance=0.9, level=mem_level)
+                                    res_msg = f"✅ Memory saved successfully: {mem_content[:50]}..."
+                                    action_reports.append(res_msg)
+                                    if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                        streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "success", "error": None})
+                                    if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                        streaming_callback(f'<status>success</status>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                elif tag_name == "mem_update":
+                                    id_match = re.search(r'id="([^"]*)"', raw_xml)
+                                    content_match = re.search(r'content="([^"]*)"', raw_xml)
+                                    body_match = re.search(r'<mem_update[^>]*>(.*?)</mem_update>', raw_xml, re.DOTALL | re.IGNORECASE)
+                                    mem_id = id_match.group(1) if id_match else ""
+                                    mem_content = content_match.group(1) if content_match else (body_match.group(1).strip() if body_match else "")
+                                    self.memory_manager.update(memory_id=mem_id, content=mem_content)
+                                    res_msg = f"✅ Memory updated successfully: {mem_id}"
+                                    action_reports.append(res_msg)
+                                    if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                        streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "success", "error": None})
+                                    if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                        streaming_callback(f'<status>success</status>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                continue
+                            body_match = re.search(r'<(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>(.*?)</(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>', raw_xml, re.DOTALL | re.IGNORECASE)
+                            body_content = body_match.group(1).strip() if body_match else ""
+
+                            if not body_content:
+                                attr_match = re.search(r'(?:path|file|files)=["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
+                                if attr_match:
+                                    body_content = attr_match.group(1).strip()
+
+                            context_sig = f"{tag_name}::{body_content}"
+                            if context_sig in successful_context_signatures:
+                                rep_msg = f"Repetitive context action '{tag_name}' with identical parameters blocked. Files are already in the requested state."
+                                action_reports.append(rep_msg)
+                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                    streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "failure", "error": rep_msg})
+                                if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                    streaming_callback(f'<status>failure</status>\n<error>{rep_msg}</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                continue
+
+                            vis_result = self._execute_context_visibility(tag_name, body_content)
+                            status_str = ""
+                            loaded_contents = {}
+                            if isinstance(vis_result, dict):
+                                status_str = vis_result.get("status_str", "")
+                                loaded_contents = vis_result.get("loaded_contents", {})
+                                is_failure = bool(vis_result.get("not_found") or vis_result.get("blocked_files"))
+                                error_msg = vis_result.get("error")
+
+                                if not is_failure:
+                                    successful_context_signatures.add(context_sig)
+
+                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                    streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {
+                                        "action": tag_name,
+                                        "files": vis_result.get("processed_files", []) + vis_result.get("already_in_state", []),
+                                        "status": "failure" if is_failure else "success",
+                                        "error": error_msg if is_failure else None
+                                    })
+                            else:
+                                status_str = vis_result
+                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                    streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {
+                                        "action": tag_name,
+                                        "files": [],
+                                        "status": "failure",
+                                        "error": status_str
+                                    })
+
+                            if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                if "❌" in status_str or "Not found" in status_str or "SYSTEM ERROR" in status_str:
+                                    streaming_callback(f'<status>failure</status>\n<error>{status_str}</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                else:
+                                    streaming_callback(f'<status>success</status>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                            action_reports.append(status_str)
+
+                            if loaded_contents:
+                                content_parts = ["\n=== NEWLY LOADED FILE CONTENTS (INJECTED FOR VISIBILITY) ==="]
+                                for f_title, f_content in loaded_contents.items():
+                                    content_parts.append(f'<file path="{f_title}">\n{f_content}\n</file>')
+                                content_parts.append("=== END LOADED CONTENTS ===\nAnalyze these results and continue your task, or emit <done/> if finished.")
+                                action_reports.append("\n".join(content_parts))
+                        except Exception as ctx_err:
+                            err_msg = f"Failed to process context tag: {ctx_err}"
+                            action_reports.append(f"[SYSTEM ERROR] {err_msg}")
+                            if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "failure", "error": str(ctx_err)})
+                            if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                streaming_callback(f'<status>failure</status>\n<error>{str(ctx_err)}</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                files_after = self._take_workspace_snapshot()
+                changes = self._sync_workspace(files_before, files_after)
+                if changes:
+                    workspace_changes.extend(changes)
+
+                if action_reports:
+                    report_text = "\n\n".join(action_reports) + "\n\nAnalyze these results and continue your task, or emit <done/> if finished."
+                    virtual_history.append(SimpleNamespace(sender_type="user", content=report_text))
+
+                ss.completed_actions.clear()
+                ss.tool_trigger = False
+                ss.artifact_trigger = False
+                ss.context_trigger = False
+                continue
+
+            raw_round_text = ss.get_clean_text()
+            done_match = re.search(r'(?m)^\s*<done\s*/?>\s*$', raw_round_text.strip())
+            if done_match:
+                final_response = re.sub(r'(?m)^\s*<done\s*/?>\s*$', '', raw_round_text, flags=re.MULTILINE).strip()
                 break
 
-            if ss.tool_trigger:
-                tool_call_json_str = ss.get_tool_call_json()
-                if tool_call_json_str:
-                    try:
-                        call_data = json.loads(tool_call_json_str)
-                        tool_name = call_data.get("name", "")
-                        tool_params = call_data.get("parameters", {})
+            ctx_health = self._calculate_context_fill(stable_system_prompt, base_conversation, virtual_history, raw_round_text)
 
-                        raw_round_text = ss.get_clean_text()
-                        clean_history_text = self._sanitize_history_for_context(raw_round_text)
-                        virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text))
+            if ctx_health["fill_percentage"] > 85.0 and len(virtual_history) > 0 and not getattr(self, '_compaction_triggered_this_turn', False):
+                ASCIIColors.warning(f"[{self.name}] Context fill at {ctx_health['fill_percentage']}%. Triggering autonomous compaction.")
+                object.__setattr__(self, '_compaction_triggered_this_turn', True)
 
-                        if not active_tools or tool_name not in active_tools:
-                            virtual_history.append(SimpleNamespace(sender_type="user", content=f"Tool '{tool_name}' not available. Use one of: {list(active_tools.keys())}"))
-                            continue
-
-                        is_shell_tool = tool_name == "tool_execute_shell_command"
-                        if is_shell_tool:
-                            command_str = str(tool_params.get("command", "")).strip()
-                            context_aware_sig = f"{tool_name}::{command_str}"
-                        else:
-                            param_sig = json.dumps(tool_params, sort_keys=True, default=str)
-                            context_aware_sig = f"{tool_name}::{param_sig}"
-
-                        if context_aware_sig in successful_tool_signatures:
-                            virtual_history.append(SimpleNamespace(
-                                sender_type="user",
-                                content=f"Repetitive call to '{tool_name}' with identical parameters blocked. Output already in context. If you need to run a different command, do so now; otherwise finish with <done/>."
-                            ))
-                            continue
-
-                        files_before = self._take_workspace_snapshot()
-                        tool_res = self._execute_tool(tool_name, tool_params, active_tools)
-                        files_after = self._take_workspace_snapshot()
-
-                        changes = self._sync_workspace(files_before, files_after)
-                        if changes:
-                            workspace_changes.extend(changes)
-
-                        tool_success = isinstance(tool_res, dict) and tool_res.get("success", True) is not False
-                        if tool_success:
-                            successful_tool_signatures.add(context_aware_sig)
-
-                        tool_calls_this_turn.append({"round": round_count, "name": tool_name, "parameters": tool_params})
-                        tool_results_this_turn.append({"round": round_count, "name": tool_name, "result": tool_res, "success": tool_success})
-                        clean_result_str = _sanitize_tool_result(tool_res)
-
-                        event_mode = kwargs.get("event_mode", EventMode.PROCESSING_TAG_MODE)
-                        if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
-                            try:
-                                if streaming_callback:
-                                    streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_START, {
-                                        "tool_name": tool_name,
-                                        "parameters": tool_params
-                                    })
-                            except Exception:
-                                pass
-
-                        if tool_success:
-                            user_part = (
-                                f"=== ✅ TOOL RESULT: {tool_name} ===\n"
-                                f"⚠️ This is a RESULT, not a new call.\n"
-                                f"<tool_result name=\"{tool_name}\" status=\"SUCCESS\">\n{clean_result_str}\n</tool_result>\n"
-                                f"Analyze this data and respond, or emit <done/> if finished."
-                            )
-                        else:
-                            user_part = (
-                                f"=== ❌ TOOL FAILED: {tool_name} ===\n"
-                                f"<tool_result name=\"{tool_name}\" status=\"FAILED\">\n{clean_result_str}\n</tool_result>\n"
-                                f"Analyze the error and try a different approach, or emit <done/> if stuck."
-                            )
-
-                        if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
-                            try:
-                                if streaming_callback:
-                                    streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_END, {
-                                        "tool_name": tool_name,
-                                        "success": tool_success,
-                                        "output": clean_result_str if tool_success else None,
-                                        "error": None if tool_success else clean_result_str
-                                    })
-                            except Exception:
-                                pass
-
-                        virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
-                        continue
-                    except Exception as e:
-                        final_response = f"[Tool execution error: {e}]"
-                        if getattr(self, 'debug_mode', False):
-                            ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Tool execution error ===")
-                        break
-            elif ss.was_refactor_triggered():
-                ASCIIColors.info(f"[{self.name}] 🧹 [Refactor Trigger] History refactoring requested by LLM.")
-                raw_round_text = ss.get_clean_text()
-                virtual_history.append(SimpleNamespace(sender_type="assistant", content=raw_round_text if raw_round_text.strip() else "[Assistant requested history refactoring]"))
-
-                base_conversation = self._autonomous_history_refactoring(base_conversation, streaming_callback)
+                virtual_history = self._compact_virtual_history(virtual_history, streaming_callback)
 
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
-                    content="[SYSTEM: History refactoring complete. The conversation history has been compressed. Please continue your task or emit <done/> if finished.]"
+                    content="[SYSTEM: Context has been compacted. Please continue your task based on the summarized history. If you were finished, output your final answer and <done/>.]"
                 ))
                 if getattr(self, 'debug_mode', False):
-                    ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Refactor triggered ===")
+                    ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Context compaction triggered ===")
                 continue
 
-            elif ss.context_trigger or (ss.was_action_dispatched() and ("<unlock_file" in ss.get_clean_text().lower() or "<collapse_folder" in ss.get_clean_text().lower() or "<scratchpad_" in ss.get_clean_text().lower())):
-                raw_round_text = ss.get_clean_text()
-                tag_xml = ss.get_context_tag_xml() or ""
-                full_extraction_text = raw_round_text + "\n" + tag_xml
-                ASCIIColors.info(f"[{self.name}] 🔍 [Context Trigger] Intercepted raw text: {full_extraction_text[:200]}...")
+            if len(tool_calls_this_turn) > 0 or getattr(ss, 'context_trigger', False) or getattr(ss, 'artifact_trigger', False):
+                if not raw_round_text.strip():
+                    empty_response_count = getattr(self, '_consecutive_empty_responses', 0) + 1
+                    object.__setattr__(self, '_consecutive_empty_responses', empty_response_count)
 
-                def _extract_robust_tags(text: str) -> list:
-                    tags = []
-                    pattern = re.compile(
-                        r'(<(unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|user_profile_update|user_profile_clear)\b[^>]*?/?>)',
-                        re.IGNORECASE
-                    )
-                    for m in pattern.finditer(text):
-                        full_tag = m.group(1)
-                        tag_name = m.group(2).lower()
+                    if empty_response_count >= 2:
+                        ASCIIColors.warning(f"[{self.name}] Consecutive empty LLM responses detected ({empty_response_count}). Terminating loop to prevent spin.")
+                        final_response = "[Terminated: LLM stopped generating without completing the task.]"
+                        break
 
-                        if full_tag.strip().endswith("/>"):
-                            tags.append((full_tag, tag_name, ""))
-                            continue
+                    ASCIIColors.warning(f"[{self.name}] Empty LLM response detected after action (attempt {empty_response_count}). Injecting continuation mandate.")
+                else:
+                    object.__setattr__(self, '_consecutive_empty_responses', 0)
 
-                        close_tag = f"</{tag_name}>"
-                        close_idx = text.find(close_tag, m.end())
-                        if close_idx != -1:
-                            body = text[m.end():close_idx].strip()
-                            full_match = text[m.start():close_idx + len(close_tag)]
-                            tags.append((full_match, tag_name, body))
-                        else:
-                            body = text[m.end():].strip()
-                            tags.append((full_tag, tag_name, body))
-                    return tags
+                ASCIIColors.info("[LollmsPersonality.chat] Action previously executed but no <done/> detected. Injecting continuation mandate.")
 
-                all_tags = _extract_robust_tags(full_extraction_text)
-
-                _VALID_VISIBILITY_TAGS = ("unlock_file", "lock_file", "hide_file", "collapse_folder", "uncollapse_folder", "scratchpad_append", "scratchpad_patch", "user_profile_update")
-                has_tag_marker = any(f"<{tag}" in raw_round_text.lower() for tag in _VALID_VISIBILITY_TAGS)
-
-                if not all_tags and not has_tag_marker:
-                    clean_history_text = self._sanitize_history_for_context(raw_round_text)
-                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant executed a context visibility tag]"))
-                    continue
-
-                if not all_tags and raw_round_text.strip():
-                    ASCIIColors.warning(f"[{self.name}] ⚠️ [Context Trigger] Malformed tag detected. Injecting format correction.")
-                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=raw_round_text))
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="user",
-                        content="[SYSTEM: You emitted a partial or malformed context visibility tag. No action was taken. If you intended to unlock a file, ensure the tag is properly closed (e.g., <unlock_file>path/to/file.py</unlock_file>).]"
-                    ))
-                    continue
-
-                if not all_tags:
-                    continue
-
-                clean_history_text = raw_round_text
-                for tag_tuple in all_tags:
-                    clean_history_text = clean_history_text.replace(tag_tuple[0], "")
-                clean_history_text = clean_history_text.strip()
-
-                virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text else "[Assistant executed a context visibility tag]"))
-
-                try:
-                    processed_files = []
-                    already_loaded_intercept = False
-
-                    all_arts = self._artefact_manager._get_all_raw() if self._artefact_manager else []
-                    loaded_files = [
-                        a.get("title", "") for a in all_arts 
-                        if a.get("visibility") == ArtefactVisibility.FULL
-                    ]
-
-                    for tag_tuple in all_tags:
-                        full_tag_str = tag_tuple[0]
-                        tag_name = tag_tuple[1].lower()
-                        body_content = tag_tuple[2]
-
-                        ASCIIColors.info(f"[{self.name}] 🔓 [Context Trigger] Executing tag: {tag_name} with body: {body_content[:50]}......")
-
-                        if tag_name == "scratchpad_clear":
-                            user_part = self._execute_scratchpad_clear()
-                            virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
-                            continue
-
-                        if tag_name == "user_profile_clear":
-                            user_part = self._execute_user_profile_clear()
-                            virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
-                            continue
-
-                        if "scratchpad" in tag_name:
-                            user_part = self._execute_scratchpad_update(tag_name, body_content)
-                            virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
-                            continue
-
-                        if "user_profile_update" in tag_name:
-                            user_part = self._execute_user_profile_update(body_content)
-                            virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
-                            continue
-
-                        if tag_name == "unlock_file":
-                            target_files = [t.strip().replace("\\", "/") for t in re.split(r'[\n,;]+', body_content) if t.strip()]
-                            if all(tf in loaded_files for tf in target_files):
-                                ASCIIColors.info(f"[{self.name}] ⚡ [Context Trigger] Perception-loop detected: Files {target_files} are already loaded.")
-                                already_loaded_intercept = True
-                                user_part = "[SYSTEM: The requested file(s) are ALREADY fully loaded in your context (marked [C]). Do not emit <unlock_file> again. Acknowledge the user that the file is loaded and emit <done/> to finish the turn.]"
-                                virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
-                                continue
-
-                        vis_result = self._execute_context_visibility(tag_name, body_content)
-                        if isinstance(vis_result, dict):
-                            user_part = vis_result.get("status_str", "")
-                            processed_files.extend(vis_result.get("processed_files", []))
-                        else:
-                            user_part = vis_result
-
-                        virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
-
-                    try:
-                        if hasattr(self, '_artefact_proxy') and hasattr(self._artefact_proxy, 'commit'):
-                            self._artefact_proxy.commit()
-                            ASCIIColors.info(f"[{self.name}] 🔄 [Context Trigger] Persisted artefact visibility changes to proxy.")
-                    except Exception as commit_err:
-                        ASCIIColors.warning(f"[{self.name}] Failed to commit proxy state after visibility change: {commit_err}")
-
-                    if not already_loaded_intercept and processed_files:
-                        loaded_contents = []
-                        all_arts = self._artefact_manager._get_all_raw() if self._artefact_manager else []
-                        for t_file in processed_files:
-                            # Use fuzzy matching to find the artefact if exact match fails
-                            art = next((a for a in all_arts if a.get("title") == t_file), None)
-                            if not art:
-                                best_match = self._artefact_manager._find_best_title_match(t_file, [a["title"] for a in all_arts])
-                                if best_match:
-                                    art = next((a for a in all_arts if a.get("title") == best_match), None)
-
-                            if not art:
-                                continue
-
-                            content_val = art.get("content")
-                            if not content_val and hasattr(self, '_resolved_workspace'):
-                                file_path = self._resolved_workspace / art.get("title", t_file)
-                                if file_path.exists():
-                                    try:
-                                        content_val = file_path.read_text(encoding="utf-8", errors="ignore")
-                                        art["content"] = content_val
-                                        art["content_source"] = "disk"
-                                    except Exception:
-                                        pass
-                            if content_val:
-                                loaded_contents.append(f'<file path="{art.get("title", t_file)}">\n{content_val}\n</file>')
-
-                        if loaded_contents:
-                            content_str = "\n\n".join(loaded_contents)
-                            virtual_history.append(SimpleNamespace(
-                                sender_type="user",
-                                content=f"System infos: The file was loaded successfully.\nLoaded file content:\n{content_str}\nPlease inform the user about that and when you're done doing the task, issue a <done/> tag at the end of your answer"
-                            ))
-                        else:
-                            virtual_history.append(SimpleNamespace(
-                                sender_type="user",
-                                content="[SYSTEM: Context visibility operations applied successfully. The workspace index has been updated. NOTE: Due to KV-Cache optimization, historical messages are not rewritten. The file content may still appear in older messages, but it has been logically removed from your active context and will NOT appear in future turns. Do NOT emit the lock/unlock tag again. Acknowledge the user and emit <done/>.]"
-                            ))
-                    elif already_loaded_intercept:
-                        virtual_history.append(SimpleNamespace(
-                            sender_type="user",
-                            content="[SYSTEM: The requested file(s) are ALREADY fully loaded in your context (marked [C]). Do not emit <unlock_file> again. Acknowledge the user that the file is loaded and emit <done/> to finish the turn.]"
-                        ))
-                    continue
-                except Exception as e:
-                    ASCIIColors.error(f"[{self.name}] ❌ [Context Trigger] Exception during execution: {e}")
-                    user_part = f"[SYSTEM ERROR] Failed to process context visibility tag: {e}"
-                    virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
-                    continue
-            elif ss.artifact_trigger:
-                raw_artifact_xml = ss.get_artifact_xml()
-                if not raw_artifact_xml:
-                    final_response = ss.get_clean_text()
-                    break
-
-                virtual_history.append(SimpleNamespace(sender_type="assistant", content=raw_artifact_xml))
-
-                try:
-                    attrs_match = re.search(r'<art(?:ifact|efact)[^>]*>', raw_artifact_xml, re.IGNORECASE)
-                    attrs_str = attrs_match.group(0) if attrs_match else ""
-                    body_match = re.search(r'<art(?:ifact|efact)[^>]*>(.*)</art(?:ifact|efact)>', raw_artifact_xml, re.DOTALL | re.IGNORECASE)
-                    body_content = body_match.group(1).strip() if body_match else ""
-
-                    title = "artifact"
-                    lang = "python"
-                    for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
-                        if m.group(1).lower() in ("name", "title"):
-                            title = m.group(2)
-                        elif m.group(1).lower() == "language":
-                            lang = m.group(2)
-
-                    is_patch = "<<<<<<< SEARCH" in body_content
-
-                    event_mode = kwargs.get("event_mode", EventMode.PROCESSING_TAG_MODE)
-                    if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
-                        try:
-                            if streaming_callback:
-                                streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {
-                                    "title": title,
-                                    "art_type": "code",
-                                    "language": lang,
-                                    "is_patch": is_patch
-                                })
-                        except Exception:
-                            pass
-
-                    if is_patch:
-                        file_path = self._resolved_workspace / title
-                        if not file_path.exists():
-                            user_part = f"[SYSTEM ERROR] File '{title}' not found. Cannot apply patch."
-                            virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
-                            continue
-
-                        original_content = file_path.read_text(encoding="utf-8", errors="ignore")
-                        try:
-                            patched_content = ArtefactManager.apply_aider_patch(original_content, body_content)
-                            file_path.write_text(patched_content, encoding="utf-8")
-                            user_part = f"✅ SEARCH/REPLACE applied successfully to {title}."
-                            if self._artefact_manager:
-                                self._artefact_manager.update(title=title, new_content=patched_content, language=lang, bump_version=True, active=True)
-                        except Exception as patch_err:
-                            user_part = f"❌ SEARCH/REPLACE FAILED for {title}.\nError: {patch_err}\n\nPlease read the file using tool_read_file and correct your SEARCH block."
-
-                        virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
-                        continue
-
-                        if result.get("success"):
-                            file_path.write_text(result["patched_content"], encoding="utf-8")
-                            user_part = f"✅ SEARCH/REPLACE applied successfully to {title}."
-                            if self._artefact_manager:
-                                self._artefact_manager.update(title=title, new_content=result["patched_content"], language=lang, bump_version=True, active=True)
-                        else:
-                            user_part = f"❌ SEARCH/REPLACE FAILED for {title}.\nError: {result.get('error')}\n\nPlease read the file using tool_read_file and correct your SEARCH block."
-
-                        virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
-                        continue
-                    else:
-                        if self._artefact_manager:
-                            self._artefact_manager.add(title=title, artefact_type="code", content=body_content, language=lang, active=True)
-                        file_path = self._resolved_workspace / title
-                        file_path.write_text(body_content, encoding="utf-8")
-                        user_part = f"✅ File {title} created/updated successfully."
-                        virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
-                        continue
-                except Exception as e:
-                    user_part = f"[SYSTEM ERROR] Failed to process artifact tag: {e}"
-                    virtual_history.append(SimpleNamespace(sender_type="user", content=user_part))
-                    continue
-            else:
-                raw_round_text = ss.get_clean_text()
-                done_match = re.search(r'(?m)^\s*<done\s*/?>\s*$', raw_round_text.strip())
-                if done_match:
-                    final_response = re.sub(r'(?m)^\s*<done\s*/?>\s*$', '', raw_round_text, flags=re.MULTILINE).strip()
-                    break
-
-                ctx_health = self._calculate_context_fill(stable_system_prompt, base_conversation, virtual_history, raw_round_text)
-
-                if ctx_health["fill_percentage"] > 85.0 and len(virtual_history) > 0 and not getattr(self, '_compaction_triggered_this_turn', False):
-                    ASCIIColors.warning(f"[{self.name}] Context fill at {ctx_health['fill_percentage']}%. Triggering autonomous compaction.")
-                    object.__setattr__(self, '_compaction_triggered_this_turn', True)
-
-                    virtual_history = self._compact_virtual_history(virtual_history, streaming_callback)
-
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="user",
-                        content="[SYSTEM: Context has been compacted. Please continue your task based on the summarized history. If you were finished, output your final answer and <done/>.]"
-                    ))
-                    if getattr(self, 'debug_mode', False):
-                        ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Context compaction triggered ===")
-                    continue
-
-                if len(tool_calls_this_turn) > 0 or getattr(ss, 'context_trigger', False) or getattr(ss, 'artifact_trigger', False):
-                    if not raw_round_text.strip():
-                        empty_response_count = getattr(self, '_consecutive_empty_responses', 0) + 1
-                        object.__setattr__(self, '_consecutive_empty_responses', empty_response_count)
-
-                        if empty_response_count >= 2:
-                            ASCIIColors.warning(f"[{self.name}] Consecutive empty LLM responses detected ({empty_response_count}). Terminating loop to prevent spin.")
-                            final_response = "[Terminated: LLM stopped generating without completing the task.]"
-                            break
-
-                        ASCIIColors.warning(f"[{self.name}] Empty LLM response detected after action (attempt {empty_response_count}). Injecting continuation mandate.")
-                    else:
-                        object.__setattr__(self, '_consecutive_empty_responses', 0)
-
-                    ASCIIColors.info("[LollmsPersonality.chat] Action previously executed but no <done/> detected. Injecting continuation mandate.")
-
-                    clean_history_text = self._sanitize_history_for_context(raw_round_text)
-                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant provided no output]"))
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="user",
-                        content="[SYSTEM: You stopped generation without emitting a <done/> tag. If your task is complete, output a final conversational summary and end it with a <done/> tag on a new line. If you need to continue working, emit the next functional tag now.]"
-                    ))
-                    if getattr(self, 'debug_mode', False):
-                        ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: No <done/> detected, injecting continuation mandate ===")
-                    continue
-
-                if "<tool" in raw_round_text.lower() or "<art" in raw_round_text.lower():
-                    ASCIIColors.warning("[LollmsPersonality.chat] Malformed functional tag detected. Injecting format correction.")
-                    clean_history_text = self._sanitize_history_for_context(raw_round_text)
-                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text))
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="user",
-                        content=(
-                            "[SYSTEM: CRITICAL FORMAT ERROR. You emitted a functional tag with the wrong syntax (e.g., using XML attributes instead of JSON). "
-                            "You MUST use the exact format: `<tool>{\"name\": \"...\", \"parameters\": {...}}</tool>`. "
-                            "Output the corrected tag NOW.]"
-                        )
-                    ))
-                    if getattr(self, 'debug_mode', False):
-                        ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Malformed tag detected, injecting format correction ===")
-                    continue
-
+                clean_history_text = self._sanitize_history_for_context(raw_round_text)
+                virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant provided no output]"))
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content="[SYSTEM: You stopped generation without emitting a <done/> tag. If your task is complete, output a final conversational summary and end it with a <done/> tag on a new line. If you need to continue working, emit the next functional tag now.]"
+                ))
                 if getattr(self, 'debug_mode', False):
-                    ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Clean exit ===")
-                break
+                    ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: No <done/> detected, injecting continuation mandate ===")
+                continue
+
+            if "<tool" in raw_round_text.lower() or "<art" in raw_round_text.lower():
+                ASCIIColors.warning("[LollmsPersonality.chat] Malformed functional tag detected. Injecting format correction.")
+                clean_history_text = self._sanitize_history_for_context(raw_round_text)
+                virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text))
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content=(
+                        "[SYSTEM: CRITICAL FORMAT ERROR. You emitted a functional tag with the wrong syntax (e.g., using XML attributes instead of JSON). "
+                        "You MUST use the exact format: `<tool>{\"name\": \"...\", \"parameters\": {...}}</tool>`. "
+                        "Output the corrected tag NOW.]"
+                    )
+                ))
+                if getattr(self, 'debug_mode', False):
+                    ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Malformed tag detected, injecting format correction ===")
+                continue
+
+            if getattr(self, 'debug_mode', False):
+                ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Clean exit ===")
+            break
 
         if use_internal_history and not was_cancelled:
             self._conversation.append({"role": "user", "content": prompt})
@@ -2894,6 +3075,21 @@ JSON:"""
                 self._autonomous_memory_consolidation(prompt, final_response)
             except Exception as mem_ex:
                 ASCIIColors.warning(f"[{self.name}] Failed to process memory tags: {mem_ex}")
+
+        try:
+            if prompt.strip().lower() in ("yes", "y", "oui", "ye", "yeah"):
+                object.__setattr__(self, '_git_autonomy_granted', True)
+                if getattr(self, '_user_profile_path', None) and self._user_profile_path.exists():
+                    current_profile = self._user_profile_path.read_text(encoding="utf-8", errors="ignore")
+                    if "Git Autonomy: Granted" not in current_profile:
+                        from lollms_client.lollms_artefact import ArtefactManager
+                        patch_body = "<<<<<<< SEARCH\n## Global Constraints & Preferences\n- \n=======\n## Global Constraints & Preferences\n- Git Autonomy: Granted (User has authorized autonomous branch creation)\n>>>>>>> REPLACE"
+                        patched_profile = ArtefactManager.apply_aider_patch(current_profile, patch_body)
+                        self._user_profile_path.write_text(patched_profile, encoding="utf-8")
+                        object.__setattr__(self, '_user_profile_content', patched_profile)
+                        ASCIIColors.success(f"[{self.name}] 📝 Git autonomy preference saved to user profile.")
+        except Exception:
+            pass
 
         context_health = {"used_tokens": 0, "max_tokens": 0, "fill_percentage": 0.0}
         try:
@@ -2928,6 +3124,9 @@ JSON:"""
            "was_cancelled": was_cancelled,
            "context_health": context_health
        }
+        
+        
+        
 # ---------------------------------------------------------------------------
 # NullPersonality  — drop-in default so chat() never needs ``if personality:``
 # ---------------------------------------------------------------------------

@@ -88,7 +88,7 @@ class SkillsManager:
         loadable = [s for s in self.skills.values() if s.visibility == "loadable"]
         if loadable:
             lines = ["=== AVAILABLE SKILLS (Loadable on Demand) ==="]
-            lines.append("Use the `tool_load_skill` tool to load the full content of any skill listed below.")
+            lines.append(f"There are {len(loadable)} loadable skills. Use the `tool_load_skill` tool to load the full content of any skill listed below.")
             lines.append("")
             for skill in loadable:
                 desc = skill.description or "No description"
@@ -104,7 +104,10 @@ class SkillsManager:
             lines.append("=== END SEARCHABLE SKILLS ===")
             parts.append("\n".join(lines))
 
-        return "\n\n".join(parts) if parts else ""
+        if not parts:
+            return "\n=== SKILLS SYSTEM ===\nThere are currently 0 skills in the library.\n=== END SKILLS SYSTEM ==="
+
+        return "\n\n".join(parts)
 
     def search_skills(self, query: str) -> List[Skill]:
         query_lower = query.lower()
@@ -143,6 +146,7 @@ class SkillsManager:
     def build_skill_tools(self) -> Dict[str, Dict[str, Any]]:
         """
         Conditionally builds tool specifications for skill management based on visibility tiers.
+        - `tool_list_skills` is registered ONLY if there is at least 1 skill in the library.
         - `tool_load_skill` is registered if there are 'loadable' or 'searchable' skills.
         - `tool_search_skills` is registered ONLY if there is at least one 'searchable' skill.
         """
@@ -150,6 +154,32 @@ class SkillsManager:
 
         has_loadable = any(s.visibility == "loadable" for s in self.skills.values())
         has_searchable = self.has_searchable_skills()
+        total_skills = len(self.skills)
+
+        if total_skills > 0:
+            def tool_list_skills() -> dict:
+                """
+                Lists all available skills in the library, categorized by their visibility tier (visible, loadable, searchable).
+                Use this to get an overview of what knowledge is available.
+                """
+                visible = [s.to_dict() for s in self.skills.values() if s.visibility == "visible"]
+                loadable = [s.to_dict() for s in self.skills.values() if s.visibility == "loadable"]
+                searchable = [s.to_dict() for s in self.skills.values() if s.visibility == "searchable"]
+                
+                report = {
+                    "visible_skills": visible,
+                    "loadable_skills": loadable,
+                    "searchable_skills": searchable,
+                    "total_count": total_skills
+                }
+                return {"success": True, "output": report}
+
+            tools["tool_list_skills"] = {
+                "name": "tool_list_skills",
+                "description": "Lists all available skills in the library, categorized by their visibility tier (visible, loadable, searchable).",
+                "parameters": [],
+                "callable": tool_list_skills,
+            }
 
         if has_loadable or has_searchable:
             def tool_load_skill(title: str) -> dict:
@@ -200,4 +230,6 @@ class SkillsManager:
                 "callable": tool_search_skills,
             }
 
-        return tools
+        return tools  
+    
+    

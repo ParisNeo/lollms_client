@@ -18,7 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Union, TYPE_CHECKING
 from ascii_colors import ASCIIColors, trace_exception
 
 try:
-    from lollms_client.lollms_types import MSG_TYPE
+    from lollms_client.lollms_types import MSG_TYPE, EventMode
 except ImportError:
     class MSG_TYPE:
         MSG_TYPE_CHUNK = "chunk"
@@ -227,30 +227,31 @@ class _ToolsManager:
 
 
 class _AgentStreamState:
-    def __init__(self, callback: Optional[Callable] = None):
+    def __init__(self, callback: Optional[Callable] = None, event_mode: int = 0):
         self.callback = callback
+        self._event_mode = event_mode
         self.content = ""
-        self.tool_trigger = False
-        self.artifact_trigger = False
-        self.tool_json_data = ""
-        self._done_detected = False
-        self._action_dispatched = False
+        self.completed_actions: List[Dict[str, Any]] = []
 
         self._is_accumulating_tool = False
         self._is_accumulating_artifact = False
-        
+
         self._is_accumulating_context = False
         self._context_tag_name = ""
-        self.context_trigger = False        
-        self.refactor_trigger = False
 
         self._tool_buffer = ""
         self._pending_buffer = ""
+        self._raw_stream_buffer = ""
 
         self._in_code_fence = False
         self._code_fence_buffer = ""
         self._code_fence_hold_buffer = ""
         self._in_inline_code = False
+
+        self.context_trigger = False
+        self.artifact_trigger = False
+        self.tool_trigger = False
+        self.live_artifact_meta: Optional[Dict[str, Any]] = None
 
     def _cb(self, text: str, msg_type=None, meta: Optional[Dict] = None):
         if self.callback is None:
@@ -265,17 +266,14 @@ class _AgentStreamState:
         if not isinstance(chunk, str) or not chunk:
             return True
 
-        if self._action_dispatched:
-            self._pending_buffer += chunk
-            return True
-
+        self._raw_stream_buffer += chunk
         self._pending_buffer += chunk
 
         if not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence and not self._in_inline_code:
             done_match = re.search(r'(?m)^\s*<done\s*/?>', self._pending_buffer, re.IGNORECASE)
             if done_match:
-                self._done_detected = True
                 self._pending_buffer = re.sub(r'(?m)^\s*<done\s*/?>', '', self._pending_buffer, flags=re.IGNORECASE)
+                self._cb("[SYSTEM: <done/> tag detected. Terminating generation.]", MSG_TYPE.MSG_TYPE_INFO, {"done_intercepted": True})
                 return False
 
         if not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence and not self._in_inline_code:
@@ -369,23 +367,24 @@ class _AgentStreamState:
 
         if self._is_accumulating_tool:
             self._tool_buffer += self._pending_buffer
+            if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                self._cb(self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK, {"live_tool_chunk": True})
             self._pending_buffer = ""
-            if self._try_complete_tool():
-                return False
+            self._try_complete_tool()
             return True
 
         if self._is_accumulating_artifact:
             self._tool_buffer += self._pending_buffer
+            if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                self._cb(self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK, {"live_artifact_chunk": True})
             self._pending_buffer = ""
-            if self._try_complete_artifact():
-                return False
+            self._try_complete_artifact()
             return True
 
         if self._is_accumulating_context:
             self._tool_buffer += self._pending_buffer
             self._pending_buffer = ""
-            if self._try_complete_context_tag():
-                return False
+            self._try_complete_context_tag()
             return True
 
         if not self._in_code_fence and not self._in_inline_code:
@@ -398,11 +397,17 @@ class _AgentStreamState:
                     self._cb(text_before)
 
                 self._is_accumulating_tool = True
+                self.tool_trigger = True
                 self._tool_buffer = self._pending_buffer[tag_start_idx:]
                 self._pending_buffer = ""
+
+                if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                    self._cb("<tool>", MSG_TYPE.MSG_TYPE_TOOL_START, {"tool_name": "pending", "parameters": {}})
                 
-                if self._try_complete_tool():
-                    return False
+                if self._event_mode == EventMode.PROCESSING_TAG_MODE:
+                    self._cb('\n<processing type="tool" title="pending">\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                self._try_complete_tool()
                 return True
 
             artifact_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<art(?:ifact|efact)\b', self._pending_buffer, re.IGNORECASE)
@@ -414,11 +419,31 @@ class _AgentStreamState:
                     self._cb(text_before)
 
                 self._is_accumulating_artifact = True
+                self.artifact_trigger = True
                 self._tool_buffer = self._pending_buffer[tag_start_idx:]
                 self._pending_buffer = ""
 
-                if self._try_complete_artifact():
-                    return False
+                attrs_match = re.search(r'<art(?:ifact|efact)[^>]*>', self._tool_buffer, re.IGNORECASE)
+                title = "artifact"
+                lang = "python"
+                is_patch = "<<<<<<< SEARCH" in self._tool_buffer
+                if attrs_match:
+                    attrs_str = attrs_match.group(0)
+                    for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
+                        if m.group(1).lower() in ("name", "title"):
+                            title = m.group(2)
+                        elif m.group(1).lower() == "language":
+                            lang = m.group(2)
+
+                self.live_artifact_meta = {"title": title, "art_type": "code", "language": lang, "is_patch": is_patch}
+                
+                if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                    self._cb("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, self.live_artifact_meta)
+
+                if self._event_mode == EventMode.PROCESSING_TAG_MODE:
+                    self._cb(f'\n<processing type="artifact" title="{title}">\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                self._try_complete_artifact()
                 return True
 
             refactor_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<refactor_history\b', self._pending_buffer, re.IGNORECASE)
@@ -434,11 +459,16 @@ class _AgentStreamState:
                 self._tool_buffer = self._pending_buffer[tag_start_idx:]
                 self._pending_buffer = ""
 
-                if self._try_complete_context_tag():
-                    return False
+                if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                    self._cb("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": "refactor_history", "files": [], "status": "streaming"})
+
+                if self._event_mode == EventMode.PROCESSING_TAG_MODE:
+                    self._cb(f'\n<processing type="context" title="refactor_history">\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                self._try_complete_context_tag()
                 return True
 
-            context_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<(unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch)\b', self._pending_buffer, re.IGNORECASE)
+            context_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<(unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|user_profile_update|user_profile_clear|mem_new|mem_update)\b', self._pending_buffer, re.IGNORECASE)
             if context_match:
                 tag_start_idx = context_match.start()
                 tag_name = context_match.group(1).lower()
@@ -448,12 +478,18 @@ class _AgentStreamState:
                     self._cb(text_before)
 
                 self._is_accumulating_context = True
+                self.context_trigger = True
                 self._context_tag_name = tag_name
                 self._tool_buffer = self._pending_buffer[tag_start_idx:]
                 self._pending_buffer = ""
 
-                if self._try_complete_context_tag():
-                    return False
+                if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                    self._cb("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "streaming"})
+
+                if self._event_mode == EventMode.PROCESSING_TAG_MODE:
+                    self._cb(f'\n<processing type="context" title="{tag_name}">\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                self._try_complete_context_tag()
                 return True
 
         def _ends_with_partial_tag(buffer: str) -> int:
@@ -477,7 +513,6 @@ class _AgentStreamState:
                     if buffer.endswith(tag[:i]):
                         return len(buffer) - i
             return -1
-
 
         partial_idx = _ends_with_partial_tag(self._pending_buffer)
         if partial_idx == -1:
@@ -519,10 +554,10 @@ class _AgentStreamState:
         self._pending_buffer = ""
         return True
 
-    def _try_complete_tool(self) -> bool:
+    def _try_complete_tool(self) -> None:
         close_match = re.search(r'</tool>\s*', self._tool_buffer, re.IGNORECASE)
         if not close_match:
-            return False
+            return
 
         end_idx = close_match.start()
         end_len = len(close_match.group(0))
@@ -536,6 +571,15 @@ class _AgentStreamState:
         self._tool_buffer = ""
         if remaining:
             self._pending_buffer = remaining + self._pending_buffer
+
+        if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+            try:
+                self._cb("", MSG_TYPE.MSG_TYPE_TOOL_END, {"tool_name": "pending", "success": True, "output": None, "error": None, "stream_complete": True})
+            except Exception:
+                pass
+
+        if self._event_mode == EventMode.PROCESSING_TAG_MODE:
+            self._cb('\n</processing>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
         try:
             raw_data = json.loads(json_body)
@@ -551,6 +595,7 @@ class _AgentStreamState:
             except json.JSONDecodeError:
                 raw_data = None
 
+        normalized_json = json_body
         if isinstance(raw_data, dict):
             if "parameters" in raw_data and isinstance(raw_data["parameters"], dict):
                 if not raw_data.get("name"):
@@ -559,25 +604,24 @@ class _AgentStreamState:
                     if nested_name:
                         params_cleaned = {k: v for k, v in params_dict.items() if k not in ("tool_name", "name")}
                         normalized = {"name": nested_name, "parameters": params_cleaned}
-                        self.tool_json_data = json.dumps(normalized)
-                        return True
-                self.tool_json_data = json_body
+                        normalized_json = json.dumps(normalized)
             else:
                 tool_name = raw_data.get("name", "")
                 params = {k: v for k, v in raw_data.items() if k != "name"}
                 normalized = {"name": tool_name, "parameters": params}
-                self.tool_json_data = json.dumps(normalized)
+                normalized_json = json.dumps(normalized)
         else:
-            self.tool_json_data = json_body
+            normalized_json = json.dumps({
+                "name": "malformed_tool_call",
+                "parameters": {"raw_body": json_body[:500]}
+            })
 
-        self.tool_trigger = True
-        self._action_dispatched = True
-        return True
+        self.completed_actions.append({"type": "tool", "json": normalized_json})
 
-    def _try_complete_artifact(self) -> bool:
+    def _try_complete_artifact(self) -> None:
         close_match = re.search(r'</art(?:ifact|efact)>\s*', self._tool_buffer, re.IGNORECASE)
         if not close_match:
-            return False
+            return
 
         end_idx = close_match.start()
         end_len = len(close_match.group(0))
@@ -586,19 +630,26 @@ class _AgentStreamState:
 
         self._is_accumulating_artifact = False
         remaining = self._tool_buffer[end_idx + end_len:]
-        self._tool_buffer = full_artifact_call
+        self._tool_buffer = ""
         if remaining:
             self._pending_buffer = remaining + self._pending_buffer
 
-        self.artifact_trigger = True
-        self._action_dispatched = True
-        return True
+        if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+            try:
+                self._cb("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {"title": self.live_artifact_meta.get("title", "artifact"), "art_type": "code", "success": True, "error": None, "stream_complete": True})
+            except Exception:
+                pass
 
-    def _try_complete_context_tag(self) -> bool:
+        if self._event_mode == EventMode.PROCESSING_TAG_MODE:
+            self._cb('\n</processing>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+        self.completed_actions.append({"type": "artifact", "xml": full_artifact_call})
+
+    def _try_complete_context_tag(self) -> None:
         closing_tag = f"</{self._context_tag_name}>"
         close_match = re.search(re.escape(closing_tag) + r'\s*', self._tool_buffer, re.IGNORECASE)
         if not close_match:
-            return False
+            return
 
         end_idx = close_match.start()
         end_len = len(close_match.group(0))
@@ -607,39 +658,22 @@ class _AgentStreamState:
 
         self._is_accumulating_context = False
         remaining = self._tool_buffer[end_idx + end_len:]
-
-        if self._context_tag_name == "refactor_history":
-            self.refactor_trigger = True
-            self._action_dispatched = True
-            self._tool_buffer = ""
-            if remaining.strip():
-                self._pending_buffer = remaining + self._pending_buffer
-            return True
-
-        if not hasattr(self, '_context_tags_buffer'):
-            self._context_tags_buffer = ""
-        self._context_tags_buffer += full_tag_call + "\n"
         self._tool_buffer = ""
-
-        self.context_trigger = True
-        self._action_dispatched = True
-
-        if remaining.strip():
+        if remaining:
             self._pending_buffer = remaining + self._pending_buffer
-            if re.search(r'(?m)^\s*(?!`)(?!.*\|)<(unlock_file|lock_file|hide_file)\b', remaining, re.IGNORECASE):
-                return False
-        return True
 
-    def was_refactor_triggered(self) -> bool:
-        return self.refactor_trigger
+        if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+            try:
+                self._cb("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": self._context_tag_name, "files": [], "status": "stream_complete"})
+            except Exception:
+                pass
 
-    def get_context_tag_xml(self) -> Optional[str]:
-        if not self.context_trigger:
-            return None
-        if hasattr(self, '_context_tags_buffer') and self._context_tags_buffer:
-            return self._context_tags_buffer.strip()
-        return self._tool_buffer if self._tool_buffer else None
+        if self._event_mode == EventMode.PROCESSING_TAG_MODE:
+            self._cb('\n</processing>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
+        self.completed_actions.append({"type": "context", "tag_name": self._context_tag_name, "xml": full_tag_call})
+        
+        
     def flush_remaining_buffer(self):
         if self._in_code_fence:
             self._in_code_fence = False
@@ -651,100 +685,37 @@ class _AgentStreamState:
         if self._is_accumulating_tool:
             self._tool_buffer += self._pending_buffer
             self._pending_buffer = ""
-            if not self._try_complete_tool():
-                full_tool_call = self._tool_buffer
-                json_body = re.sub(r'^<tool>', '', full_tool_call, flags=re.IGNORECASE)
-                json_body = re.sub(r'</tool>\s*$', '', json_body, flags=re.IGNORECASE).strip()
-
+            self._try_complete_tool()
+            if self._is_accumulating_tool:
                 self._is_accumulating_tool = False
-                self._tool_buffer = ""
-
-                try:
-                    raw_data = json.loads(json_body)
-                except json.JSONDecodeError:
-                    repaired = json_body
-                    while repaired.count('{') > repaired.count('}'):
-                        repaired += '}'
-                    while repaired.count('[') > repaired.count(']'):
-                        repaired += ']'
-                    try:
-                        raw_data = json.loads(repaired)
-                        json_body = repaired
-                    except json.JSONDecodeError:
-                        raw_data = None
-
-                if isinstance(raw_data, dict):
-                    if "parameters" in raw_data and isinstance(raw_data["parameters"], dict):
-                        if not raw_data.get("name"):
-                            params_dict = raw_data["parameters"]
-                            nested_name = params_dict.get("tool_name") or params_dict.get("name")
-                            if nested_name:
-                                params_cleaned = {k: v for k, v in params_dict.items() if k not in ("tool_name", "name")}
-                                normalized = {"name": nested_name, "parameters": params_cleaned}
-                                self.tool_json_data = json.dumps(normalized)
-                                return
-                        self.tool_json_data = json_body
-                    else:
-                        tool_name = raw_data.get("name", "")
-                        params = {k: v for k, v in raw_data.items() if k != "name"}
-                        normalized = {"name": tool_name, "parameters": params}
-                        self.tool_json_data = json.dumps(normalized)
-                else:
-                    self.tool_json_data = json_body
-
-                self.tool_trigger = True
-                self._action_dispatched = True
             return
 
         if self._is_accumulating_artifact:
             self._tool_buffer += self._pending_buffer
             self._pending_buffer = ""
-            if not self._try_complete_artifact():
-                full_artifact_call = self._tool_buffer
+            self._try_complete_artifact()
+            if self._is_accumulating_artifact:
                 self._is_accumulating_artifact = False
-                self._tool_buffer = full_artifact_call
-                self.artifact_trigger = True
-                self._action_dispatched = True
             return
 
         if self._is_accumulating_context:
             self._tool_buffer += self._pending_buffer
             self._pending_buffer = ""
-            if not self._try_complete_context_tag():
-                full_tag_call = self._tool_buffer
+            self._try_complete_context_tag()
+            if self._is_accumulating_context:
                 self._is_accumulating_context = False
-
-                if self._context_tag_name == "refactor_history":
-                    self.refactor_trigger = True
-                    self._action_dispatched = True
-                    self._tool_buffer = ""
-                    return
-
-                if not hasattr(self, '_context_tags_buffer'):
-                    self._context_tags_buffer = ""
-                self._context_tags_buffer += full_tag_call + "\n"
-                self._tool_buffer = ""
-
-                self.context_trigger = True
-                self._action_dispatched = True
             return
 
         if self._pending_buffer:
             self.content += self._pending_buffer
             self._cb(self._pending_buffer)
             self._pending_buffer = ""
-
+            
+            
     def was_done_detected(self) -> bool:
-        return self._done_detected
-
-    def was_action_dispatched(self) -> bool:
-        return self._action_dispatched
-
-    def get_tool_call_json(self) -> Optional[str]:
-        return self.tool_json_data if self.tool_trigger else None
-
-    def get_artifact_xml(self) -> Optional[str]:
-        return self._tool_buffer if self.artifact_trigger else None
+        return not self._pending_buffer and not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._is_accumulating_context
 
     def get_clean_text(self) -> str:
-        return self.content
+        return self.content 
+    
+     

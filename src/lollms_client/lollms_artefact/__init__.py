@@ -1,11 +1,9 @@
-# lollms_artefact/__init__.py
-# Sibling package exposing all artifacts-related modules
-
 from .lollms_artefact import (
-    ArtefactType,
+    ArtefactManager,
     ArtefactVisibility,
     ArtefactStatus,
-    ArtefactManager,
+    ArtefactType,
+    _find_best_title_match,
     make_image_id,
     parse_image_id,
     sanitize_artifact_filename,
@@ -15,10 +13,11 @@ from .internet_import import InternetImportMixin
 from .export import ExportMixin
 
 __all__ = [
-    "ArtefactType",
+    "ArtefactManager",
     "ArtefactVisibility",
     "ArtefactStatus",
-    "ArtefactManager",
+    "ArtefactType",
+    "_find_best_title_match",
     "make_image_id",
     "parse_image_id",
     "sanitize_artifact_filename",
