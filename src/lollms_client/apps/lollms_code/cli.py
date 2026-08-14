@@ -382,7 +382,7 @@ class CodeAgentConfig:
         self.skills_mode: str = "mixed"
         self.max_sub_agent_depth: int = 2
         self.max_sub_agents_per_turn: int = 3
-        self.workspace_path: str = str(APP_DEFAULT_WORKSPACE)
+        self.workspace_path: str = str(Path.cwd())
         self.skills_dir: str = str(APP_DEFAULT_SKILLS_DIR)
         self.memory_db: str = f"sqlite:///{APP_DEFAULT_MEMORY_DB}"
         self.handbag_path: str = str(APP_DEFAULT_HANDSAG_DIR / "default_coder")
@@ -400,6 +400,8 @@ class CodeAgentConfig:
             try:
                 file_config = json.loads(APP_CONFIG_FILE.read_text(encoding="utf-8"))
                 for key, val in file_config.items():
+                    if key == "workspace_path":
+                        continue
                     if hasattr(config, key):
                         setattr(config, key, val)
             except Exception as e:
@@ -452,8 +454,12 @@ class CodeAgentConfig:
             config.host_address = cli_args.host
         if cli_args.api_key:
             config.api_key = cli_args.api_key
+            
         if cli_args.workspace:
             config.workspace_path = str(Path(cli_args.workspace).resolve())
+        else:
+            config.workspace_path = str(Path.cwd().resolve())
+            
         if cli_args.max_steps:
             config.max_reasoning_steps = cli_args.max_steps
         if cli_args.temperature is not None:
@@ -485,7 +491,7 @@ class CodeAgentConfig:
 
     def save(self):
         APP_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        data = {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
+        data = {k: v for k, v in self.__dict__.items() if not k.startswith("_") and k != "workspace_path"}
         try:
             APP_CONFIG_FILE.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
         except Exception as e:

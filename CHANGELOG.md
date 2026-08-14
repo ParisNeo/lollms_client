@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-08-14 12:30]
+
+- fix(lollms_code): use current working directory as default workspace
+
 ## [2026-08-14 12:02]
 
 - refactor(core): improve CLI rendering, artefact sanitization, and personality state management
