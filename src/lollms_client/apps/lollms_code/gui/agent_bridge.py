@@ -223,6 +223,49 @@ def create_personality(prefs: GuiPrefs, client):
     return personality
 
 
+def switch_workspace(prefs: GuiPrefs, client, new_workspace_path: str):
+    """Equivalent of the CLI's /workspace command: point prefs at the new
+    directory, persist it, and rebuild the personality against it."""
+    new_path = Path(new_workspace_path).resolve()
+    if not new_path.exists() or not new_path.is_dir():
+        raise ValueError(f"Not a directory: {new_path}")
+    prefs.workspace_path = str(new_path)
+    prefs.save()
+    return create_personality(prefs, client)
+
+
+def get_workspace_stats(personality) -> Dict[str, Any]:
+    """Same logic as the CLI's get_workspace_stats() — indexed/loaded file
+    counts and sizes, used by the /files command."""
+    stats: Dict[str, Any] = {"total_indexed": 0, "total_loaded": 0, "loaded_files": []}
+    if not hasattr(personality, "_artefact_manager") or not personality._artefact_manager:
+        return stats
+    try:
+        from lollms_client.lollms_artefact import ArtefactVisibility
+        all_arts = personality._artefact_manager._get_all_raw()
+        stats["total_indexed"] = len([a for a in all_arts if not a.get("title", "").endswith("::images")])
+        for art in all_arts:
+            if art.get("visibility") == ArtefactVisibility.FULL:
+                rel_path = art.get("physical_path") or art.get("title", "")
+                if rel_path:
+                    ws_root = str(personality._resolved_workspace)
+                    if rel_path.startswith(ws_root):
+                        rel_path = rel_path[len(ws_root):].lstrip("\\/")
+                    file_size = art.get("size", 0)
+                    if not file_size:
+                        try:
+                            abs_path = personality._resolved_workspace / rel_path
+                            if abs_path.exists() and abs_path.is_file():
+                                file_size = abs_path.stat().st_size
+                        except Exception:
+                            file_size = 0
+                    stats["loaded_files"].append({"path": rel_path, "size": file_size})
+        stats["total_loaded"] = len(stats["loaded_files"])
+    except Exception:
+        pass
+    return stats
+
+
 class QueueStreamingCallback:
     """Same event surface as the CLI's StreamRenderer, but pushes AgentEvent
     objects onto a thread-safe queue instead of printing to the terminal.

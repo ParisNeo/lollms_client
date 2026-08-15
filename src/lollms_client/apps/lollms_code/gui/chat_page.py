@@ -3,13 +3,41 @@ from __future__ import annotations
 
 import queue
 import re
-from typing import Optional
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 from nicegui import ui
 
 from gui_prefs import GuiPrefs
 from env_config import EnvStore
 import agent_bridge
+
+
+HELP_TEXT = """\
+**Commands**
+
+- `/help` — this list
+- `/clear` — clear the conversation shown here (and the agent's in-memory history)
+- `/skills` — list learned skills
+- `/files` — show which workspace files are currently loaded into context
+- `/forget` — permanently wipe the agent's persistent memory (asks to confirm)
+- `/workspace <path>` — switch the active workspace directory
+- `/config` — open Settings
+- `/models` — model switching info
+
+Anything else is sent to the agent as a task.
+"""
+
+SLASH_COMMANDS = [
+    ("/help", "Show command list"),
+    ("/clear", "Clear the conversation"),
+    ("/skills", "List learned skills"),
+    ("/files", "Show loaded context files"),
+    ("/forget", "Wipe persistent memory"),
+    ("/workspace", "Switch workspace directory"),
+    ("/config", "Open Settings"),
+    ("/models", "Model switching info"),
+]
 
 
 class ChatSession:
@@ -29,65 +57,124 @@ class ChatSession:
             self.personality = agent_bridge.create_personality(self.prefs, self.client)
 
 
-def build_chat_page(env: EnvStore, prefs: GuiPrefs) -> None:
+def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
     session = ChatSession(env, prefs)
-    resolved = env.resolve_default_connection("llm")
+    debug_log: List[Dict[str, Any]] = []
 
-    with ui.row().classes("w-full h-full no-wrap"):
-        # ---- Sidebar: workspace + session info ----
-        with ui.column().classes("w-64 shrink-0 gap-2"):
-            with ui.card().classes("w-full"):
-                ui.label("Workspace").classes("text-xs text-gray-500 uppercase")
-                ui.label(prefs.workspace_path).classes("text-sm break-all")
-                ui.label(f"Model: {resolved.get('model_name') or '(none)'}").classes("text-xs text-gray-500 mt-2")
-                ui.label(f"Binding: {resolved.get('binding_name') or '(none)'}").classes("text-xs text-gray-500")
-
-            status_card = ui.card().classes("w-full")
-            with status_card:
-                ui.label("Session").classes("text-xs text-gray-500 uppercase")
-                status_label = ui.label("Idle").classes("text-sm")
+    with ui.column().classes("w-full h-full flex-nowrap gap-0"):
+        # ---- Slim status strip (replaces the old sidebar cards) ----
+        with ui.row().classes(
+            "w-full items-center justify-between px-3 py-1 shrink-0 "
+            "bg-gray-50 dark:bg-gray-900 border-b border-gray-200 dark:border-gray-800"
+        ):
+            status_label = ui.label("Idle").classes("text-xs text-gray-500")
+            with ui.row().classes("items-center gap-3"):
                 rounds_label = ui.label("").classes("text-xs text-gray-500")
                 ctx_label = ui.label("").classes("text-xs text-gray-500")
-
-            tools_toggle = ui.switch("Show tool panels", value=prefs.show_tool_calls)
-
-        # ---- Main column: transcript + input ----
-        with ui.column().classes("flex-1 h-full"):
-            transcript = ui.column().classes("w-full flex-1 overflow-y-auto gap-2 p-2")
-
-            with ui.row().classes("w-full items-end gap-2"):
-                prompt_input = ui.textarea(placeholder="Describe the task…").classes("flex-1").props(
-                    "outlined autogrow"
+                if tools_toggle is None:
+                    tools_toggle = ui.switch("Tool panels", value=prefs.show_tool_calls).props("dense")
+                ui.button(
+                    "Copy as Markdown", icon="content_copy",
+                    on_click=lambda: copy_debug_markdown(),
+                ).props("flat dense size=sm no-caps").tooltip("Copy the full discussion, including tool calls, for debugging")
+                ui.button("Settings", icon="settings", on_click=lambda: ui.navigate.to("/settings")).props(
+                    "flat dense size=sm no-caps"
                 )
-                send_button = ui.button(icon="send").props("round color=primary")
+
+        # ---- Transcript ----
+        scroll_area = ui.scroll_area().classes("w-full flex-1")
+        with scroll_area:
+            transcript = ui.column().classes("w-full gap-2 p-3")
+
+        # ---- Slash-command suggestions (shown above the input, hidden by default) ----
+        suggestions_row = ui.row().classes("w-full gap-1 px-3 flex-wrap")
+        suggestions_row.visible = False
+
+        # ---- Input ----
+        with ui.row().classes("w-full items-end gap-2 px-3 py-2 shrink-0"):
+            prompt_input = ui.textarea(placeholder="Describe the task, or type / for commands…").classes(
+                "flex-1"
+            ).props("outlined autogrow dense rows=1 input-debounce=0")
+            send_button = ui.button(icon="send").props("round color=primary")
 
     def add_user_bubble(text: str):
+        debug_log.append({"type": "user", "text": text})
         with transcript:
             with ui.row().classes("w-full justify-end"):
                 ui.markdown(text).classes(
-                    "bg-primary text-white rounded-lg px-4 py-2 max-w-[75%]"
+                    "bg-primary text-white rounded-lg px-3 py-1.5 max-w-[75%]"
                 )
+        scroll_area.scroll_to(percent=1.0)
 
     def add_agent_message_container() -> ui.markdown:
+        entry = {"type": "agent", "text": ""}
+        debug_log.append(entry)
         with transcript:
             with ui.row().classes("w-full justify-start"):
                 md = ui.markdown("").classes(
-                    "bg-gray-100 dark:bg-gray-800 rounded-lg px-4 py-2 max-w-[85%] whitespace-pre-wrap"
+                    "bg-gray-100 dark:bg-gray-800 rounded-lg px-3 py-1.5 max-w-[85%] whitespace-pre-wrap"
                 )
+        md._debug_entry = entry  # tag so drain_queue can update the same log entry as it streams
         return md
 
-    def add_event_panel(title: str, subtitle: str, body: str, color: str, icon: str):
-        if not tools_toggle.value:
-            return
+    def add_system_notice(text: str, is_error: bool = False):
+        debug_log.append({"type": "system", "text": text, "error": is_error})
         with transcript:
-            with ui.expansion(title, icon=icon).classes(f"w-full border-l-4 border-{color}"):
+            with ui.row().classes("w-full justify-start"):
+                ui.markdown(text).classes(
+                    ("bg-red-50 dark:bg-red-950 text-red-700 dark:text-red-300" if is_error
+                     else "bg-amber-50 dark:bg-amber-950 text-amber-700 dark:text-amber-300")
+                    + " rounded-lg px-3 py-1.5 max-w-[90%] text-sm"
+                )
+        scroll_area.scroll_to(percent=1.0)
+
+    def add_event_panel(title: str, subtitle: str, body: str, color: str, icon: str):
+        debug_log.append({"type": "event", "title": title, "subtitle": subtitle, "body": body})
+        # Always create the panel; visibility is bound live to the toggle so
+        # flipping it retroactively shows/hides everything already logged,
+        # not just future events.
+        with transcript:
+            panel = ui.expansion(title, icon=icon).classes(f"w-full border-l-4 border-{color}")
+            panel.bind_visibility_from(tools_toggle, "value")
+            with panel:
                 if subtitle:
                     ui.label(subtitle).classes("text-xs text-gray-500")
                 ui.code(body or "(no output)").classes("w-full text-xs")
 
+    def build_debug_markdown() -> str:
+        resolved = env.resolve_default_connection("llm")
+        lines = [
+            "# lollms_code — session transcript",
+            "",
+            f"- Generated: {datetime.now().isoformat(timespec='seconds')}",
+            f"- Workspace: `{prefs.workspace_path}`",
+            f"- Binding / Model: `{resolved.get('binding_name') or '?'}` / `{resolved.get('model_name') or '?'}`",
+            "",
+            "---",
+            "",
+        ]
+        for entry in debug_log:
+            kind = entry["type"]
+            if kind == "user":
+                lines += ["**You:**", "", entry["text"], ""]
+            elif kind == "agent":
+                lines += ["**Agent:**", "", (entry["text"] or "_(empty)_"), ""]
+            elif kind == "system":
+                prefix = "⚠️" if entry.get("error") else "ℹ️"
+                lines += [f"> {prefix} {entry['text']}", ""]
+            elif kind == "event":
+                lines += [f"<details><summary>{entry['title']}</summary>", ""]
+                if entry.get("subtitle"):
+                    lines += [f"_{entry['subtitle']}_", ""]
+                lines += ["```", entry.get("body") or "(no output)", "```", "</details>", ""]
+        return "\n".join(lines)
+
+    def copy_debug_markdown():
+        md_text = build_debug_markdown()
+        ui.clipboard.write(md_text)
+        ui.notify("Discussion copied as Markdown.", type="positive")
+
     def _strip_processing_tags(text: str) -> str:
-        # The raw stream may still contain <processing ...>...</processing>
-        # blocks meant for the terminal renderer; hide them from the chat bubble.
         return re.sub(r"<processing.*?</processing>", "", text, flags=re.DOTALL)
 
     current_agent_md: Optional[ui.markdown] = None
@@ -179,15 +266,183 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs) -> None:
                 ui.notify(f"Agent error: {ev.data.get('message')}", type="negative", timeout=8000)
 
         if drained_any:
-            transcript.scroll_to(percent=1.0)
+            scroll_area.scroll_to(percent=1.0)
 
     ui.timer(0.15, drain_queue)
 
-    def send_prompt():
+    # ---------------- Slash-command autocomplete ----------------
+
+    def refresh_suggestions():
+        text = prompt_input.value or ""
+        suggestions_row.clear()
+        if not text.startswith("/") or " " in text:
+            suggestions_row.visible = False
+            return
+        matches = [c for c in SLASH_COMMANDS if c[0].startswith(text)]
+        if not matches:
+            suggestions_row.visible = False
+            return
+        suggestions_row.visible = True
+        with suggestions_row:
+            for cmd, desc in matches:
+                def pick(cmd=cmd):
+                    prompt_input.value = cmd + " "
+                    suggestions_row.visible = False
+                    prompt_input.run_method("focus")
+
+                with ui.button(cmd, on_click=pick).props("dense outline size=sm no-caps"):
+                    ui.tooltip(desc)
+
+    def accept_first_suggestion():
+        text = prompt_input.value or ""
+        if not text.startswith("/") or " " in text:
+            return
+        matches = [c for c in SLASH_COMMANDS if c[0].startswith(text)]
+        if matches:
+            prompt_input.value = matches[0][0] + " "
+            suggestions_row.visible = False
+
+    prompt_input.on_value_change(lambda e: refresh_suggestions())
+    prompt_input.on("keyup", lambda e: refresh_suggestions())
+    prompt_input.on("keydown.tab.prevent", lambda e: accept_first_suggestion())
+
+    # ---------------- Slash-command execution ----------------
+
+    async def handle_slash_command(text: str) -> bool:
+        cmd, _, arg = text.partition(" ")
+        cmd = cmd.lower()
+        arg = arg.strip()
+
+        if cmd in ("/exit", "/quit"):
+            add_system_notice("Nothing to exit to in the GUI — just close the window.")
+            return True
+
+        if cmd == "/help":
+            add_system_notice(HELP_TEXT)
+            return True
+
+        if cmd == "/config":
+            ui.navigate.to("/settings")
+            return True
+
+        if cmd == "/models":
+            add_system_notice("Model switching is managed via LLM profiles — open `/config` (Settings).")
+            return True
+
+        if cmd == "/clear":
+            transcript.clear()
+            if session.personality is not None:
+                session.personality._conversation = []
+            add_system_notice("Conversation cleared.")
+            return True
+
+        if cmd == "/forget":
+            confirm_dialog = ui.dialog()
+            with confirm_dialog, ui.card():
+                ui.label("⚠️ Permanently delete ALL agent memories?").classes("font-bold text-red-500")
+                ui.label("This includes learned facts and episodic history. This can't be undone.").classes(
+                    "text-sm text-gray-500"
+                )
+                with ui.row().classes("w-full justify-end gap-2 mt-2"):
+                    ui.button("Cancel", on_click=confirm_dialog.close).props("flat")
+
+                    def do_wipe():
+                        confirm_dialog.close()
+                        try:
+                            session.ensure_ready()
+                            if hasattr(session.personality, "wipe_all_memories") and session.personality.wipe_all_memories():
+                                add_system_notice("🧠 All memories wiped.")
+                            else:
+                                add_system_notice("Memory manager not initialized or wipe failed.", is_error=True)
+                        except Exception as e:
+                            add_system_notice(f"Could not wipe memory: {e}", is_error=True)
+
+                    ui.button("Wipe memories", on_click=do_wipe).props("color=red")
+            confirm_dialog.open()
+            return True
+
+        if cmd == "/skills":
+            try:
+                session.ensure_ready()
+                skills = session.personality.skills_manager.list_skills() if session.personality.skills_manager else []
+            except Exception as e:
+                add_system_notice(f"Could not load skills: {e}", is_error=True)
+                return True
+            if not skills:
+                add_system_notice("No skills learned yet.")
+            else:
+                lines = "\n".join(f"- **{s['title']}** ({s.get('category', '')}) — {s.get('description', '')}" for s in skills)
+                add_system_notice(f"**Learned skills**\n\n{lines}")
+            return True
+
+        if cmd == "/files":
+            try:
+                session.ensure_ready()
+                stats = agent_bridge.get_workspace_stats(session.personality)
+            except Exception as e:
+                add_system_notice(f"Could not read workspace stats: {e}", is_error=True)
+                return True
+            if not stats["loaded_files"]:
+                add_system_notice("No files are currently loaded in context.")
+            else:
+                lines = "\n".join(f"- `{f['path']}` ({f['size']:,} bytes)" for f in stats["loaded_files"])
+                add_system_notice(
+                    f"**Loaded context files** ({stats['total_loaded']}/{stats['total_indexed']} indexed)\n\n{lines}"
+                )
+            return True
+
+        if cmd == "/workspace":
+            async def do_switch(path: str):
+                try:
+                    session.ensure_ready()
+                    session.personality = agent_bridge.switch_workspace(prefs, session.client, path)
+                    add_system_notice(f"📂 Workspace switched to `{prefs.workspace_path}`")
+                except Exception as e:
+                    add_system_notice(f"Could not switch workspace: {e}", is_error=True)
+
+            if arg:
+                await do_switch(arg)
+            else:
+                dialog = ui.dialog()
+                with dialog, ui.card().classes("w-[480px]"):
+                    ui.label("Switch workspace").classes("font-bold")
+                    path_input = ui.input("New workspace path", value=prefs.workspace_path).classes("w-full")
+
+                    def pick_folder():
+                        try:
+                            import webview
+                            result = webview.windows[0].create_file_dialog(webview.FOLDER_DIALOG)
+                            if result:
+                                path_input.value = result[0]
+                        except Exception:
+                            ui.notify("Native folder picker unavailable — type the path manually.", type="warning")
+
+                    ui.button("Browse…", icon="folder_open", on_click=pick_folder).props("flat")
+                    with ui.row().classes("w-full justify-end gap-2 mt-2"):
+                        ui.button("Cancel", on_click=dialog.close).props("flat")
+
+                        async def confirm():
+                            dialog.close()
+                            await do_switch(path_input.value)
+
+                        ui.button("Switch", on_click=confirm).props("color=primary")
+                dialog.open()
+            return True
+
+        return False
+
+    async def send_prompt():
         text = prompt_input.value.strip()
         if not text or session.busy:
             return
         prompt_input.value = ""
+        suggestions_row.visible = False
+
+        if text.startswith("/"):
+            add_user_bubble(text)
+            await handle_slash_command(text)
+            return
+
         add_user_bubble(text)
         session.busy = True
         send_button.props("loading")

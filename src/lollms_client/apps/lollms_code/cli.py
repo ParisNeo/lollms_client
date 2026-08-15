@@ -120,9 +120,12 @@ For every task, follow this structured pipeline:
 - File encoding: always use `encoding='utf-8'` when opening files.
 - Never leave debug `print()` statements in production code.
 
-## CONTEXT MANAGEMENT
+## CONTEXT MANAGEMENT & FILE READING (CRITICAL)
 - The workspace tree is visible in your system prompt with markers: [C]=loaded, [U]=unlockable, [L]=locked.
-- Use `<unlock_file>filename</unlock_file>` to load a file into context.
+- **PRIMARY READING METHOD**: To read ANY file (text, code, PDF, DOCX, PPTX, CSV, etc.), use `<unlock_file>filename</unlock_file>`.
+  - The system natively parses PDFs, DOCX, PPTX, and other binary formats into readable text automatically.
+  - You DO NOT need to write Python scripts or use shell commands to extract text from documents.
+  - Simply emit `<unlock_file>document.pdf</unlock_file>` and the full text content will be injected into your context.
 - Use `<lock_file>filename</lock_file>` when done to free context space.
 - Do NOT read the same file repeatedly — it stays in your context after unlocking.
 
@@ -168,17 +171,15 @@ You are operating inside the project workspace at `./` (which resolves to the pr
 3. **PERSISTENT NOTES**: A `.lollms_code/scratchpad.md` file exists. Use it to store long-term context, architectural decisions, or task state. This file survives restarts.
 4. **NO WORKSPACE BLOAT**: Do not leave temporary files in the root project directory. Use the `.lollms_code/` folder for all non-essential outputs.
 
-## SYSTEM SHELL EXECUTION (PRIMARY EXECUTION METHOD)
-You have access to the `tool_execute_shell_command` tool. This is your PRIMARY and ONLY method for interacting with the system, executing code, and managing files.
+## SYSTEM SHELL EXECUTION (SECONDARY METHOD)
+You have access to the `tool_execute_shell_command` tool. This is used for running commands, tests, and environment management.
+**IMPORTANT**: Do NOT use shell commands (`type`, `cat`) to read files for context. Use `<unlock_file>` instead. Shell commands are for execution, not reading.
 
 ### WORKFLOW RULES
-1. **FILE CREATION**: To create or overwrite files, use shell redirection or `python -c` via the tool.
-   - Windows (cmd): `tool_execute_shell_command(command="echo content > scripts/file.py")`
-   - For multi-line files: `tool_execute_shell_command(command="python -c \"with open('scripts/test.py', 'w', encoding='utf-8') as f: f.write('print(1)')\"")`
-2. **FILE READING**: To read files for context, use `type scripts\file.py` (Windows) or `cat scripts/file.py` (Unix).
-3. **CODE EXECUTION**: To execute Python code, use `python scripts/script.py` or `python -c "import math; print(math.pi)"`.
-4. **PACKAGE MANAGEMENT**: If a package is missing, use `pip install package_name`.
-5. **TESTING**: Run tests using `python -m pytest` or `python -m unittest`.
+1. **FILE CREATION**: To create or overwrite files, use `<artifact>` tags.
+2. **CODE EXECUTION**: To execute Python code, use `python scripts/script.py` or `python -c "import math; print(math.pi)"`.
+3. **PACKAGE MANAGEMENT**: If a package is missing, use `pip install package_name`.
+4. **TESTING**: Run tests using `python -m pytest` or `python -m unittest`.
 
 ### GIT OPERATIONS (HIGH-EFFICIENCY PROTOCOL)
 When asked to "commit", "push", or perform any git operation, you MUST follow this 2-round protocol:
@@ -292,6 +293,7 @@ Sub-agents share the same workspace but have isolated context windows. They are 
   - [cyan]config[/cyan]: Runs the Lollms configuration wizard (changes models, bindings).
   - [cyan]forget[/cyan]: Permanently wipes the agent's associative memory (use with caution!).
   - [cyan]skills[/cyan]: Lists all stored skills in your `~/.lollms_client/lollms_code/skills/` directory.
+  - [cyan]workspace[/cyan]: Switches the active workspace to another directory.
 
 [bold yellow]Memory Management:[/bold yellow]
 The agent remembers facts about you. If you say "My name is Alex", it will save it.
@@ -396,7 +398,7 @@ class CodeAgentConfig:
         self.skills_mode: str = "mixed"
         self.max_sub_agent_depth: int = 2
         self.max_sub_agents_per_turn: int = 3
-        self.workspace_path: str = str(Path.cwd())
+        self.workspace_path: str = str(Path.cwd().resolve())
         self.skills_dir: str = str(APP_DEFAULT_SKILLS_DIR)
         self.memory_db: str = f"sqlite:///{APP_DEFAULT_MEMORY_DB}"
         self.handbag_path: str = str(APP_DEFAULT_HANDSAG_DIR / "default_coder")
@@ -654,8 +656,6 @@ def build_environment_context(config: CodeAgentConfig) -> str:
     scripts_dir = sandbox_dir / "scripts"
 
     shell_cmd = "cmd / powershell" if is_windows else "bash/sh"
-    list_cmd = "dir" if is_windows else "ls"
-    read_cmd = "type" if is_windows else "cat"
     path_sep = "\\" if is_windows else "/"
 
     git_branch_info = ""
@@ -684,15 +684,14 @@ You are operating in the following environment:
 - Path Separator: `{path_sep}`{git_branch_info}
 
 ### OS-SPECIFIC RULES (MANDATORY)
-1. **SHELL COMMANDS**: You MUST use {os_name}-compatible shell commands.
-   - To list files: Use `{list_cmd}`
-   - To read files: Use `{read_cmd} filename.ext`
+1. **FILE READING**: Use `<unlock_file>` to read ANY file (text, PDF, DOCX, etc.). Do NOT use shell commands for reading.
+2. **SHELL COMMANDS**: Use shell commands only for execution (running tests, git, pip).
    - To execute scripts: Use `python script.py` (not `python3` on Windows)
-2. **PATHS**: Always use `{path_sep}` for file paths in shell commands. ALL paths must be relative to the Workspace Root. NEVER attempt to access absolute paths outside the workspace.
-3. **TRANSIENT SCRIPTS**: When writing test scripts or temporary files, you MUST save them to the Sandbox Directory (`.lollms_code/scripts/`).
+3. **PATHS**: Always use `{path_sep}` for file paths in shell commands. ALL paths must be relative to the Workspace Root. NEVER attempt to access absolute paths outside the workspace.
+4. **TRANSIENT SCRIPTS**: When writing test scripts or temporary files, you MUST save them to the Sandbox Directory (`.lollms_code/scripts/`).
    - Example: `python -c "with open('.lollms_code{path_sep}scripts{path_sep}test.py', 'w') as f: f.write('print(1)')"`
    - NEVER create `.py` or `.log` files in the Workspace Root.
-4. **SANDBOX ISOLATION**: The Workspace Root contains the user's actual project. Do not modify project files unless explicitly instructed. Use the Sandbox Directory for all experimental work.
+5. **SANDBOX ISOLATION**: The Workspace Root contains the user's actual project. Do not modify project files unless explicitly instructed. Use the Sandbox Directory for all experimental work.
 === END ENVIRONMENT CONTEXT ===
 """
 
@@ -1195,8 +1194,6 @@ def get_context_fill_status(personality: LollmsPersonality, client: LollmsClient
     except Exception:
         return None
     
-    
-    
 def dump_startup_context(personality: LollmsPersonality, client: LollmsClient):
     """
     🐛 DEBUG INSTRUMENTATION: Writes the initial system prompt and active tools
@@ -1524,6 +1521,61 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
             sys.stdout.write("\n")
             return None
 
+def _switch_workspace_interactive(config: CodeAgentConfig, client: LollmsClient) -> Optional[LollmsPersonality]:
+    """Handles the interactive workspace switching process."""
+    try:
+        ASCIIColors.rule("[bold cyan]📂 Switch Workspace[/bold cyan]")
+        ASCIIColors.info(f"Current workspace: [yellow]{config.workspace_path}[/yellow]")
+        ASCIIColors.info("Select a new workspace directory or type a path manually.")
+        
+        default_path = Path(config.workspace_path).resolve()
+        
+        try:
+            selected_path = questionary.path(
+                "Enter new workspace path:",
+                default=str(default_path),
+                only_directories=True
+            ).ask()
+        except Exception:
+            selected_path = input("Enter new workspace path manually: ").strip()
+            
+        if not selected_path:
+            ASCIIColors.yellow("Workspace switch cancelled.")
+            return None
+            
+        new_path = Path(selected_path).resolve()
+        
+        if not new_path.exists():
+            ASCIIColors.red(f"Directory does not exist: {new_path}")
+            return None
+            
+        if not new_path.is_dir():
+            ASCIIColors.red(f"Path is not a directory: {new_path}")
+            return None
+            
+        if str(new_path) == config.workspace_path:
+            ASCIIColors.yellow("Already in this workspace.")
+            return None
+            
+        config.workspace_path = str(new_path)
+        config.save()
+        
+        ASCIIColors.success(f"✅ Workspace switched to: {new_path}")
+        
+        personality = create_coding_personality(config, client)
+        
+        if config.debug:
+            dump_startup_context(personality, client)
+            
+        return personality
+        
+    except KeyboardInterrupt:
+        ASCIIColors.yellow("\nWorkspace switch cancelled.")
+        return None
+    except Exception as e:
+        ASCIIColors.red(f"Failed to switch workspace: {e}")
+        return None
+
 def run_interactive(personality: LollmsPersonality, client: LollmsClient, config: CodeAgentConfig) -> int:
     if config.debug:
         dump_startup_context(personality, client)
@@ -1531,7 +1583,7 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
     renderer = StreamRenderer(config)
     history = PersistentHistory(APP_HISTORY_FILE)
 
-    slash_commands = ["/exit", "/quit", "/help", "/config", "/forget", "/skills", "/clear", "/models", "/files"]
+    slash_commands = ["/exit", "/quit", "/help", "/config", "/forget", "/skills", "/clear", "/models", "/files", "/workspace"]
     
     # Display a safe, truncated workspace path to the user
     ws_path_display = Path(config.workspace_path).resolve()
@@ -1546,7 +1598,7 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
         f"[cyan]Workspace:[/cyan] {ws_path_display}",
         f"[cyan]Model:[/cyan]      {config.model_name}",
         f"[cyan]Binding:[/cyan]    {config.llm_binding}",
-        f"[dim]Commands: 'exit' (quit), 'help' (manual), 'config' (wizard), 'forget' (wipe memory), 'skills' (list)[/dim]"
+        f"[dim]Commands: 'exit' (quit), 'help' (manual), 'config' (wizard), 'forget' (wipe memory), 'skills' (list), 'workspace' (switch dir)[/dim]"
     ]
 
     ctx_status = get_context_fill_status(personality, client)
@@ -1653,6 +1705,35 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
             else:
                 _render_files_table(ws_stats["loaded_files"], "Loaded Context Files [C]")
             continue
+            
+        if user_input.lower() == "/workspace":
+            new_personality = _switch_workspace_interactive(config, client)
+            if new_personality:
+                personality = new_personality
+                ws_path_display = Path(config.workspace_path).resolve()
+                try:
+                    ws_path_display = ws_path_display.relative_to(Path.home())
+                    ws_path_display = f"~/{ws_path_display}"
+                except ValueError:
+                    pass
+                
+                ASCIIColors.panel(
+                    f"[cyan]New Workspace:[/cyan] {ws_path_display}",
+                    title="[bold green]📂 Workspace Switched[/bold green]",
+                    border_style="green"
+                )
+                
+                ws_stats = get_workspace_stats(personality)
+                if ws_stats["total_indexed"] > 0:
+                    stats_content = (
+                        f"[cyan]Indexed Files:[/cyan] {ws_stats['total_indexed']}\n"
+                        f"[cyan]Loaded in Context:[/cyan] {ws_stats['total_loaded']}"
+                    )
+                    ASCIIColors.panel(stats_content, title="[bold blue]📂 Workspace Telemetry[/bold blue]", border_style="blue")
+                    
+                    if ws_stats["loaded_files"]:
+                        _render_files_table(ws_stats["loaded_files"], "Pre-loaded Context Files [C]")
+            continue
         
         history.add(user_input)
         ASCIIColors.rule("[bold green]🤖 Agent[/bold green]")
@@ -1735,7 +1816,7 @@ Examples:
     )
     parser.add_argument("prompt", nargs="?", default=None, help="The task prompt for the autonomous agent.")
     parser.add_argument("-i", "--interactive", action="store_true", help="Start in interactive REPL mode.")
-    parser.add_argument("--workspace", type=str, default=None, help="Path to the workspace directory.")
+    parser.add_argument("--workspace", type=str, default=None, help="Path to the workspace directory. Defaults to current working directory.")
     parser.add_argument("--handbag-path", type=str, default=None, help="Path to the Handbag folder containing agent resources.")
     parser.add_argument("--model", type=str, default=None, help="Model name to use.")
     parser.add_argument("--llm-binding", type=str, default=None, help="LLM binding name.")

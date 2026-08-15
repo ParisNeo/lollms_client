@@ -57,18 +57,45 @@ def main_page():
                 build_settings_page(env, prefs, on_saved=on_first_save)
         return
 
-    with ui.header().classes("items-center justify-between"):
-        with ui.row().classes("items-center gap-2"):
-            ui.icon("terminal")
-            ui.label("lollms_code").classes("text-lg font-bold")
-        with ui.row().classes("items-center gap-1"):
-            ui.button(icon="settings", on_click=lambda: ui.navigate.to("/settings")).props("flat round")
+    # Default .nicegui-content has ~1rem padding + gap and no explicit height,
+    # so a child "calc(100vh - HEADER)" div ends up sized by its content instead
+    # of the viewport, pushing the input row below the fold. Strip that here
+    # so the header + chat area exactly fill the native window.
+    ui.query(".nicegui-content").classes("h-screen p-0 gap-0")
+
+    # Fast access to Settings: Ctrl+, (also has header + in-chat "Settings"
+    # buttons — three ways in, since it's a click users reach for often).
+    def _global_shortcut(e):
+        if e.action.keydown and e.modifiers.ctrl and e.key == ",":
+            ui.navigate.to("/settings")
+
+    ui.keyboard(on_key=_global_shortcut, ignore=[])
+
+    HEADER_H = 40
+    resolved = env.resolve_default_connection("llm")
+
+    with ui.header().classes(
+        "items-center justify-between px-3 flex-nowrap"
+    ).style(f"min-height: {HEADER_H}px; height: {HEADER_H}px;"):
+        with ui.row().classes("items-center gap-2 flex-nowrap overflow-hidden"):
+            ui.icon("terminal", size="18px")
+            ui.label("lollms_code").classes("text-sm font-bold shrink-0")
+            ui.label("·").classes("text-xs opacity-40 shrink-0")
+            ui.label(prefs.workspace_path).classes("text-xs opacity-70 truncate").style("max-width: 320px;")
+            ui.label("·").classes("text-xs opacity-40 shrink-0")
+            ui.label(f"{resolved.get('binding_name') or '?'} / {resolved.get('model_name') or '?'}").classes(
+                "text-xs opacity-70 shrink-0"
+            )
+        with ui.row().classes("items-center gap-1 shrink-0"):
+            ui.button("Settings", icon="settings", on_click=lambda: ui.navigate.to("/settings")).props(
+                "flat dense size=sm no-caps"
+            )
             ui.button(
                 icon="dark_mode" if not prefs.dark_mode else "light_mode",
                 on_click=lambda: toggle_dark(prefs),
-            ).props("flat round")
+            ).props("flat round dense size=sm")
 
-    with ui.element("div").classes("w-full").style("height: calc(100vh - 64px);"):
+    with ui.element("div").classes("w-full").style(f"height: calc(100vh - {HEADER_H}px); overflow: hidden;"):
         build_chat_page(env, prefs)
 
 

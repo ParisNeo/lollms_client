@@ -65,34 +65,40 @@ def build_settings_page(env: EnvStore, prefs: GuiPrefs, on_saved) -> None:
 # ============================== Modality panel ==============================
 
 def _build_modality_panel(env: EnvStore, modality: str) -> None:
-    bindings_container = ui.column().classes("w-full gap-2")
-    profiles_container = ui.column().classes("w-full gap-2")
+    with ui.tabs().classes("w-full") as sub_tabs:
+        t_bindings = ui.tab("Bindings", icon="cable")
+        t_profiles = ui.tab("Profiles", icon="badge")
 
-    def refresh():
-        bindings_container.clear()
-        profiles_container.clear()
-        _render_bindings_list(env, modality, bindings_container, refresh)
-        _render_profiles_list(env, modality, profiles_container, refresh)
-
-    with ui.row().classes("w-full gap-4 items-start no-wrap"):
-        with ui.column().classes("flex-1"):
-            with ui.row().classes("w-full items-center justify-between"):
-                ui.label("Bindings").classes("text-lg font-semibold")
+    with ui.tab_panels(sub_tabs, value=t_bindings).classes("w-full"):
+        with ui.tab_panel(t_bindings):
+            with ui.row().classes("w-full items-center justify-between mb-2"):
+                ui.label(f"{MODALITY_LABELS[modality]} bindings").classes("text-sm text-gray-500")
                 ui.button(
                     "Add binding", icon="add",
-                    on_click=lambda: _open_add_binding_dialog(env, modality, refresh),
+                    on_click=lambda: _open_add_binding_dialog(env, modality, lambda: refresh_bindings()),
                 ).props("flat color=primary")
-            bindings_container
-        with ui.column().classes("flex-1"):
-            with ui.row().classes("w-full items-center justify-between"):
-                ui.label("Profiles").classes("text-lg font-semibold")
+            bindings_container = ui.column().classes("w-full gap-2")
+
+        with ui.tab_panel(t_profiles):
+            with ui.row().classes("w-full items-center justify-between mb-2"):
+                ui.label(f"{MODALITY_LABELS[modality]} profiles").classes("text-sm text-gray-500")
                 ui.button(
                     "Add profile", icon="add",
-                    on_click=lambda: _open_add_profile_dialog(env, modality, refresh),
+                    on_click=lambda: _open_add_profile_dialog(env, modality, lambda: refresh_profiles()),
                 ).props("flat color=primary")
-            profiles_container
+            profiles_container = ui.column().classes("w-full gap-2")
 
-    refresh()
+    def refresh_bindings():
+        bindings_container.clear()
+        _render_bindings_list(env, modality, bindings_container, refresh_bindings)
+
+    def refresh_profiles():
+        profiles_container.clear()
+        _render_profiles_list(env, modality, profiles_container, refresh_profiles)
+
+    refresh_bindings()
+    refresh_profiles()
+
 
 
 def _render_bindings_list(env: EnvStore, modality: str, container: ui.column, refresh) -> None:

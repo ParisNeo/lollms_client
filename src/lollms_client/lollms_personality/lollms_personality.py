@@ -2954,17 +2954,49 @@ JSON:"""
                     ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Context compaction triggered ===")
                 continue
 
-            if len(tool_calls_this_turn) > 0 or getattr(ss, 'context_trigger', False) or getattr(ss, 'artifact_trigger', False):
+            has_actions_this_round = bool(ss.completed_actions)
+            if len(tool_calls_this_turn) > 0 or getattr(ss, 'context_trigger', False) or getattr(ss, 'artifact_trigger', False) or has_actions_this_round:
                 if not raw_round_text.strip():
                     empty_response_count = getattr(self, '_consecutive_empty_responses', 0) + 1
                     object.__setattr__(self, '_consecutive_empty_responses', empty_response_count)
 
-                    if empty_response_count >= 2:
+                    if empty_response_count >= 3:
                         ASCIIColors.warning(f"[{self.name}] Consecutive empty LLM responses detected ({empty_response_count}). Terminating loop to prevent spin.")
                         final_response = "[Terminated: LLM stopped generating without completing the task.]"
                         break
 
-                    ASCIIColors.warning(f"[{self.name}] Empty LLM response detected after action (attempt {empty_response_count}). Injecting continuation mandate.")
+                    ASCIIColors.warning(f"[{self.name}] Empty LLM response detected after action (attempt {empty_response_count}). Injecting action-aware continuation mandate.")
+
+                    action_types = set()
+                    for act in ss.completed_actions:
+                        action_types.add(act.get("type", "unknown"))
+                    action_desc = ", ".join(sorted(action_types)) if action_types else "unknown"
+
+                    is_memory_or_context_only = action_types and action_types.issubset({"context"})
+
+                    if is_memory_or_context_only:
+                        targeted_nudge = (
+                            "[SYSTEM: CRITICAL — YOU OWE THE USER A VISIBLE RESPONSE.\n"
+                            f"You just executed side-effect action(s): {action_desc}. These are internal operations (memory saves, context updates, file locking).\n"
+                            "They do NOT count as a response to the user. The user sees NOTHING from you.\n"
+                            f"Here is the user's ORIGINAL prompt that you must respond to:\n---\n{prompt}\n---\n"
+                            "You MUST NOW write a conversational reply addressing the user's request.\n"
+                            "Do NOT emit any more memory or context tags. Do NOT emit <done/> until you have written actual text the user can read.\n"
+                            "Write your response NOW.]"
+                        )
+                    else:
+                        targeted_nudge = (
+                            "[SYSTEM: You stopped generation without emitting a <done/> tag. "
+                            "If your task is complete, output a final conversational summary and end it with a <done/> tag on a new line. "
+                            "If you need to continue working, emit the next functional tag now.]"
+                        )
+
+                    clean_history_text = self._sanitize_history_for_context(raw_round_text)
+                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant executed actions but produced no visible text]"))
+                    virtual_history.append(SimpleNamespace(sender_type="user", content=targeted_nudge))
+                    if getattr(self, 'debug_mode', False):
+                        ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Empty response after actions, injected targeted nudge (attempt {empty_response_count}) ===")
+                    continue
                 else:
                     object.__setattr__(self, '_consecutive_empty_responses', 0)
 
