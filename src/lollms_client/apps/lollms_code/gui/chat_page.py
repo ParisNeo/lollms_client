@@ -17,7 +17,13 @@ HELP_TEXT = """\
 **Commands**
 
 - `/help` — this list
-- `/clear` — clear the conversation shown here (and the agent's in-memory history)
+- `/clear-history` (alias `/clear`) — clear the conversation shown here (and the agent's in-memory history)
+- `/clear-files` (alias `/unload-all`) — unload every currently loaded file from context
+- `/load <file1> [file2] ...` — load files into context (`/load all` loads everything indexed)
+- `/unload <file1> ...` — remove specific files from context
+- `/lock <file1> ...` — lock files (agent can't unlock them)
+- `/hide <file1> ...` — hide files from the workspace tree entirely
+- `/unhide <file1> ...` — restore hidden files to the tree
 - `/skills` — list learned skills
 - `/files` — show which workspace files are currently loaded into context
 - `/forget` — permanently wipe the agent's persistent memory (asks to confirm)
@@ -30,7 +36,13 @@ Anything else is sent to the agent as a task.
 
 SLASH_COMMANDS = [
     ("/help", "Show command list"),
-    ("/clear", "Clear the conversation"),
+    ("/clear-history", "Clear the conversation"),
+    ("/clear-files", "Unload all files from context"),
+    ("/load", "Load file(s) into context (or 'all')"),
+    ("/unload", "Remove file(s) from context"),
+    ("/lock", "Lock file(s) so the agent can't unlock them"),
+    ("/hide", "Hide file(s) from the workspace tree"),
+    ("/unhide", "Restore hidden file(s) to the tree"),
     ("/skills", "List learned skills"),
     ("/files", "Show loaded context files"),
     ("/forget", "Wipe persistent memory"),
@@ -329,11 +341,36 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
             add_system_notice("Model switching is managed via LLM profiles — open `/config` (Settings).")
             return True
 
-        if cmd == "/clear":
+        if cmd in ("/clear-history", "/clear"):
             transcript.clear()
+            debug_log.clear()
             if session.personality is not None:
                 session.personality._conversation = []
             add_system_notice("Conversation cleared.")
+            return True
+
+        if cmd in ("/clear-files", "/unload-all"):
+            try:
+                session.ensure_ready()
+                result = agent_bridge.clear_all_loaded_files(session.personality)
+                add_system_notice(result.get("status_str", "Files unloaded."))
+            except Exception as e:
+                add_system_notice(f"Could not unload files: {e}", is_error=True)
+            return True
+
+        if cmd in ("/load", "/unload", "/lock", "/hide", "/unhide"):
+            if not arg:
+                add_system_notice(f"Usage: `{cmd} <file1> [file2] ...` or `{cmd} all`", is_error=True)
+                return True
+            action = cmd[1:]  # strip leading "/"
+            targets = [t.strip() for t in arg.replace(",", " ").split() if t.strip()]
+            try:
+                session.ensure_ready()
+                result = agent_bridge.change_file_visibility(session.personality, targets, action)
+                status = result.get("status_str", "Action completed.")
+                add_system_notice(status, is_error=("❌" in status or "BLOCKED" in status))
+            except Exception as e:
+                add_system_notice(f"Could not change file visibility: {e}", is_error=True)
             return True
 
         if cmd == "/forget":

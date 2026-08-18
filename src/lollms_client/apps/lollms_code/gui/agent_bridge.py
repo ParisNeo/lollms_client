@@ -69,8 +69,6 @@ def build_environment_context(workspace_path: str) -> str:
     workspace_root = Path(workspace_path).resolve()
 
     shell_cmd = "cmd / powershell" if is_windows else "bash/sh"
-    list_cmd = "dir" if is_windows else "ls"
-    read_cmd = "type" if is_windows else "cat"
     path_sep = "\\" if is_windows else "/"
 
     git_branch_info = ""
@@ -97,10 +95,14 @@ You are operating in the following environment:
 - Path Separator: `{path_sep}`{git_branch_info}
 
 ### OS-SPECIFIC RULES (MANDATORY)
-1. Use {os_name}-compatible shell commands ({list_cmd} to list, {read_cmd} to read).
-2. Always use `{path_sep}` for paths. Stay relative to the Workspace Root.
-3. Transient scripts go in `.lollms_code/scripts/` — never the workspace root.
-4. Do not modify project files unless explicitly instructed.
+1. **FILE READING**: Use `<unlock_file>` to read ANY file (text, PDF, DOCX, etc.). Do NOT use shell commands for reading.
+2. **SHELL COMMANDS**: Use shell commands only for execution (running tests, git, pip).
+   - To execute scripts: Use `python script.py` (not `python3` on Windows)
+3. **PATHS**: Always use `{path_sep}` for file paths in shell commands. ALL paths must be relative to the Workspace Root. NEVER attempt to access absolute paths outside the workspace.
+4. **TRANSIENT SCRIPTS**: When writing test scripts or temporary files, you MUST save them to the Sandbox Directory (`.lollms_code/scripts/`).
+   - Example: `python -c "with open('.lollms_code{path_sep}scripts{path_sep}test.py', 'w') as f: f.write('print(1)')"`
+   - NEVER create `.py` or `.log` files in the Workspace Root.
+5. **SANDBOX ISOLATION**: The Workspace Root contains the user's actual project. Do not modify project files unless explicitly instructed. Use the Sandbox Directory for all experimental work.
 === END ENVIRONMENT CONTEXT ===
 """
 
@@ -264,6 +266,34 @@ def get_workspace_stats(personality) -> Dict[str, Any]:
     except Exception:
         pass
     return stats
+
+
+def change_file_visibility(personality, targets: list, action: str) -> Dict[str, Any]:
+    """Wraps personality.change_file_visibility(), same as the CLI's
+    /load, /unload, /lock, /hide, /unhide commands. `action` is one of
+    'load', 'unload', 'lock', 'hide', 'unhide'."""
+    result = personality.change_file_visibility(targets, action)
+    try:
+        object.__setattr__(personality, "_last_ws_sync_time", 0.0)
+    except Exception:
+        pass
+    return result
+
+
+def clear_all_loaded_files(personality) -> Dict[str, Any]:
+    """Same as the CLI's /clear-files: unloads every currently [C]-loaded
+    file from context in one shot."""
+    if not hasattr(personality, "_artefact_manager") or not personality._artefact_manager:
+        return {"status_str": "Artefact system not initialized."}
+    from lollms_client.lollms_artefact import ArtefactVisibility
+    all_arts = personality._artefact_manager._get_all_raw()
+    loaded_files = [
+        a.get("title", "") for a in all_arts
+        if a.get("visibility") == ArtefactVisibility.FULL and not a.get("title", "").endswith("::images")
+    ]
+    if not loaded_files:
+        return {"status_str": "No files are currently loaded in context."}
+    return change_file_visibility(personality, loaded_files, "unload")
 
 
 class QueueStreamingCallback:
