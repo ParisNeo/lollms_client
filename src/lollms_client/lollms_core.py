@@ -47,6 +47,7 @@ class LollmsBindingProfile:
     vision_enabled: bool = False
     forced_context_size: Optional[int] = None
     routing_config: Optional[Dict[str, Any]] = None
+    is_legacy_extra_llm: bool = False
 
 # Backward compatibility alias
 LollmsModelProfile = LollmsBindingProfile
@@ -151,13 +152,22 @@ class LollmsClient():
         self.ttv_profiles_registry: Dict[str, LollmsBindingProfile] = {}
         self.ttm_profiles_registry: Dict[str, LollmsBindingProfile] = {}
 
-        # Pre-register profiles early so we can infer llm_binding_name if missing
-        self._register_profiles(llm_profiles, self.llm_profiles_registry, "LLM", callback)
-        self._register_profiles(tti_profiles, self.tti_profiles_registry, "TTI")
-        self._register_profiles(tts_profiles, self.tts_profiles_registry, "TTS")
-        self._register_profiles(stt_profiles, self.stt_profiles_registry, "STT")
-        self._register_profiles(ttv_profiles, self.ttv_profiles_registry, "TTV")
-        self._register_profiles(ttm_profiles, self.ttm_profiles_registry, "TTM")
+        # Backward compatibility: Map legacy extra_llms to llm_profiles
+        legacy_extra_llms = kwargs.pop("extra_llms", None)
+        if legacy_extra_llms:
+            if llm_profiles is None:
+                llm_profiles = {}
+            for alias, profile_data in legacy_extra_llms.items():
+                if alias not in llm_profiles:
+                    llm_profiles[alias] = profile_data
+
+        # Pre-register profiles early (without instantiating) so we can infer llm_binding_name if missing
+        self._register_profiles(llm_profiles, self.llm_profiles_registry, "LLM", callback, eager_instantiate=False)
+        self._register_profiles(tti_profiles, self.tti_profiles_registry, "TTI", eager_instantiate=False)
+        self._register_profiles(tts_profiles, self.tts_profiles_registry, "TTS", eager_instantiate=False)
+        self._register_profiles(stt_profiles, self.stt_profiles_registry, "STT", eager_instantiate=False)
+        self._register_profiles(ttv_profiles, self.ttv_profiles_registry, "TTV", eager_instantiate=False)
+        self._register_profiles(ttm_profiles, self.ttm_profiles_registry, "TTM", eager_instantiate=False)
 
         # Infer primary binding names from default profiles if not explicitly provided
         if not llm_binding_name:
@@ -322,6 +332,16 @@ class LollmsClient():
         # 4. Eagerly instantiate ONLY the default profiles for all modalities
         _eagerly_instantiate_default(self.llm_profiles_registry, self.switch_model, "LLM")
 
+        # Ensure legacy extra_llms are eagerly instantiated into the cache
+        for alias, profile in self.llm_profiles_registry.items():
+            if profile.is_legacy_extra_llm and alias not in self.llms:
+                new_binding = self._instantiate_binding_from_profile(
+                    alias, profile, self.llm_binding_manager, "llm", callback
+                )
+                if new_binding:
+                    self.llms[alias] = new_binding
+                    if callback: callback(f"✅ Mounted extra LLM: `{alias}`", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
+
         # Ensure legacy primary bindings are registered as master profiles if not explicitly provided
         if self.tti and "master" not in self.tti_profiles_registry:
              self.tti_profiles_registry["master"] = LollmsBindingProfile(name="master", binding_name=self.tti.binding_name, is_default=True)
@@ -343,8 +363,8 @@ class LollmsClient():
              self.ttm_profiles_registry["master"] = LollmsBindingProfile(name="master", binding_name=self.ttm.binding_name, is_default=True)
         _eagerly_instantiate_default(self.ttm_profiles_registry, self.switch_ttm, "TTM")
 
-    def _register_profiles(self, profiles_dict: Optional[Dict], registry: Dict[str, LollmsBindingProfile], modality_name: str, callback=None):
-        """Helper method to safely register binding profiles. Eagerly instantiates legacy extra_llms."""
+    def _register_profiles(self, profiles_dict: Optional[Dict], registry: Dict[str, LollmsBindingProfile], modality_name: str, callback=None, eager_instantiate: bool = True):
+        """Helper method to safely register binding profiles."""
         if not profiles_dict: 
             return
 
@@ -357,7 +377,6 @@ class LollmsClient():
             if isinstance(p_data, LollmsBindingProfile):
                 profile = p_data
             else:
-                # Detect legacy `extra_llms` dictionary format
                 if "binding_name" in p_data and "binding_config" in p_data and len(p_data) == 2:
                     is_legacy_extra_llm = True
 
@@ -368,13 +387,13 @@ class LollmsClient():
                     is_default=p_data.get("is_default", False),
                     vision_enabled=p_data.get("vision_enabled", False),
                     forced_context_size=p_data.get("forced_context_size"),
-                    routing_config=p_data.get("routing_config")
+                    routing_config=p_data.get("routing_config"),
+                    is_legacy_extra_llm=is_legacy_extra_llm
                 )
 
             registry[alias] = profile
 
-            # 🛡️ BACKWARD COMPATIBILITY: Eagerly instantiate legacy extra_llms
-            if is_legacy_extra_llm and modality_name == "LLM":
+            if eager_instantiate and is_legacy_extra_llm and modality_name == "LLM":
                 new_binding = self._instantiate_binding_from_profile(
                     alias, profile, self.llm_binding_manager, "llm", callback
                 )

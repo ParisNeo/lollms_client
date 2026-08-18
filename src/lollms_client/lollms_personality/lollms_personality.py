@@ -1777,11 +1777,15 @@ JSON:"""
         if not getattr(self, '_scratchpad_path', None):
             return "[SYSTEM ERROR] Scratchpad not initialized."
 
+        stripped_body = body.strip() if body else ""
+        if not stripped_body:
+            return "⚠️ Scratchpad update ignored: No content provided. Provide text to append or a valid SEARCH/REPLACE block."
+
         try:
             current_content = self._scratchpad_path.read_text(encoding="utf-8", errors="ignore")
 
             if tag_name == "scratchpad_append":
-                new_content = current_content + "\n" + body.strip() + "\n"
+                new_content = current_content + "\n" + stripped_body + "\n"
                 self._scratchpad_path.write_text(new_content, encoding="utf-8")
                 return "✅ Content appended to scratchpad successfully."
 
@@ -1883,6 +1887,7 @@ JSON:"""
             "    - Once you have the result, emit Tool B in your next response.\n"
             "    - Example of WRONG behavior: `<tool>{\"name\": \"find_file\", \"parameters\": {\"pattern\": \"config.yml\"}}</tool>` followed by `<tool>{\"name\": \"read_file\", \"parameters\": {\"path\": \"./config.yml\"}}</tool>` (The path is guessed).\n"
             "    - Example of CORRECT behavior: Emit `<tool>{\"name\": \"find_file\", \"parameters\": {\"pattern\": \"config.yml\"}}</tool>` and end your turn. In the next turn, use the returned path to call `read_file`.\n"
+            "11. **EXPLANATION BEFORE ARTIFACTS (MANDATORY)**: Before emitting an `<artifact>` tag, you MUST provide a brief, 2-3 sentence explanation of what you are about to write and why. Do NOT emit the `<artifact>` tag as the very first token of your response.\n"
             "\n=== TOOL CALLING DISCIPLINE (CRITICAL) ===\n"
             "1. **Tool Results ≠ Tool Calls**: When a tool returns JSON, it's a RESULT, not a new call.\n"
             "2. **One Call Per Task**: Once a tool succeeds, analyze and answer.\n"
@@ -2050,6 +2055,21 @@ JSON:"""
         return sys_prompt + "\n" + rules + skills_ctx + memory_instructions + tool_desc
     
     
+    def change_file_visibility(self, targets: List[str], action: str) -> Dict[str, Any]:
+        action_map = {
+            "load": "unlock_file",
+            "unload": "lock_file",
+            "lock": "lock_file",
+            "hide": "hide_file",
+            "unhide": "uncollapse_folder"
+        }
+        tag_name = action_map.get(action.lower())
+        if not tag_name:
+            return {"status_str": f"❌ Unknown action: {action}", "loaded_contents": {}}
+
+        body_content = "\n".join(targets)
+        return self._execute_context_visibility(tag_name, body_content)
+
     def _execute_context_visibility(self, tag_name: str, body: str) -> Dict[str, Any]:
         if not hasattr(self, '_artefact_manager') or not self._artefact_manager:
             return "[SYSTEM ERROR] Artefact system not initialized. Cannot manage file visibility."
@@ -2169,7 +2189,20 @@ JSON:"""
 
                 if file_path.exists():
                     try:
-                        content = file_path.read_text(encoding="utf-8", errors="ignore")
+                        if art.get("content") and art.get("content_source") == "db" and len(art["content"]) > 0:
+                            content = art["content"]
+                        else:
+                            import_art = self._artefact_manager.import_file(
+                                file_path=file_path,
+                                title=art["title"],
+                                active=False
+                            )
+                            content = import_art.get("content", "")
+                            art["content_source"] = "db"
+
+                            if art.get("type") == "data":
+                                content = self._artefact_manager._get_lam_content(import_art).strip()
+
                         token_count = len(content) // 4
                     except Exception as read_err:
                         ASCIIColors.warning(f"[ContextUnlock] Failed to read {art['title']}: {read_err}")
@@ -2556,29 +2589,69 @@ JSON:"""
                 return True
 
             gen_kwargs = {k: v for k, v in kwargs.items() if k not in ("streaming_callback", "temperature", "n_predict", "stream")}
-            gen_kwargs["n_predict"] = min(n_predict, self.max_tokens_per_turn)
+            gen_kwargs["n_predict"] = n_predict
             gen_kwargs["temperature"] = temperature
 
-            try:
-                self.lollms_client.generate_from_messages(
-                    messages=messages,
-                    stream=True,
-                    streaming_callback=_inline_relay,
-                    **gen_kwargs
-                )
-                if hasattr(self.lollms_client, 'llm') and hasattr(self.lollms_client.llm, 'flush_stream'):
+            _max_retries = 3
+            _retry_delay = 2.0
+            _generation_succeeded = False
+
+            for _retry_attempt in range(_max_retries):
+                try:
+                    self.lollms_client.generate_from_messages(
+                        messages=messages,
+                        stream=True,
+                        streaming_callback=_inline_relay,
+                        **gen_kwargs
+                    )
+                    if hasattr(self.lollms_client, 'llm') and hasattr(self.lollms_client.llm, 'flush_stream'):
+                        try:
+                            self.lollms_client.llm.flush_stream()
+                        except Exception:
+                            pass
+                    _generation_succeeded = True
+                    break
+                except Exception as gen_err:
+                    if self.is_generation_cancelled():
+                        was_cancelled = True
+                        break
+
+                    ss.completed_actions = []
+                    ss._is_accumulating_tool = False
+                    ss._is_accumulating_artifact = False
+                    ss._is_accumulating_context = False
+                    ss._tool_buffer = ""
+                    ss._pending_buffer = ""
+
+                    is_transient = False
                     try:
-                        self.lollms_client.llm.flush_stream()
+                        err_type_name = type(gen_err).__name__
+                        err_module = type(gen_err).__module__
+                        if "RemoteProtocolError" in err_type_name or "ConnectionError" in err_type_name or "TimeoutError" in err_type_name or "APIConnectionError" in err_type_name:
+                            is_transient = True
                     except Exception:
                         pass
-            except Exception as gen_err:
-                if self.is_generation_cancelled():
-                    was_cancelled = True
-                    break
-                else:
-                    ASCIIColors.error(f"[{self.name}] Generation error: {gen_err}")
-                    final_response = f"[Generation error: {gen_err}]"
-                    break
+
+                    if is_transient and _retry_attempt < _max_retries - 1:
+                        ASCIIColors.warning(f"[{self.name}] Transient network error during generation (attempt {_retry_attempt + 1}/{_max_retries}). Retrying in {_retry_delay}s... Error: {gen_err}")
+                        try:
+                            import time as _time
+                            _time.sleep(_retry_delay)
+                        except Exception:
+                            pass
+                        _retry_delay *= 2
+                        ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
+                        continue
+                    else:
+                        ASCIIColors.error(f"[{self.name}] Generation error: {gen_err}")
+                        final_response = f"[Generation error: The LLM server connection failed. Please check your server and retry. Details: {gen_err}]"
+                        break
+
+            if was_cancelled:
+                break
+
+            if not _generation_succeeded and not final_response:
+                break
 
             if self.is_generation_cancelled():
                 was_cancelled = True
@@ -2603,14 +2676,278 @@ JSON:"""
 
             if ss.was_done_detected():
                 final_response = ss.get_clean_text()
+
                 if ss.completed_actions:
-                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=final_response))
-                    virtual_history.append(SimpleNamespace(sender_type="user", content="[SYSTEM: You emitted <done/> but there are pending buffered actions. Executing them now. Please analyze the results and provide your final summary.]"))
-                    final_response = ""
+                    raw_round_text = final_response
+                    clean_history_text = self._sanitize_history_for_context(raw_round_text)
+                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant executed batched actions]"))
+
+                    files_before = self._take_workspace_snapshot()
+                    action_reports = []
+                    actions_executed_count = 0
+                    has_truncated_artifact = False
+                    truncated_artifact_title = None
+
+                    for action in ss.completed_actions:
+                        if action["type"] == "tool":
+                            tool_call_json_str = action["json"]
+                            try:
+                                call_data = json.loads(tool_call_json_str)
+                                tool_name = call_data.get("name", "")
+                                tool_params = call_data.get("parameters", {})
+
+                                if not active_tools or tool_name not in active_tools:
+                                    action_reports.append(f"Tool '{tool_name}' not available. Use one of: {list(active_tools.keys())}")
+                                    continue
+
+                                is_shell_tool = tool_name == "tool_execute_shell_command"
+                                if is_shell_tool:
+                                    command_str = str(tool_params.get("command", "")).strip()
+                                    context_aware_sig = f"{tool_name}::{command_str}"
+                                else:
+                                    param_sig = json.dumps(tool_params, sort_keys=True, default=str)
+                                    context_aware_sig = f"{tool_name}::{param_sig}"
+
+                                if context_aware_sig in successful_tool_signatures:
+                                    action_reports.append(f"Repetitive call to '{tool_name}' with identical parameters blocked. Output already in context.")
+                                    continue
+
+                                tool_res = self._execute_tool(tool_name, tool_params, active_tools)
+
+                                tool_success = isinstance(tool_res, dict) and tool_res.get("success", True) is not False
+                                if tool_success:
+                                    successful_tool_signatures.add(context_aware_sig)
+
+                                tool_calls_this_turn.append({"round": round_count, "name": tool_name, "parameters": tool_params})
+                                tool_results_this_turn.append({"round": round_count, "name": tool_name, "result": tool_res, "success": tool_success})
+                                clean_result_str = _sanitize_tool_result(tool_res)
+
+                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                                    try:
+                                        if streaming_callback:
+                                            streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_START, {"tool_name": tool_name, "parameters": tool_params})
+                                    except Exception:
+                                        pass
+
+                                if tool_success:
+                                    report_part = f"=== ✅ TOOL RESULT: {tool_name} ===\n<tool_result name=\"{tool_name}\" status=\"SUCCESS\">\n{clean_result_str}\n</tool_result>"
+                                else:
+                                    report_part = f"=== ❌ TOOL FAILED: {tool_name} ===\n<tool_result name=\"{tool_name}\" status=\"FAILED\">\n{clean_result_str}\n</tool_result>"
+
+                                action_reports.append(report_part)
+
+                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                                    try:
+                                        if streaming_callback:
+                                            streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_END, {
+                                                "tool_name": tool_name, "success": tool_success,
+                                                "output": clean_result_str if tool_success else None,
+                                                "error": None if tool_success else clean_result_str
+                                            })
+                                    except Exception:
+                                        pass
+                            except Exception as e:
+                                action_reports.append(f"[Tool execution error: {e}]")
+
+                        elif action["type"] == "artifact":
+                            raw_artifact_xml = action["xml"]
+                            was_truncated = action.get("was_truncated", False)
+                            try:
+                                attrs_match = re.search(r'<art(?:ifact|efact)[^>]*>', raw_artifact_xml, re.IGNORECASE)
+                                attrs_str = attrs_match.group(0) if attrs_match else ""
+                                body_match = re.search(r'<art(?:ifact|efact)[^>]*>(.*)</art(?:ifact|efact)>', raw_artifact_xml, re.DOTALL | re.IGNORECASE)
+                                body_content = body_match.group(1).strip() if body_match else ""
+
+                                title = "artifact"
+                                lang = "python"
+                                for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
+                                    if m.group(1).lower() in ("name", "title"):
+                                        title = m.group(2)
+                                    elif m.group(1).lower() == "language":
+                                        lang = m.group(2)
+
+                                is_patch = "<<<<<<< SEARCH" in body_content
+
+                                if was_truncated and not is_patch:
+                                    has_truncated_artifact = True
+                                    truncated_artifact_title = title
+                                    action_reports.append(
+                                        f"❌ GENERATION TRUNCATED for artifact '{title}'. "
+                                        "You hit the token generation limit (n_predict) before finishing the file. "
+                                        "The file was NOT saved to disk to prevent corruption. "
+                                        "You MUST use a SEARCH/REPLACE patch to append the remaining content to the file in the next turn. "
+                                        "Start your SEARCH block from the last few lines you managed to generate."
+                                    )
+                                    continue
+
+                                file_path = self._resolved_workspace / title
+                                is_overwrite = file_path.exists()
+
+                                git_block = self._enforce_git_safety(title, is_overwrite)
+                                if git_block:
+                                    action_reports.append(git_block)
+                                    continue
+
+                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                                    try:
+                                        if streaming_callback:
+                                            streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {"title": title, "art_type": "code", "language": lang, "is_patch": is_patch})
+                                    except Exception:
+                                        pass
+
+                                if is_patch:
+                                    if not file_path.exists():
+                                        action_reports.append(f"[SYSTEM ERROR] File '{title}' not found. Cannot apply patch.")
+                                        continue
+
+                                    stripped_body = body_content.strip()
+                                    if not stripped_body:
+                                        action_reports.append(
+                                            f"❌ SEARCH/REPLACE BLOCKED for {title}. The patch body is empty. "
+                                            "You MUST provide a valid SEARCH/REPLACE block inside the <artifact> tag. "
+                                            "Do not output an empty artifact. Retry immediately with the correct format."
+                                        )
+                                        continue
+
+                                    original_content = file_path.read_text(encoding="utf-8", errors="ignore")
+                                    try:
+                                        patched_content = ArtefactManager.apply_aider_patch(original_content, body_content)
+                                        file_path.write_text(patched_content, encoding="utf-8")
+                                        action_reports.append(f"✅ SEARCH/REPLACE applied successfully to {title}.")
+                                        if self._artefact_manager:
+                                            self._artefact_manager.update(title=title, new_content=patched_content, language=lang, bump_version=True, active=True)
+                                    except Exception as patch_err:
+                                        action_reports.append(f"❌ SEARCH/REPLACE FAILED for {title}. Error: {patch_err}")
+                                else:
+                                    stripped_body = body_content.strip()
+                                    if not stripped_body:
+                                        action_reports.append(f"❌ FILE WRITE BLOCKED for {title}. Empty artifact body.")
+                                        continue
+
+                                    if self._artefact_manager:
+                                        self._artefact_manager.add(title=title, artefact_type="code", content=body_content, language=lang, active=True)
+                                    file_path = self._resolved_workspace / title
+                                    file_path.write_text(body_content, encoding="utf-8")
+                                    action_reports.append(f"✅ File {title} created/updated successfully.")
+                                    actions_executed_count += 1
+                            except Exception as e:
+                                action_reports.append(f"[SYSTEM ERROR] Failed to process artifact tag: {e}")
+
+                        elif action["type"] == "context":
+                            tag_name = action["tag_name"]
+                            raw_xml = action["xml"]
+                            try:
+                                if tag_name == "scratchpad_clear":
+                                    action_reports.append(self._execute_scratchpad_clear())
+                                    continue
+                                if tag_name == "user_profile_clear":
+                                    action_reports.append(self._execute_user_profile_clear())
+                                    continue
+                                if "scratchpad" in tag_name:
+                                    body_match = re.search(r'<scratchpad_(?:append|patch)>(.*?)</scratchpad_(?:append|patch)>', raw_xml, re.DOTALL | re.IGNORECASE)
+                                    body_content = body_match.group(1).strip() if body_match else ""
+                                    action_reports.append(self._execute_scratchpad_update(tag_name, body_content))
+                                    continue
+                                if "user_profile_update" in tag_name:
+                                    body_match = re.search(r'<user_profile_update>(.*?)</user_profile_update>', raw_xml, re.DOTALL | re.IGNORECASE)
+                                    body_content = body_match.group(1).strip() if body_match else ""
+                                    action_reports.append(self._execute_user_profile_update(body_content))
+                                    continue
+                                if tag_name in ("mem_new", "mem_update"):
+                                    if not self.memory_manager:
+                                        action_reports.append("[SYSTEM ERROR] Memory manager not initialized.")
+                                        continue
+                                    if tag_name == "mem_new":
+                                        content_match = re.search(r'content="([^"]*)"', raw_xml)
+                                        tags_match = re.search(r'tags="([^"]*)"', raw_xml)
+                                        level_match = re.search(r'level="([^"]*)"', raw_xml)
+                                        body_match = re.search(r'<mem_new[^>]*>(.*?)</mem_new>', raw_xml, re.DOTALL | re.IGNORECASE)
+                                        mem_content = content_match.group(1) if content_match else (body_match.group(1).strip() if body_match else "")
+                                        mem_tags = tags_match.group(1).split(",") if tags_match else []
+                                        mem_level = int(level_match.group(1)) if level_match else 2
+                                        self.memory_manager.add(content=mem_content, tags=mem_tags, importance=0.9, level=mem_level)
+                                        action_reports.append(f"✅ Memory saved successfully: {mem_content[:50]}...")
+                                    elif tag_name == "mem_update":
+                                        id_match = re.search(r'id="([^"]*)"', raw_xml)
+                                        content_match = re.search(r'content="([^"]*)"', raw_xml)
+                                        body_match = re.search(r'<mem_update[^>]*>(.*?)</mem_update>', raw_xml, re.DOTALL | re.IGNORECASE)
+                                        mem_id = id_match.group(1) if id_match else ""
+                                        mem_content = content_match.group(1) if content_match else (body_match.group(1).strip() if body_match else "")
+                                        self.memory_manager.update(memory_id=mem_id, content=mem_content)
+                                        action_reports.append(f"✅ Memory updated successfully: {mem_id}")
+                                    continue
+
+                                body_match = re.search(r'<(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>(.*?)</(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>', raw_xml, re.DOTALL | re.IGNORECASE)
+                                body_content = body_match.group(1).strip() if body_match else ""
+
+                                context_sig = f"{tag_name}::{body_content}"
+                                if context_sig in seen_context_signatures:
+                                    rep_msg = f"Repetitive context action '{tag_name}' with identical parameters blocked. Files are already in the requested state or failed previously. Do not retry."
+                                    action_reports.append(rep_msg)
+                                    continue
+
+                                seen_context_signatures.add(context_sig)
+
+                                vis_result = self._execute_context_visibility(tag_name, body_content)
+                                status_str = ""
+                                loaded_contents = {}
+                                is_failure = False
+
+                                if isinstance(vis_result, dict):
+                                    status_str = vis_result.get("status_str", "")
+                                    loaded_contents = vis_result.get("loaded_contents", {})
+                                    is_failure = bool(vis_result.get("not_found") or vis_result.get("blocked_files"))
+
+                                    if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                        streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {
+                                            "action": tag_name,
+                                            "files": vis_result.get("processed_files", []) + vis_result.get("already_in_state", []),
+                                            "status": "failure" if is_failure else "success",
+                                            "error": vis_result.get("error") if is_failure else None
+                                        })
+
+                                if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                    if is_failure:
+                                        streaming_callback(f'<status>failure</status>\n<error>{status_str}</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                    else:
+                                        streaming_callback(f'<status>success</status>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                                action_reports.append(status_str)
+
+                                if loaded_contents:
+                                    content_parts = ["\n=== NEWLY LOADED FILE CONTENTS (INJECTED FOR VISIBILITY) ==="]
+                                    for f_title, f_content in loaded_contents.items():
+                                        content_parts.append(f'<file path="{f_title}">\n{f_content}\n</file>')
+                                    content_parts.append("=== END LOADED CONTENTS ===\nAnalyze these results and continue your task, or emit <done/> if finished.")
+                                    action_reports.append("\n".join(content_parts))
+
+                                object.__setattr__(self, '_last_ws_sync_time', 0.0)
+
+                            except Exception as ctx_err:
+                                action_reports.append(f"[SYSTEM ERROR] Failed to process context tag: {ctx_err}")
+
+                    files_after = self._take_workspace_snapshot()
+                    changes = self._sync_workspace(files_before, files_after)
+                    if changes:
+                        workspace_changes.extend(changes)
+
+                    ss.completed_actions = []
+
+                if has_truncated_artifact:
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content=(
+                            f"[SYSTEM: CRITICAL ERROR. Your previous generation of '{truncated_artifact_title}' was TRUNCATED because you hit the token limit. "
+                            "The file was NOT saved. You MUST rewrite the COMPLETE file from scratch using a standard <artifact> tag (NOT a SEARCH/REPLACE patch). "
+                            "Reproduce the existing content exactly and append the missing ending. Do NOT emit `<done/>` until the file is complete.]"
+                        )
+                    ))
+                    ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
+                    continue
 
                 sanitized_final_response = re.sub(r'<[^>]+>', '', final_response).strip()
-                
-                if not sanitized_final_response and round_count == 1 and not ss.completed_actions and not virtual_history:
+
+                if not sanitized_final_response and not tool_calls_this_turn and not workspace_changes and round_count == 1 and not virtual_history:
                     ASCIIColors.warning(f"[{self.name}] 🚫 Empty response with <done/> detected on round 1. Forcing continuation.")
                     virtual_history.append(SimpleNamespace(
                         sender_type="user",
@@ -2621,14 +2958,14 @@ JSON:"""
                 if getattr(self, 'debug_mode', False):
                     ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: <done/> detected ===")
                 break
-            
-            
+
             if ss.completed_actions:
                 raw_round_text = ss.get_clean_text()
                 clean_history_text = self._sanitize_history_for_context(raw_round_text)
                 virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant executed batched actions]"))
 
                 files_before = self._take_workspace_snapshot()
+                actions_executed_count = 0
 
                 action_reports = []
                 for action in ss.completed_actions:
@@ -2664,6 +3001,7 @@ JSON:"""
                             tool_calls_this_turn.append({"round": round_count, "name": tool_name, "parameters": tool_params})
                             tool_results_this_turn.append({"round": round_count, "name": tool_name, "result": tool_res, "success": tool_success})
                             clean_result_str = _sanitize_tool_result(tool_res)
+                            actions_executed_count += 1
 
                             if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
                                 try:
@@ -2718,10 +3056,13 @@ JSON:"""
                                 action_reports.append(git_block)
                                 continue
 
+                            art_type_match = re.search(r'type=["\']([^"\']*)["\']', attrs_str, re.IGNORECASE)
+                            resolved_art_type = art_type_match.group(1) if art_type_match else "code"
+
                             if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
                                 try:
                                     if streaming_callback:
-                                        streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {"title": title, "art_type": "code", "language": lang, "is_patch": is_patch})
+                                        streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {"title": title, "art_type": resolved_art_type, "language": lang, "is_patch": is_patch})
                                 except Exception:
                                     pass
 
@@ -2755,6 +3096,7 @@ JSON:"""
                                 file_path = self._resolved_workspace / title
                                 file_path.write_text(body_content, encoding="utf-8")
                                 action_reports.append(f"✅ File {title} created/updated successfully.")
+                                actions_executed_count += 1
                         except Exception as e:
                             action_reports.append(f"[SYSTEM ERROR] Failed to process artifact tag: {e}")
 
@@ -2765,6 +3107,7 @@ JSON:"""
                             if tag_name == "scratchpad_clear":
                                 res_msg = self._execute_scratchpad_clear()
                                 action_reports.append(res_msg)
+                                actions_executed_count += 1
                                 if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
                                     streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "success" if "✅" in res_msg else "failure", "error": None if "✅" in res_msg else res_msg})
                                 if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
@@ -2775,6 +3118,7 @@ JSON:"""
                             if tag_name == "user_profile_clear":
                                 res_msg = self._execute_user_profile_clear()
                                 action_reports.append(res_msg)
+                                actions_executed_count += 1
                                 if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
                                     streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "success" if "✅" in res_msg else "failure", "error": None if "✅" in res_msg else res_msg})
                                 if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
@@ -2787,8 +3131,7 @@ JSON:"""
                                 body_content = body_match.group(1).strip() if body_match else ""
                                 res_msg = self._execute_scratchpad_update(tag_name, body_content)
                                 action_reports.append(res_msg)
-                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
-                                    streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "success" if "✅" in res_msg else "failure", "error": None if "✅" in res_msg else res_msg})
+                                actions_executed_count += 1
                                 if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
                                     if "✅" in res_msg: streaming_callback(f'<status>success</status>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                                     else: streaming_callback(f'<status>failure</status>\n<error>{res_msg}</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
@@ -2799,6 +3142,7 @@ JSON:"""
                                 body_content = body_match.group(1).strip() if body_match else ""
                                 res_msg = self._execute_user_profile_update(body_content)
                                 action_reports.append(res_msg)
+                                actions_executed_count += 1
                                 if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
                                     streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "success" if "✅" in res_msg else "failure", "error": None if "✅" in res_msg else res_msg})
                                 if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
@@ -2815,21 +3159,22 @@ JSON:"""
                                     if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
                                         streaming_callback(f'<status>failure</status>\n<error>{err_msg}</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                                     continue
-                                if tag_name == "mem_new":
-                                    content_match = re.search(r'content\s*=\s*["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
-                                    tags_match = re.search(r'tags\s*=\s*["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
-                                    level_match = re.search(r'level\s*=\s*["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
-                                    body_match = re.search(r'<mem_new[^>]*>(.*?)</mem_new>', raw_xml, re.DOTALL | re.IGNORECASE)
-                                    mem_content = content_match.group(1) if content_match else (body_match.group(1).strip() if body_match else "")
-                                    mem_tags = tags_match.group(1).split(",") if tags_match else []
-                                    mem_level = int(level_match.group(1)) if level_match else 2
-                                    self.memory_manager.add(content=mem_content, tags=mem_tags, importance=0.9, level=mem_level)
-                                    res_msg = f"✅ Memory saved successfully: {mem_content[:50]}..."
-                                    action_reports.append(res_msg)
-                                    if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
-                                        streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "success", "error": None})
-                                    if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
-                                        streaming_callback(f'<status>success</status>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                    if tag_name == "mem_new":
+                                        content_match = re.search(r'content\s*=\s*["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
+                                        tags_match = re.search(r'tags\s*=\s*["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
+                                        level_match = re.search(r'level\s*=\s*["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
+                                        body_match = re.search(r'<mem_new[^>]*>(.*?)</mem_new>', raw_xml, re.DOTALL | re.IGNORECASE)
+                                        mem_content = content_match.group(1) if content_match else (body_match.group(1).strip() if body_match else "")
+                                        mem_tags = tags_match.group(1).split(",") if tags_match else []
+                                        mem_level = int(level_match.group(1)) if level_match else 2
+                                        self.memory_manager.add(content=mem_content, tags=mem_tags, importance=0.9, level=mem_level)
+                                        res_msg = f"✅ Memory saved successfully: {mem_content[:50]}..."
+                                        action_reports.append(res_msg)
+                                        actions_executed_count += 1
+                                        if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                            streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "success", "error": None})
+                                        if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                            streaming_callback(f'<status>success</status>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                                 elif tag_name == "mem_update":
                                     id_match = re.search(r'id\s*=\s*["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
                                     content_match = re.search(r'content\s*=\s*["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
@@ -2839,6 +3184,7 @@ JSON:"""
                                     self.memory_manager.update(memory_id=mem_id, content=mem_content)
                                     res_msg = f"✅ Memory updated successfully: {mem_id}"
                                     action_reports.append(res_msg)
+                                    actions_executed_count += 1
                                     if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
                                         streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "success", "error": None})
                                     if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
@@ -2902,6 +3248,7 @@ JSON:"""
                                     streaming_callback(f'<status>success</status>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
                             action_reports.append(status_str)
+                            actions_executed_count += 1
 
                             if loaded_contents:
                                 content_parts = ["\n=== NEWLY LOADED FILE CONTENTS (INJECTED FOR VISIBILITY) ==="]
@@ -2960,48 +3307,15 @@ JSON:"""
                     empty_response_count = getattr(self, '_consecutive_empty_responses', 0) + 1
                     object.__setattr__(self, '_consecutive_empty_responses', empty_response_count)
 
-                    if empty_response_count >= 3:
+                    if empty_response_count >= 2:
                         ASCIIColors.warning(f"[{self.name}] Consecutive empty LLM responses detected ({empty_response_count}). Terminating loop to prevent spin.")
                         final_response = "[Terminated: LLM stopped generating without completing the task.]"
                         break
 
-                    ASCIIColors.warning(f"[{self.name}] Empty LLM response detected after action (attempt {empty_response_count}). Injecting action-aware continuation mandate.")
-
-                    action_types = set()
-                    for act in ss.completed_actions:
-                        action_types.add(act.get("type", "unknown"))
-                    action_desc = ", ".join(sorted(action_types)) if action_types else "unknown"
-
-                    is_memory_or_context_only = action_types and action_types.issubset({"context"})
-
-                    if is_memory_or_context_only:
-                        targeted_nudge = (
-                            "[SYSTEM: CRITICAL — YOU OWE THE USER A VISIBLE RESPONSE.\n"
-                            f"You just executed side-effect action(s): {action_desc}. These are internal operations (memory saves, context updates, file locking).\n"
-                            "They do NOT count as a response to the user. The user sees NOTHING from you.\n"
-                            f"Here is the user's ORIGINAL prompt that you must respond to:\n---\n{prompt}\n---\n"
-                            "You MUST NOW write a conversational reply addressing the user's request.\n"
-                            "Do NOT emit any more memory or context tags. Do NOT emit <done/> until you have written actual text the user can read.\n"
-                            "Write your response NOW.]"
-                        )
-                    else:
-                        targeted_nudge = (
-                            "[SYSTEM: You stopped generation without emitting a <done/> tag. "
-                            "If your task is complete, output a final conversational summary and end it with a <done/> tag on a new line. "
-                            "If you need to continue working, emit the next functional tag now.]"
-                        )
-
-                    clean_history_text = self._sanitize_history_for_context(raw_round_text)
-                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant executed actions but produced no visible text]"))
-                    virtual_history.append(SimpleNamespace(sender_type="user", content=targeted_nudge))
-                    if getattr(self, 'debug_mode', False):
-                        ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Empty response after actions, injected targeted nudge (attempt {empty_response_count}) ===")
-                    continue
+                    ASCIIColors.warning(f"[{self.name}] Empty LLM response detected after action (attempt {empty_response_count}). Injecting continuation mandate.")
                 else:
                     object.__setattr__(self, '_consecutive_empty_responses', 0)
-
-                ASCIIColors.info("[LollmsPersonality.chat] Action previously executed but no <done/> detected. Injecting continuation mandate.")
-
+                    
                 clean_history_text = self._sanitize_history_for_context(raw_round_text)
                 virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant provided no output]"))
                 virtual_history.append(SimpleNamespace(
@@ -3013,6 +3327,16 @@ JSON:"""
                 continue
 
             if "<tool" in raw_round_text.lower() or "<art" in raw_round_text.lower():
+                if not raw_round_text.strip():
+                    empty_response_count = getattr(self, '_consecutive_empty_responses', 0) + 1
+                    object.__setattr__(self, '_consecutive_empty_responses', empty_response_count)
+                    if empty_response_count >= 3:
+                        ASCIIColors.warning(f"[{self.name}] Consecutive empty responses with malformed tags ({empty_response_count}). Terminating.")
+                        final_response = "[Terminated: LLM repeatedly produced malformed tags without content.]"
+                        break
+                else:
+                    object.__setattr__(self, '_consecutive_empty_responses', 0)
+
                 ASCIIColors.warning("[LollmsPersonality.chat] Malformed functional tag detected. Injecting format correction.")
                 clean_history_text = self._sanitize_history_for_context(raw_round_text)
                 virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text))
@@ -3031,6 +3355,84 @@ JSON:"""
             if getattr(self, 'debug_mode', False):
                 ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Clean exit ===")
             break
+
+        if ss.completed_actions and not was_cancelled:
+            ASCIIColors.warning(f"[{self.name}] ⚠️ Generation ended with {len(ss.completed_actions)} unexecuted buffered action(s). Flushing now.")
+
+            files_before = self._take_workspace_snapshot()
+            action_reports = []
+
+            for action in ss.completed_actions:
+                if action["type"] == "artifact":
+                    raw_artifact_xml = action["xml"]
+                    try:
+                        attrs_match = re.search(r'<art(?:ifact|efact)[^>]*>', raw_artifact_xml, re.IGNORECASE)
+                        attrs_str = attrs_match.group(0) if attrs_match else ""
+                        body_match = re.search(r'<art(?:ifact|efact)[^>]*>(.*)</art(?:ifact|efact)>', raw_artifact_xml, re.DOTALL | re.IGNORECASE)
+                        body_content = body_match.group(1).strip() if body_match else ""
+
+                        title = "artifact"
+                        lang = "python"
+                        for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
+                            if m.group(1).lower() in ("name", "title"):
+                                title = m.group(2)
+                            elif m.group(1).lower() == "language":
+                                lang = m.group(2)
+
+                        is_patch = "<<<<<<< SEARCH" in body_content
+                        file_path = self._resolved_workspace / title
+                        is_overwrite = file_path.exists()
+
+                        git_block = self._enforce_git_safety(title, is_overwrite)
+                        if git_block:
+                            action_reports.append(git_block)
+                            continue
+
+                        event_mode = kwargs.get("event_mode", EventMode.PROCESSING_TAG_MODE)
+                        if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                            try:
+                                if streaming_callback:
+                                    streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {"title": title, "art_type": "code", "language": lang, "is_patch": is_patch})
+                            except Exception:
+                                pass
+
+                        if is_patch:
+                            if not file_path.exists():
+                                action_reports.append(f"[SYSTEM ERROR] File '{title}' not found. Cannot apply patch.")
+                                continue
+                            original_content = file_path.read_text(encoding="utf-8", errors="ignore")
+                            try:
+                                patched_content = ArtefactManager.apply_aider_patch(original_content, body_content)
+                                file_path.write_text(patched_content, encoding="utf-8")
+                                action_reports.append(f"✅ SEARCH/REPLACE applied successfully to {title}.")
+                                if self._artefact_manager:
+                                    self._artefact_manager.update(title=title, new_content=patched_content, language=lang, bump_version=True, active=True)
+                            except Exception as patch_err:
+                                action_reports.append(f"❌ SEARCH/REPLACE FAILED for {title}. Error: {patch_err}")
+                        else:
+                            if not body_content.strip():
+                                action_reports.append(f"❌ FILE WRITE BLOCKED for {title}. Empty artifact body.")
+                                continue
+                            if self._artefact_manager:
+                                self._artefact_manager.add(title=title, artefact_type="code", content=body_content, language=lang, active=True)
+                            file_path = self._resolved_workspace / title
+                            file_path.write_text(body_content, encoding="utf-8")
+                            action_reports.append(f"✅ File {title} created/updated successfully.")
+
+                        if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                            try:
+                                streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {"title": title, "art_type": "code", "success": True, "stream_complete": True})
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        action_reports.append(f"[SYSTEM ERROR] Failed to process stranded artifact tag: {e}")
+
+            files_after = self._take_workspace_snapshot()
+            changes = self._sync_workspace(files_before, files_after)
+            if changes:
+                workspace_changes.extend(changes)
+
+            ss.completed_actions = []
 
         if use_internal_history and not was_cancelled:
             self._conversation.append({"role": "user", "content": prompt})

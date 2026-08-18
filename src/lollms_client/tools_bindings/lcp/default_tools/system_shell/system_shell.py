@@ -2,6 +2,7 @@ import os
 import sys
 import subprocess
 import platform
+import shlex
 from typing import Any, Dict
 from ascii_colors import ASCIIColors
 
@@ -9,15 +10,9 @@ TOOL_LIBRARY_NAME = "System Shell"
 TOOL_LIBRARY_DESC = "Executes shell commands (bash, cmd, powershell) with adjustable autonomy levels for environment management and tooling."
 TOOL_LIBRARY_ICON = "⚙️"
 
-# ── HOST-CONFIGURABLE MODULE VARIABLES ──
-# These are invisible to the LLM and strictly controlled by the host application.
 AUTONOMY_LEVEL: str = "safe"
 
 def init_tools_library(config: dict = None) -> None:
-    """
-    Initializes the tool library with host-provided configurations.
-    This function is called by the LCP Binding during lazy initialization.
-    """
     global AUTONOMY_LEVEL
     if config and isinstance(config, dict):
         autonomy = config.get("autonomy_level", "safe").lower()
@@ -29,6 +24,34 @@ def init_tools_library(config: dict = None) -> None:
             AUTONOMY_LEVEL = "safe"
     else:
         AUTONOMY_LEVEL = "safe"
+
+def _is_safe_command(command: str) -> bool:
+    safe_commands = {
+        "dir", "echo", "type", "cd", "pip", "python", "py", "git",
+        "ls", "pwd", "cat", "head", "tail", "mkdir", "rmdir", "del",
+        "powershell", "pwsh", "cmd", "node", "npm", "npx",
+        "where", "which", "set", "env"
+    }
+    try:
+        stripped = command.strip()
+        parts = shlex.split(stripped, posix=(platform.system() != "Windows"))
+        if parts:
+            base_cmd = os.path.basename(parts[0]).lower()
+            if base_cmd.endswith(".exe"):
+                base_cmd = base_cmd[:-4]
+            if base_cmd in safe_commands:
+                return True
+            for safe in safe_commands:
+                if stripped.lower().startswith(safe + " "):
+                    return True
+            return False
+    except ValueError:
+        pass
+    stripped_lower = command.strip().lower()
+    for safe in safe_commands:
+        if stripped_lower == safe or stripped_lower.startswith(safe + " "):
+            return True
+    return False
 
 def tool_execute_shell_command(
     command: str
@@ -44,64 +67,33 @@ def tool_execute_shell_command(
     autonomy_level = AUTONOMY_LEVEL
 
     try:
-        if is_windows:
-            if autonomy_level == "full_access":
-                result = subprocess.run(
-                    command,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    cwd=os.getcwd(),
-                    timeout=120
-                )
-            else:
-                safe_commands = ["dir", "echo", "type", "cd", "pip", "python", "git", "git diff", "git status", "git log", "git add", "git commit", "git push", "ls", "pwd", "cat", "head", "tail"]
-                if not any(command.lower().strip().startswith(cmd) for cmd in safe_commands):
-                    return {
-                        "success": False,
-                        "error": f"Command '{command}' requires 'full_access' autonomy level. Ask the user to enable it."
-                    }
-                result = subprocess.run(
-                    command,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    cwd=os.getcwd(),
-                    timeout=60
-                )
+        if autonomy_level == "full_access":
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=os.getcwd(),
+                timeout=120
+            )
         else:
-            if autonomy_level == "full_access":
-                result = subprocess.run(
-                    command,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    cwd=os.getcwd(),
-                    timeout=120
-                )
-            else:
-                safe_commands = ["ls", "cat", "echo", "cd", "pip", "python", "git", "pwd", "head", "tail"]
-                if not any(command.lower().strip().startswith(cmd) for cmd in safe_commands):
-                    return {
-                        "success": False,
-                        "error": f"Command '{command}' requires 'full_access' autonomy level. Ask the user to enable it."
-                    }
-                result = subprocess.run(
-                    command,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    cwd=os.getcwd(),
-                    timeout=60
-                )
+            if not _is_safe_command(command):
+                return {
+                    "success": False,
+                    "error": f"Command '{command}' requires 'full_access' autonomy level. Ask the user to enable it."
+                }
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=os.getcwd(),
+                timeout=60
+            )
 
         return {
             "success": result.returncode == 0,

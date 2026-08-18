@@ -11,7 +11,7 @@ TOOL_LIBRARY_NAME = "Execute Python Code"
 TOOL_LIBRARY_DESC = "Executes arbitrary sandboxed Python code and returns stdout, stderr, and generated plots."
 TOOL_LIBRARY_ICON = "🐍"
 
-def init_tools_library() -> None:
+def init_tools_library(config: dict = None) -> None:
     import pipmaster as pm
     pm.ensure_packages(["matplotlib"])
     global matplotlib

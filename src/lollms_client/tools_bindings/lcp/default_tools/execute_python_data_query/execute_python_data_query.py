@@ -12,7 +12,7 @@ TOOL_LIBRARY_NAME = "Execute Python Data Query"
 TOOL_LIBRARY_DESC = "Executes sandboxed Python code to analyze or modify datasets in the workspace."
 TOOL_LIBRARY_ICON = "📊"
 
-def init_tools_library() -> None:
+def init_tools_library(config: dict = None) -> None:
     import pipmaster as pm
     pm.ensure_packages(["pandas", "numpy", "matplotlib", "openpyxl", "sqlalchemy"])
     global matplotlib

@@ -420,9 +420,33 @@ class _AgentStreamState:
         if self._is_accumulating_artifact:
             self._tool_buffer += self._pending_buffer
             if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
-                self._cb(self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK, {"live_artifact_chunk": True})
+                self._cb(self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK, {"live_artifact_chunk": True, "artifact_title": self.live_artifact_meta.get("title", "artifact") if self.live_artifact_meta else "artifact", "artifact_lang": self.live_artifact_meta.get("language", "") if self.live_artifact_meta else ""})
             self._pending_buffer = ""
             self._try_complete_artifact()
+
+            if self._is_accumulating_artifact and len(self._tool_buffer) > 500:
+                attrs_match = re.search(r'<art(?:ifact|efact)[^>]*>', self._tool_buffer, re.IGNORECASE)
+                if attrs_match:
+                    attrs_str = attrs_match.group(0)
+                    new_title = self.live_artifact_meta.get("title", "artifact") if self.live_artifact_meta else "artifact"
+                    new_lang = self.live_artifact_meta.get("language", "") if self.live_artifact_meta else ""
+
+                    updated = False
+                    for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
+                        if m.group(1).lower() in ("name", "title") and m.group(2) != new_title:
+                            new_title = m.group(2)
+                            updated = True
+                        elif m.group(1).lower() == "language" and m.group(2) != new_lang:
+                            new_lang = m.group(2)
+                            updated = True
+
+                    if updated and self.live_artifact_meta:
+                        self.live_artifact_meta["title"] = new_title
+                        self.live_artifact_meta["language"] = new_lang
+                        try:
+                            self._cb("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, self.live_artifact_meta)
+                        except Exception:
+                            pass
             return True
 
         if self._is_accumulating_context:
@@ -591,6 +615,7 @@ class _AgentStreamState:
         self._is_accumulating_tool = False
         remaining = self._tool_buffer[end_idx + end_len:]
         self._tool_buffer = ""
+        self._code_fence_hold_buffer = ""
 
         if remaining:
             self._pending_buffer = remaining
@@ -663,9 +688,20 @@ class _AgentStreamState:
         self._is_accumulating_artifact = False
         remaining = self._tool_buffer[end_idx + end_len:]
         self._tool_buffer = ""
+        self._code_fence_hold_buffer = ""
 
         if remaining:
-            self._pending_buffer = remaining
+            self._pending_buffer = remaining + self._pending_buffer
+
+        if self.live_artifact_meta:
+            attrs_match = re.search(r'<art(?:ifact|efact)[^>]*>', full_artifact_call, re.IGNORECASE)
+            if attrs_match:
+                attrs_str = attrs_match.group(0)
+                for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
+                    if m.group(1).lower() in ("name", "title"):
+                        self.live_artifact_meta["title"] = m.group(2)
+                    elif m.group(1).lower() == "language":
+                        self.live_artifact_meta["language"] = m.group(2)
 
         if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
             try:
@@ -677,6 +713,11 @@ class _AgentStreamState:
             self._cb('\n</processing>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
         self.completed_actions.append({"type": "artifact", "xml": full_artifact_call})
+
+        if self.live_artifact_meta:
+            self.live_artifact_meta = None
+
+        self._code_fence_hold_buffer = ""
         
          
 
@@ -694,6 +735,7 @@ class _AgentStreamState:
         self._is_accumulating_context = False
         remaining = self._tool_buffer[end_idx + end_len:]
         self._tool_buffer = ""
+        self._code_fence_hold_buffer = ""
 
         if remaining:
             self._pending_buffer = remaining
@@ -731,8 +773,23 @@ class _AgentStreamState:
             self._tool_buffer += self._pending_buffer
             self._pending_buffer = ""
             self._try_complete_artifact()
+
             if self._is_accumulating_artifact:
                 self._is_accumulating_artifact = False
+
+                if "<artifact" in self._tool_buffer.lower() or "<artefact" in self._tool_buffer.lower():
+                    content_match = re.search(r'<art(?:ifact|efact)[^>]*>(.*)', self._tool_buffer, re.DOTALL | re.IGNORECASE)
+                    if content_match:
+                        body_content = content_match.group(1).strip()
+                    else:
+                        body_content = self._tool_buffer
+
+                    if body_content:
+                        full_artifact_call = self._tool_buffer
+                        if "</artifact" not in full_artifact_call.lower() and "</artefact" not in full_artifact_call.lower():
+                            full_artifact_call += "\n</artifact>"
+
+                        self.completed_actions.append({"type": "artifact", "xml": full_artifact_call, "was_truncated": True})
             return
 
         if self._is_accumulating_context:

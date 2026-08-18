@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-08-18 00:00]
+
+- feat(core): enhance personality, artefact, and tool bindings across lollms client
+
 ## [2026-08-15 00:41]
 
 - refactor(lollms_code): update CLI pipeline and GUI components

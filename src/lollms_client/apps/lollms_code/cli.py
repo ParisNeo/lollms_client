@@ -303,6 +303,32 @@ Next session, you can ask "What is my name?" and it will know.
 Use `--workspace ./path/to/project` to target a specific directory without changing your current terminal path.
 """
     },
+    "7": {
+        "title": "📂 7. Manual Context Management",
+        "content": """\
+[bold magenta]Use Case: Manually managing files and conversation state to optimize the agent's context window.[/bold magenta]
+
+You can manually control the agent's context using these slash commands. 
+This is highly recommended for large workspaces to save context tokens.
+
+[bold yellow]Context Clearing Commands:[/bold yellow]
+  - [cyan]/clear-history[/cyan]: Wipes the conversation history from the agent's memory.
+  - [cyan]/clear-files[/cyan]: Unloads ALL currently loaded files from context (frees up maximum space).
+
+[bold yellow]File Visibility Commands:[/bold yellow]
+  - [cyan]/load <file1> [file2] ...[/cyan]: Manually loads files into the [C] (Fully Loaded) context.
+    Example: `/load src/main.py src/utils.py`
+    You can also use `all` to load all indexed files: `/load all`
+  - [cyan]/unload <file1> ...[/cyan]: Removes specific files from context (changes [C] to [U]).
+  - [cyan]/lock <file1> ...[/cyan]: Locks files in the tree (changes to [L], cannot be unlocked by agent).
+  - [cyan]/hide <file1> ...[/cyan]: Completely hides files from the workspace tree.
+  - [cyan]/unhide <file1> ...[/cyan]: Restores hidden files to the tree.
+  - [cyan]/files[/cyan]: Lists all files currently loaded in the context [C].
+
+[bold green]Pro-Tip:[/bold green]
+If the agent is running out of context space, manually `/load` only the files relevant to your current task.
+"""
+    },
     "q": {
         "title": "Exit Help",
         "content": "Returning to the agent..."
@@ -318,7 +344,7 @@ def show_interactive_help():
         ASCIIColors.rich_print(section["content"])
         
         ASCIIColors.rich_print("\n[bold]Navigation:[/bold]")
-        ASCIIColors.rich_print("  [cyan]1-6[/cyan] - Jump to a specific section")
+        ASCIIColors.rich_print("  [cyan]1-7[/cyan] - Jump to a specific section")
         ASCIIColors.rich_print("  [cyan]q[/cyan]   - Quit help and return to the agent")
         
         try:
@@ -814,6 +840,10 @@ class StreamRenderer:
         self.config = config
         self._processing_buffer = ""
         self._in_processing = False
+        self._live_artifact_panel = None
+        self._live_artifact_title = ""
+        self._live_artifact_lang = ""
+        self._live_artifact_buffer = ""
 
     def _render_processing_block(self, block_content: str):
         """Parses and renders a <processing> block as a rich panel."""
@@ -852,6 +882,81 @@ class StreamRenderer:
                 title=f"[bold magenta]⚙️ {title}[/bold magenta]",
                 border_style="magenta"
             )
+
+    def _start_live_artifact_panel(self, title: str, lang: str = ""):
+        """Initializes a live-updating panel for streaming artifact content."""
+        from rich.live import Live
+        from rich.panel import Panel
+        from rich.console import Console
+
+        self._live_artifact_title = title
+        self._live_artifact_lang = lang
+        self._live_artifact_buffer = ""
+        self._live_artifact_line_count = 0
+        self._progress_frame = 0
+
+        if not hasattr(self, '_rich_console'):
+            self._rich_console = Console()
+
+        panel = Panel(
+            "[dim]Preparing to stream content...[/dim]",
+            title=f"[bold magenta]📝 Writing: {title}[/bold magenta]" + (f" [dim]({lang})[/dim]" if lang else ""),
+            border_style="magenta"
+        )
+        self._live_artifact_panel = Live(panel, console=self._rich_console, refresh_per_second=10, vertical_overflow="visible")
+        self._live_artifact_panel.start()
+
+    def _update_live_artifact_panel(self, chunk: str, fallback_title: str = "artifact", fallback_lang: str = ""):
+        """Updates the live artifact panel with a simple, rotating progress message."""
+        if not self._live_artifact_panel:
+            self._start_live_artifact_panel(fallback_title, fallback_lang)
+
+        from rich.panel import Panel
+
+        self._live_artifact_buffer += chunk
+        self._live_artifact_line_count += 1
+
+        if not hasattr(self, '_progress_frame'):
+            self._progress_frame = 0
+        self._progress_frame = (self._progress_frame + 1) % 4
+
+        spinners = ["⠋", "⠙", "⠹", "⠸"]
+        spinner = spinners[self._progress_frame]
+
+        detected_section = ""
+        import re
+        header_match = re.search(r'^#+\s+(.+)|^#{1,3}\s+(.+)|^class\s+(\w+)|^def\s+(\w+)|^function\s+(\w+)', self._live_artifact_buffer, re.MULTILINE)
+        if header_match:
+            detected_section = header_match.group(1) or header_match.group(2) or header_match.group(3) or header_match.group(4) or header_match.group(5)
+
+        lines = []
+        lines.append(f"[bold magenta]{spinner} Generating content...[/bold magenta]")
+        lines.append(f"[dim]Lines written: {self._live_artifact_line_count}[/dim]")
+        if detected_section:
+            lines.append(f"[cyan]📝 Section: {detected_section.strip()[:60]}[/cyan]")
+        else:
+            lines.append("[dim]Composing narrative...[/dim]")
+
+        panel = Panel(
+            "\n".join(lines),
+            title=f"[bold magenta]📝 Writing: {self._live_artifact_title}[/bold magenta]" + (f" [dim]({self._live_artifact_lang})[/dim]" if self._live_artifact_lang else ""),
+            border_style="magenta"
+        )
+        self._live_artifact_panel.update(panel)
+
+    def _stop_live_artifact_panel(self):
+        """Stops the live artifact panel."""
+        if self._live_artifact_panel:
+            try:
+                self._live_artifact_panel.stop()
+            except Exception:
+                pass
+            self._live_artifact_panel = None
+            self._live_artifact_buffer = ""
+            self._live_artifact_title = ""
+            self._live_artifact_lang = ""
+            self._live_artifact_line_count = 0
+            self._progress_frame = 0
 
     def _render_callback_event(self, msg_type: Any, meta: Optional[Dict]):
         """Renders structured MSG_TYPE events as Rich panels for FULL_CALLBACK_MODE."""
@@ -907,30 +1012,34 @@ class StreamRenderer:
             )
 
         elif msg_type == MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START:
+            self._stop_live_artifact_panel()
             title = meta.get("title", "artifact")
             art_type = meta.get("art_type", "code")
             lang = meta.get("language", "")
             is_patch = meta.get("is_patch", False)
 
-            action = "📝 Rewriting" if not is_patch else "🔧 Patching"
-            ASCIIColors.panel(
-                f"[cyan]Action:[/cyan] {action}\n[cyan]Language:[/cyan] {lang or 'N/A'}",
-                title=f"[bold magenta]⚙️ Artifact: {title}[/bold magenta]",
-                border_style="magenta"
-            )
+            if is_patch:
+                ASCIIColors.rich_print(f"\n[bold yellow]🔧 PATCHING ARTIFACT:[/bold yellow] [yellow]{title}[/yellow]" + (f" [dim]({lang})[/dim]" if lang else ""))
+            else:
+                ASCIIColors.rich_print(f"\n[bold magenta]📝 Writing artifact:[/bold magenta] [yellow]{title}[/yellow]" + (f" [dim]({lang})[/dim]" if lang else ""))
+
+            if not meta.get("stream_complete"):
+                self._start_live_artifact_panel(title, lang)
+            return
 
         elif msg_type == MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END:
+            self._stop_live_artifact_panel()
             title = meta.get("title", "artifact")
             success = meta.get("success", False)
             version = meta.get("version", 1)
             error = meta.get("error")
 
-            status_str = f"[green]✅ Saved (v{version})[/green]" if success else f"[red]❌ Failed: {error}[/red]"
-            ASCIIColors.panel(
-                status_str,
-                title=f"[bold magenta]⚙️ Artifact Complete: {title}[/bold magenta]",
-                border_style="green" if success else "red"
-            )
+            if success:
+                status_str = f"[green]✅ Patched (v{version})[/green]" if meta.get("is_patch") else f"[green]✅ Saved (v{version})[/green]"
+            else:
+                status_str = f"[red]❌ Patch Failed: {error}[/red]" if meta.get("is_patch") else f"[red]❌ Save Failed: {error}[/red]"
+            ASCIIColors.rich_print(f"  {status_str}")
+            return
 
         elif msg_type == MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE:
             action = meta.get("action", "update")
@@ -964,6 +1073,8 @@ class StreamRenderer:
 
     def flush(self):
         """Flushes any pending buffers, rendering unclosed tags as raw text."""
+        self._stop_live_artifact_panel()
+        self._first_token_printed = False
         if self._in_processing and self._processing_buffer:
             ASCIIColors.rich_print(self._processing_buffer, end="")
             self._processing_buffer = ""
@@ -981,18 +1092,20 @@ class StreamRenderer:
             MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END,
             MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE
         ]:
-            # Suppress intermediate stream events to prevent UI bleeding and "pending" panels.
-            # We only render the final execution event (host-generated).
-            if meta and (meta.get("stream_complete") or meta.get("status") in ("streaming", "stream_complete")):
+            if meta and meta.get("stream_complete"):
+                if msg_type == MSG_TYPE.MSG_TYPE_TOOL_START and meta.get("tool_name") == "pending":
+                    return True
+                if msg_type == MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START:
+                    return True
+                if msg_type == MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END:
+                    return True
+
+            if meta and meta.get("status") in ("streaming", "stream_complete"):
                 if meta.get("tool_name") == "pending":
                     ASCIIColors.rich_print("\n[dim]⏳ Detected tool call, buffering stream...[/dim]")
                 return True
 
-            # Also suppress the initial START event for tool/artifact when in FULL_CALLBACK_MODE
             if msg_type == MSG_TYPE.MSG_TYPE_TOOL_START and meta.get("tool_name") == "pending":
-                return True
-            if msg_type == MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START and meta.get("title") == "artifact" and not meta.get("stream_complete"):
-                ASCIIColors.rich_print("\n[dim]⏳ Detected artifact tag, buffering stream...[/dim]")
                 return True
 
             self._processing_buffer = ""
@@ -1014,22 +1127,34 @@ class StreamRenderer:
                     except Exception as e:
                         ASCIIColors.rich_print(self._processing_buffer, end="")
                     self._processing_buffer = ""
-            elif meta and (meta.get("live_tool_chunk") or meta.get("live_artifact_chunk")):
-                # Suppress raw JSON/XML chunks of tools and artifacts to prevent UI bleeding.
+            elif meta and meta.get("live_tool_chunk"):
+                return True
+            elif meta and meta.get("live_artifact_chunk"):
+                art_title = "artifact"
+                art_lang = ""
+                if isinstance(meta, dict):
+                    art_title = meta.get("artifact_title", art_title)
+                    art_lang = meta.get("artifact_lang", art_lang)
+                self._update_live_artifact_panel(chunk, fallback_title=art_title, fallback_lang=art_lang)
                 return True
             else:
-                # Intercept and suppress <done/> tags from raw text stream
                 if "<done" in chunk and "/>" in chunk:
                     return True
 
                 if self._in_processing:
                     self._processing_buffer += chunk
                 else:
+                    if not self._live_artifact_panel and not self._in_processing:
+                        if not getattr(self, '_first_token_printed', False):
+                            ASCIIColors.rich_print("\n[dim]🤖 Thinking...[/dim]", end="")
+                            ASCIIColors.rich_print("\r\033[K", end="")
+                            self._first_token_printed = True
                     ASCIIColors.rich_print(chunk, end="")
         elif msg_type == MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK:
             ASCIIColors.rich_print(f"[dim]{chunk}[/dim]", end="")
         elif msg_type == MSG_TYPE.MSG_TYPE_INFO:
             if meta and meta.get("done_intercepted"):
+                self._stop_live_artifact_panel()
                 ASCIIColors.rule("[bold green]✅ Task Completed (<done/>)[/bold green]")
                 return True
             else:
@@ -1124,6 +1249,8 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
 
     start_time = time.time()
     ASCIIColors.rich_print("") # Ensure output starts on a new line
+
+    renderer._first_token_printed = False
 
     def _signal_handler(sig, frame):
         ASCIIColors.yellow("\n\n⚠️  Interrupt received. Cancelling generation...")
@@ -1274,9 +1401,11 @@ def dump_startup_context(personality: LollmsPersonality, client: LollmsClient):
 
 def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optional[str]:
     """
-    Cross-platform raw key-capture prompt with Ghost-Text Autocomplete.
-    - Type '/': shows '/exit' in gray. Cursor stays after '/'.
-    - Type 'f': shows '/files' in gray. Cursor stays after 'f'.
+    Cross-platform raw key-capture prompt with Ghost-Text Autocomplete and Multi-line support.
+    - Submit: Press Enter to submit the prompt.
+    - Multi-line: Press Shift+Enter (Windows) or Alt+Enter (cross-platform) to insert a newline.
+    - Type '/': shows '/exit' in gray.
+    - Type 'f': shows '/files' in gray.
     - Press Tab or Right Arrow: accepts the gray suggestion.
     - Press Up/Down: cycles through matching commands (or history if no match).
     """
@@ -1292,9 +1421,7 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
         else:
             sys.stdout.write(f"{PROMPT_TEXT}{buffer}")
 
-        # Move cursor back to correct position
         if cursor_pos < len(buffer + ghost):
-            # +1 because terminal positions are 1-based
             target_col = PROMPT_LEN + cursor_pos + 1
             sys.stdout.write(f"\033[{target_col}G")
         sys.stdout.flush()
@@ -1312,9 +1439,11 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
         active_suggestion_idx = -1
 
         def get_suggestions():
-            if not buffer.startswith("/"):
+            lines = buffer.split('\n')
+            current_line = lines[-1]
+            if not current_line.startswith("/"):
                 return []
-            return [c for c in commands if c.startswith(buffer)]
+            return [c for c in commands if c.startswith(current_line)]
 
         try:
             tty.setraw(fd)
@@ -1326,84 +1455,94 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
                 sugg = get_suggestions()
                 ghost_text = ""
 
-                if ch == '\x03' or ch == '\x04':
-                    sys.stdout.write("\n")
-                    return None
-                elif ch in ('\r', '\n'):
-                    sys.stdout.write("\n")
-                    sys.stdout.flush()
+                if ch == '\r':
+                    if buffer:
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                        if not buffer.strip().startswith("/"):
+                            history.add(buffer)
                     return buffer
+                elif ch == '\x1b':
+                    ch2 = sys.stdin.read(1)
+                    if ch2 == '\r':
+                        buffer = buffer[:cursor_pos] + '\n' + buffer[cursor_pos:]
+                        cursor_pos += 1
+                        active_suggestion_idx = -1
+                        sys.stdout.write("\n")
+                        _draw_line(buffer, cursor_pos, "")
+                    else:
+                        ch3 = sys.stdin.read(1)
+                        if ch2 == '[':
+                            if ch3 == 'A':
+                                if sugg:
+                                    active_suggestion_idx = (active_suggestion_idx - 1) % len(sugg)
+                                    lines = buffer.split('\n')
+                                    lines[-1] = sugg[active_suggestion_idx]
+                                    buffer = '\n'.join(lines)
+                                    cursor_pos = len(buffer)
+                                    _draw_line(buffer, cursor_pos)
+                                elif history.entries:
+                                    if history_idx == len(history.entries):
+                                        current_input = buffer
+                                    history_idx = max(0, history_idx - 1)
+                                    buffer = history.entries[history_idx]
+                                    cursor_pos = len(buffer)
+                                    _draw_line(buffer, cursor_pos)
+                            elif ch3 == 'B':
+                                if sugg:
+                                    active_suggestion_idx = (active_suggestion_idx + 1) % len(sugg)
+                                    lines = buffer.split('\n')
+                                    lines[-1] = sugg[active_suggestion_idx]
+                                    buffer = '\n'.join(lines)
+                                    cursor_pos = len(buffer)
+                                    _draw_line(buffer, cursor_pos)
+                                elif history_idx < len(history.entries):
+                                    history_idx += 1
+                                    if history_idx == len(history.entries):
+                                        buffer = current_input
+                                    else:
+                                        buffer = history.entries[history_idx]
+                                    cursor_pos = len(buffer)
+                                    _draw_line(buffer, cursor_pos)
+                            elif ch3 == 'C':
+                                if sugg and cursor_pos == len(buffer):
+                                    lines = buffer.split('\n')
+                                    lines[-1] = sugg[0]
+                                    buffer = '\n'.join(lines)
+                                    cursor_pos = len(buffer)
+                                    active_suggestion_idx = -1
+                                    _draw_line(buffer, cursor_pos)
+                                elif cursor_pos < len(buffer):
+                                    cursor_pos += 1
+                                    _draw_line(buffer, cursor_pos, ghost_text)
+                            elif ch3 == 'D':
+                                if cursor_pos > 0:
+                                    cursor_pos -= 1
+                                    _draw_line(buffer, cursor_pos, ghost_text)
                 elif ch in ('\x7f', '\b'):
                     if cursor_pos > 0:
                         buffer = buffer[:cursor_pos-1] + buffer[cursor_pos:]
                         cursor_pos -= 1
                         active_suggestion_idx = -1
                         sugg = get_suggestions()
-                        ghost_text = sugg[0][len(buffer):] if sugg and sugg[0].startswith(buffer) else ""
+                        current_line = buffer.split('\n')[-1]
+                        ghost_text = sugg[0][len(current_line):] if sugg and sugg[0].startswith(current_line) else ""
                         _draw_line(buffer, cursor_pos, ghost_text)
-                elif ch == '\t':  # Tab accepts ghost text
+                elif ch == '\t':
                     if sugg:
-                        buffer = sugg[0]
+                        lines = buffer.split('\n')
+                        lines[-1] = sugg[0]
+                        buffer = '\n'.join(lines)
                         cursor_pos = len(buffer)
                         active_suggestion_idx = -1
                         _draw_line(buffer, cursor_pos)
-                elif ch in ('\r', '\n'):
-                    sugg = get_suggestions()
-                    if sugg and sugg[0].startswith(buffer):
-                        buffer = sugg[0]
-                    sys.stdout.write("\n")
-                    sys.stdout.flush()
-                    return buffer
-                elif ch == '\x1b':
-                    ch2 = sys.stdin.read(1)
-                    ch3 = sys.stdin.read(1)
-                    if ch2 == '[':
-                        if ch3 == 'A':  # Up
-                            if sugg:
-                                active_suggestion_idx = (active_suggestion_idx - 1) % len(sugg)
-                                buffer = sugg[active_suggestion_idx]
-                                cursor_pos = len(buffer)
-                                _draw_line(buffer, cursor_pos)
-                            elif history.entries:
-                                if history_idx == len(history.entries):
-                                    current_input = buffer
-                                history_idx = max(0, history_idx - 1)
-                                buffer = history.entries[history_idx]
-                                cursor_pos = len(buffer)
-                                _draw_line(buffer, cursor_pos)
-                        elif ch3 == 'B':  # Down
-                            if sugg:
-                                active_suggestion_idx = (active_suggestion_idx + 1) % len(sugg)
-                                buffer = sugg[active_suggestion_idx]
-                                cursor_pos = len(buffer)
-                                _draw_line(buffer, cursor_pos)
-                            elif history_idx < len(history.entries):
-                                history_idx += 1
-                                if history_idx == len(history.entries):
-                                    buffer = current_input
-                                else:
-                                    buffer = history.entries[history_idx]
-                                cursor_pos = len(buffer)
-                                _draw_line(buffer, cursor_pos)
-                        elif ch3 == 'C':  # Right accepts ghost text
-                            if sugg and cursor_pos == len(buffer):
-                                buffer = sugg[0]
-                                cursor_pos = len(buffer)
-                                active_suggestion_idx = -1
-                                _draw_line(buffer, cursor_pos)
-                            elif cursor_pos < len(buffer):
-                                cursor_pos += 1
-                                _draw_line(buffer, cursor_pos, ghost_text)
-                        elif ch3 == 'D':  # Left
-                            if cursor_pos > 0:
-                                cursor_pos -= 1
-                                _draw_line(buffer, cursor_pos, ghost_text)
                 elif len(ch) == 1 and ch.isprintable():
                     buffer = buffer[:cursor_pos] + ch + buffer[cursor_pos:]
                     cursor_pos += 1
                     active_suggestion_idx = -1
                     sugg = get_suggestions()
-                    ghost_text = sugg[0][len(buffer):] if sugg and sugg[0].startswith(buffer) else ""
+                    current_line = buffer.split('\n')[-1]
+                    ghost_text = sugg[0][len(current_line):] if sugg and sugg[0].startswith(current_line) else ""
                     _draw_line(buffer, cursor_pos, ghost_text)
         except Exception:
             return None
@@ -1420,9 +1559,11 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
         active_suggestion_idx = -1
 
         def get_suggestions():
-            if not buffer.startswith("/"):
+            lines = buffer.split('\n')
+            current_line = lines[-1]
+            if not current_line.startswith("/"):
                 return []
-            return [c for c in commands if c.startswith(buffer)]
+            return [c for c in commands if c.startswith(current_line)]
 
         sys.stdout.write(PROMPT_TEXT)
         sys.stdout.flush()
@@ -1435,40 +1576,27 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
             sugg = get_suggestions()
             ghost_text = ""
 
-            if ch in ('\x03', '\x1b'):
-                sys.stdout.write("\n")
-                return None
-            elif ch in ('\r', '\n'):
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                return buffer
-            elif ch in ('\x08', '\x7f'):
-                if cursor_pos > 0:
-                    buffer = buffer[:cursor_pos-1] + buffer[cursor_pos:]
-                    cursor_pos -= 1
-                    active_suggestion_idx = -1
-                    sugg = get_suggestions()
-                    ghost_text = sugg[0][len(buffer):] if sugg and sugg[0].startswith(buffer) else ""
-                    _draw_line(buffer, cursor_pos, ghost_text)
-            elif ch == '\t':
-                if sugg:
-                    buffer = sugg[0]
-                    cursor_pos = len(buffer)
-                    active_suggestion_idx = -1
-                    _draw_line(buffer, cursor_pos)
-            elif ch in ('\r', '\n'):
-                sugg = get_suggestions()
-                if sugg and sugg[0].startswith(buffer):
-                    buffer = sugg[0]
-                sys.stdout.write("\n")
-                sys.stdout.flush()
+            if ch == '\r':
+                if buffer:
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    if not buffer.strip().startswith("/"):
+                        history.add(buffer)
                 return buffer
             elif ch == '\x00' or ch == '\xe0':
                 ch2 = msvcrt.getwch()
-                if ch2 == 'H': # Up
+                if ch2 == '\r':
+                    buffer = buffer[:cursor_pos] + '\n' + buffer[cursor_pos:]
+                    cursor_pos += 1
+                    active_suggestion_idx = -1
+                    sys.stdout.write("\n")
+                    _draw_line(buffer, cursor_pos, "")
+                elif ch2 == 'H':
                     if sugg:
                         active_suggestion_idx = (active_suggestion_idx - 1) % len(sugg)
-                        buffer = sugg[active_suggestion_idx]
+                        lines = buffer.split('\n')
+                        lines[-1] = sugg[active_suggestion_idx]
+                        buffer = '\n'.join(lines)
                         cursor_pos = len(buffer)
                         _draw_line(buffer, cursor_pos)
                     elif history.entries:
@@ -1477,10 +1605,12 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
                         buffer = history.entries[history_idx]
                         cursor_pos = len(buffer)
                         _draw_line(buffer, cursor_pos)
-                elif ch2 == 'P': # Down
+                elif ch2 == 'P':
                     if sugg:
                         active_suggestion_idx = (active_suggestion_idx + 1) % len(sugg)
-                        buffer = sugg[active_suggestion_idx]
+                        lines = buffer.split('\n')
+                        lines[-1] = sugg[active_suggestion_idx]
+                        buffer = '\n'.join(lines)
                         cursor_pos = len(buffer)
                         _draw_line(buffer, cursor_pos)
                     elif history_idx < len(history.entries):
@@ -1488,25 +1618,45 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
                         buffer = current_input if history_idx == len(history.entries) else history.entries[history_idx]
                         cursor_pos = len(buffer)
                         _draw_line(buffer, cursor_pos)
-                elif ch2 == 'M': # Right
+                elif ch2 == 'M':
                     if sugg and cursor_pos == len(buffer):
-                        buffer = sugg[0]
+                        lines = buffer.split('\n')
+                        lines[-1] = sugg[0]
+                        buffer = '\n'.join(lines)
                         cursor_pos = len(buffer)
                         active_suggestion_idx = -1
                         _draw_line(buffer, cursor_pos)
                     elif cursor_pos < len(buffer):
                         cursor_pos += 1
                         _draw_line(buffer, cursor_pos, ghost_text)
-                elif ch2 == 'K': # Left
+                elif ch2 == 'K':
                     if cursor_pos > 0:
                         cursor_pos -= 1
                         _draw_line(buffer, cursor_pos, ghost_text)
+            elif ch in ('\x08', '\x7f'):
+                if cursor_pos > 0:
+                    buffer = buffer[:cursor_pos-1] + buffer[cursor_pos:]
+                    cursor_pos -= 1
+                    active_suggestion_idx = -1
+                    sugg = get_suggestions()
+                    current_line = buffer.split('\n')[-1]
+                    ghost_text = sugg[0][len(current_line):] if sugg and sugg[0].startswith(current_line) else ""
+                    _draw_line(buffer, cursor_pos, ghost_text)
+            elif ch == '\t':
+                if sugg:
+                    lines = buffer.split('\n')
+                    lines[-1] = sugg[0]
+                    buffer = '\n'.join(lines)
+                    cursor_pos = len(buffer)
+                    active_suggestion_idx = -1
+                    _draw_line(buffer, cursor_pos)
             elif ch.isprintable():
                 buffer = buffer[:cursor_pos] + ch + buffer[cursor_pos:]
                 cursor_pos += 1
                 active_suggestion_idx = -1
                 sugg = get_suggestions()
-                ghost_text = sugg[0][len(buffer):] if sugg and sugg[0].startswith(buffer) else ""
+                current_line = buffer.split('\n')[-1]
+                ghost_text = sugg[0][len(current_line):] if sugg and sugg[0].startswith(current_line) else ""
                 _draw_line(buffer, cursor_pos, ghost_text)
 
     try:
@@ -1519,8 +1669,9 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
             return input(PROMPT_TEXT)
         except (EOFError, KeyboardInterrupt):
             sys.stdout.write("\n")
-            return None
-
+            return None  
+            
+        
 def _switch_workspace_interactive(config: CodeAgentConfig, client: LollmsClient) -> Optional[LollmsPersonality]:
     """Handles the interactive workspace switching process."""
     try:
@@ -1583,7 +1734,7 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
     renderer = StreamRenderer(config)
     history = PersistentHistory(APP_HISTORY_FILE)
 
-    slash_commands = ["/exit", "/quit", "/help", "/config", "/forget", "/skills", "/clear", "/models", "/files", "/workspace"]
+    slash_commands = ["/exit", "/quit", "/help", "/config", "/forget", "/skills", "/clear-history", "/clear-files", "/models", "/files", "/workspace", "/load", "/unload", "/lock", "/hide", "/unhide"]
     
     # Display a safe, truncated workspace path to the user
     ws_path_display = Path(config.workspace_path).resolve()
@@ -1598,7 +1749,7 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
         f"[cyan]Workspace:[/cyan] {ws_path_display}",
         f"[cyan]Model:[/cyan]      {config.model_name}",
         f"[cyan]Binding:[/cyan]    {config.llm_binding}",
-        f"[dim]Commands: 'exit' (quit), 'help' (manual), 'config' (wizard), 'forget' (wipe memory), 'skills' (list), 'workspace' (switch dir)[/dim]"
+        f"[dim]Commands: 'exit', 'help', 'config', 'forget', 'skills', 'clear-history', 'clear-files', 'workspace', 'files', 'load', 'unload', 'lock', 'hide'[/dim]"
     ]
 
     ctx_status = get_context_fill_status(personality, client)
@@ -1683,9 +1834,47 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                 ASCIIColors.yellow("  Skills manager not initialized.")
             continue
 
-        if user_input.lower() == "/clear":
+        if user_input.lower() in ("/clear-history", "/clear"):
             personality._conversation = []
             ASCIIColors.green("  Conversation history cleared.")
+            continue
+
+        if user_input.lower() in ("/clear-files", "/unload-all"):
+            if not hasattr(personality, '_artefact_manager') or not personality._artefact_manager:
+                ASCIIColors.yellow("  Artefact system not initialized.")
+                continue
+
+            try:
+                from lollms_client.lollms_artefact import ArtefactVisibility
+                all_arts = personality._artefact_manager._get_all_raw()
+                loaded_files = [
+                    a.get("title", "") for a in all_arts
+                    if a.get("visibility") == ArtefactVisibility.FULL
+                    and not a.get("title", "").endswith("::images")
+                ]
+
+                if not loaded_files:
+                    ASCIIColors.yellow("  No files are currently loaded in context [C].")
+                    continue
+
+                result = personality.change_file_visibility(loaded_files, "unload")
+                status_str = result.get("status_str", "Action completed.")
+
+                object.__setattr__(personality, '_last_ws_sync_time', 0.0)
+
+                if "❌" in status_str:
+                    ASCIIColors.red(f"\n  {status_str}")
+                else:
+                    ASCIIColors.green(f"\n  ✅ All files unloaded successfully.")
+
+                ws_stats = get_workspace_stats(personality)
+                if ws_stats["loaded_files"]:
+                    ASCIIColors.rich_print("")
+                    _render_files_table(ws_stats["loaded_files"], "Remaining Loaded Context Files [C]")
+                else:
+                    ASCIIColors.yellow("\n  📂 No files are currently loaded in context.")
+            except Exception as e:
+                ASCIIColors.red(f"\n  ❌ Error unloading files: {e}")
             continue
 
         if user_input.lower() == "/models":
@@ -1706,6 +1895,37 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                 _render_files_table(ws_stats["loaded_files"], "Loaded Context Files [C]")
             continue
             
+        cmd_parts = user_input.split(maxsplit=1)
+        cmd = cmd_parts[0].lower()
+        if cmd in ("/load", "/unload", "/lock", "/hide", "/unhide"):
+            if len(cmd_parts) < 2 or not cmd_parts[1].strip():
+                ASCIIColors.red(f"  Usage: {cmd} <file1> [file2] ... or {cmd} all")
+                continue
+
+            action = cmd[1:]
+            targets = [t.strip() for t in cmd_parts[1].replace(",", " ").split() if t.strip()]
+
+            try:
+                result = personality.change_file_visibility(targets, action)
+                status_str = result.get("status_str", "Action completed.")
+
+                if "🛑 BLOCKED" in status_str or "❌" in status_str:
+                    ASCIIColors.red(f"\n  {status_str}")
+                else:
+                    ASCIIColors.green(f"\n  {status_str}")
+
+                object.__setattr__(personality, '_last_ws_sync_time', 0.0)
+
+                ws_stats = get_workspace_stats(personality)
+                if ws_stats["loaded_files"]:
+                    ASCIIColors.rich_print("")
+                    _render_files_table(ws_stats["loaded_files"], "Current Loaded Context Files [C]")
+                else:
+                    ASCIIColors.yellow("\n  📂 No files are currently loaded in context.")
+            except Exception as e:
+                ASCIIColors.red(f"\n  ❌ Error during context visibility change: {e}")
+            continue
+
         if user_input.lower() == "/workspace":
             new_personality = _switch_workspace_interactive(config, client)
             if new_personality:
@@ -1738,6 +1958,8 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
         history.add(user_input)
         ASCIIColors.rule("[bold green]🤖 Agent[/bold green]")
         ASCIIColors.rich_print("") # Ensure output starts on a new line
+
+        renderer._first_token_printed = False
 
         start_time = time.time()
         try:
