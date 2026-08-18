@@ -279,6 +279,32 @@ class _AgentStreamState:
         except Exception:
             pass
 
+    def _check_exact_control_tag_match(self, buffer: str) -> int:
+        if not buffer:
+            return -1
+
+        lines = buffer.splitlines(keepends=True)
+        if not lines:
+            return -1
+
+        last_line = lines[-1].strip()
+        if not last_line:
+            return -1
+
+        for tag in ["<done/>", "<done>"]:
+            if last_line.lower() == tag:
+                return len(buffer) - len(last_line)
+
+        for tag in ["<tool>", "<artifact>", "<artefact>", "<refactor_history>"]:
+            if last_line.lower() == tag:
+                return len(buffer) - len(last_line)
+
+        for tag in ["</tool>", "</artifact>", "</artefact>", "</refactor_history>", "</processing>"]:
+            if last_line.lower() == tag:
+                return len(buffer) - len(last_line)
+
+        return -1
+
     def feed(self, chunk: str) -> bool:
         if not isinstance(chunk, str) or not chunk:
             return True
@@ -319,6 +345,17 @@ class _AgentStreamState:
                 self._done_intercepted = True
                 self._cb("", MSG_TYPE.MSG_TYPE_INFO, {"done_intercepted": True})
                 return False
+
+        if self._done_intercepted and (self._is_accumulating_artifact or self._is_accumulating_tool):
+            if self._is_accumulating_artifact:
+                self._tool_buffer += self._pending_buffer
+                self._pending_buffer = ""
+                self._try_complete_artifact()
+            elif self._is_accumulating_tool:
+                self._tool_buffer += self._pending_buffer
+                self._pending_buffer = ""
+                self._try_complete_tool()
+            return True
 
         if not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence and not self._in_inline_code:
             proc_match = re.search(r'(?m)^\s*<processing', self._pending_buffer, re.IGNORECASE)
@@ -481,6 +518,17 @@ class _AgentStreamState:
             artifact_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<art(?:ifact|efact)\b', self._pending_buffer, re.IGNORECASE)
             if artifact_match:
                 tag_start_idx = artifact_match.start()
+                partial_tag_buffer = self._pending_buffer[tag_start_idx:]
+
+                full_tag_match = re.search(r'<art(?:ifact|efact)[^>]*>', partial_tag_buffer, re.IGNORECASE)
+                if not full_tag_match:
+                    text_before = self._pending_buffer[:tag_start_idx]
+                    if text_before:
+                        self.content += text_before
+                        self._cb(text_before)
+                    self._pending_buffer = partial_tag_buffer
+                    return True
+
                 text_before = self._pending_buffer[:tag_start_idx]
                 if text_before:
                     self.content += text_before
@@ -488,23 +536,20 @@ class _AgentStreamState:
 
                 self._is_accumulating_artifact = True
                 self.artifact_trigger = True
-                self._tool_buffer = self._pending_buffer[tag_start_idx:]
+                self._tool_buffer = partial_tag_buffer
                 self._pending_buffer = ""
 
-                attrs_match = re.search(r'<art(?:ifact|efact)[^>]*>', self._tool_buffer, re.IGNORECASE)
+                attrs_str = full_tag_match.group(0)
                 title = "artifact"
                 lang = "python"
-                is_patch = "<<<<<<< SEARCH" in self._tool_buffer
-                if attrs_match:
-                    attrs_str = attrs_match.group(0)
-                    for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
-                        if m.group(1).lower() in ("name", "title"):
-                            title = m.group(2)
-                        elif m.group(1).lower() == "language":
-                            lang = m.group(2)
+                for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
+                    if m.group(1).lower() in ("name", "title"):
+                        title = m.group(2)
+                    elif m.group(1).lower() == "language":
+                        lang = m.group(2)
 
-                self.live_artifact_meta = {"title": title, "art_type": "code", "language": lang, "is_patch": is_patch}
-                
+                self.live_artifact_meta = {"title": title, "art_type": "code", "language": lang, "is_patch": "<<<<<<< SEARCH" in self._tool_buffer}
+
                 if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
                     self._cb("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, self.live_artifact_meta)
 
@@ -582,9 +627,13 @@ class _AgentStreamState:
                         return len(buffer) - i
             return -1
 
-        partial_idx = _ends_with_partial_tag(self._pending_buffer)
-        if partial_idx == -1:
-            partial_idx = _ends_with_partial_tag_anywhere(self._pending_buffer)
+        exact_match_idx = self._check_exact_control_tag_match(self._pending_buffer)
+        if exact_match_idx != -1:
+            partial_idx = -1
+        else:
+            partial_idx = _ends_with_partial_tag(self._pending_buffer)
+            if partial_idx == -1:
+                partial_idx = _ends_with_partial_tag_anywhere(self._pending_buffer)
 
         if partial_idx != -1:
             text_before = self._pending_buffer[:partial_idx]

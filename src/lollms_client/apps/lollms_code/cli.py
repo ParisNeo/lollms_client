@@ -44,6 +44,10 @@ from lollms_client.lollms_personality.skills_manager import SkillsManager
 from lollms_client.lollms_agent.lollms_agent import CapabilityFlags
 from lollms_client.lollms_types import MSG_TYPE, EventMode
 
+from ascii_colors.rich.console import Console
+from ascii_colors.rich.table import Table
+
+
 APP_NAME = "lollms_code"
 APP_VERSION = "2.0.0"
 APP_CONFIG_DIR = Path.home() / ".lollms_client" / "lollms_code"
@@ -128,6 +132,7 @@ For every task, follow this structured pipeline:
   - Simply emit `<unlock_file>document.pdf</unlock_file>` and the full text content will be injected into your context.
 - Use `<lock_file>filename</lock_file>` when done to free context space.
 - Do NOT read the same file repeatedly — it stays in your context after unlocking.
+- **ANTI-PATTERN WARNING**: If a file disappears from your context (changes from [C] to [U]) after you modified it, this is NORMAL behavior (the system invalidates the cache to prevent stale reads). You MUST recover it by emitting `<unlock_file>`. You are STRICTLY FORBIDDEN from using `tool_execute_shell_command` with `python -c "open(...).read()"`, `type`, or `cat` to inspect file contents. Shell commands are for execution (tests, git), NOT for reading files into your context. Violating this rule is a CRITICAL ERROR.
 
 ## SUB-AGENT DELEGATION
 - If `tool_spawn_sub_agent` is available and the task has independent sub-components, delegate each to a focused sub-agent.
@@ -771,8 +776,6 @@ def _format_bytes(size: int) -> str:
     return f"{size:.1f} PB"
 
 def _render_files_table(files_data: List[Dict[str, Any]], title: str):
-    from rich.console import Console
-    from rich.table import Table
     console = Console()
     sorted_files = sorted(
         files_data, 
@@ -884,28 +887,72 @@ class StreamRenderer:
             )
 
     def _start_live_artifact_panel(self, title: str, lang: str = ""):
-        """Initializes a live-updating panel for streaming artifact content."""
-        from rich.live import Live
-        from rich.panel import Panel
-        from rich.console import Console
+        """Initializes state for streaming artifact content with a simple one-line print."""
+        if getattr(self, '_live_artifact_started', False) and self._live_artifact_title == title:
+            return
 
         self._live_artifact_title = title
         self._live_artifact_lang = lang
         self._live_artifact_buffer = ""
         self._live_artifact_line_count = 0
         self._progress_frame = 0
+        self._live_artifact_panel = None
+        self._live_artifact_started = True
 
         if not hasattr(self, '_rich_console'):
             self._rich_console = Console()
 
+        ASCIIColors.rich_print(
+            f"\n[bold magenta]📝 Writing:[/bold magenta] [yellow]{title}[/yellow]"
+            + (f" [dim]({lang})[/dim]" if lang else "")
+            + "\n[dim]Preparing to stream content...[/dim]"
+        )
+
+    def _update_live_artifact_panel(self, chunk: str, fallback_title: str = "artifact", fallback_lang: str = ""):
+        """Updates the live artifact panel with a simple, rotating progress message."""
+        if not self._live_artifact_panel:
+            self._start_live_artifact_panel(fallback_title, fallback_lang)
+
+        from rich.panel import Panel
+
+        self._live_artifact_buffer += chunk
+        self._live_artifact_line_count += 1
+
+        if not hasattr(self, '_progress_frame'):
+            self._progress_frame = 0
+        self._progress_frame = (self._progress_frame + 1) % 4
+
+        spinners = ["⠋", "⠙", "⠹", "⠸"]
+        spinner = spinners[self._progress_frame]
+
+        recent_lines = self._live_artifact_buffer.splitlines()[-3:]
+        preview_content = "\n".join(recent_lines)
+        if len(preview_content) > 200:
+            preview_content = "..." + preview_content[-200:]
+
+        lines = []
+        lines.append(f"[bold magenta]{spinner} Streaming content...[/bold magenta]")
+        lines.append(f"[dim]Lines written: {self._live_artifact_line_count}[/dim]")
+        if preview_content.strip():
+            lines.append(f"[cyan]Last lines:[/cyan]")
+            lines.append(f"[dim]{preview_content}[/dim]")
+        else:
+            lines.append("[dim]Composing narrative...[/dim]")
+
         panel = Panel(
-            "[dim]Preparing to stream content...[/dim]",
-            title=f"[bold magenta]📝 Writing: {title}[/bold magenta]" + (f" [dim]({lang})[/dim]" if lang else ""),
+            "\n".join(lines),
+            title=f"[bold magenta]📝 Writing: {self._live_artifact_title}[/bold magenta]" + (f" [dim]({self._live_artifact_lang})[/dim]" if self._live_artifact_lang else ""),
             border_style="magenta"
         )
-        self._live_artifact_panel = Live(panel, console=self._rich_console, refresh_per_second=10, vertical_overflow="visible")
-        self._live_artifact_panel.start()
 
+        if self._live_artifact_panel is None:
+            from rich.live import Live
+            self._live_artifact_panel = Live(panel, console=self._rich_console, refresh_per_second=10, vertical_overflow="visible")
+            self._live_artifact_panel.start()
+        else:
+            self._live_artifact_panel.update(panel)
+        
+        
     def _update_live_artifact_panel(self, chunk: str, fallback_title: str = "artifact", fallback_lang: str = ""):
         """Updates the live artifact panel with a simple, rotating progress message."""
         if not self._live_artifact_panel:
@@ -957,6 +1004,7 @@ class StreamRenderer:
             self._live_artifact_lang = ""
             self._live_artifact_line_count = 0
             self._progress_frame = 0
+            self._live_artifact_started = False
 
     def _render_callback_event(self, msg_type: Any, meta: Optional[Dict]):
         """Renders structured MSG_TYPE events as Rich panels for FULL_CALLBACK_MODE."""
@@ -1012,18 +1060,22 @@ class StreamRenderer:
             )
 
         elif msg_type == MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START:
-            self._stop_live_artifact_panel()
             title = meta.get("title", "artifact")
             art_type = meta.get("art_type", "code")
             lang = meta.get("language", "")
             is_patch = meta.get("is_patch", False)
 
+            if meta.get("stream_complete"):
+                return
+
+            if self._live_artifact_panel and self._live_artifact_title == title:
+                return
+
+            self._stop_live_artifact_panel()
+
             if is_patch:
                 ASCIIColors.rich_print(f"\n[bold yellow]🔧 PATCHING ARTIFACT:[/bold yellow] [yellow]{title}[/yellow]" + (f" [dim]({lang})[/dim]" if lang else ""))
             else:
-                ASCIIColors.rich_print(f"\n[bold magenta]📝 Writing artifact:[/bold magenta] [yellow]{title}[/yellow]" + (f" [dim]({lang})[/dim]" if lang else ""))
-
-            if not meta.get("stream_complete"):
                 self._start_live_artifact_panel(title, lang)
             return
 

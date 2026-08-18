@@ -56,6 +56,7 @@ except ImportError:
 from lollms_client.lollms_memory import FailureMemory
 from lollms_client.lollms_agent.lollms_agent import CapabilityFlags, SubAgentSpawner, ModelSwitcher, BindingToolsBuilder, _build_workspace_context, _normalize_messages, _get_builtin_workspace_tools, _IGNORED_WS_DIRS, _IGNORED_WS_EXTS, _TEXT_EXTS
 from lollms_client.lollms_artefact import ArtefactVisibility, ArtefactManager
+from lollms_client.lollms_artefact.lollms_artefact import ArtefactManager as _ArtefactManager
 
 
 _TEXT_RAG_EXTS = {
@@ -1568,6 +1569,52 @@ JSON:"""
             
             
             
+    def _dump_error(self, error: Exception, context_desc: str, round_count: int, extra_data: Optional[Dict[str, Any]] = None):
+        """Writes a detailed error log to the debug dumps directory."""
+        if not getattr(self, 'debug_mode', False):
+            return
+
+        try:
+            import traceback as _traceback
+            from pathlib import Path
+
+            ws_path = getattr(self, '_resolved_workspace', None)
+            if not ws_path:
+                return
+
+            debug_dir = ws_path / ".lollms_code" / "_debug_dumps"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+
+            error_log_path = debug_dir / f"error_round_{round_count}_{context_desc.replace(' ', '_').lower()}.log"
+
+            with open(error_log_path, "w", encoding="utf-8") as f:
+                f.write("=" * 80 + "\n")
+                f.write(f"🐛 [DEBUG] ERROR DUMP - ROUND {round_count}\n")
+                f.write(f"Context: {context_desc}\n")
+                f.write("=" * 80 + "\n\n")
+
+                f.write("--- EXCEPTION ---\n")
+                f.write(f"Type: {type(error).__name__}\n")
+                f.write(f"Message: {str(error)}\n\n")
+
+                f.write("--- TRACEBACK ---\n")
+                f.write(_traceback.format_exc())
+                f.write("\n\n")
+
+                if extra_data:
+                    f.write("--- EXTRA DATA ---\n")
+                    import json as _json
+                    try:
+                        f.write(_json.dumps(extra_data, indent=2, default=str, ensure_ascii=False))
+                    except Exception:
+                        f.write(str(extra_data))
+                    f.write("\n\n")
+
+            ASCIIColors.error(f"[{self.name}] 🐛 Error dumped to: {error_log_path}")
+
+        except Exception as dump_err:
+            ASCIIColors.warning(f"[{self.name}] Failed to write error dump: {dump_err}")
+
     def _sanitize_history_for_context(self, text: str) -> str:
         text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r'<!-- status:[^>]*-->', '', text, flags=re.IGNORECASE)
@@ -2182,6 +2229,10 @@ JSON:"""
             elif art.get("visibility") == target_visibility:
                 already_in_state.append(t_target)
             elif target_visibility == ArtefactVisibility.FULL:
+                if art.get("visibility") == ArtefactVisibility.FULL:
+                    already_in_state.append(t_target)
+                    continue
+
                 file_path = self._resolved_workspace / art["title"]
 
                 token_count = 0
@@ -2643,6 +2694,13 @@ JSON:"""
                         ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
                         continue
                     else:
+                        if getattr(self, 'debug_mode', False):
+                            self._dump_error(
+                                error=gen_err,
+                                context_desc="LLM Generation Error",
+                                round_count=round_count,
+                                extra_data={"messages": messages}
+                            )
                         ASCIIColors.error(f"[{self.name}] Generation error: {gen_err}")
                         final_response = f"[Generation error: The LLM server connection failed. Please check your server and retry. Details: {gen_err}]"
                         break
@@ -2747,6 +2805,13 @@ JSON:"""
                                     except Exception:
                                         pass
                             except Exception as e:
+                                if getattr(self, 'debug_mode', False):
+                                    self._dump_error(
+                                        error=e,
+                                        context_desc="Tool Execution Error",
+                                        round_count=round_count,
+                                        extra_data={"tool_name": tool_name, "parameters": tool_params, "raw_json": tool_call_json_str}
+                                    )
                                 action_reports.append(f"[Tool execution error: {e}]")
 
                         elif action["type"] == "artifact":
@@ -2811,12 +2876,19 @@ JSON:"""
 
                                     original_content = file_path.read_text(encoding="utf-8", errors="ignore")
                                     try:
-                                        patched_content = ArtefactManager.apply_aider_patch(original_content, body_content)
+                                        patched_content = _ArtefactManager.apply_aider_patch(original_content, body_content)
                                         file_path.write_text(patched_content, encoding="utf-8")
                                         action_reports.append(f"✅ SEARCH/REPLACE applied successfully to {title}.")
                                         if self._artefact_manager:
                                             self._artefact_manager.update(title=title, new_content=patched_content, language=lang, bump_version=True, active=True)
                                     except Exception as patch_err:
+                                        if getattr(self, 'debug_mode', False):
+                                            self._dump_error(
+                                                error=patch_err,
+                                                context_desc="Artifact Patch Error (Block 1)",
+                                                round_count=round_count,
+                                                extra_data={"title": title, "original_length": len(original_content), "patch_body": body_content[:500]}
+                                            )
                                         action_reports.append(f"❌ SEARCH/REPLACE FAILED for {title}. Error: {patch_err}")
                                 else:
                                     stripped_body = body_content.strip()
@@ -2831,6 +2903,13 @@ JSON:"""
                                     action_reports.append(f"✅ File {title} created/updated successfully.")
                                     actions_executed_count += 1
                             except Exception as e:
+                                if getattr(self, 'debug_mode', False):
+                                    self._dump_error(
+                                        error=e,
+                                        context_desc="Artifact Processing Error",
+                                        round_count=round_count,
+                                        extra_data={"raw_xml": raw_artifact_xml}
+                                    )
                                 action_reports.append(f"[SYSTEM ERROR] Failed to process artifact tag: {e}")
 
                         elif action["type"] == "context":
@@ -2924,6 +3003,13 @@ JSON:"""
                                 object.__setattr__(self, '_last_ws_sync_time', 0.0)
 
                             except Exception as ctx_err:
+                                if getattr(self, 'debug_mode', False):
+                                    self._dump_error(
+                                        error=ctx_err,
+                                        context_desc="Context Visibility Error",
+                                        round_count=round_count,
+                                        extra_data={"tag_name": tag_name, "raw_xml": raw_xml}
+                                    )
                                 action_reports.append(f"[SYSTEM ERROR] Failed to process context tag: {ctx_err}")
 
                     files_after = self._take_workspace_snapshot()
@@ -2948,6 +3034,13 @@ JSON:"""
                 sanitized_final_response = re.sub(r'<[^>]+>', '', final_response).strip()
 
                 if not sanitized_final_response and not tool_calls_this_turn and not workspace_changes and round_count == 1 and not virtual_history:
+                    if getattr(self, 'debug_mode', False):
+                        self._dump_error(
+                            error=Exception("Empty response with <done/> on round 1"),
+                            context_desc="Empty Response Interception",
+                            round_count=round_count,
+                            extra_data={"virtual_history": [vh.content for vh in virtual_history]}
+                        )
                     ASCIIColors.warning(f"[{self.name}] 🚫 Empty response with <done/> detected on round 1. Forcing continuation.")
                     virtual_history.append(SimpleNamespace(
                         sender_type="user",
@@ -3078,12 +3171,19 @@ JSON:"""
 
                                 original_content = file_path.read_text(encoding="utf-8", errors="ignore")
                                 try:
-                                    patched_content = ArtefactManager.apply_aider_patch(original_content, body_content)
+                                    patched_content = _ArtefactManager.apply_aider_patch(original_content, body_content)
                                     file_path.write_text(patched_content, encoding="utf-8")
                                     action_reports.append(f"✅ SEARCH/REPLACE applied successfully to {title}.")
                                     if self._artefact_manager:
                                         self._artefact_manager.update(title=title, new_content=patched_content, language=lang, bump_version=True, active=True)
                                 except Exception as patch_err:
+                                    if getattr(self, 'debug_mode', False):
+                                        self._dump_error(
+                                            error=patch_err,
+                                            context_desc="Artifact Patch Error (Block 2)",
+                                            round_count=round_count,
+                                            extra_data={"title": title, "original_length": len(original_content), "patch_body": body_content[:500]}
+                                        )
                                     action_reports.append(f"❌ SEARCH/REPLACE FAILED for {title}. Error: {patch_err}")
                             else:
                                 stripped_body = body_content.strip()
@@ -3402,12 +3502,19 @@ JSON:"""
                                 continue
                             original_content = file_path.read_text(encoding="utf-8", errors="ignore")
                             try:
-                                patched_content = ArtefactManager.apply_aider_patch(original_content, body_content)
+                                patched_content = _ArtefactManager.apply_aider_patch(original_content, body_content)
                                 file_path.write_text(patched_content, encoding="utf-8")
                                 action_reports.append(f"✅ SEARCH/REPLACE applied successfully to {title}.")
                                 if self._artefact_manager:
                                     self._artefact_manager.update(title=title, new_content=patched_content, language=lang, bump_version=True, active=True)
                             except Exception as patch_err:
+                                if getattr(self, 'debug_mode', False):
+                                    self._dump_error(
+                                        error=patch_err,
+                                        context_desc="Artifact Patch Error (Block 4)",
+                                        round_count=round_count,
+                                        extra_data={"title": title, "original_length": len(original_content), "patch_body": body_content[:500]}
+                                    )
                                 action_reports.append(f"❌ SEARCH/REPLACE FAILED for {title}. Error: {patch_err}")
                         else:
                             if not body_content.strip():
