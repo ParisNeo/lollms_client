@@ -66,6 +66,10 @@ def tool_execute_shell_command(
     is_windows = platform.system() == "Windows"
     autonomy_level = AUTONOMY_LEVEL
 
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+
     try:
         if autonomy_level == "full_access":
             result = subprocess.run(
@@ -76,6 +80,7 @@ def tool_execute_shell_command(
                 encoding="utf-8",
                 errors="replace",
                 cwd=os.getcwd(),
+                env=env,
                 timeout=120
             )
         else:
@@ -92,6 +97,7 @@ def tool_execute_shell_command(
                 encoding="utf-8",
                 errors="replace",
                 cwd=os.getcwd(),
+                env=env,
                 timeout=60
             )
 

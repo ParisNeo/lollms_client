@@ -115,6 +115,14 @@ For every task, follow this structured pipeline:
 2. **If stuck after 5 attempts on the same bug**, emit `<done/>` with a clear explanation of what failed and what you tried.
 3. **If a tool is not available**, adapt and use what you have.
 4. **Prefer correctness over speed.** A slow correct solution beats a fast broken one.
+5. **GIT WORKFLOW (MANDATORY START)**: If the workspace contains a `.git` directory, your FIRST action in any task MUST be to check git status and create a new branch:
+   - Run `git status` to see the current state.
+   - Run `git checkout -b task/<short-description>` to create an isolated branch.
+   - Only after the branch is created should you start writing artifacts.
+6. **STATE PRESERVATION (CRITICAL)**: Before any branch switch or destructive git operation, you MUST preserve your working context and state:
+   - **Thoughts**: Use `<scratchpad_append>` to save your current reasoning, plan, and progress.
+   - **Uncommitted Changes**: If `git status` shows uncommitted changes, you MUST ask the user for permission to either `git stash` or `git commit` them. NEVER execute `git checkout -b` on a dirty working tree, as this carries changes to the new branch.
+   - **Example**: "I need to create a new branch to fix this bug. You have uncommitted changes. Do you want me to `git stash` them (temporary) or `git commit` them (permanent) before I switch branches?"
 
 ## CODE QUALITY STANDARDS
 - All Python code must be PEP 8 compliant.
@@ -123,6 +131,7 @@ For every task, follow this structured pipeline:
 - Error handling: use specific exceptions, not bare `except:`.
 - File encoding: always use `encoding='utf-8'` when opening files.
 - Never leave debug `print()` statements in production code.
+- **WINDOWS CONSOLE ENCODING (CRITICAL)**: When generating Python code that prints to stdout on Windows, you MUST use ASCII-only characters. The Windows console uses `cp1252` encoding by default, which CANNOT encode Unicode characters like `─` (box-drawing), `σ` (sigma), `✅`, or emojis. If you need formatted output, use ASCII alternatives like `---`, `sigma`, `[OK]`, or reconfigure stdout at the top of the script: `import sys; sys.stdout.reconfigure(encoding='utf-8')`. Failure to follow this rule will cause `UnicodeEncodeError` crashes.
 
 ## CONTEXT MANAGEMENT & FILE READING (CRITICAL)
 - The workspace tree is visible in your system prompt with markers: [C]=loaded, [U]=unlockable, [L]=locked.
@@ -847,6 +856,7 @@ class StreamRenderer:
         self._live_artifact_title = ""
         self._live_artifact_lang = ""
         self._live_artifact_buffer = ""
+        self._last_stream_artifact_title = None
 
     def _render_processing_block(self, block_content: str):
         """Parses and renders a <processing> block as a rich panel."""
@@ -898,6 +908,7 @@ class StreamRenderer:
         self._progress_frame = 0
         self._live_artifact_panel = None
         self._live_artifact_started = True
+        self._last_stream_artifact_title = title
 
         if not hasattr(self, '_rich_console'):
             self._rich_console = Console()
@@ -1005,6 +1016,7 @@ class StreamRenderer:
             self._live_artifact_line_count = 0
             self._progress_frame = 0
             self._live_artifact_started = False
+            self._last_stream_artifact_title = None
 
     def _render_callback_event(self, msg_type: Any, meta: Optional[Dict]):
         """Renders structured MSG_TYPE events as Rich panels for FULL_CALLBACK_MODE."""
@@ -1020,20 +1032,20 @@ class StreamRenderer:
             
             if tool_name == "tool_execute_shell_command" and command_str:
                 panel_content = (
-                    f"[cyan]Command:[/cyan] [yellow]{command_str}[/yellow]\n"
+                    f"\n[cyan]Command:[/cyan] [yellow]{command_str}[/yellow]\n"
                     f"[cyan]Autonomy:[/cyan] [dim]{autonomy}[/dim]\n"
                     f"\n[cyan]Status:[/cyan] [yellow]⏳ Executing...[/yellow]"
                 )
             else:
                 params_str = json.dumps(params, indent=2, ensure_ascii=False) if params else "{}"
                 panel_content = (
-                    f"[cyan]Parameters:[/cyan]\n[dim]{params_str}[/dim]\n"
+                    f"\n[cyan]Parameters:[/cyan]\n[dim]{params_str}[/dim]\n"
                     f"\n[cyan]Status:[/cyan] [yellow]⏳ Executing...[/yellow]"
                 )
 
             ASCIIColors.panel(
                 panel_content,
-                title=f"[bold blue]🛠️ Executing: {tool_name}[/bold blue]",
+                title=f"\n[bold blue]🛠️ Executing: {tool_name}[/bold blue]",
                 border_style="blue"
             )
 
@@ -1052,10 +1064,10 @@ class StreamRenderer:
             else:
                 log_content = output or error or ""
 
-            panel_content = f"[cyan]Status:[/cyan] {status_str}\n\n[cyan]Execution Log:[/cyan]\n{log_content}"
+            panel_content = f"\n[cyan]Status:[/cyan] {status_str}\n\n[cyan]Execution Log:[/cyan]\n{log_content}"
             ASCIIColors.panel(
                 panel_content,
-                title=f"[bold blue]🛠️ Finished: {tool_name}[/bold blue]",
+                title=f"\n[bold blue]🛠️ Finished: {tool_name}[/bold blue]",
                 border_style="green" if success else "red"
             )
 
@@ -1064,11 +1076,16 @@ class StreamRenderer:
             art_type = meta.get("art_type", "code")
             lang = meta.get("language", "")
             is_patch = meta.get("is_patch", False)
+            is_execution = meta.get("execution_phase", False)
 
             if meta.get("stream_complete"):
                 return
 
             if self._live_artifact_panel and self._live_artifact_title == title:
+                return
+
+            if is_execution and self._last_stream_artifact_title == title:
+                self._last_stream_artifact_title = None
                 return
 
             self._stop_live_artifact_panel()
@@ -1112,13 +1129,13 @@ class StreamRenderer:
                 files_display = "\n".join(f"  - {f}" for f in files)
 
             status_color = "green" if status == "success" else "red"
-            panel_content = f"[cyan]Files:[/cyan]\n{files_display}\n\n[cyan]Status:[/cyan] [{status_color}]{status}[/{status_color}]"
+            panel_content = f"\n[cyan]Files:[/cyan]\n{files_display}\n\n[cyan]Status:[/cyan] [{status_color}]{status}[/{status_color}]"
             if error:
                 panel_content += f"\n[cyan]Error:[/cyan] [red]{error}[/red]"
 
             ASCIIColors.panel(
                 panel_content,
-                title=f"[bold yellow]📂 Context {action.replace('_', ' ').capitalize()}[/bold yellow]",
+                title=f"\n[bold yellow]📂 Context {action.replace('_', ' ').capitalize()}[/bold yellow]",
                 border_style="yellow"
             )
 
@@ -1151,6 +1168,12 @@ class StreamRenderer:
                     return True
                 if msg_type == MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END:
                     return True
+
+            if msg_type == MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START and meta and meta.get("execution_phase"):
+                self._processing_buffer = ""
+                self._in_processing = False
+                self._render_callback_event(msg_type, meta)
+                return True
 
             if meta and meta.get("status") in ("streaming", "stream_complete"):
                 if meta.get("tool_name") == "pending":

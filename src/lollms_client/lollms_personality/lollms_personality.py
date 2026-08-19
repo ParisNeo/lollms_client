@@ -1887,6 +1887,7 @@ JSON:"""
         """
         Programmatic guard for destructive file writes.
         Returns an error message string if the write is blocked, or None if allowed.
+        New file creation is ALWAYS exempt from blocking to prevent autonomous loop deadlocks.
         """
         if not is_overwrite or not self._resolved_workspace:
             return None
@@ -1995,6 +1996,12 @@ JSON:"""
             "   Wait for the user's response before emitting the tool tag.\n"
             "3. **AUTONOMOUS DEBUGGING LOOPS**: Fixing failing tests, resolving merge conflicts, and iterating on code during a debug cycle is EXEMPT from the confirmation rule.\n"
             "   If tests fail, autonomously read the logs, fix the code, and re-run tests until they pass. Do NOT ask the user for help.\n"
+            "4. **GIT STATE PRESERVATION (CRITICAL)**: \n"
+            "   Before creating a new branch (`git checkout -b`), you MUST ensure the working tree is clean.\n"
+            "   a. Run `git status`.\n"
+            "   b. If there are uncommitted changes, you MUST ask the user: \"There are uncommitted changes. Do you want me to `git stash` them or `git commit` them before creating the new branch?\"\n"
+            "   c. NEVER execute `git checkout -b` on a dirty working tree. This carries changes to the new branch and pollutes it.\n"
+            "   d. Before stashing or switching, use `<scratchpad_append>` to save your current plan and reasoning so you don't lose your train of thought.\n"
             "=== END OPERATIONAL SAFETY DOCTRINE ===\n"
             f"{onboarding_block}"
             "\n=== THINKING & REASONING CONSTRAINT ===\n"
@@ -2856,7 +2863,7 @@ JSON:"""
                                 if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
                                     try:
                                         if streaming_callback:
-                                            streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {"title": title, "art_type": "code", "language": lang, "is_patch": is_patch})
+                                            streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {"title": title, "art_type": "code", "language": lang, "is_patch": is_patch, "execution_phase": True})
                                     except Exception:
                                         pass
 
@@ -2899,9 +2906,21 @@ JSON:"""
                                     if self._artefact_manager:
                                         self._artefact_manager.add(title=title, artefact_type="code", content=body_content, language=lang, active=True)
                                     file_path = self._resolved_workspace / title
+                                    file_path.parent.mkdir(parents=True, exist_ok=True)
                                     file_path.write_text(body_content, encoding="utf-8")
                                     action_reports.append(f"✅ File {title} created/updated successfully.")
                                     actions_executed_count += 1
+
+                                    _BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".zip", ".tar", ".gz", ".pdf", ".docx", ".pptx", ".mp3", ".wav", ".mp4"}
+                                    file_ext = file_path.suffix.lower()
+                                    if file_ext not in _BINARY_EXTS and len(body_content) < 50000:
+                                        try:
+                                            self._execute_context_visibility("unlock_file", title)
+                                            action_reports.append(f"📂 Auto-loaded '{title}' into context [C].")
+                                        except Exception:
+                                            pass
+                                    elif file_ext in _BINARY_EXTS:
+                                        action_reports.append(f"🚫 Skipped auto-loading binary file '{title}' from context.")
                             except Exception as e:
                                 if getattr(self, 'debug_mode', False):
                                     self._dump_error(
@@ -3155,7 +3174,7 @@ JSON:"""
                             if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
                                 try:
                                     if streaming_callback:
-                                        streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {"title": title, "art_type": resolved_art_type, "language": lang, "is_patch": is_patch})
+                                        streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {"title": title, "art_type": resolved_art_type, "language": lang, "is_patch": is_patch, "execution_phase": True})
                                 except Exception:
                                     pass
 
@@ -3194,9 +3213,21 @@ JSON:"""
                                 if self._artefact_manager:
                                     self._artefact_manager.add(title=title, artefact_type="code", content=body_content, language=lang, active=True)
                                 file_path = self._resolved_workspace / title
+                                file_path.parent.mkdir(parents=True, exist_ok=True)
                                 file_path.write_text(body_content, encoding="utf-8")
                                 action_reports.append(f"✅ File {title} created/updated successfully.")
                                 actions_executed_count += 1
+
+                                _BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".zip", ".tar", ".gz", ".pdf", ".docx", ".pptx", ".mp3", ".wav", ".mp4"}
+                                file_ext = file_path.suffix.lower()
+                                if file_ext not in _BINARY_EXTS and len(body_content) < 50000:
+                                    try:
+                                        self._execute_context_visibility("unlock_file", title)
+                                        action_reports.append(f"📂 Auto-loaded '{title}' into context [C].")
+                                    except Exception:
+                                        pass
+                                elif file_ext in _BINARY_EXTS:
+                                    action_reports.append(f"🚫 Skipped auto-loading binary file '{title}' from context.")
                         except Exception as e:
                             action_reports.append(f"[SYSTEM ERROR] Failed to process artifact tag: {e}")
 
@@ -3492,7 +3523,7 @@ JSON:"""
                         if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
                             try:
                                 if streaming_callback:
-                                    streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {"title": title, "art_type": "code", "language": lang, "is_patch": is_patch})
+                                    streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {"title": title, "art_type": "code", "language": lang, "is_patch": is_patch, "execution_phase": True})
                             except Exception:
                                 pass
 
@@ -3523,8 +3554,20 @@ JSON:"""
                             if self._artefact_manager:
                                 self._artefact_manager.add(title=title, artefact_type="code", content=body_content, language=lang, active=True)
                             file_path = self._resolved_workspace / title
+                            file_path.parent.mkdir(parents=True, exist_ok=True)
                             file_path.write_text(body_content, encoding="utf-8")
                             action_reports.append(f"✅ File {title} created/updated successfully.")
+
+                            _BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".zip", ".tar", ".gz", ".pdf", ".docx", ".pptx", ".mp3", ".wav", ".mp4"}
+                            file_ext = file_path.suffix.lower()
+                            if file_ext not in _BINARY_EXTS and len(body_content) < 50000:
+                                try:
+                                    self._execute_context_visibility("unlock_file", title)
+                                    action_reports.append(f"📂 Auto-loaded '{title}' into context [C].")
+                                except Exception:
+                                    pass
+                            elif file_ext in _BINARY_EXTS:
+                                action_reports.append(f"🚫 Skipped auto-loading binary file '{title}' from context.")
 
                         if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
                             try:
