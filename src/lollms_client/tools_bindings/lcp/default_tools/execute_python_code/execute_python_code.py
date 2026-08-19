@@ -13,17 +13,24 @@ TOOL_LIBRARY_ICON = "🐍"
 
 def init_tools_library(config: dict = None) -> None:
     import pipmaster as pm
-    pm.ensure_packages(["matplotlib"])
+    pm.ensure_packages(["matplotlib", "pipmaster"])
     global matplotlib
     import matplotlib
     matplotlib.use('Agg')
 
-def _safe_import(module_name: str, package_name: str = None):
+def _ensure_import(module_name: str, package_name: str = None):
     try:
         return __import__(module_name)
-    except Exception as e:
-        ASCIIColors.warning(f"[execute_python_code] Optional dependency '{module_name}' failed to import: {e}")
-        return None
+    except ImportError:
+        import pipmaster as pm
+        pkg = package_name or module_name
+        ASCIIColors.warning(f"[execute_python_code] Missing dependency '{pkg}'. Installing automatically...")
+        try:
+            pm.ensure_installed(pkg)
+            return __import__(module_name)
+        except Exception as install_err:
+            ASCIIColors.error(f"[execute_python_code] Failed to auto-install '{pkg}': {install_err}")
+            return None
 
 def tool_execute_python_code(
     code: str = ""
@@ -32,8 +39,10 @@ def tool_execute_python_code(
     Execute arbitrary sandboxed Python code directly from a string.
     Useful for quick calculations, data transformations, or ad-hoc scripting.
     
-    The code runs in the current workspace directory. Any plots generated via matplotlib
-    are automatically saved to disk and registered as image artifacts.
+    The execution environment automatically provides common aliases:
+    - pd (pandas), np (numpy), plt (matplotlib.pyplot)
+    - sns (seaborn), sklearn (scikit-learn), scipy
+    If any of these libraries are missing, they will be automatically installed.
 
     Args:
         code (str): The raw Python code string to execute.
@@ -52,11 +61,20 @@ def tool_execute_python_code(
     import numpy as np
     import matplotlib.pyplot as plt
 
+    pandas_mod = _ensure_import("pandas", "pandas")
+    seaborn_mod = _ensure_import("seaborn", "seaborn")
+    sklearn_mod = _ensure_import("sklearn", "scikit-learn")
+    scipy_mod = _ensure_import("scipy", "scipy")
+
     local_vars = {
         "Path": Path,
-        "pd": _safe_import("pandas"),
+        "pd": pandas_mod,
         "np": np,
         "plt": plt,
+        "sns": seaborn_mod,
+        "sklearn": sklearn_mod,
+        "scipy": scipy_mod,
+        "_ensure_import": _ensure_import,
         "__builtins__": __builtins__
     }
 

@@ -551,7 +551,16 @@ class _AgentStreamState:
                 self.live_artifact_meta = {"title": title, "art_type": "code", "language": lang, "is_patch": "<<<<<<< SEARCH" in self._tool_buffer}
 
                 if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
-                    self._cb("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, self.live_artifact_meta)
+                    try:
+                        self._cb("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {
+                            "title": title,
+                            "art_type": "code",
+                            "language": lang,
+                            "is_patch": self.live_artifact_meta.get("is_patch", False),
+                            "stream_complete": False
+                        })
+                    except Exception:
+                        pass
 
                 if self._event_mode == EventMode.PROCESSING_TAG_MODE:
                     self._cb(f'\n<processing type="artifact" title="{title}">\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
@@ -675,7 +684,7 @@ class _AgentStreamState:
         try:
             raw_data = json.loads(json_body)
             if isinstance(raw_data, dict):
-                resolved_tool_name = raw_data.get("name", "pending")
+                resolved_tool_name = raw_data.get("name", "malformed_tool_call")
                 resolved_params = raw_data.get("parameters", {})
         except json.JSONDecodeError:
             repaired = json_body
@@ -687,10 +696,11 @@ class _AgentStreamState:
                 raw_data = json.loads(repaired)
                 json_body = repaired
                 if isinstance(raw_data, dict):
-                    resolved_tool_name = raw_data.get("name", "pending")
+                    resolved_tool_name = raw_data.get("name", "malformed_tool_call")
                     resolved_params = raw_data.get("parameters", {})
             except json.JSONDecodeError:
                 raw_data = None
+                resolved_tool_name = "malformed_tool_call"
 
         if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
             try:
@@ -752,9 +762,20 @@ class _AgentStreamState:
                     elif m.group(1).lower() == "language":
                         self.live_artifact_meta["language"] = m.group(2)
 
+        if self.live_artifact_meta:
+            is_patch_stream = "<<<<<<< SEARCH" in full_artifact_call
+            self.live_artifact_meta["is_patch"] = is_patch_stream
+
         if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
             try:
-                self._cb("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {"title": self.live_artifact_meta.get("title", "artifact"), "art_type": "code", "success": True, "error": None, "stream_complete": True})
+                self._cb("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {
+                    "title": self.live_artifact_meta.get("title", "artifact") if self.live_artifact_meta else "artifact",
+                    "art_type": "code",
+                    "success": True,
+                    "error": None,
+                    "stream_complete": True,
+                    "is_patch": self.live_artifact_meta.get("is_patch", False) if self.live_artifact_meta else False
+                })
             except Exception:
                 pass
 

@@ -1909,6 +1909,63 @@ JSON:"""
         except Exception:
             return None
 
+    def _enforce_git_branch_safety(self, command: str) -> Optional[str]:
+        """
+        Programmatic guard for git branch switching commands.
+        Blocks `git checkout -b`, `git switch`, and `git checkout <branch>` if the working tree is dirty.
+        Returns an error message string if the command is blocked, or None if allowed.
+        """
+        if not self._resolved_workspace or not command:
+            return None
+
+        try:
+            cmd_stripped = command.strip()
+            cmd_lower = cmd_stripped.lower()
+
+            is_branch_switch = False
+            if cmd_lower.startswith("git checkout -b") or cmd_lower.startswith("git switch -c") or cmd_lower.startswith("git switch "):
+                is_branch_switch = True
+            elif cmd_lower.startswith("git checkout ") and " -b " not in cmd_lower:
+                tokens = cmd_stripped.split()
+                if len(tokens) >= 3 and not tokens[2].startswith("-"):
+                    is_branch_switch = True
+
+            if not is_branch_switch:
+                return None
+
+            git_dir = self._resolved_workspace / ".git"
+            if not git_dir.exists():
+                return None
+
+            if getattr(self, '_git_autonomy_granted', False) or "Git Autonomy: Granted" in getattr(self, '_user_profile_content', ''):
+                return None
+
+            import subprocess as _sp
+            result = _sp.run(
+                ["git", "status", "--porcelain"],
+                cwd=str(self._resolved_workspace),
+                capture_output=True, text=True, encoding="utf-8", errors="ignore"
+            )
+
+            if result.returncode == 0 and result.stdout.strip():
+                dirty_files = [line.strip() for line in result.stdout.strip().splitlines() if line.strip()]
+                file_list = "\n".join(f"  - {f}" for f in dirty_files[:10])
+                if len(dirty_files) > 10:
+                    file_list += f"\n  ... and {len(dirty_files) - 10} more"
+
+                return (
+                    f"❌ GIT BRANCH SAFETY BLOCK: You are about to run `{cmd_stripped}`.\n"
+                    f"But the working tree has {len(dirty_files)} uncommitted change(s):\n{file_list}\n\n"
+                    f"You MUST either `git stash` or `git commit` these changes BEFORE switching branches.\n"
+                    f"NEVER execute `{cmd_stripped}` on a dirty working tree — this carries changes to the new branch and pollutes it.\n"
+                    f"Output EXACTLY: \"⚠️ I need to create a new branch, but you have uncommitted changes. Do you want me to `git stash` them (temporary) or `git commit` them (permanent) before I switch branches? (stash/commit/cancel)\"\n"
+                    f"Do NOT emit `<done/>` until the user responds."
+                )
+
+            return None
+        except Exception:
+            return None
+
     def _build_system_prompt(self, active_tools: Dict) -> str:
         sys_prompt = self.system_prompt or ""
         onboarding_block = self._build_onboarding_block()
@@ -2411,6 +2468,11 @@ JSON:"""
                 extracted_args = tool_params.pop("arguments")
                 extracted_args.update(tool_params)
                 tool_params = extracted_args
+
+            if tool_name == "tool_execute_shell_command":
+                git_block_msg = self._enforce_git_branch_safety(str(tool_params.get("command", "")))
+                if git_block_msg:
+                    return {"success": False, "error": git_block_msg, "output": git_block_msg}
 
             sanitized_params = {}
             for key, value in tool_params.items():
@@ -3451,9 +3513,20 @@ JSON:"""
                     
                 clean_history_text = self._sanitize_history_for_context(raw_round_text)
                 virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant provided no output]"))
+
+                recent_tool_names = [tc.get("name", "") for tc in tool_calls_this_turn[-3:]]
+                recent_context = f" Recent actions executed: {recent_tool_names}." if recent_tool_names else ""
+
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
-                    content="[SYSTEM: You stopped generation without emitting a <done/> tag. If your task is complete, output a final conversational summary and end it with a <done/> tag on a new line. If you need to continue working, emit the next functional tag now.]"
+                    content=(
+                        f"[SYSTEM: You stopped generation without emitting a <done/> tag.{recent_context}\n"
+                        "CRITICAL: Do NOT assume any action succeeded unless you see its result in the conversation history above.\n"
+                        "If your previous response stated an intent to perform an action (e.g., 'I will commit', 'I will create a branch'), "
+                        "you MUST execute that action's tag NOW. Stating intent and then emitting `<done/>` without executing is a CRITICAL ERROR.\n"
+                        "If your task is truly complete, output a final conversational summary and end it with a <done/> tag on a new line. "
+                        "If you need to continue working, emit the next functional tag now.]"
+                    )
                 ))
                 if getattr(self, 'debug_mode', False):
                     ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: No <done/> detected, injecting continuation mandate ===")
