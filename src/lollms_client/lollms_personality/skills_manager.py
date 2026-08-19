@@ -206,7 +206,7 @@ class SkillsManager:
         if has_searchable:
             def tool_search_skills(query: str) -> dict:
                 """
-                Search for skills by keyword. Use this to find hidden skills before loading them.
+                Search for hidden skills by keyword. Use this to find hidden skills before loading them.
 
                 Args:
                     query (str): The search keyword or phrase.
@@ -230,6 +230,114 @@ class SkillsManager:
                 "callable": tool_search_skills,
             }
 
-        return tools  
+        if self._skills_dirs:
+            def tool_create_skill(name: str, description: str, content: str, category: str = "general", tags: str = "", visibility: str = "loadable") -> dict:
+                """
+                Creates a new SKILL.md file in the skills directory.
+
+                Args:
+                    name (str): The title of the skill (will be used as filename).
+                    description (str): A short description of what the skill does.
+                    content (str): The full markdown content of the skill.
+                    category (str, optional): The category for the skill. Defaults to "general".
+                    tags (str, optional): Comma-separated tags. Defaults to "".
+                    visibility (str, optional): "visible", "loadable", or "searchable". Defaults to "loadable".
+                """
+                if not name or not content:
+                    return {"success": False, "error": "Name and content are required."}
+
+                safe_name = "".join(c if c.isalnum() or c in ('-', '_') else '_' for c in name)
+                skill_dir = self._skills_dirs[0] / safe_name
+                skill_dir.mkdir(parents=True, exist_ok=True)
+                
+                skill_file = skill_dir / "SKILL.md"
+                
+                tags_list = [t.strip() for t in tags.split(',') if t.strip()] if tags else []
+                
+                yaml_lines = [
+                    "---",
+                    f"title: {name}",
+                    f"description: {description}",
+                    f"category: {category}",
+                    f"tags: [{', '.join(tags_list)}]",
+                    f"visibility: {visibility}",
+                    "---"
+                ]
+                full_content = "\n".join(yaml_lines) + "\n\n" + content
+                
+                skill_file.write_text(full_content, encoding="utf-8")
+                self.reload()
+                
+                return {"success": True, "output": f"Skill '{name}' created successfully at {skill_file}."}
+
+            tools["tool_create_skill"] = {
+                "name": "tool_create_skill",
+                "description": "Creates a new SKILL.md file to save a reusable methodology or pattern for future sessions.",
+                "parameters": [
+                    {"name": "name", "type": "str", "description": "The title of the skill."},
+                    {"name": "description", "type": "str", "description": "A short description of what the skill does."},
+                    {"name": "content", "type": "str", "description": "The full markdown content of the skill."},
+                    {"name": "category", "type": "str", "description": "The category for the skill.", "optional": True},
+                    {"name": "tags", "type": "str", "description": "Comma-separated tags.", "optional": True},
+                    {"name": "visibility", "type": "str", "description": "Visibility tier: visible, loadable, or searchable.", "optional": True}
+                ],
+                "callable": tool_create_skill,
+            }
+
+            def tool_update_skill(title: str, content: str, description: str = "", category: str = "", tags: str = "", visibility: str = "") -> dict:
+                """
+                Updates an existing SKILL.md file.
+
+                Args:
+                    title (str): The title of the skill to update.
+                    content (str): The new full markdown content.
+                    description (str, optional): New description. If empty, keeps existing.
+                    category (str, optional): New category. If empty, keeps existing.
+                    tags (str, optional): New comma-separated tags. If empty, keeps existing.
+                    visibility (str, optional): New visibility. If empty, keeps existing.
+                """
+                skill = self.skills.get(title.lower())
+                if not skill:
+                    matches = self.search_skills(title)
+                    if not matches:
+                        return {"success": False, "error": f"Skill '{title}' not found."}
+                    skill = matches[0]
+
+                if not skill.file_path or not skill.file_path.exists():
+                    return {"success": False, "error": f"Skill file path not found for '{title}'."}
+
+                tags_list = [t.strip() for t in tags.split(',') if t.strip()] if tags else skill.tags
+                
+                yaml_lines = [
+                    "---",
+                    f"title: {skill.title}",
+                    f"description: {description or skill.description}",
+                    f"category: {category or skill.category}",
+                    f"tags: [{', '.join(tags_list)}]",
+                    f"visibility: {visibility or skill.visibility}",
+                    "---"
+                ]
+                full_content = "\n".join(yaml_lines) + "\n\n" + content
+                
+                skill.file_path.write_text(full_content, encoding="utf-8")
+                self.reload()
+                
+                return {"success": True, "output": f"Skill '{skill.title}' updated successfully."}
+
+            tools["tool_update_skill"] = {
+                "name": "tool_update_skill",
+                "description": "Updates an existing SKILL.md file with new content or metadata.",
+                "parameters": [
+                    {"name": "title", "type": "str", "description": "The title of the skill to update."},
+                    {"name": "content", "type": "str", "description": "The new full markdown content."},
+                    {"name": "description", "type": "str", "description": "New description.", "optional": True},
+                    {"name": "category", "type": "str", "description": "New category.", "optional": True},
+                    {"name": "tags", "type": "str", "description": "New comma-separated tags.", "optional": True},
+                    {"name": "visibility", "type": "str", "description": "New visibility tier.", "optional": True}
+                ],
+                "callable": tool_update_skill,
+            }
+
+        return tools
     
     

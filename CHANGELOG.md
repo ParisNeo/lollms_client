@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-08-19 07:50]
+
+- fix(personality): update personality and skills manager
+
 ## [2026-08-19 07:27]
 
 - refactor(core): update lollms_code CLI pipeline, personality, and system_shell tool
