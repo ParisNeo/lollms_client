@@ -169,6 +169,38 @@ def tool_execute_python_data_query(
                 plot_path = Path(".") / plot_filename
                 fig.savefig(str(plot_path), bbox_inches='tight', facecolor=fig.get_facecolor())
 
+                if discussion_instance and hasattr(discussion_instance, "artefacts"):
+                    try:
+                        art_title = plot_filename
+                        comp_title = f"{art_title}::images"
+                        existing_comp = discussion_instance.artefacts.get(comp_title)
+
+                        if existing_comp:
+                            existing_imgs = existing_comp.get("images", [])
+                            existing_mtypes = existing_comp.get("image_media_types", [])
+                            existing_imgs.append(plot_b64)
+                            existing_mtypes.append("image/png")
+                            discussion_instance.artefacts.update(
+                                title=comp_title,
+                                new_images=existing_imgs,
+                                new_image_media_types=existing_mtypes,
+                                active=True
+                            )
+                        else:
+                            discussion_instance.artefacts.add(
+                                title=art_title,
+                                artefact_type="image",
+                                content=f"![{art_title}]({art_title})",
+                                images=[plot_b64],
+                                image_media_types=["image/png"],
+                                active=True,
+                                file_ext=".png"
+                            )
+                        discussion_instance.commit()
+                        ASCIIColors.info(f"[execute_python_data_query] Synced plot '{art_title}' to artefact system.")
+                    except Exception as sync_err:
+                        ASCIIColors.warning(f"[execute_python_data_query] Failed to sync plot to artefact system: {sync_err}")
+
             plt.close('all')
 
     except Exception as e:
