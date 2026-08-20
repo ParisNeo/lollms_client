@@ -28,7 +28,7 @@ CODING_SYSTEM_PROMPT_PATH_NOTE = (
 try:
     from lollms_client import LollmsClient
     from lollms_client.lollms_personality import LollmsPersonality
-    from lollms_client.lollms_agent.lollms_agent import CapabilityFlags
+    from lollms_client.lollms_personality.lollms_personality import CapabilityFlags
     from lollms_client.lollms_types import MSG_TYPE, EventMode
 except ImportError:
     # Allows the GUI to at least launch (Settings page) before lollms_client

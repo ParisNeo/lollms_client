@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-08-20 23:30]
+
+- docs: cleanup documentation and update core client components
+
 ## [2026-08-20 08:45]
 
 - fix: resolve bugs in cli, artefact, chat, and personality modules

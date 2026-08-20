@@ -12,8 +12,6 @@
 
 from __future__ import annotations
 
-from __future__ import annotations
-
 import hashlib
 import importlib
 import importlib.util
@@ -24,6 +22,7 @@ import re
 import traceback
 from pathlib import Path
 from types import  SimpleNamespace
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from ascii_colors import ASCIIColors, trace_exception
@@ -54,7 +53,6 @@ except ImportError:
         SILENT_MODE = 3
 
 from lollms_client.lollms_memory import FailureMemory
-from lollms_client.lollms_agent.lollms_agent import CapabilityFlags, SubAgentSpawner, ModelSwitcher, BindingToolsBuilder, _build_workspace_context, _normalize_messages, _get_builtin_workspace_tools, _IGNORED_WS_DIRS, _IGNORED_WS_EXTS, _TEXT_EXTS
 from lollms_client.lollms_artefact import ArtefactVisibility, ArtefactManager
 from lollms_client.lollms_artefact.lollms_artefact import ArtefactManager as _ArtefactManager
 
@@ -78,6 +76,946 @@ _STOP_WORDS = {
     "every", "some", "any", "many", "much", "more", "most", "other",
     "such", "only", "own", "same", "than", "too", "very", "just", "now",
 }
+
+_IGNORED_WS_DIRS = {"__pycache__", ".venv", "venv", ".git", ".idea", ".vscode", "node_modules", ".lollms", "build", "dist", ".next", "env", ".env"}
+_IGNORED_WS_EXTS = {".pyc", ".pyo", ".pyd", ".so", ".dll", ".dylib"}
+_TEXT_EXTS = {".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".scss", ".sql", ".md", ".txt", ".json", ".yaml", ".yml", ".xml", ".csv", ".log", ".toml", ".ini", ".cfg", ".sh", ".bash", ".ps1", ".bat", ".rdf", ".ttl", ".rs", ".go", ".rb", ".php", ".java", ".kt", ".swift", ".c", ".cpp", ".h", ".hpp"}
+_BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp", ".zip", ".tar", ".gz", ".pdf", ".docx", ".mp3", ".wav", ".mp4", ".avi", ".mov"}
+
+
+def _build_workspace_context(workspace_path: Path, max_file_size: int = 12000, max_total_chars: int = 30000) -> str:
+    if not workspace_path or not workspace_path.exists():
+        return ""
+
+    lines = ["=== WORKSPACE FILES ==="]
+    file_entries = []
+    content_entries = []
+    total_content_chars = 0
+
+    for f_path in sorted(workspace_path.rglob("*")):
+        if not f_path.is_file():
+            continue
+        rel_parts = f_path.relative_to(workspace_path).parts
+        if any(part in _IGNORED_WS_DIRS for part in rel_parts):
+            continue
+        if any(part.startswith(".") for part in rel_parts[:-1]):
+            continue
+        file_name = f_path.name
+        file_ext = f_path.suffix.lower()
+        if file_ext in _IGNORED_WS_EXTS or file_name.startswith("."):
+            continue
+
+        size = f_path.stat().st_size
+        rel_path = f_path.relative_to(workspace_path)
+        size_str = f"{size:,} bytes"
+
+        if file_ext in _TEXT_EXTS and size <= max_file_size:
+            file_entries.append(f"- {rel_path} ({size_str}, text)")
+            if total_content_chars < max_total_chars:
+                try:
+                    content = f_path.read_text(encoding="utf-8", errors="ignore")
+                    remaining_budget = max_total_chars - total_content_chars
+                    if len(content) > remaining_budget:
+                        content = content[:remaining_budget] + f"\n... [truncated, {len(content) - remaining_budget} more chars]"
+                    content_entries.append(f"\n--- {rel_path} ---\n```{file_ext.lstrip('.')}\n{content}\n```\n")
+                    total_content_chars += len(content)
+                except Exception:
+                    file_entries.append(f"- {rel_path} ({size_str}, unreadable)")
+        elif file_ext in _BINARY_EXTS:
+            file_entries.append(f"- {rel_path} ({size_str}, binary)")
+        else:
+            file_entries.append(f"- {rel_path} ({size_str})")
+
+    if not file_entries:
+        lines.append("(Workspace is empty)")
+        lines.append("=== END WORKSPACE FILES ===")
+        return "\n".join(lines)
+
+    lines.append("Files in workspace:")
+    lines.extend(file_entries)
+
+    if content_entries:
+        lines.append("\nFile Contents:")
+        lines.extend(content_entries)
+
+    lines.append("=== END WORKSPACE FILES ===")
+    return "\n".join(lines)
+
+
+
+
+def _normalize_messages(messages: List[Dict]) -> List[Dict]:
+    """Ensure proper user/assistant alternation for OpenAI API."""
+    if not messages:
+        return messages
+
+    normalized = []
+    system_content_parts = []
+    non_system_messages = []
+
+    for msg in messages:
+        if msg.get("role") == "system":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                text_parts = [item.get("text", "") for item in content if item.get("type") == "text"]
+                system_content_parts.append("\n".join(text_parts))
+            else:
+                system_content_parts.append(str(content))
+        else:
+            non_system_messages.append(msg)
+
+    if system_content_parts:
+        fused = "\n\n".join(p for p in system_content_parts if p.strip())
+        if fused.strip():
+            normalized.append({"role": "system", "content": fused})
+
+    if non_system_messages:
+        current_role = None
+        current_content = []
+        for msg in non_system_messages:
+            role = msg.get("role")
+            content = msg.get("content", "")
+            if not content and not msg.get("images"):
+                continue
+            if role == current_role:
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            current_content.append(item.get("text", ""))
+                else:
+                    current_content.append(str(content))
+            else:
+                if current_role is not None and current_content:
+                    merged = "\n\n".join(c for c in current_content if c.strip())
+                    if merged.strip():
+                        normalized.append({"role": current_role, "content": merged})
+                current_role = role
+                current_content = []
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            current_content.append(item.get("text", ""))
+                else:
+                    current_content.append(str(content))
+        if current_role is not None and current_content:
+            merged = "\n\n".join(c for c in current_content if c.strip())
+            if merged.strip():
+                normalized.append({"role": current_role, "content": merged})
+
+    non_sys_start = 0
+    for i, msg in enumerate(normalized):
+        if msg.get("role") != "system":
+            non_sys_start = i
+            break
+    if non_sys_start < len(normalized):
+        first_non_sys = normalized[non_sys_start]
+        if first_non_sys.get("role") == "assistant":
+            normalized.insert(non_sys_start, {"role": "user", "content": "Continue."})
+
+    return normalized
+
+
+
+# ===========================================================================
+# CapabilityFlags — Boolean gates for agent capabilities
+# ===========================================================================
+
+@dataclass
+class CapabilityFlags:
+    """
+    Controls what the agent is allowed to do.
+    All dangerous capabilities default to False for safety.
+    """
+    # Code execution
+    enable_code_execution: bool = False
+
+    # File access
+    enable_external_file_access: bool = False  # Access files outside workspace
+
+    # Networking
+    enable_networking: bool = False  # Internet/network tools
+
+    # Multimodal bindings
+    enable_image_generation: bool = True
+    enable_image_editing: bool = True
+    enable_tts: bool = False
+    enable_stt: bool = False
+    enable_ttm: bool = False  # Text-to-music
+    enable_ttv: bool = False  # Text-to-video
+
+    # Agentic features
+    enable_sub_agents: bool = True
+    enable_model_switching: bool = False
+    enable_skill_creation: bool = True
+    enable_skill_loading: bool = True
+
+    # Skills display mode: "always_visible", "loadable", "mixed"
+    skills_mode: str = "loadable"
+
+    # Sub-agent limits
+    max_sub_agent_depth: int = 3
+    max_sub_agents_per_turn: int = 5
+
+    # Workspace file tools (always enabled if workspace is configured)
+    # These are not toggleable for security reasons — workspace tools are always safe
+    enable_workspace_tools: bool = True  # tool_write_file, tool_read_file, tool_list_files
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "enable_code_execution": self.enable_code_execution,
+            "enable_external_file_access": self.enable_external_file_access,
+            "enable_networking": self.enable_networking,
+            "enable_image_generation": self.enable_image_generation,
+            "enable_image_editing": self.enable_image_editing,
+            "enable_tts": self.enable_tts,
+            "enable_stt": self.enable_stt,
+            "enable_ttm": self.enable_ttm,
+            "enable_ttv": self.enable_ttv,
+            "enable_sub_agents": self.enable_sub_agents,
+            "enable_model_switching": self.enable_model_switching,
+            "enable_skill_creation": self.enable_skill_creation,
+            "enable_skill_loading": self.enable_skill_loading,
+            "skills_mode": self.skills_mode,
+            "max_sub_agent_depth": self.max_sub_agent_depth,
+            "max_sub_agents_per_turn": self.max_sub_agents_per_turn,
+        }
+
+
+# ===========================================================================
+# ToolsManager — Load and execute lollms-format tool scripts (existing, kept)
+# ===========================================================================
+
+class ToolsManager:
+    SYSTEM_TOOLS_DIR = Path("app/tools")
+    USER_TOOLS_DIR = Path.home() / ".lollms_hub" / "tools"
+
+    def __init__(self, extra_dirs: Optional[List[Union[str, Path]]] = None):
+        self._extra_dirs: List[Path] = [Path(d) for d in (extra_dirs or [])]
+        self._loaded_modules: Dict[str, ModuleType] = {}
+
+    @classmethod
+    def ensure_dirs(cls):
+        cls.SYSTEM_TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+        cls.USER_TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _scan_paths(self) -> List[Path]:
+        dirs = [self.SYSTEM_TOOLS_DIR, self.USER_TOOLS_DIR] + self._extra_dirs
+        return [d for d in dirs if d.exists()]
+
+    def list_available_files(self) -> List[Path]:
+        files: set = set()
+        for directory in self._scan_paths():
+            for fp in directory.glob("*.py"):
+                if fp.name == "__init__.py":
+                    continue
+                files.add(fp.resolve())
+        return sorted(files, key=lambda p: p.name.lower())
+
+    @staticmethod
+    def parse_metadata(content: str) -> Dict[str, str]:
+        meta = {"name": "Unnamed Tool Library", "description": "No description provided.", "icon": "🔧"}
+        try:
+            tree = ast.parse(content)
+            for node in tree.body:
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            if target.id == "TOOL_LIBRARY_NAME":
+                                meta["name"] = ast.literal_eval(node.value)
+                            elif target.id == "TOOL_LIBRARY_DESC":
+                                meta["description"] = ast.literal_eval(node.value)
+                            elif target.id == "TOOL_LIBRARY_ICON":
+                                meta["icon"] = ast.literal_eval(node.value)
+        except Exception:
+            pass
+        return meta
+
+    @staticmethod
+    def get_tool_definitions(content: str) -> List[Dict[str, Any]]:
+        tools: List[Dict[str, Any]] = []
+        titles: Dict[str, str] = {}
+        try:
+            tree = ast.parse(content)
+            for node in tree.body:
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and target.id == "TOOL_TITLES":
+                            titles = ast.literal_eval(node.value)
+            for node in tree.body:
+                if isinstance(node, ast.FunctionDef) and node.name.startswith("tool_"):
+                    docstring = ast.get_docstring(node) or "No description provided."
+                    params: Dict[str, Any] = {"type": "object", "properties": {}, "required": []}
+                    arg_pattern = re.compile(
+                        r'^\s*-\s+([\w_]+)\s*\(([\w_]+)(?:,\s*optional)?\):\s*(.*)',
+                        re.MULTILINE | re.IGNORECASE,
+                    )
+                    for m in arg_pattern.finditer(docstring):
+                        name, p_type, desc = m.groups()
+                        p_type_map = {"str": "string", "int": "integer", "float": "number", "bool": "boolean", "dict": "object", "list": "array"}
+                        params["properties"][name] = {"type": p_type_map.get(p_type.lower(), "string"), "description": desc.strip()}
+                        if "optional" not in m.group(0).lower():
+                            params["required"].append(name)
+                    if not params["properties"]:
+                        has_args = any((isinstance(arg, ast.arg) and arg.arg == "args") for arg in node.args.args)
+                        if has_args:
+                            params["properties"]["args"] = {"type": "object", "description": "Arguments for the tool"}
+                    tools.append({"type": "function", "pretty_name": titles.get(node.name), "function": {"name": node.name, "description": docstring.split('\n\n')[0].strip(), "parameters": params}})
+        except Exception:
+            pass
+        return tools
+
+    def load_file(self, file_path: Union[str, Path]) -> ModuleType:
+        fp = Path(file_path).resolve()
+        key = str(fp)
+        if key in self._loaded_modules:
+            return self._loaded_modules[key]
+        content = fp.read_text(encoding="utf-8")
+        module_name = f"lollms_tools_{fp.stem}_{uuid.uuid4().hex[:8]}"
+        module = ModuleType(module_name)
+        module.__file__ = str(fp)
+        exec(compile(content, str(fp), "exec"), module.__dict__)
+        if hasattr(module, "init_tools_library"):
+            try:
+                module.init_tools_library()
+            except Exception as e:
+                ASCIIColors.warning(f"Tool init failed for {fp.name}: {e}")
+        self._loaded_modules[key] = module
+        return module
+
+    def get_callable_tools(self, file_path: Union[str, Path]) -> Dict[str, Callable]:
+        module = self.load_file(file_path)
+        return {name: getattr(module, name) for name in dir(module) if name.startswith("tool_") and callable(getattr(module, name))}
+
+    def execute_tool(self, file_path: Union[str, Path], tool_name: str, args: Dict[str, Any]) -> Any:
+        callables = self.get_callable_tools(file_path)
+        if tool_name not in callables:
+            raise ValueError(f"Tool '{tool_name}' not found in {file_path}")
+        return callables[tool_name](args)
+
+    def resolve_tool_file(self, tool_name: str) -> Optional[Path]:
+        for fp in self.list_available_files():
+            defs = self.get_tool_definitions(fp.read_text(encoding="utf-8"))
+            for d in defs:
+                if d["function"]["name"] == tool_name:
+                    return fp
+        return None
+
+    def build_tool_specs(self, sources: List[Union[str, Path, Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        specs: List[Dict[str, Any]] = []
+        for src in sources:
+            if isinstance(src, dict):
+                specs.append(src)
+                continue
+            fp = Path(src)
+            if not fp.exists():
+                raise FileNotFoundError(f"Tool file not found: {fp}")
+            content = fp.read_text(encoding="utf-8")
+            file_specs = self.get_tool_definitions(content)
+            for s in file_specs:
+                s["_source_file"] = str(fp.resolve())
+            specs.extend(file_specs)
+        return specs
+
+    def build_inline_tools_dict(self, sources: List[Union[str, Path, Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
+        tools_dict: Dict[str, Dict[str, Any]] = {}
+        for src in sources:
+            if isinstance(src, dict):
+                name = src.get("name", src.get("function", {}).get("name", "unknown"))
+                tools_dict[name] = src
+                continue
+            fp = Path(src)
+            if not fp.exists():
+                raise FileNotFoundError(f"Tool file not found: {fp}")
+            module = self.load_file(fp)
+            callables = self.get_callable_tools(fp)
+            for tool_name, fn in callables.items():
+                doc = (fn.__doc__ or "").strip()
+                params: List[Dict[str, Any]] = []
+                arg_pattern = re.compile(r'^\s*-\s+([\w_]+)\s*\(([\w_]+)(?:,\s*optional)?\):\s*(.*)', re.MULTILINE | re.IGNORECASE)
+                for m in arg_pattern.finditer(doc):
+                    pname, ptype, pdesc = m.groups()
+                    is_optional = "optional" in m.group(0).lower()
+                    p_entry: Dict[str, Any] = {"name": pname, "type": ptype.lower(), "description": pdesc.strip()}
+                    if is_optional:
+                        p_entry["optional"] = True
+                    params.append(p_entry)
+                tools_dict[tool_name] = {"name": tool_name, "callable": fn, "parameters": params, "description": doc.split('\n\n')[0].strip() if doc else f"Execute {tool_name}", "_source_file": str(fp.resolve())}
+        return tools_dict
+
+    
+# ===========================================================================
+# SubAgentSpawner — Delegation to focused child agents
+# ===========================================================================
+
+class SubAgentSpawner:
+    """
+    Spawns child agents for sub-task delegation.
+    Enforces recursion depth and per-turn spawn count limits.
+    """
+
+    def __init__(self, parent_agent: 'Agent', max_depth: int = 3, max_per_turn: int = 5):
+        self.parent = parent_agent
+        self.max_depth = max_depth
+        self.max_per_turn = max_per_turn
+        self._current_depth = 0
+        self._spawned_this_turn = 0
+
+    def reset_turn(self):
+        self._spawned_this_turn = 0
+
+    def set_depth(self, depth: int):
+        self._current_depth = depth
+
+    def can_spawn(self) -> bool:
+        return (
+            self._current_depth < self.max_depth and
+            self._spawned_this_turn < self.max_per_turn
+        )
+
+    def spawn(
+        self,
+        instruction: str,
+        personality_conditioning: Optional[str] = None,
+        model_name: Optional[str] = None,
+        temperature: float = 0.3,
+        max_steps: int = 5,
+    ) -> Dict[str, Any]:
+        """
+        Spawns a child agent to perform a sub-task.
+        The child shares the parent's workspace but has NO sub-agent capability
+        (to prevent infinite recursion).
+
+        Args:
+            instruction: The specific task for the child agent.
+            personality_conditioning: Custom system prompt for the child.
+            model_name: Specific model to use (None = parent's model).
+            temperature: Low temperature for focused work (default 0.3).
+            max_steps: Maximum reasoning steps for the child (default 5).
+        """
+        if not self.can_spawn():
+            return {
+                "success": False,
+                "error": f"Sub-agent spawn limit reached (depth: {self._current_depth}/{self.max_depth}, spawned: {self._spawned_this_turn}/{self.max_per_turn})."
+            }
+
+        self._spawned_this_turn += 1
+
+        try:
+            from lollms_client.lollms_personality.lollms_personality import LollmsPersonality
+
+            # Create a focused personality for the child
+            child_personality = LollmsPersonality(
+                name=f"SubAgent_{uuid.uuid4().hex[:6]}",
+                author="lollms_agent",
+                category="sub_agent",
+                description="A focused sub-agent spawned for a specific task.",
+                system_prompt=personality_conditioning or (
+                    "You are a focused sub-agent. Execute the given task precisely and return the result. "
+                    "Do not engage in conversational pleasantries. Focus solely on the task."
+                ),
+            )
+
+            # Create child agent with disabled sub-agents and model switching
+            child_caps = CapabilityFlags(
+                enable_code_execution=self.parent.capabilities.enable_code_execution,
+                enable_image_generation=False,  # Children don't need image gen
+                enable_image_editing=False,
+                enable_sub_agents=False,  # CRITICAL: Prevent infinite recursion
+                enable_model_switching=False,
+                enable_skill_loading=self.parent.capabilities.enable_skill_loading,
+                enable_skill_creation=False,  # Children can't create skills
+                skills_mode="loadable",
+                max_sub_agent_depth=0,
+            )
+
+            child_agent = Agent(
+                lc=self.parent.lc,
+                personality=child_personality,
+                name=f"SubAgent_{self._spawned_this_turn}",
+                role=AgentRole.IMPLEMENTER,
+                workspace_path=self.parent.get_workspace_path(),
+                capabilities=child_caps,
+                skills_manager=self.parent.skills_manager,  # Share skills
+                model_params=self.parent.model_params,
+                max_tokens_per_turn=self.parent.max_tokens_per_turn,
+                memory_manager=None,  # Children don't write to memory
+                _parent_depth=self._current_depth + 1,
+            )
+
+            # If model_name specified, temporarily switch
+            original_model = None
+            if model_name and hasattr(self.parent.lc, 'llm'):
+                try:
+                    original_model = getattr(self.parent.lc.llm, 'model_name', None)
+                except Exception:
+                    pass
+
+            # Execute child chat (non-streaming, no internal history)
+            result = child_agent.chat(
+                prompt=instruction,
+                streaming_callback=None,
+                max_reasoning_steps=max_steps,
+                temperature=temperature,
+                use_internal_history=False,
+            )
+
+            child_response = result.get("response", "")
+            child_tool_calls = result.get("tool_calls", [])
+
+            return {
+                "success": True,
+                "output": child_response,
+                "child_tool_calls": child_tool_calls,
+                "child_rounds": result.get("rounds", 0),
+                "prompt_injection": f"\n\n=== 🧠 SUB-AGENT REPORT ===\nThe sub-agent completed: '{instruction[:100]}...'\n\n{child_response}\n=== END SUB-AGENT REPORT ===",
+            }
+
+        except Exception as e:
+            trace_exception(e)
+            return {
+                "success": False,
+                "error": f"Sub-agent spawn failed: {e}",
+                "traceback": traceback.format_exc(),
+            }
+
+
+# ===========================================================================
+# ModelSwitcher — On-the-fly model switching
+# ===========================================================================
+
+class ModelSwitcher:
+    """
+    Allows the agent to switch between models during a session.
+    Uses the LLM binding's mount/load capabilities.
+    """
+
+    def __init__(self, client: 'LollmsClient'):
+        self.client = client
+        self._original_model: Optional[str] = None
+        self._current_model: Optional[str] = None
+        self._available_models: List[str] = []
+
+    def _get_llm(self):
+        return getattr(self.client, 'llm', None)
+
+    def list_models(self) -> List[str]:
+        """Lists available models from the binding."""
+        llm = self._get_llm()
+        if not llm:
+            return []
+
+        # Try different methods based on binding type
+        if hasattr(llm, 'list_models'):
+            try:
+                return llm.list_models()
+            except Exception:
+                pass
+
+        if hasattr(llm, 'available_models'):
+            try:
+                return llm.available_models
+            except Exception:
+                pass
+
+        # For local bindings with a models directory
+        if hasattr(llm, 'models_path'):
+            try:
+                models_dir = Path(llm.models_path)
+                if models_dir.exists():
+                    exts = {'.gguf', '.bin', '.onnx', '.pt', '.safetensors'}
+                    return [f.name for f in models_dir.iterdir() if f.is_file() and f.suffix.lower() in exts]
+            except Exception:
+                pass
+
+        return self._available_models
+
+    def get_current_model(self) -> str:
+        llm = self._get_llm()
+        if llm:
+            return getattr(llm, 'model_name', 'unknown')
+        return 'unknown'
+
+    def switch_model(self, model_name: str) -> Dict[str, Any]:
+        """
+        Switches to a different model.
+        For local bindings: unloads current model and loads the new one.
+        For remote bindings: updates the model_name parameter.
+        """
+        llm = self._get_llm()
+        if not llm:
+            return {"success": False, "error": "No LLM binding available."}
+
+        # Store original model for restoration
+        if self._original_model is None:
+            self._original_model = getattr(llm, 'model_name', None)
+
+        try:
+            # For local bindings with load_model/unload_model
+            if hasattr(llm, 'unload_model') and hasattr(llm, 'load_model'):
+                try:
+                    llm.unload_model()
+                except Exception:
+                    pass
+                success = llm.load_model(model_name)
+                if not success:
+                    # Try to restore original
+                    if self._original_model:
+                        try:
+                            llm.load_model(self._original_model)
+                        except Exception:
+                            pass
+                    return {"success": False, "error": f"Failed to load model '{model_name}'."}
+                self._current_model = model_name
+                return {
+                    "success": True,
+                    "output": f"Switched to model '{model_name}'.",
+                    "current_model": model_name,
+                }
+
+            # For remote bindings, just set model_name
+            elif hasattr(llm, 'model_name'):
+                old_model = llm.model_name
+                llm.model_name = model_name
+                self._current_model = model_name
+                return {
+                    "success": True,
+                    "output": f"Switched from '{old_model}' to '{model_name}'.",
+                    "current_model": model_name,
+                }
+
+            else:
+                return {"success": False, "error": "Binding does not support model switching."}
+
+        except Exception as e:
+            trace_exception(e)
+            return {"success": False, "error": f"Model switch failed: {e}"}
+
+    def restore_original_model(self) -> Dict[str, Any]:
+        """Restores the original model if it was switched."""
+        if self._original_model and self._current_model != self._original_model:
+            return self.switch_model(self._original_model)
+        return {"success": True, "output": "No restoration needed."}        
+
+
+
+# ===========================================================================
+# BindingToolsBuilder — Exposes lollms_client bindings as callable tools
+# ===========================================================================
+
+class BindingToolsBuilder:
+    """
+    Builds callable tools from lollms_client's multimodal bindings (TTI, TTS, STT, etc.).
+    Each tool is only registered if the corresponding binding is available and the
+    capability flag is enabled.
+    """
+
+    @staticmethod
+    def build_tools(client: 'LollmsClient', caps: CapabilityFlags, workspace_path: Optional[Path] = None) -> Dict[str, Dict[str, Any]]:
+        """Builds all binding-based tools based on available bindings and capability flags."""
+        tools: Dict[str, Dict[str, Any]] = {}
+
+        # TTI (Text-to-Image)
+        tti = getattr(client, 'tti', None)
+        if tti is not None:
+            if caps.enable_image_generation:
+                tools["tool_generate_image"] = BindingToolsBuilder._make_tti_generate_tool(tti, workspace_path)
+            if caps.enable_image_editing:
+                tools["tool_edit_image"] = BindingToolsBuilder._make_tti_edit_tool(tti, workspace_path)
+
+        # TTS (Text-to-Speech)
+        tts = getattr(client, 'tts', None)
+        if tts is not None and caps.enable_tts:
+            tools["tool_text_to_speech"] = BindingToolsBuilder._make_tts_tool(tts, workspace_path)
+
+        # STT (Speech-to-Text)
+        stt = getattr(client, 'stt', None)
+        if stt is not None and caps.enable_stt:
+            tools["tool_speech_to_text"] = BindingToolsBuilder._make_stt_tool(stt, workspace_path)
+
+        # TTM (Text-to-Music)
+        ttm = getattr(client, 'ttm', None)
+        if ttm is not None and caps.enable_ttm:
+            tools["tool_generate_music"] = BindingToolsBuilder._make_ttm_tool(ttm, workspace_path)
+
+        # TTV (Text-to-Video)
+        ttv = getattr(client, 'ttv', None)
+        if ttv is not None and caps.enable_ttv:
+            tools["tool_generate_video"] = BindingToolsBuilder._make_ttv_tool(ttv, workspace_path)
+
+        return tools
+
+    @staticmethod
+    def _make_tti_generate_tool(tti_binding, workspace_path: Optional[Path]) -> Dict[str, Any]:
+        def tool_generate_image(prompt: str, width: int = 1024, height: int = 1024, file_name: str = "") -> dict:
+            """
+            Generate an image from a text prompt using the Text-to-Image binding.
+
+            Args:
+                prompt (str): Detailed English prompt describing the image to generate.
+                width (int, optional): Image width in pixels. Defaults to 1024.
+                height (int, optional): Image height in pixels. Defaults to 1024.
+                file_name (str, optional): Output filename (without extension). Auto-generated if empty.
+            """
+            try:
+                img_bytes = tti_binding.generate_image(prompt=prompt, width=width, height=height)
+                if not img_bytes:
+                    return {"success": False, "error": "Image generation returned no data."}
+
+                fname = file_name or f"generated_image_{uuid.uuid4().hex[:6]}"
+                if not fname.endswith(".png"):
+                    fname += ".png"
+
+                save_path = Path(fname)
+                if workspace_path:
+                    save_path = workspace_path / fname
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                save_path.write_bytes(img_bytes)
+
+                img_b64 = base64.b64encode(img_bytes).decode('utf-8')
+                return {
+                    "success": True,
+                    "output": f"Image generated and saved as '{fname}'.",
+                    "image_filename": fname,
+                    "image_b64": img_b64,
+                    "prompt_injection": f"\n\n✅ **Image Generated:** `{fname}`\nReference it in your response."
+                }
+            except Exception as e:
+                return {"success": False, "error": f"Image generation failed: {e}"}
+
+        return {
+            "name": "tool_generate_image",
+            "description": "Generate an image from a text prompt using the Text-to-Image (TTI) binding. The image is saved to the workspace.",
+            "parameters": [
+                {"name": "prompt", "type": "str", "description": "Detailed English prompt describing the image."},
+                {"name": "width", "type": "int", "description": "Image width in pixels (default 1024).", "optional": True},
+                {"name": "height", "type": "int", "description": "Image height in pixels (default 1024).", "optional": True},
+                {"name": "file_name", "type": "str", "description": "Output filename without extension (auto-generated if empty).", "optional": True},
+            ],
+            "callable": tool_generate_image,
+        }
+
+    @staticmethod
+    def _make_tti_edit_tool(tti_binding, workspace_path: Optional[Path]) -> Dict[str, Any]:
+        def tool_edit_image(prompt: str, image_file_name: str = "") -> dict:
+            """
+            Edit an existing image in the workspace using a text prompt.
+
+            Args:
+                prompt (str): Detailed English prompt describing the edits to apply.
+                image_file_name (str): Filename of the image to edit (in the workspace).
+            """
+            try:
+                # Load source image
+                source_b64 = None
+                if image_file_name:
+                    img_path = Path(image_file_name)
+                    if not img_path.exists() and workspace_path:
+                        img_path = workspace_path / image_file_name
+                    if img_path.exists():
+                        raw = img_path.read_bytes()
+                        source_b64 = base64.b64encode(raw).decode('utf-8')
+
+                if not source_b64:
+                    return {"success": False, "error": f"Source image '{image_file_name}' not found in workspace."}
+
+                img_bytes = tti_binding.edit_image(image=source_b64, prompt=prompt)
+                if not img_bytes:
+                    return {"success": False, "error": "Image edit returned no data."}
+
+                fname = f"edited_image_{uuid.uuid4().hex[:6]}.png"
+                save_path = Path(fname)
+                if workspace_path:
+                    save_path = workspace_path / fname
+                save_path.write_bytes(img_bytes)
+
+                return {
+                    "success": True,
+                    "output": f"Image edited and saved as '{fname}'.",
+                    "image_filename": fname,
+                }
+            except Exception as e:
+                return {"success": False, "error": f"Image edit failed: {e}"}
+
+        return {
+            "name": "tool_edit_image",
+            "description": "Edit an existing image in the workspace using a text prompt via the TTI binding.",
+            "parameters": [
+                {"name": "prompt", "type": "str", "description": "Detailed prompt describing the edits."},
+                {"name": "image_file_name", "type": "str", "description": "Filename of the source image in the workspace."},
+            ],
+            "callable": tool_edit_image,
+        }
+
+    @staticmethod
+    def _make_tts_tool(tts_binding, workspace_path: Optional[Path]) -> Dict[str, Any]:
+        def tool_text_to_speech(text: str, voice: str = "", language: str = "en", file_name: str = "") -> dict:
+            """
+            Convert text to speech audio using the TTS binding.
+
+            Args:
+                text (str): The text to synthesize into speech.
+                voice (str, optional): Voice name to use (binding-specific).
+                language (str, optional): Language code (e.g., 'en', 'fr'). Defaults to 'en'.
+                file_name (str, optional): Output filename (without extension). Auto-generated if empty.
+            """
+            try:
+                audio_bytes = tts_binding.generate_audio(text=text, voice=voice or None, language=language)
+                if not audio_bytes:
+                    return {"success": False, "error": "TTS returned no audio data."}
+
+                fname = file_name or f"speech_{uuid.uuid4().hex[:6]}"
+                if not fname.endswith(".wav"):
+                    fname += ".wav"
+
+                save_path = Path(fname)
+                if workspace_path:
+                    save_path = workspace_path / fname
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                save_path.write_bytes(audio_bytes)
+
+                return {
+                    "success": True,
+                    "output": f"Audio generated and saved as '{fname}'.",
+                    "audio_filename": fname,
+                }
+            except Exception as e:
+                return {"success": False, "error": f"TTS failed: {e}"}
+
+        return {
+            "name": "tool_text_to_speech",
+            "description": "Convert text to speech audio using the Text-to-Speech (TTS) binding. Audio is saved as a WAV file.",
+            "parameters": [
+                {"name": "text", "type": "str", "description": "The text to synthesize."},
+                {"name": "voice", "type": "str", "description": "Voice name (binding-specific, optional).", "optional": True},
+                {"name": "language", "type": "str", "description": "Language code (default 'en').", "optional": True},
+                {"name": "file_name", "type": "str", "description": "Output filename without extension (auto-generated if empty).", "optional": True},
+            ],
+            "callable": tool_text_to_speech,
+        }
+
+    @staticmethod
+    def _make_stt_tool(stt_binding, workspace_path: Optional[Path]) -> Dict[str, Any]:
+        def tool_speech_to_text(audio_file_name: str) -> dict:
+            """
+            Transcribe speech from an audio file to text using the STT binding.
+
+            Args:
+                audio_file_name (str): Filename of the audio file in the workspace.
+            """
+            try:
+                audio_path = Path(audio_file_name)
+                if not audio_path.exists() and workspace_path:
+                    audio_path = workspace_path / audio_file_name
+                if not audio_path.exists():
+                    return {"success": False, "error": f"Audio file '{audio_file_name}' not found."}
+
+                audio_bytes = audio_path.read_bytes()
+                transcript = stt_binding.transcribe(audio=audio_bytes)
+                return {
+                    "success": True,
+                    "output": f"Transcription: {transcript}",
+                    "transcript": transcript,
+                }
+            except Exception as e:
+                return {"success": False, "error": f"STT failed: {e}"}
+
+        return {
+            "name": "tool_speech_to_text",
+            "description": "Transcribe speech from an audio file in the workspace to text using the STT binding.",
+            "parameters": [
+                {"name": "audio_file_name", "type": "str", "description": "Filename of the audio file in the workspace."},
+            ],
+            "callable": tool_speech_to_text,
+        }
+
+    @staticmethod
+    def _make_ttm_tool(ttm_binding, workspace_path: Optional[Path]) -> Dict[str, Any]:
+        def tool_generate_music(prompt: str, duration: int = 10, file_name: str = "") -> dict:
+            """
+            Generate music from a text prompt using the TTM binding.
+
+            Args:
+                prompt (str): Description of the music to generate.
+                duration (int, optional): Duration in seconds. Defaults to 10.
+                file_name (str, optional): Output filename (without extension). Auto-generated if empty.
+            """
+            try:
+                audio_bytes = ttm_binding.generate_music(prompt=prompt, duration=duration)
+                if not audio_bytes:
+                    return {"success": False, "error": "TTM returned no audio data."}
+
+                fname = file_name or f"music_{uuid.uuid4().hex[:6]}"
+                if not fname.endswith(".wav"):
+                    fname += ".wav"
+
+                save_path = Path(fname)
+                if workspace_path:
+                    save_path = workspace_path / fname
+                save_path.write_bytes(audio_bytes)
+
+                return {
+                    "success": True,
+                    "output": f"Music generated and saved as '{fname}'.",
+                    "audio_filename": fname,
+                }
+            except Exception as e:
+                return {"success": False, "error": f"TTM failed: {e}"}
+
+        return {
+            "name": "tool_generate_music",
+            "description": "Generate music from a text prompt using the Text-to-Music (TTM) binding.",
+            "parameters": [
+                {"name": "prompt", "type": "str", "description": "Description of the music to generate."},
+                {"name": "duration", "type": "int", "description": "Duration in seconds (default 10).", "optional": True},
+                {"name": "file_name", "type": "str", "description": "Output filename without extension.", "optional": True},
+            ],
+            "callable": tool_generate_music,
+        }
+
+    @staticmethod
+    def _make_ttv_tool(ttv_binding, workspace_path: Optional[Path]) -> Dict[str, Any]:
+        def tool_generate_video(prompt: str, duration: int = 5, file_name: str = "") -> dict:
+            """
+            Generate a video from a text prompt using the TTV binding.
+
+            Args:
+                prompt (str): Description of the video to generate.
+                duration (int, optional): Duration in seconds. Defaults to 5.
+                file_name (str, optional): Output filename (without extension). Auto-generated if empty.
+            """
+            try:
+                video_bytes = ttv_binding.generate_video(prompt=prompt, duration=duration)
+                if not video_bytes:
+                    return {"success": False, "error": "TTV returned no video data."}
+
+                fname = file_name or f"video_{uuid.uuid4().hex[:6]}"
+                if not fname.endswith(".mp4"):
+                    fname += ".mp4"
+
+                save_path = Path(fname)
+                if workspace_path:
+                    save_path = workspace_path / fname
+                save_path.write_bytes(video_bytes)
+
+                return {
+                    "success": True,
+                    "output": f"Video generated and saved as '{fname}'.",
+                    "video_filename": fname,
+                }
+            except Exception as e:
+                return {"success": False, "error": f"TTV failed: {e}"}
+
+        return {
+            "name": "tool_generate_video",
+            "description": "Generate a video from a text prompt using the Text-to-Video (TTV) binding.",
+            "parameters": [
+                {"name": "prompt", "type": "str", "description": "Description of the video to generate."},
+                {"name": "duration", "type": "int", "description": "Duration in seconds (default 5).", "optional": True},
+                {"name": "file_name", "type": "str", "description": "Output filename without extension.", "optional": True},
+            ],
+            "callable": tool_generate_video,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Personality Bundle Importer

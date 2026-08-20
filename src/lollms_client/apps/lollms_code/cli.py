@@ -41,7 +41,7 @@ from lollms_client.lollms_config_cli_env import get_client_from_env
 from lollms_client import LollmsClient
 from lollms_client.lollms_personality import LollmsPersonality, PersonalityBundle
 from lollms_client.lollms_personality.skills_manager import SkillsManager
-from lollms_client.lollms_agent.lollms_agent import CapabilityFlags
+from lollms_client.lollms_personality.lollms_personality import CapabilityFlags
 from lollms_client.lollms_types import MSG_TYPE, EventMode
 
 from ascii_colors.rich.console import Console

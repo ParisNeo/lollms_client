@@ -220,11 +220,10 @@ class WhisperSTTBinding(LollmsSTTBinding):
             raise RuntimeError("Communication with the Whisper server failed.") from e
 
     def transcribe_audio(self, audio_source: Union[str, Path, bytes], model: Optional[str] = None, **kwargs) -> str:
-        if self.auto_start_server:
-            self.ensure_server_is_running(True)
+        self.ensure_server_is_running(True)
             
-        if not self.is_server_running() and not self.auto_start_server:
-             raise RuntimeError("Whisper server is not running and auto_start_server is False.")
+        if not self.is_server_running():
+             raise RuntimeError("Whisper server is not running and couldn't been started.")
 
         try:
             if isinstance(audio_source, (str, Path)):

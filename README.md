@@ -754,7 +754,7 @@ my_handbag/
 You can automatically scaffold a new, empty Handbag folder using the `Handbag.create_structure()` helper.
 
 ```python
-from lollms_client.lollms_agent.handbag import Handbag
+from lollms_client.lollms_personality.handbag import Handbag
 
 # Scaffolds the complete folder structure
 hb_path = Handbag.create_structure("./my_research_handbag", name="Research Handbag")
