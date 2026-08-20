@@ -1210,7 +1210,16 @@ class StreamRenderer:
                 if isinstance(meta, dict):
                     art_title = meta.get("artifact_title", art_title)
                     art_lang = meta.get("artifact_lang", art_lang)
-                self._update_live_artifact_panel(chunk, fallback_title=art_title, fallback_lang=art_lang)
+
+                clean_chunk = chunk
+                if "<<<<<<< SEARCH" in clean_chunk:
+                    clean_chunk = clean_chunk.replace("<<<<<<< SEARCH", "[🔍 SEARCH]")
+                if "=======" in clean_chunk:
+                    clean_chunk = clean_chunk.replace("=======", "[✏️ REPLACE]")
+                if ">>>>>>> REPLACE" in clean_chunk:
+                    clean_chunk = clean_chunk.replace(">>>>>>> REPLACE", "[✅ END REPLACE]")
+
+                self._update_live_artifact_panel(clean_chunk, fallback_title=art_title, fallback_lang=art_lang)
                 return True
             else:
                 if "<done" in chunk and "/>" in chunk:

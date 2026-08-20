@@ -2892,7 +2892,12 @@ JSON:"""
                                 attrs_match = re.search(r'<art(?:ifact|efact)[^>]*>', raw_artifact_xml, re.IGNORECASE)
                                 attrs_str = attrs_match.group(0) if attrs_match else ""
                                 body_match = re.search(r'<art(?:ifact|efact)[^>]*>(.*)</art(?:ifact|efact)>', raw_artifact_xml, re.DOTALL | re.IGNORECASE)
-                                body_content = body_match.group(1).strip() if body_match else ""
+
+                                if not body_match:
+                                    action_reports.append(f"❌ TRUNCATED ARTIFACT REJECTED. Missing closing tag for '{title}'. Retry generation.")
+                                    continue
+
+                                body_content = body_match.group(1).strip()
 
                                 title = "artifact"
                                 lang = "python"
@@ -2927,7 +2932,14 @@ JSON:"""
                                 if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
                                     try:
                                         if streaming_callback:
-                                            streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {"title": title, "art_type": "code", "language": lang, "is_patch": is_patch, "execution_phase": True})
+                                            streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {
+                                                "title": title, 
+                                                "art_type": "code", 
+                                                "language": lang, 
+                                                "is_patch": is_patch, 
+                                                "operation": "patch" if is_patch else "full_rewrite",
+                                                "execution_phase": True
+                                            })
                                     except Exception:
                                         pass
 
@@ -3212,7 +3224,12 @@ JSON:"""
                             attrs_match = re.search(r'<art(?:ifact|efact)[^>]*>', raw_artifact_xml, re.IGNORECASE)
                             attrs_str = attrs_match.group(0) if attrs_match else ""
                             body_match = re.search(r'<art(?:ifact|efact)[^>]*>(.*)</art(?:ifact|efact)>', raw_artifact_xml, re.DOTALL | re.IGNORECASE)
-                            body_content = body_match.group(1).strip() if body_match else ""
+
+                            if not body_match:
+                                action_reports.append(f"❌ TRUNCATED ARTIFACT REJECTED. Missing closing tag for '{title}'. Retry generation.")
+                                continue
+
+                            body_content = body_match.group(1).strip()
 
                             title = "artifact"
                             lang = "python"
@@ -3238,7 +3255,14 @@ JSON:"""
                             if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
                                 try:
                                     if streaming_callback:
-                                        streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {"title": title, "art_type": resolved_art_type, "language": lang, "is_patch": is_patch, "execution_phase": True})
+                                        streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {
+                                            "title": title, 
+                                            "art_type": resolved_art_type, 
+                                            "language": lang, 
+                                            "is_patch": is_patch, 
+                                            "operation": "patch" if is_patch else "full_rewrite",
+                                            "execution_phase": True
+                                        })
                                 except Exception:
                                     pass
 
@@ -3575,7 +3599,12 @@ JSON:"""
                         attrs_match = re.search(r'<art(?:ifact|efact)[^>]*>', raw_artifact_xml, re.IGNORECASE)
                         attrs_str = attrs_match.group(0) if attrs_match else ""
                         body_match = re.search(r'<art(?:ifact|efact)[^>]*>(.*)</art(?:ifact|efact)>', raw_artifact_xml, re.DOTALL | re.IGNORECASE)
-                        body_content = body_match.group(1).strip() if body_match else ""
+
+                        if not body_match:
+                            action_reports.append(f"❌ TRUNCATED ARTIFACT REJECTED. Missing closing tag for '{title}'. Retry generation.")
+                            continue
+
+                        body_content = body_match.group(1).strip()
 
                         title = "artifact"
                         lang = "python"
@@ -3598,7 +3627,14 @@ JSON:"""
                         if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
                             try:
                                 if streaming_callback:
-                                    streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {"title": title, "art_type": "code", "language": lang, "is_patch": is_patch, "execution_phase": True})
+                                    streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {
+                                        "title": title, 
+                                        "art_type": "code", 
+                                        "language": lang, 
+                                        "is_patch": is_patch, 
+                                        "operation": "patch" if is_patch else "full_rewrite",
+                                        "execution_phase": True
+                                    })
                             except Exception:
                                 pass
 

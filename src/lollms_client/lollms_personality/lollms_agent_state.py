@@ -456,8 +456,68 @@ class _AgentStreamState:
 
         if self._is_accumulating_artifact:
             self._tool_buffer += self._pending_buffer
+
             if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
                 self._cb(self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK, {"live_artifact_chunk": True, "artifact_title": self.live_artifact_meta.get("title", "artifact") if self.live_artifact_meta else "artifact", "artifact_lang": self.live_artifact_meta.get("language", "") if self.live_artifact_meta else ""})
+            elif self._event_mode == EventMode.PROCESSING_TAG_MODE:
+                clean_chunk = self._pending_buffer
+                if "<<<<<<< SEARCH" in clean_chunk:
+                    clean_chunk = clean_chunk.replace("<<<<<<< SEARCH", "\n[🔍 SEARCH BLOCK]\n")
+                if "=======" in clean_chunk:
+                    clean_chunk = clean_chunk.replace("=======", "\n[✏️ REPLACE BLOCK]\n")
+                if ">>>>>>> REPLACE" in clean_chunk:
+                    clean_chunk = clean_chunk.replace(">>>>>>> REPLACE", "\n[✅ END REPLACE]\n")
+
+                extracted_sections = []
+                if self.live_artifact_meta and not self.live_artifact_meta.get("is_patch"):
+                    lines_to_check = self._tool_buffer.splitlines()
+                    for line in lines_to_check:
+                        line_str = line.strip()
+                        if not line_str:
+                            continue
+
+                        md_h = re.match(r'^(#{1,6})\s+(.+)', line_str)
+                        if md_h:
+                            extracted_sections.append({"type": "markdown_header", "name": md_h.group(2).strip(), "level": len(md_h.group(1))})
+                        else:
+                            py_c = re.match(r'^(?:class|def)\s+([A-Za-z0-9_]+)', line_str)
+                            if py_c:
+                                extracted_sections.append({"type": "python_symbol", "name": py_c.group(1), "symbol_type": py_c.group(0).split()[0]})
+                            else:
+                                js_c = re.match(r'^(?:class|function|def)\s+([A-Za-z0-9_]+)', line_str)
+                                if js_c:
+                                    extracted_sections.append({"type": "js_symbol", "name": js_c.group(1), "symbol_type": js_c.group(0).split()[0]})
+                                else:
+                                    generic_c = re.match(r'^(?:class|def|function)\s+([A-Za-z0-9_]+)', line_str, re.IGNORECASE)
+                                    if generic_c:
+                                        extracted_sections.append({"type": "symbol", "name": generic_c.group(1), "symbol_type": generic_c.group(0).split()[0]})
+
+                last_reported_section = self.live_artifact_meta.get("last_reported_section") if self.live_artifact_meta else None
+                current_last_section = extracted_sections[-1] if extracted_sections else None
+
+                if current_last_section and current_last_section != last_reported_section:
+                    self.live_artifact_meta["last_reported_section"] = current_last_section
+                    status_icon = "📝" if current_last_section.get("type") == "markdown_header" else "🛠️"
+                    status_msg = f"{status_icon} {current_last_section.get('symbol_type', 'Section').capitalize()}: {current_last_section.get('name')}\n"
+
+                    self._cb(status_msg, MSG_TYPE.MSG_TYPE_CHUNK, {
+                        "was_processed": True, 
+                        "event_type": "artifact_chunk",
+                        "artifact_title": self.live_artifact_meta.get("title", "artifact") if self.live_artifact_meta else "artifact",
+                        "is_patch": self.live_artifact_meta.get("is_patch", False) if self.live_artifact_meta else False,
+                        "sections": extracted_sections,
+                        "live_artifact_chunk": True
+                    })
+                else:
+                    self._cb(clean_chunk, MSG_TYPE.MSG_TYPE_CHUNK, {
+                        "was_processed": True, 
+                        "event_type": "artifact_chunk",
+                        "artifact_title": self.live_artifact_meta.get("title", "artifact") if self.live_artifact_meta else "artifact",
+                        "is_patch": self.live_artifact_meta.get("is_patch", False) if self.live_artifact_meta else False,
+                        "sections": extracted_sections,
+                        "live_artifact_chunk": True
+                    })
+
             self._pending_buffer = ""
             self._try_complete_artifact()
 
@@ -548,22 +608,49 @@ class _AgentStreamState:
                     elif m.group(1).lower() == "language":
                         lang = m.group(2)
 
-                self.live_artifact_meta = {"title": title, "art_type": "code", "language": lang, "is_patch": "<<<<<<< SEARCH" in self._tool_buffer}
+                parsed_art_type = "code"
+                type_match = re.search(r'type=["\']([^"\']*)["\']', self._tool_buffer, re.IGNORECASE)
+                if type_match:
+                    parsed_art_type = type_match.group(1)
+
+                is_patch_start = "<<<<<<< SEARCH" in self._tool_buffer
+                operation_type = "patch" if is_patch_start else "full_rewrite"
+
+                self.live_artifact_meta = {
+                    "title": title, 
+                    "art_type": parsed_art_type, 
+                    "language": lang, 
+                    "is_patch": is_patch_start,
+                    "operation": operation_type
+                }
 
                 if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
                     try:
                         self._cb("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {
                             "title": title,
-                            "art_type": "code",
+                            "art_type": parsed_art_type,
                             "language": lang,
-                            "is_patch": self.live_artifact_meta.get("is_patch", False),
+                            "is_patch": is_patch_start,
+                            "operation": operation_type,
                             "stream_complete": False
                         })
                     except Exception:
                         pass
 
                 if self._event_mode == EventMode.PROCESSING_TAG_MODE:
-                    self._cb(f'\n<processing type="artifact" title="{title}">\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    op_icon = "🔧" if operation_type == "patch" else "✍️"
+                    op_label = "Patching" if operation_type == "patch" else "Writing"
+                    start_status = f'\n{op_icon} {op_label} {parsed_art_type} artifact: {title} (operation: {operation_type})...\n'
+                    self.ai_message_content_buffer += start_status if hasattr(self, 'ai_message_content_buffer') else start_status
+
+                    self._cb(start_status, MSG_TYPE.MSG_TYPE_CHUNK, {
+                        "was_processed": True,
+                        "event_type": "artifact_start",
+                        "artifact_title": title,
+                        "art_type": parsed_art_type,
+                        "is_patch": is_patch_start,
+                        "operation": operation_type
+                    })
 
                 self._try_complete_artifact()
                 return True
@@ -765,22 +852,40 @@ class _AgentStreamState:
         if self.live_artifact_meta:
             is_patch_stream = "<<<<<<< SEARCH" in full_artifact_call
             self.live_artifact_meta["is_patch"] = is_patch_stream
+            self.live_artifact_meta["operation"] = "patch" if is_patch_stream else "full_rewrite"
+
+            type_match_end = re.search(r'type=["\']([^"\']*)["\']', full_artifact_call, re.IGNORECASE)
+            if type_match_end:
+                self.live_artifact_meta["art_type"] = type_match_end.group(1)
+
+        art_type_end = self.live_artifact_meta.get("art_type", "code") if self.live_artifact_meta else "code"
+        title_end = self.live_artifact_meta.get("title", "artifact") if self.live_artifact_meta else "artifact"
+        is_patch_end = self.live_artifact_meta.get("is_patch", False) if self.live_artifact_meta else False
+        operation_end = self.live_artifact_meta.get("operation", "full_rewrite") if self.live_artifact_meta else "full_rewrite"
 
         if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
             try:
                 self._cb("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {
-                    "title": self.live_artifact_meta.get("title", "artifact") if self.live_artifact_meta else "artifact",
-                    "art_type": "code",
+                    "title": title_end,
+                    "art_type": art_type_end,
                     "success": True,
                     "error": None,
                     "stream_complete": True,
-                    "is_patch": self.live_artifact_meta.get("is_patch", False) if self.live_artifact_meta else False
+                    "is_patch": is_patch_end,
+                    "operation": operation_end
                 })
             except Exception:
                 pass
 
         if self._event_mode == EventMode.PROCESSING_TAG_MODE:
-            self._cb('\n</processing>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            self._cb('\n</processing>\n', MSG_TYPE.MSG_TYPE_CHUNK, {
+                "was_processed": True,
+                "event_type": "artifact_complete",
+                "artifact_title": title_end,
+                "art_type": art_type_end,
+                "is_patch": is_patch_end,
+                "operation": operation_end
+            })
 
         self.completed_actions.append({"type": "artifact", "xml": full_artifact_call})
 

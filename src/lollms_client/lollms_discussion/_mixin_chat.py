@@ -990,18 +990,23 @@ class _StreamState:
                         atype = attrs.get("type", "code").lower()
                         opening_status = _ARTEFACT_TYPE_MESSAGES.get(atype, "✨ Starting artifact...")
 
+                        # Check if the remaining content already contains the patch marker
+                        remaining_content = self._pending_buffer[end_of_tag_idx+1:]
+                        is_patch_start = "<<<<<<< SEARCH" in remaining_content
+                        operation_type = "patch" if is_patch_start else "full_rewrite"
+
                         # Fire the opening processing tag to the UI and save it
-                        proc_tag = f'\n<processing type="artefact" title="{title}" language="{lang or ""}">\n'
+                        proc_tag = f'\n<processing type="artefact" title="{title}" language="{lang or ""}" operation="{operation_type}">\n'
                         self.ai_message.content += proc_tag
-                        _cb(self.callback, proc_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        _cb(self.callback, proc_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True, "operation": operation_type, "is_patch": is_patch_start})
 
                         # Start the heartbeat in case the artifact body is slow/empty
                         self._start_artefact_heartbeat()
 
                         # Emit the type-aware initial status message
-                        status_line = f'{opening_status}\n'
+                        status_line = f'{opening_status} (operation: {operation_type})\n'
                         self.ai_message.content += status_line
-                        _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True, "operation": operation_type, "is_patch": is_patch_start})
 
                         # Check if the closing tag also arrived in this same chunk
                         remaining_content = self._pending_buffer[end_of_tag_idx+1:]

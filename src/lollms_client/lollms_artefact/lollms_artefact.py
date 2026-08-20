@@ -2199,6 +2199,13 @@ class ArtefactManager:
                         )
                     except ValueError as e:
                         result_artefact = None
+                        error_msg = f"[SYSTEM ERROR: SEARCH/REPLACE patch failed for '{resolved_title}'. Error: {e}. You MUST retry the patch with the exact existing content.]"
+                        cleaned = cleaned.replace(match.group(0), error_msg)
+                        if event_callback:
+                            try:
+                                event_callback(None, False, error_msg)
+                            except Exception:
+                                pass
             else:
                 if is_new:
                     result_artefact = self.add(
