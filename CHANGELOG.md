@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-08-24 08:34]
+
+- feat(config): hydrate config from YAML fallback before forcing setup wizard
+
 ## [2026-08-24 08:18]
 
 - feat(cli): customize menu exit text and safely initialize LCP tool libraries

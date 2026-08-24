@@ -256,11 +256,25 @@ def get_client_from_env(
             ASCIIColors.warning(f"Failed to parse {home_yaml}: {e}")
 
     # 5. Auto-resolve or run wizard if incomplete
+    #    If the baseline environment is missing the master binding key, attempt to
+    #    hydrate it directly from the standard ~/.lollms_client/config.yaml file before
+    #    forcing the wizard. This prevents the CLI from hallucinating a missing
+    #    configuration just because the process environment wasn't pre-loaded.
     required_keys = []
     if create_llm: required_keys.append("LLM_BINDINGS_MASTER_BINDING_NAME")
-    # Add checks for other modalities...
 
     missing = [k for k in required_keys if k not in resolved_env]
+    if missing:
+        home_yaml_fallback = Path.home() / ".lollms_client" / "config.yaml"
+        if home_yaml_fallback.exists():
+            try:
+                yaml_data = load_yaml_file(home_yaml_fallback)
+                resolved_env.update(_flatten_dict_to_env(yaml_data))
+            except Exception as e:
+                ASCIIColors.warning(f"Failed to parse fallback config.yaml: {e}")
+
+        missing = [k for k in required_keys if k not in resolved_env]
+
     if missing:
         if run_wizard_if_fail:
             ASCIIColors.yellow("⚠️ Configuration incomplete. Starting wizard...")
@@ -269,8 +283,6 @@ def get_client_from_env(
             home_env = home_dir / ".env"
             home_yaml = home_dir / "config.yaml"
 
-            if home_env.exists():
-                resolved_env.update(load_env_file(home_env))
             if home_yaml.exists():
                 try:
                     yaml_data = load_yaml_file(home_yaml)
@@ -278,6 +290,9 @@ def get_client_from_env(
                 except Exception:
                     pass
 
+            if home_env.exists():
+                resolved_env.update(load_env_file(home_env))
+                
             if not resolved_env:
                 raise ValueError("Wizard completed but configuration is still missing.")
         else:
