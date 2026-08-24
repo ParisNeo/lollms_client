@@ -119,7 +119,23 @@ _BINARY_BLOB_KEYS = {
     "binary", "raw_image", "image_data", "raw_data",
 }
 
-_MAX_TOOL_RESULT_CHARS = 4000
+_MAX_TOOL_RESULT_CHARS = 12000
+
+def _calculate_dynamic_tool_char_limit(client: Optional[Any] = None) -> int:
+    """
+    Calculates the maximum allowed characters for a tool result based on the LLM's context size.
+    Uses 25% of the context window, capped at 50,000 chars to preserve conversation space.
+    Falls back to 12,000 chars if context size is unavailable.
+    """
+    if client and hasattr(client, 'get_ctx_size'):
+        try:
+            ctx_size = client.get_ctx_size() or 0
+            if ctx_size > 0:
+                dynamic_limit = int((ctx_size * 0.25) * 4)
+                return min(max(dynamic_limit, 8000), 50000)
+        except Exception:
+            pass
+    return 12000
 
 
 import time as _time
@@ -252,8 +268,11 @@ def _is_large_base64(v: str) -> bool:
 
 def _sanitize_tool_result(
     tool_res: Any,
-    max_chars: int = _MAX_TOOL_RESULT_CHARS,
+    max_chars: Optional[int] = None,
+    client: Optional[Any] = None,
 ) -> str:
+    if max_chars is None:
+        max_chars = _calculate_dynamic_tool_char_limit(client)
     """
     Converts an arbitrary tool execution result into a clean, LLM-friendly
     text representation.
@@ -3916,7 +3935,7 @@ class ChatMixin:
                                 details_block = f"Error Logs:\n{result_str}\n"
                             else:
                                 status_done_line = f"* Completed execution of '{tool_name}' successfully.\n"
-                                clean_result_str = _sanitize_tool_result(tool_res)
+                                clean_result_str = _sanitize_tool_result(tool_res, client=self.lollmsClient)
                                 safe_output = result_str[:2000] + ("..." if len(result_str) > 2000 else "")
                                 details_block = f"Output Logs:\n{safe_output}\n"
                     except Exception as e:

@@ -37,20 +37,27 @@ from lollms_client.lollms_discussion import LollmsDiscussion
 @dataclass
 class LollmsBindingProfile:
     """
-    A declarative profile for any modality binding (LLM, TTI, TTS, etc.), 
-    supporting lazy instantiation and routing.
+    Declarative profile for a modality binding engine/server (Connection Layer).
+    Defines the backend connection (e.g., host, api_key, binding library).
     """
     name: str
     binding_name: str
     binding_config: Dict[str, Any] = field(default_factory=dict)
     is_default: bool = False
+
+@dataclass
+class LollmsModelProfile:
+    """
+    Declarative profile for a specific model (Execution Layer).
+    References a binding profile and defines model-specific execution parameters.
+    """
+    name: str
+    binding_profile_name: str
+    model_name: Optional[str] = None
+    is_default: bool = False
     vision_enabled: bool = False
     forced_context_size: Optional[int] = None
     routing_config: Optional[Dict[str, Any]] = None
-    is_legacy_extra_llm: bool = False
-
-# Backward compatibility alias
-LollmsModelProfile = LollmsBindingProfile
 
 
 
@@ -93,19 +100,87 @@ class LollmsClient():
         debug: Optional[bool] = True,
         cooperative_vram_management: Optional[bool] = False,
         
-       # 🧠 Modern Lazy Profiles (Universal across all modalities)
-     llm_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
-      tti_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
-      tts_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
-      stt_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
-      ttv_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
-      ttm_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
+        # 🧠 Modern Lazy Profiles (Universal across all modalities)
+        llm_binding_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
+        tti_binding_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
+        tts_binding_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
+        stt_binding_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
+        ttv_binding_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
+        ttm_binding_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
+
+        llm_model_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsModelProfile']]] = None,
+        tti_model_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsModelProfile']]] = None,
+        tts_model_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsModelProfile']]] = None,
+        stt_model_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsModelProfile']]] = None,
+        ttv_model_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsModelProfile']]] = None,
+        ttm_model_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsModelProfile']]] = None,
 
         **kwargs
         ):
         """
         Initialize the LollmsClient with LLM and optional modality bindings.
-        Supports lazy-loaded profiles via llm_profiles, tti_profiles, etc., or legacy extra_llms.
+
+        This client implements a strict, decoupled, lazy-loaded Two-Tier Profile Architecture:
+
+        1. Connection Layer (`*_binding_profiles`): Defines the backend engine/server configuration 
+           (e.g., host address, API keys, binding library name). Declared once per server.
+        2. Execution Layer (`*_model_profiles`): Defines specific models, routing rules, and vision flags.
+           References a binding profile via `binding_profile_name`.
+
+        Only the model profile marked as `is_default=True` is eagerly instantiated at startup. 
+        All other models are instantiated lazily on-demand when switched to, preserving RAM and VRAM.
+
+        Backward Compatibility:
+        - Legacy parameters like `llm_binding_name` and `llm_binding_config` are automatically 
+          registered as the `"master"` binding and model profiles.
+        - The legacy `extra_llms` kwarg is mapped into the new two-tier system automatically.
+
+        Args:
+            llm_binding_name (Optional[str]): Legacy direct LLM binding name.
+            tts_binding_name (Optional[str]): Legacy direct TTS binding name.
+            tti_binding_name (Optional[str]): Legacy direct TTI binding name.
+            stt_binding_name (Optional[str]): Legacy direct STT binding name.
+            ttv_binding_name (Optional[str]): Legacy direct TTV binding name.
+            ttm_binding_name (Optional[str]): Legacy direct TTM binding name.
+            tools_binding_name (Optional[str]): Legacy direct MCP/Tools binding name.
+
+            llm_bindings_dir (Path): Directory containing LLM bindings.
+            tts_bindings_dir (Path): Directory containing TTS bindings.
+            tti_bindings_dir (Path): Directory containing TTI bindings.
+            stt_bindings_dir (Path): Directory containing STT bindings.
+            ttv_bindings_dir (Path): Directory containing TTV bindings.
+            ttm_bindings_dir (Path): Directory containing TTM bindings.
+            tools_bindings_dir (Path): Directory containing Tools bindings.
+
+            llm_binding_config (Optional[Dict]): Legacy direct LLM configuration.
+            tts_binding_config (Optional[Dict]): Legacy direct TTS configuration.
+            tti_binding_config (Optional[Dict]): Legacy direct TTI configuration.
+            stt_binding_config (Optional[Dict]): Legacy direct STT configuration.
+            ttv_binding_config (Optional[Dict]): Legacy direct TTV configuration.
+            ttm_binding_config (Optional[Dict]): Legacy direct TTM configuration.
+            tools_binding_config (Optional[Dict]): Legacy direct Tools configuration.
+
+            user_name (str): Name used for the user in prompt headers.
+            ai_name (str): Name used for the AI in prompt headers.
+            callback (Optional[Callable]): Initialization progress callback.
+            debug (Optional[bool]): Enable debug logging.
+            cooperative_vram_management (Optional[bool]): Unload inactive modality models to free VRAM.
+
+            llm_binding_profiles (Optional[Dict]): Connection profiles for LLM engines.
+            tti_binding_profiles (Optional[Dict]): Connection profiles for TTI engines.
+            tts_binding_profiles (Optional[Dict]): Connection profiles for TTS engines.
+            stt_binding_profiles (Optional[Dict]): Connection profiles for STT engines.
+            ttv_binding_profiles (Optional[Dict]): Connection profiles for TTV engines.
+            ttm_binding_profiles (Optional[Dict]): Connection profiles for TTM engines.
+
+            llm_model_profiles (Optional[Dict]): Execution profiles for LLM models.
+            tti_model_profiles (Optional[Dict]): Execution profiles for TTI models.
+            tts_model_profiles (Optional[Dict]): Execution profiles for TTS models.
+            stt_model_profiles (Optional[Dict]): Execution profiles for STT models.
+            ttv_model_profiles (Optional[Dict]): Execution profiles for TTV models.
+            ttm_model_profiles (Optional[Dict]): Execution profiles for TTM models.
+
+            **kwargs: Catch-all for legacy parameters like `extra_llms`.
         """
 
         self.debug = debug
@@ -144,136 +219,62 @@ class LollmsClient():
         self._active_ttv_alias: Optional[str] = None
         self._active_ttm_alias: Optional[str] = None
 
-        # 🧠 Profile Registries (Declarative Configs - Universal)
-        self.llm_profiles_registry: Dict[str, LollmsBindingProfile] = {}
-        self.tti_profiles_registry: Dict[str, LollmsBindingProfile] = {}
-        self.tts_profiles_registry: Dict[str, LollmsBindingProfile] = {}
-        self.stt_profiles_registry: Dict[str, LollmsBindingProfile] = {}
-        self.ttv_profiles_registry: Dict[str, LollmsBindingProfile] = {}
-        self.ttm_profiles_registry: Dict[str, LollmsBindingProfile] = {}
+        # 🧠 Profile Registries (Declarative Configs - Universal Two-Tier Architecture)
+        self.llm_binding_profiles_registry: Dict[str, LollmsBindingProfile] = {}
+        self.tti_binding_profiles_registry: Dict[str, LollmsBindingProfile] = {}
+        self.tts_binding_profiles_registry: Dict[str, LollmsBindingProfile] = {}
+        self.stt_binding_profiles_registry: Dict[str, LollmsBindingProfile] = {}
+        self.ttv_binding_profiles_registry: Dict[str, LollmsBindingProfile] = {}
+        self.ttm_binding_profiles_registry: Dict[str, LollmsBindingProfile] = {}
 
-        # Backward compatibility: Map legacy extra_llms to llm_profiles
+        self.llm_model_profiles_registry: Dict[str, LollmsModelProfile] = {}
+        self.tti_model_profiles_registry: Dict[str, LollmsModelProfile] = {}
+        self.tts_model_profiles_registry: Dict[str, LollmsModelProfile] = {}
+        self.stt_model_profiles_registry: Dict[str, LollmsModelProfile] = {}
+        self.ttv_model_profiles_registry: Dict[str, LollmsModelProfile] = {}
+        self.ttm_model_profiles_registry: Dict[str, LollmsModelProfile] = {}
+
+        # Backward compatibility: Map legacy extra_llms to llm_model_profiles
         legacy_extra_llms = kwargs.pop("extra_llms", None)
         if legacy_extra_llms:
-            if llm_profiles is None:
-                llm_profiles = {}
+            if llm_model_profiles is None:
+                llm_model_profiles = {}
             for alias, profile_data in legacy_extra_llms.items():
-                if alias not in llm_profiles:
-                    llm_profiles[alias] = profile_data
-
-        # Pre-register profiles early (without instantiating) so we can infer llm_binding_name if missing
-        self._register_profiles(llm_profiles, self.llm_profiles_registry, "LLM", callback, eager_instantiate=False)
-        self._register_profiles(tti_profiles, self.tti_profiles_registry, "TTI", eager_instantiate=False)
-        self._register_profiles(tts_profiles, self.tts_profiles_registry, "TTS", eager_instantiate=False)
-        self._register_profiles(stt_profiles, self.stt_profiles_registry, "STT", eager_instantiate=False)
-        self._register_profiles(ttv_profiles, self.ttv_profiles_registry, "TTV", eager_instantiate=False)
-        self._register_profiles(ttm_profiles, self.ttm_profiles_registry, "TTM", eager_instantiate=False)
-
-        # Infer primary binding names from default profiles if not explicitly provided
-        if not llm_binding_name:
-            default_llm_profile = next((p for p in self.llm_profiles_registry.values() if p.is_default), None)
-            if default_llm_profile:
-                llm_binding_name = default_llm_profile.binding_name
-                llm_binding_config = default_llm_profile.binding_config
+                if alias not in llm_model_profiles:
+                    # Create a master binding profile if it doesn't exist
+                    if "legacy_master_binding" not in (llm_binding_profiles or {}):
+                        if llm_binding_profiles is None: llm_binding_profiles = {}
+                        llm_binding_profiles["legacy_master_binding"] = LollmsBindingProfile(
+                            name="legacy_master_binding",
+                            binding_name=profile_data.get("binding_name"),
+                            binding_config=profile_data.get("binding_config", {})
+                        )
+                    llm_model_profiles[alias] = {
+                        "binding_profile_name": "legacy_master_binding",
+                        "model_name": profile_data.get("binding_config", {}).get("model_name")
+                    }
 
         # User and AI names are important for prompt construction
         self.user_name = user_name
         self.ai_name = ai_name
 
-        if llm_binding_name:
-            if callback: callback(f"🤖 Initializing **LLM** binding: `{llm_binding_name}`...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
-            config = llm_binding_config or {}
-            config['user_name'] = self.user_name
-            config['ai_name'] = self.ai_name
-            config['debug'] = self.debug
-            self.llm = self.llm_binding_manager.create_binding(
-                binding_name=llm_binding_name,
-                **{k: v for k, v in config.items() if k != "binding_name"}
-            )
-            if self.llm is None:
-                msg = f"Failed to create LLM binding: {llm_binding_name}."
-                if callback: callback(f"❌ {msg}", MSG_TYPE.MSG_TYPE_ERROR, {})
-                ASCIIColors.warning(msg)
-            elif callback:
-                callback(f"✅ **LLM** binding ready.", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
+        # 1. Register Connection Layer Profiles (Bindings)
+        self._register_binding_profiles(llm_binding_profiles, self.llm_binding_profiles_registry, "LLM", llm_binding_name, llm_binding_config)
+        self._register_binding_profiles(tts_binding_profiles, self.tts_binding_profiles_registry, "TTS", tts_binding_name, tts_binding_config)
+        self._register_binding_profiles(tti_binding_profiles, self.tti_binding_profiles_registry, "TTI", tti_binding_name, tti_binding_config)
+        self._register_binding_profiles(stt_binding_profiles, self.stt_binding_profiles_registry, "STT", stt_binding_name, stt_binding_config)
+        self._register_binding_profiles(ttv_binding_profiles, self.ttv_binding_profiles_registry, "TTV", ttv_binding_name, ttv_binding_config)
+        self._register_binding_profiles(ttm_binding_profiles, self.ttm_binding_profiles_registry, "TTM", ttm_binding_name, ttm_binding_config)
 
-        if tts_binding_name:
-            if callback: callback(f"🗣️ Initializing **TTS** binding: `{tts_binding_name}`...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
-            try:
-                self.tts = self.tts_binding_manager.create_binding(binding_name=tts_binding_name, **(tts_binding_config or {}))
-                if self.tts is None: 
-                    msg = f"Failed to create TTS binding: {tts_binding_name}"
-                    if callback: callback(f"❌ {msg}", MSG_TYPE.MSG_TYPE_ERROR, {})
-                    ASCIIColors.warning(msg)
-                elif callback:
-                    callback(f"✅ **TTS** binding ready.", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
-            except Exception as e:
-                trace_exception(e)
-                self.tts = None
-                if callback: callback(f"❌ Error initializing TTS: {e}", MSG_TYPE.MSG_TYPE_ERROR, {})
+        # 2. Register Execution Layer Profiles (Models)
+        self._register_model_profiles(llm_model_profiles, self.llm_model_profiles_registry, "LLM", self.llm_binding_profiles_registry)
+        self._register_model_profiles(tts_model_profiles, self.tts_model_profiles_registry, "TTS", self.tts_binding_profiles_registry)
+        self._register_model_profiles(tti_model_profiles, self.tti_model_profiles_registry, "TTI", self.tti_binding_profiles_registry)
+        self._register_model_profiles(stt_model_profiles, self.stt_model_profiles_registry, "STT", self.stt_binding_profiles_registry)
+        self._register_model_profiles(ttv_model_profiles, self.ttv_model_profiles_registry, "TTV", self.ttv_binding_profiles_registry)
+        self._register_model_profiles(ttm_model_profiles, self.ttm_model_profiles_registry, "TTM", self.ttm_binding_profiles_registry)
 
-        if tti_binding_name:
-            if callback: callback(f"🎨 Initializing **TTI** binding: `{tti_binding_name}`...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
-            try:
-                tti_config = (tti_binding_config or {}).copy()
-                tti_config['debug'] = self.debug
-                self.tti = self.tti_binding_manager.create_binding(binding_name=tti_binding_name, **tti_config)
-                if self.tti is None: 
-                    msg = f"Failed to create TTI binding: {tti_binding_name}"
-                    if callback: callback(f"❌ {msg}", MSG_TYPE.MSG_TYPE_ERROR, {})
-                    ASCIIColors.warning(msg)
-                elif callback:
-                    callback(f"✅ **TTI** binding ready.", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
-            except Exception as e:
-                trace_exception(e)
-                self.tti = None
-                if callback: callback(f"❌ Error initializing TTI: {e}", MSG_TYPE.MSG_TYPE_ERROR, {})
-                
-        if stt_binding_name:
-            if callback: callback(f"👂 Initializing **STT** binding: `{stt_binding_name}`...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
-            try:
-                self.stt = self.stt_binding_manager.create_binding(binding_name=stt_binding_name, **(stt_binding_config or {}))
-                if self.stt is None: 
-                    msg = f"Failed to create STT binding: {stt_binding_name}"
-                    if callback: callback(f"❌ {msg}", MSG_TYPE.MSG_TYPE_ERROR, {})
-                    ASCIIColors.warning(msg)
-                elif callback:
-                    callback(f"✅ **STT** binding ready.", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
-            except Exception as e:
-                trace_exception(e)
-                self.stt = None
-                if callback: callback(f"❌ Error initializing STT: {e}", MSG_TYPE.MSG_TYPE_ERROR, {})
-                
-        if ttv_binding_name:
-            if callback: callback(f"🎬 Initializing **TTV** binding: `{ttv_binding_name}`...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
-            try:
-                self.ttv = self.ttv_binding_manager.create_binding(binding_name=ttv_binding_name, **(ttv_binding_config or {}))
-                if self.ttv is None: 
-                    msg = f"Failed to create TTV binding: {ttv_binding_name}"
-                    if callback: callback(f"❌ {msg}", MSG_TYPE.MSG_TYPE_ERROR, {})
-                    ASCIIColors.warning(msg)
-                elif callback:
-                    callback(f"✅ **TTV** binding ready.", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
-            except Exception as e:
-                trace_exception(e)
-                self.ttv = None
-                if callback: callback(f"❌ Error initializing TTV: {e}", MSG_TYPE.MSG_TYPE_ERROR, {})
-
-        if ttm_binding_name:
-            if callback: callback(f"🎵 Initializing **TTM** binding: `{ttm_binding_name}`...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
-            try:
-                self.ttm = self.ttm_binding_manager.create_binding(binding_name=ttm_binding_name, **(ttm_binding_config or {}))
-                if self.ttm is None: 
-                    msg = f"Failed to create TTM binding: {ttm_binding_name}"
-                    if callback: callback(f"❌ {msg}", MSG_TYPE.MSG_TYPE_ERROR, {})
-                    ASCIIColors.warning(msg)
-                elif callback:
-                    callback(f"✅ **TTM** binding ready.", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
-            except Exception as e:
-                trace_exception(e)
-                self.ttm = None
-                if callback: callback(f"❌ Error initializing TTM: {e}", MSG_TYPE.MSG_TYPE_ERROR, {})
-
+        # 3. Tools binding remains direct (not part of the two-tier profile system yet)
         if tools_binding_name:
             if callback: callback(f"🔌 Initializing **MCP** binding: `{tools_binding_name}`...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
             try:
@@ -289,121 +290,88 @@ class LollmsClient():
                 self.tools = None  
                 if callback: callback(f"❌ Error initializing MCP: {e}", MSG_TYPE.MSG_TYPE_ERROR, {})   
 
-        # ── 🧠 LAZY PROFILE REGISTRATION ──
-        # 2. Register Modern profiles (overrides any legacy duplicates)
-        # Note: Profiles were pre-registered above to infer binding names.
-        # We call it again to safely handle any legacy `extra_llms` that may 
-        # have been converted, ensuring no duplicates are lost.
-        self._register_profiles(llm_profiles, self.llm_profiles_registry, "LLM", callback)
-        self._register_profiles(tti_profiles, self.tti_profiles_registry, "TTI")
-        self._register_profiles(tts_profiles, self.tts_profiles_registry, "TTS")
-        self._register_profiles(stt_profiles, self.stt_profiles_registry, "STT")
-        self._register_profiles(ttv_profiles, self.ttv_profiles_registry, "TTV")
-        self._register_profiles(ttm_profiles, self.ttm_profiles_registry, "TTM")
-
         if callback: callback("✨ **Lollms Client** Initialization Complete.", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
 
-        def _eagerly_instantiate_default(registry: dict, switch_method: Callable, modality_name: str):
-            default_alias = next((a for a, p in registry.items() if p.is_default), None)
+        # 4. Eagerly instantiate ONLY the default models for all modalities
+        def _eagerly_instantiate_default(model_registry: dict, switch_method: Callable, modality_name: str):
+            default_alias = next((a for a, p in model_registry.items() if p.is_default), None)
             if default_alias:
                 switch_method(default_alias, callback=callback)
-            elif "master" in registry:
+            elif "master" in model_registry:
                 switch_method("master", callback=callback)
 
-        # 3. Register Legacy Primary Bindings as "master" profiles
-        if llm_binding_name:
-            self.llm_profiles_registry["master"] = LollmsModelProfile(
+        _eagerly_instantiate_default(self.llm_model_profiles_registry, self.switch_model, "LLM")
+        _eagerly_instantiate_default(self.tts_model_profiles_registry, self.switch_tts, "TTS")
+        _eagerly_instantiate_default(self.tti_model_profiles_registry, self.switch_tti, "TTI")
+        _eagerly_instantiate_default(self.stt_model_profiles_registry, self.switch_stt, "STT")
+        _eagerly_instantiate_default(self.ttv_model_profiles_registry, self.switch_ttv, "TTV")
+        _eagerly_instantiate_default(self.ttm_model_profiles_registry, self.switch_ttm, "TTM")
+
+    def _register_binding_profiles(self, profiles_dict: Optional[Dict], registry: Dict[str, LollmsBindingProfile], modality_name: str, legacy_binding_name: Optional[str] = None, legacy_binding_config: Optional[Dict] = None):
+        """Registers connection layer profiles (binding engines/servers)."""
+        if profiles_dict:
+            for alias, p_data in profiles_dict.items():
+                if isinstance(p_data, LollmsBindingProfile):
+                    profile = p_data
+                else:
+                    profile = LollmsBindingProfile(
+                        name=alias,
+                        binding_name=p_data.get("binding_name"),
+                        binding_config=p_data.get("binding_config", {}) or {},
+                        is_default=p_data.get("is_default", False)
+                    )
+                registry[alias] = profile
+
+        # Backward compatibility: auto-register legacy direct binding params as "master"
+        if legacy_binding_name and "master" not in registry:
+            registry["master"] = LollmsBindingProfile(
                 name="master",
-                binding_name=llm_binding_name,
-                binding_config=llm_binding_config or {},
+                binding_name=legacy_binding_name,
+                binding_config=legacy_binding_config or {},
                 is_default=True
             )
-        if tts_binding_name:
-            self.tts_profiles_registry["master"] = LollmsBindingProfile(name="master", binding_name=tts_binding_name, is_default=True)
-        if tti_binding_name:
-            self.tti_profiles_registry["master"] = LollmsBindingProfile(name="master", binding_name=tti_binding_name, is_default=True)
-        if stt_binding_name:
-            self.stt_profiles_registry["master"] = LollmsBindingProfile(name="master", binding_name=stt_binding_name, is_default=True)
-        if ttv_binding_name:
-            self.ttv_profiles_registry["master"] = LollmsBindingProfile(name="master", binding_name=ttv_binding_name, is_default=True)
-        if ttm_binding_name:
-            self.ttm_profiles_registry["master"] = LollmsBindingProfile(name="master", binding_name=ttm_binding_name, is_default=True)
 
-        # 4. Eagerly instantiate ONLY the default profiles for all modalities
-        _eagerly_instantiate_default(self.llm_profiles_registry, self.switch_model, "LLM")
+    def _register_model_profiles(self, profiles_dict: Optional[Dict], registry: Dict[str, LollmsModelProfile], modality_name: str, binding_registry: Dict[str, LollmsBindingProfile]):
+        """Registers execution layer profiles (models). Auto-creates a master profile for legacy bindings."""
+        if profiles_dict:
+            for alias, p_data in profiles_dict.items():
+                if isinstance(p_data, LollmsModelProfile):
+                    profile = p_data
+                else:
+                    profile = LollmsModelProfile(
+                        name=alias,
+                        binding_profile_name=p_data.get("binding_profile_name", "master"),
+                        model_name=p_data.get("model_name"),
+                        is_default=p_data.get("is_default", False),
+                        vision_enabled=p_data.get("vision_enabled", False),
+                        forced_context_size=p_data.get("forced_context_size"),
+                        routing_config=p_data.get("routing_config") or p_data.get("routing_profile")
+                    )
+                registry[alias] = profile
 
-        # Ensure legacy extra_llms are eagerly instantiated into the cache
-        for alias, profile in self.llm_profiles_registry.items():
-            if profile.is_legacy_extra_llm and alias not in self.llms:
-                new_binding = self._instantiate_binding_from_profile(
-                    alias, profile, self.llm_binding_manager, "llm", callback
-                )
-                if new_binding:
-                    self.llms[alias] = new_binding
-                    if callback: callback(f"✅ Mounted extra LLM: `{alias}`", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
+        # Backward compatibility: If we registered a master binding but no master model profile exists, create one.
+        if "master" in binding_registry and "master" not in registry:
+            registry["master"] = LollmsModelProfile(
+                name="master",
+                binding_profile_name="master",
+                is_default=True
+            )
 
-        # Ensure legacy primary bindings are registered as master profiles if not explicitly provided
-        if self.tti and "master" not in self.tti_profiles_registry:
-             self.tti_profiles_registry["master"] = LollmsBindingProfile(name="master", binding_name=self.tti.binding_name, is_default=True)
-        _eagerly_instantiate_default(self.tti_profiles_registry, self.switch_tti, "TTI")
+    def _instantiate_binding_from_profile(self, alias: str, model_profile: LollmsModelProfile, manager: Any, modality: str, callback=None) -> Optional[Any]:
+        """Instantiates a binding from a model profile, merging the referenced binding profile config."""
+        binding_registry = getattr(self, f"{modality}_binding_profiles_registry")
+        binding_profile = binding_registry.get(model_profile.binding_profile_name)
 
-        if self.tts and "master" not in self.tts_profiles_registry:
-             self.tts_profiles_registry["master"] = LollmsBindingProfile(name="master", binding_name=self.tts.binding_name, is_default=True)
-        _eagerly_instantiate_default(self.tts_profiles_registry, self.switch_tts, "TTS")
+        if not binding_profile:
+            ASCIIColors.error(f"{modality.upper()} binding profile '{model_profile.binding_profile_name}' not found for model '{alias}'.")
+            return None
 
-        if self.stt and "master" not in self.stt_profiles_registry:
-             self.stt_profiles_registry["master"] = LollmsBindingProfile(name="master", binding_name=self.stt.binding_name, is_default=True)
-        _eagerly_instantiate_default(self.stt_profiles_registry, self.switch_stt, "STT")
+        # Base connection config from the binding profile
+        b_config = binding_profile.binding_config.copy() if binding_profile.binding_config else {}
 
-        if self.ttv and "master" not in self.ttv_profiles_registry:
-             self.ttv_profiles_registry["master"] = LollmsBindingProfile(name="master", binding_name=self.ttv.binding_name, is_default=True)
-        _eagerly_instantiate_default(self.ttv_profiles_registry, self.switch_ttv, "TTV")
-
-        if self.ttm and "master" not in self.ttm_profiles_registry:
-             self.ttm_profiles_registry["master"] = LollmsBindingProfile(name="master", binding_name=self.ttm.binding_name, is_default=True)
-        _eagerly_instantiate_default(self.ttm_profiles_registry, self.switch_ttm, "TTM")
-
-    def _register_profiles(self, profiles_dict: Optional[Dict], registry: Dict[str, LollmsBindingProfile], modality_name: str, callback=None, eager_instantiate: bool = True):
-        """Helper method to safely register binding profiles."""
-        if not profiles_dict: 
-            return
-
-        for alias, p_data in profiles_dict.items():
-            if alias == "master": 
-                ASCIIColors.warning(f"Alias 'master' is reserved for {modality_name}. Skipping explicit master profile.")
-                continue
-
-            is_legacy_extra_llm = False
-            if isinstance(p_data, LollmsBindingProfile):
-                profile = p_data
-            else:
-                if "binding_name" in p_data and "binding_config" in p_data and len(p_data) == 2:
-                    is_legacy_extra_llm = True
-
-                profile = LollmsBindingProfile(
-                    name=alias,
-                    binding_name=p_data.get("binding_name"),
-                    binding_config=p_data.get("binding_config", {}) or {},
-                    is_default=p_data.get("is_default", False),
-                    vision_enabled=p_data.get("vision_enabled", False),
-                    forced_context_size=p_data.get("forced_context_size"),
-                    routing_config=p_data.get("routing_config"),
-                    is_legacy_extra_llm=is_legacy_extra_llm
-                )
-
-            registry[alias] = profile
-
-            if eager_instantiate and is_legacy_extra_llm and modality_name == "LLM":
-                new_binding = self._instantiate_binding_from_profile(
-                    alias, profile, self.llm_binding_manager, "llm", callback
-                )
-                if new_binding:
-                    self.llms[alias] = new_binding
-                    if callback: callback(f"✅ Mounted extra LLM: `{alias}`", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
-
-    def _instantiate_binding_from_profile(self, alias: str, profile: LollmsBindingProfile, manager: Any, modality: str, callback=None) -> Optional[Any]:
-        """Instantiates any binding from its profile using the provided manager."""
-        b_config = profile.binding_config.copy() if profile.binding_config else {}
+        # Inject model_name if specified at the model profile level
+        if model_profile.model_name:
+            b_config['model_name'] = model_profile.model_name
 
         # Inject LLM-specific configs if applicable
         if modality == "llm":
@@ -413,32 +381,32 @@ class LollmsClient():
 
         try:
             binding = manager.create_binding(
-                binding_name=profile.binding_name,
+                binding_name=binding_profile.binding_name,
                 **{k: v for k, v in b_config.items() if k != "binding_name"}
             )
             if binding:
-                binding.vision_enabled = profile.vision_enabled
+                binding.vision_enabled = model_profile.vision_enabled
                 if hasattr(binding, "forced_context_size"):
-                    binding.forced_context_size = profile.forced_context_size
+                    binding.forced_context_size = model_profile.forced_context_size
                 if hasattr(binding, "routing_config"):
-                    binding.routing_config = profile.routing_config
+                    binding.routing_config = model_profile.routing_config
                 return binding
         except Exception as e:
             trace_exception(e)
             if callback: callback(f"❌ Failed to instantiate {modality.upper()} '{alias}': {e}", MSG_TYPE.MSG_TYPE_ERROR, {})
         return None
 
-    def _switch_modality(self, alias: str, registry: dict, instance_cache: dict, manager: Any, modality: str, attr_name: str, active_alias_attr: str, callback=None) -> bool:
-        """Generic switch method for all modalities."""
-        if alias not in registry:
-            ASCIIColors.error(f"{modality.upper()} profile '{alias}' not found. Available: {list(registry.keys())}")
+    def _switch_modality(self, alias: str, model_registry: dict, binding_registry: dict, instance_cache: dict, manager: Any, modality: str, attr_name: str, active_alias_attr: str, callback=None) -> bool:
+        """Generic switch method for all modalities, operating on the two-tier profile system."""
+        if alias not in model_registry:
+            ASCIIColors.error(f"{modality.upper()} model profile '{alias}' not found. Available: {list(model_registry.keys())}")
             return False
 
         if alias in instance_cache:
             object.__setattr__(self, attr_name, instance_cache[alias])
         else:
-            profile = registry[alias]
-            new_binding = self._instantiate_binding_from_profile(alias, profile, manager, modality, callback)
+            model_profile = model_registry[alias]
+            new_binding = self._instantiate_binding_from_profile(alias, model_profile, manager, modality, callback)
             if not new_binding: return False
 
             instance_cache[alias] = new_binding
@@ -451,22 +419,22 @@ class LollmsClient():
         return True
 
     def switch_model(self, alias: str, callback=None) -> bool:
-        return self._switch_modality(alias, self.llm_profiles_registry, self.llms, self.llm_binding_manager, "llm", "llm", "_active_llm_alias", callback)
+        return self._switch_modality(alias, self.llm_model_profiles_registry, self.llm_binding_profiles_registry, self.llms, self.llm_binding_manager, "llm", "llm", "_active_llm_alias", callback)
 
     def switch_tti(self, alias: str, callback=None) -> bool:
-        return self._switch_modality(alias, self.tti_profiles_registry, self.ttis, self.tti_binding_manager, "tti", "tti", "_active_tti_alias", callback)
+        return self._switch_modality(alias, self.tti_model_profiles_registry, self.tti_binding_profiles_registry, self.ttis, self.tti_binding_manager, "tti", "tti", "_active_tti_alias", callback)
 
     def switch_tts(self, alias: str, callback=None) -> bool:
-        return self._switch_modality(alias, self.tts_profiles_registry, self.tts_bindings, self.tts_binding_manager, "tts", "tts", "_active_tts_alias", callback)
+        return self._switch_modality(alias, self.tts_model_profiles_registry, self.tts_binding_profiles_registry, self.tts_bindings, self.tts_binding_manager, "tts", "tts", "_active_tts_alias", callback)
 
     def switch_stt(self, alias: str, callback=None) -> bool:
-        return self._switch_modality(alias, self.stt_profiles_registry, self.stts, self.stt_binding_manager, "stt", "stt", "_active_stt_alias", callback)
+        return self._switch_modality(alias, self.stt_model_profiles_registry, self.stt_binding_profiles_registry, self.stts, self.stt_binding_manager, "stt", "stt", "_active_stt_alias", callback)
 
     def switch_ttv(self, alias: str, callback=None) -> bool:
-        return self._switch_modality(alias, self.ttv_profiles_registry, self.ttvs, self.ttv_binding_manager, "ttv", "ttv", "_active_ttv_alias", callback)
+        return self._switch_modality(alias, self.ttv_model_profiles_registry, self.ttv_binding_profiles_registry, self.ttvs, self.ttv_binding_manager, "ttv", "ttv", "_active_ttv_alias", callback)
 
     def switch_ttm(self, alias: str, callback=None) -> bool:
-        return self._switch_modality(alias, self.ttm_profiles_registry, self.ttms, self.ttm_binding_manager, "ttm", "ttm", "_active_ttm_alias", callback)
+        return self._switch_modality(alias, self.ttm_model_profiles_registry, self.ttm_binding_profiles_registry, self.ttms, self.ttm_binding_manager, "ttm", "ttm", "_active_ttm_alias", callback)
 
     # Legacy aliases
     def mount_llm(self, alias: str) -> bool: return self.switch_model(alias)
@@ -493,36 +461,43 @@ class LollmsClient():
     def sink(self, s=None,i=None,d=None): pass
 
     # --- Binding Updates ---
-    def _update_binding(self, binding_name: str, config: Optional[Dict[str, Any]], registry: dict, instance_cache: dict, switch_method: Callable, modality: str):
-        """Generic update method for all modality bindings."""
+    def _update_binding(self, binding_name: str, config: Optional[Dict[str, Any]], binding_registry: dict, model_registry: dict, instance_cache: dict, switch_method: Callable, modality: str):
+        """Generic update method for all modality bindings, respecting the two-tier architecture."""
         config = config or {}
-        registry["master"] = LollmsBindingProfile(
+        binding_registry["master"] = LollmsBindingProfile(
             name="master",
             binding_name=binding_name,
             binding_config=config,
             is_default=True
         )
+        # Ensure a default model profile exists that points to the master binding
+        if "master" not in model_registry:
+            model_registry["master"] = LollmsModelProfile(
+                name="master",
+                binding_profile_name="master",
+                is_default=True
+            )
         if "master" in instance_cache:
             del instance_cache["master"]
         return switch_method("master")
 
     def update_llm_binding(self, binding_name: str, config: Optional[Dict[str, Any]] = None):
-        return self._update_binding(binding_name, config, self.llm_profiles_registry, self.llms, self.switch_model, "LLM")
+        return self._update_binding(binding_name, config, self.llm_binding_profiles_registry, self.llm_model_profiles_registry, self.llms, self.switch_model, "LLM")
 
     def update_tts_binding(self, binding_name: str, config: Optional[Dict[str, Any]] = None):
-        return self._update_binding(binding_name, config, self.tts_profiles_registry, self.tts_bindings, self.switch_tts, "TTS")
+        return self._update_binding(binding_name, config, self.tts_binding_profiles_registry, self.tts_model_profiles_registry, self.tts_bindings, self.switch_tts, "TTS")
 
     def update_tti_binding(self, binding_name: str, config: Optional[Dict[str, Any]] = None):
-        return self._update_binding(binding_name, config, self.tti_profiles_registry, self.ttis, self.switch_tti, "TTI")
+        return self._update_binding(binding_name, config, self.tti_binding_profiles_registry, self.tti_model_profiles_registry, self.ttis, self.switch_tti, "TTI")
 
     def update_stt_binding(self, binding_name: str, config: Optional[Dict[str, Any]] = None):
-        return self._update_binding(binding_name, config, self.stt_profiles_registry, self.stts, self.switch_stt, "STT")
+        return self._update_binding(binding_name, config, self.stt_binding_profiles_registry, self.stt_model_profiles_registry, self.stts, self.switch_stt, "STT")
 
     def update_ttv_binding(self, binding_name: str, config: Optional[Dict[str, Any]] = None):
-        return self._update_binding(binding_name, config, self.ttv_profiles_registry, self.ttvs, self.switch_ttv, "TTV")
+        return self._update_binding(binding_name, config, self.ttv_binding_profiles_registry, self.ttv_model_profiles_registry, self.ttvs, self.switch_ttv, "TTV")
 
     def update_ttm_binding(self, binding_name: str, config: Optional[Dict[str, Any]] = None):
-        return self._update_binding(binding_name, config, self.ttm_profiles_registry, self.ttms, self.switch_ttm, "TTM")
+        return self._update_binding(binding_name, config, self.ttm_binding_profiles_registry, self.ttm_model_profiles_registry, self.ttms, self.switch_ttm, "TTM")
 
     def update_tools_binding(self, binding_name: str, config: Optional[Dict[str, Any]] = None):
         # Tools binding does not use the profile system yet, fallback to direct instantiation

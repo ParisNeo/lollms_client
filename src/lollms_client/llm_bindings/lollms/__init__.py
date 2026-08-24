@@ -113,8 +113,13 @@ class LollmsBinding(LollmsLLMBinding):
         verify = True
 
         if not self.verify_ssl_certificate:
+            # Explicitly construct an unverified SSL context to force httpx
+            # to bypass all certificate checks at the lowest socket level.
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
             self.verify = False
-            verify = False
+            verify = ssl_context
 
         elif self.certificate_file_path:
             cert_path = Path(self.certificate_file_path)

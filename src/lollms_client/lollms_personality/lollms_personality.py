@@ -3643,6 +3643,8 @@ JSON:"""
                     return ss._cb(chunk, msg_type, meta) if streaming_callback else True
                 if isinstance(chunk, str):
                     raw_llm_output_buffer += chunk
+                    if meta and meta.get("live_tool_chunk"):
+                        return True
                     if meta and meta.get("was_processed"):
                         return True
                     return ss.feed(chunk)
@@ -3742,7 +3744,7 @@ JSON:"""
             ss.flush_remaining_buffer()
 
             if ss.was_done_detected():
-                final_response = ss.get_clean_text()
+                final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
 
                 if ss.completed_actions:
                     raw_round_text = final_response
@@ -3787,7 +3789,7 @@ JSON:"""
 
                                 tool_calls_this_turn.append({"round": round_count, "name": tool_name, "parameters": tool_params})
                                 tool_results_this_turn.append({"round": round_count, "name": tool_name, "result": tool_res, "success": tool_success})
-                                clean_result_str = _sanitize_tool_result(tool_res)
+                                clean_result_str = _sanitize_tool_result(tool_res, client=self.lollms_client)
 
                                 if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
                                     try:
@@ -4075,9 +4077,21 @@ JSON:"""
                             extra_data={"virtual_history": [vh.content for vh in virtual_history]}
                         )
                     ASCIIColors.warning(f"[{self.name}] 🚫 Empty response with <done/> detected on round 1. Forcing continuation.")
+
+                    # 🛑 FIX: Capture stated intent from the raw round text to prevent the LLM 
+                    # from abandoning its task when generation halts prematurely.
+                    last_assistant_text = virtual_history[-1].content if virtual_history else ""
+                    intent_hint = ""
+                    if last_assistant_text:
+                        # Look for common intent phrases
+                        import re as _re_intent
+                        intent_match = _re_intent.search(r'(Let me|Now I will|I will|Let\'s|Next, I)\s+.*', last_assistant_text, _re_intent.IGNORECASE)
+                        if intent_match:
+                            intent_hint = f" You previously stated: \"{intent_match.group(0).strip()}\. You must execute this stated intent NOW by emitting the appropriate `<tool>` or `<artifact>` tag."
+
                     virtual_history.append(SimpleNamespace(
                         sender_type="user",
-                        content="[SYSTEM: Your previous response was completely empty. You MUST provide a substantive response or use a tool. Do NOT output an empty response. If you are analyzing code, state your findings. If you are writing code, emit the `<artifact>` tag. Do not emit `<done/>` until you have actually produced output.]"
+                        content=f"[SYSTEM: Your previous response was completely empty.{intent_hint} Do NOT output an empty response. Do NOT emit `<done/>` until you have actually produced output or executed the tool.]"
                     ))
                     ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
                     continue
@@ -4092,6 +4106,8 @@ JSON:"""
 
                 files_before = self._take_workspace_snapshot()
                 actions_executed_count = 0
+                has_truncated_artifact = False
+                truncated_artifact_title = None
 
                 action_reports = []
                 for action in ss.completed_actions:
@@ -4126,7 +4142,7 @@ JSON:"""
 
                             tool_calls_this_turn.append({"round": round_count, "name": tool_name, "parameters": tool_params})
                             tool_results_this_turn.append({"round": round_count, "name": tool_name, "result": tool_res, "success": tool_success})
-                            clean_result_str = _sanitize_tool_result(tool_res)
+                            clean_result_str = _sanitize_tool_result(tool_res, client=self.lollms_client)
                             actions_executed_count += 1
 
                             if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
@@ -4434,15 +4450,37 @@ JSON:"""
                     virtual_history.append(SimpleNamespace(sender_type="user", content=report_text))
 
                 ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
+                if getattr(self, 'debug_mode', False):
+                    ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Actions dispatched, continuing ===")
                 continue
-
             raw_round_text = ss.get_clean_text()
             done_match = re.search(r'(?m)^\s*<done\s*/?>\s*$', raw_round_text.strip())
             if done_match:
-                final_response = re.sub(r'(?m)^\s*<done\s*/?>\s*$', '', raw_round_text, flags=re.MULTILINE).strip()
+                final_response = re.sub(r'(?i)<done\s*/?>', '', raw_round_text).strip()
+                if getattr(self, 'debug_mode', False):
+                    ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: <done/> detected (fallback) ===")
                 break
 
+            if round_count > 1 and tool_calls_this_turn and not was_cancelled:
+                ASCIIColors.warning(f"[{self.name}] Mid-task stall detected (Round {round_count}). LLM stopped without <done/> or new actions. Forcing continuation.")
+                clean_history_text = self._sanitize_history_for_context(raw_round_text)
+                virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant stalled without output]"))
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content=(
+                        "[SYSTEM: CRITICAL. You are in the middle of an agentic task and stopped generating without a `<done/>` tag or any functional action tag. "
+                        "You MUST either continue executing your task by emitting the next `<tool>` or `<artifact>` tag, or output your final conversational answer and end with `<done/>`. "
+                        "Do NOT stop generating until one of these conditions is met.]"
+                    )
+                ))
+                continue
+
             ctx_health = self._calculate_context_fill(stable_system_prompt, base_conversation, virtual_history, raw_round_text)
+
+            if getattr(self, 'debug_mode', False):
+                gen_tokens = len(raw_round_text) // 4
+                raw_tokens = len(raw_llm_output_buffer) // 4
+                ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: No <done/> detected. Generated ~{gen_tokens} tokens (raw buffer: ~{raw_tokens} tokens). Total context fill: {ctx_health.get('fill_percentage', 0.0):.1f}% ===")
 
             if ctx_health["fill_percentage"] > 85.0 and len(virtual_history) > 0 and not getattr(self, '_compaction_triggered_this_turn', False):
                 ASCIIColors.warning(f"[{self.name}] Context fill at {ctx_health['fill_percentage']}%. Triggering autonomous compaction.")

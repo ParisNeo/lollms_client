@@ -1026,10 +1026,16 @@ class StreamRenderer:
         if msg_type == MSG_TYPE.MSG_TYPE_TOOL_START:
             tool_name = meta.get("tool_name", "unknown")
             params = meta.get("parameters", {})
-            
+
+            # 🛑 FIX: Suppress the structured TOOL_START event if it's a shell command.
+            # The _StreamState interceptor already emitted a <processing> block for it,
+            # so rendering this panel would cause a duplicate UI block.
+            if tool_name == "tool_execute_shell_command":
+                return True
+
             command_str = params.get("command", "")
             autonomy = params.get("autonomy_level", "safe")
-            
+
             if tool_name == "tool_execute_shell_command" and command_str:
                 panel_content = (
                     f"\n[cyan]Command:[/cyan] [yellow]{command_str}[/yellow]\n"
@@ -1045,7 +1051,7 @@ class StreamRenderer:
 
             ASCIIColors.panel(
                 panel_content,
-                title=f"\n[bold blue]🛠️ Executing: {tool_name}[/bold blue]",
+                title=f"[bold blue]🛠️ Executing: {tool_name}[/bold blue]",
                 border_style="blue"
             )
 
@@ -1067,7 +1073,7 @@ class StreamRenderer:
             panel_content = f"\n[cyan]Status:[/cyan] {status_str}\n\n[cyan]Execution Log:[/cyan]\n{log_content}"
             ASCIIColors.panel(
                 panel_content,
-                title=f"\n[bold blue]🛠️ Finished: {tool_name}[/bold blue]",
+                title=f"[bold blue]🛠️ Finished: {tool_name}[/bold blue]",
                 border_style="green" if success else "red"
             )
 
@@ -1135,7 +1141,7 @@ class StreamRenderer:
 
             ASCIIColors.panel(
                 panel_content,
-                title=f"\n[bold yellow]📂 Context {action.replace('_', ' ').capitalize()}[/bold yellow]",
+                title=f"[bold yellow]📂 Context {action.replace('_', ' ').capitalize()}[/bold yellow]",
                 border_style="yellow"
             )
 

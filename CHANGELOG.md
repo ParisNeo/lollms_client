@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-08-24 07:18]
+
+- feat: enhance universal profiles and multi-model routing with expanded documentation and examples
+
 ## [2026-08-20 23:30]
 
 - docs: cleanup documentation and update core client components
