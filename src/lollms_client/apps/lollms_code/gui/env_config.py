@@ -112,13 +112,24 @@ class EnvStore:
             except Exception:
                 pass
 
-    def is_configured(self) -> bool:
-        """At least one usable LLM binding or profile is present."""
-        if get_configured_aliases("llm", self.config_map, "BINDINGS"):
-            return True
-        if get_configured_aliases("llm", self.config_map, "PROFILES"):
-            return True
-        return False
+    def is_configured(self, require_llm: bool = True, require_tti: bool = False, require_tts: bool = False, require_stt: bool = False, require_ttm: bool = False, require_ttv: bool = False) -> bool:
+        """Validates configuration based on required modalities using the Two-Tier Profile System."""
+        required_modalities = {
+            "llm": require_llm,
+            "tti": require_tti,
+            "tts": require_tts,
+            "stt": require_stt,
+            "ttm": require_ttm,
+            "ttv": require_ttv
+        }
+
+        for modality, required in required_modalities.items():
+            if required:
+                has_binding = bool(get_configured_aliases(modality, self.config_map, "BINDINGS"))
+                has_profile = bool(get_configured_aliases(modality, self.config_map, "PROFILES"))
+                if not (has_binding and has_profile):
+                    return False
+        return True
 
     def save(self) -> Path:
         target_dir = Path.home() / ".lollms-client"

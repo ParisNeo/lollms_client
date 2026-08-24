@@ -539,72 +539,187 @@ blocks = tp.extract_code_blocks(
 
 ## 🧠 Universal Lazy Profiles & Multi-Model Routing
 
-`lollms_client` features a powerful, memory-efficient multi-binding architecture via **Universal Lazy Profiles**. Instead of eagerly instantiating all models/engines at startup (which wastes RAM and VRAM), you define declarative registries of `LollmsBindingProfile` configurations for *any* modality (LLM, TTI, TTS, STT, TTV, TTM). 
+`lollms_client` features a powerful, memory-efficient multi-binding architecture via a **Two-Tier Profile System**. Instead of eagerly instantiating all models/engines at startup (which wastes RAM and VRAM), you declaratively separate your configuration into two layers:
 
-Only the binding marked as `is_default` is loaded at startup. Other bindings are instantiated lazily *on-demand* when you switch to them. This system is 100% backward compatible. If you use the legacy `llm_binding_name` or `tti_binding_name` parameters, they are automatically registered as the `"master"` profiles and marked as defaults.
+1. **Connection Layer (`*_binding_profiles`)**: Defines the backend engine/server configuration (e.g., host address, API keys, binding library name). You declare this **once per server**.
+2. **Execution Layer (`*_model_profiles`)**: Defines specific models, routing rules, and vision flags. It references a binding profile via `binding_profile_name`, allowing N models to share 1 connection configuration without duplication (DRY principle).
 
-### 1. Multi-Model LLM Routing
-Define multiple LLM profiles to handle different domains or complexity tiers.
+Only the model profile marked as `is_default=True` is loaded at startup. Other models are instantiated lazily *on-demand* when you switch to them.
+
+**100% Backward Compatible**: If you use the legacy `llm_binding_name` or `extra_llms` parameters, they are automatically registered as the `"master"` binding and model profiles and eagerly instantiated.
+
+### 🏗️ Production Scaling: Multi-User Concurrency & Resource Management
+
+When deploying `lollms_client` in a multi-user application (e.g., a web backend serving multiple clients simultaneously), resource management is split into two distinct layers:
+
+#### 1. Multi-User Concurrency (Binding Layer)
+If multiple users are interacting with the **same model** at the same time, `lollms_client` does not instantiate multiple copies of the model. Instead, concurrency is handled entirely by the binding backend. 
+For example, when using the `llama_cpp_server` binding, you can configure `n_parallel` (parallel decoding slots) in the `binding_config`. The binding spins up a single server process that safely handles concurrent requests from multiple users using shared KV caches. This ensures optimal VRAM usage while maintaining high throughput.
+
+#### 2. Resource Freeing & Cooperative VRAM Management
+If your application instantiates multiple *different* models (e.g., a coding model, a vision model, and a text-to-speech engine), `lollms_client` provides robust mechanisms to prevent Out-Of-Memory (OOM) crashes:
+
+*   **LRU Eviction (Per-Binding)**: Bindings like `llama_cpp_server` enforce a `max_active_models` limit. If the limit is reached and a new model is requested, the binding automatically evicts the **Least-Recently-Used (LRU)** model, freeing its VRAM before spawning the new server.
+*   **Cooperative VRAM Management (Cross-Modality)**: By initializing `LollmsClient(cooperative_vram_management=True)`, the client dynamically unloads inactive modality models to make room for the active one. For instance, if a user requests image generation (`tti`), the client will automatically unload the LLM (`llm`) from VRAM to ensure the image model fits, and reload the LLM when the user returns to chat.
+
+---
+
+### 1. One Binding, Multiple Models (DRY Configuration)
+If you have a single Ollama server but want to use multiple models (e.g., a fast model for chat and a heavy model for coding), you define the connection *once* and map multiple models to it.
 
 ```python
-from lollms_client import LollmsClient, LollmsBindingProfile
+from lollms_client import LollmsClient, LollmsBindingProfile, LollmsModelProfile
 
-# 1. Define LLM profiles declaratively (None of these are instantiated yet)
-llm_profiles = {
-    "cloud_vision": LollmsBindingProfile(
-        name="cloud_vision",
-        binding_name="openai",
-        binding_config={"model_name": "gpt-4o", "service_key": "your-key"},
-        vision_enabled=True,
-        is_default=True  # This one will be loaded at startup
-    ),
-    "local_coder": LollmsBindingProfile(
-        name="local_coder",
+# 1. Define the Connection Layer ONCE
+llm_binding_profiles = {
+    "local_ollama": LollmsBindingProfile(
+        name="local_ollama",
         binding_name="ollama",
-        binding_config={"host_address": "http://localhost:11434", "model_name": "qwen2.5-coder:7b"},
-        forced_context_size=32768
-    ),
-    "local_fast": LollmsBindingProfile(
-        name="local_fast",
-        binding_name="ollama",
-        binding_config={"host_address": "http://localhost:11434", "model_name": "llama3.2:3b"}
+        binding_config={"host_address": "http://localhost:11434"}
     )
 }
 
-# 2. Initialize the client (Only "cloud_vision" is instantiated)
-lc = LollmsClient(llm_profiles=llm_profiles)
+# 2. Define multiple Execution Layer models referencing the binding
+llm_model_profiles = {
+    "fast_chat": LollmsModelProfile(
+        name="fast_chat",
+        binding_profile_name="local_ollama",
+        model_name="llama3.2:3b",
+        is_default=True # Loaded at startup
+    ),
+    "deep_coder": LollmsModelProfile(
+        name="deep_coder",
+        binding_profile_name="local_ollama",
+        model_name="qwen2.5-coder:7b",
+        forced_context_size=32768
+    )
+}
 
-# 3. Use the default model
+# 3. Initialize the client (Only "fast_chat" is instantiated)
+lc = LollmsClient(
+    llm_binding_profiles=llm_binding_profiles,
+    llm_model_profiles=llm_model_profiles
+)
+
+# 4. Use the default model
 response1 = lc.generate_text("Explain quantum physics.")
 
-# 4. Dynamically switch to the local coder (Instantiated on-the-fly and cached)
-lc.switch_model("local_coder")
+# 5. Dynamically switch to the coder (Instantiated on-the-fly and cached)
+lc.switch_model("deep_coder")
 response2 = lc.generate_text("Write a Python script to sort a list.")
 
-# 5. Switch back to the default cloud vision model (Retrieved from cache, no re-instantiation)
-lc.switch_model("cloud_vision")
+# 6. Switch back to the fast chat model (Retrieved from cache, zero re-instantiation)
+lc.switch_model("fast_chat")
 ```
 
-### 2. Multi-Engine TTI (Text-to-Image) Routing
-The profile system is universal. You can define profiles for image generation engines and switch between a local Stable Diffusion model and a cloud DALL-E API seamlessly.
+### 2. Two Bindings, Two Models with Auto-Routing
+You can combine the Two-Tier Profile system with the `smart_router` meta-binding. The router evaluates incoming prompts using TF-IDF (subject matching), complexity heuristics, and weighted constraints (cost/latency) to delegate generation to the optimal child model automatically.
 
 ```python
-# Define TTI profiles
-tti_profiles = {
-    "local_sd": LollmsBindingProfile(
-        name="local_sd",
-        binding_name="diffusers",
-        binding_config={"model_name": "stable-diffusion-v1-5"},
-        is_default=True
+from lollms_client import LollmsClient, LollmsBindingProfile, LollmsModelProfile
+
+# 1. Define two distinct Connection Layers (e.g., Local vs Cloud)
+llm_binding_profiles = {
+    "local_server": LollmsBindingProfile(
+        name="local_server",
+        binding_name="ollama",
+        binding_config={"host_address": "http://localhost:11434"}
     ),
-    "cloud_dalle": LollmsBindingProfile(
-        name="cloud_dalle",
+    "cloud_server": LollmsBindingProfile(
+        name="cloud_server",
         binding_name="openai",
-        binding_config={"model_name": "dall-e-3", "service_key": "your-key"}
+        binding_config={"service_key": "your-openai-key"}
     )
 }
 
-lc = LollmsClient(llm_binding_name="ollama", tti_profiles=tti_profiles)
+# 2. Define Execution Layer models with routing metadata
+llm_model_profiles = {
+    "cheap_fast": LollmsModelProfile(
+        name="cheap_fast",
+        binding_profile_name="local_server",
+        model_name="llama3.2:3b",
+        routing_config={
+            "description": "fast simple tasks math formatting",
+            "cost_per_1k_tokens": 0.0,
+            "avg_latency_ms": 20,
+            "complexity_tier": 1
+        }
+    ),
+    "smart_coder": LollmsModelProfile(
+        name="smart_coder",
+        binding_profile_name="cloud_server",
+        model_name="gpt-4o",
+        routing_config={
+            "description": "python javascript rust code debugging algorithms",
+            "cost_per_1k_tokens": 0.01,
+            "avg_latency_ms": 200,
+            "complexity_tier": 3
+        }
+    )
+}
+
+# 3. Initialize the client with a Smart Router as the default master binding
+lc = LollmsClient(
+    # The router acts as the master, delegating to the profiles above
+    llm_binding_name="smart_router",
+    llm_binding_config={
+        "routing_strategy": "cost_optimized",
+        "model_profiles": {
+            "cheap_fast": llm_model_profiles["cheap_fast"].__dict__,
+            "smart_coder": llm_model_profiles["smart_coder"].__dict__
+        }
+    },
+    # Pass the same profiles to the lazy registry for manual switching if needed
+    llm_binding_profiles=llm_binding_profiles,
+    llm_model_profiles=llm_model_profiles
+)
+
+# The router automatically selects "cheap_fast" for simple prompts
+response = lc.generate_text("What is 2+2?")
+
+# The router automatically selects "smart_coder" for coding prompts
+response = lc.generate_text("Write a Python script to sort a list.")
+```
+
+### 3. Multi-Engine TTI (Text-to-Image) Routing
+The profile system is universal across all modalities. You can define profiles for image generation engines and switch between a local Stable Diffusion model and a cloud DALL-E API seamlessly.
+
+```python
+from lollms_client import LollmsClient, LollmsBindingProfile, LollmsModelProfile
+
+# 1. Define TTI Connection Layers
+tti_binding_profiles = {
+    "local_engine": LollmsBindingProfile(
+        name="local_engine",
+        binding_name="diffusers",
+        binding_config={"model_name": "stable-diffusion-v1-5"}
+    ),
+    "cloud_engine": LollmsBindingProfile(
+        name="cloud_engine",
+        binding_name="openai",
+        binding_config={"service_key": "your-key"}
+    )
+}
+
+# 2. Define TTI Execution Layers
+tti_model_profiles = {
+    "local_sd": LollmsModelProfile(
+        name="local_sd",
+        binding_profile_name="local_engine",
+        is_default=True
+    ),
+    "cloud_dalle": LollmsModelProfile(
+        name="cloud_dalle",
+        binding_profile_name="cloud_engine",
+        model_name="dall-e-3"
+    )
+}
+
+lc = LollmsClient(
+    llm_binding_name="ollama",
+    tti_binding_profiles=tti_binding_profiles,
+    tti_model_profiles=tti_model_profiles
+)
 
 # Generate with default local SD
 img_bytes = lc.generate_image("A cyberpunk cat")
@@ -614,50 +729,44 @@ lc.switch_tti("cloud_dalle")
 img_bytes = lc.generate_image("A hyperrealistic oil painting of a dog")
 ```
 
-### 3. The Smart Router Binding
-For automated routing, the `smart_router` meta-binding evaluates incoming prompts using TF-IDF (subject matching), complexity heuristics, and weighted constraints (cost/latency) to delegate generation to the optimal child model automatically.
+### 4. VLM as a Tool (`vlm_query`)
+When using a text-only LLM, you can enable VLM collaboration via the `vlm_query` LCP tool. This allows the text LLM to delegate visual analysis to a secondary VLM on-demand. Using the Two-Tier system, you mount both the text LLM and the VLM on the same client.
 
 ```python
-from lollms_client import LollmsClient
+from lollms_client import LollmsClient, LollmsBindingProfile, LollmsModelProfile
 
-router_config = {
-    "routing_strategy": "cost_optimized",
-    "model_profiles": {
-        "cheap_fast": {
-            "binding_name": "ollama",
-            "binding_config": {"model_name": "qwen2.5:3b"},
-            "routing_profile": {"description": "fast simple tasks", "complexity_tier": 1}
-        },
-        "smart_coder": {
-            "binding_name": "ollama",
-            "binding_config": {"model_name": "qwen2.5-coder:7b"},
-            "routing_profile": {"description": "python code debugging", "complexity_tier": 2}
-        }
-    }
+# 1. Define Connection Layer (Both models on the same local Ollama server)
+llm_binding_profiles = {
+    "local_ollama": LollmsBindingProfile(
+        name="local_ollama",
+        binding_name="ollama",
+        binding_config={"host_address": "http://localhost:11434"}
+    )
 }
 
-lc = LollmsClient(llm_binding_name="smart_router", llm_binding_config=router_config)
+# 2. Define Execution Layer (A text model and a vision model)
+llm_model_profiles = {
+    "text_llm": LollmsModelProfile(
+        name="text_llm",
+        binding_profile_name="local_ollama",
+        model_name="llama3",
+        is_default=True
+    ),
+    "vlm": LollmsModelProfile(
+        name="vlm",
+        binding_profile_name="local_ollama",
+        model_name="llava",
+        vision_enabled=True
+    )
+}
 
-# The router automatically selects "cheap_fast" for simple prompts
-response = lc.generate_text("What is 2+2?")
-
-# The router automatically selects "smart_coder" for coding prompts
-response = lc.generate_text("Write a Python script to sort a list.")
-```
-
-### 4. VLM as a Tool (`vlm_query`)
-When using a text-only LLM (or Smart Router without a VLM child), you can enable VLM collaboration via the `vlm_query` LCP tool. This allows the text LLM to delegate visual analysis to a secondary VLM on-demand.
-
-```python
-# Client with a text-only LLM and a separate VLM profile
+# 3. Initialize client
 lc = LollmsClient(
-    llm_profiles={
-        "text_llm": LollmsBindingProfile(name="text_llm", binding_name="ollama", binding_config={"model_name": "llama3"}, is_default=True),
-        "vlm": LollmsBindingProfile(name="vlm", binding_name="ollama", binding_config={"model_name": "llava"}, vision_enabled=True)
-    }
+    llm_binding_profiles=llm_binding_profiles,
+    llm_model_profiles=llm_model_profiles
 )
 
-# The user sends an image and asks a question
+# 4. Chat with an image (Assuming a LollmsDiscussion is set up)
 discussion.chat(
     user_message="Look at the diagram in the image. What are the main components?",
     images=["base64_encoded_image_data..."],
@@ -2040,29 +2149,6 @@ response = lc.generate_text("What is 2+2?")
 
 # The router automatically selects "smart_coder" for coding prompts
 response = lc.generate_text("Write a Python script to sort a list.")
-```
-
-#### 4. VLM as a Tool (`vlm_query`)
-When using a text-only LLM (or Smart Router without a VLM child), you can enable VLM collaboration via the `vlm_query` LCP tool. This allows the text LLM to delegate visual analysis to a secondary VLM on-demand.
-
-```python
-# Client with a text-only LLM and a separate VLM profile
-lc = LollmsClient(
-    llm_profiles={
-        "text_llm": LollmsBindingProfile(name="text_llm", binding_name="ollama", binding_config={"model_name": "llama3"}, is_default=True),
-        "vlm": LollmsBindingProfile(name="vlm", binding_name="ollama", binding_config={"model_name": "llava"}, vision_enabled=True)
-    }
-)
-
-# The user sends an image and asks a question
-discussion.chat(
-    user_message="Look at the diagram in the image. What are the main components?",
-    images=["base64_encoded_image_data..."],
-    enable_vlm_query=True, # CRITICAL: Explicitly enable the fallback tool
-    max_reasoning_steps=10
-)
-# The LLM (llama3) will realize it needs vision, call `tool_vlm_query(0, "Identify the main components.")`,
-# receive the text description from the VLM (llava), and synthesize the final answer.
 ```
 
 ### Smart Routing & VLM Collaboration

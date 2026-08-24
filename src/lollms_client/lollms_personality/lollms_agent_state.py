@@ -44,7 +44,26 @@ _BINARY_BLOB_KEYS = {
     "screenshot_b64", "pdf_b64", "thumbnail_b64", "base64",
     "binary", "raw_image", "image_data", "raw_data",
 }
-_MAX_TOOL_RESULT_CHARS = 4000
+
+def _calculate_dynamic_tool_char_limit(client: Optional[Any] = None) -> int:
+    """
+    Calculates the maximum allowed characters for a tool result based on the LLM's context size.
+    Uses 25% of the context window, capped at 50,000 chars to preserve conversation space.
+    Falls back to 12,000 chars if context size is unavailable.
+    """
+    if client and hasattr(client, 'get_ctx_size'):
+        try:
+            ctx_size = client.get_ctx_size() or 0
+            if ctx_size > 0:
+                # 1 token ~= 4 chars. Allow up to 25% of context window for a single tool output.
+                dynamic_limit = int((ctx_size * 0.25) * 4)
+                # Cap at 50,000 chars to prevent a single tool from consuming the entire budget
+                return min(max(dynamic_limit, 8000), 50000)
+        except Exception:
+            pass
+    return 12000
+
+_MAX_TOOL_RESULT_CHARS = 12000
 
 def _is_large_base64(v: str) -> bool:
     sample = v.replace("\n", "").replace("\r", "").replace(" ", "")
@@ -52,7 +71,10 @@ def _is_large_base64(v: str) -> bool:
         return False
     return bool(_BASE64_RE.match(sample[:1000]))
 
-def _sanitize_tool_result(tool_res: Any, max_chars: int = _MAX_TOOL_RESULT_CHARS) -> str:
+def _sanitize_tool_result(tool_res: Any, max_chars: Optional[int] = None, client: Optional[Any] = None) -> str:
+    if max_chars is None:
+        max_chars = _calculate_dynamic_tool_char_limit(client)
+
     def _find_prompt_injection(obj: Any, depth: int = 0) -> Optional[str]:
         if depth > 4:
             return None
@@ -431,7 +453,7 @@ class _AgentStreamState:
                 self._pending_buffer = ""
                 return True
 
-        if not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence and not self._in_inline_code:
+        if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence and not self._in_inline_code:
             done_match = re.search(r'(?m)^\s*<done\s*/?>', self._pending_buffer, re.IGNORECASE)
             if done_match:
                 text_before = self._pending_buffer[:done_match.start()].strip()
@@ -455,13 +477,13 @@ class _AgentStreamState:
                 self._try_complete_tool()
             return True
 
-        if not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence and not self._in_inline_code:
+        if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence and not self._in_inline_code:
             proc_match = re.search(r'(?m)^\s*<processing', self._pending_buffer, re.IGNORECASE)
             if proc_match:
                 self._pending_buffer = re.sub(r'(?m)^\s*<processing[^>]*>', '', self._pending_buffer, flags=re.IGNORECASE)
                 return False
 
-        if not self._is_accumulating_tool and not self._is_accumulating_artifact:
+        if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact:
             if "```" in self._pending_buffer:
                 self._code_fence_buffer += self._pending_buffer
                 self._pending_buffer = ""
@@ -499,7 +521,7 @@ class _AgentStreamState:
                 self._pending_buffer = ""
                 return True
 
-        if not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence:
+        if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence:
             if "`" in self._pending_buffer:
                 if self._in_inline_code:
                     idx = self._pending_buffer.find("`")
@@ -647,14 +669,16 @@ class _AgentStreamState:
             self._try_complete_context_tag()
             return True
 
-        if not self._in_code_fence and not self._in_inline_code:
+        if not self._in_think_block and not self._in_code_fence and not self._in_inline_code:
             tool_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<tool>', self._pending_buffer, re.IGNORECASE)
             if tool_match:
                 tag_start_idx = tool_match.start()
                 text_before = self._pending_buffer[:tag_start_idx]
                 if text_before:
-                    self.content += text_before
-                    self._cb(text_before)
+                    stripped_before = text_before.strip()
+                    if stripped_before:
+                        self.content += text_before
+                        self._cb(text_before)
 
                 self._is_accumulating_tool = True
                 self.tool_trigger = True
@@ -663,7 +687,7 @@ class _AgentStreamState:
 
                 if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
                     self._cb("<tool>", MSG_TYPE.MSG_TYPE_TOOL_START, {"tool_name": "pending", "parameters": {}})
-                
+
                 if self._event_mode == EventMode.PROCESSING_TAG_MODE:
                     self._cb('\n<processing type="tool" title="pending">\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
@@ -845,6 +869,41 @@ class _AgentStreamState:
         return True
 
 
+    @staticmethod
+    def _extract_balanced_json(text: str) -> Optional[str]:
+        start_idx = text.find('{')
+        if start_idx == -1:
+            return None
+
+        depth = 0
+        in_string = False
+        escape = False
+        string_char = ""
+
+        for i in range(start_idx, len(text)):
+            char = text[i]
+
+            if in_string:
+                if char == '\\':
+                    escape = not escape
+                elif char == string_char and not escape:
+                    in_string = False
+                else:
+                    escape = False
+                continue
+
+            if char in ('"', "'"):
+                in_string = True
+                string_char = char
+            elif char == '{':
+                depth += 1
+            elif char == '}':
+                depth -= 1
+                if depth == 0:
+                    return text[start_idx:i + 1]
+
+        return None
+
     def _try_complete_tool(self) -> None:
         close_match = re.search(r'</tool>\s*', self._tool_buffer, re.IGNORECASE)
         if not close_match:
@@ -854,8 +913,18 @@ class _AgentStreamState:
         end_len = len(close_match.group(0))
 
         full_tool_call = self._tool_buffer[:end_idx + end_len]
-        json_body = re.sub(r'^<tool>', '', full_tool_call, flags=re.IGNORECASE)
-        json_body = re.sub(r'</tool>\s*$', '', json_body, flags=re.IGNORECASE).strip()
+
+        tag_start_idx = full_tool_call.lower().find("<tool>")
+        if tag_start_idx != -1:
+            content_between_tags = full_tool_call[tag_start_idx + 6:end_idx]
+        else:
+            content_between_tags = full_tool_call[:end_idx]
+
+        json_body = self._extract_balanced_json(content_between_tags)
+        if json_body is None:
+            json_body = content_between_tags.strip()
+            if not json_body:
+                json_body = "{}"
 
         self._is_accumulating_tool = False
         remaining = self._tool_buffer[end_idx + end_len:]
@@ -866,15 +935,31 @@ class _AgentStreamState:
             self._pending_buffer = remaining
 
         raw_data = None
-        resolved_tool_name = "pending"
+        resolved_tool_name = "malformed_tool_call"
         resolved_params = {}
+
+        def _fix_unescaped_backslashes(text: str) -> str:
+            valid_json_escapes = r'\\(["\\/bfnrtu])'
+            def replacer(m):
+                if m.group(1) in ('"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u'):
+                    return m.group(0)
+                return '\\\\' + m.group(1)
+            return re.sub(valid_json_escapes, replacer, text)
+
+        sanitized_json_body = _fix_unescaped_backslashes(json_body)
+
         try:
-            raw_data = json.loads(json_body)
+            raw_data = json.loads(sanitized_json_body)
+            json_body = sanitized_json_body
             if isinstance(raw_data, dict):
                 resolved_tool_name = raw_data.get("name", "malformed_tool_call")
+                if not resolved_tool_name:
+                    resolved_tool_name = "malformed_tool_call"
                 resolved_params = raw_data.get("parameters", {})
+                if not isinstance(resolved_params, dict):
+                    resolved_params = {}
         except json.JSONDecodeError:
-            repaired = json_body
+            repaired = sanitized_json_body
             while repaired.count('{') > repaired.count('}'):
                 repaired += '}'
             while repaired.count('[') > repaired.count(']'):
@@ -884,10 +969,15 @@ class _AgentStreamState:
                 json_body = repaired
                 if isinstance(raw_data, dict):
                     resolved_tool_name = raw_data.get("name", "malformed_tool_call")
+                    if not resolved_tool_name:
+                        resolved_tool_name = "malformed_tool_call"
                     resolved_params = raw_data.get("parameters", {})
+                    if not isinstance(resolved_params, dict):
+                        resolved_params = {}
             except json.JSONDecodeError:
                 raw_data = None
                 resolved_tool_name = "malformed_tool_call"
+                resolved_params = {}
 
         if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
             try:
@@ -909,9 +999,9 @@ class _AgentStreamState:
                         normalized = {"name": nested_name, "parameters": params_cleaned}
                         normalized_json = json.dumps(normalized)
             else:
-                tool_name = raw_data.get("name", "")
+                t_name = raw_data.get("name", "")
                 params = {k: v for k, v in raw_data.items() if k != "name"}
-                normalized = {"name": tool_name, "parameters": params}
+                normalized = {"name": t_name, "parameters": params}
                 normalized_json = json.dumps(normalized)
         else:
             normalized_json = json.dumps({
@@ -919,7 +1009,13 @@ class _AgentStreamState:
                 "parameters": {"raw_body": json_body[:500]}
             })
 
-        self.completed_actions.append({"type": "tool", "json": normalized_json})
+        if resolved_tool_name == "malformed_tool_call":
+            self.completed_actions.append({
+                "type": "malformed_json",
+                "raw_body": json_body[:1000]
+            })
+        else:
+            self.completed_actions.append({"type": "tool", "json": normalized_json})
 
     def _try_complete_artifact(self) -> None:
         close_match = re.search(r'</art(?:ifact|efact)>\s*', self._tool_buffer, re.IGNORECASE)

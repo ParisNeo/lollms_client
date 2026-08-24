@@ -553,21 +553,64 @@ class CodeAgentConfig:
         except Exception as e:
             ASCIIColors.warning(f"Failed to save config: {e}")
 
-    def is_configured(self) -> bool:
-        if not self.llm_binding or not self.model_name:
-            return False
-        if self.llm_binding_config:
-            return True
-            
-        host_address = os.getenv("HOST_ADDRESS")
-        if host_address:
-            return True
-            
-        for k, v in os.environ.items():
-            if k.startswith("LLM_BINDINGS_") and "_HOST_ADDRESS" in k and v:
-                return True
-                
-        return False
+    def _read_yaml_config(self) -> Dict[str, str]:
+        """Reads the canonical ~/.lollms_client/config.yaml file into a flattened dictionary."""
+        env_data = {}
+        home_yaml = Path.home() / ".lollms_client" / "config.yaml"
+        if home_yaml.exists():
+            try:
+                import yaml as _yaml
+                with open(home_yaml, "r", encoding="utf-8") as f:
+                    yaml_data = _yaml.safe_load(f) or {}
+
+                def _flatten_dict(d: Dict[str, Any], parent_key: str = "", sep: str = "_") -> Dict[str, str]:
+                    items = []
+                    for k, v in d.items():
+                        new_key = f"{parent_key}{sep}{k}" if parent_key else str(k)
+                        if isinstance(v, dict):
+                            items.extend(_flatten_dict(v, new_key, sep=sep).items())
+                        elif isinstance(v, list):
+                            for i, item in enumerate(v):
+                                if isinstance(item, dict):
+                                    items.extend(_flatten_dict(item, f"{new_key}{sep}{i}", sep=sep).items())
+                                else:
+                                    items.append((f"{new_key}{sep}{i}", str(item)))
+                        elif isinstance(v, bool):
+                            items.append((new_key, "true" if v else "false"))
+                        elif v is not None:
+                            items.append((new_key, str(v)))
+                    return dict(items)
+
+                env_data.update(_flatten_dict(yaml_data))
+            except Exception:
+                pass
+        return env_data
+
+    def _has_modality_configured(self, env_data: Dict[str, str], modality: str) -> bool:
+        """Checks if at least one binding and one profile exist for the given modality (e.g., 'llm', 'tti')."""
+        mod_upper = modality.upper()
+        has_binding = any(k.startswith(f"{mod_upper}_BINDINGS_") and k.endswith("_BINDING_NAME") and v for k, v in env_data.items())
+        has_profile = any(k.startswith(f"{mod_upper}_PROFILES_") and k.endswith("_BINDING_ALIAS") and v for k, v in env_data.items())
+        return has_binding and has_profile
+
+    def is_configured(self, require_llm: bool = True, require_tti: bool = False, require_tts: bool = False, require_stt: bool = False, require_ttm: bool = False, require_ttv: bool = False) -> bool:
+        """Validates configuration based on required modalities using the Two-Tier Profile System."""
+        env_data = self._read_yaml_config()
+
+        required_modalities = {
+            "llm": require_llm,
+            "tti": require_tti,
+            "tts": require_tts,
+            "stt": require_stt,
+            "ttm": require_ttm,
+            "ttv": require_ttv
+        }
+
+        for modality, required in required_modalities.items():
+            if required and not self._has_modality_configured(env_data, modality):
+                return False
+
+        return True
     
 
 def create_client(config: CodeAgentConfig) -> LollmsClient:
@@ -1026,10 +1069,16 @@ class StreamRenderer:
         if msg_type == MSG_TYPE.MSG_TYPE_TOOL_START:
             tool_name = meta.get("tool_name", "unknown")
             params = meta.get("parameters", {})
-            
+
+            # 🛑 FIX: Suppress the structured TOOL_START event if it's a shell command.
+            # The _StreamState interceptor already emitted a <processing> block for it,
+            # so rendering this panel would cause a duplicate UI block.
+            if tool_name == "tool_execute_shell_command":
+                return True
+
             command_str = params.get("command", "")
             autonomy = params.get("autonomy_level", "safe")
-            
+
             if tool_name == "tool_execute_shell_command" and command_str:
                 panel_content = (
                     f"\n[cyan]Command:[/cyan] [yellow]{command_str}[/yellow]\n"
@@ -1045,7 +1094,7 @@ class StreamRenderer:
 
             ASCIIColors.panel(
                 panel_content,
-                title=f"\n[bold blue]🛠️ Executing: {tool_name}[/bold blue]",
+                title=f"[bold blue]🛠️ Executing: {tool_name}[/bold blue]",
                 border_style="blue"
             )
 
@@ -1067,7 +1116,7 @@ class StreamRenderer:
             panel_content = f"\n[cyan]Status:[/cyan] {status_str}\n\n[cyan]Execution Log:[/cyan]\n{log_content}"
             ASCIIColors.panel(
                 panel_content,
-                title=f"\n[bold blue]🛠️ Finished: {tool_name}[/bold blue]",
+                title=f"[bold blue]🛠️ Finished: {tool_name}[/bold blue]",
                 border_style="green" if success else "red"
             )
 
@@ -1135,7 +1184,7 @@ class StreamRenderer:
 
             ASCIIColors.panel(
                 panel_content,
-                title=f"\n[bold yellow]📂 Context {action.replace('_', ' ').capitalize()}[/bold yellow]",
+                title=f"[bold yellow]📂 Context {action.replace('_', ' ').capitalize()}[/bold yellow]",
                 border_style="yellow"
             )
 
@@ -2152,7 +2201,8 @@ def main():
 
     config = CodeAgentConfig.load(args)
 
-    if args.config or not config.is_configured():
+    # The CLI requires at least the LLM modality to be configured.
+    if args.config or not config.is_configured(require_llm=True):
         from lollms_client.lollms_config_cli_env import run_wizard_and_save
         run_wizard_and_save()
         config = CodeAgentConfig.load(args)
