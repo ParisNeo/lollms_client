@@ -182,6 +182,103 @@ def _sanitize_tool_result(tool_res: Any, max_chars: int = _MAX_TOOL_RESULT_CHARS
         text = text[:max_chars] + f"\n... [truncated, {len(text) - max_chars} more chars]"
     return text
 
+
+def _extract_artefact_meta(buffer: str, language: Optional[str] = None, art_type: str = "code") -> Dict[str, Any]:
+    """
+    Extracts rich structural metadata from an artifact buffer without embedding the full raw content.
+    """
+    if not buffer:
+        return {
+            "line_count": 0,
+            "size_chars": 0,
+            "estimated_tokens": 0,
+            "is_patch": False,
+            "current_section": None,
+            "sections": [],
+            "sections_count": 0,
+            "patch_stats": None,
+            "preview": ""
+        }
+
+    lines = buffer.splitlines()
+    line_count = len(lines)
+    size_chars = len(buffer)
+    estimated_tokens = size_chars // 4
+
+    is_patch = "<<<<<<< SEARCH" in buffer
+    patch_stats = None
+    if is_patch:
+        search_count = len(re.findall(r'^<{6,8}(?:\s*\w+)?\s*$', buffer, re.MULTILINE))
+        replace_count = len(re.findall(r'^={5,}\s*$', buffer, re.MULTILINE))
+        has_end_replace = bool(re.search(r'^>{6,8}(?:\s*\w+)?\s*$', buffer, re.MULTILINE))
+        patch_stats = {
+            "hunks_count": search_count,
+            "is_complete_hunk": search_count > 0 and search_count == replace_count and has_end_replace
+        }
+
+    sections: List[Dict[str, Any]] = []
+    current_section: Optional[str] = None
+    lang = (language or "").lower()
+
+    for idx, line in enumerate(lines):
+        line_str = line.strip()
+        if not line_str:
+            continue
+
+        if lang in ("markdown", "md") or art_type in ("document", "note", "skill", "scratchpad", "presentation"):
+            m = re.match(r'^(#{1,6})\s+(.+)$', line_str)
+            if m:
+                sec = {"type": "heading", "name": m.group(2).strip(), "level": len(m.group(1)), "line": idx + 1}
+                sections.append(sec)
+                current_section = f"Section: {sec['name']}"
+                continue
+
+        if lang == "python" or art_type in ("code", "tool"):
+            m = re.match(r'^(?:async\s+)?(def|class)\s+([a-zA-Z_][a-zA-Z0-9_]*)', line_str)
+            if m:
+                sec = {"type": m.group(1), "name": m.group(2), "line": idx + 1}
+                sections.append(sec)
+                current_section = f"{m.group(1)} {m.group(2)}"
+                continue
+
+        if lang in ("javascript", "js", "typescript", "ts"):
+            m = re.match(r'^(?:export\s+)?(?:async\s+)?(class|function|const|let|var)\s+([a-zA-Z_][a-zA-Z0-9_]*)', line_str)
+            if m:
+                sec = {"type": m.group(1), "name": m.group(2), "line": idx + 1}
+                sections.append(sec)
+                current_section = f"{m.group(1)} {m.group(2)}"
+                continue
+
+        if lang == "html":
+            m = re.match(r'<(section|div|nav|footer|header|main|article|form|table)\s+[^>]*(?:id|class)=["\']([^"\']*)["\']', line_str, re.IGNORECASE)
+            if m:
+                sec = {"type": "element", "name": f"<{m.group(1)} class='{m.group(2)}'>", "line": idx + 1}
+                sections.append(sec)
+                current_section = sec['name']
+                continue
+        elif lang == "css":
+            m = re.match(r'^\s*([.#][a-zA-Z_][a-zA-Z0-9_-]*)\s*\{', line_str)
+            if m:
+                sec = {"type": "selector", "name": m.group(1), "line": idx + 1}
+                sections.append(sec)
+                current_section = sec['name']
+                continue
+
+    capped_sections = sections[-20:] if len(sections) > 20 else sections
+    preview = lines[-1].strip()[:120] if lines else ""
+
+    return {
+        "line_count": line_count,
+        "size_chars": size_chars,
+        "estimated_tokens": estimated_tokens,
+        "is_patch": is_patch,
+        "current_section": current_section,
+        "sections": capped_sections,
+        "sections_count": len(sections),
+        "patch_stats": patch_stats,
+        "preview": preview,
+    }
+
 class _ToolsManager:
     SYSTEM_TOOLS_DIR = Path("app/tools")
     USER_TOOLS_DIR = Path.home() / ".lollms_hub" / "tools"
@@ -269,6 +366,7 @@ class _AgentStreamState:
         self.tool_trigger = False
         self.live_artifact_meta: Optional[Dict[str, Any]] = None
         self._done_intercepted: bool = False
+        self._seen_symbol_keys: set = set()
 
     def _cb(self, text: str, msg_type=None, meta: Optional[Dict] = None):
         if self.callback is None:
@@ -457,8 +555,46 @@ class _AgentStreamState:
         if self._is_accumulating_artifact:
             self._tool_buffer += self._pending_buffer
 
+            # ── DETECT NEW STRUCTURAL SYMBOLS ──
+            art_lang = self.live_artifact_meta.get("language", "") if self.live_artifact_meta else ""
+            art_type = self.live_artifact_meta.get("art_type", "code") if self.live_artifact_meta else "code"
+            art_title = self.live_artifact_meta.get("title", "artifact") if self.live_artifact_meta else "artifact"
+
+            # Parse structural symbols in active buffer
+            symbols = _detect_structural_symbols(self._tool_buffer, art_lang, art_type)
+            new_symbols = []
+            for sym in symbols:
+                sym_key = f"{sym['symbol_type']}::{sym['symbol_name']}::{sym['line']}"
+                if sym_key not in self._seen_symbol_keys:
+                    self._seen_symbol_keys.add(sym_key)
+                    new_symbols.append(sym)
+
+            if new_symbols:
+                for sym in new_symbols:
+                    if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                        self._cb("", getattr(MSG_TYPE, "MSG_TYPE_ARTEFACT_SYMBOL_DETECTED", MSG_TYPE.MSG_TYPE_CHUNK), {
+                            "title": art_title,
+                            "art_type": art_type,
+                            "language": art_lang,
+                            "symbol": sym,
+                            "symbol_type": sym.get("symbol_type"),
+                            "symbol_name": sym.get("symbol_name"),
+                            "line": sym.get("line"),
+                            "detail": sym.get("detail"),
+                            "signature": sym.get("signature"),
+                        })
+
+                    if self._event_mode == EventMode.PROCESSING_TAG_MODE or self._event_mode == EventMode.MIXED_MODE:
+                        status_msg = f"  • {sym['detail']} (line {sym['line']})\n"
+                        self._cb(status_msg, MSG_TYPE.MSG_TYPE_CHUNK, {
+                            "was_processed": True,
+                            "event_type": "symbol_detected",
+                            "symbol": sym,
+                            "artifact_title": art_title
+                        })
+
             if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
-                self._cb(self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK, {"live_artifact_chunk": True, "artifact_title": self.live_artifact_meta.get("title", "artifact") if self.live_artifact_meta else "artifact", "artifact_lang": self.live_artifact_meta.get("language", "") if self.live_artifact_meta else ""})
+                self._cb(self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK, {"live_artifact_chunk": True, "artifact_title": art_title, "artifact_lang": art_lang})
             elif self._event_mode == EventMode.PROCESSING_TAG_MODE:
                 clean_chunk = self._pending_buffer
                 if "<<<<<<< SEARCH" in clean_chunk:
@@ -468,53 +604,12 @@ class _AgentStreamState:
                 if ">>>>>>> REPLACE" in clean_chunk:
                     clean_chunk = clean_chunk.replace(">>>>>>> REPLACE", "\n[✅ END REPLACE]\n")
 
-                extracted_sections = []
-                if self.live_artifact_meta and not self.live_artifact_meta.get("is_patch"):
-                    lines_to_check = self._tool_buffer.splitlines()
-                    for line in lines_to_check:
-                        line_str = line.strip()
-                        if not line_str:
-                            continue
-
-                        md_h = re.match(r'^(#{1,6})\s+(.+)', line_str)
-                        if md_h:
-                            extracted_sections.append({"type": "markdown_header", "name": md_h.group(2).strip(), "level": len(md_h.group(1))})
-                        else:
-                            py_c = re.match(r'^(?:class|def)\s+([A-Za-z0-9_]+)', line_str)
-                            if py_c:
-                                extracted_sections.append({"type": "python_symbol", "name": py_c.group(1), "symbol_type": py_c.group(0).split()[0]})
-                            else:
-                                js_c = re.match(r'^(?:class|function|def)\s+([A-Za-z0-9_]+)', line_str)
-                                if js_c:
-                                    extracted_sections.append({"type": "js_symbol", "name": js_c.group(1), "symbol_type": js_c.group(0).split()[0]})
-                                else:
-                                    generic_c = re.match(r'^(?:class|def|function)\s+([A-Za-z0-9_]+)', line_str, re.IGNORECASE)
-                                    if generic_c:
-                                        extracted_sections.append({"type": "symbol", "name": generic_c.group(1), "symbol_type": generic_c.group(0).split()[0]})
-
-                last_reported_section = self.live_artifact_meta.get("last_reported_section") if self.live_artifact_meta else None
-                current_last_section = extracted_sections[-1] if extracted_sections else None
-
-                if current_last_section and current_last_section != last_reported_section:
-                    self.live_artifact_meta["last_reported_section"] = current_last_section
-                    status_icon = "📝" if current_last_section.get("type") == "markdown_header" else "🛠️"
-                    status_msg = f"{status_icon} {current_last_section.get('symbol_type', 'Section').capitalize()}: {current_last_section.get('name')}\n"
-
-                    self._cb(status_msg, MSG_TYPE.MSG_TYPE_CHUNK, {
-                        "was_processed": True, 
-                        "event_type": "artifact_chunk",
-                        "artifact_title": self.live_artifact_meta.get("title", "artifact") if self.live_artifact_meta else "artifact",
-                        "is_patch": self.live_artifact_meta.get("is_patch", False) if self.live_artifact_meta else False,
-                        "sections": extracted_sections,
-                        "live_artifact_chunk": True
-                    })
-                else:
+                if not new_symbols:
                     self._cb(clean_chunk, MSG_TYPE.MSG_TYPE_CHUNK, {
                         "was_processed": True, 
                         "event_type": "artifact_chunk",
-                        "artifact_title": self.live_artifact_meta.get("title", "artifact") if self.live_artifact_meta else "artifact",
+                        "artifact_title": art_title,
                         "is_patch": self.live_artifact_meta.get("is_patch", False) if self.live_artifact_meta else False,
-                        "sections": extracted_sections,
                         "live_artifact_chunk": True
                     })
 
@@ -598,6 +693,7 @@ class _AgentStreamState:
                 self.artifact_trigger = True
                 self._tool_buffer = partial_tag_buffer
                 self._pending_buffer = ""
+                self._seen_symbol_keys.clear()
 
                 attrs_str = full_tag_match.group(0)
                 title = "artifact"
@@ -632,7 +728,11 @@ class _AgentStreamState:
                             "language": lang,
                             "is_patch": is_patch_start,
                             "operation": operation_type,
-                            "stream_complete": False
+                            "stream_complete": False,
+                            "line_count": 0,
+                            "size_chars": 0,
+                            "current_section": None,
+                            "sections": []
                         })
                     except Exception:
                         pass
@@ -865,14 +965,30 @@ class _AgentStreamState:
 
         if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
             try:
+                # Extract clean body text for meta inspection
+                body_content = ""
+                b_match = re.search(r'<art(?:ifact|efact)[^>]*>(.*)</art(?:ifact|efact)>', full_artifact_call, re.DOTALL | re.IGNORECASE)
+                if b_match:
+                    body_content = b_match.group(1).strip()
+
+                meta_summary = _extract_artefact_meta(body_content, self.live_artifact_meta.get("language") if self.live_artifact_meta else None, art_type_end)
                 self._cb("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {
                     "title": title_end,
                     "art_type": art_type_end,
+                    "language": self.live_artifact_meta.get("language") if self.live_artifact_meta else None,
+                    "version": 1,
                     "success": True,
                     "error": None,
                     "stream_complete": True,
                     "is_patch": is_patch_end,
-                    "operation": operation_end
+                    "operation": operation_end,
+                    "line_count": meta_summary["line_count"],
+                    "size_chars": meta_summary["size_chars"],
+                    "estimated_tokens": meta_summary["estimated_tokens"],
+                    "sections": meta_summary["sections"],
+                    "sections_count": meta_summary["sections_count"],
+                    "patch_stats": meta_summary["patch_stats"],
+                    "preview": meta_summary["preview"]
                 })
             except Exception:
                 pass

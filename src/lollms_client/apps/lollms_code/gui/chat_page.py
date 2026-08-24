@@ -233,16 +233,54 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
 
             elif ev.kind == "artefact_start":
                 title = ev.data.get("title", "artifact")
-                add_event_panel(f"📝 Writing: {title}", ev.data.get("language", ""), "", "purple-500", "description")
+                lang = ev.data.get("language", "")
+                op = ev.data.get("operation", "write")
+                sec = ev.data.get("current_section") or ""
+                subtitle = f"{op} · {lang}" if lang else op
+                if sec:
+                    subtitle += f" · {sec}"
+                add_event_panel(f"📝 Writing: {title}", subtitle, "", "purple-500", "description")
+
+            elif ev.kind == "artefact_symbol":
+                sym = ev.data.get("symbol", {})
+                detail = sym.get("detail") or ev.data.get("detail", "")
+                title = ev.data.get("title", "artifact")
+                status_label.set_text(f"Writing {title}: {detail}")
 
             elif ev.kind == "artefact_end":
                 title = ev.data.get("title", "artifact")
                 success = ev.data.get("success", False)
                 version = ev.data.get("version", 1)
+                lines = ev.data.get("line_count", 0)
+                chars = ev.data.get("size_chars", 0)
+                is_patch = ev.data.get("is_patch", False)
+
+                meta_details = []
+                if version: meta_details.append(f"v{version}")
+                if lines: meta_details.append(f"{lines} lines")
+                if chars: meta_details.append(f"{chars:,} chars")
+                subtitle = " · ".join(meta_details) if success else str(ev.data.get("error", "failed"))
+
+                # Build summary of symbols/sections without printing full content
+                body_lines = []
+                sections = ev.data.get("sections", [])
+                if sections:
+                    body_lines.append("Sections/Symbols:")
+                    for s in sections[:10]:
+                        body_lines.append(f"  • {s.get('type', 'item')}: {s.get('name', '')} (line {s.get('line', '?')})")
+                    if len(sections) > 10:
+                        body_lines.append(f"  ... (+{len(sections) - 10} more)")
+
+                patch_stats = ev.data.get("patch_stats")
+                if patch_stats:
+                    body_lines.append(f"\nPatch Hunks: {patch_stats.get('hunks_count', 1)}")
+
                 add_event_panel(
-                    f"{'✅' if success else '❌'} Saved: {title}",
-                    f"v{version}" if success else str(ev.data.get("error", "")),
-                    "", "green-500" if success else "red-500", "task_alt",
+                    f"{'✅' if success else '❌'} {'Patched' if is_patch else 'Saved'}: {title}",
+                    subtitle,
+                    "\n".join(body_lines),
+                    "green-500" if success else "red-500",
+                    "task_alt",
                 )
 
             elif ev.kind == "context_update":

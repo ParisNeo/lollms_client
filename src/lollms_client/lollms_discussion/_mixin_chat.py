@@ -15,7 +15,7 @@ import random
 from typing import Any, Dict, List, Optional, Tuple, Callable, Union
 from types import SimpleNamespace
 from ascii_colors import ASCIIColors, trace_exception
-from lollms_client.lollms_types import MSG_TYPE
+from lollms_client.lollms_types import MSG_TYPE, EventMode
 from ._message import LollmsMessage
 from lollms_client.lollms_artefact import ArtefactType, make_image_id, ArtefactVisibility, ArtefactStatus
 from lollms_client.lollms_memory import FailureMemory
@@ -124,122 +124,414 @@ _MAX_TOOL_RESULT_CHARS = 4000
 
 import time as _time
 
-def _analyze_artefact_structure(buffer: str, language: Optional[str]) -> Optional[Dict[str, str]]:
-   """
-   Analyzes a partial code/markdown buffer to detect structural boundaries.
-   Returns a metadata dict if a new boundary is found, else None.
-   """
-   if not buffer:
-       return None
+def _detect_structural_symbols(buffer: str, language: Optional[str] = None, art_type: str = "code") -> List[Dict[str, Any]]:
+    """
+    Parses an artifact buffer and extracts all detected structural symbols:
+    - Markdown: headings (# H1, ## H2, ### H3, #### H4)
+    - Python: classes, methods (self/cls), functions, async functions, decorators
+    - JS/TS: classes, interfaces, types, enums, functions, arrow functions, React components/hooks
+    - Rust: structs, enums, traits, impls, functions (fn)
+    - Go: structs, interfaces, functions (func), methods
+    - C/C++/C#/Java: classes, structs, interfaces, methods, functions
+    - HTML: major semantic elements (<section>, <article>, <main>, <nav>, <header>, <footer>, <form>, <table>)
+    - CSS: rule selectors (.class, #id, @media, @keyframes)
+    - SQL: statements (CREATE TABLE/VIEW, ALTER, SELECT, INSERT, etc.)
+    """
+    if not buffer:
+        return []
 
-   if language in ("markdown", "md"):
-       match = re.search(r'^#{1,2}\s+(.+)$', buffer, re.MULTILINE)
-       if match:
-           header_text = match.group(1).strip()
-           return {
-               "status": f"Writing section: {header_text}",
-               "detail": header_text
-           }
-       return None
+    lines = buffer.splitlines()
+    symbols: List[Dict[str, Any]] = []
+    lang = (language or "").lower()
+    in_py_class: Optional[str] = None
 
-   if language == "python":
-       match = re.search(r'^(class|def|async\s+def)\s+([a-zA-Z_][a-zA-Z0-9_]*)', buffer, re.MULTILINE)
-       if match:
-           kind = match.group(1).replace("async ", "")
-           name = match.group(2)
-           return {
-               "status": f"Defining {kind} {name}",
-               "detail": f"{kind} {name}"
-           }
-       return None
+    for idx, line in enumerate(lines):
+        line_str = line.strip()
+        if not line_str:
+            continue
+        line_num = idx + 1
 
-   if language in ("javascript", "js", "typescript", "ts"):
-       match = re.search(r'^(export\s+)?(class|function|const|let)\s+([a-zA-Z_][a-zA-Z0-9_]*)', buffer, re.MULTILINE)
-       if match:
-           kind = match.group(2)
-           name = match.group(3)
-           return {
-               "status": f"Defining {kind} {name}",
-               "detail": f"{kind} {name}"
-           }
-       return None
+        # ── 1. Markdown / Documentation Headings ──
+        if lang in ("markdown", "md") or art_type in ("document", "note", "skill", "scratchpad", "presentation") or not lang:
+            m = re.match(r'^(#{1,6})\s+(.+)$', line_str)
+            if m:
+                level = len(m.group(1))
+                h_type = "heading"
+                if level == 1:
+                    h_type = "major_section"
+                elif level == 2:
+                    h_type = "section"
+                elif level == 3:
+                    h_type = "subsection"
+                else:
+                    h_type = f"h{level}_heading"
 
-   if language in ("html", "css"):
-       if language == "html":
-           match = re.search(r'<(section|div|nav|footer|header|main|article)\s+[^>]*class="[^"]*"', buffer, re.IGNORECASE)
-           if match:
-               tag = match.group(1)
-               return {"status": f"Building <{tag}> block", "detail": tag}
-       else:
-           match = re.search(r'^\.([a-zA-Z_][a-zA-Z0-9_-]*)\s*\{', buffer, re.MULTILINE)
-           if match:
-               cls = match.group(1)
-               return {"status": f"Styling .{cls}", "detail": cls}
-       return None
+                name = m.group(2).strip()
+                symbols.append({
+                    "symbol_type": h_type,
+                    "symbol_name": name,
+                    "level": level,
+                    "line": line_num,
+                    "detail": f"{h_type.replace('_', ' ').capitalize()}: {name}",
+                    "signature": line_str
+                })
+                continue
 
-   lines = buffer.strip().splitlines()
-   if lines and len(buffer) > 50:
-       first_line = lines[0].strip()
-       if first_line and not first_line.startswith("#") and not first_line.startswith("//"):
-           return {"status": f"Processing: {first_line[:40]}...", "detail": first_line[:40]}
+        # ── 2. Python Constructs ──
+        if lang == "python" or art_type in ("code", "tool"):
+            m_class = re.match(r'^class\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*\((.*?)\))?\s*:', line_str)
+            if m_class:
+                c_name = m_class.group(1)
+                bases = m_class.group(2) or ""
+                in_py_class = c_name
+                symbols.append({
+                    "symbol_type": "class",
+                    "symbol_name": c_name,
+                    "line": line_num,
+                    "detail": f"Class {c_name}" + (f"({bases})" if bases else ""),
+                    "signature": line_str.rstrip(":")
+                })
+                continue
 
-   return None
+            m_func = re.match(r'^(?:async\s+)?def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.*?)\)', line_str)
+            if m_func:
+                f_name = m_func.group(1)
+                args = m_func.group(2)
+                is_async = line_str.startswith("async ")
+                indent = len(line) - len(line.lstrip())
+                is_method = bool(indent > 0 and in_py_class) or "self" in args or "cls" in args
+
+                if is_method:
+                    sym_type = "async_method" if is_async else "method"
+                    parent_ctx = f" in {in_py_class}" if in_py_class else ""
+                    detail = f"{'Async Method' if is_async else 'Method'} {f_name}{parent_ctx}"
+                else:
+                    in_py_class = None
+                    sym_type = "async_function" if is_async else "function"
+                    detail = f"{'Async Function' if is_async else 'Function'} {f_name}"
+
+                symbols.append({
+                    "symbol_type": sym_type,
+                    "symbol_name": f_name,
+                    "parent_class": in_py_class if is_method else None,
+                    "line": line_num,
+                    "detail": detail,
+                    "signature": f"{'async ' if is_async else ''}def {f_name}({args})"
+                })
+                continue
+
+        # ── 3. JavaScript / TypeScript / JSX / TSX ──
+        if lang in ("javascript", "js", "typescript", "ts", "jsx", "tsx"):
+            m_ts = re.match(r'^(?:export\s+)?(interface|type|enum)\s+([a-zA-Z_][a-zA-Z0-9_]*)', line_str)
+            if m_ts:
+                kind = m_ts.group(1)
+                name = m_ts.group(2)
+                symbols.append({
+                    "symbol_type": kind,
+                    "symbol_name": name,
+                    "line": line_num,
+                    "detail": f"{kind.capitalize()} {name}",
+                    "signature": line_str
+                })
+                continue
+
+            m_class = re.match(r'^(?:export\s+)?(?:default\s+)?class\s+([a-zA-Z_][a-zA-Z0-9_]*)', line_str)
+            if m_class:
+                c_name = m_class.group(1)
+                symbols.append({
+                    "symbol_type": "class",
+                    "symbol_name": c_name,
+                    "line": line_num,
+                    "detail": f"Class {c_name}",
+                    "signature": line_str
+                })
+                continue
+
+            m_func = re.match(r'^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', line_str)
+            if m_func:
+                f_name = m_func.group(1)
+                is_async = "async " in line_str
+                symbols.append({
+                    "symbol_type": "async_function" if is_async else "function",
+                    "symbol_name": f_name,
+                    "line": line_num,
+                    "detail": f"{'Async Function' if is_async else 'Function'} {f_name}",
+                    "signature": line_str
+                })
+                continue
+
+            m_arrow = re.match(r'^(?:export\s+)?(?:const|let|var)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[a-zA-Z_][a-zA-Z0-9_]*)\s*=>', line_str)
+            if m_arrow:
+                f_name = m_arrow.group(1)
+                is_hook = f_name.startswith("use") and len(f_name) > 3 and f_name[3].isupper()
+                is_component = f_name[0].isupper()
+                sym_type = "react_hook" if is_hook else ("react_component" if is_component else "arrow_function")
+                detail = f"Hook {f_name}" if is_hook else (f"Component <{f_name} />" if is_component else f"Function {f_name}")
+                symbols.append({
+                    "symbol_type": sym_type,
+                    "symbol_name": f_name,
+                    "line": line_num,
+                    "detail": detail,
+                    "signature": line_str
+                })
+                continue
+
+        # ── 4. Rust ──
+        if lang in ("rust", "rs"):
+            m_rust = re.match(r'^(?:pub\s+)?(struct|enum|trait|union|type)\s+([a-zA-Z_][a-zA-Z0-9_]*)', line_str)
+            if m_rust:
+                kind, name = m_rust.group(1), m_rust.group(2)
+                symbols.append({
+                    "symbol_type": kind,
+                    "symbol_name": name,
+                    "line": line_num,
+                    "detail": f"Rust {kind.capitalize()} {name}",
+                    "signature": line_str
+                })
+                continue
+
+            m_impl = re.match(r'^impl(?:\s*<[^>]*>)?\s+(?:([a-zA-Z_][a-zA-Z0-9_]*)\s+for\s+)?([a-zA-Z_][a-zA-Z0-9_]*)', line_str)
+            if m_impl:
+                trait_name, target = m_impl.group(1), m_impl.group(2)
+                desc = f"Impl {trait_name} for {target}" if trait_name else f"Impl {target}"
+                symbols.append({
+                    "symbol_type": "impl",
+                    "symbol_name": target,
+                    "line": line_num,
+                    "detail": desc,
+                    "signature": line_str
+                })
+                continue
+
+            m_fn = re.match(r'^(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+([a-zA-Z_][a-zA-Z0-9_]*)', line_str)
+            if m_fn:
+                f_name = m_fn.group(1)
+                symbols.append({
+                    "symbol_type": "function",
+                    "symbol_name": f_name,
+                    "line": line_num,
+                    "detail": f"Function fn {f_name}()",
+                    "signature": line_str
+                })
+                continue
+
+        # ── 5. Go ──
+        if lang in ("go", "golang"):
+            m_go_type = re.match(r'^type\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+(struct|interface)', line_str)
+            if m_go_type:
+                name, kind = m_go_type.group(1), m_go_type.group(2)
+                symbols.append({
+                    "symbol_type": kind,
+                    "symbol_name": name,
+                    "line": line_num,
+                    "detail": f"Go {kind.capitalize()} {name}",
+                    "signature": line_str
+                })
+                continue
+
+            m_go_func = re.match(r'^func\s+(?:\((?:[^)]+)\)\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', line_str)
+            if m_go_func:
+                f_name = m_go_func.group(1)
+                symbols.append({
+                    "symbol_type": "function",
+                    "symbol_name": f_name,
+                    "line": line_num,
+                    "detail": f"Go Func {f_name}()",
+                    "signature": line_str
+                })
+                continue
+
+        # ── 6. C / C++ / C# / Java ──
+        if lang in ("c", "cpp", "c++", "csharp", "cs", "java"):
+            m_oop = re.match(r'^(?:public|private|protected|internal|static|abstract|sealed|final|\s)*\s*(class|struct|interface|enum)\s+([a-zA-Z_][a-zA-Z0-9_]*)', line_str)
+            if m_oop:
+                kind, name = m_oop.group(1), m_oop.group(2)
+                symbols.append({
+                    "symbol_type": kind,
+                    "symbol_name": name,
+                    "line": line_num,
+                    "detail": f"{kind.capitalize()} {name}",
+                    "signature": line_str
+                })
+                continue
+
+        # ── 7. HTML ──
+        if lang == "html":
+            m_html = re.match(r'<(\w+)(?:\s+[^>]*)?(?:id|class)=["\']([^"\']*)["\']', line_str, re.IGNORECASE)
+            if m_html and m_html.group(1).lower() in ("section", "article", "main", "nav", "header", "footer", "form", "table", "dialog", "aside"):
+                tag, id_or_cls = m_html.group(1), m_html.group(2)
+                symbols.append({
+                    "symbol_type": "html_element",
+                    "symbol_name": f"<{tag} {id_or_cls}>",
+                    "line": line_num,
+                    "detail": f"HTML <{tag}> ({id_or_cls})",
+                    "signature": line_str
+                })
+                continue
+
+        # ── 8. CSS / SCSS ──
+        if lang in ("css", "scss", "sass", "less"):
+            m_css = re.match(r'^([.#@][a-zA-Z0-9_\-:\s,>+~]+)\s*\{', line_str)
+            if m_css:
+                sel = m_css.group(1).strip()
+                symbols.append({
+                    "symbol_type": "css_selector",
+                    "symbol_name": sel,
+                    "line": line_num,
+                    "detail": f"CSS {sel}",
+                    "signature": line_str
+                })
+                continue
+
+        # ── 9. SQL ──
+        if lang == "sql":
+            m_sql = re.match(r'^(CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|VIEW|PROCEDURE|FUNCTION|INDEX)|ALTER\s+TABLE)\s+([a-zA-Z0-9_\."`]+)', line_str, re.IGNORECASE)
+            if m_sql:
+                stmt_type, target = m_sql.group(1).upper(), m_sql.group(2)
+                symbols.append({
+                    "symbol_type": "sql_statement",
+                    "symbol_name": f"{stmt_type} {target}",
+                    "line": line_num,
+                    "detail": f"SQL {stmt_type} {target}",
+                    "signature": line_str
+                })
+                continue
+
+    return symbols
+
+
+def _extract_artefact_meta(buffer: str, language: Optional[str] = None, art_type: str = "code") -> Dict[str, Any]:
+    """
+    Extracts rich structural metadata from an artifact buffer without embedding the full raw content.
+    """
+    if not buffer:
+        return {
+            "line_count": 0,
+            "size_chars": 0,
+            "estimated_tokens": 0,
+            "is_patch": False,
+            "current_section": None,
+            "sections": [],
+            "sections_count": 0,
+            "patch_stats": None,
+            "preview": ""
+        }
+
+    lines = buffer.splitlines()
+    line_count = len(lines)
+    size_chars = len(buffer)
+    estimated_tokens = size_chars // 4
+
+    is_patch = "<<<<<<< SEARCH" in buffer
+    patch_stats = None
+    if is_patch:
+        search_count = len(re.findall(r'^<{6,8}(?:\s*\w+)?\s*$', buffer, re.MULTILINE))
+        replace_count = len(re.findall(r'^={5,}\s*$', buffer, re.MULTILINE))
+        has_end_replace = bool(re.search(r'^>{6,8}(?:\s*\w+)?\s*$', buffer, re.MULTILINE))
+        patch_stats = {
+            "hunks_count": search_count,
+            "is_complete_hunk": search_count > 0 and search_count == replace_count and has_end_replace
+        }
+
+    detected_symbols = _detect_structural_symbols(buffer, language, art_type)
+    current_section = detected_symbols[-1]["detail"] if detected_symbols else None
+
+    # Map detected symbols to sections list for backward compatibility
+    sections = [
+        {"type": s["symbol_type"], "name": s["symbol_name"], "line": s["line"], "detail": s["detail"]}
+        for s in detected_symbols
+    ]
+    capped_sections = sections[-20:] if len(sections) > 20 else sections
+    preview = lines[-1].strip()[:120] if lines else ""
+
+    return {
+        "line_count": line_count,
+        "size_chars": size_chars,
+        "estimated_tokens": estimated_tokens,
+        "is_patch": is_patch,
+        "current_section": current_section,
+        "sections": capped_sections,
+        "sections_count": len(sections),
+        "patch_stats": patch_stats,
+        "preview": preview,
+    }
 
 
 class _ArtefactStreamTracker:
-   """Tracks the state of an artifact being built for sparse chunk forwarding."""
-   def __init__(self):
-       self.is_inside_artefact = False
-       self.current_buffer = ""
-       self.last_event_detail = None
-       self.last_event_time = 0.0
-       self.current_title = None
-       self.current_language = None
+    """Tracks the state of an artifact being built, emitting events upon discovering new structural symbols."""
+    def __init__(self):
+        self.is_inside_artefact = False
+        self.current_buffer = ""
+        self.last_event_detail = None
+        self.last_event_time = 0.0
+        self.current_title = None
+        self.current_language = None
+        self.current_art_type = "code"
+        self.seen_symbol_keys: set = set()
 
-   def reset(self):
-       self.is_inside_artefact = False
-       self.current_buffer = ""
-       self.last_event_detail = None
-       self.last_event_time = 0.0
-       self.current_title = None
-       self.current_language = None
+    def reset(self):
+        self.is_inside_artefact = False
+        self.current_buffer = ""
+        self.last_event_detail = None
+        self.last_event_time = 0.0
+        self.current_title = None
+        self.current_language = None
+        self.current_art_type = "code"
+        self.seen_symbol_keys.clear()
 
-   def open(self, title: str, language: Optional[str]):
-       self.is_inside_artefact = True
-       self.current_title = title
-       self.current_language = language
-       self.current_buffer = ""
-       self.last_event_detail = None
-       self.last_event_time = 0.0
+    def open(self, title: str, language: Optional[str], art_type: str = "code"):
+        self.is_inside_artefact = True
+        self.current_title = title
+        self.current_language = language
+        self.current_art_type = art_type
+        self.current_buffer = ""
+        self.last_event_detail = None
+        self.last_event_time = 0.0
+        self.seen_symbol_keys.clear()
 
-   def feed(self, chunk: str) -> Optional[Dict[str, str]]:
-       """Feeds a chunk and returns event metadata if a new boundary is crossed."""
-       if not self.is_inside_artefact:
-           return None
+    def feed(self, chunk: str) -> Optional[Dict[str, Any]]:
+        """
+        Feeds a chunk and returns event metadata if a new boundary is crossed,
+        including any newly discovered symbols.
+        """
+        if not self.is_inside_artefact:
+            return None
 
-       self.current_buffer += chunk
+        self.current_buffer += chunk
 
-       # Throttle analysis to prevent performance hit on every token.
-       # Reduced to 30ms (from 100ms) so fast local LLMs don't miss boundaries.
-       now = _time.time()
-       if now - self.last_event_time < 0.03:
-           return None
+        now = _time.time()
+        if now - self.last_event_time < 0.02:
+            return None
 
-       # CRITICAL FIX: Always re-analyze the full buffer, not just the chunk.
-       # This ensures boundaries that arrived during the throttle window are detected.
-       analysis = _analyze_artefact_structure(self.current_buffer, self.current_language)
-       if analysis and analysis.get("detail") != self.last_event_detail:
-           self.last_event_detail = analysis.get("detail")
-           self.last_event_time = now
-           return {
-               "title": self.current_title,
-               "status": analysis.get("status", "Building..."),
-               "language": self.current_language
-           }
-       return None
+        symbols = _detect_structural_symbols(self.current_buffer, self.current_language, self.current_art_type)
+        new_symbols = []
+        for sym in symbols:
+            key = f"{sym['symbol_type']}::{sym['symbol_name']}::{sym['line']}"
+            if key not in self.seen_symbol_keys:
+                self.seen_symbol_keys.add(key)
+                new_symbols.append(sym)
 
-   def close(self):
-       self.reset()
+        meta = _extract_artefact_meta(self.current_buffer, self.current_language, self.current_art_type)
+        detail = meta.get("current_section") or (f"Line {meta['line_count']}" if meta['line_count'] > 0 else None)
+
+        if new_symbols or detail != self.last_event_detail or (now - self.last_event_time > 1.0):
+            self.last_event_detail = detail
+            self.last_event_time = now
+            latest_sym = new_symbols[-1] if new_symbols else (symbols[-1] if symbols else None)
+            return {
+                "title": self.current_title,
+                "art_type": self.current_art_type,
+                "language": self.current_language,
+                "status": f"Writing {self.current_title}: {detail}" if detail else f"Writing {self.current_title}...",
+                "detail": detail,
+                "new_symbols": new_symbols,
+                "latest_symbol": latest_sym,
+                **meta
+            }
+        return None
+
+    def close(self):
+        self.reset()
 
 
 def _is_large_base64(v: str) -> bool:
@@ -496,7 +788,7 @@ class _StreamState:
     def __init__(
         self,
         discussion: 'LollmsDiscussion',
-       forward_artefact_chunks: bool,
+        forward_artefact_chunks: bool,
         callback: Optional[Callable],
         ai_message: Any,
         enable_notes: bool = True,
@@ -509,6 +801,7 @@ class _StreamState:
         content_offset: int = 0,
         fast_artefact_replicas: Optional[List[str]] = None,
         processed_tags: Optional[set] = None,
+        event_mode: EventMode = EventMode.PROCESSING_TAG_MODE,
     ):
         self.discussion = discussion
         self.callback = callback
@@ -517,6 +810,7 @@ class _StreamState:
         self.enable_in_message_status = enable_in_message_status
         self.auto_activate = auto_activate_artefacts
         self.content_offset = content_offset
+        self.event_mode = event_mode
 
         self.enable_notes = enable_notes if enable_artefacts else False
         self.enable_skills = enable_skills if enable_artefacts else False
@@ -914,9 +1208,10 @@ class _StreamState:
                         return False
 
                     # Close the processing block cleanly with status metadata INSIDE the block.
-                    proc_close_tag = '\n<!-- status:finished -->\n</processing>\n'
-                    self.ai_message.content += proc_close_tag
-                    _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                        proc_close_tag = '\n<!-- status:finished -->\n</processing>\n'
+                        self.ai_message.content += proc_close_tag
+                        _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
                     # Keep any text that came after the closing tag
                     self._pending_buffer = self._artefact_buffer[close_idx+len(closing_tag):]
@@ -927,21 +1222,50 @@ class _StreamState:
                     return False
                 else:
                     # Still in the middle of the artifact body. Suppress raw output from main stream.
-
-                    # CRITICAL FIX: Always emit lightweight structural status events,
-                    # regardless of forward_artefact_chunks. The forward_artefact_chunks
-                    # flag only controls whether raw code chunks (high bandwidth) are forwarded.
-                    # The status tags are tiny and should always fire to keep the user engaged.
                     event_meta = self.artefact_tracker.feed(chunk)
                     if event_meta:
+                        new_symbols = event_meta.get("new_symbols", [])
+
+                        # ── EMIT TARGETED SYMBOL DETECTION EVENTS ──
+                        if new_symbols:
+                            for sym in new_symbols:
+                                if self.event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                                    _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACT_SYMBOL_DETECTED, {
+                                        "title": self.artefact_tracker.current_title,
+                                        "art_type": self.artefact_tracker.current_art_type,
+                                        "language": self.artefact_tracker.current_language,
+                                        "symbol": sym,
+                                        "symbol_type": sym.get("symbol_type"),
+                                        "symbol_name": sym.get("symbol_name"),
+                                        "line": sym.get("line"),
+                                        "detail": sym.get("detail"),
+                                        "signature": sym.get("signature"),
+                                    })
+
+                                if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                                    sym_line = f"  • {sym['detail']} (line {sym['line']})\n"
+                                    self.ai_message.content += sym_line
+                                    _cb(self.callback, sym_line, MSG_TYPE.MSG_TYPE_CHUNK, {
+                                        "was_processed": True,
+                                        "event_type": "symbol_detected",
+                                        "symbol": sym
+                                    })
+                        else:
+                            if self.event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                                _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {
+                                    **event_meta,
+                                    "stream_complete": False
+                                })
+
+                            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                                status_tag = f'{event_meta["status"]}\n'
+                                self.ai_message.content += status_tag
+                                _cb(self.callback, status_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
                         # If forward_artefact_chunks is True, also forward the raw chunk
                         if self.forward_artefact_chunks:
                             _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK, event_meta)
 
-                        # Always forward the lightweight structural status tag
-                        status_tag = f'{event_meta["status"]}\n'
-                        self.ai_message.content += status_tag
-                        _cb(self.callback, status_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                 return True
 
             # State 2: We are not inside an artifact, check if we are entering one
@@ -975,7 +1299,8 @@ class _StreamState:
                         m_lang = re.search(r'language=["\']([^"\']*)["\']', attrs_str, re.IGNORECASE)
                         if m_lang: lang = m_lang.group(1)
 
-                        self.artefact_tracker.open(title, lang)
+                        atype = attrs.get("type", "code").lower()
+                        self.artefact_tracker.open(title, lang, atype)
 
                         # Forward the text BEFORE the tag to the UI and save it
                         text_before_tag = self._pending_buffer[:tag_start_idx]
@@ -987,7 +1312,6 @@ class _StreamState:
                         self._artefact_buffer = attrs_str
 
                         # Determine the type-specific opening message
-                        atype = attrs.get("type", "code").lower()
                         opening_status = _ARTEFACT_TYPE_MESSAGES.get(atype, "✨ Starting artifact...")
 
                         # Check if the remaining content already contains the patch marker
@@ -995,18 +1319,32 @@ class _StreamState:
                         is_patch_start = "<<<<<<< SEARCH" in remaining_content
                         operation_type = "patch" if is_patch_start else "full_rewrite"
 
-                        # Fire the opening processing tag to the UI and save it
-                        proc_tag = f'\n<processing type="artefact" title="{title}" language="{lang or ""}" operation="{operation_type}">\n'
-                        self.ai_message.content += proc_tag
-                        _cb(self.callback, proc_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True, "operation": operation_type, "is_patch": is_patch_start})
+                        if self.event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                            _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {
+                                "title": title,
+                                "art_type": atype,
+                                "language": lang,
+                                "is_patch": is_patch_start,
+                                "operation": operation_type,
+                                "stream_complete": False,
+                                "line_count": 0,
+                                "size_chars": 0,
+                                "current_section": None,
+                                "sections": []
+                            })
+
+                        if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                            proc_tag = f'\n<processing type="artefact" title="{title}" language="{lang or ""}" operation="{operation_type}">\n'
+                            self.ai_message.content += proc_tag
+                            _cb(self.callback, proc_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True, "operation": operation_type, "is_patch": is_patch_start})
 
                         # Start the heartbeat in case the artifact body is slow/empty
                         self._start_artefact_heartbeat()
 
-                        # Emit the type-aware initial status message
-                        status_line = f'{opening_status} (operation: {operation_type})\n'
-                        self.ai_message.content += status_line
-                        _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True, "operation": operation_type, "is_patch": is_patch_start})
+                        if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                            status_line = f'{opening_status} (operation: {operation_type})\n'
+                            self.ai_message.content += status_line
+                            _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True, "operation": operation_type, "is_patch": is_patch_start})
 
                         # Check if the closing tag also arrived in this same chunk
                         remaining_content = self._pending_buffer[end_of_tag_idx+1:]
@@ -1038,11 +1376,12 @@ class _StreamState:
                                 return False
 
                             # Close the processing block cleanly with status metadata.
-                            proc_close_tag = f'\n</processing>\n'
-                            status_comment = f'<!-- status:finished -->\n'
-                            self.ai_message.content += proc_close_tag + status_comment
-                            _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                            _cb(self.callback, status_comment, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                                proc_close_tag = f'\n</processing>\n'
+                                status_comment = f'<!-- status:finished -->\n'
+                                self.ai_message.content += proc_close_tag + status_comment
+                                _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                _cb(self.callback, status_comment, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
                             self._artefact_buffer = ""
                             # Keep any text after the closing tag in the pending buffer
@@ -1461,11 +1800,36 @@ class _StreamState:
             # history for the LLM. This prevents the marker from leaking into the live UI.
 
             # Fire an event update to the UI so it cleanly rebuilds and replaces the code block
+            meta_info = _extract_artefact_meta(body, lang, atype)
+            if self.event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {
+                    "title": title,
+                    "art_type": atype,
+                    "language": lang,
+                    "version": art.get("version", 1) if art else 1,
+                    "success": bool(art),
+                    "error": None,
+                    "stream_complete": True,
+                    "operation": "patch" if is_patch else ("create" if is_new else "full_rewrite"),
+                    "is_patch": is_patch,
+                    "line_count": meta_info["line_count"],
+                    "size_chars": meta_info["size_chars"],
+                    "estimated_tokens": meta_info["estimated_tokens"],
+                    "sections": meta_info["sections"],
+                    "sections_count": meta_info["sections_count"],
+                    "patch_stats": meta_info["patch_stats"],
+                    "preview": meta_info["preview"]
+                })
+
             _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
                 "type": "artifact_updated" if not is_new else "artifact_created",
                 "title": title,
                 "version": art.get("version", 1) if art else 1,
-                "art_type": atype
+                "art_type": atype,
+                "line_count": meta_info["line_count"],
+                "size_chars": meta_info["size_chars"],
+                "estimated_tokens": meta_info["estimated_tokens"],
+                "sections": meta_info["sections"]
             })
             return True
 
@@ -2500,6 +2864,7 @@ class ChatMixin:
         debug_export:                 bool = False,
         debug:                        bool = False,
         enable_vlm_query:             bool = False,
+        event_mode:                   EventMode = EventMode.PROCESSING_TAG_MODE,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -3012,8 +3377,9 @@ class ChatMixin:
                 enable_artefacts=enable_artefacts,
                 enable_in_message_status=enable_in_message_status,
                 fast_artefact_replicas=fast_artefact_replicas,
-                content_offset=current_content_length,  # Start parsing from current position
-                processed_tags=persistent_processed_tags # Pass the persistent set
+                content_offset=current_content_length,
+                processed_tags=persistent_processed_tags,
+                event_mode=event_mode
             )
 
             def _inline_relay(chunk, msg_type=None, meta=None):

@@ -314,8 +314,10 @@ class QueueStreamingCallback:
             MSG_TYPE.MSG_TYPE_TOOL_END: "tool_end",
             MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START: "artefact_start",
             MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END: "artefact_end",
+            getattr(MSG_TYPE, "MSG_TYPE_ARTEFACT_SYMBOL_DETECTED", None): "artefact_symbol",
             MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE: "context_update",
         }
+        mapping.pop(None, None)
         if msg_type in mapping:
             self.q.put(AgentEvent(mapping[msg_type], **(meta or {})))
             return True

@@ -142,8 +142,17 @@ class MSG_TYPE(Enum):
     # MSG_TYPE_TOOL_START: {"tool_name": str, "parameters": dict}
     # MSG_TYPE_TOOL_END:   {"tool_name": str, "success": bool, "output": str, "error": str|None}
     #
-    # MSG_TYPE_ARTEFACT_BUILD_START: {"title": str, "art_type": str, "language": str|None, "is_patch": bool}
-    # MSG_TYPE_ARTEFACT_BUILD_END:   {"title": str, "art_type": str, "version": int, "success": bool, "error": str|None}
+    # MSG_TYPE_ARTEFACT_BUILD_START: {
+    #     "title": str, "art_type": str, "language": str|None, "is_patch": bool, "operation": str,
+    #     "line_count": int, "size_chars": int, "current_section": str|None, "sections": list,
+    #     "stream_complete": bool
+    # }
+    # MSG_TYPE_ARTEFACT_BUILD_END: {
+    #     "title": str, "art_type": str, "version": int, "success": bool, "is_patch": bool,
+    #     "operation": str, "line_count": int, "size_chars": int, "estimated_tokens": int,
+    #     "sections": list, "sections_count": int, "patch_stats": dict|None, "preview": str,
+    #     "error": str|None, "stream_complete": bool
+    # }
     #
     # MSG_TYPE_CONTEXT_UPDATE: {"action": str ("unlock"|"lock"|"hide"), "files": list[str], "status": str}
 
@@ -154,6 +163,7 @@ class MSG_TYPE(Enum):
     MSG_TYPE_ARTEFACT_BUILD_END        = 53 # an artifact has been successfully built or patched
 
     MSG_TYPE_CONTEXT_UPDATE            = 54 # context visibility has been updated (unlock/lock/hide)
+    MSG_TYPE_ARTEFACT_SYMBOL_DETECTED  = 55 # a structural symbol (class, method, function, section) was detected
 
 
 class EventMode(Enum):
