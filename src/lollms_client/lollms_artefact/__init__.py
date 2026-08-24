@@ -8,7 +8,7 @@ from .lollms_artefact import (
     parse_image_id,
     sanitize_artifact_filename,
 )
-from .file_import import FileImportMixin, ALL_IMPORT_MODES
+from .file_import import FileImportMixin, ALL_IMPORT_MODES, IMPORT_MODE_AS_IS
 from .internet_import import InternetImportMixin
 from .export import ExportMixin
 
@@ -23,6 +23,7 @@ __all__ = [
     "sanitize_artifact_filename",
     "FileImportMixin",
     "ALL_IMPORT_MODES",
+    "IMPORT_MODE_AS_IS",
     "InternetImportMixin",
     "ExportMixin"
 ]

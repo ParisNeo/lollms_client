@@ -92,10 +92,9 @@ class TestMultiBindingSupport(unittest.TestCase):
             },
         )
 
-        self.assertIn("local_model", lc.llms)
-        self.assertEqual(lc.llms["local_model"], self.mock_llm_extra)
-
+        # Lazy loading instantiates on switch/mount
         lc.mount_llm("local_model")
+        self.assertIn("local_model", lc.llms)
         self.assertEqual(lc.llm, self.mock_llm_extra)
         self.assertEqual(lc._active_llm_alias, "local_model")
 

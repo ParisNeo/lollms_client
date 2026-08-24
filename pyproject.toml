@@ -73,7 +73,7 @@ lollms_client = ["assets/*.json", "**/description.yaml", "apps/lollms_discussion
 
 [tool.pytest.ini_options]
 filterwarnings = [
-    "ignore::pyparsing.exceptions.PyparsingDeprecationWarning",
     "ignore:.*pyparsing.*:DeprecationWarning",
+    "ignore:.*Pyparsing.*:UserWarning",
     "ignore:Matplotlib is currently using agg.*:UserWarning"
 ]

@@ -45,8 +45,7 @@ from ascii_colors import ASCIIColors, trace_exception
 
 from lollms_client.lollms_types import MSG_TYPE
 
-# We import Agent lazily to avoid circular imports at module level
-# from lollms_client.lollms_agent import Agent, AgentRole
+# Agents in the swarm are LollmsPersonality instances
 
 
 # ---------------------------------------------------------------------------

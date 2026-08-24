@@ -112,6 +112,9 @@ def _sanitize_tool_result(tool_res: Any, max_chars: Optional[int] = None, client
                     if isinstance(v, str) and v:
                         approx_kb = len(v) * 3 / 4 / 1024
                         cleaned[k] = f"[base64 blob stripped: {approx_kb:.1f}KB]"
+                    elif isinstance(v, (list, tuple)) and v:
+                        approx_kb = sum(len(x) for x in v if isinstance(x, str)) * 3 / 4 / 1024
+                        cleaned[k] = f"[list of {len(v)} base64 blobs stripped: {approx_kb:.1f}KB]"
                     else:
                         cleaned[k] = None
                 else:
@@ -124,28 +127,65 @@ def _sanitize_tool_result(tool_res: Any, max_chars: Optional[int] = None, client
             return walked
         return str(obj)
 
-    if isinstance(tool_res, dict) and tool_res.get("success") is False:
-        error_msg = tool_res.get("error", "Unknown error")
-        inner = tool_res.get("output")
-        if isinstance(inner, dict):
-            error_msg = inner.get("error", error_msg)
-        return f"⚠ Tool Failed\nError: {error_msg}"
+    if isinstance(tool_res, str):
+        if len(tool_res) > max_chars:
+            return tool_res[:max_chars] + f"\n... [truncated, {len(tool_res) - max_chars} more chars]"
+        return tool_res
+
+    if isinstance(tool_res, dict):
+        inner_dict = tool_res.get("output") if isinstance(tool_res.get("output"), dict) else {}
+
+        # Comprehensive Failure Detection
+        is_fail = (
+            tool_res.get("success") is False
+            or (inner_dict and inner_dict.get("success") is False)
+            or tool_res.get("status_code", 200) not in (200, 201)
+            or (inner_dict and inner_dict.get("status_code", 200) not in (200, 201))
+            or bool(tool_res.get("error"))
+            or (inner_dict and bool(inner_dict.get("error")))
+            or (tool_res.get("return_code") is not None and tool_res.get("return_code") != 0)
+            or (inner_dict and inner_dict.get("return_code") is not None and inner_dict.get("return_code") != 0)
+        )
+
+        if is_fail:
+            error_parts = ["⚠️ **Tool Execution Failed**"]
+
+            error_msg = tool_res.get("error") or (inner_dict.get("error") if inner_dict else None)
+            if error_msg:
+                error_parts.append(f"**Error Details:**\n{error_msg}")
+
+            stderr = tool_res.get("stderr") or (inner_dict.get("stderr") if inner_dict else None)
+            if stderr and str(stderr).strip():
+                error_parts.append(f"**Standard Error (stderr):**\n```\n{str(stderr).strip()}\n```")
+
+            out_val = tool_res.get("output")
+            if isinstance(out_val, dict):
+                inner_stdout = out_val.get("output") or out_val.get("stdout")
+                if inner_stdout and str(inner_stdout).strip() and str(inner_stdout).strip() != str(error_msg).strip():
+                    error_parts.append(f"**Output before failure:**\n{str(inner_stdout).strip()}")
+            elif out_val and str(out_val).strip() and str(out_val).strip() != str(error_msg).strip():
+                error_parts.append(f"**Output before failure:**\n{str(out_val).strip()}")
+
+            tb = tool_res.get("traceback") or (inner_dict.get("traceback") if inner_dict else None)
+            if tb and str(tb).strip() and str(tb).strip() not in str(error_msg):
+                error_parts.append(f"**Stack Trace:**\n```\n{str(tb).strip()}\n```")
+
+            rc = tool_res.get("return_code") if tool_res.get("return_code") is not None else (inner_dict.get("return_code") if inner_dict else None)
+            if rc is not None and rc != 0:
+                error_parts.append(f"**Exit Code:** {rc}")
+
+            pinj = _find_prompt_injection(tool_res)
+            if pinj:
+                error_parts.append(f"\n{pinj}")
+
+            error_text = "\n\n".join(error_parts)
+            if len(error_text) > max_chars:
+                error_text = error_text[:max_chars] + f"\n... [truncated, {len(error_text) - max_chars} more chars]"
+            return error_text
 
     pinj = _find_prompt_injection(tool_res)
     if pinj:
-        success = True
-        inner = tool_res.get("output", tool_res) if isinstance(tool_res, dict) else tool_res
-        if isinstance(inner, dict):
-            success = inner.get("success", True)
-        if isinstance(tool_res, dict) and tool_res.get("success") is False:
-            success = False
-        success_status = "✓ Success" if success else "⚠ Tool Failed"
-        error_msg = ""
-        if not success and isinstance(tool_res, dict):
-            error_msg = tool_res.get("error", "")
-        if error_msg:
-            return f"{success_status}\nError: {error_msg}\n{pinj}"
-        return f"{success_status}\n{pinj}"
+        return f"✓ Success\n{pinj}"
 
     unwrapped = tool_res
     if isinstance(tool_res, dict):
@@ -176,19 +216,6 @@ def _sanitize_tool_result(tool_res: Any, max_chars: Optional[int] = None, client
         return obj
 
     sanitized = _walk(_replace_none(unwrapped))
-    
-    if isinstance(tool_res, dict) and "files" in tool_res and tool_res["files"]:
-        files_list = tool_res["files"]
-        if isinstance(files_list, list):
-            files_str = "\n".join(files_list[:50])
-            if isinstance(sanitized, str):
-                sanitized = sanitized + f"\nMatching Files:\n{files_str}"
-            else:
-                try:
-                    sanitized_str = json.dumps(sanitized, indent=2, default=str, ensure_ascii=False)
-                    sanitized = sanitized_str + f"\nMatching Files:\n{files_str}"
-                except Exception:
-                    pass
 
     if isinstance(sanitized, str):
         if len(sanitized) > max_chars:
@@ -203,6 +230,120 @@ def _sanitize_tool_result(tool_res: Any, max_chars: Optional[int] = None, client
     if len(text) > max_chars:
         text = text[:max_chars] + f"\n... [truncated, {len(text) - max_chars} more chars]"
     return text
+
+def _detect_structural_symbols(buffer: str, language: Optional[str] = None, art_type: str = "code") -> List[Dict[str, Any]]:
+    if not buffer:
+        return []
+
+    lines = buffer.splitlines()
+    symbols: List[Dict[str, Any]] = []
+    lang = (language or "").lower()
+    in_py_class: Optional[str] = None
+
+    for idx, line in enumerate(lines):
+        line_str = line.strip()
+        if not line_str:
+            continue
+        line_num = idx + 1
+
+        if lang in ("markdown", "md") or art_type in ("document", "note", "skill", "scratchpad", "presentation") or not lang:
+            m = re.match(r'^(#{1,6})\s+(.+)$', line_str)
+            if m:
+                level = len(m.group(1))
+                h_type = "heading" if level > 3 else ("major_section" if level == 1 else ("section" if level == 2 else "subsection"))
+                name = m.group(2).strip()
+                symbols.append({
+                    "symbol_type": h_type,
+                    "symbol_name": name,
+                    "level": level,
+                    "line": line_num,
+                    "detail": f"{h_type.replace('_', ' ').capitalize()}: {name}",
+                    "signature": line_str
+                })
+                continue
+
+        if lang == "python" or art_type in ("code", "tool"):
+            m_class = re.match(r'^class\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*\((.*?)\))?\s*:', line_str)
+            if m_class:
+                c_name = m_class.group(1)
+                bases = m_class.group(2) or ""
+                in_py_class = c_name
+                symbols.append({
+                    "symbol_type": "class",
+                    "symbol_name": c_name,
+                    "line": line_num,
+                    "detail": f"Class {c_name}" + (f"({bases})" if bases else ""),
+                    "signature": line_str.rstrip(":")
+                })
+                continue
+
+            m_func = re.match(r'^(?:async\s+)?def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.*?)\)', line_str)
+            if m_func:
+                f_name = m_func.group(1)
+                args = m_func.group(2)
+                is_async = line_str.startswith("async ")
+                indent = len(line) - len(line.lstrip())
+                is_method = bool(indent > 0 and in_py_class) or "self" in args or "cls" in args
+
+                if is_method:
+                    sym_type = "async_method" if is_async else "method"
+                    parent_ctx = f" in {in_py_class}" if in_py_class else ""
+                    detail = f"{'Async Method' if is_async else 'Method'} {f_name}{parent_ctx}"
+                else:
+                    in_py_class = None
+                    sym_type = "async_function" if is_async else "function"
+                    detail = f"{'Async Function' if is_async else 'Function'} {f_name}"
+
+                symbols.append({
+                    "symbol_type": sym_type,
+                    "symbol_name": f_name,
+                    "parent_class": in_py_class if is_method else None,
+                    "line": line_num,
+                    "detail": detail,
+                    "signature": f"{'async ' if is_async else ''}def {f_name}({args})"
+                })
+                continue
+
+        if lang in ("javascript", "js", "typescript", "ts", "jsx", "tsx"):
+            m_ts = re.match(r'^(?:export\s+)?(interface|type|enum)\s+([a-zA-Z_][a-zA-Z0-9_]*)', line_str)
+            if m_ts:
+                kind = m_ts.group(1)
+                name = m_ts.group(2)
+                symbols.append({
+                    "symbol_type": kind,
+                    "symbol_name": name,
+                    "line": line_num,
+                    "detail": f"{kind.capitalize()} {name}",
+                    "signature": line_str
+                })
+                continue
+
+            m_class = re.match(r'^(?:export\s+)?(?:default\s+)?class\s+([a-zA-Z_][a-zA-Z0-9_]*)', line_str)
+            if m_class:
+                c_name = m_class.group(1)
+                symbols.append({
+                    "symbol_type": "class",
+                    "symbol_name": c_name,
+                    "line": line_num,
+                    "detail": f"Class {c_name}",
+                    "signature": line_str
+                })
+                continue
+
+            m_func = re.match(r'^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', line_str)
+            if m_func:
+                f_name = m_func.group(1)
+                is_async = "async " in line_str
+                symbols.append({
+                    "symbol_type": "async_function" if is_async else "function",
+                    "symbol_name": f_name,
+                    "line": line_num,
+                    "detail": f"{'Async Function' if is_async else 'Function'} {f_name}",
+                    "signature": line_str
+                })
+                continue
+
+    return symbols
 
 
 def _extract_artefact_meta(buffer: str, language: Optional[str] = None, art_type: str = "code") -> Dict[str, Any]:
@@ -386,6 +527,8 @@ class _AgentStreamState:
         self.context_trigger = False
         self.artifact_trigger = False
         self.tool_trigger = False
+        self.tool_json_data = ""
+        self._action_dispatched: bool = False
         self.live_artifact_meta: Optional[Dict[str, Any]] = None
         self._done_intercepted: bool = False
         self._seen_symbol_keys: set = set()
@@ -765,7 +908,6 @@ class _AgentStreamState:
                     op_icon = "🔧" if operation_type == "patch" else "✍️"
                     op_label = "Patching" if operation_type == "patch" else "Writing"
                     start_status = f'\n{op_icon} {op_label} {parsed_art_type} artifact: {title} (operation: {operation_type})...\n'
-                    self.ai_message_content_buffer += start_status if hasattr(self, 'ai_message_content_buffer') else start_status
 
                     self._cb(start_status, MSG_TYPE.MSG_TYPE_CHUNK, {
                         "was_processed": True,
@@ -826,25 +968,37 @@ class _AgentStreamState:
                 return True
 
         def _ends_with_partial_tag(buffer: str) -> int:
-            tags_to_check = ["<tool", "<done", "<artifact", "<artefact", "<unlock_file", "<lock_file", "<hide_file", "<refactor_history", "<collapse_folder", "<uncollapse_folder", "<scratchpad_append", "<scratchpad_patch", "<scratchpad_clear", "<user_profile_update", "<user_profile_clear", "<mem_new", "<mem_update", "<think"]
+            tags_to_check = [
+                "<tool", "<done", "<artifact", "<artefact", "<unlock_file", "<lock_file",
+                "<hide_file", "<refactor_history", "<collapse_folder", "<uncollapse_folder",
+                "<scratchpad_append", "<scratchpad_patch", "<scratchpad_clear",
+                "<user_profile_update", "<user_profile_clear", "<mem_new", "<mem_update", "<think"
+            ]
+
+            def _is_at_line_start(buf: str, idx: int) -> bool:
+                if idx == 0:
+                    return True
+                j = idx - 1
+                while j >= 0 and buf[j] != '\n':
+                    if not buf[j].isspace():
+                        return False
+                    j -= 1
+                return True
+
             for tag in tags_to_check:
                 for i in range(1, len(tag)):
                     if buffer.endswith(tag[:i]):
                         start_idx = len(buffer) - i
-                        j = start_idx - 1
-                        while j >= 0 and buffer[j] != '\n':
-                            if not buffer[j].isspace():
-                                return -1
-                            j -= 1
-                        return start_idx
-            return -1
+                        if _is_at_line_start(buffer, start_idx):
+                            return start_idx
 
-        def _ends_with_partial_tag_anywhere(buffer: str) -> int:
-            tags_to_check = ["<tool", "<done", "<artifact", "<artefact", "<unlock_file", "<lock_file", "<hide_file", "<refactor_history", "<collapse_folder", "<uncollapse_folder", "<scratchpad_append", "<scratchpad_patch", "<scratchpad_clear", "<user_profile_update", "<user_profile_clear", "<mem_new", "<mem_update", "<think"]
+            # Fallback: Check for unclosed tags with attributes (e.g. '<artifact name="...')
             for tag in tags_to_check:
-                for i in range(1, len(tag)):
-                    if buffer.endswith(tag[:i]):
-                        return len(buffer) - i
+                idx = buffer.rfind(tag)
+                if idx != -1 and ">" not in buffer[idx:]:
+                    if _is_at_line_start(buffer, idx):
+                        return idx
+
             return -1
 
         exact_match_idx = self._check_exact_control_tag_match(self._pending_buffer)
@@ -852,8 +1006,6 @@ class _AgentStreamState:
             partial_idx = -1
         else:
             partial_idx = _ends_with_partial_tag(self._pending_buffer)
-            if partial_idx == -1:
-                partial_idx = _ends_with_partial_tag_anywhere(self._pending_buffer)
 
         if partial_idx != -1:
             text_before = self._pending_buffer[:partial_idx]
@@ -1009,6 +1161,10 @@ class _AgentStreamState:
                 "parameters": {"raw_body": json_body[:500]}
             })
 
+        self.tool_json_data = normalized_json
+        self.tool_trigger = True
+        self._action_dispatched = True
+
         if resolved_tool_name == "malformed_tool_call":
             self.completed_actions.append({
                 "type": "malformed_json",
@@ -1151,6 +1307,8 @@ class _AgentStreamState:
         if self._is_accumulating_tool:
             self._tool_buffer += self._pending_buffer
             self._pending_buffer = ""
+            if "</tool>" not in self._tool_buffer.lower():
+                self._tool_buffer += "</tool>"
             self._try_complete_tool()
             if self._is_accumulating_tool:
                 self._is_accumulating_tool = False
@@ -1198,6 +1356,16 @@ class _AgentStreamState:
              
     def was_done_detected(self) -> bool:
         return self._done_intercepted
+
+    def was_action_dispatched(self) -> bool:
+        return bool(self.completed_actions) or self._action_dispatched or self.tool_trigger or self.artifact_trigger or self.context_trigger
+
+    def get_tool_call_json(self) -> Optional[str]:
+        if self.completed_actions:
+            for act in reversed(self.completed_actions):
+                if act.get("type") == "tool":
+                    return act.get("json")
+        return self.tool_json_data or None
 
     def get_clean_text(self) -> str:
         return self.content 

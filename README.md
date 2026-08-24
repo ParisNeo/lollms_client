@@ -28,6 +28,7 @@ Whether you're connecting to a remote LoLLMs server, an Ollama instance, the Ope
 
 ### 🤖 Sovereign Multi-Step Agency & MCP Integration
 *   **Deterministic State Control**: Uses a robust **Observe-Think-Act-Verify** state machine. If the model generates a thought process but fails to act, the parser detects the omission, restricts reasoning, and injects precise structural corrections to guide it back on track.
+*   **Multi-Source RAG Knowledge Bases (`RAGDataSource`)**: Register multiple named and described RAG data sources. Supports pre-hydration without arbitrary chunk slicing, signature inspection for custom query engines `(query, store, **kwargs)`, and on-demand querying via `tool_query_rag`.
 *   **Model Context Protocol (MCP)**: Native integration of local and remote MCP tool registries (e.g., File I/O, Web Search, Sandboxed Code Execution) giving agents direct hands-on power.
 *   **Real-Time Performance Metrics**: Tracks exact performance statistics per spinoff agent turn, capturing **Time to First Token (TTFT)**, **Average Generation Speed (TPS)**, and total token usage stored directly in the discussion database.
 
@@ -1132,7 +1133,7 @@ The system ensures the LLM **always sees error details** when a tool fails, impl
 
 ### File Import Modes & Conflict Resolution
 
-The `import_file` method supports 6 ingestion modes: `text`, `text_images`, `images_only`, `ocr`, `data` (Dual-Stream), and `data_bundle` (Schema Fusion).
+The `import_file` method supports 9 ingestion modes: `as_is` (Native File Preservation with zero context bloat), `text`, `text_images`, `text_embedded_images`, `images_only`, `ocr`, `data` (Dual-Stream), `data_bundle` (Schema Fusion), and `audio_stt` (Speech-to-Text).
 
 When importing, 4 conflict resolution strategies are available via `on_conflict`:
 *   `suffix` (default): Renames new file (e.g., `README_1.md`).
@@ -1188,9 +1189,36 @@ Forms allow the LLM to request structured data from the user mid-generation. Whe
 
 ---
 
-## 👜 Personality Bundles & RAG
+## 👜 Multi-Source RAG & Personality Bundles
 
-Personalities are packaged using the **Bundle Format**. A bundle is a directory containing a `SOUL.md` file and optional resource folders (`tools/`, `skills/`, `knowledge/`).
+Personalities support multiple named, described RAG data sources. Each data source can be pre-hydrated into context or queried on demand via `tool_query_rag`:
+
+```python
+from lollms_client.lollms_personality import LollmsPersonality, RAGDataSource
+
+personality = LollmsPersonality(
+    name="ResearchExpert",
+    system_prompt="You are a research assistant with access to multiple domain knowledge bases.",
+    data_sources=[
+        RAGDataSource(
+            name="scientific_papers",
+            description="Peer-reviewed research papers and abstracts",
+            query_fn=query_rag_callback,
+            store=papers_store,
+            auto_query=True
+        ),
+        RAGDataSource(
+            name="code_repos",
+            description="Repository source code and module definitions",
+            query_fn=query_rag_callback,
+            store=code_store,
+            auto_query=False  # Queried on demand by LLM
+        )
+    ]
+)
+```
+
+Personalities can also be packaged using the **Bundle Format**. A bundle is a directory containing a `SOUL.md` file and optional resource folders (`tools/`, `skills/`, `knowledge/`).
 
 ```python
 from lollms_client.lollms_personality import PersonalityBundle
@@ -2055,30 +2083,47 @@ Define multiple LLM profiles to handle different domains or complexity tiers.
 ```python
 from lollms_client import LollmsClient, LollmsBindingProfile
 
-# 1. Define LLM profiles declaratively (None of these are instantiated yet)
-llm_profiles = {
-    "cloud_vision": LollmsBindingProfile(
-        name="cloud_vision",
+# 1. Define Connection Profiles (Bindings)
+llm_binding_profiles = {
+    "cloud_openai": LollmsBindingProfile(
+        name="cloud_openai",
         binding_name="openai",
-        binding_config={"model_name": "gpt-4o", "service_key": "your-key"},
-        vision_enabled=True,
-        is_default=True  # This one will be loaded at startup
+        binding_config={"service_key": "your-key"}
     ),
-    "local_coder": LollmsBindingProfile(
-        name="local_coder",
+    "local_ollama": LollmsBindingProfile(
+        name="local_ollama",
         binding_name="ollama",
-        binding_config={"host_address": "http://localhost:11434", "model_name": "qwen2.5-coder:7b"},
-        forced_context_size=32768
-    ),
-    "local_fast": LollmsBindingProfile(
-        name="local_fast",
-        binding_name="ollama",
-        binding_config={"host_address": "http://localhost:11434", "model_name": "llama3.2:3b"}
+        binding_config={"host_address": "http://localhost:11434"}
     )
 }
 
-# 2. Initialize the client (Only "cloud_vision" is instantiated)
-lc = LollmsClient(llm_profiles=llm_profiles)
+# 2. Define Model Profiles referencing the bindings
+llm_model_profiles = {
+    "cloud_vision": LollmsModelProfile(
+        name="cloud_vision",
+        binding_profile_name="cloud_openai",
+        model_name="gpt-4o",
+        vision_enabled=True,
+        is_default=True  # Loaded at startup
+    ),
+    "local_coder": LollmsModelProfile(
+        name="local_coder",
+        binding_profile_name="local_ollama",
+        model_name="qwen2.5-coder:7b",
+        forced_context_size=32768
+    ),
+    "local_fast": LollmsModelProfile(
+        name="local_fast",
+        binding_profile_name="local_ollama",
+        model_name="llama3.2:3b"
+    )
+}
+
+# 3. Initialize the client (Only "cloud_vision" is instantiated)
+lc = LollmsClient(
+    llm_binding_profiles=llm_binding_profiles,
+    llm_model_profiles=llm_model_profiles
+)
 
 # 3. Use the default model
 response1 = lc.generate_text("Explain quantum physics.")
@@ -2095,22 +2140,38 @@ lc.switch_model("cloud_vision")
 The profile system is universal. You can define profiles for image generation engines and switch between a local Stable Diffusion model and a cloud DALL-E API seamlessly.
 
 ```python
-# Define TTI profiles
-tti_profiles = {
-    "local_sd": LollmsBindingProfile(
-        name="local_sd",
-        binding_name="diffusers",
-        binding_config={"model_name": "stable-diffusion-v1-5"},
-        is_default=True
+# Define TTI Connection Profiles & Model Profiles
+tti_binding_profiles = {
+    "local_engine": LollmsBindingProfile(
+        name="local_engine",
+        binding_name="diffusers"
     ),
-    "cloud_dalle": LollmsBindingProfile(
-        name="cloud_dalle",
+    "cloud_engine": LollmsBindingProfile(
+        name="cloud_engine",
         binding_name="openai",
-        binding_config={"model_name": "dall-e-3", "service_key": "your-key"}
+        binding_config={"service_key": "your-key"}
     )
 }
 
-lc = LollmsClient(llm_binding_name="ollama", tti_profiles=tti_profiles)
+tti_model_profiles = {
+    "local_sd": LollmsModelProfile(
+        name="local_sd",
+        binding_profile_name="local_engine",
+        model_name="stable-diffusion-v1-5",
+        is_default=True
+    ),
+    "cloud_dalle": LollmsModelProfile(
+        name="cloud_dalle",
+        binding_profile_name="cloud_engine",
+        model_name="dall-e-3"
+    )
+}
+
+lc = LollmsClient(
+    llm_binding_name="ollama",
+    tti_binding_profiles=tti_binding_profiles,
+    tti_model_profiles=tti_model_profiles
+)
 
 # Generate with default local SD
 img_bytes = lc.generate_image("A cyberpunk cat")

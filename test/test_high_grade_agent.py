@@ -29,7 +29,8 @@ from unittest.mock import MagicMock, patch
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from lollms_client.lollms_agent.lollms_agent import (
+from lollms_client.lollms_personality import (
+    LollmsPersonality,
     Agent,
     AgentRole,
     CapabilityFlags,
@@ -37,8 +38,9 @@ from lollms_client.lollms_agent.lollms_agent import (
     ModelSwitcher,
     BindingToolsBuilder,
     ToolsManager,
+)
+from lollms_client.lollms_personality.lollms_agent_state import (
     _AgentStreamState,
-    _DEFAULT_SKILLS_DIR,
 )
 from lollms_client.lollms_personality.skill import Skill, parse_skill_md
 from lollms_client.lollms_personality.skills_manager import SkillsManager

@@ -35,7 +35,7 @@ def parse_skill_md(file_path: Path, default_visibility: str = "loadable") -> Opt
     except Exception:
         return None
 
-    title = file_path.stem
+    title = file_path.parent.name if file_path.stem.upper() == "SKILL" and file_path.parent.name else file_path.stem
     description = ""
     category = ""
     tags: List[str] = []

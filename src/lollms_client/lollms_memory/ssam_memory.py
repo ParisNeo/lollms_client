@@ -220,6 +220,11 @@ class SSAMEngine:
                 neighbor_sti.activation += source_sti.compute_petroff_activation(t, self.decay_rate) * self.spread_probability
                 ASCIIColors.info(f"[Spreading Activation] Pre-warmed associated memory '{neighbor_sti.content[:40]}...' (New weight: {neighbor_sti.activation:.2f})")
 
+    def search(self, keyword: str = "", query: str = "", t: float = None, **kwargs) -> List[Tuple[float, Dict[str, Any]]]:
+        """Unified search interface for semantic network query."""
+        search_term = keyword or query or kwargs.get("text", "")
+        return self.query_semantic_network(keyword=search_term, t=t)
+
     def query_semantic_network(self, keyword: str, t: float = None) -> List[Tuple[float, Dict[str, Any]]]:
         """
         Query memories. Matches semantic nodes, calculates Petroff decay,

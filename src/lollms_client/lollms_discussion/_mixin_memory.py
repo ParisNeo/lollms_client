@@ -292,6 +292,23 @@ class MemoryMixin:
             return self.memory_manager.list_all(level, search_query, page, page_size)
         return {"total": 0, "page": page, "page_size": page_size, "pages": 0, "memories": []}
 
+    def search_memories(
+        self,
+        text: Optional[str] = None,
+        query: Optional[str] = None,
+        search_query: Optional[str] = None,
+        top_k: int = 5,
+        level: Optional[int] = None,
+        **kwargs
+    ) -> List[Dict]:
+        """Perform a keyword search on the database memories."""
+        if self.memory_manager:
+            search_term = text if text is not None else (query if query is not None else (search_query or kwargs.get("q", "")))
+            if hasattr(self.memory_manager, "search"):
+                return self.memory_manager.search(text=search_term or "", top_k=top_k, level=level, **kwargs)
+            return self.memory_manager.query(text=search_term or "", top_k=top_k, level=level)
+        return []
+
     def query_memories(self, text: str, top_k: int = 5, level: Optional[int] = None) -> List[Dict]:
         """Perform a keyword search on the database memories."""
         if self.memory_manager:

@@ -565,29 +565,6 @@ def _sanitize_tool_result(
 ) -> str:
     if max_chars is None:
         max_chars = _calculate_dynamic_tool_char_limit(client)
-    """
-    Converts an arbitrary tool execution result into a clean, LLM-friendly
-    text representation.
-    Rules
-    -----
-    1.  If ``tool_res`` (or its LCP-wrapped ``output`` inner dict) exposes a
-        ``prompt_injection`` key anywhere in its tree, that string is used
-        verbatim. Tool authors craft ``prompt_injection`` to tell the LLM
-        *exactly* what to do next (e.g. reference the produced file with an
-        <img /> tag). Using it as the LLM-facing message prevents the LLM
-        from re-running the same tool on the freshly-produced artifact.
-    2.  Known large-binary fields (``plot_b64``, ``image_b64``, ...) are
-        stripped and replaced with a tiny "[base64 blob stripped: 24.3KB]"
-        note so the LLM knows a file was produced without ingesting the data.
-    3.  Any standalone long base64-looking string is replaced with the same
-        note (defence in depth).
-    4.  Any string longer than ``max_chars`` is truncated with an ellipsis.
-    5.  Lists are capped at 50 entries and walked recursively.
-    6.  The result is always returned as a plain ``str`` (JSON-serialised
-        when the input was structured).
-    7.  🛑 CRITICAL FIX: If the tool returns {"success": True, "output": <content>},
-        extract the <content> directly rather than showing the LLM the wrapper dict.
-    """
 
     def _find_prompt_injection(obj: Any, depth: int = 0) -> Optional[str]:
         if depth > 4:
@@ -641,50 +618,70 @@ def _sanitize_tool_result(
             return walked
         return str(obj)
 
-    if isinstance(tool_res, dict) and tool_res.get("success") is False:
-        error_msg = tool_res.get("error", "Unknown error")
-        # Check for nested error in output dict
-        if not error_msg or error_msg == "Unknown error":
-            inner = tool_res.get("output")
-            if isinstance(inner, dict):
-                error_msg = inner.get("error", error_msg)
-        return f"⚠ Tool Failed\nError: {error_msg}"
+    if isinstance(tool_res, str):
+        if len(tool_res) > max_chars:
+            return tool_res[:max_chars] + f"\n... [truncated, {len(tool_res) - max_chars} more chars]"
+        return tool_res
+
+    if isinstance(tool_res, dict):
+        inner_dict = tool_res.get("output") if isinstance(tool_res.get("output"), dict) else {}
+
+        # Comprehensive Failure Detection
+        is_fail = (
+            tool_res.get("success") is False
+            or (inner_dict and inner_dict.get("success") is False)
+            or tool_res.get("status_code", 200) not in (200, 201)
+            or (inner_dict and inner_dict.get("status_code", 200) not in (200, 201))
+            or bool(tool_res.get("error"))
+            or (inner_dict and bool(inner_dict.get("error")))
+            or (tool_res.get("return_code") is not None and tool_res.get("return_code") != 0)
+            or (inner_dict and inner_dict.get("return_code") is not None and inner_dict.get("return_code") != 0)
+        )
+
+        if is_fail:
+            error_parts = ["⚠️ **Tool Execution Failed**"]
+
+            error_msg = tool_res.get("error") or (inner_dict.get("error") if inner_dict else None)
+            if error_msg:
+                error_parts.append(f"**Error Details:**\n{error_msg}")
+
+            stderr = tool_res.get("stderr") or (inner_dict.get("stderr") if inner_dict else None)
+            if stderr and str(stderr).strip():
+                error_parts.append(f"**Standard Error (stderr):**\n```\n{str(stderr).strip()}\n```")
+
+            out_val = tool_res.get("output")
+            if isinstance(out_val, dict):
+                inner_stdout = out_val.get("output") or out_val.get("stdout")
+                if inner_stdout and str(inner_stdout).strip() and str(inner_stdout).strip() != str(error_msg).strip():
+                    error_parts.append(f"**Output before failure:**\n{str(inner_stdout).strip()}")
+            elif out_val and str(out_val).strip() and str(out_val).strip() != str(error_msg).strip():
+                error_parts.append(f"**Output before failure:**\n{str(out_val).strip()}")
+
+            tb = tool_res.get("traceback") or (inner_dict.get("traceback") if inner_dict else None)
+            if tb and str(tb).strip() and str(tb).strip() not in str(error_msg):
+                error_parts.append(f"**Stack Trace:**\n```\n{str(tb).strip()}\n```")
+
+            rc = tool_res.get("return_code") if tool_res.get("return_code") is not None else (inner_dict.get("return_code") if inner_dict else None)
+            if rc is not None and rc != 0:
+                error_parts.append(f"**Exit Code:** {rc}")
+
+            pinj = _find_prompt_injection(tool_res)
+            if pinj:
+                error_parts.append(f"\n{pinj}")
+
+            error_text = "\n\n".join(error_parts)
+            if len(error_text) > max_chars:
+                error_text = error_text[:max_chars] + f"\n... [truncated, {len(error_text) - max_chars} more chars]"
+            return error_text
 
     pinj = _find_prompt_injection(tool_res)
     if pinj:
-        success = True
-        inner = tool_res.get("output", tool_res) if isinstance(tool_res, dict) else tool_res
-        if isinstance(inner, dict):
-            success = inner.get("success", True)
-        if isinstance(tool_res, dict) and tool_res.get("success") is False:
-            success = False
-        success_status = "✓ Success" if success else "⚠ Tool Failed"
-        error_msg = ""
-        if not success and isinstance(tool_res, dict):
-            error_msg = tool_res.get("error", "")
-            if not error_msg and isinstance(inner, dict):
-                error_msg = inner.get("error", "")
-        if error_msg:
-            return f"{success_status}\nError: {error_msg}\n{pinj}"
-        return f"{success_status}\n{pinj}"
-
-    if isinstance(tool_res, dict) and tool_res.get("success") is False:
-        error_msg = tool_res.get("error", "Unknown tool error")
-        # Check nested output dict for error
-        inner_out = tool_res.get("output")
-        if isinstance(inner_out, dict) and inner_out.get("error"):
-            error_msg = inner_out["error"]
-        # Also check for traceback to give the LLM full context
-        traceback_str = tool_res.get("traceback", "")
-        if traceback_str:
-            return f"⚠ Tool Failed\nError: {error_msg}\nTraceback:\n{traceback_str}"
-        return f"⚠ Tool Failed\nError: {error_msg}"
+        return f"✓ Success\n{pinj}"
 
     unwrapped = tool_res
     if isinstance(tool_res, dict):
         if "output" in tool_res:
             unwrapped = tool_res["output"]
-            # If output is still a dict with nested content, unwrap one more level
             if isinstance(unwrapped, dict):
                 for key in ("content", "text", "result", "data", "page_content", "summary"):
                     if key in unwrapped:
@@ -711,7 +708,6 @@ def _sanitize_tool_result(
 
     sanitized = _walk(_replace_none(unwrapped))
 
-    # If sanitized is already a string (from unwrapping), return it directly
     if isinstance(sanitized, str):
         if len(sanitized) > max_chars:
             return sanitized[:max_chars] + f"\n... [truncated, {len(sanitized) - max_chars} more chars]"
@@ -3052,15 +3048,31 @@ class ChatMixin:
                 rag_res = personality.query_data(user_message)
                 if rag_res and rag_res.get("success") and rag_res.get("sources"):
                     sources_text = []
+                    _MAX_RAG_CHARS = 50000
+                    current_rag_chars = 0
                     for src in rag_res.get("sources", []):
-                        sources_text.append(f"Source [{src.get('source')}]: {src.get('content')}")
+                        title = src.get("title") or src.get("source") or "Document"
+                        ds_label = f" [{src.get('datasource_name')}]" if src.get('datasource_name') else ""
+                        score_val = src.get("score")
+                        score_str = f" (Score: {score_val:.2f})" if isinstance(score_val, (int, float)) and score_val <= 1.0 else (f" (Score: {score_val})" if score_val is not None else "")
+                        chunk_text = f"--- Source [{title}]{ds_label}{score_str} ---\n{src.get('content')}"
+                        if current_rag_chars + len(chunk_text) > _MAX_RAG_CHARS:
+                            sources_text.append(f"... [Remaining RAG context truncated at {_MAX_RAG_CHARS} chars to prevent context bloat]")
+                            break
+                        sources_text.append(chunk_text)
+                        current_rag_chars += len(chunk_text)
                     if sources_text:
-                        rag_context = "\n=== RETRIEVED RAG CONTEXT ===\n" + "\n\n".join(sources_text[:3]) + "\n=== END RAG CONTEXT ===\n"
+                        rag_context = "\n=== RETRIEVED RAG CONTEXT ===\n" + "\n\n".join(sources_text) + "\n=== END RAG CONTEXT ===\n"
             except Exception as e:
                 trace_exception(e)
 
         if rag_context:
             full_system_prompt += "\n" + rag_context
+
+        if personality and hasattr(personality, "build_rag_system_block"):
+            rag_sys_block = personality.build_rag_system_block()
+            if rag_sys_block:
+                full_system_prompt += "\n" + rag_sys_block
 
         # ── 5. Active Artifacts & Memories Injection ──
         if enable_artefacts:
@@ -3092,11 +3104,12 @@ class ChatMixin:
         # ── SOVEREIGN OPT-IN DOCTRINE ──
         active_tools = {}
 
-        # 1. Personality Handbag Tools
-        if personality and hasattr(personality, "handbag_path") and personality.handbag_path:
-            # The personality was loaded from a handbag. We need to mount the tool files.
-            # The LCPBinding is already attached to personality.tools if it exists.
-            pass
+        # 1. Personality Handbag Tools, RAG Tools & Skill Tools
+        if personality and hasattr(personality, "build_rag_tools"):
+            active_tools.update(personality.build_rag_tools())
+
+        if personality and hasattr(personality, "skills_manager") and personality.skills_manager:
+            active_tools.update(personality.skills_manager.build_skill_tools())
 
         if personality and hasattr(personality, "tools") and _is_tool_binding(personality.tools):
             try:
@@ -3143,6 +3156,23 @@ class ChatMixin:
             except Exception as ex:
                 trace_exception(ex)
                 lcp_binding = None
+
+        if lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
+            # Auto-mount as-is document tools for binary and document operations
+            lcp_binding.mount_tool_library("as_is_document_tools")
+            try:
+                lcp_tools = lcp_binding.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
+                for t_name, t_spec in lcp_tools.items():
+                    if t_name.startswith("tool_inspect_document") or \
+                       t_name.startswith("tool_read_document_content") or \
+                       t_name.startswith("tool_grep_document") or \
+                       t_name.startswith("tool_modify_docx") or \
+                       t_name.startswith("tool_modify_excel") or \
+                       t_name.startswith("tool_modify_pdf_annotation") or \
+                       t_name.startswith("tool_modify_pptx_slide"):
+                        active_tools[t_name] = t_spec
+            except Exception as ex:
+                trace_exception(ex)
 
         if enable_data_tools_flag and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
             if has_data_files:
@@ -4338,25 +4368,21 @@ class ChatMixin:
                     inner_res = tool_res.get("output", tool_res) if isinstance(tool_res, dict) else tool_res
 
                     is_failure = (
-                        (isinstance(inner_res, dict) and inner_res.get("success") is False) or
-                        (isinstance(tool_res, dict) and tool_res.get("status_code", 200) != 200) or
-                        "crashed" in status_done_line.lower() or
-                        (isinstance(inner_res, dict) and inner_res.get("error") and not inner_res.get("success", True))
+                        (isinstance(inner_res, dict) and inner_res.get("success") is False)
+                        or (isinstance(tool_res, dict) and tool_res.get("status_code", 200) not in (200, 201))
+                        or (isinstance(tool_res, dict) and bool(tool_res.get("error")))
+                        or (isinstance(inner_res, dict) and bool(inner_res.get("error")) and not inner_res.get("success", True))
+                        or (isinstance(tool_res, dict) and tool_res.get("return_code", 0) != 0)
+                        or (isinstance(inner_res, dict) and inner_res.get("return_code", 0) != 0)
+                        or "crashed" in status_done_line.lower()
+                        or "⚠" in clean_result_str
                     )
                     status_meta = "failure" if is_failure else "success"
                     tool_close_tag = f"{status_done_line}{details_block}<!-- status:{status_meta} -->\n</processing>\n\n"
                     ai_msg.content += tool_close_tag
                     _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
-                    inner_res = tool_res.get("output", tool_res) if isinstance(tool_res, dict) else tool_res
-                    tool_success = (
-                        isinstance(inner_res, dict) and 
-                        inner_res.get("success", True) is not False and
-                        tool_res.get("status_code", 200) == 200
-                    ) if isinstance(inner_res, dict) else True
-                    if not isinstance(inner_res, dict):
-                        # Non-dict results: fall back to string matching
-                        tool_success = "Error" not in clean_result_str and "failed" not in clean_result_str.lower()
+                    tool_success = not is_failure
 
                     if tool_success :
                         successful_tool_signatures.add(context_aware_signature)

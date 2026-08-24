@@ -2736,8 +2736,9 @@ class ArtefactManager:
             except Exception as e:
                 content = f"Failed to read content: {e}"
 
+        art_title = title if (ext and title.lower().endswith(ext)) else f"{title}{ext}"
         art = self.add(
-            title=title + ext,
+            title=art_title,
             artefact_type=artefact_type,
             content=content,
             language=ext.replace(".", "") if artefact_type == ArtefactType.CODE else None,

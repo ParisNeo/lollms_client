@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-08-24 21:22]
+
+- feat(client): enhance agentic capabilities, personality management and artefact handling
+
 ## [2026-08-24 13:37]
 
 - feat(chat): enhance agent bridge and chat page functionality

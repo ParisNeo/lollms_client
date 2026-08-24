@@ -16,8 +16,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from ascii_colors import ASCIIColors
 from lollms_client.lollms_config_cli_env import get_client_from_env
-from lollms_client.lollms_agent import Agent, AgentRole, CapabilityFlags
-from lollms_client.lollms_personality import LollmsPersonality
+from lollms_client.lollms_personality import LollmsPersonality, CapabilityFlags
 from lollms_client.lollms_types import MSG_TYPE
 
 _tool_buffer = []
@@ -103,17 +102,12 @@ def main():
         enable_skill_loading=False,
     )
 
-    agent = Agent(
-        lc=client,
-        personality=personality,
-        name="MinimalBot",
-        role=AgentRole.IMPLEMENTER,
-        workspace_path=str(workspace),
-        capabilities=caps,
-        enable_artefact_system=True,
-        disable_artefact_versioning=True,
-        max_tokens_per_turn=4096,
-    )
+    personality.lollms_client = client
+    personality.workspace_path = workspace
+    personality.capabilities = caps
+    personality.enable_artefact_system = True
+    personality.disable_artefact_versioning = True
+    personality.max_tokens_per_turn = 4096
 
     prompt = (
         "Write a Python script named 'fibonacci.py' that calculates the first 10 numbers of the Fibonacci sequence, "
@@ -124,7 +118,7 @@ def main():
     ASCIIColors.panel(f"[cyan]{prompt}[/cyan]", title="[bold]📝 Task[/bold]", border_style="cyan")
     ASCIIColors.rule("[bold green]🤖 Agent output[/bold green]")
 
-    result = agent.chat(
+    result = personality.chat(
         prompt=prompt,
         streaming_callback=streaming_callback,
         max_reasoning_steps=15,

@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib
 import importlib.util
@@ -20,8 +21,9 @@ import json
 import os
 import re
 import traceback
+import uuid
 from pathlib import Path
-from types import  SimpleNamespace
+from types import SimpleNamespace
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -217,8 +219,220 @@ def _normalize_messages(messages: List[Dict]) -> List[Dict]:
 
 
 # ===========================================================================
-# CapabilityFlags — Boolean gates for agent capabilities
+# RAGDataSource — Multi-source RAG Knowledge Base Schema
 # ===========================================================================
+
+@dataclass
+class RAGDataSource:
+    """
+    Represents a named, described RAG data source with query resolution.
+    """
+    name: str
+    description: str = ""
+    query_fn: Optional[Callable] = None
+    store: Optional[Any] = None
+    auto_query: bool = True
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def query(self, query_text: str, **kwargs) -> Dict[str, Any]:
+        if not self.query_fn:
+            return {
+                "success": False,
+                "sources": [],
+                "count": 0,
+                "query": query_text,
+                "datasource_name": self.name
+            }
+        try:
+            raw = _call_query_engine(self.query_fn, query_text, store=self.store, **kwargs)
+            return _normalise_raw(raw, query_text, self.name)
+        except Exception as e:
+            trace_exception(e)
+            return {
+                "success": False,
+                "sources": [],
+                "count": 0,
+                "query": query_text,
+                "error": str(e),
+                "datasource_name": self.name
+            }
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "auto_query": self.auto_query,
+            "metadata": self.metadata
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RAGDataSource":
+        return cls(
+            name=data.get("name", "knowledge_base"),
+            description=data.get("description", ""),
+            query_fn=data.get("query_fn") or data.get("source") or data.get("callable"),
+            store=data.get("store") or data.get("ss"),
+            auto_query=data.get("auto_query", True),
+            metadata=data.get("metadata", {})
+        )
+
+
+def _call_query_engine(query_fn: Callable, query: str, store: Any = None, **kwargs) -> Any:
+    """
+    Dynamically calls query_fn matching signatures such as:
+      - query_fn(query)
+      - query_fn(query, ss, ...)
+      - query_fn(query, store, **kwargs)
+    """
+    if not callable(query_fn):
+        return str(query_fn)
+
+    sig = None
+    try:
+        sig = inspect.signature(query_fn)
+    except Exception:
+        pass
+
+    if sig:
+        param_names = list(sig.parameters.keys())
+        call_kwargs = {}
+
+        if len(param_names) >= 2 and param_names[1] in ("ss", "store", "data_store", "storage", "database"):
+            positional_args = [query, store]
+            for k, v in kwargs.items():
+                if k in param_names[2:]:
+                    call_kwargs[k] = v
+            try:
+                return query_fn(*positional_args, **call_kwargs)
+            except TypeError:
+                pass
+
+        for k, v in kwargs.items():
+            if k in param_names:
+                call_kwargs[k] = v
+
+        if "ss" in param_names and "ss" not in call_kwargs and store is not None:
+            call_kwargs["ss"] = store
+        elif "store" in param_names and "store" not in call_kwargs and store is not None:
+            call_kwargs["store"] = store
+
+        has_var_keyword = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        if has_var_keyword:
+            call_kwargs.update(kwargs)
+            if store is not None and "ss" not in call_kwargs:
+                call_kwargs["ss"] = store
+
+        try:
+            return query_fn(query, **call_kwargs)
+        except TypeError:
+            if store is not None:
+                try:
+                    return query_fn(query, store)
+                except TypeError:
+                    return query_fn(query)
+            return query_fn(query)
+    else:
+        if store is not None:
+            try:
+                return query_fn(query, store, **kwargs)
+            except TypeError:
+                try:
+                    return query_fn(query, store)
+                except TypeError:
+                    return query_fn(query)
+        try:
+            return query_fn(query, **kwargs)
+        except TypeError:
+            return query_fn(query)
+
+
+def _normalise_raw(raw: Any, query: str, source_label: str) -> Dict[str, Any]:
+    """Normalizes raw RAG outputs (dicts, lists of chunks, strings) into standard format."""
+    if isinstance(raw, dict) and "sources" in raw:
+        if "success" not in raw:
+            raw["success"] = True
+        raw.setdefault("query", query)
+        raw.setdefault("count", len(raw["sources"]))
+        raw.setdefault("datasource_name", source_label)
+        return raw
+
+    if isinstance(raw, list):
+        sources = []
+        for chunk in raw:
+            if isinstance(chunk, dict):
+                if "error" in chunk and len(chunk) == 1 and not chunk.get("content"):
+                    continue
+                content = (
+                    chunk.get("content") or
+                    chunk.get("chunk_text") or
+                    chunk.get("text") or
+                    chunk.get("snippet") or
+                    str(chunk)
+                )
+                title = (
+                    chunk.get("title") or
+                    chunk.get("name") or
+                    (Path(chunk.get("file_path", "")).name if chunk.get("file_path") else "") or
+                    source_label
+                )
+                score = chunk.get("score", chunk.get("similarity_percent", chunk.get("fused_score", chunk.get("value", 1.0))))
+                try:
+                    score = float(score)
+                except (ValueError, TypeError):
+                    score = 1.0
+
+                sources.append({
+                    "content":  content,
+                    "score":    score,
+                    "source":   title or source_label,
+                    "metadata": chunk.get("document_metadata", chunk.get("metadata", {})),
+                    "title":    title,
+                    "datasource_name": source_label
+                })
+            else:
+                sources.append({
+                    "content": str(chunk),
+                    "score": 1.0,
+                    "source": source_label,
+                    "metadata": {},
+                    "title": source_label,
+                    "datasource_name": source_label
+                })
+        return {
+            "success": True,
+            "sources": sources,
+            "count": len(sources),
+            "query": query,
+            "datasource_name": source_label
+        }
+
+    text = str(raw) if raw is not None else ""
+    return {
+        "success": bool(text),
+        "sources": [{"content": text, "score": 1.0, "source": source_label, "title": source_label, "datasource_name": source_label}] if text else [],
+        "count":   1 if text else 0,
+        "query":   query,
+        "datasource_name": source_label
+    }
+
+
+# ===========================================================================
+# AgentRole & CapabilityFlags
+# ===========================================================================
+
+class AgentRole:
+    PROPOSER = "proposer"
+    CRITIC = "critic"
+    DEVIL_ADVOCATE = "devil_advocate"
+    DOMAIN_EXPERT = "domain_expert"
+    SYNTHESIZER = "synthesizer"
+    MODERATOR = "moderator"
+    IMPLEMENTER = "implementer"
+    TESTER = "tester"
+    NARRATOR = "narrator"
+    PLAYER = "player"
+    FREEFORM = "freeform"
+
 
 @dataclass
 class CapabilityFlags:
@@ -501,44 +715,35 @@ class SubAgentSpawner:
         self._spawned_this_turn += 1
 
         try:
-            from lollms_client.lollms_personality.lollms_personality import LollmsPersonality
+            child_caps = CapabilityFlags(
+                enable_code_execution=self.parent.capabilities.enable_code_execution if self.parent.capabilities else False,
+                enable_image_generation=False,
+                enable_image_editing=False,
+                enable_sub_agents=False,  # Prevent infinite recursion
+                enable_model_switching=False,
+                enable_skill_loading=self.parent.capabilities.enable_skill_loading if self.parent.capabilities else True,
+                enable_skill_creation=False,
+                skills_mode="loadable",
+                max_sub_agent_depth=0,
+            )
 
-            # Create a focused personality for the child
-            child_personality = LollmsPersonality(
-                name=f"SubAgent_{uuid.uuid4().hex[:6]}",
-                author="lollms_agent",
+            child_agent = LollmsPersonality(
+                name=f"SubAgent_{self._spawned_this_turn}",
+                author="lollms_personality",
                 category="sub_agent",
                 description="A focused sub-agent spawned for a specific task.",
                 system_prompt=personality_conditioning or (
                     "You are a focused sub-agent. Execute the given task precisely and return the result. "
                     "Do not engage in conversational pleasantries. Focus solely on the task."
                 ),
-            )
-
-            # Create child agent with disabled sub-agents and model switching
-            child_caps = CapabilityFlags(
-                enable_code_execution=self.parent.capabilities.enable_code_execution,
-                enable_image_generation=False,  # Children don't need image gen
-                enable_image_editing=False,
-                enable_sub_agents=False,  # CRITICAL: Prevent infinite recursion
-                enable_model_switching=False,
-                enable_skill_loading=self.parent.capabilities.enable_skill_loading,
-                enable_skill_creation=False,  # Children can't create skills
-                skills_mode="loadable",
-                max_sub_agent_depth=0,
-            )
-
-            child_agent = Agent(
-                lc=self.parent.lc,
-                personality=child_personality,
-                name=f"SubAgent_{self._spawned_this_turn}",
                 role=AgentRole.IMPLEMENTER,
                 workspace_path=self.parent.get_workspace_path(),
                 capabilities=child_caps,
-                skills_manager=self.parent.skills_manager,  # Share skills
+                skills_manager=self.parent.skills_manager,
                 model_params=self.parent.model_params,
                 max_tokens_per_turn=self.parent.max_tokens_per_turn,
-                memory_manager=None,  # Children don't write to memory
+                memory_manager=None,
+                lollms_client=self.parent.lollms_client,
                 _parent_depth=self._current_depth + 1,
             )
 
@@ -1310,19 +1515,20 @@ class LollmsPersonality:
 
     def __init__(
         self,
-        name: str,
-        author: str,
-        category: str,
-        description: str,
-        system_prompt: str,
+        name: str = "assistant",
+        author: str = "",
+        category: str = "general",
+        description: str = "",
+        system_prompt: str = "",
         metadata: Optional[Dict[str, Any]] = None,
         icon: Optional[str] = None,
         tools: Optional[Any] = None,
-        data_source: Optional[Union[str, Callable[[str], Any]]] = None,
+        data_source: Optional[Union[str, Callable, Dict[str, Any], List[Any], RAGDataSource]] = None,
+        data_sources: Optional[Union[List[Any], Dict[str, Any]]] = None,
         data_files: Optional[List[Union[str, Path]]] = None,
         vectorize_chunk_callback: Optional[Callable[[str, str], None]] = None,
         is_vectorized_callback: Optional[Callable[[str], bool]] = None,
-        query_rag_callback: Optional[Callable[[str], Any]] = None,
+        query_rag_callback: Optional[Callable] = None,
         script: Optional[str] = None,
         personality_id: Optional[str] = None,
         handbag_path: Optional[Union[str, Path]] = None,
@@ -1333,7 +1539,49 @@ class LollmsPersonality:
         lollms_client: Optional[Any] = None,
         capabilities: Optional[Any] = None,
         max_tokens_per_turn: int = 4096,
+        role: str = AgentRole.IMPLEMENTER,
+        model_params: Optional[Dict[str, Any]] = None,
+        enable_artefact_system: bool = False,
+        disable_artefact_versioning: bool = False,
+        skills_dirs: Optional[List[Union[str, Path]]] = None,
+        _parent_depth: int = 0,
+        lc: Optional[Any] = None,
+        personality: Optional[Any] = None,
     ):
+        if personality is not None:
+            if name == "assistant" and hasattr(personality, "name"):
+                name = personality.name
+            if not author and hasattr(personality, "author"):
+                author = personality.author
+            if category == "general" and hasattr(personality, "category"):
+                category = personality.category
+            if not description and hasattr(personality, "description"):
+                description = personality.description
+            if not system_prompt and hasattr(personality, "system_prompt"):
+                system_prompt = personality.system_prompt
+            if metadata is None and hasattr(personality, "metadata"):
+                metadata = personality.metadata
+            if icon is None and hasattr(personality, "icon"):
+                icon = personality.icon
+            if tools is None and hasattr(personality, "tools"):
+                tools = personality.tools
+            if data_source is None and hasattr(personality, "data_source"):
+                data_source = personality.data_source
+            if data_sources is None and hasattr(personality, "data_sources"):
+                data_sources = personality.data_sources
+            if skills_manager is None and hasattr(personality, "skills_manager"):
+                skills_manager = personality.skills_manager
+            if memory_manager is None and hasattr(personality, "memory_manager"):
+                memory_manager = personality.memory_manager
+            if capabilities is None and hasattr(personality, "capabilities"):
+                capabilities = personality.capabilities
+            if model_params is None and hasattr(personality, "model_params"):
+                model_params = personality.model_params
+            if lollms_client is None and hasattr(personality, "lollms_client"):
+                lollms_client = personality.lollms_client
+
+        resolved_client = lc or lollms_client
+
         self.name = name or "assistant"
         self.author = author or ""
         self.category = category or "general"
@@ -1342,6 +1590,8 @@ class LollmsPersonality:
         self.metadata = metadata or {}
         self.icon = icon
         self.personality_id = personality_id or self._generate_id()
+        self.role = role
+        self.model_params = model_params or {}
 
         self.mcp_tool_names: List[str] = []
         self._tool_binding: Any = _NULL_TOOL_BINDING
@@ -1353,6 +1603,8 @@ class LollmsPersonality:
         self.vectorize_chunk_callback = vectorize_chunk_callback
         self.is_vectorized_callback = is_vectorized_callback
         self.query_rag_callback = query_rag_callback
+        self.data_sources: List[RAGDataSource] = []
+        self._init_data_sources(data_source, data_sources, query_rag_callback)
         self._query_data_fn = self._build_query_data_fn(data_source)
 
         self.script = script
@@ -1361,17 +1613,27 @@ class LollmsPersonality:
 
         # Unified Stateful Components
         self.handbag_path = Path(handbag_path) if handbag_path else None
-        self.skills_manager = skills_manager
+
+        # Skills initialization
+        if skills_manager:
+            self.skills_manager = skills_manager
+        elif skills_dirs:
+            self.skills_manager = SkillsManager(skills_dirs=skills_dirs, mode="mixed")
+        else:
+            self.skills_manager = None
+
         self.memory_manager = memory_manager
         self._workspace_path: Optional[Path] = None
         self.workspace_path = Path(workspace_path) if workspace_path else None
         self.enable_git_management = enable_git_management
         self.coworkers: Dict[str, 'LollmsPersonality'] = {}
 
-        self.lollms_client = lollms_client
+        self.lollms_client = resolved_client
         self.max_tokens_per_turn = max_tokens_per_turn
+        self.enable_artefact_system = enable_artefact_system
+        self.disable_artefact_versioning = disable_artefact_versioning
 
-        # Agent-like capabilities
+        # Capabilities
         if CapabilityFlags is not None:
             self.capabilities = capabilities if capabilities is not None else CapabilityFlags()
         else:
@@ -1390,8 +1652,6 @@ class LollmsPersonality:
         # INSTRUMENTATION: Debug mode flag for context dumping
         self.debug_mode: bool = False
 
-        self._workspace_path: Optional[Path] = None
-
         # Initialize SubAgentSpawner and ModelSwitcher if client is provided
         if SubAgentSpawner and ModelSwitcher and self.lollms_client:
             self._sub_agent_spawner = SubAgentSpawner(
@@ -1399,12 +1659,130 @@ class LollmsPersonality:
                 max_depth=self.capabilities.max_sub_agent_depth if self.capabilities else 3,
                 max_per_turn=self.capabilities.max_sub_agents_per_turn if self.capabilities else 5
             )
+            self._sub_agent_spawner.set_depth(_parent_depth)
             self._model_switcher = ModelSwitcher(self.lollms_client)
         else:
             self._sub_agent_spawner = None
             self._model_switcher = None
 
+        if self.enable_artefact_system and self._resolved_workspace:
+            self._init_artefact_system()
+
         self.ensure_data_vectorized()
+
+    @property
+    def display_name(self) -> str:
+        return self.name
+
+    @property
+    def _agent_id(self) -> str:
+        return self.personality_id
+
+    @property
+    def lc(self) -> Optional[Any]:
+        return self.lollms_client
+
+    @lc.setter
+    def lc(self, value: Optional[Any]) -> None:
+        self.lollms_client = value
+
+    def clear_conversation(self) -> None:
+        """Clears the agent's internal multi-turn conversation memory."""
+        self._conversation = []
+
+    def generate(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
+        n_predict: Optional[int] = None,
+        streaming_callback: Optional[Callable] = None,
+        **kwargs
+    ) -> str:
+        """Direct text generation proxy."""
+        if not self.lollms_client:
+            raise RuntimeError("lollms_client is required for text generation.")
+        return self.lollms_client.generate_text(
+            prompt=prompt,
+            system_prompt=system_prompt if system_prompt is not None else self.system_prompt,
+            temperature=temperature if temperature is not None else self.model_params.get("temperature", 0.7),
+            n_predict=n_predict if n_predict is not None else self.max_tokens_per_turn,
+            streaming_callback=streaming_callback,
+            **kwargs
+        )
+
+    def generate_structured(
+        self,
+        prompt: str,
+        schema: Dict[str, Any],
+        temperature: float = 0.1,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Direct structured JSON generation proxy."""
+        if not self.lollms_client:
+            raise RuntimeError("lollms_client is required for structured generation.")
+        return self.lollms_client.generate_structured_content(
+            prompt=prompt,
+            schema=schema,
+            temperature=temperature,
+            **kwargs
+        )
+
+    def generate_with_tools(
+        self,
+        prompt: str,
+        tools: Optional[List[Union[str, Path, Dict[str, Any]]]] = None,
+        system_prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
+        n_predict: Optional[int] = None,
+        max_tool_rounds: int = 10,
+        streaming_callback: Optional[Callable] = None,
+        auto_execute: bool = True,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Executes an agentic tool reasoning loop."""
+        if not auto_execute:
+            # Single-pass manual mode: delegate to client.generate_from_messages
+            messages = [
+                {"role": "system", "content": system_prompt or self.system_prompt},
+                {"role": "user", "content": prompt}
+            ]
+            response_text = self.lollms_client.generate_from_messages(
+                messages=messages,
+                temperature=temperature or 0.7,
+                n_predict=n_predict or self.max_tokens_per_turn,
+                **kwargs
+            )
+            tool_calls = []
+            m = re.search(r'<tool>(.*?)</tool>', response_text, re.DOTALL | re.IGNORECASE)
+            if m:
+                try:
+                    tool_data = json.loads(m.group(1).strip())
+                    tool_calls.append(tool_data)
+                except Exception:
+                    pass
+            return {
+                "response": response_text,
+                "tool_calls": tool_calls,
+                "rounds": 1
+            }
+
+        return self.chat(
+            prompt=prompt,
+            lollms_client=self.lollms_client,
+            tool_files=tools,
+            max_reasoning_steps=max_tool_rounds,
+            temperature=temperature or 0.7,
+            n_predict=n_predict or self.max_tokens_per_turn,
+            streaming_callback=streaming_callback,
+            use_internal_history=False,
+            **kwargs
+        )
+
+    def generate_with_tools_sync(self, prompt: str, tools: Optional[List] = None, **kwargs) -> str:
+        """Synchronous wrapper returning only the final response string."""
+        res = self.generate_with_tools(prompt=prompt, tools=tools, **kwargs)
+        return res.get("response", "")
 
     @staticmethod
     def from_handbag(path: Union[str, Path], lollms_client: Optional[Any] = None) -> 'LollmsPersonality':
@@ -1421,7 +1799,8 @@ class LollmsPersonality:
         description = meta.get("description", "")
 
         # Initialize Skills
-        sm = SkillsManager(skills_dirs=hb.skills_dirs) if hb.skills_dirs else None
+        skills_mode = meta.get("skills_mode") or hb.manifest.get("skills_mode", "mixed")
+        sm = SkillsManager(skills_dirs=hb.skills_dirs, mode=skills_mode) if hb.skills_dirs else None
 
         # Initialize Memory (Independent Life)
         mm = hb.create_memory_manager()
@@ -1538,90 +1917,238 @@ class LollmsPersonality:
 
     # ------------------------------------------------------------------ data
 
+    def _init_data_sources(
+        self,
+        data_source: Optional[Any],
+        data_sources: Optional[Any],
+        query_rag_callback: Optional[Callable]
+    ) -> None:
+        self.data_sources = []
+
+        if data_sources:
+            if isinstance(data_sources, dict):
+                for name, val in data_sources.items():
+                    self._register_data_source_item(val, default_name=name)
+            elif isinstance(data_sources, list):
+                for item in data_sources:
+                    self._register_data_source_item(item)
+
+        if data_source:
+            if isinstance(data_source, dict) and not any(k in data_source for k in ("query_fn", "source", "callable", "engine")):
+                for name, val in data_source.items():
+                    self._register_data_source_item(val, default_name=name)
+            elif isinstance(data_source, list):
+                for item in data_source:
+                    self._register_data_source_item(item)
+            else:
+                self._register_data_source_item(data_source, default_name="primary_knowledge_base")
+
+        if query_rag_callback and not self.data_sources:
+            self._register_data_source_item(query_rag_callback, default_name="rag_callback")
+
+    def _register_data_source_item(self, item: Any, default_name: Optional[str] = None) -> Optional[RAGDataSource]:
+        if isinstance(item, RAGDataSource):
+            if not any(ds.name == item.name for ds in self.data_sources):
+                self.data_sources.append(item)
+            return item
+
+        if isinstance(item, dict):
+            name = item.get("name") or default_name or f"datasource_{len(self.data_sources)+1}"
+            desc = item.get("description") or item.get("desc") or ""
+            query_fn = item.get("query_fn") or item.get("source") or item.get("callable") or item.get("engine")
+            store = item.get("store") or item.get("ss")
+            auto_q = item.get("auto_query", True)
+            meta = item.get("metadata", {})
+
+            if isinstance(query_fn, str):
+                static_text = query_fn
+                query_fn = lambda q: static_text
+
+            ds = RAGDataSource(name=name, description=desc, query_fn=query_fn, store=store, auto_query=auto_q, metadata=meta)
+            if not any(existing.name == ds.name for existing in self.data_sources):
+                self.data_sources.append(ds)
+            return ds
+
+        if callable(item):
+            name = default_name or getattr(item, "__name__", f"datasource_{len(self.data_sources)+1}")
+            if name == "<lambda>":
+                name = default_name or f"datasource_{len(self.data_sources)+1}"
+            doc = getattr(item, "__doc__", "") or ""
+            desc = doc.strip().split("\n")[0] if doc else "RAG query engine"
+            ds = RAGDataSource(name=name, description=desc, query_fn=item, auto_query=True)
+            if not any(existing.name == ds.name for existing in self.data_sources):
+                self.data_sources.append(ds)
+            return ds
+
+        if isinstance(item, str):
+            name = default_name or "static_knowledge"
+            static_text = item
+            ds = RAGDataSource(name=name, description="Static knowledge base", query_fn=lambda q: static_text, auto_query=True)
+            if not any(existing.name == ds.name for existing in self.data_sources):
+                self.data_sources.append(ds)
+            return ds
+
+        return None
+
+    def add_data_source(
+        self,
+        name: str,
+        description: str = "",
+        query_fn: Optional[Callable] = None,
+        store: Optional[Any] = None,
+        auto_query: bool = True,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> RAGDataSource:
+        """Register a new RAG datasource dynamically."""
+        ds = RAGDataSource(
+            name=name,
+            description=description,
+            query_fn=query_fn,
+            store=store,
+            auto_query=auto_query,
+            metadata=metadata or {}
+        )
+        self.data_sources = [existing for existing in self.data_sources if existing.name != name]
+        self.data_sources.append(ds)
+        return ds
+
+    def remove_data_source(self, name: str) -> bool:
+        before = len(self.data_sources)
+        self.data_sources = [ds for ds in self.data_sources if ds.name != name]
+        return len(self.data_sources) < before
+
+    def get_data_source(self, name: str) -> Optional[RAGDataSource]:
+        return next((ds for ds in self.data_sources if ds.name.lower() == name.lower()), None)
+
+    def list_data_sources(self) -> List[Dict[str, Any]]:
+        return [ds.to_dict() for ds in self.data_sources]
+
     def _build_query_data_fn(
         self, source: Optional[Union[str, Callable]]
     ) -> Callable[[str], Dict[str, Any]]:
-        def _empty(query: str) -> Dict[str, Any]:
+        def _runner(query: str, **kwargs) -> Dict[str, Any]:
+            return self.query_data(query, **kwargs)
+        return _runner
+
+    def query_data(self, query: str, datasource_name: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+        if not self.data_sources:
+            if self.query_rag_callback:
+                try:
+                    raw = _call_query_engine(self.query_rag_callback, query, **kwargs)
+                    return _normalise_raw(raw, query, "rag_callback")
+                except Exception as e:
+                    trace_exception(e)
+                    return {"success": False, "sources": [], "count": 0, "query": query, "error": str(e)}
             return {"success": False, "sources": [], "count": 0, "query": query}
 
-        def _normalise_raw(raw: Any, query: str, source_label: str) -> Dict[str, Any]:
-            if isinstance(raw, dict) and "sources" in raw:
-                if "success" not in raw:
-                    raw["success"] = True
-                raw.setdefault("query", query)
-                raw.setdefault("count", len(raw["sources"]))
-                return raw
+        if datasource_name:
+            target_ds = next((ds for ds in self.data_sources if ds.name.lower() == datasource_name.lower()), None)
+            if not target_ds:
+                return {
+                    "success": False,
+                    "sources": [],
+                    "count": 0,
+                    "query": query,
+                    "error": f"Datasource '{datasource_name}' not found. Available: {[ds.name for ds in self.data_sources]}"
+                }
+            return target_ds.query(query, **kwargs)
 
-            if isinstance(raw, list):
-                sources = []
-                for chunk in raw:
-                    if isinstance(chunk, dict):
-                        sources.append({
-                            "content":  chunk.get("content", str(chunk)),
-                            "score":    float(chunk.get("score", chunk.get("value", 1.0))),
-                            "source":   chunk.get("source", source_label),
-                            "metadata": chunk.get("metadata", {}),
-                            "title":    chunk.get("title", ""),
-                        })
-                    else:
-                        sources.append({
-                            "content": str(chunk), "score": 1.0,
-                            "source": source_label, "metadata": {}, "title": "",
-                        })
-                return {"success": True, "sources": sources,
-                        "count": len(sources), "query": query}
+        active_sources = [ds for ds in self.data_sources if ds.auto_query]
+        if not active_sources:
+            active_sources = self.data_sources
 
-            text = str(raw) if raw is not None else ""
-            return {
-                "success": bool(text),
-                "sources": [{"content": text, "score": 1.0,
-                             "source": source_label}] if text else [],
-                "count":   1 if text else 0,
-                "query":   query,
-            }
+        all_sources = []
+        for ds in active_sources:
+            res = ds.query(query, **kwargs)
+            if res.get("success") and res.get("sources"):
+                for src in res["sources"]:
+                    src.setdefault("datasource_name", ds.name)
+                    all_sources.append(src)
 
-        if isinstance(source, str):
-            _static = source
-            def _static_fn(query: str) -> Dict[str, Any]:
+        return {
+            "success": bool(all_sources),
+            "sources": all_sources,
+            "count": len(all_sources),
+            "query": query
+        }
+
+    def build_rag_system_block(self) -> str:
+        if not self.has_data:
+            return ""
+        lines = ["=== RAG KNOWLEDGE BASES ==="]
+        lines.append("You have access to the following RAG knowledge base data source(s):")
+        for ds in self.data_sources:
+            desc = f": {ds.description}" if ds.description else ""
+            lines.append(f"- **{ds.name}**{desc}")
+        lines.append(
+            "Relevant excerpts are automatically pre-hydrated into your context under "
+            "'=== RETRIEVED RAG CONTEXT ==='.\n"
+            "You can also query specific data sources on demand using `tool_query_rag`."
+        )
+        lines.append("=== END RAG KNOWLEDGE BASES ===\n")
+        return "\n".join(lines)
+
+    def build_rag_tools(self) -> Dict[str, Dict[str, Any]]:
+        if not self.has_data:
+            return {}
+
+        ds_descriptions = []
+        for ds in self.data_sources:
+            desc = f"'{ds.name}': {ds.description}" if ds.description else f"'{ds.name}'"
+            ds_descriptions.append(desc)
+
+        ds_list_str = "; ".join(ds_descriptions) if ds_descriptions else "Default Knowledge Base"
+
+        def tool_query_rag(query: str, datasource_name: str = "") -> dict:
+            """
+            Query the attached RAG knowledge base data source(s) for relevant document excerpts, citations, or facts.
+
+            Args:
+                query (str): The search query or question to retrieve information for.
+                datasource_name (str, optional): The name of the specific data source to query. If omitted, queries available data sources.
+            """
+            try:
+                ds_target = datasource_name.strip() or None
+                res = self.query_data(query, datasource_name=ds_target)
+                if not res or not res.get("success") or not res.get("sources"):
+                    return {
+                        "success": True,
+                        "output": f"No relevant content found in RAG datasource for query: '{query}'."
+                    }
+
+                output_parts = []
+                for idx, src in enumerate(res.get("sources", []), 1):
+                    title = src.get("title") or src.get("source") or "Document"
+                    score_val = src.get("score")
+                    score_str = f" (Score: {score_val:.2f})" if isinstance(score_val, (int, float)) and score_val <= 1.0 else (f" (Score: {score_val})" if score_val is not None else "")
+                    output_parts.append(f"[{idx}] {title}{score_str}:\n{src.get('content')}")
+
                 return {
                     "success": True,
-                    "sources": [{"content": _static, "score": 1.0, "source": "static"}],
-                    "count":   1,
-                    "query":   query,
+                    "sources_count": len(res.get("sources", [])),
+                    "output": "\n\n".join(output_parts)
                 }
-            return _static_fn
+            except Exception as e:
+                return {"success": False, "error": f"RAG query failed: {e}"}
 
-        if callable(source):
-            _callable = source
-            def _callable_fn(query: str) -> Dict[str, Any]:
-                try:
-                    return _normalise_raw(_callable(query), query, "data_source")
-                except Exception as exc:
-                    trace_exception(exc)
-                    return {"success": False, "sources": [], "count": 0,
-                            "query": query, "error": str(exc)}
-            return _callable_fn
-
-        if self.query_rag_callback is not None:
-            _rag_cb = self.query_rag_callback
-            def _rag_fn(query: str) -> Dict[str, Any]:
-                try:
-                    return _normalise_raw(_rag_cb(query), query, "rag")
-                except Exception as exc:
-                    trace_exception(exc)
-                    return {"success": False, "sources": [], "count": 0,
-                            "query": query, "error": str(exc)}
-            return _rag_fn
-
-        return _empty
-
-    def query_data(self, query: str) -> Dict[str, Any]:
-        return self._query_data_fn(query)
+        ds_names = [ds.name for ds in self.data_sources]
+        return {
+            "tool_query_rag": {
+                "name": "tool_query_rag",
+                "description": f"Query external RAG knowledge bases for information. Available data sources: {ds_list_str}",
+                "parameters": [
+                    {"name": "query", "type": "str", "description": "The search query or keywords."},
+                    {"name": "datasource_name", "type": "str", "description": f"Specific data source name to query (options: {', '.join(ds_names)}).", "optional": True}
+                ],
+                "callable": tool_query_rag
+            }
+        }
 
     @property
     def has_data(self) -> bool:
         return (
-            self._raw_data_source is not None
+            bool(self.data_sources)
+            or self._raw_data_source is not None
             or self.query_rag_callback is not None
             or bool(self.data_files)
         )
@@ -2482,15 +3009,10 @@ JSON:"""
                 metadata={},
                 _is_db_backed=False,
                 commit=lambda: None,
-                disable_artefact_versioning=True,
-                _skip_physical_sync=True
+                disable_artefact_versioning=self.disable_artefact_versioning,
             )
 
-            class _IndexOnlyArtefactManager(ArtefactManager):
-                def _sync_to_disk_workspace(self, *args, **kwargs):
-                    return
-
-            am = _IndexOnlyArtefactManager(proxy)
+            am = ArtefactManager(proxy)
             object.__setattr__(self, '_artefact_manager', am)
             object.__setattr__(self, '_artefact_proxy', proxy)
             object.__setattr__(self, '_discussion', proxy)
@@ -2580,11 +3102,65 @@ JSON:"""
 
         return text.strip()
 
-    def _discover_tools(self, explicit_tools: Optional[Dict], tool_files: Optional[List]) -> Dict[str, Dict[str, Any]]:
+    def _discover_tools(self, explicit_tools: Optional[Dict] = None, tool_files: Optional[List] = None, *args, **kwargs) -> Dict[str, Dict[str, Any]]:
         active_tools = {}
 
-        # Sovereign Tool Opt-In Doctrine: File I/O is strictly handled by the Artefact System (<unlock_file>, <artifact>).
-        # We DO NOT mount generic tool_read_file or tool_write_file to prevent context pollution and architectural drift.
+        if self.capabilities and self.capabilities.enable_workspace_tools and self._resolved_workspace:
+            ws_path = self._resolved_workspace
+
+            def tool_write_file(file_name: str, content: str) -> dict:
+                """Write content to a file in the workspace."""
+                try:
+                    p = ws_path / file_name
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(content, encoding="utf-8")
+                    return {"success": True, "output": f"File '{file_name}' written successfully."}
+                except Exception as e:
+                    return {"success": False, "error": str(e)}
+
+            def tool_read_file(file_name: str) -> dict:
+                """Read content from a file in the workspace."""
+                try:
+                    p = ws_path / file_name
+                    if not p.exists():
+                        return {"success": False, "error": f"File '{file_name}' not found."}
+                    return {"success": True, "output": p.read_text(encoding="utf-8", errors="ignore")}
+                except Exception as e:
+                    return {"success": False, "error": str(e)}
+
+            def tool_list_files(directory: str = ".") -> dict:
+                """List all files in the workspace."""
+                try:
+                    files = [str(f.relative_to(ws_path)) for f in ws_path.rglob("*") if f.is_file()]
+                    return {"success": True, "files": sorted(files), "output": "\n".join(sorted(files))}
+                except Exception as e:
+                    return {"success": False, "error": str(e)}
+
+            active_tools["tool_write_file"] = {
+                "name": "tool_write_file",
+                "description": "Write content to a file in the workspace.",
+                "parameters": [
+                    {"name": "file_name", "type": "str", "description": "The path of the file to write."},
+                    {"name": "content", "type": "str", "description": "The content to write into the file."}
+                ],
+                "callable": tool_write_file
+            }
+            active_tools["tool_read_file"] = {
+                "name": "tool_read_file",
+                "description": "Read content from a file in the workspace.",
+                "parameters": [
+                    {"name": "file_name", "type": "str", "description": "The path of the file to read."}
+                ],
+                "callable": tool_read_file
+            }
+            active_tools["tool_list_files"] = {
+                "name": "tool_list_files",
+                "description": "List all files in the workspace.",
+                "parameters": [
+                    {"name": "directory", "type": "str", "description": "Directory to list (optional).", "optional": True}
+                ],
+                "callable": tool_list_files
+            }
 
         if BindingToolsBuilder and self.lollms_client and self.capabilities:
             binding_tools = BindingToolsBuilder.build_tools(self.lollms_client, self.capabilities, self._resolved_workspace)
@@ -2608,19 +3184,44 @@ JSON:"""
                 "callable": tool_spawn_sub_agent,
             }
 
+        if self._model_switcher and self.capabilities and self.capabilities.enable_model_switching:
+            def tool_switch_model(model_name: str) -> dict:
+                return self._model_switcher.switch_model(model_name)
+
+            def tool_list_models() -> dict:
+                models = self._model_switcher.list_models()
+                return {"success": True, "models": models, "output": ", ".join(models)}
+
+            active_tools["tool_switch_model"] = {
+                "name": "tool_switch_model",
+                "description": "Switch to a different model.",
+                "parameters": [{"name": "model_name", "type": "str", "description": "The name of the model to switch to."}],
+                "callable": tool_switch_model
+            }
+            active_tools["tool_list_models"] = {
+                "name": "tool_list_models",
+                "description": "List available models.",
+                "parameters": [],
+                "callable": tool_list_models
+            }
+
         lcp_binding = getattr(self.lollms_client, 'tools', None)
+        if not _is_tool_binding(lcp_binding) or hasattr(lcp_binding, "_mock_return_value"):
+            lcp_binding = None
+
         if lcp_binding is None and (tool_files or self._resolved_workspace):
             try:
+                import lollms_client as _lollms_client_pkg
                 from lollms_client.tools_bindings.lcp import LCPBinding
-                pkg_root = Path(lollms_client.__file__).resolve().parent
+                pkg_root = Path(_lollms_client_pkg.__file__).resolve().parent
                 default_tools = pkg_root / "tools_bindings" / "lcp" / "default_tools"
                 lcp_binding = LCPBinding(tools_folders=[str(default_tools)] if default_tools.exists() else [])
             except Exception:
                 lcp_binding = None
 
         if lcp_binding and hasattr(lcp_binding, 'mount_tool_library'):
-            # Auto-mount essential discovery and execution tools
-            _ESSENTIAL_LIBRARIES = ["system_shell", "grep_files", "find_files"]
+            # Auto-mount essential discovery, execution, and as-is document tools
+            _ESSENTIAL_LIBRARIES = ["system_shell", "grep_files", "find_files", "as_is_document_tools"]
             for lib_name in _ESSENTIAL_LIBRARIES:
                 try:
                     lcp_binding.mount_tool_library(lib_name)
@@ -2629,11 +3230,18 @@ JSON:"""
 
             try:
                 lcp_tools = lcp_binding.to_chat_tool_specs()
-                # Expose all tools from the essential libraries (system_shell, grep, find)
+                # Expose all tools from the essential libraries (system_shell, grep, find, document tools)
                 for t_name, t_spec in lcp_tools.items():
                     if t_name.startswith("tool_execute_shell_command") or \
                        t_name.startswith("tool_grep_") or \
-                       t_name.startswith("tool_find_"):
+                       t_name.startswith("tool_find_") or \
+                       t_name.startswith("tool_inspect_document") or \
+                       t_name.startswith("tool_read_document_content") or \
+                       t_name.startswith("tool_grep_document") or \
+                       t_name.startswith("tool_modify_docx") or \
+                       t_name.startswith("tool_modify_excel") or \
+                       t_name.startswith("tool_modify_pdf_annotation") or \
+                       t_name.startswith("tool_modify_pptx_slide"):
                         active_tools[t_name] = t_spec
             except Exception as e:
                 ASCIIColors.warning(f"[LollmsPersonality] Failed to extract LCP tool specs: {e}")
@@ -3743,6 +4351,9 @@ JSON:"""
 
             ss.flush_remaining_buffer()
 
+            has_truncated_artifact = False
+            truncated_artifact_title = None
+
             if ss.was_done_detected():
                 final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
 
@@ -3784,6 +4395,17 @@ JSON:"""
                                 tool_res = self._execute_tool(tool_name, tool_params, active_tools)
 
                                 tool_success = isinstance(tool_res, dict) and tool_res.get("success", True) is not False
+                                inner_res = tool_res.get("output", tool_res) if isinstance(tool_res, dict) else tool_res
+                                is_failure = (
+                                    (isinstance(inner_res, dict) and inner_res.get("success") is False)
+                                    or (isinstance(tool_res, dict) and tool_res.get("status_code", 200) not in (200, 201))
+                                    or (isinstance(tool_res, dict) and bool(tool_res.get("error")))
+                                    or (isinstance(inner_res, dict) and bool(inner_res.get("error")) and not inner_res.get("success", True))
+                                    or (isinstance(tool_res, dict) and tool_res.get("return_code", 0) != 0)
+                                    or (isinstance(inner_res, dict) and inner_res.get("return_code", 0) != 0)
+                                )
+                                tool_success = not is_failure
+
                                 if tool_success:
                                     successful_tool_signatures.add(context_aware_sig)
 
@@ -3801,7 +4423,7 @@ JSON:"""
                                 if tool_success:
                                     report_part = f"=== ✅ TOOL RESULT: {tool_name} ===\n<tool_result name=\"{tool_name}\" status=\"SUCCESS\">\n{clean_result_str}\n</tool_result>"
                                 else:
-                                    report_part = f"=== ❌ TOOL FAILED: {tool_name} ===\n<tool_result name=\"{tool_name}\" status=\"FAILED\">\n{clean_result_str}\n</tool_result>"
+                                    report_part = f"=== ❌ TOOL FAILED: {tool_name} ===\n<tool_result name=\"{tool_name}\" status=\"FAILED\">\n{clean_result_str}\n</tool_result>\n\n⚠️ **Error Analysis Guidance:** Read the error details above carefully to understand what failed. Fix the parameters or try an alternative approach."
 
                                 action_reports.append(report_part)
 
@@ -4087,7 +4709,7 @@ JSON:"""
                         import re as _re_intent
                         intent_match = _re_intent.search(r'(Let me|Now I will|I will|Let\'s|Next, I)\s+.*', last_assistant_text, _re_intent.IGNORECASE)
                         if intent_match:
-                            intent_hint = f" You previously stated: \"{intent_match.group(0).strip()}\. You must execute this stated intent NOW by emitting the appropriate `<tool>` or `<artifact>` tag."
+                            intent_hint = f' You previously stated: "{intent_match.group(0).strip()}". You must execute this stated intent NOW by emitting the appropriate `<tool>` or `<artifact>` tag.'
 
                     virtual_history.append(SimpleNamespace(
                         sender_type="user",
@@ -4136,7 +4758,17 @@ JSON:"""
 
                             tool_res = self._execute_tool(tool_name, tool_params, active_tools)
 
-                            tool_success = isinstance(tool_res, dict) and tool_res.get("success", True) is not False
+                            inner_res = tool_res.get("output", tool_res) if isinstance(tool_res, dict) else tool_res
+                            is_failure = (
+                                (isinstance(inner_res, dict) and inner_res.get("success") is False)
+                                or (isinstance(tool_res, dict) and tool_res.get("status_code", 200) not in (200, 201))
+                                or (isinstance(tool_res, dict) and bool(tool_res.get("error")))
+                                or (isinstance(inner_res, dict) and bool(inner_res.get("error")) and not inner_res.get("success", True))
+                                or (isinstance(tool_res, dict) and tool_res.get("return_code", 0) != 0)
+                                or (isinstance(inner_res, dict) and inner_res.get("return_code", 0) != 0)
+                            )
+                            tool_success = not is_failure
+
                             if tool_success:
                                 successful_tool_signatures.add(context_aware_sig)
 
@@ -4155,7 +4787,7 @@ JSON:"""
                             if tool_success:
                                 report_part = f"=== ✅ TOOL RESULT: {tool_name} ===\n<tool_result name=\"{tool_name}\" status=\"SUCCESS\">\n{clean_result_str}\n</tool_result>"
                             else:
-                                report_part = f"=== ❌ TOOL FAILED: {tool_name} ===\n<tool_result name=\"{tool_name}\" status=\"FAILED\">\n{clean_result_str}\n</tool_result>"
+                                report_part = f"=== ❌ TOOL FAILED: {tool_name} ===\n<tool_result name=\"{tool_name}\" status=\"FAILED\">\n{clean_result_str}\n</tool_result>\n\n⚠️ **Error Analysis Guidance:** Read the error details above carefully to understand what failed. Fix the parameters or try an alternative approach."
 
                             action_reports.append(report_part)
 
@@ -4558,9 +5190,15 @@ JSON:"""
                     ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Malformed tag detected, injecting format correction ===")
                 continue
 
+            if not final_response:
+                final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
+
             if getattr(self, 'debug_mode', False):
                 ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Clean exit ===")
             break
+
+        if not final_response and ss:
+            final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
 
         if ss.completed_actions and not was_cancelled:
             ASCIIColors.warning(f"[{self.name}] ⚠️ Generation ended with {len(ss.completed_actions)} unexecuted buffered action(s). Flushing now.")
@@ -4736,6 +5374,8 @@ JSON:"""
            "was_cancelled": was_cancelled,
            "context_health": context_health
        }
+
+Agent = LollmsPersonality
 
 # ---------------------------------------------------------------------------
 # NullPersonality  — drop-in default so chat() never needs ``if personality:``

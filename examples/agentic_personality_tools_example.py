@@ -49,8 +49,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from ascii_colors import ASCIIColors
 from lollms_client.lollms_config_cli_env import get_client_from_env
 from lollms_client import LollmsClient
-from lollms_client.lollms_agent.lollms_agent import Agent, AgentRole
-from lollms_client.lollms_personality.lollms_personality import LollmsPersonality
+from lollms_client.lollms_personality import LollmsPersonality, AgentRole
 from lollms_client.lollms_types import MSG_TYPE
 
 
@@ -331,17 +330,12 @@ def main():
         ),
     )
 
-    ASCIIColors.panel("[blue]Creating Agent with personality and tools...[/blue]", title="[bold]🤖 Agent[/bold]", border_style="blue")
-    agent = Agent(
-        lc=client,
-        personality=personality,
-        name="ResearchAgent",
-        role=AgentRole.DOMAIN_EXPERT,
-        model_params={"temperature": 0.7},
-        max_tokens_per_turn=4096,
-        metadata={"specialization": "AI/CS research synthesis"},
-    )
-    ASCIIColors.cyan(f"   Agent: {agent.display_name} | Role: {agent.role} | ID: {agent._agent_id[:8]}")
+    ASCIIColors.panel("[blue]Configuring ResearchAgent personality with agentic parameters...[/blue]", title="[bold]🤖 Agent[/bold]", border_style="blue")
+    personality.lollms_client = client
+    personality.role = AgentRole.DOMAIN_EXPERT
+    personality.model_params = {"temperature": 0.7}
+    personality.max_tokens_per_turn = 4096
+    ASCIIColors.cyan(f"   Agent: {personality.display_name} | Role: {personality.role} | ID: {personality._agent_id[:8]}")
 
     research_query = (
         "I want to understand the current state of reasoning in large language models. "
@@ -358,7 +352,7 @@ def main():
     overall_t0 = time.time()
     
     try:
-        result = agent.generate_with_tools(
+        result = personality.generate_with_tools(
             prompt=research_query,
             tools=[arxiv_path, wiki_path],
             system_prompt=personality.system_prompt,

@@ -175,7 +175,10 @@ def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: 
                 try:
                     query_str = f'SELECT * FROM "{table}" LIMIT 3' if dialect != "mysql" else f'SELECT * FROM `{table}` LIMIT 3'
                     with engine.connect() as connection:
-                        df = pd.read_sql_query(query_str, connection)
+                        res = connection.execute(text(query_str))
+                        cols = list(res.keys())
+                        rows = res.fetchall()
+                        df = pd.DataFrame(rows, columns=cols)
                     schema_parts.append("### Preview (First 3 Rows):")
                     schema_parts.append(df.to_markdown(index=False))
                 except Exception as ex:

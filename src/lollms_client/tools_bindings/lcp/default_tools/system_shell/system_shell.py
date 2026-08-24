@@ -101,10 +101,15 @@ def tool_execute_shell_command(
                 timeout=60
             )
 
+        error_msg = None
+        if result.returncode != 0:
+            error_msg = result.stderr if result.stderr else f"Command failed with exit code {result.returncode}"
+
         return {
             "success": result.returncode == 0,
-            "output": result.stdout or "Command executed successfully (no stdout).",
+            "output": result.stdout or ("Command executed successfully (no stdout)." if result.returncode == 0 else ""),
             "stderr": result.stderr,
+            "error": error_msg,
             "return_code": result.returncode
         }
     except subprocess.TimeoutExpired:

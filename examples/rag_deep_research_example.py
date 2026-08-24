@@ -57,8 +57,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from lollms_client import LollmsClient
-from lollms_client.lollms_agent.lollms_agent import Agent, AgentRole
-from lollms_client.lollms_personality.lollms_personality import LollmsPersonality
+from lollms_client.lollms_personality import LollmsPersonality, AgentRole
 from lollms_client.lollms_types import MSG_TYPE
 
 
@@ -1202,18 +1201,13 @@ def main():
         ),
     )
 
-    # ── 7. Create Agent ───────────────────────────────────────────────
-    print("🤖 Creating Agent with deep research capabilities...")
-    agent = Agent(
-        lc=client,
-        personality=personality,
-        name="DeepResearchAgent",
-        role=AgentRole.DOMAIN_EXPERT,
-        model_params={"temperature": 0.7},
-        max_tokens_per_turn=4096,
-        metadata={"specialization": "Deep web research with RAG"},
-    )
-    print(f"   Agent: {agent.display_name} | Role: {agent.role} | ID: {agent._agent_id[:8]}")
+    # ── 7. Configure Personality with deep research capabilities ──────
+    print("🤖 Configuring Personality with deep research capabilities...")
+    personality.lollms_client = client
+    personality.role = AgentRole.DOMAIN_EXPERT
+    personality.model_params = {"temperature": 0.7}
+    personality.max_tokens_per_turn = 4096
+    print(f"   Agent: {personality.display_name} | Role: {personality.role} | ID: {personality._agent_id[:8]}")
 
     # ── 8. Define deep research query ─────────────────────────────────
     research_query = (
@@ -1240,7 +1234,7 @@ def main():
 
     overall_t0 = time.time()
     
-    result = agent.generate_with_tools(
+    result = personality.generate_with_tools(
         prompt=research_query,
         tools=[web_search_path, download_path, data_lake_path],
         system_prompt=personality.system_prompt,

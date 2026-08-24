@@ -136,16 +136,81 @@ The `tool_specs()` method resolves which tools the LLM is allowed to use based o
 | `[]` (empty list) | `True` | Expose NO tools (empty allowlist). |
 | `["tool_a", "tool_b"]` | `True` | Expose ONLY `tool_a` and `tool_b` from the binding. |
 
-### Data Source Normalization
-The `data_source` parameter accepts `None`, a static `str`, or a `Callable`. During initialization, these are normalized into a unified `_query_data_fn(query: str) -> Dict[str, Any]` that guarantees the following return schema:
+### Multi-Source RAG Architecture (`RAGDataSource`)
+`LollmsPersonality` supports registering multiple named, described RAG knowledge bases. Each data source specifies its purpose, allowing both automated turn pre-hydration and on-demand agentic querying via `tool_query_rag`.
+
+#### `RAGDataSource` Schema
+```python
+from lollms_client.lollms_personality import RAGDataSource
+
+ds = RAGDataSource(
+    name="tech_manuals",                      # Unique identifier
+    description="Architecture & API guides",  # Exposed to LLM for cognitive routing
+    query_fn=my_query_callback,               # Retrieval function
+    store=my_vector_store,                    # Underlying storage instance (passed as `ss` or `store`)
+    auto_query=True                           # Pre-hydrate on turn start (True) or tool-only (False)
+)
+```
+
+#### Multi-Source Registration Patterns
+```python
+# 1. Using explicit list of RAGDataSource objects
+personality = LollmsPersonality(
+    name="ResearchSpecialist",
+    data_sources=[
+        RAGDataSource(name="manuals", description="Product user manuals", query_fn=query_rag_callback, store=manuals_store, auto_query=True),
+        RAGDataSource(name="code_repos", description="Source code indexing", query_fn=query_rag_callback, store=code_store, auto_query=False)
+    ]
+)
+
+# 2. Using dictionary definitions
+personality = LollmsPersonality(
+    name="Assistant",
+    data_sources={
+        "customer_faq": {"description": "Customer support FAQ", "query_fn": faq_engine, "auto_query": True},
+        "legal_terms": {"description": "Terms of service and GDPR compliance", "query_fn": legal_engine, "auto_query": False}
+    }
+)
+
+# 3. Dynamic runtime registration
+personality.add_data_source(
+    name="live_telemetry",
+    description="Real-time server logs and metrics",
+    query_fn=logs_query_fn,
+    auto_query=False
+)
+```
+
+#### Flexible Calling Conventions & Signature Resolution
+The query dispatcher automatically resolves caller signatures via `inspect.signature`, supporting functions like:
+- `fn(query)`
+- `fn(query, ss, ...)`
+- `fn(query, store, rag_top_k=..., rag_min_similarity_percent=..., mode=...)`
+
+All raw outputs (dictionaries with `sources`, lists of chunk dictionaries with `chunk_text`, `file_path`, `similarity_percent`, `document_metadata`, or plain strings) are normalized to:
 
 ```python
 {
     "success": bool,
-    "sources": [{"content": str, "score": float, "source": str}],
+    "sources": [
+        {
+            "content": str,
+            "score": float,
+            "source": str,
+            "title": str,
+            "metadata": dict,
+            "datasource_name": str
+        }
+    ],
     "count": int,
     "query": str
 }
+```
+
+#### On-Demand RAG Tooling (`tool_query_rag`)
+When a personality has RAG data sources, `build_rag_tools()` generates the `tool_query_rag` tool and `build_rag_system_block()` injects an overview into the system prompt:
+```xml
+<tool>{"name": "tool_query_rag", "parameters": {"query": "JWT token expiration", "datasource_name": "tech_manuals"}}</tool>
 ```
 
 ### Memory Scoping (Independent vs. System-Managed Life)

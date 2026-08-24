@@ -48,13 +48,13 @@ def tool_execute_sql_query(
     try:
         if ext == ".sqlconn":
             import json
-            from sqlalchemy import create_engine, inspect as sqlalchemy_inspect
+            from sqlalchemy import create_engine, text, inspect as sqlalchemy_inspect
             with open(file_path, "r", encoding="utf-8") as f:
                 conn_info = json.load(f)
-            
+
             dialect = conn_info.get("dialect", "sqlite").lower()
             connection_url = conn_info.get("url", "")
-            
+
             if not connection_url:
                 if dialect == "sqlite":
                     db_path = conn_info.get("database", "")
@@ -79,7 +79,11 @@ def tool_execute_sql_query(
 
             with engine.connect() as connection:
                 for table in tables:
-                    df = pd.read_sql_query(f'SELECT * FROM "{table}"', connection)
+                    query_str = f'SELECT * FROM "{table}"' if dialect != "mysql" else f'SELECT * FROM `{table}`'
+                    res = connection.execute(text(query_str))
+                    cols = list(res.keys())
+                    rows = res.fetchall()
+                    df = pd.DataFrame(rows, columns=cols)
                     df.to_sql(table, conn, index=False, if_exists="replace")
             engine.dispose()
             

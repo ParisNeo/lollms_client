@@ -111,6 +111,7 @@ IMPORT_MODE_OCR         = "ocr"
 IMPORT_MODE_DATA        = "data"
 IMPORT_MODE_DATA_BUNDLE = "data_bundle"
 IMPORT_MODE_AUDIO_STT   = "audio_stt"
+IMPORT_MODE_AS_IS       = "as_is"
 
 ALL_IMPORT_MODES = {
     IMPORT_MODE_TEXT,
@@ -121,6 +122,7 @@ ALL_IMPORT_MODES = {
     IMPORT_MODE_DATA,
     IMPORT_MODE_DATA_BUNDLE,
     IMPORT_MODE_AUDIO_STT,
+    IMPORT_MODE_AS_IS,
 }
 
 # Extensions treated as source code → ArtefactType.CODE
@@ -207,20 +209,22 @@ def _detect_artefact_type_from_mode(path: Path, mode: str) -> str:
     This prevents the .lam Dual-Stream system from hijacking text imports.
     """
     ext = path.suffix.lower()
-    
+
+    if mode == IMPORT_MODE_AS_IS:
+        return ArtefactType.FILE
     if mode in (IMPORT_MODE_DATA, IMPORT_MODE_DATA_BUNDLE):
         return ArtefactType.DATA
     if mode == IMPORT_MODE_IMAGES_ONLY:
         return ArtefactType.IMAGE
     if mode == IMPORT_MODE_AUDIO_STT:
         return ArtefactType.DOCUMENT
-        
+
     # If mode is text/text_images/ocr, we force DOCUMENT or CODE
     if ext in _CODE_EXTENSIONS:
         return ArtefactType.CODE
     if ext in _IMAGE_EXTENSIONS:
         return ArtefactType.IMAGE
-        
+
     return ArtefactType.DOCUMENT
 
 
@@ -1238,6 +1242,76 @@ class FileImportMixin:
                         "image_count": 0,
                         "warnings": warnings,
                     }
+
+        # ── as_is mode (Native Binary/Document Preservation) ─────────────────
+        if mode == IMPORT_MODE_AS_IS:
+            _progress(f"Importing '{path.name}' as-is (native file preservation)...")
+            clean_title = title
+            if not clean_title.lower().endswith(ext) and ext:
+                clean_title = f"{clean_title}{ext}"
+
+            try:
+                raw_physical_bytes = path.read_bytes()
+                file_size = len(raw_physical_bytes)
+            except Exception as e:
+                raw_physical_bytes = b""
+                file_size = 0
+                warnings.append(f"Could not read raw bytes for '{path.name}': {e}")
+
+            descriptor_lines = [
+                f"# As-Is File: {clean_title}\n",
+                f"- **Filename**: `{clean_title}`",
+                f"- **Format**: {ext.upper().lstrip('.') if ext else 'Binary/Raw'}",
+                f"- **Size**: {file_size:,} bytes",
+                f"- **Location**: `./{clean_title}`",
+                f"- **Mode**: AS-IS (Native file preserved in workspace without markdown conversion)",
+                f"\n> **Note**: This file is kept in its native format and is NOT injected into prompt context as markdown.",
+                f"> Use the document tools (`tool_inspect_document`, `tool_read_document_content`, `tool_grep_document`, `tool_modify_docx`, `tool_modify_excel`, `tool_modify_pptx_slide`, `tool_modify_pdf_annotation`) to inspect, search, or edit it selectively without context bloat."
+            ]
+
+            if description and description.strip():
+                descriptor_lines.append(f"\n## Description\n{description.strip()}")
+
+            descriptor_content = "\n".join(descriptor_lines)
+
+            # Ensure raw file is written directly into workspace_data/
+            try:
+                if getattr(self, "workspace_data_path", None):
+                    ws_dir = Path(self.workspace_data_path)
+                else:
+                    base_ws = Path(self.workspace_path) if getattr(self, "workspace_path", None) else Path("./data_workspace")
+                    disc_id = getattr(self, "id", "default")
+                    ws_dir = base_ws / disc_id / "workspace_data"
+
+                ws_dir.mkdir(parents=True, exist_ok=True)
+                target_file_path = ws_dir / clean_title
+                target_file_path.write_bytes(raw_physical_bytes)
+            except Exception as w_err:
+                warnings.append(f"Failed to write physical file to workspace: {w_err}")
+
+            art = self.artefacts.add(
+                title=clean_title,
+                artefact_type=ArtefactType.FILE,
+                content=descriptor_content,
+                active=activate,
+                file_ext=ext,
+                version=1,
+                read_only=False,
+                physical_data=raw_physical_bytes,
+                logical_content=descriptor_content,
+                visibility=ArtefactVisibility.FULL if activate else ArtefactVisibility.TREE_UNLOCKABLE,
+                commit_message=f"Imported '{path.name}' as-is"
+            )
+
+            _progress(f"As-Is file imported successfully: '{clean_title}'")
+            return {
+                "text_artefact": art,
+                "image_artefact": None,
+                "mode": mode,
+                "page_count": 0,
+                "image_count": 0,
+                "warnings": warnings,
+            }
 
         # ── data mode (Single File) ──────────────────────────────────────────
         # 🛑 CRITICAL FIX: Dedented to top-level so it executes when mode == IMPORT_MODE_DATA

@@ -15,6 +15,175 @@ It is composed of nine orthogonal mixins:
 
 ---
 
+## 🔍 13. Multi-Source RAG (Retrieval-Augmented Generation) in LollmsDiscussion
+
+`LollmsDiscussion` supports **Multi-Source Retrieval-Augmented Generation (RAG)** through the `LollmsPersonality` layer. It combines automatic turn-level pre-hydration with on-demand agentic tool execution (`tool_query_rag`), allowing the LLM to inspect cataloged knowledge bases and retrieve domain facts on demand.
+
+### 🏛️ Architecture: The Dual RAG Execution Model
+
+```
+                          User Prompt
+                              │
+                              ▼
+┌───────────────────────────────────────────────────────────┐
+│ 1. Turn Pre-Hydration (Automatic on Turn Start)           │
+│    • Queries all data sources with `auto_query=True`      │
+│    • Injects all retrieved chunks into system prompt      │
+│    • 50k character safety ceiling (no 3-chunk crop)       │
+└─────────────────────────────┬─────────────────────────────┘
+                              │
+                              ▼
+┌───────────────────────────────────────────────────────────┐
+│ 2. Agentic Reasoning Loop & On-Demand Tools               │
+│    • System prompt lists all available RAG databases      │
+│    • LLM can call `tool_query_rag(query, datasource_name)`│
+│    • Retries / drills down into specific domain indices   │
+└─────────────────────────────┬─────────────────────────────┘
+                              │
+                              ▼
+                         Final Answer
+```
+
+---
+
+### 🚀 Complete Quick Start Examples
+
+#### Example 1: Basic RAG with a Custom Query Function
+
+```python
+from lollms_client import LollmsClient, LollmsDiscussion, LollmsDataManager
+from lollms_client.lollms_personality import LollmsPersonality
+
+# 1. Initialize Client and Database Manager
+client = LollmsClient(llm_binding_name="ollama", llm_binding_config={"model_name": "llama3"})
+db_manager = LollmsDataManager("sqlite:///discussion.db")
+
+# 2. Define your RAG retrieval engine
+def my_search_engine(query: str) -> list:
+    # Your search / vector database logic here
+    return [
+        {
+            "title": "architecture_overview.md",
+            "content": "The backend microservice uses FastAPI with async SQLAlchemy sessions.",
+            "score": 0.94
+        },
+        {
+            "title": "deployment_guide.md",
+            "content": "Deployments are managed via Kubernetes pods with horizontal auto-scaling.",
+            "score": 0.88
+        }
+    ]
+
+# 3. Create a Personality with the RAG data source
+personality = LollmsPersonality(
+    name="SystemArchitect",
+    system_prompt="You are a senior system architect assistant.",
+    data_source=my_search_engine
+)
+
+# 4. Create Discussion and Chat
+discussion = LollmsDiscussion.create_new(lollms_client=client, db_manager=db_manager)
+
+response = discussion.chat(
+    user_message="What framework does our backend microservice use?",
+    personality=personality,
+    prehydrate_rag=True  # Automatically queries my_search_engine and injects results
+)
+
+print("AI Response:", response["ai_message"].content)
+```
+
+---
+
+#### Example 2: Multi-Source RAG with `RAGDataSource` & Advanced Callbacks
+
+Use `RAGDataSource` when you have multiple distinct knowledge bases (e.g., Codebase Docs, Legal/Compliance, Customer FAQs) or when using advanced retrieval engines with custom arguments (`ss`, `rag_top_k`, `mode`, etc.).
+
+```python
+from pathlib import Path
+from lollms_client import LollmsClient, LollmsDiscussion, LollmsDataManager
+from lollms_client.lollms_personality import LollmsPersonality, RAGDataSource
+
+client = LollmsClient(llm_binding_name="ollama", llm_binding_config={"model_name": "qwen2.5-coder:7b"})
+db_manager = LollmsDataManager("sqlite:///multi_rag_discussion.db")
+
+# Advanced RAG callback supporting store instances and custom retrieval kwargs
+def advanced_rag_query_engine(query: str, ss, rag_top_k=None, rag_min_similarity_percent=None, mode="hybrid") -> list:
+    if not ss:
+        return []
+    # Queries the underlying store (e.g., SafeStore, GraphStore, Chroma, etc.)
+    results = ss.query(query, top_k=rag_top_k or 5, min_similarity_percent=rag_min_similarity_percent or 50.0)
+    return [
+        {
+            "title": Path(entry.get("file_path", "doc")).name,
+            "content": entry.get("chunk_text", ""),
+            "score": float(entry.get("score", 1.0))
+        }
+        for entry in results
+    ]
+
+# Define individual named knowledge bases
+knowledge_bases = [
+    RAGDataSource(
+        name="api_specs",
+        description="REST and GraphQL endpoint definitions, request/response schemas, and auth headers",
+        query_fn=advanced_rag_query_engine,
+        store=api_vector_store_instance,
+        auto_query=True  # Pre-hydrated automatically on turn start
+    ),
+    RAGDataSource(
+        name="database_schemas",
+        description="PostgreSQL table definitions, foreign key relationships, and migration history",
+        query_fn=advanced_rag_query_engine,
+        store=db_vector_store_instance,
+        auto_query=False  # Queried on-demand by the LLM via tool_query_rag
+    )
+]
+
+personality = LollmsPersonality(
+    name="LeadEngineer",
+    system_prompt="You are a lead software engineer with access to API and database documentation.",
+    data_sources=knowledge_bases
+)
+
+discussion = LollmsDiscussion.create_new(lollms_client=client, db_manager=db_manager)
+
+# The LLM receives the 'api_specs' pre-hydrated and can invoke `tool_query_rag` to inspect 'database_schemas'
+response = discussion.chat(
+    user_message="How do we authenticate requests to the /orders endpoint, and what table does it insert into?",
+    personality=personality,
+    prehydrate_rag=True,
+    max_reasoning_steps=5
+)
+
+print("AI Response:", response["ai_message"].content)
+```
+
+---
+
+#### Example 3: On-Demand Agentic Querying via `tool_query_rag`
+
+When `personality.has_data` is `True`, `LollmsDiscussion` automatically mounts the `tool_query_rag` tool. The LLM can call this tool multiple times across reasoning rounds:
+
+```xml
+<!-- LLM output during reasoning turn -->
+I need to check the database schema for the orders table.
+<tool>{"name": "tool_query_rag", "parameters": {"query": "orders table columns and foreign keys", "datasource_name": "database_schemas"}}</tool>
+```
+
+---
+
+### 📊 RAG Parameters & Configuration Options
+
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `prehydrate_rag` | `bool` | `True` | If `True`, automatically queries data sources with `auto_query=True` using the `user_message` and injects chunks under `=== RETRIEVED RAG CONTEXT ===`. |
+| `data_source` | `Callable` \| `str` \| `RAGDataSource` | `None` | Legacy / single data source passed during `LollmsPersonality` initialization. |
+| `data_sources` | `List[RAGDataSource]` \| `Dict[str, dict]` | `None` | Multi-source registry of knowledge bases with names and descriptions. |
+| `auto_query` | `bool` | `True` | Flag on `RAGDataSource`. Set `False` for large or specialized indices that should only be queried when the LLM explicitly calls `tool_query_rag`. |
+
+---
+
 ## 🧠 12. Persistent Memory & Graph Traversal API
 
 The `MemoryMixin` integrates the `LollmsMemoryManager` directly into the discussion session, exposing high-level APIs for persistent memory management and cognitive graph traversal. This enables the host application to build advanced UI dashboards for memory inspection and relationship mapping.
@@ -165,6 +334,8 @@ This protocol works in tandem with the **Anti-Mimicry Defense**. Because older m
     * **Dynamic Tool Mounting**: If data files exist in workspace AND `enable_data_tools=True`, `semantic_data_engineer` is auto-mounted.
 2.  **Context Assembly**:
     * System Prompt + Rules (including `<done/>` protocol instructions).
+    * **Multi-Source RAG Knowledge Bases**: Injects overview of available RAG data sources (`=== RAG KNOWLEDGE BASES ===`) and pre-hydrates all retrieved chunks under `=== RETRIEVED RAG CONTEXT ===` (guarded by a generous 50,000-character safety wall to prevent context bloat without arbitrary 3-chunk slicing).
+    * **On-Demand RAG Tool Mounting**: Auto-mounts `tool_query_rag(query, datasource_name)` when `personality.has_data` is True.
     * **Progressive Skill Enhancement**: If the `personality` has a `skills_manager`, its context (visible/loadable/searchable tiers) is injected into the system prompt.
     * **Active Artefacts**: Injects `.lam` content (Logical Twins) for all active files.
     * Memory Handles.
@@ -708,12 +879,15 @@ The `import_file` method supports sophisticated ingestion strategies:
 
 | Mode | Behavior | Use Case |
 | :--- | :--- | :--- |
+| **`as_is`** | **Native File Preservation**. Stores raw physical bytes directly into the workspace without converting to Markdown. Does not bloat prompt context. | Native `.docx`, `.pdf`, `.xlsx`, `.pptx`, binary files interacted with via document LCP tools. |
 | **`text`** | Extracts raw text only. | Code, Logs, Markdown. |
 | **`text_images`** | Extracts text + renders pages/images. Anchors images in text via `<artefact_image id="..." />`. | PDFs, DOCX with diagrams. |
+| **`text_embedded_images`** | Extracts text + extracts embedded images as separate companion image artifacts. | Rich Word/PDF reports with inline graphics. |
 | **`images_only`** | Rasterizes everything to images. No text extraction. | Scanned books, complex layouts. |
 | **`ocr`** | Renders pages → Sends to Vision LLM → Transcribes text. | Handwritten notes, non-selectable PDFs. |
 | **`data`** | **Dual-Stream**. Parses schema (.lam) + saves raw binary (.csv/.db). | Datasets, Spreadsheets. |
 | **`data_bundle`** | **Schema Fusion**. Scans a folder, groups files by column signature, fuses them into a single SQLite DB. | Merging 100s of daily CSV reports into one DB. |
+| **`audio_stt`** | Transcribes speech audio (`.mp3`, `.wav`, `.m4a`) using the active Speech-to-Text binding. | Voice memos, call recordings, podcasts. |
 
 ### Data Bundle Fusion Logic
 When importing a folder as `data_bundle`:
@@ -1213,6 +1387,46 @@ response = discussion.chat(
 # The LLM will output:
 # <tool>{"name": "tool_execute_python_code", "parameters": {"code": "import math; print(math.factorial(10))"}}</tool>
 # The system will execute it, capture stdout, and feed it back to the LLM to formulate the final answer.
+```
+
+---
+
+## 🚀 Quick Start: Using RAG in a Discussion
+
+To equip an agent with external domain documents, attach a RAG query function or `RAGDataSource` list to the `LollmsPersonality`:
+
+```python
+from lollms_client import LollmsClient, LollmsDiscussion, LollmsDataManager
+from lollms_client.lollms_personality import LollmsPersonality, RAGDataSource
+
+# 1. Initialize client & storage
+client = LollmsClient(llm_binding_name="ollama", llm_binding_config={"model_name": "llama3"})
+db_manager = LollmsDataManager("sqlite:///discussion.db")
+discussion = LollmsDiscussion.create_new(lollms_client=client, db_manager=db_manager)
+
+# 2. Define RAG retrieval callback
+def my_docs_search(query: str) -> list:
+    return [
+        {"title": "security_policy.md", "content": "Passwords must be at least 16 characters long and rotated quarterly.", "score": 0.95}
+    ]
+
+# 3. Create personality with RAG
+personality = LollmsPersonality(
+    name="SecurityAuditor",
+    system_prompt="You are a security compliance auditor.",
+    data_sources=[
+        RAGDataSource(name="security_policies", description="Corporate security and password policies", query_fn=my_docs_search, auto_query=True)
+    ]
+)
+
+# 4. Chat with pre-hydration and on-demand tool search
+response = discussion.chat(
+    user_message="What is our password length requirement?",
+    personality=personality,
+    prehydrate_rag=True
+)
+
+print(response["ai_message"].content)
 ```
 
 ---

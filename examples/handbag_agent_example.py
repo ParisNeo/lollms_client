@@ -41,7 +41,7 @@ except ImportError:
     pass
 
 from lollms_client import LollmsClient
-from lollms_client.lollms_agent import Agent, AgentRole, CapabilityFlags, Handbag
+from lollms_client.lollms_personality import LollmsPersonality, AgentRole, CapabilityFlags, Handbag
 from lollms_client.lollms_types import MSG_TYPE
 from ascii_colors import ASCIIColors
 
@@ -262,11 +262,9 @@ def main():
         ai_name="assistant",
     )
 
-    # ── 4. Instantiate Agent using ONLY the Handbag ────────────────────
-    # Notice we do not pass personality, tool_files, skills_dirs, or memory_manager.
-    # The Handbag provides all of these automatically!
-    print("\n🤖 Instantiating Agent from Handbag...")
-    
+    # ── 4. Instantiate Personality using ONLY the Handbag ──────────────
+    print("\n🤖 Instantiating Personality from Handbag...")
+
     caps = CapabilityFlags(
         enable_code_execution=False,
         enable_sub_agents=False,
@@ -275,19 +273,14 @@ def main():
         skills_mode="mixed",        # Match the manifest setting
     )
 
-    agent = Agent(
-        lc=client,
-        handbag_path=str(HANDBAG_DIR),
-        name="HandbagResearchBot",
-        role=AgentRole.DOMAIN_EXPERT,
-        capabilities=caps,
-        max_tokens_per_turn=2048,
-    )
-    
+    agent = LollmsPersonality.from_handbag(str(HANDBAG_DIR), lollms_client=client)
+    agent.role = AgentRole.DOMAIN_EXPERT
+    agent.capabilities = caps
+    agent.max_tokens_per_turn = 2048
+
     print(f"✅ Agent initialized: {agent.display_name}")
-    print(f"   • Personality: {agent.personality.name}")
-    print(f"   • Has RAG: {agent.personality.has_data}")
-    print(f"   • Tool Files: {agent.tool_files}")
+    print(f"   • Personality: {agent.name}")
+    print(f"   • Has RAG: {agent.has_data}")
     print(f"   • Memory DB: {agent.memory_manager is not None}")
 
     # ── 5. Define a multi-step prompt ──────────────────────────────────

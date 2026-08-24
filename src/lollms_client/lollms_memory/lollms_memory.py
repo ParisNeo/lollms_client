@@ -794,6 +794,23 @@ class LollmsMemoryManager:
             recs = (self._q(s).filter(_MemoryRecord.level == 1).order_by(_MemoryRecord.importance.desc()).all())
             return [self._to_dict(r) for r in recs]
 
+    def search(
+        self,
+        text: Optional[str] = None,
+        query: Optional[str] = None,
+        search_query: Optional[str] = None,
+        top_k: int = 5,
+        level: Optional[int] = None,
+        **kwargs
+    ) -> List[Dict]:
+        """
+        Search memories using keyword / TF-IDF relevance scoring.
+        Provides a unified interface alias compatible with `search("term")`,
+        `search(query="term")`, or `search(text="term")`.
+        """
+        search_term = text if text is not None else (query if query is not None else (search_query or kwargs.get("q", "")))
+        return self.query(text=search_term or "", top_k=top_k, level=level)
+
     def query(self, text: str, top_k: int = 5, level: Optional[int] = None) -> List[Dict]:
         """Fast on-the-fly TF-IDF keyword query matching over database memories."""
         import math

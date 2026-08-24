@@ -17,26 +17,19 @@ An `Agent` is a stateful entity assigned a specific `AgentRole` (e.g. `DOMAIN_EX
 - **Stateful Memory**: Agents track their own thought blocks and conversation histories within their assigned discussion branches.
 
 ## 2. Setting Up an Agent
-Instantiate an agent using a loaded `LollmsClient` and custom metadata.
+Instantiate an agent using `LollmsPersonality` and custom metadata.
 
 ```python
 from lollms_client import LollmsClient
-from lollms_client.lollms_agent import Agent, AgentRole
-from lollms_client.lollms_personality import LollmsPersonality
+from lollms_client.lollms_personality import LollmsPersonality, AgentRole
 
 client = LollmsClient(llm_binding_name="ollama", llm_binding_config={"model_name": "gemma4:e2b"})
 
-# Define expert personality
-python_expert = LollmsPersonality(
+# Define expert agent personality
+agent = LollmsPersonality(
     name="PythonExpert",
-    system_prompt="You are a Senior Python Architect. Focus on clean code, SOLID principles, and type-safety."
-)
-
-# Instantiate the Agent
-agent = Agent(
-    lc=client,
-    personality=python_expert,
-    name="PythonExpert",
+    system_prompt="You are a Senior Python Architect. Focus on clean code, SOLID principles, and type-safety.",
+    lollms_client=client,
     role=AgentRole.DOMAIN_EXPERT,
     model_params={"temperature": 0.2}
 )

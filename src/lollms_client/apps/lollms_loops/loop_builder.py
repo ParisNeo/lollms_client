@@ -6,8 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from lollms_client import LollmsClient
-from lollms_client.lollms_agent import Agent, AgentRole, CapabilityFlags
-from lollms_client.lollms_personality import LollmsPersonality
+from lollms_client.lollms_personality import LollmsPersonality, CapabilityFlags
 from lollms_client.lollms_types import MSG_TYPE
 
 
@@ -92,19 +91,13 @@ class LollmsLoop:
         self._cancel_flag = False
         self._start_time = 0.0
 
-        personality = LollmsPersonality(
+        self.agent = LollmsPersonality(
             name=agent_name,
             author="LollmsLoops",
             category="autonomous",
             description=f"Autonomous agent for goal: {task_profile.goal[:100]}",
             system_prompt=task_profile.to_system_prompt(),
-        )
-
-        self.agent = Agent(
-            lc=self.client,
-            personality=personality,
-            name=agent_name,
-            role=AgentRole.IMPLEMENTER,
+            lollms_client=self.client,
             workspace_path=task_profile.workspace_path or "./lollms_loops_workspace",
             capabilities=task_profile.to_capabilities(),
             max_tokens_per_turn=8192,
