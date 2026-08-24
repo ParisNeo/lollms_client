@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-08-24 23:34]
+
+- refactor(client): update personality management and document tools bindings
+
 ## [2026-08-24 22:17]
 
 - refactor(personality): update skill and skills manager implementations

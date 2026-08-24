@@ -1,0 +1,15 @@
+binding_name: as_is_document_tools
+title: As-Is Document Inspection & Reading Tools
+author: ParisNeo & Lollms
+version: 1.0.0
+description: Inspect, read, and selectively search native document formats (.pdf, .docx, .xlsx, .pptx, .txt) in the workspace without prompt context bloat.
+commands:
+  - name: tool_inspect_document
+    title: Inspect Document
+    description: Returns structural metadata and page/sheet counts of a workspace document.
+  - name: tool_read_document_content
+    title: Read Document Content
+    description: Extracts readable text from a document or specific page/sheet up to a specified character limit.
+  - name: tool_grep_document
+    title: Grep Document
+    description: Searches for keywords or regex patterns within a document without loading the entire document into prompt context.

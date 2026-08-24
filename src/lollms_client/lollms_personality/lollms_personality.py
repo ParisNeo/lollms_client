@@ -1802,6 +1802,24 @@ class LollmsPersonality:
         skills_mode = meta.get("skills_mode") or hb.manifest.get("skills_mode", "mixed")
         sm = SkillsManager(skills_dirs=hb.skills_dirs, mode=skills_mode) if hb.skills_dirs else None
 
+        # Initialize RAG data sources from handbag rag/ folder
+        rag_data_sources: List[RAGDataSource] = []
+        if hb.rag_files:
+            for rf in hb.rag_files:
+                try:
+                    content = rf.read_text(encoding="utf-8", errors="ignore")
+                    doc_title = rf.stem.replace("_", " ").title()
+                    rag_data_sources.append(
+                        RAGDataSource(
+                            name=rf.name,
+                            description=f"Knowledge document: {doc_title}",
+                            query_fn=lambda q, doc_text=content: doc_text,
+                            auto_query=True
+                        )
+                    )
+                except Exception as ex:
+                    ASCIIColors.warning(f"[Handbag] Failed to load RAG document {rf.name}: {ex}")
+
         # Initialize Memory (Independent Life)
         mm = hb.create_memory_manager()
 
@@ -1825,6 +1843,8 @@ class LollmsPersonality:
             skills_manager=sm,
             memory_manager=mm,
             handbag_path=hb.path,
+            data_sources=rag_data_sources if rag_data_sources else None,
+            workspace_path=hb.workspace_dir if hb.workspace_dir.exists() else None,
             lollms_client=lollms_client,
         )
 
@@ -3205,9 +3225,25 @@ JSON:"""
                 "callable": tool_list_models
             }
 
+        # Merge Handbag / Personality-level Tools (LCPBinding / tool_specs)
+        if self._tool_binding and _is_tool_binding(self._tool_binding):
+            try:
+                handbag_tools = self._tool_binding.to_chat_tool_specs(
+                    discussion_instance=getattr(self, '_artefact_proxy', None),
+                    lollms_client_instance=self.lollms_client
+                )
+                active_tools.update(handbag_tools)
+            except Exception as e:
+                ASCIIColors.warning(f"[{self.name}] Failed to extract handbag tools: {e}")
+
+        # Mount RAG Query Tool if personality has RAG data sources
+        if self.has_data:
+            active_tools.update(self.build_rag_tools())
+
         lcp_binding = getattr(self.lollms_client, 'tools', None)
         if not _is_tool_binding(lcp_binding) or hasattr(lcp_binding, "_mock_return_value"):
             lcp_binding = None
+
 
         if lcp_binding is None and (tool_files or self._resolved_workspace):
             try:
@@ -4118,6 +4154,26 @@ JSON:"""
 
         stable_system_prompt = self._build_system_prompt(active_tools)
         stable_system_prompt += self._build_user_profile_context()
+
+        # Pre-hydrate RAG knowledge base context into prompt
+        if self.has_data:
+            rag_sys_block = self.build_rag_system_block()
+            if rag_sys_block:
+                stable_system_prompt += "\n" + rag_sys_block
+
+            try:
+                rag_res = self.query_data(cleaned_prompt)
+                if rag_res and rag_res.get("success") and rag_res.get("sources"):
+                    sources_text = []
+                    for src in rag_res.get("sources", []):
+                        title = src.get("title") or src.get("source") or "Document"
+                        ds_label = f" [{src.get('datasource_name')}]" if src.get('datasource_name') else ""
+                        sources_text.append(f"--- Document [{title}]{ds_label} ---\n{src.get('content')}")
+                    if sources_text:
+                        stable_system_prompt += "\n=== RETRIEVED RAG CONTEXT ===\n" + "\n\n".join(sources_text) + "\n=== END RAG CONTEXT ===\n"
+            except Exception as rag_err:
+                ASCIIColors.warning(f"[{self.name}] RAG pre-hydration warning: {rag_err}")
+
 
         dynamic_suffix_parts = []
 

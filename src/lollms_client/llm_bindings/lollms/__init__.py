@@ -772,22 +772,7 @@ class LollmsBinding(LollmsLLMBinding):
 
         return 4096
 
-    def get_ctx_size(self, model_name: Optional[str] = None) -> Optional[int]:
-        target_model = model_name or self.model_name
-        if not hasattr(self, "_ctx_size_cache"):
-            self._ctx_size_cache = {}
-
-        if target_model in self._ctx_size_cache:
-            return self._ctx_size_cache[target_model]
-
-        ctx_size = self._get_ctx_size(target_model)
-        if ctx_size and ctx_size > 0:
-            self._ctx_size_cache[target_model] = ctx_size
-            return ctx_size
-
-        return 4096
-
-        
+       
     def embed(self, text: str, **kwargs) -> list:
         """
         Get embeddings for the input text using OpenAI API.

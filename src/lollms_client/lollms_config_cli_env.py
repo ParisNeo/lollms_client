@@ -24,6 +24,24 @@ except ImportError:
 # 1. Configuration Loading Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def resolve_env_file(cli_env_path: Optional[Union[str, Path]] = None) -> Tuple[Optional[Path], bool]:
+    """Resolves the active .env configuration file path."""
+    if cli_env_path:
+        p = Path(cli_env_path)
+        if p.exists():
+            return p, False
+
+    home_dir = Path.home() / ".lollms_client"
+    home_env = home_dir / ".env"
+    home_yaml = home_dir / "config.yaml"
+
+    if home_env.exists():
+        return home_env, False
+    if home_yaml.exists():
+        return home_yaml, False
+
+    return None, True
+
 def load_env_file(env_path: Path) -> Dict[str, str]:
     data = {}
     try:
@@ -45,7 +63,6 @@ def _serialize_config_map_to_yaml(config_map: Dict[str, str]) -> Dict[str, Any]:
         current = yaml_data
         for i, part in enumerate(parts):
             if i == len(parts) - 1:
-                # Leaf node
                 if v.lower() in ("true", "false"):
                     current[part] = v.lower() == "true"
                 else:
@@ -128,10 +145,11 @@ def _convert_to_bool(val: Any) -> bool:
     return False
 
 def _extract_bindings_from_env(prefix: str, env_data: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
+    clean_prefix = prefix.rstrip("_").upper()
     bindings = {}
-    binding_prefix = f"{prefix}_BINDINGS_"
+    binding_prefix = f"{clean_prefix}_BINDINGS_"
     for k, v in env_data.items():
-        if k.startswith(binding_prefix):
+        if k.upper().startswith(binding_prefix):
             remainder = k[len(binding_prefix):]
             parts = remainder.split("_", 1)
             if len(parts) == 2:
@@ -146,10 +164,11 @@ def _extract_bindings_from_env(prefix: str, env_data: Dict[str, str]) -> Dict[st
     return bindings
 
 def _extract_profiles_from_env(prefix: str, bindings: Dict[str, Dict[str, Any]], env_data: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
+    clean_prefix = prefix.rstrip("_").upper()
     profiles = {}
-    profile_prefix = f"{prefix}_PROFILES_"
+    profile_prefix = f"{clean_prefix}_PROFILES_"
     for k, v in env_data.items():
-        if k.startswith(profile_prefix):
+        if k.upper().startswith(profile_prefix):
             remainder = k[len(profile_prefix):]
             parts = remainder.split("_", 1)
             if len(parts) == 2:
@@ -195,9 +214,35 @@ def _extract_profiles_from_env(prefix: str, bindings: Dict[str, Dict[str, Any]],
         }
     return resolved_profiles
 
+def _get_configured_aliases(binding_type: str, config_map: Dict[str, str], category: str = "BINDINGS") -> List[str]:
+    prefix = f"{binding_type.rstrip('_').upper()}_{category}_"
+    aliases = set()
+    for k in config_map:
+        if k.startswith(prefix):
+            parts = k[len(prefix):].split("_", 1)
+            if len(parts) == 2:
+                aliases.add(parts[0])
+    return sorted(aliases)
+
+def _get_binding_keys(binding_type: str, alias: str, config_map: Dict[str, str]) -> Dict[str, str]:
+    prefix = f"{binding_type.rstrip('_').upper()}_BINDINGS_{alias.upper()}_"
+    return {k[len(prefix):]: v for k, v in config_map.items() if k.startswith(prefix)}
+
+def _get_profile_keys(binding_type: str, alias: str, config_map: Dict[str, str]) -> Dict[str, str]:
+    prefix = f"{binding_type.rstrip('_').upper()}_PROFILES_{alias.upper()}_"
+    return {k[len(prefix):]: v for k, v in config_map.items() if k.startswith(prefix)}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Unified Client Resolver
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _is_modality_configured(b_type: str, env_data: Dict[str, str]) -> bool:
+    prefix = b_type.upper()
+    if env_data.get(f"{prefix}_BINDING_NAME"):
+        return True
+    if any(k.startswith(f"{prefix}_BINDINGS_") and k.endswith("_BINDING_NAME") and v for k, v in env_data.items()):
+        return True
+    return False
 
 def get_client_from_env(
     cli_env_path: Optional[str] = None,
@@ -214,14 +259,28 @@ def get_client_from_env(
 ) -> "LollmsClient":
     from lollms_client import LollmsClient
 
-    # 1. Start with OS Environment baseline
     resolved_env = dict(os.environ)
 
-    # 2. Merge explicit dict
+    home_dir = Path.home() / ".lollms_client"
+    home_env = home_dir / ".env"
+    if home_env.exists():
+        resolved_env.update(load_env_file(home_env))
+
+    home_yaml = home_dir / "config.yaml"
+    if home_yaml.exists():
+        try:
+            yaml_data = load_yaml_file(home_yaml)
+            resolved_env.update(_flatten_dict_to_env(yaml_data))
+        except Exception as e:
+            ASCIIColors.warning(f"Failed to parse {home_yaml}: {e}")
+
+    for local_env in [Path.cwd() / ".env", Path.cwd() / "examples" / ".env"]:
+        if local_env.exists():
+            resolved_env.update(load_env_file(local_env))
+
     if conf_dict:
         resolved_env.update(_flatten_dict_to_env(conf_dict))
 
-    # 3. Merge conf_file
     if conf_file:
         p = Path(conf_file)
         if not p.exists():
@@ -240,48 +299,15 @@ def get_client_from_env(
 
         resolved_env.update(_flatten_dict_to_env(data))
 
-    # 4. Merge CLI env path (highest file precedence)
     if cli_env_path:
         p = Path(cli_env_path)
         if p.exists():
             resolved_env.update(load_env_file(p))
 
-    # 4.5 Merge Home YAML config (Highest structural precedence)
-    home_yaml = Path.home() / ".lollms_client" / "config.yaml"
-    if home_yaml.exists():
-        try:
-            yaml_data = load_yaml_file(home_yaml)
-            resolved_env.update(_flatten_dict_to_env(yaml_data))
-        except Exception as e:
-            ASCIIColors.warning(f"Failed to parse {home_yaml}: {e}")
-
-    # 5. Auto-resolve or run wizard if incomplete
-    #    If the baseline environment is missing the master binding key, attempt to
-    #    hydrate it directly from the standard ~/.lollms_client/config.yaml file before
-    #    forcing the wizard. This prevents the CLI from hallucinating a missing
-    #    configuration just because the process environment wasn't pre-loaded.
-    required_keys = []
-    if create_llm: required_keys.append("LLM_BINDINGS_MASTER_BINDING_NAME")
-
-    missing = [k for k in required_keys if k not in resolved_env]
-    if missing:
-        home_yaml_fallback = Path.home() / ".lollms_client" / "config.yaml"
-        if home_yaml_fallback.exists():
-            try:
-                yaml_data = load_yaml_file(home_yaml_fallback)
-                resolved_env.update(_flatten_dict_to_env(yaml_data))
-            except Exception as e:
-                ASCIIColors.warning(f"Failed to parse fallback config.yaml: {e}")
-
-        missing = [k for k in required_keys if k not in resolved_env]
-
-    if missing:
+    if create_llm and not _is_modality_configured("llm", resolved_env):
         if run_wizard_if_fail:
-            ASCIIColors.yellow("⚠️ Configuration incomplete. Starting wizard...")
+            ASCIIColors.yellow("⚠️ LLM Configuration incomplete. Starting wizard...")
             run_wizard_and_save()
-            home_dir = Path.home() / ".lollms_client"
-            home_env = home_dir / ".env"
-            home_yaml = home_dir / "config.yaml"
 
             if home_yaml.exists():
                 try:
@@ -292,13 +318,12 @@ def get_client_from_env(
 
             if home_env.exists():
                 resolved_env.update(load_env_file(home_env))
-                
-            if not resolved_env:
-                raise ValueError("Wizard completed but configuration is still missing.")
-        else:
-            raise ValueError(f"Configuration incomplete. Missing keys: {missing}")
 
-    # 6. Build kwargs
+            if not _is_modality_configured("llm", resolved_env):
+                raise ValueError("Wizard completed but LLM configuration is still missing.")
+        else:
+            raise ValueError("LLM configuration is missing.")
+
     kwargs = {}
     binding_types = {
         "llm": create_llm, "tti": create_tti, "tts": create_tts,
@@ -306,26 +331,65 @@ def get_client_from_env(
     }
 
     for b_type, should_create in binding_types.items():
-        if not should_create: continue
-        prefix = b_type.upper() + "_"
+        if not should_create:
+            continue
+        prefix = b_type.upper()
 
         bindings = _extract_bindings_from_env(prefix, resolved_env)
         profiles = _extract_profiles_from_env(prefix, bindings, resolved_env)
 
-        if bindings: kwargs[f"{b_type}_binding_profiles"] = bindings
-        if profiles: kwargs[f"{b_type}_model_profiles"] = profiles
+        if bindings:
+            kwargs[f"{b_type}_binding_profiles"] = bindings
+        if profiles:
+            kwargs[f"{b_type}_model_profiles"] = profiles
 
-        binding_name = resolved_env.get(prefix + "BINDINGS_MASTER_BINDING_NAME") or resolved_env.get(prefix + "BINDING_NAME")
+        binding_name = None
+        if "master" in bindings and bindings["master"].get("binding_name"):
+            binding_name = bindings["master"]["binding_name"]
+        elif bindings:
+            first_alias = next(iter(bindings))
+            binding_name = bindings[first_alias].get("binding_name")
+        else:
+            binding_name = resolved_env.get(f"{prefix}_BINDINGS_MASTER_BINDING_NAME") or resolved_env.get(f"{prefix}_BINDING_NAME")
+
         if binding_name:
+            model_name = None
+            default_profile = next((p for p in profiles.values() if p.get("is_default")), None)
+            if default_profile and default_profile.get("model_name"):
+                model_name = default_profile["model_name"]
+            elif "master" in profiles and profiles["master"].get("model_name"):
+                model_name = profiles["master"]["model_name"]
+            elif profiles:
+                first_p = next(iter(profiles.values()))
+                model_name = first_p.get("model_name")
+            else:
+                model_name = resolved_env.get("MODEL_NAME") or resolved_env.get(f"{prefix}_MODEL_NAME")
+
             binding_config = {}
-            # Extract legacy or master binding config
+            if "master" in bindings:
+                binding_config = dict(bindings["master"].get("binding_config", {}))
+            elif bindings:
+                first_alias = next(iter(bindings))
+                binding_config = dict(bindings[first_alias].get("binding_config", {}))
+
             for k, v in resolved_env.items():
-                if k.startswith(f"{prefix}_BINDINGS_MASTER_") and k != f"{prefix}_BINDINGS_MASTER_BINDING_NAME":
-                    key_lower = k[len(f"{prefix}_BINDINGS_MASTER_"):].lower()
-                    binding_config[key_lower] = _convert_to_bool(v) if key_lower == "verify_ssl_certificate" else v
-                elif k.startswith(prefix) and not k.startswith(f"{prefix}_BINDINGS_") and not k.startswith(f"{prefix}_PROFILES_"):
-                    key_lower = k[len(prefix):].lower()
-                    binding_config[key_lower] = _convert_to_bool(v) if key_lower == "verify_ssl_certificate" else v
+                if k.startswith(f"{prefix}_") and not k.startswith(f"{prefix}_BINDINGS_") and not k.startswith(f"{prefix}_PROFILES_"):
+                    key_lower = k[len(f"{prefix}_"):].lower()
+                    if key_lower not in binding_config:
+                        binding_config[key_lower] = _convert_to_bool(v) if key_lower == "verify_ssl_certificate" else v
+
+            if model_name and "model_name" not in binding_config:
+                binding_config["model_name"] = model_name
+
+            if "host_address" not in binding_config:
+                host = resolved_env.get("HOST_ADDRESS") or resolved_env.get(f"{prefix}_HOST_ADDRESS")
+                if host:
+                    binding_config["host_address"] = host
+
+            if "service_key" not in binding_config:
+                key = resolved_env.get("API_KEY") or resolved_env.get(f"{prefix}_API_KEY") or resolved_env.get("SERVICE_KEY") or resolved_env.get(f"{prefix}_SERVICE_KEY")
+                if key:
+                    binding_config["service_key"] = key
 
             kwargs[f"{b_type}_binding_name"] = binding_name
             kwargs[f"{b_type}_binding_config"] = binding_config
@@ -506,6 +570,95 @@ def _delete_entry(b_type: str, category: str, alias: str, config_map: Dict[str, 
             del config_map[k]
         ASCIIColors.green(f"\n  🗑️ Deleted {category.lower()[:-1]}: {alias}")
 
+def _extract_model_name(m: Any) -> Optional[str]:
+    """Robustly extracts model name string from raw items (string or dict)."""
+    if not m:
+        return None
+    if isinstance(m, str):
+        name = m.strip()
+        return name if name else None
+    if isinstance(m, dict):
+        for key in ("model_name", "name", "id", "model", "voice_name", "title"):
+            val = m.get(key)
+            if val and isinstance(val, str) and val.strip():
+                return val.strip()
+    return None
+
+def _fetch_available_models(b_type: str, b_name: str, config_map: Dict[str, str], b_alias: Optional[str] = None) -> List[str]:
+    """Fetches available model names for a given binding instance."""
+    try:
+        from lollms_client import LollmsClient
+
+        b_config = {}
+        desc = _get_binding_description(b_name, b_type) or {}
+        params_meta = {p.get("name", "").lower(): p for p in (desc.get("global_input_parameters", []) + desc.get("model_input_parameters", []))}
+
+        prefix = f"{b_type.upper()}_BINDINGS_{b_alias.upper()}_" if b_alias else None
+
+        for k, v in config_map.items():
+            if not v:
+                continue
+            key_clean = k
+            if prefix and key_clean.startswith(prefix):
+                key_clean = key_clean[len(prefix):]
+            elif key_clean.startswith(f"{b_type.upper()}_"):
+                key_clean = key_clean[len(f"{b_type.upper()}_"):]
+
+            key_lower = key_clean.lower()
+            if key_lower == "binding_name":
+                continue
+
+            p_meta = params_meta.get(key_lower, {})
+            p_type = p_meta.get("type", "str").lower()
+
+            if p_type == "bool":
+                b_config[key_lower] = _convert_to_bool(v)
+            elif p_type == "int":
+                try:
+                    b_config[key_lower] = int(v)
+                except ValueError:
+                    pass
+            elif p_type == "float":
+                try:
+                    b_config[key_lower] = float(v)
+                except ValueError:
+                    pass
+            elif v.lower() in ("null", "none"):
+                b_config[key_lower] = None
+            else:
+                b_config[key_lower] = v
+
+        kwargs = {f"{b_type}_binding_name": b_name, f"{b_type}_binding_config": b_config}
+        temp_client = LollmsClient(**kwargs)
+
+        raw_models = []
+        if b_type == "llm" and temp_client.llm:
+            raw_models = temp_client.llm.list_models()
+        elif b_type == "tti" and temp_client.tti:
+            raw_models = temp_client.tti.list_models()
+        elif b_type == "tts" and temp_client.tts:
+            if hasattr(temp_client.tts, "list_voices"):
+                raw_models = temp_client.tts.list_voices()
+            elif hasattr(temp_client.tts, "list_models"):
+                raw_models = temp_client.tts.list_models()
+        elif b_type == "stt" and temp_client.stt:
+            raw_models = temp_client.stt.list_models()
+        elif b_type == "ttm" and temp_client.ttm:
+            raw_models = temp_client.ttm.list_models()
+        elif b_type == "ttv" and temp_client.ttv:
+            raw_models = temp_client.ttv.list_models()
+
+        model_names = []
+        for m in raw_models:
+            name = _extract_model_name(m)
+            if name:
+                model_names.append(name)
+
+        return sorted(list(set(model_names)))
+    except Exception as e:
+        ASCIIColors.warning(f"Could not automatically fetch models for {b_name}: {e}")
+        return []
+
 def _configure_profile_instance(b_type: str, alias: str, config_map: Dict[str, str]):
     profile_prefix = f"{b_type.upper()}_PROFILES_{alias}_"
 
@@ -524,11 +677,16 @@ def _configure_profile_instance(b_type: str, alias: str, config_map: Dict[str, s
     if b_name:
         available_models = _fetch_available_models(b_type, b_name, config_map, selected_b_alias)
         if available_models:
-            model = _safe_select(f"Select {b_type.upper()} Model for '{alias}':", available_models)
-            if not model:
+            choices = list(available_models) + ["✍️ Enter model name manually"]
+            selected_model = _safe_select(f"Select {b_type.upper()} Model for '{alias}':", choices)
+            if not selected_model:
                 ASCIIColors.yellow(f"\n  ⚠️ Model selection cancelled for profile '{alias}'.")
                 return
-            config_map[profile_prefix + "MODEL_NAME"] = model
+            if selected_model == "✍️ Enter model name manually":
+                m_name = _safe_input("Enter model name manually", "")
+                if m_name: config_map[profile_prefix + "MODEL_NAME"] = m_name
+            else:
+                config_map[profile_prefix + "MODEL_NAME"] = selected_model
         else:
             m_name = _safe_input("Enter model name manually", "")
             if m_name: config_map[profile_prefix + "MODEL_NAME"] = m_name
@@ -553,52 +711,6 @@ def _configure_profile_instance(b_type: str, alias: str, config_map: Dict[str, s
         if r_comp: config_map[profile_prefix + "ROUTING_COMPLEXITY"] = r_comp
 
     ASCIIColors.green(f"\n  ✓ Saved profile: {alias}")
-
-def _fetch_available_models(b_type: str, b_name: str, config_map: Dict[str, str], b_alias: str) -> List[str]:
-    try:
-        from lollms_client import LollmsClient
-        from lollms_client.lollms_bindings_utils import get_binding_desc
-
-        b_config = {}
-        prefix = f"{b_type.upper()}_BINDINGS_{b_alias}_"
-
-        # Fetch binding description to enforce strict type safety
-        desc = get_binding_desc(b_name, b_type) or {}
-        params_meta = {p.get("name"): p for p in (desc.get("global_input_parameters", []) + desc.get("model_input_parameters", []))}
-
-        for k, v in config_map.items():
-            if k.startswith(prefix) and k != f"{prefix}BINDING_NAME":
-                key_lower = k[len(prefix):].lower()
-                p_meta = params_meta.get(key_lower, {})
-                p_type = p_meta.get("type", "str").lower()
-
-                # Enforce type safety based on metadata
-                if p_type == "bool":
-                    b_config[key_lower] = _convert_to_bool(v)
-                elif p_type == "int":
-                    try: b_config[key_lower] = int(v)
-                    except ValueError: pass
-                elif p_type == "float":
-                    try: b_config[key_lower] = float(v)
-                    except ValueError: pass
-                elif v.lower() in ("null", "none"):
-                    b_config[key_lower] = None
-                else:
-                    b_config[key_lower] = v
-
-        kwargs = {f"{b_type}_binding_name": b_name, f"{b_type}_binding_config": b_config}
-        temp_client = LollmsClient(**kwargs)
-
-        models = []
-        if b_type == "llm": models = temp_client.list_models()
-        elif b_type == "tti": models = temp_client.list_tti_models()
-        elif b_type == "tts": models = temp_client.list_tts_voices()
-        elif b_type == "stt": models = temp_client.list_stt_models()
-        elif b_type == "ttm": models = temp_client.list_ttm_models()
-        elif b_type == "ttv": models = temp_client.list_ttv_models()
-
-        return sorted(list(set([m if isinstance(m, str) else m.get("name", m.get("id", "")) for m in models])))
-    except: return []
 
 def _add_profile_flow(b_type: str, config_map: Dict[str, str]):
     alias = _safe_input("Enter alias for the profile", "master").strip().upper()
@@ -633,12 +745,10 @@ def _load_existing_env_to_map() -> Dict[str, str]:
     config_map = {}
     home_dir = Path.home() / ".lollms_client"
 
-    # 1. Load from .env (backward compatibility)
     home_env = home_dir / ".env"
     if home_env.exists():
         config_map.update(load_env_file(home_env))
 
-    # 2. Load from config.yaml (New standard)
     home_yaml = home_dir / "config.yaml"
     if home_yaml.exists():
         try:
@@ -649,20 +759,18 @@ def _load_existing_env_to_map() -> Dict[str, str]:
 
     return config_map
 
-def _save_and_validate(config_map: Dict[str, str]):
+def _save_and_validate(config_map: Dict[str, str], test_connection: bool = False) -> bool:
     target_dir = Path.home() / ".lollms_client"
     target_dir.mkdir(parents=True, exist_ok=True)
     target_env_file = target_dir / ".env"
     target_yaml_file = target_dir / "config.yaml"
 
     try:
-        # 1. Save Flat .env for backward compatibility & OS env injection
         with open(target_env_file, "w", encoding="utf-8") as f:
             f.write("# Lollms Client Configuration\n# Generated by wizard\n\n")
             for k, v in config_map.items():
                 if v: f.write(f"{k}={v}\n")
 
-        # 2. Save Hierarchical config.yaml for structured access
         if yaml:
             yaml_data = _serialize_config_map_to_yaml(config_map)
             with open(target_yaml_file, "w", encoding="utf-8") as f:
@@ -671,8 +779,18 @@ def _save_and_validate(config_map: Dict[str, str]):
         else:
             ASCIIColors.panel(f"Configuration saved to: [bold green]{target_env_file}[/bold green] (PyYAML not installed, skipped config.yaml)", title="[bold]✅ Success[/bold]", border_style="green")
 
+        if test_connection:
+            ASCIIColors.info("\nTesting connection with saved configuration...")
+            try:
+                client = get_client_from_env(run_wizard_if_fail=False)
+                ASCIIColors.green(f"✅ Connection verified successfully! Active model: {getattr(client.llm, 'model_name', 'default')}")
+            except Exception as conn_err:
+                ASCIIColors.warning(f"⚠️ Warning: Connection test failed: {conn_err}")
+
+        return True
     except Exception as e:
         ASCIIColors.red(f"\n  ❌ Failed to save configuration: {e}")
+        return False
 
 def run_wizard_and_save():
     ASCIIColors.panel(
@@ -682,11 +800,12 @@ def run_wizard_and_save():
     )
 
     config_map = _load_existing_env_to_map()
-    if config_map: ASCIIColors.green("✅ Loaded existing configuration from .env file.")
+    if config_map:
+        ASCIIColors.green("✅ Loaded existing configuration from environment/files.")
 
     while True:
-        menu = Menu("Lollms Client Main Menu", mode=Menu.MODE_EXECUTE, exit_text="💾 Save & Exit")
-        menu.set_intro("Select a modality to configure or save and exit.")
+        menu = Menu("Lollms Client Main Menu", mode=Menu.MODE_EXECUTE, exit_text="🚪 Exit without Saving")
+        menu.set_intro("Select a modality to configure, save your changes, or exit.")
 
         menu.add_action("🧠 Configure LLM", lambda: _modality_menu("llm", config_map))
         menu.add_action("🎨 Configure TTI", lambda: _modality_menu("tti", config_map))
@@ -694,9 +813,17 @@ def run_wizard_and_save():
         menu.add_action("👂 Configure STT", lambda: _modality_menu("stt", config_map))
         menu.add_action("🎵 Configure TTM", lambda: _modality_menu("ttm", config_map))
         menu.add_action("🎬 Configure TTV", lambda: _modality_menu("ttv", config_map))
-        menu.add_action("💾 Save & Validate", lambda: _save_and_validate(config_map))
 
-        if menu.run() is None: break
+        saved_and_exit = [False]
+        def _save_and_exit_action():
+            _save_and_validate(config_map)
+            saved_and_exit[0] = True
+
+        menu.add_action("💾 Save & Exit", _save_and_exit_action)
+        menu.add_action("🔍 Save & Validate Connection", lambda: _save_and_validate(config_map, test_connection=True))
+
+        if menu.run() is None or saved_and_exit[0]:
+            break
 
 if __name__ == "__main__":
     run_wizard_and_save()
