@@ -435,7 +435,7 @@ def _add_binding_flow(b_type: str, config_map: Dict[str, str]):
 
 def _bindings_menu(b_type: str, config_map: Dict[str, str]):
     while True:
-        menu = Menu(f"{b_type.upper()} Bindings", mode=Menu.MODE_EXECUTE)
+        menu = Menu(f"{b_type.upper()} Bindings", mode=Menu.MODE_EXECUTE, exit_text="↩ Back")
         menu.set_intro("Add a new binding, edit, or delete an existing one.")
         menu.add_action("Add new binding", lambda: _add_binding_flow(b_type, config_map))
 
@@ -456,7 +456,7 @@ def _edit_keys_menu(b_type: str, category: str, alias: str, config_map: Dict[str
         keys = {k[len(prefix):]: v for k, v in config_map.items() if k.startswith(prefix)}
         if not keys: return
 
-        menu = Menu(f"Edit {b_type.upper()} {category}: {alias}", mode=Menu.MODE_EXECUTE)
+        menu = Menu(f"Edit {b_type.upper()} {category}: {alias}", mode=Menu.MODE_EXECUTE, exit_text="↩ Back")
         menu.set_intro("Select a key to edit or go back.")
         for k, v in keys.items():
             menu.add_action(f"Edit {k}: {v[:40]}", lambda k=k: _edit_single_key(b_type, category, alias, k, config_map))
@@ -591,7 +591,7 @@ def _add_profile_flow(b_type: str, config_map: Dict[str, str]):
 
 def _profiles_menu(b_type: str, config_map: Dict[str, str]):
     while True:
-        menu = Menu(f"{b_type.upper()} Profiles", mode=Menu.MODE_EXECUTE)
+        menu = Menu(f"{b_type.upper()} Profiles", mode=Menu.MODE_EXECUTE, exit_text="↩ Back")
         menu.set_intro("Add a new profile, edit, or delete an existing one.")
         menu.add_action("Add new profile", lambda: _add_profile_flow(b_type, config_map))
 
@@ -608,7 +608,7 @@ def _profiles_menu(b_type: str, config_map: Dict[str, str]):
 
 def _modality_menu(b_type: str, config_map: Dict[str, str]):
     while True:
-        menu = Menu(f"{b_type.upper()} Configuration", mode=Menu.MODE_EXECUTE)
+        menu = Menu(f"{b_type.upper()} Configuration", mode=Menu.MODE_EXECUTE, exit_text="↩ Back")
         menu.set_intro(f"Configure {b_type.upper()} Bindings and Profiles.")
         menu.add_action(f"Configure {b_type.upper()} Bindings", lambda: _bindings_menu(b_type, config_map))
         menu.add_action(f"Configure {b_type.upper()} Profiles", lambda: _profiles_menu(b_type, config_map))
@@ -670,7 +670,7 @@ def run_wizard_and_save():
     if config_map: ASCIIColors.green("✅ Loaded existing configuration from .env file.")
 
     while True:
-        menu = Menu("Lollms Client Main Menu", mode=Menu.MODE_EXECUTE)
+        menu = Menu("Lollms Client Main Menu", mode=Menu.MODE_EXECUTE, exit_text="💾 Save & Exit")
         menu.set_intro("Select a modality to configure or save and exit.")
 
         menu.add_action("🧠 Configure LLM", lambda: _modality_menu("llm", config_map))

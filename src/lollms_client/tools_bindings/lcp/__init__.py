@@ -381,7 +381,25 @@ class LCPBinding(LollmsToolBinding):
                         if hasattr(tool_module, "init_tools_library") and callable(tool_module.init_tools_library):
                             library_name = python_file_path.stem
                             host_config = self.host_tool_configs.get(library_name, {})
-                            tool_module.init_tools_library(host_config)
+
+                            import inspect as _lcp_inspect
+                            _init_sig = _lcp_inspect.signature(tool_module.init_tools_library)
+                            _init_params = _init_sig.parameters
+
+                            _accepts_positional = any(
+                                p.kind in (_lcp_inspect.Parameter.POSITIONAL_ONLY, _lcp_inspect.Parameter.POSITIONAL_OR_KEYWORD)
+                                for p in _init_params.values()
+                            )
+                            _accepts_var_positional = any(
+                                p.kind == _lcp_inspect.Parameter.VAR_POSITIONAL
+                                for p in _init_params.values()
+                            )
+
+                            if _accepts_positional or _accepts_var_positional:
+                                tool_module.init_tools_library(host_config)
+                            else:
+                                tool_module.init_tools_library()
+
                             ASCIIColors.success(f"[LCP Lazy Init] ✅ Initialized library for '{library_name}' with host configs.")
                     except Exception as init_ex:
                         ASCIIColors.error(f"[LCP execute_tool] ❌ Toolset '{python_file_path.stem}' FAILED lazy init: {init_ex}")
@@ -410,8 +428,8 @@ class LCPBinding(LollmsToolBinding):
             result = execute_function(**clean_params)
 
             if isinstance(result, dict) and result.get("success") is False and result.get("error"):
-                tb_str = "".join(traceback.format_stack())
-                result["traceback"] = f"Explicit tool failure captured during execution:\n{tb_str}"
+                if "traceback" not in result:
+                    result["traceback"] = None
                 ASCIIColors.error(f"[LCP Error Tracking] Tool '{tool_name}' reported failure: {result['error']}")
 
             return {"output": result, "status_code": 200}
