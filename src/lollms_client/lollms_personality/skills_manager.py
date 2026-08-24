@@ -12,8 +12,16 @@ class SkillsManager:
     Tiers: "visible" (in sys prompt), "loadable" (listed, tool_load_skill), "searchable" (hidden, tool_search_skills).
     """
 
-    def __init__(self, skills_dirs: Optional[List[Union[str, Path]]] = None, mode: str = "mixed"):
+    def __init__(
+        self,
+        skills_dirs: Optional[List[Union[str, Path]]] = None,
+        mode: str = "mixed",
+        max_visible_skills: int = 10,
+        max_visible_tokens: int = 4000
+    ):
         self.mode = mode
+        self.max_visible_skills = max_visible_skills
+        self.max_visible_tokens = max_visible_tokens
         self._skills_dirs: List[Path] = []
         if skills_dirs:
             for d in skills_dirs:
@@ -23,10 +31,14 @@ class SkillsManager:
         self.skills: Dict[str, Skill] = {}
         self.reload()
 
-    def _resolve_visibility(self, parsed_visibility: str) -> str:
-        if parsed_visibility == "visible":
+    def _resolve_visibility(self, skill: Skill) -> str:
+        # If the skill is text-only (no metadata), always load it unless mode is explicitly searchable
+        if not skill.has_metadata:
+            return "visible" if self.mode != "searchable" else "searchable"
+
+        if skill.visibility == "visible":
             return "visible"
-        if parsed_visibility == "searchable":
+        if skill.visibility == "searchable":
             return "searchable"
         if self.mode == "visible":
             return "visible"
@@ -49,7 +61,7 @@ class SkillsManager:
             seen_paths.add(direct_skill.resolve())
             skill = parse_skill_md(direct_skill, default_visibility=self.mode)
             if skill:
-                skill.visibility = self._resolve_visibility(skill.visibility)
+                skill.visibility = self._resolve_visibility(skill)
                 self.skills[skill.title.lower()] = skill
             return
 
@@ -60,23 +72,38 @@ class SkillsManager:
                     seen_paths.add(skill_file.resolve())
                     skill = parse_skill_md(skill_file, default_visibility=self.mode)
                     if skill:
-                        skill.visibility = self._resolve_visibility(skill.visibility)
+                        skill.visibility = self._resolve_visibility(skill)
                         self.skills[skill.title.lower()] = skill
             elif item.is_file() and item.suffix.lower() == ".md" and item.name != "README.md":
                 if item.resolve() not in seen_paths:
                     seen_paths.add(item.resolve())
                     skill = parse_skill_md(item, default_visibility=self.mode)
                     if skill:
-                        skill.visibility = self._resolve_visibility(skill.visibility)
+                        skill.visibility = self._resolve_visibility(skill)
                         self.skills[skill.title.lower()] = skill
 
     def build_context(self) -> str:
         parts = []
-        
-        visible = [s for s in self.skills.values() if s.visibility == "visible"]
-        if visible:
+
+        raw_visible = [s for s in self.skills.values() if s.visibility == "visible"]
+        active_visible = []
+        overflow_loadable = []
+
+        # Enforce budget: prevent context window saturation if too many skills are visible
+        used_chars = 0
+        max_chars = self.max_visible_tokens * 4
+
+        for s in raw_visible:
+            s_len = len(s.content)
+            if len(active_visible) < self.max_visible_skills and (used_chars + s_len <= max_chars or not active_visible):
+                active_visible.append(s)
+                used_chars += s_len
+            else:
+                overflow_loadable.append(s)
+
+        if active_visible:
             lines = ["=== ACTIVE SKILLS (Always Visible) ==="]
-            for skill in visible:
+            for skill in active_visible:
                 lines.append(f"\n--- Skill: {skill.title} ---")
                 if skill.description:
                     lines.append(f"Description: {skill.description}")
@@ -85,13 +112,13 @@ class SkillsManager:
             lines.append("=== END ACTIVE SKILLS ===")
             parts.append("\n".join(lines))
 
-        loadable = [s for s in self.skills.values() if s.visibility == "loadable"]
+        loadable = [s for s in self.skills.values() if s.visibility == "loadable"] + overflow_loadable
         if loadable:
             lines = ["=== AVAILABLE SKILLS (Loadable on Demand) ==="]
             lines.append(f"There are {len(loadable)} loadable skills. Use the `tool_load_skill` tool to load the full content of any skill listed below.")
             lines.append("")
             for skill in loadable:
-                desc = skill.description or "No description"
+                desc = skill.description or (skill.content.splitlines()[0][:100] if skill.content else "No description")
                 cat = f" [{skill.category}]" if skill.category else ""
                 lines.append(f"- **{skill.title}**{cat}: {desc}")
             lines.append("=== END AVAILABLE SKILLS ===")
@@ -152,7 +179,8 @@ class SkillsManager:
         """
         tools: Dict[str, Dict[str, Any]] = {}
 
-        has_loadable = any(s.visibility == "loadable" for s in self.skills.values())
+        raw_visible_count = sum(1 for s in self.skills.values() if s.visibility == "visible")
+        has_loadable = any(s.visibility == "loadable" for s in self.skills.values()) or (raw_visible_count > self.max_visible_skills)
         has_searchable = self.has_searchable_skills()
         total_skills = len(self.skills)
 

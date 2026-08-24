@@ -16,6 +16,7 @@ class Skill:
     content: str
     file_path: Optional[Path] = None
     visibility: str = "loadable"
+    has_metadata: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -24,6 +25,7 @@ class Skill:
             "category": self.category,
             "tags": self.tags,
             "visibility": self.visibility,
+            "has_metadata": self.has_metadata,
             "file_path": str(self.file_path) if self.file_path else None,
         }
 
@@ -40,13 +42,15 @@ def parse_skill_md(file_path: Path, default_visibility: str = "loadable") -> Opt
     category = ""
     tags: List[str] = []
     body = raw_content
-    visibility = default_visibility
+    has_metadata = False
 
     if raw_content.startswith("---"):
         fm_match = re.match(r'^---\n(.*?)\n---\n(.*)', raw_content, re.DOTALL)
         if fm_match:
+            has_metadata = True
             fm_text = fm_match.group(1)
             body = fm_match.group(2)
+            visibility = default_visibility
             for line in fm_text.splitlines():
                 line = line.strip()
                 if line.startswith("title:"):
@@ -68,7 +72,13 @@ def parse_skill_md(file_path: Path, default_visibility: str = "loadable") -> Opt
                     val = line.split(":", 1)[1].strip().strip('"\'').lower()
                     if val in ("visible", "loadable", "searchable"):
                         visibility = val
+        else:
+            # Text-only default is always loaded into context
+            visibility = "visible"
     else:
+        # Text-only (no YAML metadata) defaults to always loaded (visible)
+        has_metadata = False
+        visibility = "visible"
         h1_match = re.match(r'^#\s+(.+)', raw_content)
         if h1_match:
             title = h1_match.group(1).strip()
@@ -85,4 +95,5 @@ def parse_skill_md(file_path: Path, default_visibility: str = "loadable") -> Opt
         content=body.strip(),
         file_path=file_path,
         visibility=visibility,
+        has_metadata=has_metadata,
     )
