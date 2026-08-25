@@ -3257,7 +3257,7 @@ JSON:"""
 
         if lcp_binding and hasattr(lcp_binding, 'mount_tool_library'):
             # Auto-mount essential discovery, execution, and as-is document tools
-            _ESSENTIAL_LIBRARIES = ["system_shell", "grep_files", "find_files", "as_is_document_tools"]
+            _ESSENTIAL_LIBRARIES = ["system_shell", "grep_files", "find_files", "as_is_document_tools", "document_editor"]
             for lib_name in _ESSENTIAL_LIBRARIES:
                 try:
                     lcp_binding.mount_tool_library(lib_name)
@@ -3276,8 +3276,9 @@ JSON:"""
                        t_name.startswith("tool_grep_document") or \
                        t_name.startswith("tool_modify_docx") or \
                        t_name.startswith("tool_modify_excel") or \
-                       t_name.startswith("tool_modify_pdf_annotation") or \
-                       t_name.startswith("tool_modify_pptx_slide"):
+                       t_name.startswith("tool_modify_pptx_slide") or \
+                       t_name.startswith("tool_edit_document_text") or \
+                       t_name.startswith("tool_annotate_document"):
                         active_tools[t_name] = t_spec
             except Exception as e:
                 ASCIIColors.warning(f"[LollmsPersonality] Failed to extract LCP tool specs: {e}")
@@ -4129,6 +4130,7 @@ JSON:"""
 
         self._reset_cancel_state()
         object.__setattr__(self, '_consecutive_empty_responses', 0)
+        object.__setattr__(self, '_consecutive_stall_count', 0)
 
         if self._sub_agent_spawner:
             self._sub_agent_spawner.reset_turn()
@@ -4437,16 +4439,40 @@ JSON:"""
                                     continue
 
                                 is_shell_tool = tool_name == "tool_execute_shell_command"
+                                file_name = ""
                                 if is_shell_tool:
                                     command_str = str(tool_params.get("command", "")).strip()
                                     context_aware_sig = f"{tool_name}::{command_str}"
                                 else:
-                                    param_sig = json.dumps(tool_params, sort_keys=True, default=str)
+                                    normalized_params = dict(tool_params)
+                                    param_sig = json.dumps(normalized_params, sort_keys=True, default=str)
                                     context_aware_sig = f"{tool_name}::{param_sig}"
+                                    file_name = tool_params.get("file_name", "")
+
+                                    stripped_params = dict(normalized_params)
+                                    if "page_or_sheet" in stripped_params:
+                                        stripped_params.pop("page_or_sheet", None)
+                                    if "max_chars" in stripped_params:
+                                        stripped_params.pop("max_chars", None)
+                                    stripped_sig = f"{tool_name}::{json.dumps(stripped_params, sort_keys=True, default=str)}"
+
+                                    if stripped_sig in successful_tool_signatures:
+                                        action_reports.append(f"Repetitive call to '{tool_name}' with identical file/base parameters blocked. Output already in context. If you need a different page or sheet, change the page_or_sheet parameter.")
+                                        continue
 
                                 if context_aware_sig in successful_tool_signatures:
                                     action_reports.append(f"Repetitive call to '{tool_name}' with identical parameters blocked. Output already in context.")
                                     continue
+
+                                if file_name and tool_name in ("tool_read_document_content", "tool_inspect_document", "tool_grep_document"):
+                                    file_tool_key = f"__file_consumed__::{tool_name}::{file_name}"
+                                    if file_tool_key in successful_tool_signatures:
+                                        action_reports.append(
+                                            f"🛑 BLOCKED: You have already read '{file_name}' via '{tool_name}'. The tool returned truncated output, meaning the PDF extraction may be limited. "
+                                            f"Retrying with different page ranges will NOT help — the extraction returns the same pages. "
+                                            f"Do NOT call this tool again for this file. Instead, proceed with what you have, or inform the user that the PDF cannot be fully read."
+                                        )
+                                        continue
 
                                 tool_res = self._execute_tool(tool_name, tool_params, active_tools)
 
@@ -4801,16 +4827,40 @@ JSON:"""
                                 continue
 
                             is_shell_tool = tool_name == "tool_execute_shell_command"
+                            file_name = ""
                             if is_shell_tool:
                                 command_str = str(tool_params.get("command", "")).strip()
                                 context_aware_sig = f"{tool_name}::{command_str}"
                             else:
-                                param_sig = json.dumps(tool_params, sort_keys=True, default=str)
+                                normalized_params = dict(tool_params)
+                                param_sig = json.dumps(normalized_params, sort_keys=True, default=str)
                                 context_aware_sig = f"{tool_name}::{param_sig}"
+                                file_name = tool_params.get("file_name", "")
+
+                                stripped_params = dict(normalized_params)
+                                if "page_or_sheet" in stripped_params:
+                                    stripped_params.pop("page_or_sheet", None)
+                                if "max_chars" in stripped_params:
+                                    stripped_params.pop("max_chars", None)
+                                stripped_sig = f"{tool_name}::{json.dumps(stripped_params, sort_keys=True, default=str)}"
+
+                                if stripped_sig in successful_tool_signatures:
+                                    action_reports.append(f"Repetitive call to '{tool_name}' with identical file/base parameters blocked. Output already in context. If you need a different page or sheet, change the page_or_sheet parameter.")
+                                    continue
 
                             if context_aware_sig in successful_tool_signatures:
                                 action_reports.append(f"Repetitive call to '{tool_name}' with identical parameters blocked. Output already in context.")
                                 continue
+
+                            if file_name and tool_name in ("tool_read_document_content", "tool_inspect_document", "tool_grep_document"):
+                                file_tool_key = f"__file_consumed__::{tool_name}::{file_name}"
+                                if file_tool_key in successful_tool_signatures:
+                                    action_reports.append(
+                                        f"🛑 BLOCKED: You have already read '{file_name}' via '{tool_name}'. The tool returned truncated output, meaning the PDF extraction may be limited. "
+                                        f"Retrying with different page ranges will NOT help — the extraction returns the same pages. "
+                                        f"Do NOT call this tool again for this file. Instead, proceed with what you have, or inform the user that the PDF cannot be fully read."
+                                    )
+                                    continue
 
                             tool_res = self._execute_tool(tool_name, tool_params, active_tools)
 
@@ -4824,6 +4874,18 @@ JSON:"""
                                 or (isinstance(inner_res, dict) and inner_res.get("return_code", 0) != 0)
                             )
                             tool_success = not is_failure
+
+                            result_text = ""
+                            if isinstance(tool_res, dict):
+                                result_text = str(tool_res.get("output", "")) + str(tool_res.get("error", ""))
+                            else:
+                                result_text = str(tool_res)
+
+                            is_truncated = "truncated" in result_text.lower() and "more lines" in result_text.lower()
+                            if is_truncated and file_name and tool_name in ("tool_read_document_content", "tool_inspect_document", "tool_grep_document"):
+                                file_tool_key = f"__file_consumed__::{tool_name}::{file_name}"
+                                successful_tool_signatures.add(file_tool_key)
+                                ASCIIColors.warning(f"[{self.name}] Tool returned truncated output for '{file_name}'. Marking as consumed to prevent retry loops.")
 
                             if tool_success:
                                 successful_tool_signatures.add(context_aware_sig)
@@ -5137,10 +5199,21 @@ JSON:"""
                     report_text = "\n\n".join(str(r) for r in action_reports) + "\n\nAnalyze these results and continue your task, or emit <done/> if finished."
                     virtual_history.append(SimpleNamespace(sender_type="user", content=report_text))
 
+                ss.completed_actions = []
                 ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
                 if getattr(self, 'debug_mode', False):
                     ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Actions dispatched, continuing ===")
                 continue
+
+            if ss.was_done_detected() and not ss.completed_actions:
+                if getattr(self, 'debug_mode', False):
+                    ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: <done/> detected (no actions) ===")
+                break
+
+            if ss.was_done_detected() and not ss.completed_actions:
+                if getattr(self, 'debug_mode', False):
+                    ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: <done/> detected (no actions) ===")
+                break
             raw_round_text = ss.get_clean_text()
             done_match = re.search(r'(?m)^\s*<done\s*/?>\s*$', raw_round_text.strip())
             if done_match:
@@ -5149,8 +5222,48 @@ JSON:"""
                     ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: <done/> detected (fallback) ===")
                 break
 
-            if round_count > 1 and tool_calls_this_turn and not was_cancelled:
-                ASCIIColors.warning(f"[{self.name}] Mid-task stall detected (Round {round_count}). LLM stopped without <done/> or new actions. Forcing continuation.")
+            has_new_actions_this_round = bool(ss.completed_actions) or bool(raw_round_text.strip())
+            text_is_repetitive = False
+
+            stripped_round_text = raw_round_text.strip()
+            if stripped_round_text and len(virtual_history) > 0:
+                for vh in reversed(virtual_history):
+                    if vh.sender_type == "assistant" and vh.content.strip():
+                        last_text = vh.content.strip()
+                        if stripped_round_text == last_text or (len(stripped_round_text) > 50 and stripped_round_text in last_text) or (len(last_text) > 50 and last_text in stripped_round_text):
+                            text_is_repetitive = True
+                        break
+
+            if not text_is_repetitive and stripped_round_text:
+                lines_in_response = stripped_round_text.splitlines()
+                non_empty_lines = [l.strip() for l in lines_in_response if l.strip()]
+                if len(non_empty_lines) >= 3:
+                    from collections import Counter as _Counter
+                    line_counts = _Counter(non_empty_lines)
+                    most_common_line, most_common_count = line_counts.most_common(1)[0]
+                    if most_common_count >= 3 and len(most_common_line) > 20:
+                        text_is_repetitive = True
+                        ASCIIColors.warning(f"[{self.name}] Intra-round text duplication detected (line repeated {most_common_count}x).")
+
+            if text_is_repetitive:
+                ASCIIColors.error(f"[{self.name}] Repetitive text output detected (Round {round_count}). The LLM is producing identical text without progress. Terminating to prevent flood.")
+                final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
+                if not final_response:
+                    final_response = "[Task terminated: The agent produced repetitive text without making progress. This indicates the LLM lost context of previous tool results.]"
+                break
+
+            if round_count > 1 and tool_calls_this_turn and not was_cancelled and not has_new_actions_this_round:
+                consecutive_stall_count = getattr(self, '_consecutive_stall_count', 0) + 1
+                object.__setattr__(self, '_consecutive_stall_count', consecutive_stall_count)
+
+                if consecutive_stall_count >= 3:
+                    ASCIIColors.error(f"[{self.name}] Terminating after {consecutive_stall_count} consecutive stalls. The LLM appears unable to proceed.")
+                    final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
+                    if not final_response:
+                        final_response = "[Task terminated: The agent stalled repeatedly without producing actionable output. This may indicate the context window is full or the task is too complex for the current model.]"
+                    break
+
+                ASCIIColors.warning(f"[{self.name}] Mid-task stall detected (Round {round_count}, consecutive: {consecutive_stall_count}). LLM stopped without <done/> or new actions. Forcing continuation.")
                 clean_history_text = self._sanitize_history_for_context(raw_round_text)
                 virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant stalled without output]"))
                 virtual_history.append(SimpleNamespace(
@@ -5158,10 +5271,16 @@ JSON:"""
                     content=(
                         "[SYSTEM: CRITICAL. You are in the middle of an agentic task and stopped generating without a `<done/>` tag or any functional action tag. "
                         "You MUST either continue executing your task by emitting the next `<tool>` or `<artifact>` tag, or output your final conversational answer and end with `<done/>`. "
-                        "Do NOT stop generating until one of these conditions is met.]"
+                        "Do NOT stop generating until one of these conditions are met. "
+                        "If you are stuck because a tool returned truncated or unhelpful data, DO NOT retry the same tool. Instead, explain the limitation to the user and emit <done/>.]"
                     )
                 ))
                 continue
+            elif has_new_actions_this_round:
+                object.__setattr__(self, '_consecutive_stall_count', 0)
+                clean_history_text = self._sanitize_history_for_context(raw_round_text)
+                if clean_history_text.strip():
+                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text))
 
             ctx_health = self._calculate_context_fill(stable_system_prompt, base_conversation, virtual_history, raw_round_text)
 
@@ -5230,6 +5349,7 @@ JSON:"""
                         break
                 else:
                     object.__setattr__(self, '_consecutive_empty_responses', 0)
+                    object.__setattr__(self, '_consecutive_stall_count', 0)
 
                 ASCIIColors.warning("[LollmsPersonality.chat] Malformed functional tag detected. Injecting format correction.")
                 clean_history_text = self._sanitize_history_for_context(raw_round_text)

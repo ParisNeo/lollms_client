@@ -119,6 +119,36 @@ crew_pers.switch_crewmate("coder")
 
 ---
 
+## 📝 Document Editing & Annotation (PDF / DOCX / PPTX)
+
+The `document_editor` toolset provides autonomous capabilities for surgically modifying and annotating documents without destroying the underlying file structure. 
+
+### Available Tools
+
+#### `tool_edit_document_text`
+Surgically edits text content in a PDF, DOCX, or PPTX document.
+- **`file_name`**: The path to the document file.
+- **`operation`**: `"insert"`, `"update"`, or `"remove"`.
+- **`search_text`**: The exact text to search for. For `"insert"`, this is the anchor text after which the new text is added.
+- **`replacement_text`**: The new text (required for `"update"` and `"insert"`).
+- **`pages`**: (PDF only) Pages to apply the edit, e.g., `"1-3, 5"`. Empty means all pages.
+- **`match_case`**: Boolean for case-sensitive matching.
+- **`whole_word`**: Boolean for whole-word matching.
+
+#### `tool_annotate_document`
+Adds highlights or comments to a PDF or DOCX document.
+- **`file_name`**: The path to the document file.
+- **`annotation_type`**: `"comment"` or `"highlight"`.
+- **`search_text`**: The text to locate for annotation.
+- **`comment`**: The comment text (required for `"comment"` type).
+- **`pages`**: (PDF only) Pages to apply the annotation.
+- **`highlight_color`**: `"yellow"`, `"red"`, `"green"`, or `"blue"`.
+
+### Technical Notes
+- **PDFs**: Uses `PyMuPDF` (`fitz`) redactions for `update` and `remove` operations to permanently remove underlying text, ensuring clean modifications. Annotations are native PDF annotations.
+- **DOCX**: Uses `python-docx`. Highlighting applies native Word highlighting. Comments are currently inserted as inline `[COMMENT: ...]` runs for stability.
+- **PPTX**: Uses `python-pptx`. Edits are applied at the run level to preserve slide formatting.
+
 ## 🛠️ 3. Architecture & Deep Specification
 
 ### Null-Safety Doctrine

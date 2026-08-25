@@ -135,30 +135,43 @@ def tool_read_document_content(
 
     try:
         if ext == ".pdf":
-            from pypdf import PdfReader
-            reader = PdfReader(str(path))
-            total_pages = len(reader.pages)
-
+            import fitz
+            doc = fitz.open(str(path))
+            total_pages = len(doc)
+            
+            target_pages = list(range(total_pages))
             if page_or_sheet:
-                try:
-                    p_idx = int(page_or_sheet) - 1
-                    if 0 <= p_idx < total_pages:
-                        extracted = reader.pages[p_idx].extract_text() or ""
-                        return {"success": True, "page": p_idx + 1, "total_pages": total_pages, "content": extracted[:max_chars], "output": extracted[:max_chars]}
-                    return {"success": False, "error": f"Page {page_or_sheet} out of range [1..{total_pages}]."}
-                except ValueError:
-                    pass
+                target_pages = []
+                for part in str(page_or_sheet).split(','):
+                    part = part.strip()
+                    if '-' in part:
+                        try:
+                            start, end = map(int, part.split('-'))
+                            target_pages.extend(range(max(1, start) - 1, min(total_pages, end)))
+                        except ValueError:
+                            pass
+                    elif part.isdigit():
+                        p = int(part) - 1
+                        if 0 <= p < total_pages:
+                            target_pages.append(p)
 
-            text_parts = []
-            for i, page in enumerate(reader.pages):
-                txt = page.extract_text() or ""
-                if txt.strip():
-                    text_parts.append(f"--- Page {i + 1} ---\n{txt.strip()}")
-                if sum(len(p) for p in text_parts) >= max_chars:
+            if not target_pages:
+                return {"success": False, "error": f"No valid pages found in range '{page_or_sheet}'. Document has {total_pages} pages."}
+
+            pages_text = []
+            current_chars = 0
+            for page_num in target_pages:
+                if current_chars >= max_chars:
                     break
-
-            full_text = "\n\n".join(text_parts)[:max_chars]
-            return {"success": True, "total_pages": total_pages, "content": full_text, "output": full_text}
+                page = doc[page_num]
+                page_text = page.get_text("text")
+                pages_text.append(f"--- Page {page_num + 1} ---\n{page_text}")
+                current_chars += len(page_text)
+            doc.close()
+            
+            full_text = "\n\n".join(pages_text)
+            if len(full_text) > max_chars:
+                return {"success": True, "total_pages": total_pages, "content": full_text, "output": full_text}
 
         elif ext == ".docx":
             import docx

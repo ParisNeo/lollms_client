@@ -719,6 +719,7 @@ class _AgentStreamState:
 
         if self._is_accumulating_artifact:
             self._tool_buffer += self._pending_buffer
+            self._pending_buffer = ""
 
             # ── DETECT NEW STRUCTURAL SYMBOLS ──
             art_lang = self.live_artifact_meta.get("language", "") if self.live_artifact_meta else ""
