@@ -265,6 +265,20 @@ The `LollmsPersonality.chat()` method uses a **Buffered Execution Strategy** man
 ### The Dependency Constraint (CRITICAL)
 While the agent can batch multiple independent calls in a single response, **dependent calls must be split across separate rounds**. If the agent needs the result of Tool A to construct the parameters for Tool B, it MUST emit Tool A, end its response, and wait for the system to return the result before emitting Tool B in the next round.
 
+### Rolling Window Compaction & Base Context Sync (Critical for Anti-Amnesia)
+
+To balance KV-cache efficiency with long-term context coherence during multi-step artifact creation, `LollmsPersonality` implements a **Rolling Window Compaction Protocol**.
+
+**The Problem**: In long agentic loops (e.g., 10+ rounds of code refactoring), keeping the full XML body of every `<artifact>` tag in `virtual_history` quickly exhausts the context window. However, simply stripping old artifact bodies to placeholders causes "amnesia" — the LLM forgets the code it wrote 3 steps ago.
+
+**The Solution**: 
+1. **Eviction Limit**: We maintain a rolling window of the **last 4 consecutive artifact operations** in `virtual_history`. 
+2. **Base Context Sync**: When a 5th artifact operation occurs, the oldest artifact round is **evicted** (popped) from `virtual_history`. To prevent amnesia, the system **rebuilds the Base Context** (the initial system prompt + workspace tree injected into the first user message). The workspace tree is refreshed from disk, meaning the newly created/modified file's full content is now loaded into the Base Context under `[C] Fully Loaded File Contents`.
+3. **Trade-off**: This destroys the KV-cache up to the start of the current turn, but it guarantees the LLM always has full visibility of the current workspace state without infinitely growing the history.
+
+**Full History Compaction (95% Limit)**:
+If the context window hits 95% capacity despite the rolling window, the system autonomously summarizes the entire `virtual_history` into a dense paragraph. Before injecting this summary, it forces a **full Base Context Sync**, ensuring all artifacts on disk are reflected in the workspace tree before the old history is discarded.
+
 **Example of CORRECT behavior (Independent calls batched):**
 ```xml
 I will search for the files and check the git status simultaneously.

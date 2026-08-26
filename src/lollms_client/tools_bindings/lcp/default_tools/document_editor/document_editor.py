@@ -1,10 +1,13 @@
 import os
+import getpass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 TOOL_LIBRARY_NAME = "Document Editor"
 TOOL_LIBRARY_DESC = "Surgically edits and annotates PDF, DOCX, and PPTX files. Supports text insertion, replacement, removal, comments, and highlighting."
 TOOL_LIBRARY_ICON = "📝"
+
+_DEFAULT_COMMENTER = getpass.getuser()
 
 def init_tools_library(config: dict = None) -> None:
     try:
@@ -197,7 +200,8 @@ def tool_annotate_document(
     search_text: str,
     comment: str = "",
     pages: str = "",
-    highlight_color: str = "yellow"
+    highlight_color: str = "yellow",
+    commenter_name: str = _DEFAULT_COMMENTER
 ) -> Dict[str, Any]:
     """
     Annotates a PDF or DOCX document by highlighting text or adding comments.
@@ -209,6 +213,7 @@ def tool_annotate_document(
         comment (str, optional): The comment text. Required for "comment" type.
         pages (str, optional): Pages to apply the annotation (PDF only). E.g., "1-3, 5".
         highlight_color (str, optional): Color for highlighting. Options: "yellow", "red", "green", "blue".
+        commenter_name (str, optional): The name of the user adding the comment. Defaults to current OS user.
     """
     err = _check_file_exists(file_name)
     if err:
@@ -216,9 +221,12 @@ def tool_annotate_document(
 
     if annotation_type not in ("comment", "highlight"):
         return {"success": False, "error": "Invalid annotation_type. Must be 'comment' or 'highlight'."}
-    
+
     if annotation_type == "comment" and not comment:
         return {"success": False, "error": "comment is required when annotation_type is 'comment'."}
+
+    if not commenter_name:
+        commenter_name = _DEFAULT_COMMENTER
 
     output_path = _get_output_path(file_name, "_annotated")
     file_ext = Path(file_name).suffix.lower()
@@ -253,6 +261,7 @@ def tool_annotate_document(
                             comment,
                             icon="Comment"
                         )
+                        annot.set_info(title=commenter_name, content=comment)
                         annot.update()
                     total_annot += 1
 
@@ -282,7 +291,7 @@ def tool_annotate_document(
                                 rPr.append(highlight)
                                 total_annot += 1
                     else:
-                        paragraph.add_run(f" [COMMENT: {comment}]")
+                        paragraph.add_run(f" [COMMENT by {commenter_name}: {comment}]")
                         total_annot += 1
 
             if total_annot == 0:

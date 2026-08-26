@@ -302,12 +302,10 @@ def _extract_text_file(path: Path) -> str:
 
 def _extract_pdf_text(path: Path) -> str:
     """Extract text from all PDF pages as Markdown, preserving tables."""
-    _ensure_installed("pymupdf4llm")
     try:
+        _ensure_installed("pymupdf4llm")
         import pymupdf4llm
 
-        # to_markdown returns one big string covering all pages
-        # page_chunks=True returns a list of dicts, one per page
         chunks: list[dict] = pymupdf4llm.to_markdown(str(path), page_chunks=True)
 
         pages = []
@@ -317,8 +315,21 @@ def _extract_pdf_text(path: Path) -> str:
 
         return "\n\n".join(pages)
 
-    except ImportError:
-        ASCIIColors.warning("[FileImport] pymupdf4llm not installed — falling back to pypdf")
+    except Exception as pymupdf4llm_err:
+        ASCIIColors.warning(f"[FileImport] pymupdf4llm failed ({pymupdf4llm_err}). Falling back to fitz standard text extraction.")
+        try:
+            import fitz
+            doc = fitz.open(str(path))
+            pages = []
+            for i, page in enumerate(doc):
+                text = (page.get_text("text") or "").strip()
+                pages.append(f"## Page {i + 1}\n\n{text}" if text else f"## Page {i + 1}\n\n[No text]")
+            doc.close()
+            if pages:
+                return "\n\n".join(pages)
+        except Exception as fitz_err:
+            ASCIIColors.warning(f"[FileImport] fitz extraction failed: {fitz_err}. Falling back to pypdf.")
+
         _ensure_installed("pypdf")
         try:
             from pypdf import PdfReader

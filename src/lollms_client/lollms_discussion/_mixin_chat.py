@@ -1857,23 +1857,43 @@ class _StreamState:
             # instead of nested: {"name": "tool", "parameters": {"arg": "val"}}
             # We MUST normalize this here to prevent execution failures.
             tool_name = ""
+
+            def _sanitize_tool_json(raw_body: str) -> str:
+                """
+                Safely extracts the first valid JSON object from a tool body.
+                Handles trailing backticks, markdown fences, and stray prose
+                that cause 'Extra data' JSONDecodeError.
+                """
+                import json as _json
+                stripped = raw_body.strip()
+                if stripped.startswith("```"):
+                    lines = stripped.splitlines()
+                    if len(lines) >= 2:
+                        stripped = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+                stripped = stripped.strip("`").strip()
+                try:
+                    decoder = _json.JSONDecoder()
+                    obj, end_idx = decoder.raw_decode(stripped)
+                    return _json.dumps(obj)
+                except (_json.JSONDecodeError, ValueError):
+                    return stripped
+
+            sanitized_body = _sanitize_tool_json(body)
             try:
-                raw_data = json.loads(body)
+                raw_data = json.loads(sanitized_body)
                 if isinstance(raw_data, dict):
-                    # ALWAYS normalize to nested structure for consistency
                     tool_name = raw_data.get("name", "")
 
-                    # Check if already nested
                     if "parameters" in raw_data and isinstance(raw_data["parameters"], dict):
-                        self.tool_json_data = body
+                        self.tool_json_data = sanitized_body
                     else:
                         params = {k: v for k, v in raw_data.items() if k != "name"}
                         normalized_data = {"name": tool_name, "parameters": params}
                         self.tool_json_data = json.dumps(normalized_data)
                 else:
-                    self.tool_json_data = body
+                    self.tool_json_data = sanitized_body
             except json.JSONDecodeError as je:
-                self.tool_json_data = body
+                self.tool_json_data = sanitized_body
                 ASCIIColors.error(f"[StreamState] JSON decode failed: {je}")
 
             # ── 🛑 CRITICAL FIX: IMMEDIATE UI FEEDBACK ──
@@ -1886,7 +1906,7 @@ class _StreamState:
                 ui_tool_name = parsed_for_ui.get("name", "unknown") if isinstance(parsed_for_ui, dict) else "unknown"
                 ui_params = parsed_for_ui.get("parameters", {}) if isinstance(parsed_for_ui, dict) else {}
             except Exception:
-                ui_tool_name = "unknown"
+                ui_tool_name = tool_name or "unknown"
                 ui_params = {}
 
             escaped_params = html.escape(json.dumps(ui_params, default=str))
@@ -3157,8 +3177,7 @@ class ChatMixin:
                 trace_exception(ex)
                 lcp_binding = None
 
-        if lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
-            # Auto-mount as-is document tools for binary and document operations
+        if enable_data_tools_flag and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
             lcp_binding.mount_tool_library("as_is_document_tools")
             try:
                 lcp_tools = lcp_binding.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
@@ -3470,7 +3489,7 @@ class ChatMixin:
                 if self.lollmsClient and hasattr(self.lollmsClient, "get_ctx_size"):
                     max_ctx = self.lollmsClient.get_ctx_size() or max_ctx
 
-                if max_ctx > 0:
+                if max_ctx > 1:
                     fill_pct = (total_tokens / max_ctx) * 100.0
                     ASCIIColors.info(f"[Context] Round {round_count} fill: {total_tokens}/{max_ctx} tokens ({fill_pct:.1f}%)")
             except Exception as ctx_err:
@@ -4534,6 +4553,29 @@ class ChatMixin:
                 # The Success-Loop Interceptor provides a natural termination guarantee:
                 # if the LLM repeats the same tool call, the loop breaks automatically.
                 if len(tool_calls_this_turn) > 0:
+                    # 🛑 TEXT REPETITION GUARD (CRITICAL FIX)
+                    # Check if the LLM is repeating the same text without emitting <done/>.
+                    stripped_round_text = raw_round_text.strip()
+                    if stripped_round_text and len(virtual_history) > 0:
+                        last_assistant_text = None
+                        for vh in reversed(virtual_history):
+                            if vh.sender_type == "assistant" and vh.content.strip():
+                                last_assistant_text = vh.content.strip()
+                                break
+
+                        if last_assistant_text:
+                            is_repetitive = False
+                            if stripped_round_text == last_assistant_text:
+                                is_repetitive = True
+                            elif len(stripped_round_text) > 50 and stripped_round_text in last_assistant_text:
+                                is_repetitive = True
+                            elif len(last_assistant_text) > 50 and last_assistant_text in stripped_round_text:
+                                is_repetitive = True
+
+                            if is_repetitive:
+                                ASCIIColors.error(f"[ChatMixin] Repetitive text output detected after tool (Round {round_count}). Terminating to prevent flood.")
+                                break
+
                     ASCIIColors.info("[ChatMixin] Tool previously executed but no <done/> detected. Injecting continuation mandate.")
                     full_round_text = ss.get_clean_text_so_far()
                     raw_round_text_delta = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
@@ -4711,7 +4753,31 @@ class ChatMixin:
                     ))
                     continue
 
-                # ── 🛑 FINALIZE: No tool call, no intent, no unlock. This is the final answer. ──
+                # ── 🛑 TEXT REPETITION GUARD (CRITICAL FIX) ──
+                # If the LLM repeats the exact same text in consecutive rounds without
+                # emitting <done/>, it is stuck in a loop. We must break immediately.
+                stripped_round_text = raw_round_text.strip()
+                if stripped_round_text and len(virtual_history) > 0:
+                    last_assistant_text = None
+                    for vh in reversed(virtual_history):
+                        if vh.sender_type == "assistant" and vh.content.strip():
+                            last_assistant_text = vh.content.strip()
+                            break
+
+                    if last_assistant_text:
+                        is_repetitive = False
+                        if stripped_round_text == last_assistant_text:
+                            is_repetitive = True
+                        elif len(stripped_round_text) > 50 and stripped_round_text in last_assistant_text:
+                            is_repetitive = True
+                        elif len(last_assistant_text) > 50 and last_assistant_text in stripped_round_text:
+                            is_repetitive = True
+
+                        if is_repetitive:
+                            ASCIIColors.error(f"[ChatMixin] Repetitive text output detected (Round {round_count}). Terminating to prevent flood.")
+                            break
+
+                # ── 🏁 FINALIZE: No tool call, no intent, no unlock. This is the final answer. ──
                 # 🛑 CRITICAL ARCHITECTURAL FIX: Do NOT overwrite ai_msg.content with a sanitized gist.
                 # The `_StreamState` already accumulated conversational text and <processing> blocks
                 # safely into `ai_msg.content` during the stream. We must preserve this exact buffer

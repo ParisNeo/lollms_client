@@ -1104,16 +1104,40 @@ class StreamRenderer:
             output = meta.get("output", "")
             error = meta.get("error")
 
+            if not output and not error:
+                for key in ("matches", "files", "content", "result", "data"):
+                    val = meta.get(key)
+                    if val:
+                        try:
+                            output = json.dumps(val, indent=2, ensure_ascii=False, default=str) if not isinstance(val, str) else val
+                        except Exception:
+                            output = str(val)
+                        break
+
+            if success and error == "[No output returned by tool]":
+                error = None
+
             status_str = "[green]✅ Success[/green]" if success else "[red]❌ Failed[/red]"
-            
+
+            panel_lines = [f"\n[cyan]Status:[/cyan] {status_str}"]
+
+            if tool_name == "tool_execute_shell_command":
+                cmd_params = meta.get("parameters", {})
+                command_str = cmd_params.get("command", "")
+                if command_str:
+                    panel_lines.append(f"[cyan]Command:[/cyan] [yellow]{command_str}[/yellow]")
+
             max_log_lines = 15
-            log_lines = (output or error or "").splitlines()
+            log_source = output or error or ""
+            log_lines = log_source.splitlines()
             if len(log_lines) > max_log_lines:
                 log_content = "\n".join(log_lines[:max_log_lines]) + f"\n[dim]... ({len(log_lines) - max_log_lines} more lines truncated)[/dim]"
             else:
-                log_content = output or error or ""
+                log_content = log_source
 
-            panel_content = f"\n[cyan]Status:[/cyan] {status_str}\n\n[cyan]Execution Log:[/cyan]\n{log_content}"
+            panel_lines.append(f"\n[cyan]Execution Log:[/cyan]\n{log_content}")
+            panel_content = "\n".join(panel_lines)
+
             ASCIIColors.panel(
                 panel_content,
                 title=f"[bold blue]🛠️ Finished: {tool_name}[/bold blue]",
@@ -1294,6 +1318,29 @@ class StreamRenderer:
                 ASCIIColors.rich_print(f"\n[blue][INFO] {chunk}[/blue]")
                 return True
     
+
+def _display_context_status(personality: LollmsPersonality, client: LollmsClient):
+    """Calculates and displays the current context fill status as a Rich panel."""
+    ctx_status = get_context_fill_status(personality, client)
+    if ctx_status:
+        used = ctx_status["used_tokens"]
+        max_t = ctx_status["max_tokens"]
+        pct = ctx_status["fill_percentage"]
+
+        status_color = "green"
+        if pct > 85.0:
+            status_color = "red"
+        elif pct > 65.0:
+            status_color = "yellow"
+
+        status_content = (
+            f"[cyan]Used Tokens:[/cyan] {used:,} / {max_t:,}\n"
+            f"[cyan]Context Fill:[/cyan] [{status_color}]{pct:.1f}%[/{status_color}]"
+        )
+        ASCIIColors.panel(status_content, title="[bold blue]📊 Context Status[/bold blue]", border_style="blue")
+    else:
+        ASCIIColors.yellow("  Context status unavailable.")
+
 
 def display_result(result: Dict[str, Any], config: CodeAgentConfig, elapsed: float):
     ASCIIColors.rule("[bold cyan]📊 SESSION REPORT[/bold cyan]")
@@ -2052,11 +2099,13 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                 ws_stats = get_workspace_stats(personality)
                 if ws_stats["loaded_files"]:
                     ASCIIColors.rich_print("")
-                    _render_files_table(ws_stats["loaded_files"], "Current Loaded Context Files [C]")
+                    _render_files_table(ws_stats["loaded_files"], "Remaining Loaded Context Files [C]")
                 else:
                     ASCIIColors.yellow("\n  📂 No files are currently loaded in context.")
+                
+                _display_context_status(personality, client)
             except Exception as e:
-                ASCIIColors.red(f"\n  ❌ Error during context visibility change: {e}")
+                ASCIIColors.red(f"\n  ❌ Error unloading files: {e}")
             continue
 
         if user_input.lower() == "/workspace":

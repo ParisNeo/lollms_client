@@ -136,15 +136,32 @@ def _sanitize_tool_result(tool_res: Any, max_chars: Optional[int] = None, client
         inner_dict = tool_res.get("output") if isinstance(tool_res.get("output"), dict) else {}
 
         # Comprehensive Failure Detection
+        # An "error" string alone does not indicate failure unless success is explicitly False
+        # or a non-zero return code is present. Some tools return informational messages in "error".
         is_fail = (
             tool_res.get("success") is False
             or (inner_dict and inner_dict.get("success") is False)
             or tool_res.get("status_code", 200) not in (200, 201)
             or (inner_dict and inner_dict.get("status_code", 200) not in (200, 201))
-            or bool(tool_res.get("error"))
-            or (inner_dict and bool(inner_dict.get("error")))
             or (tool_res.get("return_code") is not None and tool_res.get("return_code") != 0)
             or (inner_dict and inner_dict.get("return_code") is not None and inner_dict.get("return_code") != 0)
+            or (
+                bool(tool_res.get("error"))
+                and (
+                    tool_res.get("success") is False
+                    or (tool_res.get("return_code") is not None and tool_res.get("return_code") != 0)
+                    or (tool_res.get("status_code", 200) not in (200, 201))
+                )
+            )
+            or (
+                inner_dict
+                and bool(inner_dict.get("error"))
+                and (
+                    inner_dict.get("success") is False
+                    or (inner_dict.get("return_code") is not None and inner_dict.get("return_code") != 0)
+                    or (inner_dict.get("status_code", 200) not in (200, 201))
+                )
+            )
         )
 
         if is_fail:
@@ -204,7 +221,7 @@ def _sanitize_tool_result(tool_res: Any, max_chars: Optional[int] = None, client
             unwrapped = tool_res["data"]
 
     if unwrapped is None:
-        return "Tool executed successfully but returned no output content."
+        return "⚠️ Tool returned success=True but NO output content was extracted. This likely means the document is image-based (scanned PDF), encrypted, or the extraction returned empty text. Try a different approach: use <unlock_file> to load the file natively, or use tool_grep_document to search for specific keywords."
 
     def _replace_none(obj):
         if obj is None:
@@ -1134,7 +1151,11 @@ class _AgentStreamState:
 
         if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
             try:
-                self._cb("", MSG_TYPE.MSG_TYPE_TOOL_START, {"tool_name": resolved_tool_name, "parameters": resolved_params, "stream_complete": True})
+                self._cb("", MSG_TYPE.MSG_TYPE_TOOL_END, {
+                    "tool_name": resolved_tool_name,
+                    "parameters": resolved_params,
+                    "stream_complete": True
+                })
             except Exception:
                 pass
 

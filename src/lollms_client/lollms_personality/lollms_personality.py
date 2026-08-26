@@ -2928,13 +2928,16 @@ JSON:"""
             ASCIIColors.warning(f"[{self.name}] History refactoring failed: {e}")
             return base_conversation
 
-    def _compact_virtual_history(self, virtual_history: List, streaming_callback: Optional[Callable]) -> List:
+    def _compact_virtual_history(self, virtual_history: List, base_conversation: List[Dict[str, str]], streaming_callback: Optional[Callable]) -> List:
         """
         Autonomously summarizes the virtual history to free up context space.
         Replaces verbose tool outputs and intermediate reasoning with a dense summary.
+        Syncs the base context to preserve artifact state before history is discarded.
         """
         if not virtual_history or not self.lollms_client:
             return virtual_history
+
+        self._sync_base_context_artifacts(base_conversation, virtual_history)
 
         # Notify the UI of the autonomous compaction
         if streaming_callback:
@@ -3099,31 +3102,102 @@ JSON:"""
         text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r'<!-- status:[^>]*-->', '', text, flags=re.IGNORECASE)
         text = re.sub(r'</processing>', '', text, flags=re.IGNORECASE)
-
-        def _artifact_anchor(match: re.Match) -> str:
-            attrs_str = match.group(0)
-            body_content = match.group(1) if match.groups() else ""
-
-            if "<<<<<<< SEARCH" in body_content:
-                title_match = re.search(r'(?:name|title)=["\']([^"\']*)["\']', attrs_str, re.IGNORECASE)
-                title = title_match.group(1) if title_match else "artifact"
-                return f"[🔧 SEARCH/REPLACE attempted on: {title}]\n{body_content}\n[/SEARCH/REPLACE]"
-
-            title_match = re.search(r'(?:name|title)=["\']([^"\']*)["\']', attrs_str, re.IGNORECASE)
-            type_match = re.search(r'type=["\']([^"\']*)["\']', attrs_str, re.IGNORECASE)
-            title = title_match.group(1) if title_match else "artifact"
-            atype = type_match.group(1) if type_match else "code"
-            return f"[🔒artefact tag called, content stripped for brievety, do not mimic:{title}|{atype}]"
-
-        text = re.sub(r'<artifact[^>]*>(.*?)</artifact>', _artifact_anchor, text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r'<artefact[^>]*>(.*?)</artefact>', _artifact_anchor, text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r'<lollms_artifact[^/]*/>', '', text, flags=re.IGNORECASE)
         text = re.sub(r'<artefact_image[^/]*/>', '', text, flags=re.IGNORECASE)
-
         return text.strip()
+
+    def _sync_base_context_artifacts(self, base_conversation: List[Dict[str, str]], virtual_history: List) -> None:
+        """
+        Rebuilds the Base Context (initial user message) by injecting the latest workspace tree.
+        This ensures the LLM sees the full content of recently evicted artifacts.
+        """
+        if not base_conversation:
+            return
+
+        try:
+            evicted_artifact_titles = []
+            if hasattr(self, '_artefact_manager') and self._artefact_manager:
+                for vh in virtual_history:
+                    content = getattr(vh, "content", "")
+                    if getattr(vh, "sender_type", "") == "assistant":
+                        matches = re.findall(r'<art(?:ifact|efact)[^>]*name=["\']([^"\']+)["\']', content, re.IGNORECASE)
+                        evicted_artifact_titles.extend(matches)
+
+                from lollms_client.lollms_artefact import ArtefactVisibility
+                for title in evicted_artifact_titles:
+                    try:
+                        art = self._artefact_manager.get(title)
+                        if art and art.get("visibility") != ArtefactVisibility.FULL:
+                            self._execute_context_visibility("unlock_file", title)
+                    except Exception:
+                        pass
+
+            ws_block = self._build_workspace_context_block()
+            if not ws_block:
+                return
+
+            ws_boundary = "=== CURRENT WORKSPACE CONTEXT ==="
+            end_boundary = "=== END CURRENT WORKSPACE CONTEXT ==="
+
+            for i, msg in enumerate(base_conversation):
+                if msg.get("role") == "user" and ws_boundary in msg.get("content", ""):
+                    start_idx = msg["content"].find(ws_boundary)
+                    end_idx = msg["content"].find(end_boundary) + len(end_boundary)
+                    prefix = msg["content"][:start_idx].strip()
+                    suffix = msg["content"][end_idx:].strip()
+                    msg["content"] = f"{prefix}\n\n{ws_boundary}\n{ws_block.strip()}\n{end_boundary}\n\n{suffix}".strip()
+                    break
+        except Exception as e:
+            ASCIIColors.warning(f"[{self.name}] Failed to sync base context artifacts: {e}")
+
+    def _apply_rolling_artifact_compaction(self, virtual_history: List, base_conversation: List[Dict[str, str]]) -> List:
+        """
+        Enforces the Rolling Window Compaction Protocol.
+        Keeps only the last 4 consecutive artifact operations in virtual_history.
+        Evicts older ones and syncs their final state into the Base Context.
+        """
+        if not virtual_history:
+            return virtual_history
+
+        artifact_indices = [
+            i for i, vh in enumerate(virtual_history)
+            if vh.sender_type == "assistant" and ("<artifact" in vh.content.lower() or "<artefact" in vh.content.lower())
+        ]
+
+        if len(artifact_indices) <= 4:
+            return virtual_history
+
+        oldest_artifact_idx = artifact_indices[0]
+        next_user_idx = oldest_artifact_idx + 1
+        while next_user_idx < len(virtual_history) and virtual_history[next_user_idx].sender_type != "user":
+            next_user_idx += 1
+
+        if next_user_idx < len(virtual_history):
+            next_user_idx += 1
+
+        evicted_history = virtual_history[:next_user_idx]
+        surviving_history = virtual_history[next_user_idx:]
+
+        self._sync_base_context_artifacts(base_conversation, evicted_history)
+
+        return surviving_history
 
     def _discover_tools(self, explicit_tools: Optional[Dict] = None, tool_files: Optional[List] = None, *args, **kwargs) -> Dict[str, Dict[str, Any]]:
         active_tools = {}
+
+        try:
+            import getpass
+            current_user_name = getpass.getuser()
+        except Exception:
+            current_user_name = "Unknown User"
+
+        if current_user_name and current_user_name != "Unknown User":
+            user_annotation_rule = (
+                f"\n\n**CRITICAL ANNOTATION RULE**: When using `tool_annotate_document` to add comments to a PDF or DOCX, "
+                f"you MUST set the `commenter_name` parameter to '{current_user_name}' (the current OS user account)."
+            )
+            if "description" in active_tools.get("tool_annotate_document", {}):
+                active_tools["tool_annotate_document"]["description"] += user_annotation_rule
 
         if self.capabilities and self.capabilities.enable_workspace_tools and self._resolved_workspace:
             ws_path = self._resolved_workspace
@@ -3549,6 +3623,82 @@ JSON:"""
         except Exception:
             return None
 
+    def _calculate_context_fill(self, full_system_prompt: str, base_conversation: List[Dict], virtual_history: List, final_response: str = "") -> Dict[str, Any]:
+        """Calculates the current context window fill percentage."""
+        try:
+            if self.lollms_client and hasattr(self.lollms_client, 'get_ctx_size'):
+                max_ctx = self.lollms_client.get_ctx_size() or 0
+                if max_ctx > 0 and hasattr(self.lollms_client, 'count_tokens'):
+                    total_used = self.lollms_client.count_tokens(full_system_prompt)
+                    for msg in base_conversation:
+                        total_used += self.lollms_client.count_tokens(msg.get("content", ""))
+                    for vh in virtual_history:
+                        total_used += self.lollms_client.count_tokens(vh.content)
+                    total_used += self.lollms_client.count_tokens(final_response)
+
+                    if total_used <= 0:
+                        return {"used_tokens": 0, "max_tokens": max_ctx, "fill_percentage": 0.0}
+
+                    return {
+                        "used_tokens": total_used,
+                        "max_tokens": max_ctx,
+                        "fill_percentage": round((total_used / max_ctx) * 100, 1)
+                    }
+        except Exception:
+            pass
+        return {"used_tokens": 0, "max_tokens": 0, "fill_percentage": 0.0}
+
+    def _compact_virtual_history(self, virtual_history: List, streaming_callback: Optional[Callable]) -> List:
+        """
+        Autonomously summarizes the virtual history to free up context space.
+        Replaces verbose tool outputs and intermediate reasoning with a dense summary.
+        """
+        if not virtual_history or not self.lollms_client:
+            return virtual_history
+
+        if streaming_callback:
+            compaction_msg = '\n<processing type="context_compaction" title="Autonomous Context Compaction">\n* 🧹 Context window approaching limit. Summarizing history to free up space...\n</processing>\n'
+            try:
+                streaming_callback(compaction_msg, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            except Exception:
+                pass
+
+        history_text = "\n\n".join([f"[{vh.sender_type}]: {vh.content}" for vh in virtual_history])
+
+        summary_prompt = (
+            "You are a context compaction engine. Summarize the following conversation history into a dense, factual summary.\n"
+            "Focus on retaining: user goals, key data retrieved from tools, file names created/modified, and final conclusions.\n"
+            "Discard: conversational pleasantries, intermediate reasoning steps, and verbose tool outputs.\n\n"
+            f"=== HISTORY TO COMPACT ===\n{history_text}\n=== END HISTORY ==="
+        )
+
+        try:
+            summary = self.lollms_client.generate_text(
+                prompt=summary_prompt,
+                temperature=0.1,
+                n_predict=1024
+            )
+            if not isinstance(summary, str) or not summary.strip():
+                return virtual_history
+
+            compacted_history = [SimpleNamespace(
+                sender_type="user",
+                content=f"[SYSTEM: AUTONOMOUS CONTEXT COMPACTION]\nThe previous history has been summarized to save space. Use this summary as your working context:\n\n{summary.strip()}"
+            )]
+
+            if streaming_callback:
+                success_msg = f'\n<processing type="context_compaction" title="Autonomous Context Compaction">\n* ✅ History compacted successfully. Context freed.\n</processing>\n'
+                try:
+                    streaming_callback(success_msg, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                except Exception:
+                    pass
+
+            return compacted_history
+
+        except Exception as e:
+            ASCIIColors.warning(f"[{self.name}] Context compaction failed: {e}")
+            return virtual_history
+
     def _build_system_prompt(self, active_tools: Dict) -> str:
         sys_prompt = self.system_prompt or ""
         onboarding_block = self._build_onboarding_block()
@@ -3581,7 +3731,8 @@ JSON:"""
             "2. **One Call Per Task**: Once a tool succeeds, analyze and answer.\n"
             "3. **Loop Prevention**: Repeating a successful tool call with identical parameters is a CRITICAL ERROR.\n"
             "4. **File Outputs**: When a tool returns a file, it's ALREADY saved. Do NOT call it again.\n"
-            "\n=== FILE EDITING PROTOCOL (AIDER SEARCH/REPLACE) ===\n"
+            "\n=== FILE EDITING & WRITING PROTOCOL ===\n"
+            "You have a massive output token limit. Write complete files whenever possible.\n"
             "For surgical updates to existing files, you MUST use the `<artifact>` tag with SEARCH/REPLACE blocks.\n"
             "The system automatically applies fuzzy matching and auto-correction if the exact search string isn't found.\n"
             "Syntax:\n"
@@ -3593,6 +3744,14 @@ JSON:"""
             ">>>>>>> REPLACE\n"
             "</artifact>\n"
             "If a patch fails, the system will return the error. You MUST read the error carefully. The file content is already available in your context under the `## Fully Loaded File Contents [C]` section. Concentrate on the exact text, fix your SEARCH block, and re-emit the `<artifact>` tag. Do not attempt to use a `tool_read_file` tool, as it does not exist.\n"
+            "\n**SEGMENTED WRITING (APPEND OPERATION)**\n"
+            "If you are writing a very large file and prefer to write it in chunks (or if you hit a generation limit), you can use the `operation=\"append\"` attribute.\n"
+            "This adds the content inside the tag to the end of the specified file without overwriting what is already there.\n"
+            "Syntax:\n"
+            "<artifact name=\"filename.ext\" type=\"code\" language=\"python\" operation=\"append\">\n"
+            "// content to add to the end of the file\n"
+            "</artifact>\n"
+            "You MUST ensure the file exists before appending to it. Use `operation=\"append\"` sequentially to build massive files piece by piece.\n"
             "\n=== SKILLS SYSTEM ===\n"
             "Skills are persistent knowledge capsules stored outside the workspace. They survive across sessions.\n"
             "They are categorized by visibility:\n"
@@ -4131,6 +4290,7 @@ JSON:"""
         self._reset_cancel_state()
         object.__setattr__(self, '_consecutive_empty_responses', 0)
         object.__setattr__(self, '_consecutive_stall_count', 0)
+        object.__setattr__(self, '_consecutive_artifact_rounds', 0)
 
         if self._sub_agent_spawner:
             self._sub_agent_spawner.reset_turn()
@@ -4317,7 +4477,12 @@ JSON:"""
                 return True
 
             gen_kwargs = {k: v for k, v in kwargs.items() if k not in ("streaming_callback", "temperature", "n_predict", "stream")}
-            gen_kwargs["n_predict"] = n_predict
+
+            if "n_predict" in kwargs:
+                gen_kwargs["n_predict"] = kwargs["n_predict"]
+            else:
+                gen_kwargs["n_predict"] = None
+
             gen_kwargs["temperature"] = temperature
 
             _max_retries = 3
@@ -4545,33 +4710,40 @@ JSON:"""
 
                                 title = "artifact"
                                 lang = "python"
+                                operation_type = "full_rewrite"
                                 for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
                                     if m.group(1).lower() in ("name", "title"):
                                         title = m.group(2)
                                     elif m.group(1).lower() == "language":
                                         lang = m.group(2)
+                                    elif m.group(1).lower() == "operation":
+                                        operation_type = m.group(2).lower()
 
                                 is_patch = "<<<<<<< SEARCH" in body_content
+                                is_append = operation_type == "append"
 
-                                if was_truncated and not is_patch:
+                                if was_truncated and not is_patch and not is_append:
                                     has_truncated_artifact = True
                                     truncated_artifact_title = title
                                     action_reports.append(
                                         f"❌ GENERATION TRUNCATED for artifact '{title}'. "
-                                        "You hit the token generation limit (n_predict) before finishing the file. "
+                                        "You hit the token generation limit before finishing the file. "
                                         "The file was NOT saved to disk to prevent corruption. "
-                                        "You MUST use a SEARCH/REPLACE patch to append the remaining content to the file in the next turn. "
-                                        "Start your SEARCH block from the last few lines you managed to generate."
+                                        "You MUST use `operation=\"append\"` in your next <artifact> tag to add the remaining content to the file, or use a SEARCH/REPLACE patch. "
+                                        "Start your append/patch from the last few lines you managed to generate."
                                     )
                                     continue
 
                                 file_path = self._resolved_workspace / title
                                 is_overwrite = file_path.exists()
 
-                                git_block = self._enforce_git_safety(title, is_overwrite)
-                                if git_block:
-                                    action_reports.append(git_block)
-                                    continue
+                                # Git safety only applies to overwrites of existing files via full_rewrite or patch.
+                                # Appending is a modification, but we bypass the strict "are you sure you want to overwrite?" block for appends.
+                                if not is_append:
+                                    git_block = self._enforce_git_safety(title, is_overwrite)
+                                    if git_block:
+                                        action_reports.append(git_block)
+                                        continue
 
                                 if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
                                     try:
@@ -4581,7 +4753,7 @@ JSON:"""
                                                 "art_type": "code", 
                                                 "language": lang, 
                                                 "is_patch": is_patch, 
-                                                "operation": "patch" if is_patch else "full_rewrite",
+                                                "operation": "patch" if is_patch else ("append" if is_append else "full_rewrite"),
                                                 "execution_phase": True
                                             })
                                     except Exception:
@@ -4617,6 +4789,35 @@ JSON:"""
                                                 extra_data={"title": title, "original_length": len(original_content), "patch_body": body_content[:500]}
                                             )
                                         action_reports.append(f"❌ SEARCH/REPLACE FAILED for {title}. Error: {patch_err}")
+                                elif is_append:
+                                    if not file_path.exists():
+                                        action_reports.append(f"[SYSTEM ERROR] File '{title}' not found. Cannot append. Create it first without operation='append'.")
+                                        continue
+
+                                    stripped_body = body_content.strip()
+                                    if not stripped_body:
+                                        action_reports.append(f"❌ APPEND BLOCKED for {title}. The body is empty.")
+                                        continue
+
+                                    original_content = file_path.read_text(encoding="utf-8", errors="ignore")
+                                    # Ensure a newline separation if the original file doesn't end with one
+                                    sep = "" if original_content.endswith("\n") else "\n"
+                                    new_content = original_content + sep + stripped_body + "\n"
+
+                                    file_path.write_text(new_content, encoding="utf-8")
+                                    action_reports.append(f"✅ Content appended successfully to {title}.")
+                                    if self._artefact_manager:
+                                        self._artefact_manager.update(title=title, new_content=new_content, language=lang, bump_version=True, active=True)
+
+                                    actions_executed_count += 1
+                                    file_ext = file_path.suffix.lower()
+                                    _BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".zip", ".tar", ".gz", ".pdf", ".docx", ".pptx", ".mp3", ".wav", ".mp4"}
+                                    if file_ext not in _BINARY_EXTS and len(new_content) < 50000:
+                                        try:
+                                            self._execute_context_visibility("unlock_file", title)
+                                            action_reports.append(f"📂 Auto-loaded '{title}' into context [C].")
+                                        except Exception:
+                                            pass
                                 else:
                                     stripped_body = body_content.strip()
                                     if not stripped_body:
@@ -4772,6 +4973,29 @@ JSON:"""
 
                 sanitized_final_response = re.sub(r'<[^>]+>', '', final_response).strip()
 
+                # 🛑 STATED INTENT VS EXECUTION GUARD (CRITICAL)
+                # Intercept cases where the LLM claims it wrote/repaired a file but failed to emit the actual <artifact> tag.
+                # This typically happens when the LLM fears hitting the token limit on large files and hallucinates the execution.
+                last_assistant_text = virtual_history[-1].content if virtual_history else ""
+                intent_keywords = ["i have created", "j'ai créé", "i've created", "i have repaired", "j'ai réparé", "i've repaired", "i have updated", "j'ai mis à jour", "the file has been recreated", "le fichier a été recréé", "fichier réparé", "file repaired", "recréé avec succès", "recreated successfully"]
+                stated_intent = any(kw in last_assistant_text.lower() for kw in intent_keywords)
+                artifact_actually_emitted = bool([act for act in ss.completed_actions if act.get("type") == "artifact"])
+
+                if stated_intent and not artifact_actually_emitted and not workspace_changes:
+                    ASCIIColors.warning(f"[{self.name}] 🚫 Hallucinated execution detected. LLM claimed file write/repair but no <artifact> tag was executed. Forcing tag emission.")
+
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content=(
+                            "[SYSTEM: CRITICAL EXECUTION ERROR. You stated that you created or repaired a file, but you DID NOT emit the `<artifact>` tag. "
+                            "Stating intent is not execution. You MUST emit the `<artifact>` tag NOW to actually write the file to disk. "
+                            "Do NOT explain what you will do. Output the `<artifact>` tag immediately. If the file is large, you MUST still emit the complete tag. "
+                            "Do NOT emit `<done/>` until the `<artifact>` tag has been fully emitted.]"
+                        )
+                    ))
+                    ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
+                    continue
+
                 if not sanitized_final_response and not tool_calls_this_turn and not workspace_changes and round_count == 1 and not virtual_history:
                     if getattr(self, 'debug_mode', False):
                         self._dump_error(
@@ -4782,12 +5006,8 @@ JSON:"""
                         )
                     ASCIIColors.warning(f"[{self.name}] 🚫 Empty response with <done/> detected on round 1. Forcing continuation.")
 
-                    # 🛑 FIX: Capture stated intent from the raw round text to prevent the LLM 
-                    # from abandoning its task when generation halts prematurely.
-                    last_assistant_text = virtual_history[-1].content if virtual_history else ""
                     intent_hint = ""
                     if last_assistant_text:
-                        # Look for common intent phrases
                         import re as _re_intent
                         intent_match = _re_intent.search(r'(Let me|Now I will|I will|Let\'s|Next, I)\s+.*', last_assistant_text, _re_intent.IGNORECASE)
                         if intent_match:
@@ -4937,21 +5157,26 @@ JSON:"""
 
                             title = "artifact"
                             lang = "python"
+                            operation_type = "full_rewrite"
                             for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
                                 if m.group(1).lower() in ("name", "title"):
                                     title = m.group(2)
                                 elif m.group(1).lower() == "language":
                                     lang = m.group(2)
+                                elif m.group(1).lower() == "operation":
+                                    operation_type = m.group(2).lower()
 
                             is_patch = "<<<<<<< SEARCH" in body_content
+                            is_append = operation_type == "append"
 
                             file_path = self._resolved_workspace / title
                             is_overwrite = file_path.exists()
 
-                            git_block = self._enforce_git_safety(title, is_overwrite)
-                            if git_block:
-                                action_reports.append(git_block)
-                                continue
+                            if not is_append:
+                                git_block = self._enforce_git_safety(title, is_overwrite)
+                                if git_block:
+                                    action_reports.append(git_block)
+                                    continue
 
                             art_type_match = re.search(r'type=["\']([^"\']*)["\']', attrs_str, re.IGNORECASE)
                             resolved_art_type = art_type_match.group(1) if art_type_match else "code"
@@ -4964,7 +5189,7 @@ JSON:"""
                                             "art_type": resolved_art_type, 
                                             "language": lang, 
                                             "is_patch": is_patch, 
-                                            "operation": "patch" if is_patch else "full_rewrite",
+                                            "operation": "patch" if is_patch else ("append" if is_append else "full_rewrite"),
                                             "execution_phase": True
                                         })
                                 except Exception:
@@ -4996,6 +5221,34 @@ JSON:"""
                                             extra_data={"title": title, "original_length": len(original_content), "patch_body": body_content[:500]}
                                         )
                                     action_reports.append(f"❌ SEARCH/REPLACE FAILED for {title}. Error: {patch_err}")
+                            elif is_append:
+                                if not file_path.exists():
+                                    action_reports.append(f"[SYSTEM ERROR] File '{title}' not found. Cannot append. Create it first without operation='append'.")
+                                    continue
+
+                                stripped_body = body_content.strip()
+                                if not stripped_body:
+                                    action_reports.append(f"❌ APPEND BLOCKED for {title}. The body is empty.")
+                                    continue
+
+                                original_content = file_path.read_text(encoding="utf-8", errors="ignore")
+                                sep = "" if original_content.endswith("\n") else "\n"
+                                new_content = original_content + sep + stripped_body + "\n"
+
+                                file_path.write_text(new_content, encoding="utf-8")
+                                action_reports.append(f"✅ Content appended successfully to {title}.")
+                                if self._artefact_manager:
+                                    self._artefact_manager.update(title=title, new_content=new_content, language=lang, bump_version=True, active=True)
+
+                                actions_executed_count += 1
+                                file_ext = file_path.suffix.lower()
+                                _BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".zip", ".tar", ".gz", ".pdf", ".docx", ".pptx", ".mp3", ".wav", ".mp4"}
+                                if file_ext not in _BINARY_EXTS and len(new_content) < 50000:
+                                    try:
+                                        self._execute_context_visibility("unlock_file", title)
+                                        action_reports.append(f"📂 Auto-loaded '{title}' into context [C].")
+                                    except Exception:
+                                        pass
                             else:
                                 stripped_body = body_content.strip()
                                 if not stripped_body:
@@ -5227,12 +5480,18 @@ JSON:"""
 
             stripped_round_text = raw_round_text.strip()
             if stripped_round_text and len(virtual_history) > 0:
+                last_assistant_text = None
                 for vh in reversed(virtual_history):
                     if vh.sender_type == "assistant" and vh.content.strip():
-                        last_text = vh.content.strip()
-                        if stripped_round_text == last_text or (len(stripped_round_text) > 50 and stripped_round_text in last_text) or (len(last_text) > 50 and last_text in stripped_round_text):
-                            text_is_repetitive = True
+                        last_assistant_text = vh.content.strip()
                         break
+                if last_assistant_text:
+                    if stripped_round_text == last_assistant_text:
+                        text_is_repetitive = True
+                    elif len(stripped_round_text) > 80 and stripped_round_text in last_assistant_text:
+                        text_is_repetitive = True
+                    elif len(last_assistant_text) > 80 and last_assistant_text in stripped_round_text:
+                        text_is_repetitive = True
 
             if not text_is_repetitive and stripped_round_text:
                 lines_in_response = stripped_round_text.splitlines()
@@ -5251,6 +5510,20 @@ JSON:"""
                 if not final_response:
                     final_response = "[Task terminated: The agent produced repetitive text without making progress. This indicates the LLM lost context of previous tool results.]"
                 break
+
+            # ── 🧹 AUTONOMOUS CONTEXT COMPACTION ──
+            ctx_health = self._calculate_context_fill(stable_system_prompt, base_conversation, virtual_history, raw_round_text)
+            if ctx_health["fill_percentage"] > 85.0 and len(virtual_history) > 0 and not getattr(self, '_compaction_triggered_this_turn', False):
+                ASCIIColors.warning(f"[{self.name}] Context fill at {ctx_health['fill_percentage']}%. Triggering autonomous compaction.")
+                object.__setattr__(self, '_compaction_triggered_this_turn', True)
+
+                virtual_history = self._compact_virtual_history(virtual_history, base_conversation, streaming_callback)
+
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content="[SYSTEM: Context has been compacted. Please continue your task based on the summarized history. If you were finished, output your final answer and <done/>.]"
+                ))
+                continue
 
             if round_count > 1 and tool_calls_this_turn and not was_cancelled and not has_new_actions_this_round:
                 consecutive_stall_count = getattr(self, '_consecutive_stall_count', 0) + 1
@@ -5293,7 +5566,7 @@ JSON:"""
                 ASCIIColors.warning(f"[{self.name}] Context fill at {ctx_health['fill_percentage']}%. Triggering autonomous compaction.")
                 object.__setattr__(self, '_compaction_triggered_this_turn', True)
 
-                virtual_history = self._compact_virtual_history(virtual_history, streaming_callback)
+                virtual_history = self._compact_virtual_history(virtual_history, base_conversation, streaming_callback)
 
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
@@ -5317,9 +5590,8 @@ JSON:"""
                     ASCIIColors.warning(f"[{self.name}] Empty LLM response detected after action (attempt {empty_response_count}). Injecting continuation mandate.")
                 else:
                     object.__setattr__(self, '_consecutive_empty_responses', 0)
-                    
-                clean_history_text = self._sanitize_history_for_context(raw_round_text)
-                virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant provided no output]"))
+                    clean_history_text = self._sanitize_history_for_context(raw_round_text)
+                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant provided no output]"))
 
                 recent_tool_names = [tc.get("name", "") for tc in tool_calls_this_turn[-3:]]
                 recent_context = f" Recent actions executed: {recent_tool_names}." if recent_tool_names else ""
@@ -5339,7 +5611,13 @@ JSON:"""
                     ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: No <done/> detected, injecting continuation mandate ===")
                 continue
 
-            if "<tool" in raw_round_text.lower() or "<art" in raw_round_text.lower():
+            has_artifact_this_round = any(act.get("type") == "artifact" for act in ss.completed_actions)
+            if has_artifact_this_round:
+                virtual_history = self._apply_rolling_artifact_compaction(virtual_history, base_conversation)
+
+            has_malformed_tag = "<tool" in raw_round_text.lower() or "<art" in raw_round_text.lower()
+
+            if has_malformed_tag:
                 if not raw_round_text.strip():
                     empty_response_count = getattr(self, '_consecutive_empty_responses', 0) + 1
                     object.__setattr__(self, '_consecutive_empty_responses', empty_response_count)
@@ -5364,6 +5642,34 @@ JSON:"""
                 ))
                 if getattr(self, 'debug_mode', False):
                     ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Malformed tag detected, injecting format correction ===")
+                continue
+
+            if len(tool_calls_this_turn) > 0 and not was_cancelled:
+                consecutive_stall_count = getattr(self, '_consecutive_stall_count', 0) + 1
+                object.__setattr__(self, '_consecutive_stall_count', consecutive_stall_count)
+
+                if consecutive_stall_count >= 3:
+                    ASCIIColors.warning(f"[{self.name}] Terminating after {consecutive_stall_count} consecutive text-only stalls after tools. LLM is stuck in preamble mode.")
+                    final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
+                    if not final_response:
+                        final_response = "[Task terminated: The agent repeatedly produced text preambles without executing any actions.]"
+                    break
+
+                ASCIIColors.warning(f"[{self.name}] LLM stopped without <done/> after tools were executed (stall #{consecutive_stall_count}). Injecting continuation mandate.")
+                clean_history_text = self._sanitize_history_for_context(raw_round_text)
+                virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant produced text-only preamble]"))
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content=(
+                        "[SYSTEM: CRITICAL. You stopped generation without emitting a <done/> tag and without executing any tool or artifact. "
+                        "You have tools available and previous tool results in your context. "
+                        "If your task is complete, output a final conversational summary and end with a <done/> tag on a new line. "
+                        "If you need to continue working, emit the next `<tool>` or `<artifact>` tag NOW. "
+                        "Do NOT write prose preambles like 'Je vais...' or 'Let me...' without following through with the actual action tag.]"
+                    )
+                ))
+                if getattr(self, 'debug_mode', False):
+                    ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Text-only after tools, injecting continuation mandate ===")
                 continue
 
             if not final_response:
@@ -5398,20 +5704,25 @@ JSON:"""
 
                         title = "artifact"
                         lang = "python"
+                        operation_type = "full_rewrite"
                         for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
                             if m.group(1).lower() in ("name", "title"):
                                 title = m.group(2)
                             elif m.group(1).lower() == "language":
                                 lang = m.group(2)
+                            elif m.group(1).lower() == "operation":
+                                operation_type = m.group(2).lower()
 
                         is_patch = "<<<<<<< SEARCH" in body_content
+                        is_append = operation_type == "append"
                         file_path = self._resolved_workspace / title
                         is_overwrite = file_path.exists()
 
-                        git_block = self._enforce_git_safety(title, is_overwrite)
-                        if git_block:
-                            action_reports.append(git_block)
-                            continue
+                        if not is_append:
+                            git_block = self._enforce_git_safety(title, is_overwrite)
+                            if git_block:
+                                action_reports.append(git_block)
+                                continue
 
                         event_mode = kwargs.get("event_mode", EventMode.PROCESSING_TAG_MODE)
                         if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
@@ -5422,7 +5733,7 @@ JSON:"""
                                         "art_type": "code", 
                                         "language": lang, 
                                         "is_patch": is_patch, 
-                                        "operation": "patch" if is_patch else "full_rewrite",
+                                        "operation": "patch" if is_patch else ("append" if is_append else "full_rewrite"),
                                         "execution_phase": True
                                     })
                             except Exception:
@@ -5448,6 +5759,20 @@ JSON:"""
                                         extra_data={"title": title, "original_length": len(original_content), "patch_body": body_content[:500]}
                                     )
                                 action_reports.append(f"❌ SEARCH/REPLACE FAILED for {title}. Error: {patch_err}")
+                        elif is_append:
+                            if not file_path.exists():
+                                action_reports.append(f"[SYSTEM ERROR] File '{title}' not found. Cannot append.")
+                                continue
+                            if not body_content.strip():
+                                action_reports.append(f"❌ APPEND BLOCKED for {title}. Empty body.")
+                                continue
+                            original_content = file_path.read_text(encoding="utf-8", errors="ignore")
+                            sep = "" if original_content.endswith("\n") else "\n"
+                            new_content = original_content + sep + body_content.strip() + "\n"
+                            file_path.write_text(new_content, encoding="utf-8")
+                            action_reports.append(f"✅ Content appended successfully to {title}.")
+                            if self._artefact_manager:
+                                self._artefact_manager.update(title=title, new_content=new_content, language=lang, bump_version=True, active=True)
                         else:
                             if not body_content.strip():
                                 action_reports.append(f"❌ FILE WRITE BLOCKED for {title}. Empty artifact body.")

@@ -171,7 +171,10 @@ def tool_read_document_content(
             
             full_text = "\n\n".join(pages_text)
             if len(full_text) > max_chars:
-                return {"success": True, "total_pages": total_pages, "content": full_text, "output": full_text}
+                full_text = full_text[:max_chars] + f"\n\n... [truncated, {len(full_text) - max_chars} more chars]"
+            if not full_text.strip():
+                return {"success": False, "error": f"Pages {page_or_sheet or '1-' + str(total_pages)} extracted but contained no readable text. The PDF may be image-based (scanned) and require OCR, or the page range is outside the document bounds."}
+            return {"success": True, "total_pages": total_pages, "pages_read": [p + 1 for p in target_pages], "content": full_text, "output": full_text}
 
         elif ext == ".docx":
             import docx
@@ -217,6 +220,8 @@ def tool_read_document_content(
 
         else:
             text = path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
+            if not text.strip():
+                return {"success": False, "error": f"File '{file_name}' exists but contains no readable text."}
             return {"success": True, "content": text, "output": text}
 
     except Exception as e:
