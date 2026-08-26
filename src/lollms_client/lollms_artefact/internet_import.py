@@ -896,64 +896,150 @@ class InternetImportMixin:
             trace_exception(e)
         return None
 
-    def import_url(self, url: str, auto_load: bool = True) -> Optional[Dict[str, Any]]:
+    def import_url(
+        self,
+        url: str,
+        depth: int = 0,
+        auto_load: bool = True,
+        title: Optional[str] = None,
+        max_pages: int = 20,
+        **kwargs: Any
+    ) -> Optional[Dict[str, Any]]:
         """
-        Fetches an arbitrary web URL, extracts the main text content, and saves it
-        as a Markdown artifact with a sanitized filename derived from the URL.
+        Fetches an arbitrary web URL (and optionally crawls linked pages up to depth),
+        extracts text content, and saves it as a Markdown artifact.
 
         Args:
             url (str): The full URL to import (e.g., https://lollms.com/the-folding/).
-            auto_load (bool): Whether to activate the artifact immediately.
+            depth (int): Crawling depth (0 = single page, 1 = direct links, etc.). Defaults to 0.
+            auto_load (bool): Whether to activate the artifact immediately. Defaults to True.
+            title (Optional[str]): Custom title/filename for the artifact.
+            max_pages (int): Safety ceiling on total pages crawled when depth > 0. Defaults to 20.
+            **kwargs: Additional parameters for backwards compatibility.
 
         Returns:
             Optional[Dict]: The created/updated artifact dict, or None on failure.
         """
         try:
+            import pipmaster as pm
+            pm.ensure_packages(["beautifulsoup4", "requests"])
+            from bs4 import BeautifulSoup
+            from urllib.parse import urlparse, urljoin, urldefrag
+
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
             }
-            response = requests.get(url, headers=headers, timeout=15)
-            response.raise_for_status()
 
-            html_content = response.text
+            skip_exts = {
+                ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp", ".ico",
+                ".pdf", ".zip", ".tar", ".gz", ".7z", ".rar", ".exe", ".bin",
+                ".mp4", ".mp3", ".wav", ".avi", ".mov", ".mkv", ".webm",
+                ".iso", ".dmg", ".pkg", ".deb", ".rpm"
+            }
 
-            # Extract title from HTML if available
-            title_match = re.search(r'<title[^>]*>(.*?)</title>', html_content, re.IGNORECASE | re.DOTALL)
-            page_title = title_match.group(1).strip() if title_match else ""
+            def _fetch_single_page(target_url: str) -> Optional[Tuple[str, str, List[str]]]:
+                try:
+                    resp = requests.get(target_url, headers=headers, timeout=15)
+                    resp.raise_for_status()
 
-            # Strip HTML tags to get plain text
-            import pipmaster as pm
-            pm.ensure_packages("beautifulsoup4")
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(html_content, "html.parser")
+                    content_type = resp.headers.get("Content-Type", "").lower()
+                    if "text" not in content_type and "html" not in content_type and "json" not in content_type:
+                        return None
 
-            # Remove script and style elements
-            for tag in soup.find_all(["script", "style", "nav", "footer", "header"]):
-                tag.decompose()
+                    soup = BeautifulSoup(resp.text, "html.parser")
 
-            text_content = soup.get_text(separator="\n", strip=True)
+                    t_match = soup.find("title")
+                    p_title = t_match.get_text().strip() if t_match else ""
 
-            # Build the Markdown content
-            content_parts = [f"# {page_title or url}\n"]
+                    outgoing_links: List[str] = []
+                    for a_tag in soup.find_all("a", href=True):
+                        href = a_tag["href"].strip()
+                        if href and not href.startswith(("javascript:", "mailto:", "tel:")):
+                            resolved = urljoin(target_url, href)
+                            defragged, _ = urldefrag(resolved)
+                            outgoing_links.append(defragged)
+
+                    for tag in soup.find_all(["script", "style", "nav", "footer", "header", "noscript", "iframe"]):
+                        tag.decompose()
+
+                    page_text = soup.get_text(separator="\n", strip=True)
+                    return p_title, page_text, outgoing_links
+                except Exception as fetch_err:
+                    ASCIIColors.warning(f"[InternetImport] Failed to fetch '{target_url}': {fetch_err}")
+                    return None
+
+            base_parsed = urlparse(url)
+            base_domain = base_parsed.netloc.lower()
+
+            visited: set = set()
+            queue: List[Tuple[str, int]] = [(url, 0)]
+            crawled_pages: List[Dict[str, Any]] = []
+
+            while queue and len(crawled_pages) < max_pages:
+                current_url, current_depth = queue.pop(0)
+
+                norm_url, _ = urldefrag(current_url)
+                if norm_url in visited:
+                    continue
+                visited.add(norm_url)
+
+                res = _fetch_single_page(current_url)
+                if not res:
+                    continue
+
+                page_title, page_text, out_links = res
+                crawled_pages.append({
+                    "url": current_url,
+                    "title": page_title or current_url,
+                    "text": page_text,
+                    "depth": current_depth
+                })
+
+                if current_depth < depth:
+                    for link in out_links:
+                        parsed_link = urlparse(link)
+                        if parsed_link.scheme in ("http", "https"):
+                            if parsed_link.netloc.lower() == base_domain:
+                                link_path = Path(parsed_link.path.lower())
+                                if link_path.suffix not in skip_exts:
+                                    if link not in visited and not any(item[0] == link for item in queue):
+                                        queue.append((link, current_depth + 1))
+
+            if not crawled_pages:
+                ASCIIColors.error(f"[InternetImport] Could not extract content from {url}")
+                return None
+
+            main_page = crawled_pages[0]
+            artifact_title = title or sanitize_artifact_filename(url)
+
+            content_parts = [f"# {main_page['title'] or artifact_title}\n"]
             content_parts.append(f"**Source URL**: {url}\n")
+            if depth > 0:
+                content_parts.append(f"**Crawl Depth**: {depth} | **Pages Crawled**: {len(crawled_pages)}\n")
             content_parts.append(f"**Imported**: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
             content_parts.append("\n---\n")
-            content_parts.append(text_content)
+            content_parts.append(main_page["text"])
+
+            if len(crawled_pages) > 1:
+                content_parts.append("\n\n---\n# Crawled Sub-Pages\n")
+                for sp in crawled_pages[1:]:
+                    content_parts.append(f"\n## [{sp['title']}]({sp['url']})\n")
+                    content_parts.append(f"*Depth: {sp['depth']} | Source: {sp['url']}*\n\n")
+                    content_parts.append(sp["text"])
+                    content_parts.append("\n\n---\n")
+
             full_content = "\n".join(content_parts)
 
-            # Craft a valid markdown filename from the URL
-            filename = sanitize_artifact_filename(url)
-
-            existing = self.artefacts.get(filename)
+            existing = self.artefacts.get(artifact_title)
             if existing is None:
                 art = self.artefacts.add(
-                    title=filename,
+                    title=artifact_title,
                     content=full_content,
                     active=auto_load
                 )
             else:
                 art = self.artefacts.update(
-                    title=filename,
+                    title=artifact_title,
                     new_content=full_content,
                     active=auto_load
                 )
