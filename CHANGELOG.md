@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-08-27 09:31]
+
+- fix: resolve issues in chat mixin, agent state, personality, and default tools
+
 ## [2026-08-26 15:38]
 
 - fix: resolve issues in stream rendering, file import, and personality agent state

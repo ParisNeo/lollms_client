@@ -12,9 +12,9 @@ _DEFAULT_COMMENTER = getpass.getuser()
 def init_tools_library(config: dict = None) -> None:
     try:
         import pipmaster as pm
-        pm.ensure_installed("pymupdf")
-        pm.ensure_installed("python-docx")
-        pm.ensure_installed("python-pptx")
+        pm.ensure_packages("pymupdf")
+        pm.ensure_packages("python-docx")
+        pm.ensure_packages("python-pptx")
     except Exception as e:
         import ascii_colors
         ascii_colors.ASCIIColors.warning(f"[Document Editor] Failed to ensure dependencies: {e}")
