@@ -73,7 +73,36 @@ The actual facts saved by the LLM are stored as Semantic Triples. If the LLM omi
 
 ## 🚀 4. Interaction XML Tags
 
-The LLM interacts with the memory system using custom XML tags inside its response stream. The system parser intercepts these tags, executes the operations on the database, and strips them before displaying the text to the user:
+The LLM interacts with the memory system using custom XML tags inside its response stream. The system parser intercepts these tags, executes the operations on the database, and strips them before displaying the text to the user.
+
+### Controlling Episodic Memory
+
+By default, the system automatically saves substantial conversations as episodic memories (Level 4). You can control this behavior using the `enable_episodic_memory` parameter in the `chat()` method:
+
+```python
+# Disable episodic memory saving (privacy mode)
+response = discussion.chat(
+    user_message="Tell me a joke",
+    enable_episodic_memory=False  # Conversation won't be saved to episodic memory
+)
+
+# Enable episodic memory saving (default behavior)
+response = discussion.chat(
+    user_message="Explain quantum computing",
+    enable_episodic_memory=True  # Conversation will be saved if substantial
+)
+```
+
+**When to disable episodic memory:**
+- Privacy-sensitive applications where conversation history shouldn't persist
+- Temporary/scratch conversations that don't represent meaningful events
+- When you want manual control over what gets saved (use `<mem_new>` tags explicitly)
+- Testing/development scenarios where you don't want to pollute the memory database
+
+**When episodic memory is saved (when enabled):**
+- Conversations longer than 200 characters
+- Turns that used tools or created artifacts
+- Non-trivial exchanges (not just greetings like "hi" or "thanks")
 
 ### Create a New Memory
 ```xml

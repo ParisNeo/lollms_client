@@ -315,7 +315,7 @@ class OllamaBinding(LollmsLLMBinding):
                         "stream": True,
                         "options": options if options else None
                     }
-                    if think:
+                    if think is not None:
                         chat_kwargs["think"] = think
 
                     if stream:
@@ -371,7 +371,7 @@ class OllamaBinding(LollmsLLMBinding):
                             "stream": False,
                             "options": options if options else None
                         }
-                        if think:
+                        if think is not None:
                             chat_kwargs["think"] = think
 
                         if self.debug:
@@ -401,7 +401,7 @@ class OllamaBinding(LollmsLLMBinding):
                         "stream": stream,
                         "options": options if options else None
                     }
-                    if think:
+                    if think is not None:
                         chat_kwargs["think"] = think
 
                     if self.debug:
@@ -517,7 +517,7 @@ class OllamaBinding(LollmsLLMBinding):
 
                 if stream:
                     chat_kwargs["stream"] = True
-                    if think:
+                    if think is not None:
                         chat_kwargs["think"] = think
                     response_stream = client.chat(**chat_kwargs)
                     in_thinking = False
@@ -568,7 +568,7 @@ class OllamaBinding(LollmsLLMBinding):
                 else:
                     chat_kwargs["stream"] = False
                     eff_think = think if "gpt-oss" not in self.model_name else reasoning_effort
-                    if eff_think:
+                    if eff_think is not None:
                         chat_kwargs["think"] = eff_think
                     response = client.chat(**chat_kwargs)
                     full_response_text = response.message.content
@@ -965,44 +965,110 @@ class OllamaBinding(LollmsLLMBinding):
     def _get_ctx_size(self, model_name: Optional[str] = None) -> Optional[int]:
         """
         Retrieves the context size for an Ollama model.
-        
-        The effective context size is the `num_ctx` parameter if overridden in the Modelfile,
-        otherwise it falls back to the model's default context length from its architecture details.
-        As a final failsafe, uses a hardcoded list of known popular models' context lengths.
+
+        The effective context size is the ``num_ctx`` parameter if overridden in the
+        Modelfile, otherwise it falls back to the model's default context length from
+        its architecture details. As a final failsafe, the base-class heuristic is used.
         """
         if model_name is None:
             model_name = self.model_name
             if not model_name:
                 ASCIIColors.warning("Model name not specified and no default model set.")
                 return None
-            
+
+        # Wrap everything in a try-except to prevent recursion errors from propagating
         try:
-            info = ollama.show(model_name)
-            
-            # Parse num_ctx from the 'parameters' string (e.g., "PARAMETER num_ctx 4096")
-            parameters = info.get('parameters', '')
+            # Use a direct HTTP request instead of the ollama library to avoid object recursion
+            import requests
+
+            url = f"{self.host_address}/api/show"
+            headers = {}
+            if self.service_key:
+                headers['Authorization'] = f'Bearer {self.service_key}'
+
+            response = requests.post(
+                url,
+                json={"name": model_name},
+                headers=headers,
+                verify=self.verify_ssl_certificate,
+                timeout=10
+            )
+            response.raise_for_status()
+            info = response.json()
+
+            # Parse num_ctx from the 'parameters' string (e.g. "num_ctx 4096")
+            parameters = info.get("parameters", "") or ""
             num_ctx = None
-            for param in parameters.split('\n'):
-                if param.strip().startswith('num_ctx'):
-                    num_ctx = int(param.split()[1])
+            for param in str(parameters).split("\n"):
+                stripped = param.strip()
+                if stripped.startswith("num_ctx"):
+                    parts = stripped.split()
+                    if len(parts) >= 2:
+                        try:
+                            num_ctx = int(parts[1])
+                        except (ValueError, IndexError):
+                            pass
                     break
-            
+
             if num_ctx is not None:
                 return num_ctx
-            
-            # Fall back to model_info context_length (e.g., 'llama.context_length')
-            model_info = info.get('model_info', {})
-            arch = model_info.get('general.architecture', '')
-            context_key = f'{arch}.context_length' if arch else 'general.context_length'
-            context_length = model_info.get(context_key)
-            
-            if context_length is not None:
-                return int(context_length)
-            
+
+            # Fall back to model_info context_length
+            model_info = info.get("model_info", {})
+
+            # Handle dict format (most common)
+            if isinstance(model_info, dict):
+                # Try to find architecture
+                arch = model_info.get("general.architecture", "")
+
+                # Try architecture-specific context length first
+                if arch:
+                    context_key = f"{arch}.context_length"
+                    context_length = model_info.get(context_key)
+                    if context_length is not None:
+                        try:
+                            return int(context_length)
+                        except (ValueError, TypeError):
+                            pass
+
+                # Try generic context_length
+                context_length = model_info.get("general.context_length")
+                if context_length is not None:
+                    try:
+                        return int(context_length)
+                    except (ValueError, TypeError):
+                        pass
+
+                # Try any key containing "context_length" as fallback
+                for key, value in model_info.items():
+                    if "context_length" in str(key).lower() and value is not None:
+                        try:
+                            return int(value)
+                        except (ValueError, TypeError):
+                            continue
+
+            # Handle list format (some Ollama versions)
+            elif isinstance(model_info, list):
+                for item in model_info:
+                    if not isinstance(item, dict):
+                        continue
+                    item_key = item.get("key")
+                    item_value = item.get("value")
+
+                    # Check if this is a context_length entry
+                    if item_key and "context_length" in str(item_key).lower() and item_value is not None:
+                        try:
+                            return int(item_value)
+                        except (ValueError, TypeError):
+                            continue
+
+        except requests.exceptions.RequestException as e:
+            ASCIIColors.warning(f"HTTP error fetching model info for '{model_name}': {str(e)}")
         except Exception as e:
-            ASCIIColors.warning(f"Error fetching model info: {str(e)}")
-        
-        return super().get_ctx_size(model_name=model_name)
+            ASCIIColors.warning(f"Error fetching model info for '{model_name}': {str(e)}")
+
+        # Use base class fallback
+        return None  # Let the base class handle the fallback
 
     def ps(self):
         """
