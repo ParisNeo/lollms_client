@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-08-27 23:31]
+
+- docs(lollms_client): update README with expanded architecture and routing details
+
 ## [2026-08-27 02:31]
 
 - refactor(client): update memory mixins and llm binding configurations
