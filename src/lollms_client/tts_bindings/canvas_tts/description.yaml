@@ -1,0 +1,47 @@
+title: 'Canvas TTS & Video Recording'
+author: 'ParisNeo'
+version: 1.0.0
+binding_name: 'canvas_tts'
+
+description: |
+  This binding bridges browser-based Text-to-Speech (SpeechSynthesis / external TTS APIs)
+  and HTML5 Canvas rendering for synchronized audio narration and video recording.
+  It provides utilities to generate Web Audio routing graphs, audio payloads, and
+  browser-capturable narration streams using MediaRecorder.
+
+global_input_parameters:
+  - name: "audio_format"
+    type: "str"
+    default: "webm"
+    description: "Target audio/video container format ('webm', 'wav', 'mp4')."
+  - name: "fps"
+    type: "int"
+    default: 30
+    description: "Canvas capture stream framerate."
+  - name: "sample_rate"
+    type: "int"
+    default: 44100
+    description: "Web Audio context sample rate in Hz."
+
+model_input_parameters:
+  - name: "model_name"
+    type: "str"
+    default: "browser_speech_synthesis"
+    description: "TTS Engine / Model identifier ('browser_speech_synthesis', 'external_api', 'web_audio')."
+
+generate_audio_parameters:
+  - name: "text"
+    type: "str"
+    description: "The narration text to synthesize."
+  - name: "voice"
+    type: "str"
+    default: "default"
+    description: "The voice identifier or SpeechSynthesis voice URI."
+  - name: "rate"
+    type: "float"
+    default: 1.0
+    description: "Speech rate multiplier (0.1 to 10.0)."
+  - name: "pitch"
+    type: "float"
+    default: 1.0
+    description: "Speech pitch multiplier (0.0 to 2.0)."

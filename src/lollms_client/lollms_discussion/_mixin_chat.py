@@ -24,11 +24,11 @@ _MAX_BRACKET_BUF = 256
 
 _HEARTBEAT_MESSAGES = [
     "✍️ Writing content...",
-    "🧠 Thinking...",
-    "⏳ Still working...",
-    "🏗️ Building structure...",
+    "🧠 Structuring code...",
+    "⏳ Building components...",
+    "🏗️ Assembling sections...",
     "✨ Crafting artifact...",
-    "🔧 Refining details...",
+    "🔧 Refining logic...",
 ]
 
 # Type-specific initial messages for artifact processing blocks
@@ -64,8 +64,22 @@ _TAG_STARTS = [
     "<note", "<skill", "<scratchpad",
     "<lollms_inline",
     "<lollms_form",
-    "<mem_new", "<mem_update", "<mem_tag", "<mem_load", "<mem_delete",
+    "<mem_new", "<mem_update", "<mem_tag", "<mem_load", "<mem_delete", "<mem_search", "<mem_rel",
 ]
+
+# CRITICAL: Memory tags that should NEVER be treated as tool calls
+# These are infrastructure tags processed silently by the memory system.
+# The LLM must NEVER wrap them in <tool>...</tool> blocks.
+_MEMORY_TAGS = {
+    "<mem_new", "<mem_update", "<mem_tag", "<mem_load", "<mem_delete", "<mem_search", "<mem_rel"
+}
+
+# Tool names that should NEVER be called (they're memory tags, not tools)
+_FORBIDDEN_TOOL_NAMES = {
+    "memory_search", "mem_search", "mem_new", "mem_update", "mem_tag", 
+    "mem_load", "mem_delete", "mem_rel", "memory_new", "memory_update",
+    "memory_tag", "memory_load", "memory_delete", "memory_rel"
+}
 
 _SECONDARY_TAG_MAP = {
     "<artifact":      ("artifact_update",     MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK, MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,    "</artifact>"),
@@ -485,6 +499,12 @@ class _ArtefactStreamTracker:
         self.current_art_type = "code"
         self.seen_symbol_keys: set = set()
 
+        # ── 🎨 MEANINGFUL PROGRESS TRACKING ──
+        # Track the last meaningful structural element reported to avoid spam
+        self.last_reported_symbol = None
+        self.last_progress_update_time = 0.0
+        self.min_progress_interval = 2.0  # Minimum 2 seconds between progress updates
+
     def reset(self):
         self.is_inside_artefact = False
         self.current_buffer = ""
@@ -494,6 +514,8 @@ class _ArtefactStreamTracker:
         self.current_language = None
         self.current_art_type = "code"
         self.seen_symbol_keys.clear()
+        self.last_reported_symbol = None
+        self.last_progress_update_time = 0.0
 
     def open(self, title: str, language: Optional[str], art_type: str = "code"):
         self.is_inside_artefact = True
@@ -504,11 +526,16 @@ class _ArtefactStreamTracker:
         self.last_event_detail = None
         self.last_event_time = 0.0
         self.seen_symbol_keys.clear()
+        self.last_reported_symbol = None
+        self.last_progress_update_time = 0.0
 
     def feed(self, chunk: str) -> Optional[Dict[str, Any]]:
         """
         Feeds a chunk and returns event metadata if a new boundary is crossed,
         including any newly discovered symbols.
+
+        CRITICAL: Only reports meaningful structural changes (functions, classes, sections).
+        Does NOT report line numbers or generic progress to avoid UI spam.
         """
         if not self.is_inside_artefact:
             return None
@@ -516,7 +543,10 @@ class _ArtefactStreamTracker:
         self.current_buffer += chunk
 
         now = _time.time()
-        if now - self.last_event_time < 0.02:
+
+        # ── 🛡️ THROTTLE: Minimum 2 seconds between updates ──
+        # This prevents flooding the UI with useless progress updates
+        if now - self.last_progress_update_time < self.min_progress_interval:
             return None
 
         symbols = _detect_structural_symbols(self.current_buffer, self.current_language, self.current_art_type)
@@ -528,22 +558,53 @@ class _ArtefactStreamTracker:
                 new_symbols.append(sym)
 
         meta = _extract_artefact_meta(self.current_buffer, self.current_language, self.current_art_type)
-        detail = meta.get("current_section") or (f"Line {meta['line_count']}" if meta['line_count'] > 0 else None)
 
-        if new_symbols or detail != self.last_event_detail or (now - self.last_event_time > 1.0):
-            self.last_event_detail = detail
-            self.last_event_time = now
-            latest_sym = new_symbols[-1] if new_symbols else (symbols[-1] if symbols else None)
+        # ── 🎯 MEANINGFUL PROGRESS ONLY ──
+        # Only report if we have a NEW structural symbol (function, class, section, etc.)
+        # Do NOT report line numbers or generic progress
+        detail = None
+
+        if new_symbols:
+            # We have a new structural element - this is meaningful progress
+            latest_new_symbol = new_symbols[-1]
+            detail = latest_new_symbol["detail"]
+
+            # Update progress tracking
+            self.last_reported_symbol = latest_new_symbol
+            self.last_progress_update_time = now
+
             return {
                 "title": self.current_title,
                 "art_type": self.current_art_type,
                 "language": self.current_language,
-                "status": f"Writing {self.current_title}: {detail}" if detail else f"Writing {self.current_title}...",
+                "status": f"Writing {self.current_title}: {detail}",
                 "detail": detail,
                 "new_symbols": new_symbols,
-                "latest_symbol": latest_sym,
+                "latest_symbol": latest_new_symbol,
                 **meta
             }
+
+        # No new symbols - check if we should report periodic progress
+        # Only report if enough time has passed AND we have a current section
+        current_section = meta.get("current_section")
+        if current_section and current_section != self.last_event_detail:
+            # The current section changed (we moved to a new function/class)
+            # This is meaningful progress
+            self.last_event_detail = current_section
+            self.last_progress_update_time = now
+
+            return {
+                "title": self.current_title,
+                "art_type": self.current_art_type,
+                "language": self.current_language,
+                "status": f"Writing {self.current_title}: {current_section}",
+                "detail": current_section,
+                "new_symbols": [],
+                "latest_symbol": symbols[-1] if symbols else None,
+                **meta
+            }
+
+        # No meaningful progress to report
         return None
 
     def close(self):
@@ -895,6 +956,49 @@ class _StreamState:
         self._fast_artefact_replicas = fast_artefact_replicas if fast_artefact_replicas else _DEFAULT_FAST_REPLICAS
 
 
+    @staticmethod
+    def _sanitize_unicode(text: str) -> str:
+        """
+        Removes invisible Unicode characters that can corrupt XML parsing.
+
+        Strips:
+        - Zero-width spaces (U+200B, U+200C, U+200D)
+        - Byte order marks (U+FEFF)
+        - Directional formatting marks (U+200E, U+200F, U+202A-U+202E)
+        - Word joiners (U+2060)
+        - Other invisible formatting characters
+
+        These characters are sometimes injected by tokenizers or model artifacts
+        and can break functional tag detection, causing malformed XML output.
+        """
+        if not text:
+            return text
+
+        # Remove common invisible Unicode characters
+        invisible_chars = [
+            '\u200b',  # Zero-width space
+            '\u200c',  # Zero-width non-joiner
+            '\u200d',  # Zero-width joiner
+            '\ufeff',  # Byte order mark / zero-width no-break space
+            '\u200e',  # Left-to-right mark
+            '\u200f',  # Right-to-left mark
+            '\u202a',  # Left-to-right embedding
+            '\u202b',  # Right-to-left embedding
+            '\u202c',  # Pop directional formatting
+            '\u202d',  # Left-to-right override
+            '\u202e',  # Right-to-left override
+            '\u2060',  # Word joiner
+            '\u2061',  # Function application
+            '\u2062',  # Invisible times
+            '\u2063',  # Invisible separator
+            '\u2064',  # Invisible plus
+        ]
+
+        for char in invisible_chars:
+            text = text.replace(char, '')
+
+        return text
+
     def _start_artefact_heartbeat(self):
         """Starts a background thread that emits cheering messages every 15s if no content arrives."""
         if self._artefact_heartbeat_thread is not None:
@@ -933,6 +1037,13 @@ class _StreamState:
         if not isinstance(chunk, str) or not chunk:
             return True
 
+        # ── 🧹 UNICODE SANITIZATION (CRITICAL FIX) ──
+        # Remove zero-width spaces, directional marks, and other invisible Unicode
+        # that can break XML tag detection and cause malformed output.
+        # These characters (U+200B, U+200C, U+200D, U+FEFF, etc.) are often injected
+        # by tokenizers or model artifacts and can corrupt functional tags.
+        chunk = self._sanitize_unicode(chunk)
+
         # ── ONE-ACTION-PER-TURN: If an action was already dispatched, consume and discard ──
         if self._action_dispatched:
             self._pending_buffer += chunk
@@ -941,8 +1052,8 @@ class _StreamState:
         # CRITICAL FIX: Append to shadow buffer instead of directly to ai_message.content
         self._pending_buffer += chunk
 
-        # ── 🛑 DONE TAG DETECTION ──
-        # Detect <done/> or <done> at the start of a line to signal explicit termination.
+        # ── 🛑 DONE TAG DETECTION (SUPPORTS ALL VARIANTS) ──
+        # Detect <done/>, <done>, <end/>, <end>, </end> at the start of a line to signal explicit termination.
         # We strip it from the buffer so it never leaks into the UI or database.
         if not self._is_accumulating_tool and not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_secondary and not self._in_code_fence:
             done_match = re.search(r'(?m)^\s*<(?:done|end)\s*/?>', self._pending_buffer, re.IGNORECASE)
@@ -1262,7 +1373,31 @@ class _StreamState:
                                     })
 
                                 if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
-                                    sym_line = f"  • {sym['detail']} (line {sym['line']})\n"
+                                    # ── 🎨 USER-FRIENDLY SYMBOL REPORTING ──
+                                    # Report structural elements in a clean, readable format
+                                    sym_type = sym.get("symbol_type", "element")
+                                    sym_name = sym.get("symbol_name", "unknown")
+
+                                    # Create user-friendly descriptions
+                                    if sym_type == "class":
+                                        sym_line = f"  📦 Class: {sym_name}\n"
+                                    elif sym_type == "function":
+                                        sym_line = f"  ⚙️ Function: {sym_name}()\n"
+                                    elif sym_type == "async_function":
+                                        sym_line = f"  ⚡ Async Function: {sym_name}()\n"
+                                    elif sym_type == "method":
+                                        sym_line = f"  🔧 Method: {sym_name}()\n"
+                                    elif sym_type == "major_section":
+                                        sym_line = f"  📑 Section: {sym_name}\n"
+                                    elif sym_type == "section":
+                                        sym_line = f"  📄 Subsection: {sym_name}\n"
+                                    elif sym_type == "react_component":
+                                        sym_line = f"  ⚛️ Component: <{sym_name} />\n"
+                                    elif sym_type == "react_hook":
+                                        sym_line = f"  🪝 Hook: {sym_name}()\n"
+                                    else:
+                                        sym_line = f"  • {sym['detail']}\n"
+
                                     self.ai_message.content += sym_line
                                     _cb(self.callback, sym_line, MSG_TYPE.MSG_TYPE_CHUNK, {
                                         "was_processed": True,
@@ -1270,6 +1405,7 @@ class _StreamState:
                                         "symbol": sym
                                     })
                         else:
+                            # No new symbols, but we have a status update (section change)
                             if self.event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
                                 _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {
                                     **event_meta,
@@ -1277,9 +1413,14 @@ class _StreamState:
                                 })
 
                             if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
-                                status_tag = f'{event_meta["status"]}\n'
-                                self.ai_message.content += status_tag
-                                _cb(self.callback, status_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                # ── 🎯 MEANINGFUL STATUS UPDATES ONLY ──
+                                # Only show status if it's a meaningful structural element
+                                detail = event_meta.get("detail")
+                                if detail and not detail.startswith("Line "):
+                                    # This is a real structural element (function, class, section)
+                                    status_tag = f'{event_meta["status"]}\n'
+                                    self.ai_message.content += status_tag
+                                    _cb(self.callback, status_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
                         # If forward_artefact_chunks is True, also forward the raw chunk
                         if self.forward_artefact_chunks:
@@ -1448,6 +1589,114 @@ class _StreamState:
                 # CRITICAL FIX: Do NOT emit a <processing> block here.
                 # The ChatMixin will handle the execution UI block once the tool call is parsed.
                 # Emitting it here causes a duplicate/empty processing block in the UI.
+
+                return True
+
+        # ── 🧠 MEMORY TAG INTERCEPTION (CRITICAL FIX) ──
+        # Memory tags (<mem_new>, <mem_search>, etc.) must be intercepted HERE
+        # and processed silently WITHOUT triggering tool execution or processing blocks.
+        # They are infrastructure tags that operate on the memory system directly.
+        if not is_inside_thoughts and not self._is_accumulating_tool and not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_secondary and not self._in_code_fence:
+            lower_buffer = self._pending_buffer.lower()
+            memory_tag_entered = False
+            memory_search_triggered = False
+            memory_search_query = None
+            memory_search_level = None
+
+            for mem_tag_prefix in ("<mem_new", "<mem_update", "<mem_tag", "<mem_load", "<mem_delete", "<mem_search", "<mem_rel"):
+                # Match self-closing or paired tags at line start
+                pattern = r'(?m)^\s*(?!`)(?!.*\|)' + re.escape(mem_tag_prefix)
+                open_match = re.search(pattern, lower_buffer)
+                if open_match:
+                    open_idx = open_match.start()
+                    end_of_tag_idx = self._pending_buffer.find(">", open_idx)
+
+                    if end_of_tag_idx != -1:
+                        tag_start_idx = open_idx
+                        opening_tag = self._pending_buffer[tag_start_idx:end_of_tag_idx+1]
+
+                        # Check if this is a self-closing tag (ends with />)
+                        is_self_closing = opening_tag.rstrip().endswith("/>")
+
+                        if is_self_closing:
+                            # Self-closing tag: process immediately
+                            text_before_tag = self._pending_buffer[:tag_start_idx]
+                            if text_before_tag:
+                                self.ai_message.content += text_before_tag
+                                _cb(self.callback, text_before_tag, MSG_TYPE.MSG_TYPE_CHUNK)
+
+                            # Extract search parameters if this is a mem_search tag
+                            if mem_tag_prefix == "<mem_search":
+                                query_match = re.search(r'query=["\']([^"\']+)["\']', opening_tag)
+                                level_match = re.search(r'level=["\'](\d+)["\']', opening_tag)
+                                if query_match:
+                                    memory_search_query = query_match.group(1)
+                                    memory_search_level = int(level_match.group(1)) if level_match else None
+                                    memory_search_triggered = True
+                                    ASCIIColors.info(f"[StreamState] Memory search triggered: query='{memory_search_query}', level={memory_search_level}")
+
+                            # Process the memory tag silently (no UI feedback)
+                            # The tag will be stripped from the final content by _process_memory_tags
+                            self._pending_buffer = self._pending_buffer[end_of_tag_idx+1:]
+                            memory_tag_entered = True
+                            break
+                        else:
+                            # Paired tag: accumulate until closing tag
+                            tag_name_match = re.match(r'<(\w+)', opening_tag)
+                            if tag_name_match:
+                                tag_name = tag_name_match.group(1).lower()
+                                closing_tag = f"</{tag_name}>"
+
+                                # Check if closing tag is already in buffer
+                                close_idx = self._pending_buffer.lower().find(closing_tag.lower(), end_of_tag_idx)
+
+                                if close_idx != -1:
+                                    # Complete tag in buffer: process immediately
+                                    text_before_tag = self._pending_buffer[:tag_start_idx]
+                                    if text_before_tag:
+                                        self.ai_message.content += text_before_tag
+                                        _cb(self.callback, text_before_tag, MSG_TYPE.MSG_TYPE_CHUNK)
+
+                                    # Extract full tag including closing
+                                    close_end_idx = close_idx + len(closing_tag)
+                                    full_tag = self._pending_buffer[tag_start_idx:close_end_idx]
+
+                                    # Process silently (memory tags are stripped later)
+                                    self._pending_buffer = self._pending_buffer[close_end_idx:]
+                                    memory_tag_entered = True
+                                    break
+                                else:
+                                    # Incomplete tag: buffer it
+                                    text_before_tag = self._pending_buffer[:tag_start_idx]
+                                    if text_before_tag:
+                                        self.ai_message.content += text_before_tag
+                                        _cb(self.callback, text_before_tag, MSG_TYPE.MSG_TYPE_CHUNK)
+
+                                    # Keep the partial tag in pending buffer for next chunk
+                                    self._pending_buffer = self._pending_buffer[tag_start_idx:]
+                                    return True
+                    else:
+                        # Partial tag detected: buffer it
+                        text_before_partial = self._pending_buffer[:open_idx]
+                        if text_before_partial:
+                            self.ai_message.content += text_before_partial
+                            _cb(self.callback, text_before_partial, MSG_TYPE.MSG_TYPE_CHUNK)
+                        self._pending_buffer = self._pending_buffer[open_idx:]
+                        return True
+
+            if memory_tag_entered:
+                # If a memory search was triggered, we need to execute it NOW and inject results
+                if memory_search_triggered and memory_search_query:
+                    # Store the search request for the ChatMixin to process
+                    if not hasattr(self.discussion, '_pending_memory_searches'):
+                        object.__setattr__(self.discussion, '_pending_memory_searches', [])
+                    self.discussion._pending_memory_searches.append({
+                        "query": memory_search_query,
+                        "level": memory_search_level
+                    })
+                    # Mark that an action was dispatched to trigger a continuation round
+                    self._action_dispatched = True
+                    return False  # Halt generation to process the search
 
                 return True
 
@@ -1662,8 +1911,12 @@ class _StreamState:
         # This prevents raw XML from leaking when the LLM streams tokens with trailing spaces or partial attributes.
         def _ends_with_partial_tag(buffer: str) -> int:
             """Returns the start index of the partial tag if found, else -1."""
-            # REMOVED "<lollms_inline" so the host application can handle it directly.
-            tags_to_check = ["<artifact", "<artefact", "<tool", "<think", "<note", "<skill", "<scratchpad", "<generate_image", "<edit_image", "<lollms_form", "<unlock_file", "<lock_file", "<hide_file"]
+            # Include memory tags in the check so they don't leak as partial tags
+            tags_to_check = [
+                "<artifact", "<artefact", "<tool", "<think", "<note", "<skill", "<scratchpad", 
+                "<generate_image", "<edit_image", "<lollms_form", "<unlock_file", "<lock_file", "<hide_file",
+                "<mem_new", "<mem_update", "<mem_tag", "<mem_load", "<mem_delete", "<mem_search"
+            ]
 
             # Helper to check if the start of the line is valid for a tag
             def _is_at_line_start(buf: str, idx: int) -> bool:
@@ -1795,6 +2048,16 @@ class _StreamState:
 
             if art:
                 self.affected_artefacts.append(art)
+
+                # ── 📊 LOG ARTIFACT CREATION ACTION ──
+                # Log this action in the turn progress tracker
+                if hasattr(self.discussion, '_turn_actions_log'):
+                    self.discussion._turn_actions_log.append({
+                        "action": "artifact_created",
+                        "title": title,
+                        "type": atype,
+                        "round": getattr(self.discussion, '_current_round', 0)
+                    })
 
             # ── 🛑 CRITICAL FIX: IMMEDIATE PHYSICAL MATERIALIZATION ──
             # The physical twin MUST exist on disk the instant the artifact is created.
@@ -2904,6 +3167,7 @@ class ChatMixin:
         memory_manager=None,
         enable_artefacts:             bool = True,
         enable_memory:                bool = True,
+        enable_episodic_memory:       bool = True,  # 🆕 NEW: Control episodic memory saving
         enable_auto_dream:            bool = True,
         enable_deep_memory_pulling:   bool = True,
         prehydrate_rag:               bool = True,
@@ -2925,6 +3189,58 @@ class ChatMixin:
     ) -> Dict[str, Any]:
         """
         Runs the conversational loop, resolving RAG, tiered memories, and tool calls.
+
+        Args:
+            user_message (str): The user's input message.
+            personality: Optional personality object with system prompt and tools.
+            branch_tip_id: Optional branch tip ID to continue from.
+            tools: Optional dict of additional tools or list of tool names to enable.
+            add_user_message (bool): If True, adds the user message to the discussion. Default True.
+            images: Optional list of image paths/base64 for multimodal input.
+            remove_thinking_blocks (bool): If True, strips <think>...</think> blocks from output. Default True.
+            enable_image_generation (bool): Enable image generation capabilities. Default True.
+            enable_image_editing (bool): Enable image editing capabilities. Default True.
+            auto_activate_artefacts (bool): Automatically activate created artifacts. Default True.
+            enable_inline_widgets (bool): Enable inline widget support. Default False.
+            enable_notes (bool): Enable note-taking functionality. Default True.
+            enable_skills (bool): Enable skill capture functionality. Default True.
+            enable_forms (bool): Enable form generation functionality. Default True.
+            enable_books (bool): Enable book/document generation. Default False.
+            enable_presentations (bool): Enable presentation/slides generation. Default False.
+            memory_manager: Optional memory manager instance for persistent memory.
+            enable_artefacts (bool): Enable artifact creation and management. Default True.
+            enable_memory (bool): Enable memory system (working/deep/archived). Default True.
+            enable_episodic_memory (bool): Enable episodic memory saving (conversation history). Default True.
+                Set to False to prevent automatic saving of conversation turns as episodic memories.
+                Useful for privacy-sensitive applications or when you want manual control over memory persistence.
+            enable_auto_dream (bool): Enable automatic memory dream/consolidation cycles. Default True.
+            enable_deep_memory_pulling (bool): Enable automatic pulling of relevant deep memories. Default True.
+            prehydrate_rag (bool): Pre-hydrate RAG context before generation. Default True.
+            max_reasoning_steps (int): Maximum number of agentic reasoning rounds. Default 20.
+            enable_in_message_status (bool): Show in-message status updates. Default False.
+            enable_sub_agents (bool): Enable spinoff sub-agent tools. Default False.
+            forward_artefact_chunks (bool): Forward artifact chunks to callback. Default False.
+            fast_artefact_replicas (Optional[List[str]]): Custom fast replica messages for artifacts.
+            tolerance_level (Optional[str]): Tolerance level for data tools ('strict', 'lenient'). Default 'strict'.
+            allow_dynamic_tools (bool): Allow dynamic tool registration from artifacts. Default False.
+            enable_data_tools (bool): Enable data manipulation tools (SQL, pandas). Default True.
+            enable_code_execution (bool): Enable arbitrary Python code execution tool. Default False.
+            suppress_images (bool): Suppress image hydration in context. Default False.
+            debug_export (bool): Enable debug export of context dumps. Default False.
+            debug (bool): Enable debug mode with additional logging. Default False.
+            enable_vlm_query (bool): Enable VLM query tool for vision fallback. Default False.
+            event_mode (EventMode): Event reporting mode. Default PROCESSING_TAG_MODE.
+            **kwargs: Additional generation parameters passed to the LLM binding.
+
+        Returns:
+            Dict[str, Any]: Dictionary containing:
+                - user_message: The user message object
+                - ai_message: The AI response message object
+                - sources: List of RAG sources used
+                - artefacts: List of artifacts created/modified
+                - memory_report: Report of memory operations
+                - dream_report: Report of dream cycle (if enabled)
+                - was_cancelled: Boolean indicating if generation was cancelled
         """
         # Store tolerance level on active discussion for downstream execution tools (like execute_python_data_query)
         if not hasattr(self, "tolerance_level") or tolerance_level:
@@ -2952,16 +3268,21 @@ class ChatMixin:
         callback = kwargs.get("streaming_callback")
         temperature = kwargs.get("temperature")
 
-        # ── 1. Safe SQLite Memory Ingestion ──
+        # ── 1. Safe SQLite Memory Ingestion (CONDITIONAL) ──
         # Memory Scoping: If personality has its own memory_manager (Independent Life), use it.
         # Otherwise, fallback to the Discussion's memory_manager (System-Managed Life).
-        if enable_memory and personality and hasattr(personality, "memory_manager") and personality.memory_manager:
-            _mm = personality.memory_manager
-        else:
-            _mm = self._get_memory_manager(memory_manager) if enable_memory else None
+        # CRITICAL: Only initialize memory manager if enable_memory is True
+        _mm = None
+        if enable_memory:
+            if personality and hasattr(personality, "memory_manager") and personality.memory_manager:
+                _mm = personality.memory_manager
+            else:
+                _mm = self._get_memory_manager(memory_manager)
+
         _counter = self.lollmsClient.count_tokens if self.lollmsClient else None
 
-        if _mm:
+        # Only perform memory operations if memory is enabled AND manager exists
+        if enable_memory and _mm:
             try:
                 _mm.apply_decay()
             except Exception:
@@ -3003,9 +3324,10 @@ class ChatMixin:
             skills_ctx = personality.skills_manager.build_context()
             if skills_ctx:
                 sys_prompt += "\n" + skills_ctx
-        
-        # Veracity and Formatting Rules
-        rules = (
+
+        # ── 🧹 CORE RULES (ALWAYS ACTIVE) ──
+        # These are fundamental behavioral rules that apply regardless of feature flags
+        core_rules = (
             "\n=== VERACITY & ATTRIBUTION REQUIREMENTS ===\n"
             "Cite retrieved sources as [1],[2]... "
             "Never fabricate facts. Say 'I don't know' when uncertain.\n"
@@ -3017,46 +3339,21 @@ class ChatMixin:
             "# python code here\n"
             "```\n"
             "Never output raw code or markup directly in conversational text without these code blocks.\n"
-            "\n=== ACTION EXECUTION & TERMINATION PROTOCOL (CRITICAL) ===\n"
-            "1. **INTENT ≠ EXECUTION**: Stating 'I will search...', 'Let me analyze...', or 'I will create...' in conversational text DOES NOT execute the action. "
-            "Conversational declarations are completely inert. You have NO ability to perform actions unless you emit the exact functional XML tags.\n"
-            "2. **MANDATORY TAG EMISSION**: To execute an action, you MUST output the corresponding functional tag (`<tool>`, `<artifact>`, `<note>`, etc.) immediately. "
-            "Do not promise an action in one turn and expect the system to execute it. If you need another round to perform work, you MUST emit the tag that triggers that work.\n"
-            "3. **EXPLICIT TERMINATION WITH `<done/>`**: You are in control of the agentic loop. When you have finished your task and provided your final conversational answer to the user, "
-            "you MUST end your generation with a `<done/>` tag on a new line. If you stop generating without emitting `<done/>`, the system will assume you have more work to do and will "
-            "force you to continue. If you have no further actions to take, simply write your final response and append `<done/>` at the end.\n"
-            "4. **SAME-SESSION CONTINUATION (MULTI-TURN CHAINS)**: When you are executing a sequence of actions across multiple turns (e.g., testing tools one by one), "
-            "you MUST emit the next action's tag in your IMMEDIATE NEXT response. Do NOT wait for the user to prompt you again. The system preserves your exact execution path, "
-            "so you have full visibility of the previous tool results. If you state 'Now testing tool_X...', the VERY NEXT token you generate MUST be `<tool>{\"name\": \"tool_X\"...}`.\n"
-            "5. **ROUND 1 SHORT-CIRCUIT**: If the user's request is purely conversational and requires NO tools or artifacts, simply respond conversationally. The system will terminate after the first round. "
-            "Do NOT emit `<done/>` if you are not in an agentic loop.\n"
-            "\n=== TOOL CALLING DISCIPLINE (CRITICAL) ===\n"
-            "1. **Tool Results ≠ Tool Calls**: When a tool returns JSON output (e.g., {\"success\": true, \"output\": ...}), "
-            "this is a **RESULT**, NOT a new tool call. Do **NOT** re-execute or re-emit the same tool call.\n"
-            "2. **One Call Per Task**: Once a tool executes successfully, the data is retrieved. Your job is to **ANALYZE** and **ANSWER**, not to call the tool again.\n"
-            "3. **Loop Prevention**: Repeating a successful tool call with identical parameters is a **CRITICAL ERROR**. "
-            "The system will block duplicate calls. If you see a tool result, move on to the next step.\n"
-            "4. **File Outputs**: When a tool successfully returns a file (image, plot, screenshot, PDF, audio, etc.), "
-            "the file is ALREADY saved to the workspace by the tool. Do NOT call the same tool "
-            "again with the same parameters to regenerate it. Instead, reference the produced "
-            "file URL in your final answer (e.g. <img src=\"/api/workspace_files/filename.png\" /> "
-            "for images) and STOP generating.\n"
-            "\n=== THINKING & REASONING CONSTRAINT ===\n"
-            "If you decide to output a thought process enclosed in  tags, "
-            "you MUST output all functional XML tags (such as <artifact>, <tool>, or <mem_new>) "
-            "on a NEW LINE strictly AFTER the closing  warn_tag tag. "
-            "NEVER place functional tags inside the  warn_tag reasoning block.\n"
-            "\n=== ANTI-MIMICRY PROTOCOL (CRITICAL) ===\n"
-            "1. **NEVER OUTPUT SYSTEM MARKERS**: You are STRICTLY FORBIDDEN from generating text patterns like `[🔒SYSTEM_ARTIFACT_ANCHOR:...`, `[SYSTEM:`, or `[content stripped...`. These are **INFRASTRUCTURE-ONLY** markers used in history to save space. If you output them, NO ACTION will occur.\n"
-            "2. **USE REAL TAGS**: To create artifacts, you MUST use the actual `<artifact name=\"...\">` XML tags. To call tools, use `<tool>`. Do NOT mimic the placeholder markers from past messages.\n"
-            "3. **TAG ISOLATION**: Functional tags (`<artifact>`, `<tool>`, `<tool_result>`) MUST NEVER appear inside  warn_tag blocks. They must ONLY appear in the final response body AFTER the closing  warn_tag tag.\n"
+            "\n=== UNICODE & CHARACTER HYGIENE ===\n"
+            "1. **NO INVISIBLE CHARACTERS**: NEVER output zero-width spaces (U+200B), directional marks, or other invisible Unicode characters in your response.\n"
+            "2. **CLEAN XML TAGS**: When emitting functional tags, use only standard ASCII characters. Do NOT use special Unicode characters as delimiters or separators.\n"
+            "3. **STANDARD PIPE CHARACTER**: If you need to use a pipe character, use the standard ASCII pipe `|` (U+007C), not any Unicode variant.\n"
         )
 
+        # ── 🎨 FEATURE-SPECIFIC INSTRUCTIONS ──
         extra_instructions = ""
         user_msg_lower = user_message.lower()
 
+        # Artifact Instructions (only if artifacts are enabled)
         if enable_artefacts:
             extra_instructions += self._build_artefact_instructions()
+
+            # Sub-feature instructions (only if their parent feature is enabled)
             if enable_inline_widgets:
                 extra_instructions += self._build_inline_widget_instructions()
             if enable_notes:
@@ -3070,17 +3367,22 @@ class ChatMixin:
             if enable_presentations and any(kw in user_msg_lower for kw in ("presentation", "slide", "slideshow", "deck", "diaporama")):
                 extra_instructions += self._build_presentation_instructions()
 
+            # Handle instructions (only if artifacts are enabled)
             branch_msgs_now = self.get_branch(user_msg.id)
             handle_instructions = _build_handle_instructions(branch_msgs_now)
             if handle_instructions:
                 extra_instructions += handle_instructions
 
-        if _mm:
+        # Memory Instructions (only if memory is enabled AND memory manager exists)
+        if enable_memory and _mm:
             extra_instructions += _mm.build_system_instructions()
+
+        # Image Generation Instructions (only if image generation/editing is enabled AND TTI binding exists)
         if (enable_image_generation or enable_image_editing) and getattr(self.lollmsClient, 'tti', None) is not None:
             extra_instructions += self._build_image_generation_instructions()
 
-        full_system_prompt = sys_prompt + "\n" + rules + "\n" + extra_instructions
+        # Combine core sections (feature rules will be added later after active_tools is built)
+        full_system_prompt = sys_prompt + "\n" + core_rules + "\n" + extra_instructions
 
         # ── 4. RAG Ingestion & Pre-Hydration ──
         rag_context = ""
@@ -3115,13 +3417,15 @@ class ChatMixin:
             if rag_sys_block:
                 full_system_prompt += "\n" + rag_sys_block
 
-        # ── 5. Active Artifacts & Memories Injection ──
+        # ── 5. Active Artifacts & Memories Injection (CONDITIONAL) ──
+        # Only inject artifact context if artifacts are enabled
         if enable_artefacts:
             artefacts_zone = self.artefacts.build_artefacts_context_zone()
             if artefacts_zone:
                 full_system_prompt += "\n=== ACTIVE ARTIFACTS ===\n" + artefacts_zone + "\n"
 
-        if _mm:
+        # Only inject memory context if memory is enabled AND memory manager exists
+        if enable_memory and _mm:
             mem_block = self._build_memory_context_block(_mm, token_counter=_counter)
             if mem_block:
                 full_system_prompt += "\n=== ACTIVE MEMORIES ===\n" + mem_block + "\n"
@@ -3280,6 +3584,88 @@ class ChatMixin:
             spinoff_tools = self._get_spinoff_agent_tools(full_system_prompt, images or [], **kwargs)
             active_tools.update(spinoff_tools)
 
+        # ── 🎯 CONDITIONAL FEATURE RULES (INJECTED AFTER active_tools IS BUILT) ──
+        # Now that we know which features are actually enabled, inject the appropriate rules
+        feature_rules = ""
+
+        # Action Execution & Termination Protocol (only if agentic features are enabled)
+        if enable_artefacts or active_tools or enable_memory:
+            feature_rules += (
+                "\n=== ACTION EXECUTION & TERMINATION PROTOCOL (CRITICAL) ===\n"
+                "1. **INTENT ≠ EXECUTION**: Stating 'I will search...', 'Let me analyze...', or 'I will create...' in conversational text DOES NOT execute the action. "
+                "Conversational declarations are completely inert. You have NO ability to perform actions unless you emit the exact functional XML tags.\n"
+                "2. **MANDATORY TAG EMISSION**: To execute an action, you MUST output the corresponding functional tag (`<tool>`, `<artifact>`, `<note>`, etc.) immediately. "
+                "Do not promise an action in one turn and expect the system to execute it. If you need another round to perform work, you MUST emit the tag that triggers that work.\n"
+                "3. **EXPLICIT TERMINATION**: You are in control of the agentic loop. When you have finished your task and provided your final conversational answer to the user, "
+                "you MUST end your generation with a termination tag on a new line. If you stop generating without emitting a termination tag, the system will assume you have more work to do and will "
+                "force you to continue. If you have no further actions to take, simply write your final response and append a termination tag at the end.\n"
+                "   **SUPPORTED TERMINATION TAGS** (use any of these):\n"
+                "   - `<done/>` (preferred)\n"
+                "   - `<end/>`\n"
+                "   - `</end>`\n"
+                "   **CRITICAL**: The termination tag must be on its own line, with nothing else on that line.\n"
+                "   **EXAMPLE**:\n"
+                "   ```\n"
+                "   Here is my final answer to your question.\n"
+                "   \n"
+                "   <done/>\n"
+                "   ```\n"
+                "4. **SAME-SESSION CONTINUATION (MULTI-TURN CHAINS)**: When you are executing a sequence of actions across multiple turns (e.g., testing tools one by one), "
+                "you MUST emit the next action's tag in your IMMEDIATE NEXT response. Do NOT wait for the user to prompt you again. The system preserves your exact execution path, "
+                "so you have full visibility of the previous tool results. If you state 'Now testing tool_X...', the VERY NEXT token you generate MUST be `<tool>{\"name\": \"tool_X\"...}`.\n"
+                "5. **ROUND 1 SHORT-CIRCUIT**: If the user's request is purely conversational and requires NO tools or artifacts, simply respond conversationally. The system will terminate after the first round. "
+                "Do NOT emit a termination tag if you are not in an agentic loop.\n"
+            )
+
+        # System Notification Handling (only if context unlocking is possible)
+        if enable_artefacts:
+            feature_rules += (
+                "\n=== SYSTEM NOTIFICATION HANDLING ===\n"
+                "1. **RECOGNIZE SYSTEM NOTIFICATIONS**: Messages wrapped in `[SYSTEM NOTIFICATION - NOT A USER MESSAGE]...[END SYSTEM NOTIFICATION]` are infrastructure events, not user input.\n"
+                "2. **DO NOT RESPOND TO NOTIFICATIONS**: If you receive a system notification, simply acknowledge it internally and continue with the pending task. Do NOT treat it as a user question.\n"
+                "3. **CONTENT AVAILABILITY**: When files are unlocked, check the `[CONTENT AVAILABILITY]` section to see which files actually have readable content vs. which are empty.\n"
+                "4. **EMPTY FILES**: If a file is listed as empty, do NOT pretend to have read content from it. Acknowledge that it's empty and move on.\n"
+            )
+
+        # Tool Calling Discipline (only if tools are available)
+        if active_tools:
+            feature_rules += (
+                "\n=== TOOL CALLING DISCIPLINE (CRITICAL) ===\n"
+                "1. **Tool Results ≠ Tool Calls**: When a tool returns JSON output (e.g., {\"success\": true, \"output\": ...}), "
+                "this is a **RESULT**, NOT a new tool call. Do **NOT** re-execute or re-emit the same tool call.\n"
+                "2. **One Call Per Task**: Once a tool executes successfully, the data is retrieved. Your job is to **ANALYZE** and **ANSWER**, not to call the tool again.\n"
+                "3. **Loop Prevention**: Repeating a successful tool call with identical parameters is a **CRITICAL ERROR**. "
+                "The system will block duplicate calls. If you see a tool result, move on to the next step.\n"
+                "4. **File Outputs**: When a tool successfully returns a file (image, plot, screenshot, PDF, audio, etc.), "
+                "the file is ALREADY saved to the workspace by the tool. Do NOT call the same tool "
+                "again with the same parameters to regenerate it. Instead, reference the produced "
+                "file URL in your final answer (e.g. <img src=\"/api/workspace_files/filename.png\" /> "
+                "for images) and STOP generating.\n"
+            )
+
+        # Thinking & Reasoning Constraint (only if agentic features are enabled)
+        if enable_artefacts or active_tools or enable_memory:
+            feature_rules += (
+                "\n=== THINKING & REASONING CONSTRAINT ===\n"
+                "If you decide to output a thought process enclosed in  tags, "
+                "you MUST output all functional XML tags (such as <artifact>, <tool>, or <mem_new>) "
+                "on a NEW LINE strictly AFTER the closing  warn_tag tag. "
+                "NEVER place functional tags inside the  warn_tag reasoning block.\n"
+            )
+
+        # Anti-Mimicry Protocol (only if agentic features are enabled)
+        if enable_artefacts or active_tools:
+            feature_rules += (
+                "\n=== ANTI-MIMICRY PROTOCOL (CRITICAL) ===\n"
+                "1. **NEVER OUTPUT SYSTEM MARKERS**: You are STRICTLY FORBIDDEN from generating text patterns like `[🔒SYSTEM_ARTIFACT_ANCHOR:...`, `[SYSTEM:`, or `[content stripped...`. These are **INFRASTRUCTURE-ONLY** markers used in history to save space. If you output them, NO ACTION will occur.\n"
+                "2. **USE REAL TAGS**: To create artifacts, you MUST use the actual `<artifact name=\"...\">` XML tags. To call tools, use `<tool>`. Do NOT mimic the placeholder markers from past messages.\n"
+                "3. **TAG ISOLATION**: Functional tags (`<artifact>`, `<tool>`, `<tool_result>`) MUST NEVER appear inside  warn_tag blocks. They must ONLY appear in the final response body AFTER the closing  warn_tag tag.\n"
+            )
+
+        # Inject feature rules into the full system prompt
+        if feature_rules:
+            full_system_prompt += feature_rules
+
         tools_prompt = ""
         if active_tools:
             tools_prompt = "\n=== TOOLS AVAILABLE ===\n"
@@ -3356,8 +3742,20 @@ class ChatMixin:
         #    alternation rules (e.g., llama.cpp Jinja templates) and causes KV-cache
         #    poisoning. virtual_history strictly tracks the NEW assistant answers and
         #    tool results generated during the agentic loop.
+        #
+        # 5. 🔄 ROLLING WINDOW PROTOCOL (NEW):
+        #    - The LLM must ALWAYS see its own actions and responses from recent rounds.
+        #    - We maintain a rolling window of the last N rounds (default: 4) in full detail.
+        #    - Older rounds are compressed into summaries to prevent context bloat.
+        #    - This ensures the LLM has full situational awareness without overwhelming the context.
 
         virtual_history = []
+
+        # ── 🔄 ROLLING WINDOW CONFIGURATION ──
+        # Maximum number of recent rounds to keep in full detail
+        ROLLING_WINDOW_SIZE = 4
+        # Maximum total tokens for virtual history before compression kicks in
+        VIRTUAL_HISTORY_TOKEN_BUDGET = 8000
 
         tool_calls_this_turn = []
         round_count = 0
@@ -3368,6 +3766,122 @@ class ChatMixin:
         tool_signature_counts = {}
 
         successful_tool_signatures = set()
+
+        # ── 📊 TURN PROGRESS TRACKER ──
+        # Tracks all actions taken during this turn so the LLM can see what it has accomplished.
+        # This prevents infinite loops where the LLM forgets it already performed an action.
+        turn_actions_log = []
+
+        # Make it accessible to _StreamState via the discussion object
+        object.__setattr__(self, '_turn_actions_log', turn_actions_log)
+
+        # ── 🔍 MEMORY SEARCH DEDUPLICATION TRACKER ──
+        # Tracks executed memory searches to prevent duplicate searches with the same query
+        executed_memory_searches = set()
+        object.__setattr__(self, '_executed_memory_searches', executed_memory_searches)
+
+        # ── 🔄 ROLLING WINDOW HELPER FUNCTION ──
+        def _compress_virtual_history_if_needed():
+            """
+            Compresses older rounds in virtual_history if it exceeds the token budget
+            or if we have more than ROLLING_WINDOW_SIZE rounds.
+
+            Strategy:
+            1. Keep the last ROLLING_WINDOW_SIZE rounds in full detail
+            2. Compress older rounds into summaries
+            3. Always preserve the first round (initial user context)
+            """
+            nonlocal virtual_history
+
+            if not virtual_history:
+                return
+
+            # Estimate token count
+            total_chars = sum(len(vh.content) for vh in virtual_history)
+            estimated_tokens = total_chars // 4
+
+            # Check if compression is needed
+            needs_compression = estimated_tokens > VIRTUAL_HISTORY_TOKEN_BUDGET or len(virtual_history) > (ROLLING_WINDOW_SIZE * 2)
+
+            if not needs_compression:
+                return
+
+            ASCIIColors.info(f"[ChatMixin] Virtual history compression triggered: {len(virtual_history)} messages, ~{estimated_tokens} tokens")
+
+            # Separate into rounds (each round = assistant message + user response)
+            rounds = []
+            current_round = []
+            for vh in virtual_history:
+                current_round.append(vh)
+                if vh.sender_type == "user":
+                    rounds.append(current_round)
+                    current_round = []
+
+            # Add any remaining messages (incomplete round)
+            if current_round:
+                rounds.append(current_round)
+
+            # If we have more rounds than the window size, compress older ones
+            if len(rounds) > ROLLING_WINDOW_SIZE:
+                # Keep the first round (initial context) and the last ROLLING_WINDOW_SIZE rounds
+                rounds_to_compress = rounds[1:-ROLLING_WINDOW_SIZE]  # Skip first, compress middle
+                rounds_to_keep = [rounds[0]] + rounds[-ROLLING_WINDOW_SIZE:]  # Keep first + last N
+
+                # Compress the middle rounds into a summary
+                compressed_summary = "[COMPRESSED EARLIER ROUNDS]\n"
+                compressed_summary += f"The following {len(rounds_to_compress)} rounds were compressed to save context:\n\n"
+
+                for idx, round_msgs in enumerate(rounds_to_compress, 1):
+                    assistant_msg = next((m for m in round_msgs if m.sender_type == "assistant"), None)
+                    user_msg = next((m for m in round_msgs if m.sender_type == "user"), None)
+
+                    if assistant_msg:
+                        # Extract key actions from the assistant message
+                        actions = []
+                        if "<tool>" in assistant_msg.content:
+                            tool_match = re.search(r'<tool>\s*{"name":\s*"([^"]+)"', assistant_msg.content)
+                            if tool_match:
+                                actions.append(f"Called tool: {tool_match.group(1)}")
+                        if "<artifact" in assistant_msg.content or "<artefact" in assistant_msg.content:
+                            art_match = re.search(r'<(?:artifact|artefact)\s+name=["\']([^"\']+)["\']', assistant_msg.content)
+                            if art_match:
+                                actions.append(f"Created artifact: {art_match.group(1)}")
+                        if "<mem_search" in assistant_msg.content:
+                            search_match = re.search(r'<mem_search\s+query=["\']([^"\']+)["\']', assistant_msg.content)
+                            if search_match:
+                                actions.append(f"Searched memory: {search_match.group(1)}")
+
+                        if actions:
+                            compressed_summary += f"Round {idx}: {'; '.join(actions)}\n"
+                        else:
+                            # Fallback: include first 100 chars of response
+                            compressed_summary += f"Round {idx}: {assistant_msg.content[:100]}...\n"
+
+                    if user_msg and "<tool_result" in user_msg.content:
+                        compressed_summary += f"  → Tool executed successfully\n"
+                    elif user_msg and "[MEMORY SEARCH RESULTS" in user_msg.content:
+                        compressed_summary += f"  → Memory search completed\n"
+
+                compressed_summary += "[END COMPRESSED ROUNDS]\n"
+
+                # Rebuild virtual_history with compression
+                new_virtual_history = []
+
+                # Add first round (initial context)
+                new_virtual_history.extend(rounds[0])
+
+                # Add compressed summary as a user message
+                new_virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content=compressed_summary
+                ))
+
+                # Add recent rounds in full detail
+                for round_msgs in rounds_to_keep[1:]:  # Skip first (already added)
+                    new_virtual_history.extend(round_msgs)
+
+                virtual_history = new_virtual_history
+                ASCIIColors.success(f"[ChatMixin] Virtual history compressed: {len(virtual_history)} messages (was {len(rounds)} rounds)")
 
         # Initialize the single, clean database assistant message ONCE before entering the loop
         ai_msg = self.add_message(
@@ -3399,6 +3913,9 @@ class ChatMixin:
         # which causes infinite loops and unwanted version bumps.
         persistent_processed_tags = set()
 
+        # Initialize pending memory searches list for this turn
+        object.__setattr__(self, '_pending_memory_searches', [])
+
         while round_count < max_reasoning_steps:
             # Check cancellation at the start of each reasoning round
             if self.is_generation_cancelled():
@@ -3406,6 +3923,9 @@ class ChatMixin:
                 break
 
             round_count += 1
+
+            # Make round count accessible to _StreamState for logging
+            object.__setattr__(self, '_current_round', round_count)
 
             # Guarantee a clean, un-canceled state before launching each independent generation round
             if self.lollmsClient and getattr(self.lollmsClient, "llm", None):
@@ -3421,6 +3941,38 @@ class ChatMixin:
                 # 🛑 CRITICAL FIX: If no tools are active, ensure tools_prompt is empty 
                 # so it doesn't append an empty string with a newline.
                 pass
+
+            # ── 📊 INJECT TURN PROGRESS TRACKER ──
+            # If any actions have been taken in this turn, inject a progress summary
+            # so the LLM can see what it has already accomplished and avoid repeating actions.
+            if turn_actions_log:
+                progress_summary = "\n[TURN PROGRESS TRACKER]\n"
+                progress_summary += f"You have completed {len(turn_actions_log)} action(s) in this turn:\n\n"
+
+                for idx, action in enumerate(turn_actions_log, 1):
+                    action_type = action.get("action", "unknown")
+                    action_round = action.get("round", "?")
+
+                    if action_type == "memory_search":
+                        query = action.get("query", "")
+                        results_count = action.get("results_count", 0)
+                        progress_summary += f"{idx}. Memory Search (Round {action_round}): Searched for '{query}' → Found {results_count} result(s)\n"
+                    elif action_type == "tool_call":
+                        tool_name = action.get("tool_name", "unknown")
+                        success = action.get("success", False)
+                        status = "✅ Success" if success else "❌ Failed"
+                        progress_summary += f"{idx}. Tool Call (Round {action_round}): {tool_name} → {status}\n"
+                    elif action_type == "artifact_created":
+                        title = action.get("title", "unknown")
+                        progress_summary += f"{idx}. Artifact Created (Round {action_round}): {title}\n"
+                    else:
+                        progress_summary += f"{idx}. {action_type} (Round {action_round})\n"
+
+                progress_summary += "\n💡 **IMPORTANT**: You have already performed the actions listed above. Do NOT repeat them.\n"
+                progress_summary += "If you have gathered enough information to answer the user's question, provide your final answer and emit `<done/>`.\n"
+                progress_summary += "[END TURN PROGRESS TRACKER]\n"
+
+                current_system_prompt += "\n" + progress_summary
 
             messages_list = self.export(
                 format_type="openai_chat",
@@ -3555,6 +4107,241 @@ class ChatMixin:
                 ASCIIColors.info("[ChatMixin] Termination tag detected. Terminating agentic loop.")
                 break
 
+            # ── 🔍 PROCESS PENDING MEMORY SEARCHES (HIGHEST PRIORITY) ──
+            # If the LLM emitted a <mem_search> tag, execute it NOW and inject results.
+            # This MUST happen BEFORE the duplicate artifact check because memory searches
+            # are NOT artifacts - they're infrastructure operations that need immediate processing.
+            if hasattr(self, '_pending_memory_searches') and self._pending_memory_searches:
+                # ── 🧠 CRITICAL FIX: CAPTURE THE LLM'S RESPONSE BEFORE PROCESSING SEARCH ──
+                # The LLM has already generated a response in this round (the one that contained
+                # the <mem_search> tag). We MUST capture this response and add it to virtual_history
+                # BEFORE processing the search, so the LLM can see its own answer in the next round.
+                full_round_text = ss.get_clean_text_so_far()
+                raw_round_text_delta = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
+
+                # Sanitize the response to remove processing blocks and functional tags
+                clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text_delta, flags=re.DOTALL | re.IGNORECASE)
+                clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
+                clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
+                clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                clean_history_text = re.sub(r'<tool>.*?</tool>', '', clean_history_text, flags=re.DOTALL | re.IGNORECASE)
+                clean_history_text = re.sub(r'<mem_[^>]*?/?>', '', clean_history_text, flags=re.IGNORECASE)
+                clean_history_text = clean_history_text.strip()
+
+                # Add the LLM's response to virtual history (this is the response that contained the mem_search tag)
+                if clean_history_text:
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="assistant",
+                        content=clean_history_text
+                    ))
+                    ASCIIColors.debug(f"[ChatMixin] Captured assistant response before memory search: {clean_history_text[:100]}...")
+
+                for search_req in self._pending_memory_searches:
+                    query = search_req["query"]
+                    level = search_req["level"]
+
+                    # ── 🛡️ DUPLICATE SEARCH PREVENTION ──
+                    # Check if we've already executed this exact search in this turn
+                    search_signature = f"{query}::{level}"
+                    if search_signature in executed_memory_searches:
+                        ASCIIColors.warning(f"[ChatMixin] Duplicate memory search detected: '{query}' (level={level}). Skipping.")
+
+                        # Inject a warning into virtual history
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="user",
+                            content=(
+                                f"[SYSTEM: DUPLICATE SEARCH BLOCKED]\n"
+                                f"You have already searched for '{query}' in this turn.\n"
+                                f"The results are already in your context above.\n"
+                                f"Do NOT repeat this search. Analyze the existing results and provide your final answer.\n"
+                                f"If the task is complete, emit `<done/>` now.\n"
+                                f"[END DUPLICATE SEARCH BLOCKED]"
+                            )
+                        ))
+                        continue
+
+                    # Mark this search as executed
+                    executed_memory_searches.add(search_signature)
+
+                    ASCIIColors.info(f"[ChatMixin] Processing memory search: query='{query}', level={level}")
+
+                    # ── 🎨 EMIT UI FEEDBACK EVENT ──
+                    # Emit a processing block to show the user that a memory search is happening
+                    if event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                        proc_open = f'\n<processing type="memory_search" title="Memory Search: {query}">\n'
+                        status_line = f'* Searching memory archives for "{query}"...\n'
+                        ai_msg.content += proc_open + status_line
+                        _cb(callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        _cb(callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                    # Emit structured event for FULL_CALLBACK_MODE
+                    if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                        _cb(callback, "", MSG_TYPE.MSG_TYPE_TOOL_START, {
+                            "tool_name": "memory_search",
+                            "parameters": {"query": query, "level": level}
+                        })
+
+                    # Execute the search
+                    if _mm:
+                        if level is not None:
+                            results = _mm.query(text=query, top_k=5, level=level)
+                        else:
+                            # Search all levels
+                            results = _mm.query(text=query, top_k=10)
+
+                        # Build the search results context
+                        if results:
+                            search_context = f"\n[MEMORY SEARCH RESULTS for query: '{query}']\n"
+                            if level is not None:
+                                level_names = {1: "Working", 2: "Deep", 3: "Archived"}
+                                search_context += f"Searched in: {level_names.get(level, f'Level {level}')} Memory\n"
+                            search_context += f"Found {len(results)} matching memories:\n\n"
+
+                            for idx, mem in enumerate(results, 1):
+                                mem_id = mem.get("id", "")[:8]
+                                content = mem.get("content", "")[:200]  # Truncate long content
+                                importance = mem.get("importance", 0)
+                                tags = mem.get("tags", "")
+                                mem_level = mem.get("level", 3)
+
+                                level_name = {1: "Working", 2: "Deep", 3: "Archived"}.get(mem_level, f"L{mem_level}")
+                                search_context += f"{idx}. [{mem_id}] ({level_name}, importance: {importance:.0%}) {content}"
+                                if tags:
+                                    search_context += f"  #{tags.replace(',', ' #')}"
+                                search_context += "\n"
+
+                            search_context += "\n💡 You can load any of these memories into Working Memory using <mem_load id=\"ID\" />\n"
+                            search_context += "[END MEMORY SEARCH RESULTS]\n"
+
+                            # ── 🎨 EMIT SUCCESS FEEDBACK ──
+                            if event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                                result_line = f'* ✅ Found {len(results)} matching memories.\n'
+                                proc_close = f'<!-- status:success -->\n</processing>\n\n'
+                                ai_msg.content += result_line + proc_close
+                                _cb(callback, result_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                _cb(callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                            if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                                _cb(callback, "", MSG_TYPE.MSG_TYPE_TOOL_END, {
+                                    "tool_name": "memory_search",
+                                    "success": True,
+                                    "output": f"Found {len(results)} matching memories",
+                                    "error": None
+                                })
+
+                            # ── 🎯 CONTEXT-AWARE TASK GUIDANCE ──
+                            # Provide flexible guidance that allows the LLM to decide whether to continue or terminate
+                            search_context += (
+                                f"\n[MEMORY SEARCH COMPLETE - DECISION POINT]\n"
+                                f"You have successfully searched your memory and found {len(results)} relevant result(s).\n"
+                                f"The search results are now visible above.\n\n"
+                                f"**ANALYZE THE USER'S ORIGINAL REQUEST**:\n"
+                                f"- Was the memory search the ONLY thing they asked for?\n"
+                                f"  → If YES: Provide your final answer and emit `<done/>`\n"
+                                f"- Or is this search just ONE STEP in a larger task (e.g., create a plan, build an artifact, call a tool)?\n"
+                                f"  → If YES: Use the retrieved information to continue with the next action (e.g., `<artifact>`, `<tool>`, etc.)\n\n"
+                                f"**EXAMPLES**:\n\n"
+                                f"Scenario 1: User asked 'Do you remember my daughter?'\n"
+                                f"```\n"
+                                f"Yes! I found information about your daughter. She was preparing for the Cambridge A2 Key exam...\n"
+                                f"\n"
+                                f"<done/>\n"
+                                f"```\n\n"
+                                f"Scenario 2: User asked 'Find my daughter's exam info and create a study plan'\n"
+                                f"```\n"
+                                f"I found your daughter's exam information. Now let me create a personalized study plan based on the Cambridge A2 Key format...\n"
+                                f"\n"
+                                f"<artifact name=\"study_plan.md\" type=\"document\">\n"
+                                f"# Cambridge A2 Key Study Plan\n"
+                                f"...\n"
+                                f"</artifact>\n"
+                                f"```\n\n"
+                                f"**CRITICAL RULES**:\n"
+                                f"1. Do NOT emit another `<mem_search>` tag - you have already retrieved the information.\n"
+                                f"2. If you need to load a specific memory into Working Memory for detailed access, use `<mem_load id=\"ID\" />`.\n"
+                                f"3. If the task is complete after the search, emit `<done/>`.\n"
+                                f"4. If the task requires more actions (create artifacts, call tools, etc.), continue with those actions.\n"
+                                f"[END DECISION POINT]\n"
+                            )
+                        else:
+                            search_context = f"\n[MEMORY SEARCH RESULTS for query: '{query}']\n"
+                            search_context += "No matching memories found in any tier.\n"
+                            search_context += "[END MEMORY SEARCH RESULTS]\n"
+
+                            # ── 🎨 EMIT NO-RESULTS FEEDBACK ──
+                            if event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                                result_line = f'* ❌ No matching memories found.\n'
+                                proc_close = f'<!-- status:success -->\n</processing>\n\n'
+                                ai_msg.content += result_line + proc_close
+                                _cb(callback, result_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                _cb(callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                            if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                                _cb(callback, "", MSG_TYPE.MSG_TYPE_TOOL_END, {
+                                    "tool_name": "memory_search",
+                                    "success": True,
+                                    "output": "No matching memories found",
+                                    "error": None
+                                })
+
+                            # ── 🎯 CONTEXT-AWARE GUIDANCE (No results) ──
+                            search_context += (
+                                f"\n[MEMORY SEARCH COMPLETE - DECISION POINT]\n"
+                                f"You have searched your memory but found no matching results.\n\n"
+                                f"**ANALYZE THE USER'S ORIGINAL REQUEST**:\n"
+                                f"- Was the memory search the ONLY thing they asked for?\n"
+                                f"  → If YES: Acknowledge you don't have the information and emit `<done/>`\n"
+                                f"- Or is this search just ONE STEP in a larger task?\n"
+                                f"  → If YES: Continue with the task using alternative approaches (ask user, use tools, etc.)\n\n"
+                                f"**EXAMPLES**:\n\n"
+                                f"Scenario 1: User asked 'Do you remember my daughter?'\n"
+                                f"```\n"
+                                f"I don't have any information about your daughter in my memory. Could you tell me about her?\n"
+                                f"\n"
+                                f"<done/>\n"
+                                f"```\n\n"
+                                f"Scenario 2: User asked 'Find my daughter's exam info and create a study plan'\n"
+                                f"```\n"
+                                f"I don't have information about your daughter's exam in my memory. Could you share the details so I can create a personalized study plan?\n"
+                                f"\n"
+                                f"<done/>\n"
+                                f"```\n\n"
+                                f"**CRITICAL RULES**:\n"
+                                f"1. Do NOT emit another `<mem_search>` tag with the same query - the search is complete.\n"
+                                f"2. If the task is complete, emit `<done/>`.\n"
+                                f"3. If you need more information from the user, ask them directly and emit `<done/>`.\n"
+                                f"4. If you can proceed with alternative approaches, do so.\n"
+                                f"[END DECISION POINT]\n"
+                            )
+
+                        # Inject the search results into virtual history
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="user",
+                            content=search_context
+                        ))
+
+                        ASCIIColors.success(f"[ChatMixin] Injected {len(results)} memory search results into virtual history")
+
+                # Clear the pending searches
+                self._pending_memory_searches = []
+
+                # ── 📊 LOG MEMORY SEARCH ACTION ──
+                # Record this action in the turn progress tracker so the LLM can see it
+                turn_actions_log.append({
+                    "action": "memory_search",
+                    "query": search_req["query"],
+                    "results_count": len(results) if results else 0,
+                    "round": round_count
+                })
+
+                # ── 🔄 COMPRESS VIRTUAL HISTORY IF NEEDED ──
+                # After adding the search results, check if we need to compress older rounds
+                _compress_virtual_history_if_needed()
+
+                # Force a continuation round so the LLM can see the search results
+                continue
+
             # ── 🛑 ARTIFACT LOOP ENFORCEMENT ──
             # If we previously flagged a force-final-answer due to an artifact loop,
             # and the LLM attempts to dispatch another artifact, we instantly break the loop.
@@ -3641,6 +4428,13 @@ class ChatMixin:
                         clean_history_text += f'<artifact name="{title}" type="{atype}" language="{lang}"{ephemeral_attr}>\n{content}\n</artifact>\n'
 
                 # Append the sanitized assistant text (containing the raw <artifact> tag) to virtual_history
+                # Ensure content is always a string, never a dict
+                if isinstance(clean_history_text, dict):
+                    # If somehow a dict got in, extract the content field
+                    clean_history_text = clean_history_text.get("content", str(clean_history_text))
+                elif not isinstance(clean_history_text, str):
+                    clean_history_text = str(clean_history_text)
+
                 virtual_history.append(SimpleNamespace(
                     sender_type="assistant",
                     content=clean_history_text.strip()
@@ -3670,6 +4464,10 @@ class ChatMixin:
 
                 # Update the assistant message to contain the real content (if we injected it)
                 virtual_history[-1].content = clean_history_text.strip()
+
+                # ── 🔄 COMPRESS VIRTUAL HISTORY IF NEEDED ──
+                # After adding the artifact creation, check if we need to compress older rounds
+                _compress_virtual_history_if_needed()
 
                 # 🧠 STATUS CHECK PROTOCOL (Replaces Forced Done)
                 # We anchor the LLM to the fact that the artifact is saved, and ask it if it is finished.
@@ -3769,6 +4567,102 @@ class ChatMixin:
 
                     tool_name = call_data.get("name", "")
                     tool_params = call_data.get("parameters", {})
+
+                    # ── 🛡️ MEMORY TAG AS TOOL INTERCEPTION (CRITICAL FIX) ──
+                    # If the LLM tries to call a memory tag as a tool (e.g., <tool>{"name": "memory_search"...}</tool>),
+                    # we MUST block it and inject a correction. Memory tags are infrastructure tags, not tools.
+                    if tool_name.lower() in _FORBIDDEN_TOOL_NAMES:
+                        ASCIIColors.error(f"[ChatMixin] LLM attempted to call memory tag '{tool_name}' as a tool. Blocking and correcting.")
+
+                        # Emit a failure processing block to the UI
+                        status_err_line = f"* Tool call blocked.\n"
+                        details_block = (
+                            f"Error: '{tool_name}' is a MEMORY SYSTEM TAG, not a tool.\n"
+                            f"Memory tags are processed silently by the memory system and must NEVER be wrapped in <tool> blocks.\n"
+                            f"Use the XML tag directly instead.\n"
+                        )
+                        tool_close_tag = f"{status_err_line}{details_block}<!-- status:failure -->\n</processing>\n\n"
+                        ai_msg.content += tool_close_tag
+                        _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                        # Inject a targeted correction into virtual history
+                        correction_msg = (
+                            f"=== ⚠️ CRITICAL: MEMORY TAG MISUSE ===\n"
+                            f"You attempted to call `{tool_name}` as a tool using `<tool>{{\"name\": \"{tool_name}\", ...}}</tool>`.\n"
+                            f"This is **WRONG**. `{tool_name}` is a **MEMORY SYSTEM TAG**, not a tool.\n\n"
+                            f"**CORRECT USAGE**:\n"
+                            f"Memory tags are used directly as XML tags, NOT wrapped in `<tool>` blocks.\n\n"
+                        )
+
+                        # Provide specific examples for common memory tags
+                        if "search" in tool_name.lower():
+                            correction_msg += (
+                                f"To search memories, use:\n"
+                                f"```\n"
+                                f"<mem_search query=\"your search terms\" />\n"
+                                f"```\n"
+                                f"NOT:\n"
+                                f"```\n"
+                                f"<tool>{{\"name\": \"memory_search\", \"parameters\": {{\"query\": \"...\"}}}}</tool>\n"
+                                f"```\n\n"
+                            )
+                        elif "new" in tool_name.lower():
+                            correction_msg += (
+                                f"To create a new memory, use:\n"
+                                f"```\n"
+                                f"<mem_new importance=\"0.8\">Memory content here</mem_new>\n"
+                                f"```\n"
+                                f"NOT:\n"
+                                f"```\n"
+                                f"<tool>{{\"name\": \"mem_new\", \"parameters\": {{...}}}}</tool>\n"
+                                f"```\n\n"
+                            )
+                        elif "load" in tool_name.lower():
+                            correction_msg += (
+                                f"To load a memory from Deep Memory, use:\n"
+                                f"```\n"
+                                f"<mem_load id=\"abc123de\" />\n"
+                                f"```\n"
+                                f"NOT:\n"
+                                f"```\n"
+                                f"<tool>{{\"name\": \"mem_load\", \"parameters\": {{\"id\": \"...\"}}}}</tool>\n"
+                                f"```\n\n"
+                            )
+
+                        correction_msg += (
+                            f"**AVAILABLE MEMORY TAGS** (use directly, NOT as tools):\n"
+                            f"  • `<mem_new importance=\"...\">content</mem_new>` — Create a new memory\n"
+                            f"  • `<mem_update id=\"ID\">content</mem_update>` — Update an existing memory\n"
+                            f"  • `<mem_tag id=\"ID\" />` — Tag a memory as used\n"
+                            f"  • `<mem_load id=\"ID\" />` — Load a memory from Deep Memory\n"
+                            f"  • `<mem_delete id=\"ID\" />` — Delete a memory\n"
+                            f"  • `<mem_search query=\"terms\" />` — Search archived memories\n"
+                            f"  • `<mem_rel source=\"ID\" target=\"ID\" type=\"TYPE\" />` — Create a relationship\n\n"
+                            f"Please continue your response using the correct memory tag syntax."
+                        )
+
+                        # Sanitize and append to virtual history
+                        full_round_text = ss.get_clean_text_so_far()
+                        raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
+                        clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
+                        clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
+                        clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
+                        clean_history_text = re.sub(r'<tool>.*?</tool>', '', clean_history_text, flags=re.DOTALL | re.IGNORECASE)
+                        clean_history_text = clean_history_text.strip()
+                        if not clean_history_text:
+                            clean_history_text = f"[Attempted to call memory tag '{tool_name}' as a tool]"
+
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="assistant",
+                            content=clean_history_text
+                        ))
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="user",
+                            content=correction_msg
+                        ))
+
+                        # Force another reasoning round to let the LLM correct itself
+                        continue
 
                     full_round_text = ss.get_clean_text_so_far()
                     raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
@@ -4460,6 +5354,18 @@ class ChatMixin:
                         "result": {"output": clean_result_str, "success": tool_success}
                     })
 
+                    # ── 📊 LOG TOOL CALL ACTION ──
+                    turn_actions_log.append({
+                        "action": "tool_call",
+                        "tool_name": tool_name,
+                        "success": tool_success,
+                        "round": round_count
+                    })
+
+                    # ── 🔄 COMPRESS VIRTUAL HISTORY IF NEEDED ──
+                    # After adding the tool result, check if we need to compress older rounds
+                    _compress_virtual_history_if_needed()
+
                     # ── 🛑 SUCCESS LOOP DETECTION & PREVENTION ─────────────────────
                     # Check if the LAST assistant message in history was a tool call to the SAME tool
                     # This prevents the LLM from getting stuck in a "success loop"
@@ -4676,16 +5582,112 @@ class ChatMixin:
                     )
                     ai_msg.content = ai_msg.content.replace("sales_over_time.png", real_fn)
 
-        # Process memories
-        mem_cleaned, mem_report = self._process_memory_tags(ai_msg.content, _mm, callback)
-        if mem_cleaned != ai_msg.content:
-            ai_msg.content = mem_cleaned
+        # Process memories (only if memory is enabled)
+        mem_cleaned, mem_report = ai_msg.content, {}
+        if enable_memory and _mm:
+            mem_cleaned, mem_report = self._process_memory_tags(ai_msg.content, _mm, callback)
+            if mem_cleaned != ai_msg.content:
+                ai_msg.content = mem_cleaned
 
-        if _mm:
+        # ── 🔍 INJECT SEARCH RESULTS ──
+        # If the LLM searched archived memories, inject the results into the context
+        # so it can see what was found and potentially load relevant memories
+        if mem_report.get("searches"):
+            for search_result in mem_report["searches"]:
+                query = search_result.get("query", "")
+                level = search_result.get("level")
+                results = search_result.get("results", [])
+
+                if results:
+                    # Build a context block with the search results
+                    search_context = f"\n[MEMORY SEARCH RESULTS for query: '{query}']\n"
+                    if level is not None:
+                        level_names = {1: "Working", 2: "Deep", 3: "Archived"}
+                        search_context += f"Searched in: {level_names.get(level, f'Level {level}')} Memory\n"
+                    search_context += f"Found {len(results)} matching memories:\n\n"
+
+                    for idx, mem in enumerate(results, 1):
+                        # Handle both dict and object access patterns safely
+                        if isinstance(mem, dict):
+                            mem_id = mem.get("id", "")[:8]
+                            content = mem.get("content", "")[:200]  # Truncate long content
+                            importance = mem.get("importance", 0)
+                            tags = mem.get("tags", "")
+                        else:
+                            # If it's an object, use attribute access
+                            mem_id = getattr(mem, "id", "")[:8]
+                            content = getattr(mem, "content", "")[:200]
+                            importance = getattr(mem, "importance", 0)
+                            tags = getattr(mem, "tags", "")
+
+                        search_context += f"{idx}. [{mem_id}] (importance: {importance:.0%}) {content}"
+                        if tags:
+                            search_context += f"  #{tags.replace(',', ' #')}"
+                        search_context += "\n"
+
+                    search_context += "\nYou can load any of these memories into Working Memory using <mem_load id=\"ID\" />\n"
+                    search_context += "[END MEMORY SEARCH RESULTS]\n"
+
+                    # Append to the AI message content so it's visible in the next round
+                    ai_msg.content += search_context
+
+                    ASCIIColors.info(f"[ChatMixin] Injected {len(results)} memory search results for query: '{query}'")
+
+        # ── 🧠 SELECTIVE EPISODIC MEMORY SAVING (CONDITIONAL) ──
+        # Only save episodic memory if:
+        # 1. Memory system is enabled (enable_memory=True), AND
+        # 2. Episodic memory is explicitly enabled (enable_episodic_memory=True), AND
+        # 3. Memory manager exists (_mm is not None), AND
+        # 4. The conversation is substantial enough (not trivial exchanges)
+        if enable_memory and _mm and enable_episodic_memory:
             try:
-                self._save_episodic_memory_turn(user_message, ai_msg.content, _mm)
+                # Calculate conversation significance
+                user_msg_length = len(user_message.strip())
+                ai_msg_length = len(ai_msg.content.strip())
+                total_length = user_msg_length + ai_msg_length
+
+                # Only save if:
+                # 1. The conversation is substantial (>200 chars total), OR
+                # 2. Tools were used (indicating a task was performed), OR
+                # 3. Artifacts were created (indicating work was done), OR
+                # 4. The conversation contains meaningful content (not just greetings)
+
+                should_save_episodic = False
+
+                # Check for substantial content
+                if total_length > 200:
+                    should_save_episodic = True
+
+                # Check for tool usage
+                if tool_calls_this_turn:
+                    should_save_episodic = True
+
+                # Check for artifact creation
+                if ss and ss.affected_artefacts:
+                    should_save_episodic = True
+
+                # Check for meaningful keywords (not just greetings)
+                trivial_patterns = [
+                    r'^(hi|hello|hey|greetings|good morning|good afternoon|good evening)\s*[.!?]*$',
+                    r'^(thanks|thank you|thx|ty)\s*[.!?]*$',
+                    r'^(ok|okay|k|alright|sure)\s*[.!?]*$',
+                    r'^(yes|no|yeah|nope)\s*[.!?]*$',
+                ]
+                is_trivial = any(re.match(pattern, user_message.strip().lower()) for pattern in trivial_patterns)
+
+                if is_trivial and not tool_calls_this_turn and not (ss and ss.affected_artefacts):
+                    should_save_episodic = False
+
+                if should_save_episodic:
+                    self._save_episodic_memory_turn(user_message, ai_msg.content, _mm)
+                    ASCIIColors.info(f"[ChatMixin] Saved episodic memory (length: {total_length} chars, tools: {len(tool_calls_this_turn)}, artifacts: {len(ss.affected_artefacts) if ss else 0})")
+                else:
+                    ASCIIColors.debug(f"[ChatMixin] Skipped episodic memory (trivial exchange, length: {total_length} chars)")
+
             except Exception as ex:
                 trace_exception(ex)
+        elif _mm and not enable_episodic_memory:
+            ASCIIColors.debug(f"[ChatMixin] Episodic memory saving disabled via enable_episodic_memory=False")
 
         # Update metadata for alternating exports
         # CRITICAL: Preserve virtual_history if it was set in the cancellation/non-cancellation block above.
@@ -4699,9 +5701,9 @@ class ChatMixin:
         if existing_virtual_history:
             ai_msg.metadata["virtual_history"] = existing_virtual_history
 
-        # Auto dream
+        # Auto dream (only if memory is enabled)
         dream_report = None
-        if enable_auto_dream and _mm is not None:
+        if enable_memory and enable_auto_dream and _mm is not None:
             try:
                 dream_report = _mm.dream(self.lollmsClient)
             except Exception as ex:

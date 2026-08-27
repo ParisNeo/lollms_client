@@ -18,6 +18,13 @@ import json
 
 @lru_cache(maxsize=1)
 def load_known_contexts() -> dict:
+    """
+    Loads the known_contexts data from a JSON file.
+
+    Returns:
+        dict: A dictionary containing the known_contexts data with 'exact', 'aliases', 
+              and 'prefix' keys. Returns empty dict structure on error.
+    """
     file_path = Path(__file__).parent / "assets" / "models_ctx_sizes.json"
     try:
         with file_path.open("r", encoding="utf-8") as f:
@@ -26,6 +33,7 @@ def load_known_contexts() -> dict:
         if not isinstance(data, dict):
             raise ValueError(f"Expected top-level dict in {file_path}")
 
+        # Ensure all required keys exist
         data.setdefault("exact", {})
         data.setdefault("aliases", {})
         data.setdefault("prefix", {})
@@ -33,39 +41,14 @@ def load_known_contexts() -> dict:
         return data
 
     except FileNotFoundError:
-        print(f"Error: File not found at {file_path}")
-    except json.JSONDecodeError:
-        print(f"Error: Could not decode JSON from {file_path}")
+        ASCIIColors.warning(f"Context sizes file not found at {file_path}, using empty defaults")
+    except json.JSONDecodeError as e:
+        ASCIIColors.warning(f"Could not decode JSON from {file_path}: {e}, using empty defaults")
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        ASCIIColors.warning(f"Unexpected error loading context sizes: {e}, using empty defaults")
 
+    # Always return a proper dict structure, never a list
     return {"exact": {}, "aliases": {}, "prefix": {}}
-
-
-def load_known_contexts():
-    """
-    Loads the known_contexts data from a JSON file.
-
-    Args:
-        file_path (str): The path to the JSON file.
-
-    Returns:
-        dict: A dictionary containing the known_contexts data, or None if an error occurs.
-    """
-    try:
-        file_path = Path(__file__).parent / "assets" / "models_ctx_sizes.json"
-        with open(file_path, "r") as f:
-            known_contexts = json.load(f)
-        return known_contexts
-    except FileNotFoundError:
-        print(f"Error: File not found at {file_path}")
-        return []
-    except json.JSONDecodeError:
-        print(f"Error: Could not decode JSON from {file_path}")
-        return []
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-        return []
 
 class LollmsLLMBinding(LollmsBaseBinding):
     """Abstract base class for all LOLLMS LLM bindings"""

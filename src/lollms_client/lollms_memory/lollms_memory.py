@@ -230,6 +230,7 @@ class LollmsMemoryManager:
     _PAT_LOAD     = re.compile(r'<mem_load\s+id=["\']([^"\']+)["\'](?:\s*/)?>',     re.I)
     _PAT_UPDATE   = re.compile(r'<mem_update\s+id=["\']([^"\']+)["\']>(.*?)</mem_update>', re.I | re.DOTALL)
     _PAT_NEW      = re.compile(r'<mem_new\s+([^>]*?)(?:>(.*?)</mem_new>|/?>)', re.I | re.DOTALL)
+    _PAT_SEARCH   = re.compile(r'<mem_search\s+query=["\']([^"\']+)["\'](?:\s+level=["\'](\d+)["\'])?(?:\s*/)?>', re.I)
 
     def __init__(
         self,
@@ -831,7 +832,13 @@ class LollmsMemoryManager:
             if level is not None:
                 q = q.filter(_MemoryRecord.level == level)
             records_raw = q.order_by(_MemoryRecord.importance.desc()).limit(200).all()
-            dicts = [self._to_dict(r) for r in records_raw]
+            # Ensure all results are dictionaries, not objects
+            dicts = []
+            for r in records_raw:
+                if isinstance(r, dict):
+                    dicts.append(r)
+                else:
+                    dicts.append(self._to_dict(r))
 
         if not dicts:
             return []
@@ -839,7 +846,7 @@ class LollmsMemoryManager:
         total_docs = len(dicts)
         df_map = {}
         for w in query_words:
-            df_map[w] = sum(1 for d in dicts if w in d['content'].lower())
+            df_map[w] = sum(1 for d in dicts if w in d.get('content', '').lower())
 
         idf_map = {}
         for w, df in df_map.items():
@@ -847,7 +854,7 @@ class LollmsMemoryManager:
 
         scored = []
         for d in dicts:
-            content_lower = d['content'].lower()
+            content_lower = d.get('content', '').lower()
             doc_words = content_lower.split()
             score = 0.0
             for w in query_words:
@@ -856,7 +863,7 @@ class LollmsMemoryManager:
                     tf_scaled = 1.0 + math.log(tf)
                     score += tf_scaled * idf_map[w]
             if score > 0.0:
-                scored.append((score + (d['importance'] * 0.1), d))
+                scored.append((score + (d.get('importance', 0) * 0.1), d))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         return [d for _, d in scored[:top_k]]
@@ -936,20 +943,47 @@ class LollmsMemoryManager:
         return (
             "\n=== MEMORY SYSTEM ===\n\n"
             "You are equipped with a multi-level persistent memory system with GRAPH-BASED relationships to recall facts, user preferences, and past events/conversations across turns.\n\n"
-            "── Working Memory: Active memories and past conversation episodes appear in the WORKING MEMORY zone below (injected into your context). They are shown in chronological order with their timestamp, [ID], importance, and centrality (graph connectivity).\n"
+            "── Working Memory (Level 1): Active memories appear in the WORKING MEMORY zone below (injected into your context). They are shown in chronological order with their timestamp, [ID], importance, and centrality (graph connectivity).\n"
             "   👉 CRITICAL RULE: When you utilize or refer to an active memory [ID] to answer, you MUST prepend `<mem_tag id=\"ID\" />` to your response so the system can track its usage.\n"
-            "── Deep Memory: Stored memories and past episodes that are currently inactive. Only their compact handles appear. "
+            "── Deep Memory (Level 2): Stored memories and past episodes that are currently inactive. Only their compact handles appear. "
             "If you see a handle (e.g. [abc123de]) that contains information needed to answer the user's question, you MUST load it first by outputting `<mem_load id=\"ID\" />`.\n"
+            "   📌 NOTE: Episodic memories (past conversation turns) are stored here to avoid cluttering your context with redundant history.\n"
+            "── Archived Memory (Level 3): Very old or low-importance memories that are completely hidden from context. "
+            "If you cannot find information in Working or Deep Memory, you can search archived memories using `<mem_search query=\"search terms\" />`.\n"
             "── Memory Graph: Memories are connected via explicit relationships. High-centrality memories are more connected and important.\n"
-            "── Tags Available:\n"
+            "\n"
+            "🚨 **CRITICAL: MEMORY TAGS ARE NOT TOOLS** 🚨\n"
+            "Memory tags (`<mem_new>`, `<mem_search>`, `<mem_load>`, etc.) are **INFRASTRUCTURE TAGS**, not tool calls.\n"
+            "They are processed silently by the memory system and do NOT require `<tool>` wrapper.\n"
+            "**NEVER** wrap memory tags in `<tool>...</tool>` blocks. Use them directly as XML tags.\n"
+            "\n"
+            "**❌ WRONG (DO NOT DO THIS)**:\n"
+            "```\n"
+            "<tool>{\"name\": \"memory_search\", \"parameters\": {\"query\": \"daughter\"}}</tool>\n"
+            "```\n"
+            "\n"
+            "**✅ CORRECT (USE THIS)**:\n"
+            "```\n"
+            "<mem_search query=\"daughter\" />\n"
+            "```\n"
+            "\n"
+            "── Memory Tags Available (USE DIRECTLY AS XML TAGS, NOT AS TOOLS):\n"
             "   • `<mem_new importance=\"...\">content</mem_new>` — Save a new fact, preference, or event (importance is a float, default 0.75).\n"
             "     🚨 CURATION PROTOCOL (ONLY SAVE HIGH-DENSITY, PERSISTENT KNOWLEDGE):\n"
             "     ✅ ALWAYS SAVE: Core user preferences (e.g., language choice, custom guidelines), persistent architectural decisions, structural rules, and primary project goals.\n"
             "     ❌ NEVER SAVE: Casual pleasantries, greetings, small talk, weather, conversational fluff, temporary feelings, or large raw code blocks.\n"
+            "     ❌ NEVER SAVE: Episodic memories (past conversation turns) - these are automatically saved by the system.\n"
             "   • `<mem_update id=\"ID\">content</mem_update>` — Update an existing memory's verbatim content.\n"
             "   • `<mem_tag id=\"ID\" />` — Tag/acknowledge that a memory was retrieved and used to answer the user.\n"
             "   • `<mem_load id=\"ID\" />` — Load an inactive Deep Memory into active Working Memory.\n"
             "   • `<mem_delete id=\"ID\" />` — Delete a memory that is no longer correct or relevant.\n"
+            "   • `<mem_search query=\"search terms\" />` — Search archived memories (Level 3) for information not found in Working/Deep Memory.\n"
+            "     Returns matching memories with their IDs. You can then use `<mem_load id=\"ID\" />` to bring them into Working Memory.\n"
+            "     **EXAMPLE**: If user asks 'Do you remember my daughter?' and Working/Deep Memory is empty:\n"
+            "     ```\n"
+            "     <mem_search query=\"daughter\" />\n"
+            "     ```\n"
+            "     The system will search archived memories and inject results into your context.\n"
             "   • `<mem_rel source=\"ID\" target=\"ID\" type=\"TYPE\" weight=\"1.0\" />` — Create a graph relationship between memories.\n"
             "     Relationship types: RELATED_TO, DERIVED_FROM, CONTRADICTS, SUPPORTS, TEMPORAL_AFTER\n\n"
             "── Rules: Use exact 8-character ID prefixes. All tags are automatically stripped from your reply before display.\n"
@@ -960,13 +994,20 @@ class LollmsMemoryManager:
             "     - `subject`: the lowercase subject entity (e.g. `subject=\"user\"`)\n"
             "     - `predicate`: valid uppercase TBox predicate (PREFERS, RELATED_TO, IMPLEMENTS, CONTRADICTS, SUPPORTS)\n"
             "     - `object`: the lowercase object entity (e.g. `object=\"saif\"`)\n"
+            "\n"
+            "── 🎯 MEMORY SEARCH AS A STEPPING STONE:\n"
+            "   When you use `<mem_search>`, the search is just ONE STEP in your task. After receiving search results:\n"
+            "   • If the search was the ONLY thing the user asked for → provide your answer and emit `<done/>`\n"
+            "   • If the search is part of a LARGER TASK (e.g., 'find X and create Y') → use the retrieved info to continue with the next action\n"
+            "   • Do NOT automatically emit `<done/>` after a search unless the task is truly complete\n"
+            "   • Analyze the user's original request to determine if more actions are needed\n"
             "=== END MEMORY SYSTEM ===\n"
         )
 
     _PAT_REL = re.compile(r'<mem_rel\s+source=["\']([^"\']+)["\']\s+target=["\']([^"\']+)["\'](?:\s+type=["\']([^"\']+)["\'])?(?:\s+weight=["\']([^"\']+)["\'])?(?:\s*/)?>', re.I)
 
     def process_llm_output(self, text: str) -> Tuple[str, Dict[str, Any]]:
-        cleaned, report = text, {"created": [], "updated": [], "tagged": [], "deleted": [], "loaded": [], "relationships": []}
+        cleaned, report = text, {"created": [], "updated": [], "tagged": [], "deleted": [], "loaded": [], "relationships": [], "searches": []}
         for m in self._PAT_UPDATE.finditer(text):
             full_id = self._resolve_id(m.group(1))
             if full_id:
@@ -1011,6 +1052,28 @@ class LollmsMemoryManager:
             full_id = self._resolve_id(m.group(1))
             if full_id and self.delete(full_id): report["deleted"].append(m.group(1))
             cleaned = cleaned.replace(m.group(0), "", 1)
+
+        # Process search tags
+        for m in self._PAT_SEARCH.finditer(text):
+            query = m.group(1)
+            level = int(m.group(2)) if m.group(2) else None
+
+            # Perform search
+            if level is not None:
+                results = self.query(text=query, top_k=5, level=level)
+            else:
+                # Search all levels
+                results = self.query(text=query, top_k=10)
+
+            if results:
+                report["searches"].append({
+                    "query": query,
+                    "level": level,
+                    "results": results
+                })
+
+            cleaned = cleaned.replace(m.group(0), "", 1)
+
         # Process relationship tags
         for m in self._PAT_REL.finditer(text):
             source_id = self._resolve_id(m.group(1))
@@ -1031,6 +1094,23 @@ class LollmsMemoryManager:
         with self._session() as s:
             r = self._q(s).filter(_MemoryRecord.id.like(f"{partial_id}%")).first()
             return r.id if r else None
+
+    def search_archived_memories(self, query: str, top_k: int = 5) -> List[Dict]:
+        """
+        Search archived (Level 3) memories using keyword matching.
+        Returns matching memories with their IDs so the LLM can load them if needed.
+        """
+        return self.query(text=query, top_k=top_k, level=3)
+
+    def search_all_levels(self, query: str, top_k: int = 10) -> Dict[str, List[Dict]]:
+        """
+        Search across all memory levels and return grouped results.
+        """
+        return {
+            "working": self.query(text=query, top_k=top_k, level=1),
+            "deep": self.query(text=query, top_k=top_k, level=2),
+            "archived": self.query(text=query, top_k=top_k, level=3),
+        }
 
     def apply_decay(self) -> int:
         now, count = datetime.utcnow(), 0

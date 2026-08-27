@@ -184,26 +184,100 @@ class MemoryMixin:
 
         return True
 
-    def _save_episodic_memory_turn(self, user_text: str, ai_text: str, mm: Optional['LollmsMemoryManager']):
-        if mm is None:
-            return
-        # Clean AI text of processing tags or HTML tags
-        clean_ai = re.sub(r'<processing.*?>.*?</processing>', '', ai_text, flags=re.DOTALL)
-        clean_ai = re.sub(r'<[^>]+>', '', clean_ai).strip()
-        clean_user = user_text.strip()
-        if not clean_user or not clean_ai:
+    def _save_episodic_memory_turn(self, user_msg_content: str, ai_msg_content: str, mm: Any):
+        """
+        Saves the current turn as an episodic memory (Level 2 - Deep Memory).
+        
+        ARCHITECTURAL CHANGE: Episodic memories are now saved at Level 2 (Deep Memory)
+        instead of Level 1 (Working Memory). This prevents them from being automatically
+        injected into every context, which would be redundant with the actual conversation
+        history and would clutter the context window.
+        
+        Episodic memories are only accessible via:
+        - Deep Memory handles (if they match user query keywords)
+        - Explicit <mem_search> queries
+        - <mem_load> tags to promote them to Working Memory when needed
+        """
+        if not mm:
             return
 
-        if not self._is_turn_worth_memorizing(clean_user, clean_ai):
-            return
+        try:
+            # 🧹 Pre-Sanitization Protocol: Strip all functional XML tags to prevent memory pollution
+            clean_ai_content = re.sub(r'<tool>.*?</tool>', '', ai_msg_content, flags=re.DOTALL | re.IGNORECASE)
+            clean_ai_content = re.sub(r'<processing[^>]*>.*?</processing>', '', clean_ai_content, flags=re.DOTALL | re.IGNORECASE)
+            clean_ai_content = re.sub(r'<artifact[^>]*>.*?</artifact>', '', clean_ai_content, flags=re.DOTALL | re.IGNORECASE)
+            clean_ai_content = re.sub(r'<artefact[^>]*>.*?</artefact>', '', clean_ai_content, flags=re.DOTALL | re.IGNORECASE)
+            clean_ai_content = re.sub(r'<mem_new[^>]*>.*?</mem_new>', '', clean_ai_content, flags=re.DOTALL | re.IGNORECASE)
+            clean_ai_content = re.sub(r'<scratchpad[^>]*>.*?</scratchpad>', '', clean_ai_content, flags=re.DOTALL | re.IGNORECASE)
+            clean_ai_content = re.sub(r'<note[^>]*>.*?</note>', '', clean_ai_content, flags=re.DOTALL | re.IGNORECASE)
+            clean_ai_content = re.sub(r'<skill[^>]*>.*?</skill>', '', clean_ai_content, flags=re.DOTALL | re.IGNORECASE)
+            clean_ai_content = re.sub(r'<lollms_inline[^>]*>.*?</lollms_inline>', '', clean_ai_content, flags=re.DOTALL | re.IGNORECASE)
+            clean_ai_content = re.sub(r'<lollms_form[^>]*>.*?</lollms_form>', '', clean_ai_content, flags=re.DOTALL | re.IGNORECASE)
+            clean_ai_content = re.sub(r'<generate_image[^>]*>.*?</generate_image>', '', clean_ai_content, flags=re.DOTALL | re.IGNORECASE)
+            clean_ai_content = re.sub(r'<edit_image[^>]*>.*?</edit_image>', '', clean_ai_content, flags=re.DOTALL | re.IGNORECASE)
+            clean_ai_content = re.sub(r'<mem_tag\s+id=["\'][^"\']+["\']\s*/?>', '', clean_ai_content, flags=re.IGNORECASE)
+            clean_ai_content = re.sub(r'<mem_load\s+id=["\'][^"\']+["\']\s*/?>', '', clean_ai_content, flags=re.IGNORECASE)
+            clean_ai_content = re.sub(r'<mem_delete\s+id=["\'][^"\']+["\']\s*/?>', '', clean_ai_content, flags=re.IGNORECASE)
+            clean_ai_content = re.sub(r'<mem_update\s+id=["\'][^"\']+["\']>.*?</mem_update>', '', clean_ai_content, flags=re.DOTALL | re.IGNORECASE)
+            clean_ai_content = re.sub(r'<mem_search\s+query=["\'][^"\']+["\']\s*/?>', '', clean_ai_content, flags=re.IGNORECASE)
+            clean_ai_content = clean_ai_content.strip()
 
-        episode_content = f"Event/Interaction on {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC:\nUser asked: \"{clean_user}\"\nAI responded: \"{clean_ai}\""
-        mm.add(content=episode_content, importance=0.8, tags=["episode", "interaction"], level=1)
+            # Skip if the AI response is empty after sanitization
+            if not clean_ai_content:
+                ASCIIColors.debug("[Memory] Skipping episodic memory save (AI response empty after sanitization).")
+                return
 
+            # Build the episodic entry
+            timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            episode_content = (
+                f"Event/Interaction on {timestamp}: "
+                f"User asked: \"{user_msg_content[:300]}\" "
+                f"AI responded: \"{clean_ai_content[:500]}\""
+            )
+
+            # Save as a Level 2 episodic memory (Deep Memory - only searchable, not auto-injected)
+            # This prevents context clutter and redundancy with actual conversation history
+            mm.add(
+                content=episode_content,
+                importance=0.6,  # Moderate importance - enough to stay in Deep Memory but not auto-promote
+                tags=["episode", "conversation", "interaction"],
+                subject_group="episodic_history",
+                subject="user",
+                predicate="RELATED_TO",
+                obj="conversation",
+                level=2  # Level 2 = Deep Memory (searchable but not auto-injected into context)
+            )
+            ASCIIColors.info(f"[Memory] Saved episodic memory to Deep Memory (Level 2): {episode_content[:80]}...")
+        except Exception as e:
+            ASCIIColors.warning(f"[Memory] Failed to save episodic memory: {e}")
+
+
+            
     def _process_memory_tags(self, text: str, mm: Optional['LollmsMemoryManager'], callback=None) -> tuple:
         if mm is None: return text, {}
         from lollms_client.lollms_types import MSG_TYPE
         cleaned, report = mm.process_llm_output(text)
+
+        # Ensure search results are properly formatted as dictionaries
+        if report.get("searches"):
+            for search_result in report["searches"]:
+                if "results" in search_result:
+                    # Ensure each result is a dict, not an object
+                    formatted_results = []
+                    for mem in search_result["results"]:
+                        if isinstance(mem, dict):
+                            formatted_results.append(mem)
+                        else:
+                            # Convert object to dict if needed
+                            formatted_results.append({
+                                "id": getattr(mem, "id", ""),
+                                "content": getattr(mem, "content", ""),
+                                "importance": getattr(mem, "importance", 0),
+                                "tags": getattr(mem, "tags", ""),
+                                "level": getattr(mem, "level", 3)
+                            })
+                    search_result["results"] = formatted_results
+
         if any(report.values()):
             if callback:
                 try: callback(json.dumps(report, default=str), MSG_TYPE.MSG_TYPE_INFO, {"type": "memory_update", "report": report})

@@ -1,0 +1,155 @@
+title: Pocket TTS (Kyutai)
+author: Kyutai Labs & ParisNeo
+creation_date: 2026-08-27
+last_update_date: 2026-08-27
+description: "Ultra-lightweight 100M-parameter text-to-speech engine developed by Kyutai Labs. Designed for fast, high-quality audio synthesis and zero-shot voice cloning directly on CPU (~6x real-time inference speed)."
+
+global_input_parameters:
+  - name: voices_dir
+    type: str
+    description: "Directory path where custom reference voices (.wav, .mp3, .safetensors) are stored."
+    mandatory: false
+    default: "data/tts/pocket-tts/voices"
+  - name: models_dir
+    type: str
+    description: "Directory path for caching downloaded Pocket TTS model checkpoints."
+    mandatory: false
+    default: "data/tts/pocket-tts/models"
+  - name: device
+    type: str
+    description: "Inference compute device ('cpu', 'cuda', 'mps', 'auto')."
+    mandatory: false
+    default: "cpu"
+  - name: auto_install
+    type: bool
+    description: "Automatically install pocket-tts via pipmaster if not present."
+    mandatory: false
+    default: true
+
+model_input_parameters:
+  - name: model_name
+    type: str
+    description: "Model repository identifier ('kyutai/pocket-tts', 'kyutai/pocket-tts-without-voice-cloning')."
+    mandatory: true
+    default: "kyutai/pocket-tts"
+  - name: voice
+    type: str
+    description: "Default voice name (e.g., 'alba', 'marius', 'jean', 'cosette') or custom voice name."
+    mandatory: false
+    default: "alba"
+  - name: temperature
+    type: float
+    description: "Default sampling temperature (0.3 for English, 0.7 for multilingual diversity)."
+    mandatory: false
+    default: 0.7
+
+generate_audio_parameters:
+  - name: text
+    type: str
+    description: "The text to synthesize."
+  - name: voice
+    type: str
+    default: "alba"
+    description: "Built-in voice name, custom uploaded voice alias, or path to reference WAV/MP3 audio sample."
+  - name: temperature
+    type: float
+    default: 0.7
+    description: "Sampling temperature for generation diversity."
+  - name: split_sentences
+    type: bool
+    default: true
+    description: "Split long texts into sentences to maintain consistent flow."
+
+commands:
+  - name: upload_voice
+    title: Upload Voice
+    description: "Upload and register a reference voice audio file (WAV, MP3, FLAC, OGG) to the voices directory for persistent zero-shot cloning."
+    parameters:
+      - name: voice_path
+        type: str
+        description: "Absolute path to the local audio file to upload (5-30 seconds of clean speech recommended)."
+        mandatory: true
+        default: ""
+      - name: voice_name
+        type: str
+        description: "Optional custom alias for the voice. If omitted, the filename stem is used."
+        mandatory: false
+        default: ""
+    output:
+      - name: status
+        type: bool
+        description: "True if the upload and registration succeeded."
+      - name: voice_name
+        type: str
+        description: "The registered voice name identifier."
+      - name: message
+        type: str
+        description: "Status message."
+
+  - name: delete_voice
+    title: Delete Custom Voice
+    description: "Deletes an uploaded custom voice file and clears its cached state from disk."
+    parameters:
+      - name: voice_name
+        type: str
+        description: "Name of the custom voice to delete."
+        mandatory: true
+        default: ""
+    output:
+      - name: status
+        type: bool
+        description: "True if the deletion succeeded."
+      - name: message
+        type: str
+        description: "Status message."
+
+  - name: list_custom_voices
+    title: List Custom Voices
+    description: "Lists all custom uploaded voices found in the voices directory."
+    parameters: []
+    output:
+      - name: status
+        type: bool
+        description: "Operation status."
+      - name: voices
+        type: list
+        description: "List of custom voice dictionaries containing name, file path, and size."
+
+  - name: test_voice
+    title: Test Voice
+    description: "Synthesizes a short test sentence to verify voice output quality and latency."
+    parameters:
+      - name: voice
+        type: str
+        description: "Voice name to test (built-in or custom)."
+        mandatory: false
+        default: "alba"
+      - name: sample_text
+        type: str
+        description: "Text phrase to synthesize."
+        mandatory: false
+        default: "Hello, this is a test of Pocket TTS speech synthesis."
+    output:
+      - name: status
+        type: bool
+        description: "True if audio was synthesized successfully."
+      - name: message
+        type: str
+        description: "Details on generated audio size and status."
+
+  - name: select_model
+    title: Select / Load Model
+    description: "Switches the active Pocket TTS model checkpoint."
+    parameters:
+      - name: model_name
+        type: str
+        description: "Hugging Face model repository ID (e.g. 'kyutai/pocket-tts')."
+        mandatory: true
+        default: "kyutai/pocket-tts"
+    output:
+      - name: status
+        type: bool
+        description: "True if the model was loaded successfully."
+      - name: message
+        type: str
+        description: "Status message."
