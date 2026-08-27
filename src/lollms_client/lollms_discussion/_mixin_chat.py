@@ -3321,9 +3321,15 @@ class ChatMixin:
 
         # Inject Skills Context (Progressive Enhancement)
         if personality and hasattr(personality, "skills_manager") and personality.skills_manager:
-            skills_ctx = personality.skills_manager.build_context()
-            if skills_ctx:
-                sys_prompt += "\n" + skills_ctx
+            if not getattr(personality, "_skills_context_injected", False):
+                skills_ctx = personality.skills_manager.build_context()
+                if skills_ctx:
+                    sys_prompt += "\n" + skills_ctx
+                    object.__setattr__(personality, "_skills_context_injected", True)
+            else:
+                skills_ctx = personality.skills_manager.build_context()
+                if skills_ctx and skills_ctx not in sys_prompt:
+                    sys_prompt += "\n" + skills_ctx
 
         # ── 🧹 CORE RULES (ALWAYS ACTIVE) ──
         # These are fundamental behavioral rules that apply regardless of feature flags

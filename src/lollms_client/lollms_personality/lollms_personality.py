@@ -1617,10 +1617,29 @@ class LollmsPersonality:
         # Skills initialization
         if skills_manager:
             self.skills_manager = skills_manager
+            if skills_dirs:
+                self.skills_manager._skills_dirs.extend([Path(d).resolve() for d in skills_dirs if Path(d).exists()])
+                self.skills_manager.reload()
         elif skills_dirs:
-            self.skills_manager = SkillsManager(skills_dirs=skills_dirs, mode="mixed")
+            self.skills_manager = SkillsManager(skills_dirs=skills_dirs, mode="mixed", max_visible_tokens=8000)
         else:
             self.skills_manager = None
+
+        # Pre-inject skills context into the system prompt so that
+        # external callers (like LollmsDiscussion) inherit the skills
+        # without needing to invoke the private _build_system_prompt().
+        if self.skills_manager:
+            skills_ctx_str = self.skills_manager.build_context()
+            if skills_ctx_str:
+                if "=== SKILLS SYSTEM ===" not in self.system_prompt:
+                    self.system_prompt = f"{self.system_prompt}\n\n{skills_ctx_str}".strip()
+                    self._skills_context_injected = True
+                else:
+                    self._skills_context_injected = True
+            else:
+                self._skills_context_injected = False
+        else:
+            self._skills_context_injected = False
 
         self.memory_manager = memory_manager
         self._workspace_path: Optional[Path] = None
@@ -1829,6 +1848,7 @@ class LollmsPersonality:
             metadata=meta,
             tools=tool_binding,
             skills_manager=sm,
+            skills_dirs=hb.skills_dirs,
             memory_manager=mm,
             handbag_path=hb.path,
             data_sources=rag_data_sources if rag_data_sources else None,

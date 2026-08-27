@@ -72,11 +72,11 @@ def parse_skill_md(file_path: Path, default_visibility: str = "loadable") -> Opt
                     val = line.split(":", 1)[1].strip().strip('"\'').lower()
                     if val in ("visible", "loadable", "searchable"):
                         visibility = val
+            if visibility == "mixed":
+                visibility = "visible"
         else:
-            # Text-only default is always loaded into context
             visibility = "visible"
     else:
-        # Text-only (no YAML metadata) defaults to always loaded (visible)
         has_metadata = False
         visibility = "visible"
         h1_match = re.match(r'^#\s+(.+)', raw_content)
