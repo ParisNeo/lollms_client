@@ -52,13 +52,9 @@ class Handbag:
             if item.is_file() and item.suffix == ".py" and item.stem != "__init__":
                 files.append(item.resolve())
             elif item.is_dir():
-                tool_file = item / f"{item.name}.py"
-                if tool_file.exists():
-                    files.append(tool_file.resolve())
-                else:
-                    for py_file in sorted(item.glob("*.py")):
-                        if py_file.stem != "__init__":
-                            files.append(py_file.resolve())
+                for py_file in sorted(item.glob("*.py")):
+                    if py_file.stem != "__init__":
+                        files.append(py_file.resolve())
         return files
 
     def _load_rag_files(self) -> List[Path]:

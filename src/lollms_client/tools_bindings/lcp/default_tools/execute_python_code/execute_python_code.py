@@ -26,7 +26,7 @@ def _ensure_import(module_name: str, package_name: str = None):
         pkg = package_name or module_name
         ASCIIColors.warning(f"[execute_python_code] Missing dependency '{pkg}'. Installing automatically...")
         try:
-            pm.ensure_installed(pkg)
+            pm.ensure_packages(pkg)
             return __import__(module_name)
         except Exception as install_err:
             ASCIIColors.error(f"[execute_python_code] Failed to auto-install '{pkg}': {install_err}")

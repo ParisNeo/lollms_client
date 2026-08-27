@@ -1403,7 +1403,7 @@ class PersonalityBundle:
         if knowledge_dir.exists() and lollms_client is not None:
             try:
                 import pipmaster as pm
-                pm.ensure_installed("safestore")
+                pm.ensure_packages("safestore")
 
                 from safestore.safestore import Safestore
                 from safestore.core.database import Database
@@ -1617,10 +1617,29 @@ class LollmsPersonality:
         # Skills initialization
         if skills_manager:
             self.skills_manager = skills_manager
+            if skills_dirs:
+                self.skills_manager._skills_dirs.extend([Path(d).resolve() for d in skills_dirs if Path(d).exists()])
+                self.skills_manager.reload()
         elif skills_dirs:
-            self.skills_manager = SkillsManager(skills_dirs=skills_dirs, mode="mixed")
+            self.skills_manager = SkillsManager(skills_dirs=skills_dirs, mode="mixed", max_visible_tokens=8000)
         else:
             self.skills_manager = None
+
+        # Pre-inject skills context into the system prompt so that
+        # external callers (like LollmsDiscussion) inherit the skills
+        # without needing to invoke the private _build_system_prompt().
+        if self.skills_manager:
+            skills_ctx_str = self.skills_manager.build_context()
+            if skills_ctx_str:
+                if "=== SKILLS SYSTEM ===" not in self.system_prompt:
+                    self.system_prompt = f"{self.system_prompt}\n\n{skills_ctx_str}".strip()
+                    self._skills_context_injected = True
+                else:
+                    self._skills_context_injected = True
+            else:
+                self._skills_context_injected = False
+        else:
+            self._skills_context_injected = False
 
         self.memory_manager = memory_manager
         self._workspace_path: Optional[Path] = None
@@ -1706,7 +1725,7 @@ class LollmsPersonality:
             prompt=prompt,
             system_prompt=system_prompt if system_prompt is not None else self.system_prompt,
             temperature=temperature if temperature is not None else self.model_params.get("temperature", 0.7),
-            n_predict=n_predict if n_predict is not None else self.max_tokens_per_turn,
+            n_predict=None,
             streaming_callback=streaming_callback,
             **kwargs
         )
@@ -1750,7 +1769,7 @@ class LollmsPersonality:
             response_text = self.lollms_client.generate_from_messages(
                 messages=messages,
                 temperature=temperature or 0.7,
-                n_predict=n_predict or self.max_tokens_per_turn,
+                n_predict=None,
                 **kwargs
             )
             tool_calls = []
@@ -1766,18 +1785,6 @@ class LollmsPersonality:
                 "tool_calls": tool_calls,
                 "rounds": 1
             }
-
-        return self.chat(
-            prompt=prompt,
-            lollms_client=self.lollms_client,
-            tool_files=tools,
-            max_reasoning_steps=max_tool_rounds,
-            temperature=temperature or 0.7,
-            n_predict=n_predict or self.max_tokens_per_turn,
-            streaming_callback=streaming_callback,
-            use_internal_history=False,
-            **kwargs
-        )
 
     def generate_with_tools_sync(self, prompt: str, tools: Optional[List] = None, **kwargs) -> str:
         """Synchronous wrapper returning only the final response string."""
@@ -1841,6 +1848,7 @@ class LollmsPersonality:
             metadata=meta,
             tools=tool_binding,
             skills_manager=sm,
+            skills_dirs=hb.skills_dirs,
             memory_manager=mm,
             handbag_path=hb.path,
             data_sources=rag_data_sources if rag_data_sources else None,
@@ -2416,6 +2424,33 @@ class LollmsPersonality:
 
     def _reset_cancel_state(self):
         object.__setattr__(self, '_cancel_flag', False)
+
+    @staticmethod
+    def _build_progressive_continuation_prompt(stall_count: int, recent_tools: Optional[List[str]] = None) -> str:
+        recent_ctx = f" Recent actions executed: {recent_tools}." if recent_tools else ""
+        if stall_count <= 1:
+            return (
+                f"[SYSTEM: You stopped generation without emitting a <done/> tag.{recent_ctx}\n"
+                "CRITICAL: Do NOT assume any action succeeded unless you see its result in the conversation history above.\n"
+                "If your previous response stated an intent to perform an action (e.g., 'I will commit', 'I will create a branch'), "
+                "you MUST execute that action's tag NOW. Stating intent and then emitting `<done/>` without executing is a CRITICAL ERROR.\n"
+                "If your task is truly complete, output a final conversational summary and end it with a <done/> tag on a new line. "
+                "If you need to continue working, emit the next functional tag now.]"
+            )
+        elif stall_count == 2:
+            return (
+                f"[SYSTEM: You have stopped without <done/> or any new action for 2 consecutive rounds.{recent_ctx}\n"
+                "This is wasting context. You MUST either:\n"
+                "1. Emit the next <tool> or <artifact> tag to continue your task, OR\n"
+                "2. Write your final response and emit <done/> to terminate.\n"
+                "Do NOT produce another preamble without following through.]"
+            )
+        else:
+            return (
+                f"[SYSTEM: CRITICAL — You have stalled {stall_count} times without producing output or <done/>.\n"
+                "You are wasting tokens and context. You MUST emit <done/> NOW on a new line.\n"
+                "Write a brief summary of the current situation and immediately emit <done/>.]"
+            )
 
     # ------------------------------------------------------------------ Independent Agentic Chat
 
@@ -3562,144 +3597,11 @@ JSON:"""
                 f"This workspace is a git repository. You MUST ask the user for permission.\n"
                 f"Output EXACTLY: \"⚠️ I am about to modify `{title}`. This action will be executed on a new git branch. Do you approve? (yes/no)\"\n"
                 f"Do NOT emit the `<artifact>` tag again until the user replies 'yes'."
-            )
+                    )
         except Exception:
             return None
 
-    def _enforce_git_branch_safety(self, command: str) -> Optional[str]:
-        """
-        Programmatic guard for git branch switching commands.
-        Blocks `git checkout -b`, `git switch`, and `git checkout <branch>` if the working tree is dirty.
-        Returns an error message string if the command is blocked, or None if allowed.
-        """
-        if not self._resolved_workspace or not command:
-            return None
-
-        try:
-            cmd_stripped = command.strip()
-            cmd_lower = cmd_stripped.lower()
-
-            is_branch_switch = False
-            if cmd_lower.startswith("git checkout -b") or cmd_lower.startswith("git switch -c") or cmd_lower.startswith("git switch "):
-                is_branch_switch = True
-            elif cmd_lower.startswith("git checkout ") and " -b " not in cmd_lower:
-                tokens = cmd_stripped.split()
-                if len(tokens) >= 3 and not tokens[2].startswith("-"):
-                    is_branch_switch = True
-
-            if not is_branch_switch:
-                return None
-
-            git_dir = self._resolved_workspace / ".git"
-            if not git_dir.exists():
-                return None
-
-            if getattr(self, '_git_autonomy_granted', False) or "Git Autonomy: Granted" in getattr(self, '_user_profile_content', ''):
-                return None
-
-            import subprocess as _sp
-            result = _sp.run(
-                ["git", "status", "--porcelain"],
-                cwd=str(self._resolved_workspace),
-                capture_output=True, text=True, encoding="utf-8", errors="ignore"
-            )
-
-            if result.returncode == 0 and result.stdout.strip():
-                dirty_files = [line.strip() for line in result.stdout.strip().splitlines() if line.strip()]
-                file_list = "\n".join(f"  - {f}" for f in dirty_files[:10])
-                if len(dirty_files) > 10:
-                    file_list += f"\n  ... and {len(dirty_files) - 10} more"
-
-                return (
-                    f"❌ GIT BRANCH SAFETY BLOCK: You are about to run `{cmd_stripped}`.\n"
-                    f"But the working tree has {len(dirty_files)} uncommitted change(s):\n{file_list}\n\n"
-                    f"You MUST either `git stash` or `git commit` these changes BEFORE switching branches.\n"
-                    f"NEVER execute `{cmd_stripped}` on a dirty working tree — this carries changes to the new branch and pollutes it.\n"
-                    f"Output EXACTLY: \"⚠️ I need to create a new branch, but you have uncommitted changes. Do you want me to `git stash` them (temporary) or `git commit` them (permanent) before I switch branches? (stash/commit/cancel)\"\n"
-                    f"Do NOT emit `<done/>` until the user responds."
-                )
-
-            return None
-        except Exception:
-            return None
-
-    def _calculate_context_fill(self, full_system_prompt: str, base_conversation: List[Dict], virtual_history: List, final_response: str = "") -> Dict[str, Any]:
-        """Calculates the current context window fill percentage."""
-        try:
-            if self.lollms_client and hasattr(self.lollms_client, 'get_ctx_size'):
-                max_ctx = self.lollms_client.get_ctx_size() or 0
-                if max_ctx > 0 and hasattr(self.lollms_client, 'count_tokens'):
-                    total_used = self.lollms_client.count_tokens(full_system_prompt)
-                    for msg in base_conversation:
-                        total_used += self.lollms_client.count_tokens(msg.get("content", ""))
-                    for vh in virtual_history:
-                        total_used += self.lollms_client.count_tokens(vh.content)
-                    total_used += self.lollms_client.count_tokens(final_response)
-
-                    if total_used <= 0:
-                        return {"used_tokens": 0, "max_tokens": max_ctx, "fill_percentage": 0.0}
-
-                    return {
-                        "used_tokens": total_used,
-                        "max_tokens": max_ctx,
-                        "fill_percentage": round((total_used / max_ctx) * 100, 1)
-                    }
-        except Exception:
-            pass
-        return {"used_tokens": 0, "max_tokens": 0, "fill_percentage": 0.0}
-
-    def _compact_virtual_history(self, virtual_history: List, streaming_callback: Optional[Callable]) -> List:
-        """
-        Autonomously summarizes the virtual history to free up context space.
-        Replaces verbose tool outputs and intermediate reasoning with a dense summary.
-        """
-        if not virtual_history or not self.lollms_client:
-            return virtual_history
-
-        if streaming_callback:
-            compaction_msg = '\n<processing type="context_compaction" title="Autonomous Context Compaction">\n* 🧹 Context window approaching limit. Summarizing history to free up space...\n</processing>\n'
-            try:
-                streaming_callback(compaction_msg, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-            except Exception:
-                pass
-
-        history_text = "\n\n".join([f"[{vh.sender_type}]: {vh.content}" for vh in virtual_history])
-
-        summary_prompt = (
-            "You are a context compaction engine. Summarize the following conversation history into a dense, factual summary.\n"
-            "Focus on retaining: user goals, key data retrieved from tools, file names created/modified, and final conclusions.\n"
-            "Discard: conversational pleasantries, intermediate reasoning steps, and verbose tool outputs.\n\n"
-            f"=== HISTORY TO COMPACT ===\n{history_text}\n=== END HISTORY ==="
-        )
-
-        try:
-            summary = self.lollms_client.generate_text(
-                prompt=summary_prompt,
-                temperature=0.1,
-                n_predict=1024
-            )
-            if not isinstance(summary, str) or not summary.strip():
-                return virtual_history
-
-            compacted_history = [SimpleNamespace(
-                sender_type="user",
-                content=f"[SYSTEM: AUTONOMOUS CONTEXT COMPACTION]\nThe previous history has been summarized to save space. Use this summary as your working context:\n\n{summary.strip()}"
-            )]
-
-            if streaming_callback:
-                success_msg = f'\n<processing type="context_compaction" title="Autonomous Context Compaction">\n* ✅ History compacted successfully. Context freed.\n</processing>\n'
-                try:
-                    streaming_callback(success_msg, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                except Exception:
-                    pass
-
-            return compacted_history
-
-        except Exception as e:
-            ASCIIColors.warning(f"[{self.name}] Context compaction failed: {e}")
-            return virtual_history
-
-    def _build_system_prompt(self, active_tools: Dict) -> str:
+    def _build_system_prompt(self, active_tools: Optional[Dict] = None) -> str:
         sys_prompt = self.system_prompt or ""
         onboarding_block = self._build_onboarding_block()
         rules = (
@@ -3905,8 +3807,6 @@ JSON:"""
                 param_desc = ", ".join([f"{p['name']}: {p['type']}" for p in params_list])
                 tool_desc += f"- {t_name}({param_desc}): {desc}\n"
 
-        # 🛡️ KV-CACHE OPTIMIZATION: Workspace context is strictly kept OUT of the system prompt.
-        # It is injected as a dynamic suffix at the very end of the messages array.
         return sys_prompt + "\n" + rules + skills_ctx + memory_instructions + tool_desc
     
     
@@ -4276,7 +4176,7 @@ JSON:"""
         tool_files: Optional[List[Union[str, Path]]] = None,
         max_reasoning_steps: int = 20,
         temperature: float = 0.7,
-        n_predict: int = 4096,
+        n_predict: Optional[int] = None,
         enable_artefacts: bool = True,
         use_internal_history: bool = True,
         **kwargs
@@ -4478,10 +4378,7 @@ JSON:"""
 
             gen_kwargs = {k: v for k, v in kwargs.items() if k not in ("streaming_callback", "temperature", "n_predict", "stream")}
 
-            if "n_predict" in kwargs:
-                gen_kwargs["n_predict"] = kwargs["n_predict"]
-            else:
-                gen_kwargs["n_predict"] = None
+            gen_kwargs["n_predict"] = None
 
             gen_kwargs["temperature"] = temperature
 
@@ -4973,30 +4870,7 @@ JSON:"""
 
                 sanitized_final_response = re.sub(r'<[^>]+>', '', final_response).strip()
 
-                # 🛑 STATED INTENT VS EXECUTION GUARD (CRITICAL)
-                # Intercept cases where the LLM claims it wrote/repaired a file but failed to emit the actual <artifact> tag.
-                # This typically happens when the LLM fears hitting the token limit on large files and hallucinates the execution.
-                last_assistant_text = virtual_history[-1].content if virtual_history else ""
-                intent_keywords = ["i have created", "j'ai créé", "i've created", "i have repaired", "j'ai réparé", "i've repaired", "i have updated", "j'ai mis à jour", "the file has been recreated", "le fichier a été recréé", "fichier réparé", "file repaired", "recréé avec succès", "recreated successfully"]
-                stated_intent = any(kw in last_assistant_text.lower() for kw in intent_keywords)
-                artifact_actually_emitted = bool([act for act in ss.completed_actions if act.get("type") == "artifact"])
-
-                if stated_intent and not artifact_actually_emitted and not workspace_changes:
-                    ASCIIColors.warning(f"[{self.name}] 🚫 Hallucinated execution detected. LLM claimed file write/repair but no <artifact> tag was executed. Forcing tag emission.")
-
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="user",
-                        content=(
-                            "[SYSTEM: CRITICAL EXECUTION ERROR. You stated that you created or repaired a file, but you DID NOT emit the `<artifact>` tag. "
-                            "Stating intent is not execution. You MUST emit the `<artifact>` tag NOW to actually write the file to disk. "
-                            "Do NOT explain what you will do. Output the `<artifact>` tag immediately. If the file is large, you MUST still emit the complete tag. "
-                            "Do NOT emit `<done/>` until the `<artifact>` tag has been fully emitted.]"
-                        )
-                    ))
-                    ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
-                    continue
-
-                if not sanitized_final_response and not tool_calls_this_turn and not workspace_changes and round_count == 1 and not virtual_history:
+                if not sanitized_final_response and not tool_calls_this_turn and not workspace_changes and not ss.completed_actions and round_count == 1:
                     if getattr(self, 'debug_mode', False):
                         self._dump_error(
                             error=Exception("Empty response with <done/> on round 1"),
@@ -5005,17 +4879,9 @@ JSON:"""
                             extra_data={"virtual_history": [vh.content for vh in virtual_history]}
                         )
                     ASCIIColors.warning(f"[{self.name}] 🚫 Empty response with <done/> detected on round 1. Forcing continuation.")
-
-                    intent_hint = ""
-                    if last_assistant_text:
-                        import re as _re_intent
-                        intent_match = _re_intent.search(r'(Let me|Now I will|I will|Let\'s|Next, I)\s+.*', last_assistant_text, _re_intent.IGNORECASE)
-                        if intent_match:
-                            intent_hint = f' You previously stated: "{intent_match.group(0).strip()}". You must execute this stated intent NOW by emitting the appropriate `<tool>` or `<artifact>` tag.'
-
                     virtual_history.append(SimpleNamespace(
                         sender_type="user",
-                        content=f"[SYSTEM: Your previous response was completely empty.{intent_hint} Do NOT output an empty response. Do NOT emit `<done/>` until you have actually produced output or executed the tool.]"
+                        content="[SYSTEM: Your previous response was empty. Continue your task or emit <done/> if you are truly finished.]"
                     ))
                     ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
                     continue
@@ -5463,17 +5329,37 @@ JSON:"""
                     ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: <done/> detected (no actions) ===")
                 break
 
-            if ss.was_done_detected() and not ss.completed_actions:
-                if getattr(self, 'debug_mode', False):
-                    ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: <done/> detected (no actions) ===")
-                break
+            # ── 🛑 TERTIARY <done/> / <end/> FALLBACK ──
             raw_round_text = ss.get_clean_text()
-            done_match = re.search(r'(?m)^\s*<done\s*/?>\s*$', raw_round_text.strip())
+            done_pattern = re.compile(r'(?i)<(?:done|end)\s*/?>')
+            done_match = done_pattern.search(raw_round_text)
             if done_match:
-                final_response = re.sub(r'(?i)<done\s*/?>', '', raw_round_text).strip()
+                final_response = done_pattern.sub('', raw_round_text).strip()
                 if getattr(self, 'debug_mode', False):
                     ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: <done/> detected (fallback) ===")
                 break
+
+            # ── 🛡️ SAFETY NET: Detect phantom artifact processing ──
+            # If the LLM emitted <processing> or <artifact> markers in the raw stream
+            # but completed_actions is empty (artifact was never fully parsed/dispatched),
+            # we must NOT exit. Force a continuation to prevent silent termination.
+            if not ss.completed_actions and not was_cancelled:
+                _has_artifact_evidence = bool(re.search(
+                    r'<(?:processing|artifact|artefact)\b',
+                    raw_llm_output_buffer or "",
+                    re.IGNORECASE
+                ))
+                if _has_artifact_evidence:
+                    ASCIIColors.warning(f"[{self.name}] Phantom artifact detected (processing markers in stream but no completed actions). Forcing continuation.")
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="assistant",
+                        content=self._sanitize_history_for_context(raw_round_text).strip() or "[Assistant emitted an artifact block]"
+                    ))
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content="[SYSTEM: Your previous artifact was detected but not fully processed. If you intended to write a file, emit the <artifact> tag again with the complete content. If your task is complete, output your final answer and end with <done/>.]"
+                    ))
+                    continue
 
             has_new_actions_this_round = bool(ss.completed_actions) or bool(raw_round_text.strip())
             text_is_repetitive = False
@@ -5481,11 +5367,21 @@ JSON:"""
             stripped_round_text = raw_round_text.strip()
             if stripped_round_text and len(virtual_history) > 0:
                 last_assistant_text = None
-                for vh in reversed(virtual_history):
-                    if vh.sender_type == "assistant" and vh.content.strip():
-                        last_assistant_text = vh.content.strip()
-                        break
-                if last_assistant_text:
+                _last_vh = virtual_history[-1]
+                _is_continuation_context = (
+                    _last_vh.sender_type == "user"
+                    and "[SYSTEM:" in _last_vh.content
+                )
+                if _is_continuation_context and len(virtual_history) >= 2:
+                    _candidate = virtual_history[-2]
+                    if _candidate.sender_type == "assistant" and _candidate.content.strip():
+                        last_assistant_text = _candidate.content.strip()
+                else:
+                    for vh in reversed(virtual_history):
+                        if vh.sender_type == "assistant" and vh.content.strip():
+                            last_assistant_text = vh.content.strip()
+                            break
+                if last_assistant_text and not _is_continuation_context:
                     if stripped_round_text == last_assistant_text:
                         text_is_repetitive = True
                     elif len(stripped_round_text) > 80 and stripped_round_text in last_assistant_text:
@@ -5505,11 +5401,28 @@ JSON:"""
                         ASCIIColors.warning(f"[{self.name}] Intra-round text duplication detected (line repeated {most_common_count}x).")
 
             if text_is_repetitive:
-                ASCIIColors.error(f"[{self.name}] Repetitive text output detected (Round {round_count}). The LLM is producing identical text without progress. Terminating to prevent flood.")
-                final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
-                if not final_response:
-                    final_response = "[Task terminated: The agent produced repetitive text without making progress. This indicates the LLM lost context of previous tool results.]"
-                break
+                ASCIIColors.warning(f"[{self.name}] Repetitive text preamble detected (Round {round_count}). Injecting correction — NOT terminating.")
+                clean_history_text = self._sanitize_history_for_context(raw_round_text)
+                virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant produced repetitive text]"))
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content=(
+                        "[SYSTEM: You are producing repetitive conversational preambles (e.g., 'Je vais lire...') without varying your approach. "
+                        "If you are reading a document page-by-page, continue with the next pages — do NOT re-read pages you already processed. "
+                        "If you have finished reading and are ready to act, emit your final answer or the next action tag now. "
+                        "If you are stuck, explain the situation to the user and emit <done/>.]"
+                    )
+                ))
+                consecutive_stall_count = getattr(self, '_consecutive_stall_count', 0) + 1
+                object.__setattr__(self, '_consecutive_stall_count', consecutive_stall_count)
+                if consecutive_stall_count >= 3:
+                    ASCIIColors.warning(f"[{self.name}] Breaking after {consecutive_stall_count} consecutive repetition+stall cycles.")
+                    final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
+                    if not final_response:
+                        final_response = "[Task paused: The agent produced repetitive text multiple times. It may need user guidance to continue.]"
+                    break
+                ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
+                continue
 
             # ── 🧹 AUTONOMOUS CONTEXT COMPACTION ──
             ctx_health = self._calculate_context_fill(stable_system_prompt, base_conversation, virtual_history, raw_round_text)
@@ -5539,14 +5452,10 @@ JSON:"""
                 ASCIIColors.warning(f"[{self.name}] Mid-task stall detected (Round {round_count}, consecutive: {consecutive_stall_count}). LLM stopped without <done/> or new actions. Forcing continuation.")
                 clean_history_text = self._sanitize_history_for_context(raw_round_text)
                 virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant stalled without output]"))
+                recent_tool_names = [tc.get("name", "") for tc in tool_calls_this_turn[-3:]]
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
-                    content=(
-                        "[SYSTEM: CRITICAL. You are in the middle of an agentic task and stopped generating without a `<done/>` tag or any functional action tag. "
-                        "You MUST either continue executing your task by emitting the next `<tool>` or `<artifact>` tag, or output your final conversational answer and end with `<done/>`. "
-                        "Do NOT stop generating until one of these conditions are met. "
-                        "If you are stuck because a tool returned truncated or unhelpful data, DO NOT retry the same tool. Instead, explain the limitation to the user and emit <done/>.]"
-                    )
+                    content=self._build_progressive_continuation_prompt(consecutive_stall_count, recent_tool_names)
                 ))
                 continue
             elif has_new_actions_this_round:
@@ -5554,6 +5463,8 @@ JSON:"""
                 clean_history_text = self._sanitize_history_for_context(raw_round_text)
                 if clean_history_text.strip():
                     virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text))
+            if not text_is_repetitive and stripped_round_text:
+                object.__setattr__(self, '_consecutive_stall_count', 0)
 
             ctx_health = self._calculate_context_fill(stable_system_prompt, base_conversation, virtual_history, raw_round_text)
 
@@ -5594,17 +5505,12 @@ JSON:"""
                     virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant provided no output]"))
 
                 recent_tool_names = [tc.get("name", "") for tc in tool_calls_this_turn[-3:]]
-                recent_context = f" Recent actions executed: {recent_tool_names}." if recent_tool_names else ""
 
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
-                    content=(
-                        f"[SYSTEM: You stopped generation without emitting a <done/> tag.{recent_context}\n"
-                        "CRITICAL: Do NOT assume any action succeeded unless you see its result in the conversation history above.\n"
-                        "If your previous response stated an intent to perform an action (e.g., 'I will commit', 'I will create a branch'), "
-                        "you MUST execute that action's tag NOW. Stating intent and then emitting `<done/>` without executing is a CRITICAL ERROR.\n"
-                        "If your task is truly complete, output a final conversational summary and end it with a <done/> tag on a new line. "
-                        "If you need to continue working, emit the next functional tag now.]"
+                    content=self._build_progressive_continuation_prompt(
+                        getattr(self, '_consecutive_stall_count', 0),
+                        recent_tool_names
                     )
                 ))
                 if getattr(self, 'debug_mode', False):
@@ -5658,15 +5564,10 @@ JSON:"""
                 ASCIIColors.warning(f"[{self.name}] LLM stopped without <done/> after tools were executed (stall #{consecutive_stall_count}). Injecting continuation mandate.")
                 clean_history_text = self._sanitize_history_for_context(raw_round_text)
                 virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant produced text-only preamble]"))
+                recent_tool_names = [tc.get("name", "") for tc in tool_calls_this_turn[-3:]]
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
-                    content=(
-                        "[SYSTEM: CRITICAL. You stopped generation without emitting a <done/> tag and without executing any tool or artifact. "
-                        "You have tools available and previous tool results in your context. "
-                        "If your task is complete, output a final conversational summary and end with a <done/> tag on a new line. "
-                        "If you need to continue working, emit the next `<tool>` or `<artifact>` tag NOW. "
-                        "Do NOT write prose preambles like 'Je vais...' or 'Let me...' without following through with the actual action tag.]"
-                    )
+                    content=self._build_progressive_continuation_prompt(consecutive_stall_count, recent_tool_names)
                 ))
                 if getattr(self, 'debug_mode', False):
                     ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Text-only after tools, injecting continuation mandate ===")

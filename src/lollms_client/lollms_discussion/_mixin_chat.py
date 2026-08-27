@@ -927,6 +927,11 @@ class _StreamState:
         # Ensures generation halts immediately after dispatching a single functional tag.
         self._action_dispatched = False
 
+        # ── PATCH FAILURE TRACKING ──
+        # Distinguishes a failed SEARCH/REPLACE patch (which should allow a correction round)
+        # from a true duplicate artifact (which should hard-break the loop).
+        self._last_dispatch_failed = False
+
         # ── DONE TAG DETECTION ──
         # Set to True when the LLM emits <done/> to signal explicit task termination.
         self._done_detected = False
@@ -1051,14 +1056,11 @@ class _StreamState:
         # Detect <done/>, <done>, <end/>, <end>, </end> at the start of a line to signal explicit termination.
         # We strip it from the buffer so it never leaks into the UI or database.
         if not self._is_accumulating_tool and not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_secondary and not self._in_code_fence:
-            # Match all termination tag variants: <done/>, <done>, <end/>, <end>, </end>
-            done_match = re.search(r'(?m)^\s*(?:<done\s*/?>|<end\s*/?>|</end\s*>)', self._pending_buffer, re.IGNORECASE)
+            done_match = re.search(r'(?m)^\s*<(?:done|end)\s*/?>', self._pending_buffer, re.IGNORECASE)
             if done_match:
-                matched_tag = done_match.group(0).strip()
-                ASCIIColors.info(f"[StreamState] Termination tag '{matched_tag}' detected. Halting generation.")
+                ASCIIColors.info("[StreamState] Termination tag (<done/> or <end/>) detected. Halting generation.")
                 self._done_detected = True
-                # Remove the tag from the buffer
-                self._pending_buffer = re.sub(r'(?m)^\s*(?:<done\s*/?>|<end\s*/?>|</end\s*>)', '', self._pending_buffer, flags=re.IGNORECASE)
+                self._pending_buffer = re.sub(r'(?m)^\s*<(?:done|end)\s*/?>', '', self._pending_buffer, flags=re.IGNORECASE)
                 return False
 
         # ── 🛑 ANTI-MIMICRY: Prevent LLM from generating <processing> blocks ──
@@ -1999,6 +2001,7 @@ class _StreamState:
                     )
                 except Exception as patch_err:
                     ASCIIColors.error(f"[StreamState] Artifact patch failed: {patch_err}")
+                    self._last_dispatch_failed = True
                     proc_open = f'\n<processing type="artefact" title="{title}" language="{lang or ""}">\n'
                     proc_body = f'* ❌ Failed to apply patch to artifact: {patch_err}\n'
                     proc_close = f'<!-- status:failure -->\n</processing>\n'
@@ -2478,6 +2481,10 @@ class _StreamState:
         """Returns True if the LLM emitted the <done/> termination tag."""
         return self._done_detected
 
+    def was_last_dispatch_failed(self) -> bool:
+        """Returns True if the last dispatched artifact tag failed (e.g., SEARCH/REPLACE mismatch)."""
+        return self._last_dispatch_failed
+
     def passthrough(self, chunk, msg_type=None, meta=None) -> bool:
         if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
             if msg_type in (MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK, MSG_TYPE.MSG_TYPE_REASONING):
@@ -2551,6 +2558,18 @@ class _StreamState:
             # ── ONE-ACTION-PER-TURN: Halt generation immediately ──
             self._action_dispatched = True
             return
+
+        # ── 🛑 POST-STREAM <done/> / <end/> SWEEP (DEFENSE-IN-DEPTH) ──
+        # The streaming interceptor in feed() can miss <done/> when the parser
+        # is inside a code fence, inline code, artifact, or secondary tag state.
+        # After all buffers are flushed, scan the ENTIRE accumulated content
+        # for any termination tag that was missed, strip it, and set the flag.
+        if not self._done_detected:
+            done_pattern = re.compile(r'(?i)<(?:done|end)\s*/?>')
+            if done_pattern.search(self.ai_message.content):
+                ASCIIColors.info("[StreamState] Post-stream sweep detected missed <done/> or <end/> tag. Setting termination flag.")
+                self._done_detected = True
+                self.ai_message.content = done_pattern.sub('', self.ai_message.content).strip()
 
         if self._pending_buffer or self.artefact_tracker.is_inside_artefact:
             # If we are still inside an artifact for some reason (unclosed tag), dump it to the UI
@@ -3302,9 +3321,15 @@ class ChatMixin:
 
         # Inject Skills Context (Progressive Enhancement)
         if personality and hasattr(personality, "skills_manager") and personality.skills_manager:
-            skills_ctx = personality.skills_manager.build_context()
-            if skills_ctx:
-                sys_prompt += "\n" + skills_ctx
+            if not getattr(personality, "_skills_context_injected", False):
+                skills_ctx = personality.skills_manager.build_context()
+                if skills_ctx:
+                    sys_prompt += "\n" + skills_ctx
+                    object.__setattr__(personality, "_skills_context_injected", True)
+            else:
+                skills_ctx = personality.skills_manager.build_context()
+                if skills_ctx and skills_ctx not in sys_prompt:
+                    sys_prompt += "\n" + skills_ctx
 
         # ── 🧹 CORE RULES (ALWAYS ACTIVE) ──
         # These are fundamental behavioral rules that apply regardless of feature flags
@@ -3873,6 +3898,8 @@ class ChatMixin:
             model_name=getattr(self.lollmsClient.llm, "model_name", "unknown") if self.lollmsClient else "unknown",
             binding_name=getattr(self.lollmsClient.llm, "binding_name", "unknown") if self.lollmsClient else "unknown"
         )
+
+        object.__setattr__(self, "_consecutive_text_only_stalls", 0)
         if callback:
             callback(ai_msg.id, MSG_TYPE.MSG_TYPE_NEW_MESSAGE, {"message_id": ai_msg.id})
 
@@ -4080,10 +4107,10 @@ class ChatMixin:
 
             ss.flush_remaining_buffer()
 
-            # ── 🏁 DONE TAG TERMINATION PROTOCOL ──
-            # If the LLM emitted <done/>, the task is explicitly complete. Break immediately.
+            # ── 🏁 TERMINATION TAG PROTOCOL ──
+            # If the LLM emitted <done/> or <end/>, the task is explicitly complete. Break immediately.
             if ss.was_done_detected():
-                ASCIIColors.info("[ChatMixin] <done/> tag detected. Terminating agentic loop.")
+                ASCIIColors.info("[ChatMixin] Termination tag detected. Terminating agentic loop.")
                 break
 
             # ── 🔍 PROCESS PENDING MEMORY SEARCHES (HIGHEST PRIORITY) ──
@@ -4328,20 +4355,43 @@ class ChatMixin:
                 ASCIIColors.warning("[ChatMixin] LLM attempted artifact dispatch after force-final-answer. Breaking loop.")
                 break
 
-            # ── 🛑 CRITICAL FIX: DUPLICATE ARTIFACT INTERCEPTION (NEW) ──
+            # ── 🛑 CRITICAL FIX: DISTINGUISH FAILED PATCH FROM TRUE DUPLICATE ──
             # If the LLM emits an artifact tag that was ALREADY processed in a previous round,
             # _StreamState skips dispatching it (affected_artefacts remains empty).
-            # We detect this to force the final answer and prevent an infinite loop.
-            # IMPORTANT: This check must come AFTER memory search processing to avoid false positives.
+            # HOWEVER, a failed SEARCH/REPLACE patch ALSO results in empty affected_artefacts.
+            # We must only force-final-answer for TRUE duplicates, not failed patches.
             if ss.was_action_dispatched() and not ss.tool_trigger and not ss.affected_artefacts:
-                # Check if this was actually a memory operation, not an artifact
-                is_memory_operation = hasattr(self, '_pending_memory_searches') and self._pending_memory_searches
+                if ss.was_last_dispatch_failed():
+                    # ── PATCH CORRECTION PATH ──
+                    # The SEARCH/REPLACE block failed. Inject the error and let the LLM correct it.
+                    ASCIIColors.warning("[ChatMixin] Artifact patch failed. Injecting correction context.")
+                    full_round_text = ss.get_clean_text_so_far()
+                    raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
+                    clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
+                    clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
+                    clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
+                    clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                    clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
 
-                if not is_memory_operation:
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="assistant",
+                        content=clean_history_text.strip()
+                    ))
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content=(
+                            "[SYSTEM: Your last <artifact> SEARCH/REPLACE patch FAILED. The SEARCH block text was not found in the existing file content. "
+                            "You MUST retry the patch with a corrected SEARCH block that exactly matches the current file content. "
+                            "Look at the 'Fully Loaded File Contents [C]' section in your context to find the exact text to match. "
+                            "Do NOT emit <done/> until the patch succeeds or you decide to do a full rewrite instead.]"
+                        )
+                    ))
+                    continue
+                else:
+                    # ── TRUE DUPLICATE PATH ──
                     ASCIIColors.warning("[ChatMixin] LLM emitted a duplicate artifact tag. Forcing final answer.")
                     object.__setattr__(self, "_force_final_answer", True)
 
-                    # Inject a hard stop into virtual_history
                     full_round_text = ss.get_clean_text_so_far()
                     raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
                     clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
@@ -4358,10 +4408,6 @@ class ChatMixin:
                         sender_type="user",
                         content="[SYSTEM: CRITICAL. You just attempted to recreate an artifact that already exists with the exact same content. This is a loop. You MUST NOT create or update this artifact again. You MUST now provide your final conversational answer to the user, explaining what you have done, and end with <done/>.]"
                     ))
-
-                    # 🛑 ARCHITECTURAL FIX: Hard-break the loop immediately. 
-                    # Continuing the loop allows the LLM another generation pass, which it uses 
-                    # to hallucinate another preamble. We must force the loop to terminate.
                     break
 
             # ── 🛑 ONE-ACTION-PER-TURN PROTOCOL ──
@@ -5430,344 +5476,46 @@ class ChatMixin:
                 else:
                     break
             else:
-                raw_round_text = ss.get_clean_text_so_far()
-                raw_round_len = len(raw_round_text.strip())
+                full_round_text = ss.get_clean_text_so_far()
+                raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
 
-                if ss.was_action_dispatched():
-                    full_round_text = ss.get_clean_text_so_far()
-                    raw_round_text_delta = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
-                    clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text_delta, flags=re.DOTALL | re.IGNORECASE)
-                    clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
-                    clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
-                    clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
-                    clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="assistant",
-                        content=clean_history_text.strip()
-                    ))
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="user",
-                        content="[SYSTEM: Action completed. Please continue your task or provide your final answer.]"
-                    ))
-                    continue
+                clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
+                clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
+                clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
+                clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
 
-                # ── 🏁 DONE TAG TERMINATION PROTOCOL (SUPPORTS ALL VARIANTS) ──
-                # If the LLM emits <done/>, <done>, <end/>, <end>, or </end> on a new line, the task is complete. Break immediately.
-                raw_round_text = ss.get_clean_text_so_far()
-                done_match = re.search(r'(?m)^\s*(?:<done\s*/?>|<end\s*/?>|</end\s*>)\s*$', raw_round_text.strip())
-                if done_match:
-                    matched_tag = done_match.group(0).strip()
-                    ASCIIColors.info(f"[ChatMixin] Termination tag '{matched_tag}' detected. Finalizing turn.")
-                    # Remove all termination tag variants from the final content
-                    ai_msg.content = re.sub(r'(?m)^\s*(?:<done\s*/?>|<end\s*/?>|</end\s*>)\s*$', '', ai_msg.content, flags=re.MULTILINE).strip()
+                virtual_history.append(SimpleNamespace(
+                    sender_type="assistant",
+                    content=clean_history_text.strip()
+                ))
+
+                text_only_stall_count = getattr(self, "_consecutive_text_only_stalls", 0) + 1
+                object.__setattr__(self, "_consecutive_text_only_stalls", text_only_stall_count)
+
+                if text_only_stall_count >= 3:
+                    ASCIIColors.warning(f"[ChatMixin] Terminating after {text_only_stall_count} consecutive text-only stalls without <done/> or actions. The LLM is stuck.")
                     break
 
-                # ── 🛑 CONTINUATION MANDATE (NO <done/>) ──
-                # If tools were previously executed OR memory searches were performed, and the LLM stops
-                # without <done/> and without dispatching a new action, inject a mandate to either continue
-                # or emit <done/>. The Success-Loop Interceptor provides a natural termination guarantee:
-                # if the LLM repeats the same tool call, the loop breaks automatically.
-                has_actions = len(tool_calls_this_turn) > 0 or len(turn_actions_log) > 0
+                ASCIIColors.warning(f"[ChatMixin] Text-only stall detected (#{text_only_stall_count}). LLM stopped without <done/> or actions. Forcing continuation.")
 
-                if has_actions:
-                    # 🛑 TEXT REPETITION GUARD (CRITICAL FIX)
-                    # Check if the LLM is repeating the same text without emitting <done/>.
-                    stripped_round_text = raw_round_text.strip()
-                    if stripped_round_text and len(virtual_history) > 0:
-                        last_assistant_text = None
-                        for vh in reversed(virtual_history):
-                            if vh.sender_type == "assistant" and vh.content.strip():
-                                last_assistant_text = vh.content.strip()
-                                break
-
-                        if last_assistant_text:
-                            is_repetitive = False
-                            if stripped_round_text == last_assistant_text:
-                                is_repetitive = True
-                            elif len(stripped_round_text) > 50 and stripped_round_text in last_assistant_text:
-                                is_repetitive = True
-                            elif len(last_assistant_text) > 50 and last_assistant_text in stripped_round_text:
-                                is_repetitive = True
-
-                            if is_repetitive:
-                                ASCIIColors.error(f"[ChatMixin] Repetitive text output detected after action (Round {round_count}). Terminating to prevent flood.")
-                                break
-
-                    ASCIIColors.info("[ChatMixin] Action previously executed but no <done/> detected. Injecting continuation mandate.")
-
-                    # ── 🧠 CRITICAL FIX: CAPTURE THE LLM'S RESPONSE ──
-                    # Before injecting the continuation mandate, we MUST capture the LLM's response
-                    # from this round and add it to virtual_history. This ensures the LLM can see
-                    # its own answer in the next round and doesn't repeat itself.
-                    full_round_text = ss.get_clean_text_so_far()
-                    raw_round_text_delta = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
-
-                    # Sanitize the response to remove processing blocks and functional tags
-                    clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text_delta, flags=re.DOTALL | re.IGNORECASE)
-                    clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
-                    clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
-                    clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
-                    clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
-                    clean_history_text = re.sub(r'<tool>.*?</tool>', '', clean_history_text, flags=re.DOTALL | re.IGNORECASE)
-                    clean_history_text = re.sub(r'<mem_[^>]*?/?>', '', clean_history_text, flags=re.IGNORECASE)
-                    clean_history_text = clean_history_text.strip()
-
-                    # Add the LLM's response to virtual history
-                    if clean_history_text:
-                        virtual_history.append(SimpleNamespace(
-                            sender_type="assistant",
-                            content=clean_history_text
-                        ))
-                        ASCIIColors.debug(f"[ChatMixin] Captured assistant response in virtual history: {clean_history_text[:100]}...")
-
-                    # Inject the continuation mandate with explicit task completion check
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="user",
-                        content=(
-                            "[SYSTEM: TASK COMPLETION CHECK]\n"
-                            "You have provided a response above. Now, analyze your work:\n\n"
-                            "1. **Did you fully answer the user's question or complete their request?**\n"
-                            "   → If YES: Emit a `<done/>` tag on a new line to signal task completion.\n"
-                            "   → If NO: Continue with the next action (tool call, artifact creation, etc.)\n\n"
-                            "2. **DO NOT REPEAT YOUR PREVIOUS RESPONSE**. You have already provided the answer above.\n"
-                            "   If you find yourself about to write the same thing again, you are in a loop.\n"
-                            "   Instead, emit `<done/>` immediately.\n\n"
-                            "3. **SUPPORTED TERMINATION TAGS**: You can use any of these to end the turn:\n"
-                            "   - `<done/>` (preferred)\n"
-                            "   - `<end/>`\n"
-                            "   - `</end>`\n\n"
-                            "Example of correct completion:\n"
-                            "```\n"
-                            "[Your final answer here]\n"
-                            "\n"
-                            "<done/>\n"
-                            "```\n"
-                            "[END TASK COMPLETION CHECK]"
-                        )
-                    ))
-                    continue
-
-                # Only run intent detection on SHORT responses (preambles before a missed tool call)
-                intent_pattern = re.compile(r'(let me|now i|next i|i will|i need to|we need to).*(query|get|fetch|build|create|analyze|summarize|aggregate|plot)', re.IGNORECASE)
-                intent_match = intent_pattern.search(raw_round_text)
-                has_intent = False
-                if intent_match:
-                    matched_line = intent_match.group(0)
-                    line_end_idx = raw_round_text.find(matched_line) + len(matched_line)
-                    line_end_char = raw_round_text[line_end_idx] if line_end_idx < len(raw_round_text) else ""
-
-                    line_start_idx = raw_round_text.rfind('\n', 0, intent_match.start()) + 1
-                    line_start = raw_round_text[line_start_idx:intent_match.start()].strip().lower()
-
-                    is_question = line_end_char == '?' or line_start.startswith(("would you", "do you", "shall i", "should i", "could you"))
-
-                    if not is_question:
-                        has_intent = True
-
-                has_tool_tag = "<tool>" in raw_round_text.lower()
-
-                if has_intent and not has_tool_tag and not was_cancelled and round_count < max_reasoning_steps:
-                    ASCIIColors.info(f"[ChatMixin] Detected pending tool intent without XML tag. Forcing continuation...")
-
-                    full_round_text = ss.get_clean_text_so_far()
-                    raw_round_text_delta = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
-                    clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text_delta, flags=re.DOTALL | re.IGNORECASE)
-                    clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
-                    clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
-                    clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
-                    clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="assistant",
-                        content=clean_history_text.strip()
-                    ))
-
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="user",
-                        content="[SYSTEM: CRITICAL. You stopped generation before executing your stated intent. Output the <tool> or <artifact> tag NOW. Do not write any more prose.]"
-                    ))
-
-                    continue
-
-                # ── 🔄 FORCE CONTINUATION AFTER CONTEXT UNLOCK ─────────────────
-                # If the model requested files to be loaded, force at least one more round
-                # so it can immediately use the newly available context
                 if ss.context_unlock_requested and not was_cancelled:
-                    ASCIIColors.info(f"[ChatMixin] Context unlock detected ({ss.context_unlocked_files}), forcing continuation round...")
-
-                    # Inject a system prompt confirming the unlock and inviting continuation
                     unlock_files_str = ', '.join(ss.context_unlocked_files)
-
-                    # ── 🧹 IMPROVED CONTEXT UNLOCK MESSAGING ──
-                    # Make it crystal clear that this is a system notification, not a user message,
-                    # and explicitly state whether content is available or not.
-                    continuation_prompt = (
-                        f"\n\n[SYSTEM NOTIFICATION - NOT A USER MESSAGE]\n"
-                        f"The following context files have been unlocked and are now available: {unlock_files_str}\n"
-                        f"You can now reference and use the content from these files.\n"
-                        f"Please continue with your task.\n"
-                        f"[END SYSTEM NOTIFICATION]\n\n"
-                    )
-
-                    # ── CONTEXT BUDGET GUARD: Inject blocked files guidance ──
-                    blocked_guidance = getattr(ss, '_blocked_files_guidance', None) or getattr(self, '_blocked_files_guidance', None)
-                    if blocked_guidance:
-                        if isinstance(blocked_guidance, list):
-                            continuation_prompt += (
-                                f"\n[SYSTEM: 🛑 CONTEXT BUDGET LIMIT EXCEEDED]\n"
-                                f"The following files are too large to load into your context window:\n"
-                                + "\n".join(f"  • {guidance}" for guidance in blocked_guidance) + 
-                                f"\nYou MUST NOT attempt to <unlock_file> these files again.\n"
-                                f"Instead, use a tool to extract specific data:\n"
-                                f"  - Use `tool_query_database_sql` for SQL queries on .db files\n"
-                                f"  - Use `tool_execute_python_code` to parse JSON/CSV files with pandas/json modules\n"
-                                f"  - Use a grep-like approach to search for specific patterns\n"
-                                f"Extract ONLY the data you need for your current task.\n"
-                                f"[END BUDGET LIMIT NOTICE]\n\n"
-                            )
-                        else:
-                            continuation_prompt += f"\n{blocked_guidance}\n\n"
-                        # Clear the guidance after injecting it
-                        if hasattr(self, '_blocked_files_guidance'):
-                            object.__setattr__(self, '_blocked_files_guidance', [])
-
-                    # ── 🧠 CONTENT AVAILABILITY CHECK ──
-                    # Explicitly tell the LLM whether the unlocked files actually have content
-                    # or if they're empty/placeholder files.
-                    files_with_content = []
-                    files_empty = []
-                    for fname in ss.context_unlocked_files:
-                        art = self.artefacts.get(fname)
-                        if art:
-                            content = art.get("content", "")
-                            if content and len(content.strip()) > 0:
-                                files_with_content.append(f"{fname} ({len(content)} chars)")
-                            else:
-                                files_empty.append(fname)
-
-                    if files_with_content or files_empty:
-                        continuation_prompt += "[CONTENT AVAILABILITY]\n"
-                        if files_with_content:
-                            continuation_prompt += f"Files with readable content: {', '.join(files_with_content)}\n"
-                        if files_empty:
-                            continuation_prompt += f"Files that are empty or have no readable content: {', '.join(files_empty)}\n"
-                        continuation_prompt += "[END CONTENT AVAILABILITY]\n\n"
-
-                    # 🛑 CRITICAL: Append SANITIZED assistant text to virtual_history (preserves KV-cache)
-                    # Strip <processing> blocks to prevent the LLM from mimicking execution logs
-                    raw_round_text = ss.get_clean_text_so_far()
-                    clean_history_text = re.sub(r'<processing[^>]*>.*?</processing>', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
-                    clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
-                    clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
-                    clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
-                    clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="assistant",
-                        content=clean_history_text.strip()
-                    ))
-
-                    # Add a user message to force the loop to continue
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="user",
-                        content=f"[SYSTEM: Files {unlock_files_str} are now available. Continue.]"
-                    ))
-
-                    # Reset the flag and continue the loop
+                    continuation_prompt = f"[SYSTEM: The following files have been processed: {unlock_files_str}. You can now read their full content and use them. Please continue your task.]"
                     ss.context_unlock_requested = False
-                    continue  # Jump to next reasoning round immediately
-
-                # ── 🛑 MIMICRY INTERCEPTION PROTOCOL ──
-                # If the LLM mimics system infrastructure markers instead of emitting real tags,
-                # intercept it, sanitize the buffer, and force a correction round.
-                _mimicry_patterns = [
-                    re.compile(r'\[🔒SYSTEM_ARTIFACT_ANCHOR:', re.IGNORECASE),
-                    re.compile(r'\[SYSTEM:', re.IGNORECASE),
-                    re.compile(r'\[content stripped', re.IGNORECASE),
-                    re.compile(r'\[🔒artefact tag called, content stripped for brievety, do not mimic:', re.IGNORECASE),
-                    re.compile(r'\[🔒SYSTEM_ARTIFACT_UPDATED:', re.IGNORECASE),
-                ]
-
-                def _detect_mimicry(text: str) -> bool:
-                    if not text:
-                        return False
-                    tail = text[-500:]
-                    return any(pattern.search(tail) for pattern in _mimicry_patterns)
-
-                if _detect_mimicry(ai_msg.content):
-                    if not hasattr(self, "_mimicry_attempt_counts"):
-                        object.__setattr__(self, "_mimicry_attempt_counts", [0])
-
-                    self._mimicry_attempt_counts[0] += 1
-                    current_attempts = self._mimicry_attempt_counts[0]
-                    ASCIIColors.warning(f"[ChatMixin] LLM mimicked system markers. Correction attempt {current_attempts}.")
-
-                    if current_attempts >= 2:
-                        ASCIIColors.error("[ChatMixin] LLM repeatedly mimicked system markers. Breaking loop to prevent infinite cycle.")
-
-                        # CRITICAL FIX: Hard-clear any content before breaking to guarantee no ghost artifacts
-                        # are left in a state that could be misinterpreted by post-processing.
-                        ai_msg.content = ""
-                        break
-
-                    # Sanitize the ai_msg.content to remove the mimicked markers
-                    sanitized_content = ai_msg.content
-                    for pattern in _mimicry_patterns:
-                        # Remove the line containing the mimicked marker
-                        sanitized_content = re.sub(r'^.*' + pattern.pattern + r'.*$', '', sanitized_content, flags=re.MULTILINE | re.IGNORECASE)
-                    ai_msg.content = sanitized_content.strip()
-
-                    # Append the sanitized (but failed) assistant text to virtual history
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="assistant",
-                        content=ai_msg.content if ai_msg.content else "[Empty response after removing mimicked system markers]"
-                    ))
-
-                    # Inject a targeted correction
-                    correction_msg = (
-                        "=== ⚠️ CRITICAL: SYSTEM MARKER MIMICRY DETECTED ===\n"
-                        "Your previous response contained mimicked system infrastructure markers (e.g., `[SYSTEM:`, `[🔒SYSTEM_ARTIFACT_ANCHOR:`, `[content stripped...`).\n"
-                        "These markers are strictly system-generated and are **NOT** functional. Outputting them does **NOT** execute any action.\n\n"
-                        "To create an artifact, you MUST use the actual XML tag: `<artifact name=\"filename.ext\" type=\"code\">...code...</artifact>`\n"
-                        "To call a tool, you MUST use the actual XML tag: `<tool>{\"name\": \"tool_name\", \"parameters\": {...}}</tool>`\n\n"
-                        "Do NOT mimic system placeholders. Output the real functional tag NOW to perform your intended action."
+                else:
+                    continuation_prompt = (
+                        "[SYSTEM: CRITICAL. You stopped generation without emitting a <done/> tag and without executing any tool or artifact. "
+                        "If your task is complete, output your final conversational summary and end with a <done/> tag on a new line. "
+                        "If you need to continue working, emit the next `<tool>` or `<artifact>` tag NOW. "
+                        "Do NOT write prose preambles like 'Je vais...' or 'Let me...' without following through with the actual action tag.]"
                     )
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="user",
-                        content=correction_msg
-                    ))
-                    continue
 
-                # ── 🛑 TEXT REPETITION GUARD (CRITICAL FIX) ──
-                # If the LLM repeats the exact same text in consecutive rounds without
-                # emitting <done/>, it is stuck in a loop. We must break immediately.
-                stripped_round_text = raw_round_text.strip()
-                if stripped_round_text and len(virtual_history) > 0:
-                    last_assistant_text = None
-                    for vh in reversed(virtual_history):
-                        if vh.sender_type == "assistant" and vh.content.strip():
-                            last_assistant_text = vh.content.strip()
-                            break
-
-                    if last_assistant_text:
-                        is_repetitive = False
-                        if stripped_round_text == last_assistant_text:
-                            is_repetitive = True
-                        elif len(stripped_round_text) > 50 and stripped_round_text in last_assistant_text:
-                            is_repetitive = True
-                        elif len(last_assistant_text) > 50 and last_assistant_text in stripped_round_text:
-                            is_repetitive = True
-
-                        if is_repetitive:
-                            ASCIIColors.error(f"[ChatMixin] Repetitive text output detected (Round {round_count}). Terminating to prevent flood.")
-                            break
-
-                # ── 🏁 FINALIZE: No tool call, no intent, no unlock. This is the final answer. ──
-                # 🛑 CRITICAL ARCHITECTURAL FIX: Do NOT overwrite ai_msg.content with a sanitized gist.
-                # The `_StreamState` already accumulated conversational text and <processing> blocks
-                # safely into `ai_msg.content` during the stream. We must preserve this exact buffer
-                # so the execution logs remain visible in the final saved message.
-                # The `export()` method will handle stripping <processing> blocks when building 
-                # context for the LLM to prevent context bloat.
-                break
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content=continuation_prompt
+                ))
+                continue
 
         # ── 11. Final Post-Processing & Database Commit ──
 

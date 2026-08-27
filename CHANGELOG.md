@@ -47,13 +47,12 @@ All notable changes to this project will be documented in this file.
 
 - docs(lollms_client): update README with expanded architecture and routing details
 
-## [2026-08-27 02:31]
+## [2026-08-27 23:30]
+- fix(personality): pre-inject skills context into system prompt and refine skill loading
 
-- refactor(client): update memory mixins and llm binding configurations
+## [2026-08-27 09:31]
 
-## [2026-08-26 23:35]
-
-- refactor(internet_import): update internet import logic
+- fix: resolve issues in chat mixin, agent state, personality, and default tools
 
 ## [2026-08-26 15:38]
 

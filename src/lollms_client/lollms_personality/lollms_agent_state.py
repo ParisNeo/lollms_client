@@ -1367,15 +1367,27 @@ class _AgentStreamState:
                 self._is_accumulating_context = False
             return
 
+        # ── 🛑 POST-STREAM <done/> / <end/> SWEEP (DEFENSE-IN-DEPTH) ──
+        # The streaming interceptor in feed() can miss <done/> when the parser
+        # is inside a code fence, inline code, artifact, or tool accumulation state.
+        # After all buffers are flushed, scan the ENTIRE accumulated content
+        # for any termination tag that was missed, strip it, and set the flag.
+        if not self._done_intercepted:
+            done_pattern = re.compile(r'(?i)<(?:done|end)\s*/?>')
+            if done_pattern.search(self.content):
+                ASCIIColors.info("[AgentStreamState] Post-stream sweep detected missed <done/> or <end/> tag. Setting termination flag.")
+                self._done_intercepted = True
+                self.content = done_pattern.sub('', self.content).strip()
+
         if self._pending_buffer:
             cleaned_buffer = re.sub(r'<done\s*/?>\s*$', '', self._pending_buffer, flags=re.IGNORECASE).strip()
             if cleaned_buffer:
                 self.content += cleaned_buffer
                 self._cb(cleaned_buffer)
             self._pending_buffer = ""
-                
-                 
-             
+
+
+
     def was_done_detected(self) -> bool:
         return self._done_intercepted
 
