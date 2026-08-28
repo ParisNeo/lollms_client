@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -32,7 +33,6 @@ class SkillsManager:
         self.reload()
 
     def _resolve_visibility(self, skill: Skill) -> str:
-        # If the skill is text-only (no metadata), always load it unless mode is explicitly searchable
         if not skill.has_metadata:
             return "visible" if self.mode != "searchable" else "searchable"
 
@@ -82,6 +82,135 @@ class SkillsManager:
                         skill.visibility = self._resolve_visibility(skill)
                         self.skills[skill.title.lower()] = skill
 
+    def _sanitize_title(self, title: str) -> str:
+        safe_title = re.sub(r'[^\w\-]', '_', title).strip('_')
+        return safe_title or "unnamed_skill"
+
+    def create_skill(
+        self,
+        title: str,
+        content: str,
+        description: str = "",
+        category: str = "",
+        tags: Optional[List[str]] = None,
+        visibility: str = "loadable"
+    ) -> Optional[Skill]:
+        if not self._skills_dirs:
+            return None
+
+        target_dir = self._skills_dirs[0]
+        safe_title = self._sanitize_title(title)
+        
+        skill_dir = target_dir / safe_title
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_path = skill_dir / "SKILL.md"
+
+        tags_str = ", ".join(tags) if tags else ""
+        
+        frontmatter = "---\n"
+        frontmatter += f"title: \"{title}\"\n"
+        if description:
+            frontmatter += f"description: \"{description}\"\n"
+        if category:
+            frontmatter += f"category: \"{category}\"\n"
+        if tags_str:
+            frontmatter += f"tags: [{tags_str}]\n"
+        frontmatter += f"visibility: {visibility}\n"
+        frontmatter += "---\n\n"
+
+        skill_path.write_text(frontmatter + content.strip() + "\n", encoding="utf-8")
+        
+        self.reload()
+        return self.skills.get(title.lower())
+
+    def update_skill(
+        self,
+        title: str,
+        content: str,
+        description: Optional[str] = None,
+        category: Optional[str] = None,
+        tags: Optional[List[str]] = None
+    ) -> Optional[Skill]:
+        skill = self.skills.get(title.lower())
+        if not skill or not skill.file_path:
+            matches = self.search_skills(title)
+            if matches:
+                skill = matches[0]
+        
+        if not skill or not skill.file_path:
+            return None
+
+        target_dir = skill.file_path.parent
+        safe_title = self._sanitize_title(title)
+        skill_path = target_dir / "SKILL.md"
+
+        tags_str = ", ".join(tags) if tags else (", ".join(skill.tags) if skill.tags else "")
+        
+        frontmatter = "---\n"
+        frontmatter += f"title: \"{skill.title}\"\n"
+        final_desc = description if description is not None else skill.description
+        if final_desc:
+            frontmatter += f"description: \"{final_desc}\"\n"
+        final_cat = category if category is not None else skill.category
+        if final_cat:
+            frontmatter += f"category: \"{final_cat}\"\n"
+        if tags_str:
+            frontmatter += f"tags: [{tags_str}]\n"
+        frontmatter += f"visibility: {skill.visibility}\n"
+        frontmatter += "---\n\n"
+
+        skill_path.write_text(frontmatter + content.strip() + "\n", encoding="utf-8")
+        
+        self.reload()
+        return self.skills.get(skill.title.lower())
+
+    def append_to_skill(
+        self,
+        title: str,
+        content: str
+    ) -> Optional[Skill]:
+        skill = self.skills.get(title.lower())
+        if not skill or not skill.file_path:
+            matches = self.search_skills(title)
+            if matches:
+                skill = matches[0]
+        
+        if not skill or not skill.file_path:
+            return None
+
+        existing_content = skill.file_path.read_text(encoding="utf-8", errors="ignore")
+        
+        separator = "\n\n---\n\n"
+        new_content = existing_content.rstrip() + separator + content.strip() + "\n"
+        skill.file_path.write_text(new_content, encoding="utf-8")
+        
+        self.reload()
+        return self.skills.get(skill.title.lower())
+
+    def remove_skill(self, title: str) -> bool:
+        skill = self.skills.get(title.lower())
+        if not skill or not skill.file_path:
+            matches = self.search_skills(title)
+            if matches:
+                skill = matches[0]
+        
+        if not skill or not skill.file_path:
+            return False
+
+        skill_path = skill.file_path
+        parent_dir = skill_path.parent
+
+        try:
+            skill_path.unlink()
+            
+            if parent_dir != self._skills_dirs[0] and not any(parent_dir.iterdir()):
+                parent_dir.rmdir()
+        except Exception:
+            return False
+
+        self.reload()
+        return True
+
     def build_context(self) -> str:
         parts = []
 
@@ -89,7 +218,6 @@ class SkillsManager:
         active_visible = []
         overflow_loadable = []
 
-        # Enforce budget: prevent context window saturation if too many skills are visible
         used_chars = 0
         max_chars = self.max_visible_tokens * 4
 
@@ -173,9 +301,6 @@ class SkillsManager:
     def build_skill_tools(self) -> Dict[str, Dict[str, Any]]:
         """
         Conditionally builds tool specifications for skill management based on visibility tiers.
-        - `tool_list_skills` is registered ONLY if there is at least 1 skill in the library.
-        - `tool_load_skill` is registered if there are 'loadable' or 'searchable' skills.
-        - `tool_search_skills` is registered ONLY if there is at least one 'searchable' skill.
         """
         tools: Dict[str, Dict[str, Any]] = {}
 
@@ -257,5 +382,138 @@ class SkillsManager:
                 ],
                 "callable": tool_search_skills,
             }
+
+        def tool_create_skill(
+            title: str,
+            content: str,
+            description: str = "",
+            category: str = "",
+            tags: str = "",
+            visibility: str = "loadable"
+        ) -> dict:
+            """
+            Create a new persistent skill (SKILL.md) that survives across sessions.
+            Use this when you discover a reusable methodology, workaround, or best practice.
+
+            Args:
+                title (str): A concise, descriptive title for the skill.
+                content (str): The full Markdown content of the skill.
+                description (str, optional): A one-sentence summary. Defaults to "".
+                category (str, optional): A category for grouping. Defaults to "".
+                tags (str, optional): Comma-separated tags for searchability. Defaults to "".
+                visibility (str, optional): "visible", "loadable", or "searchable". Defaults to "loadable".
+            """
+            tags_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+            skill = self.create_skill(
+                title=title,
+                content=content,
+                description=description,
+                category=category,
+                tags=tags_list,
+                visibility=visibility
+            )
+            if skill:
+                return {"success": True, "output": f"Skill '{title}' created successfully."}
+            return {"success": False, "error": "Failed to create skill."}
+
+        tools["tool_create_skill"] = {
+            "name": "tool_create_skill",
+            "description": "Create a new persistent skill (SKILL.md) to save reusable knowledge, methodologies, or workarounds.",
+            "parameters": [
+                {"name": "title", "type": "str", "description": "A concise, descriptive title for the skill."},
+                {"name": "content", "type": "str", "description": "The full Markdown content of the skill."},
+                {"name": "description", "type": "str", "description": "A one-sentence summary.", "optional": True},
+                {"name": "category", "type": "str", "description": "A category for grouping.", "optional": True},
+                {"name": "tags", "type": "str", "description": "Comma-separated tags for searchability.", "optional": True},
+                {"name": "visibility", "type": "str", "description": "Visibility tier: 'visible', 'loadable', or 'searchable'.", "optional": True}
+            ],
+            "callable": tool_create_skill,
+        }
+
+        def tool_update_skill(
+            title: str,
+            content: str,
+            description: str = "",
+            category: str = "",
+            tags: str = ""
+        ) -> dict:
+            """
+            Update an existing skill with new content. Overwrites the existing content.
+
+            Args:
+                title (str): The exact title of the existing skill to update.
+                content (str): The new full Markdown content.
+                description (str, optional): New description. If empty, keeps existing.
+                category (str, optional): New category. If empty, keeps existing.
+                tags (str, optional): New comma-separated tags. If empty, keeps existing.
+            """
+            tags_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
+            skill = self.update_skill(
+                title=title,
+                content=content,
+                description=description if description else None,
+                category=category if category else None,
+                tags=tags_list
+            )
+            if skill:
+                return {"success": True, "output": f"Skill '{title}' updated successfully."}
+            return {"success": False, "error": f"Skill '{title}' not found."}
+
+        tools["tool_update_skill"] = {
+            "name": "tool_update_skill",
+            "description": "Update an existing skill with new content. Overwrites the existing content.",
+            "parameters": [
+                {"name": "title", "type": "str", "description": "The exact title of the existing skill to update."},
+                {"name": "content", "type": "str", "description": "The new full Markdown content."},
+                {"name": "description", "type": "str", "description": "New description. If empty, keeps existing.", "optional": True},
+                {"name": "category", "type": "str", "description": "New category. If empty, keeps existing.", "optional": True},
+                {"name": "tags", "type": "str", "description": "New comma-separated tags. If empty, keeps existing.", "optional": True}
+            ],
+            "callable": tool_update_skill,
+        }
+
+        def tool_append_to_skill(title: str, content: str) -> dict:
+            """
+            Append new content to the end of an existing skill.
+
+            Args:
+                title (str): The exact title of the existing skill.
+                content (str): The Markdown content to append.
+            """
+            skill = self.append_to_skill(title=title, content=content)
+            if skill:
+                return {"success": True, "output": f"Content appended to skill '{title}' successfully."}
+            return {"success": False, "error": f"Skill '{title}' not found."}
+
+        tools["tool_append_to_skill"] = {
+            "name": "tool_append_to_skill",
+            "description": "Append new content to the end of an existing skill.",
+            "parameters": [
+                {"name": "title", "type": "str", "description": "The exact title of the existing skill."},
+                {"name": "content", "type": "str", "description": "The Markdown content to append."}
+            ],
+            "callable": tool_append_to_skill,
+        }
+
+        def tool_remove_skill(title: str) -> dict:
+            """
+            Permanently delete a skill from the library.
+
+            Args:
+                title (str): The exact title of the skill to delete.
+            """
+            success = self.remove_skill(title=title)
+            if success:
+                return {"success": True, "output": f"Skill '{title}' removed successfully."}
+            return {"success": False, "error": f"Skill '{title}' not found."}
+
+        tools["tool_remove_skill"] = {
+            "name": "tool_remove_skill",
+            "description": "Permanently delete a skill from the library.",
+            "parameters": [
+                {"name": "title", "type": "str", "description": "The exact title of the skill to delete."}
+            ],
+            "callable": tool_remove_skill,
+        }
 
         return tools

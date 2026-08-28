@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-08-28 16:29]
+
+- feat(tools): enhance default tool bindings and integrate skills manager
+
 ## [2026-08-28 01:32]
 
 - feat(personality): conditionally mount LCP document and data tools based on workspace file types

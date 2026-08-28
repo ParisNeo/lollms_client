@@ -47,7 +47,10 @@ def tool_inspect_document(file_name: str) -> Dict[str, Any]:
 
     try:
         if ext == ".pdf":
-            from pypdf import PdfReader
+            try:
+                from pypdf import PdfReader
+            except ImportError:
+                return {"success": False, "error": "pypdf is not installed. Please install it to read PDF files."}
             reader = PdfReader(str(path))
             return {
                 "success": True,
@@ -135,10 +138,13 @@ def tool_read_document_content(
 
     try:
         if ext == ".pdf":
-            import fitz
-            doc = fitz.open(str(path))
-            total_pages = len(doc)
-            
+            try:
+                from pypdf import PdfReader
+            except ImportError:
+                return {"success": False, "error": "pypdf is not installed. Please install it to read PDF files."}
+            reader = PdfReader(str(path))
+            total_pages = len(reader.pages)
+
             target_pages = list(range(total_pages))
             if page_or_sheet:
                 target_pages = []
@@ -163,12 +169,11 @@ def tool_read_document_content(
             for page_num in target_pages:
                 if current_chars >= max_chars:
                     break
-                page = doc[page_num]
-                page_text = page.get_text("text")
+                page = reader.pages[page_num]
+                page_text = page.extract_text() or ""
                 pages_text.append(f"--- Page {page_num + 1} ---\n{page_text}")
                 current_chars += len(page_text)
-            doc.close()
-            
+
             full_text = "\n\n".join(pages_text)
             if len(full_text) > max_chars:
                 full_text = full_text[:max_chars] + f"\n\n... [truncated, {len(full_text) - max_chars} more chars]"

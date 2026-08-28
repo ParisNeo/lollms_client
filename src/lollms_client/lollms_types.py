@@ -164,6 +164,7 @@ class MSG_TYPE(Enum):
 
     MSG_TYPE_CONTEXT_UPDATE            = 54 # context visibility has been updated (unlock/lock/hide)
     MSG_TYPE_ARTEFACT_SYMBOL_DETECTED  = 55 # a structural symbol (class, method, function, section) was detected
+    MSG_TYPE_SCRATCHPAD_UPDATE         = 56 # the persistent scratchpad was updated or cleared
 
 
 class EventMode(Enum):

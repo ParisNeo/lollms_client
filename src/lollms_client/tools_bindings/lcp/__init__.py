@@ -10,6 +10,8 @@ import traceback
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union, Callable
 
+from builtins import compile as _native_compile
+
 from lollms_client.lollms_tools_binding import LollmsToolBinding
 from ascii_colors import ASCIIColors, trace_exception
 
@@ -317,7 +319,7 @@ class LCPBinding(LollmsToolBinding):
         try:
             module_name = f"dynamic_tool_{tool_name_prefix}_{uuid.uuid4().hex[:8]}"
             module = types.ModuleType(module_name)
-            exec(compile(code, "<dynamic_tool>", "exec"), module.__dict__)
+            exec(_native_compile(code, "<dynamic_tool>", "exec"), module.__dict__)
             tree = ast.parse(code)
             registered_count = 0
             

@@ -3462,6 +3462,13 @@ class ChatMixin:
         if personality and hasattr(personality, "skills_manager") and personality.skills_manager:
             active_tools.update(personality.skills_manager.build_skill_tools())
 
+        if personality and hasattr(personality, "capabilities") and personality.capabilities and personality.capabilities.enable_skill_creation:
+            if personality.skills_manager:
+                skill_tools = personality.skills_manager.build_skill_tools()
+                for t_name, t_spec in skill_tools.items():
+                    if t_name in ("tool_create_skill", "tool_update_skill", "tool_append_to_skill", "tool_remove_skill"):
+                        active_tools[t_name] = t_spec
+
         if personality and hasattr(personality, "tools") and _is_tool_binding(personality.tools):
             try:
                 pers_tools = personality.tools.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)

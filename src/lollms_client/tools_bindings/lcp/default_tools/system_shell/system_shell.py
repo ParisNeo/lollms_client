@@ -26,15 +26,22 @@ def init_tools_library(config: dict = None) -> None:
         AUTONOMY_LEVEL = "safe"
 
 def _is_safe_command(command: str) -> bool:
+    is_windows = platform.system() == "Windows"
     safe_commands = {
         "dir", "echo", "type", "cd", "pip", "python", "py", "git",
         "ls", "pwd", "cat", "head", "tail", "mkdir", "rmdir", "del",
         "powershell", "pwsh", "cmd", "node", "npm", "npx",
         "where", "which", "set", "env"
     }
+    if is_windows:
+        safe_commands.update({
+            "copy", "move", "ren", "rename", "md", "rd", "cls",
+            "chdir", "pushd", "popd", "tree", "find", "findstr",
+            "sort", "more", "help", "ver", "vol", "label", "time", "date"
+        })
     try:
         stripped = command.strip()
-        parts = shlex.split(stripped, posix=(platform.system() != "Windows"))
+        parts = shlex.split(stripped, posix=(not is_windows))
         if parts:
             base_cmd = os.path.basename(parts[0]).lower()
             if base_cmd.endswith(".exe"):
@@ -85,9 +92,17 @@ def tool_execute_shell_command(
             )
         else:
             if not _is_safe_command(command):
+                allowed_list = ", ".join(sorted(safe_commands))
                 return {
                     "success": False,
-                    "error": f"Command '{command}' requires 'full_access' autonomy level. Ask the user to enable it."
+                    "output": (
+                        f"🛑 BLOCKED BY SANDBOX: The command '{command}' is not in the safe whitelist.\n\n"
+                        f"The system shell is currently in 'safe' mode and only permits read-only or non-destructive operations.\n"
+                        f"Allowed safe commands include: {allowed_list}.\n\n"
+                        f"⚠️ **ACTION REQUIRED FROM THE USER**: If this task requires elevated privileges (e.g., system configuration, complex shell scripts), "
+                        f"please ask the user to enable 'full_access' mode by typing `/shell` in the CLI, or by pressing `Ctrl+C` and restarting with the `--shell-autonomy full_access` flag."
+                    ),
+                    "error": "Blocked by sandbox (safe mode)"
                 }
             result = subprocess.run(
                 command,

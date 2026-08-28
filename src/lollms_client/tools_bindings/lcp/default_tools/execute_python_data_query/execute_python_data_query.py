@@ -125,7 +125,16 @@ def tool_execute_python_data_query(
         plt.clf()
         plt.close('all')
 
-        exec(code, local_vars)
+        try:
+            import builtins
+            native_compile = getattr(builtins, 'compile', None)
+            if native_compile and native_compile.__module__ == 'builtins':
+                compiled_code = native_compile(code, "<execute_python_data_query>", "exec")
+                exec(compiled_code, local_vars)
+            else:
+                exec(code, local_vars)
+        except TypeError:
+            exec(code, local_vars)
 
         if auto_loaded_df_file and "df" in local_vars and isinstance(local_vars["df"], pd.DataFrame):
             try:

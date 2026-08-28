@@ -28,7 +28,7 @@ import threading
 import platform
 from pathlib import Path
 from typing import Optional, Dict, Any, List
-
+from ascii_colors import trace_exception
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
 SRC_DIR = PROJECT_ROOT / "src"
 if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
@@ -814,6 +814,8 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
             personality._init_artefact_system()
         if hasattr(personality, "_sync_artefact_index_with_disk"):
             personality._sync_artefact_index_with_disk()
+        if hasattr(personality, "_init_scratchpad"):
+            personality._init_scratchpad()
     except Exception as e:
         ASCIIColors.warning(f"Failed to pre-initialize artefact system for stats: {e}")
 
@@ -913,6 +915,9 @@ class StreamRenderer:
         proc_type = type_match.group(1) if type_match else "action"
         title = title_match.group(1) if title_match else "Processing"
 
+        status_match = re.search(r'<!-- status:(\w+)\s*-->', block_content)
+        block_status = status_match.group(1) if status_match else None
+
         if proc_type == "tool":
             params_str = params_match.group(1) if params_match else "{}"
             try:
@@ -923,20 +928,38 @@ class StreamRenderer:
 
             body_match = re.search(r'>(.*)', block_content, re.DOTALL)
             body_text = body_match.group(1).strip() if body_match else ""
+            body_text = re.sub(r'<!-- status:\w+\s*-->', '', body_text).strip()
 
-            panel_content = f"[cyan]Parameters:[/cyan]\n[dim]{params_str_formatted}[/dim]\n\n[cyan]Execution Log:[/cyan]\n{body_text}"
+            if not body_text:
+                body_text = "[dim](No execution log output was provided by the tool)[/dim]"
+
+            panel_lines = [f"[cyan]Parameters:[/cyan]\n[dim]{params_str_formatted}[/dim]\n"]
+            if block_status == "failure":
+                panel_lines.append(f"[cyan]Error Details:[/cyan]\n[red]{body_text}[/red]")
+            else:
+                panel_lines.append(f"[cyan]Execution Log:[/cyan]\n{body_text}")
+            panel_content = "\n".join(panel_lines)
+
+            border = "red" if block_status == "failure" else "blue"
+            print("")
             ASCIIColors.panel(
                 panel_content,
-                title=f"[bold blue]🛠️ Tool Execution: {title}[/bold blue]",
-                border_style="blue"
+                title=f"[bold {'red' if block_status == 'failure' else 'blue'}]🛠️ Tool Execution: {title}[/bold {'red' if block_status == 'failure' else 'blue'}]",
+                border_style=border
             )
         else:
             body_match = re.search(r'>(.*)', block_content, re.DOTALL)
             body_text = body_match.group(1).strip() if body_match else ""
+            body_text = re.sub(r'<!-- status:\w+\s*-->', '', body_text).strip()
+            if not body_text:
+                body_text = "[dim](No output)[/dim]"
+            border = "red" if block_status == "failure" else "magenta"
+            print("")
+
             ASCIIColors.panel(
                 body_text,
-                title=f"[bold magenta]⚙️ {title}[/bold magenta]",
-                border_style="magenta"
+                title=f"[bold {'red' if block_status == 'failure' else 'magenta'}]⚙️ {title}[/bold {'red' if block_status == 'failure' else 'magenta'}]",
+                border_style=border
             )
 
     def _start_live_artifact_panel(self, title: str, lang: str = ""):
@@ -1067,6 +1090,7 @@ class StreamRenderer:
             return
 
         if msg_type == MSG_TYPE.MSG_TYPE_TOOL_START:
+            ASCIIColors.rich_print("")
             tool_name = meta.get("tool_name", "unknown")
             params = meta.get("parameters", {})
 
@@ -1099,6 +1123,7 @@ class StreamRenderer:
             )
 
         elif msg_type == MSG_TYPE.MSG_TYPE_TOOL_END:
+            ASCIIColors.rich_print("")
             tool_name = meta.get("tool_name", "unknown")
             success = meta.get("success", False)
             output = meta.get("output", "")
@@ -1117,25 +1142,40 @@ class StreamRenderer:
             if success and error == "[No output returned by tool]":
                 error = None
 
+            if not success and not error and output:
+                error = output
+                output = ""
+
+            if not success and not error:
+                error = "Tool returned success=False but no error or output content was provided."
+
             status_str = "[green]✅ Success[/green]" if success else "[red]❌ Failed[/red]"
 
             panel_lines = [f"\n[cyan]Status:[/cyan] {status_str}"]
 
+            cmd_params = meta.get("parameters", {})
+            if cmd_params:
+                try:
+                    params_str = json.dumps(cmd_params, indent=2, ensure_ascii=False, default=str)
+                except Exception:
+                    params_str = str(cmd_params)
+                panel_lines.append(f"[cyan]Parameters:[/cyan]\n[dim]{params_str}[/dim]")
+
             if tool_name == "tool_execute_shell_command":
-                cmd_params = meta.get("parameters", {})
                 command_str = cmd_params.get("command", "")
                 if command_str:
                     panel_lines.append(f"[cyan]Command:[/cyan] [yellow]{command_str}[/yellow]")
 
-            max_log_lines = 15
             log_source = output or error or ""
-            log_lines = log_source.splitlines()
+            max_log_lines = 30
+            log_lines = log_source.splitlines() if log_source else []
             if len(log_lines) > max_log_lines:
                 log_content = "\n".join(log_lines[:max_log_lines]) + f"\n[dim]... ({len(log_lines) - max_log_lines} more lines truncated)[/dim]"
             else:
-                log_content = log_source
+                log_content = log_source if log_source else "[dim](No output or error details provided)[/dim]"
 
-            panel_lines.append(f"\n[cyan]Execution Log:[/cyan]\n{log_content}")
+            log_label = "Execution Log" if success else "Error Details"
+            panel_lines.append(f"\n[cyan]{log_label}:[/cyan]\n{log_content}")
             panel_content = "\n".join(panel_lines)
 
             ASCIIColors.panel(
@@ -1163,8 +1203,9 @@ class StreamRenderer:
 
             self._stop_live_artifact_panel()
 
+            print("")
             if is_patch:
-                ASCIIColors.rich_print(f"\n[bold yellow]🔧 PATCHING ARTIFACT:[/bold yellow] [yellow]{title}[/yellow]" + (f" [dim]({lang})[/dim]" if lang else ""))
+                ASCIIColors.rich_print(f"[bold yellow]🔧 PATCHING ARTIFACT:[/bold yellow] [yellow]{title}[/yellow]" + (f" [dim]({lang})[/dim]" if lang else ""))
             else:
                 self._start_live_artifact_panel(title, lang)
             return
@@ -1176,6 +1217,7 @@ class StreamRenderer:
             version = meta.get("version", 1)
             error = meta.get("error")
 
+            ASCIIColors.rich_print("")
             if success:
                 status_str = f"[green]✅ Patched (v{version})[/green]" if meta.get("is_patch") else f"[green]✅ Saved (v{version})[/green]"
             else:
@@ -1187,10 +1229,10 @@ class StreamRenderer:
             action = meta.get("action", "update")
             status = meta.get("status", "")
 
-            # Suppress intermediate stream events; only render the final execution event
             if status in ("streaming", "stream_complete"):
                 return
 
+            ASCIIColors.rich_print("")
             files = meta.get("files", [])
             error = meta.get("error")
 
@@ -1212,6 +1254,25 @@ class StreamRenderer:
                 border_style="yellow"
             )
 
+        elif msg_type == MSG_TYPE.MSG_TYPE_SCRATCHPAD_UPDATE:
+            action = meta.get("action", "update")
+            status = meta.get("status", "success")
+            message = meta.get("message", "Scratchpad updated.")
+            preview = meta.get("preview", "")
+
+            ASCIIColors.rich_print("")
+            status_color = "green" if status == "success" else "red"
+            panel_content = f"\n[cyan]Status:[/cyan] [{status_color}]{message}[/{status_color}]"
+            if preview:
+                panel_content += f"\n[cyan]Preview:[/cyan] [dim]{preview}...[/dim]"
+
+            ASCIIColors.panel(
+                panel_content,
+                title=f"[bold yellow]📝 Scratchpad {action.replace('_', ' ').title()}[/bold yellow]",
+                border_style="yellow"
+            )
+            return
+
 
     def flush(self):
         """Flushes any pending buffers, rendering unclosed tags as raw text."""
@@ -1232,7 +1293,8 @@ class StreamRenderer:
             MSG_TYPE.MSG_TYPE_TOOL_END,
             MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START,
             MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END,
-            MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE
+            MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE,
+            MSG_TYPE.MSG_TYPE_SCRATCHPAD_UPDATE
         ]:
             if meta and meta.get("stream_complete"):
                 if msg_type == MSG_TYPE.MSG_TYPE_TOOL_START and meta.get("tool_name") == "pending":
@@ -1593,16 +1655,29 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
 
     PROMPT_TEXT = "👤 You> "
     PROMPT_LEN = len(PROMPT_TEXT)
+    CONT_PROMPT_TEXT = "... "
+    CONT_PROMPT_LEN = len(CONT_PROMPT_TEXT)
 
-    def _draw_line(buffer: str, cursor_pos: int, ghost: str = ""):
+    def _draw_line(buffer: str, cursor_pos: int, ghost: str = "", line_index: int = 0):
         sys.stdout.write("\r\033[K")
-        if ghost:
-            sys.stdout.write(f"{PROMPT_TEXT}{buffer}\033[90m{ghost}\033[0m")
-        else:
-            sys.stdout.write(f"{PROMPT_TEXT}{buffer}")
+        lines = buffer.split('\n')
+        for i, line in enumerate(lines):
+            prefix = PROMPT_TEXT if i == 0 else CONT_PROMPT_TEXT
+            if i > 0:
+                sys.stdout.write("\n")
+            if i == line_index and ghost:
+                sys.stdout.write(f"{prefix}{line}\033[90m{ghost}\033[0m")
+            else:
+                sys.stdout.write(f"{prefix}{line}")
 
         if cursor_pos < len(buffer + ghost):
-            target_col = PROMPT_LEN + cursor_pos + 1
+            lines_before = buffer[:cursor_pos].count('\n')
+            if lines_before == 0:
+                target_col = PROMPT_LEN + cursor_pos + 1
+            else:
+                col_in_line = cursor_pos - buffer.rfind('\n', 0, cursor_pos) - 1
+                target_col = CONT_PROMPT_LEN + col_in_line + 1
+                sys.stdout.write(f"\033[{lines_before}A")
             sys.stdout.write(f"\033[{target_col}G")
         sys.stdout.flush()
 
@@ -1624,6 +1699,11 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
             if not current_line.startswith("/"):
                 return []
             return [c for c in commands if c.startswith(current_line)]
+
+        def get_line_index():
+            if '\n' not in buffer:
+                return 0
+            return buffer[:cursor_pos].count('\n')
 
         try:
             tty.setraw(fd)
@@ -1649,7 +1729,7 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
                         cursor_pos += 1
                         active_suggestion_idx = -1
                         sys.stdout.write("\n")
-                        _draw_line(buffer, cursor_pos, "")
+                        _draw_line(buffer, cursor_pos, "", line_index=get_line_index())
                     else:
                         ch3 = sys.stdin.read(1)
                         if ch2 == '[':
@@ -1660,14 +1740,14 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
                                     lines[-1] = sugg[active_suggestion_idx]
                                     buffer = '\n'.join(lines)
                                     cursor_pos = len(buffer)
-                                    _draw_line(buffer, cursor_pos)
+                                    _draw_line(buffer, cursor_pos, line_index=get_line_index())
                                 elif history.entries:
                                     if history_idx == len(history.entries):
                                         current_input = buffer
                                     history_idx = max(0, history_idx - 1)
                                     buffer = history.entries[history_idx]
                                     cursor_pos = len(buffer)
-                                    _draw_line(buffer, cursor_pos)
+                                    _draw_line(buffer, cursor_pos, line_index=get_line_index())
                             elif ch3 == 'B':
                                 if sugg:
                                     active_suggestion_idx = (active_suggestion_idx + 1) % len(sugg)
@@ -1675,7 +1755,7 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
                                     lines[-1] = sugg[active_suggestion_idx]
                                     buffer = '\n'.join(lines)
                                     cursor_pos = len(buffer)
-                                    _draw_line(buffer, cursor_pos)
+                                    _draw_line(buffer, cursor_pos, line_index=get_line_index())
                                 elif history_idx < len(history.entries):
                                     history_idx += 1
                                     if history_idx == len(history.entries):
@@ -1683,7 +1763,7 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
                                     else:
                                         buffer = history.entries[history_idx]
                                     cursor_pos = len(buffer)
-                                    _draw_line(buffer, cursor_pos)
+                                    _draw_line(buffer, cursor_pos, line_index=get_line_index())
                             elif ch3 == 'C':
                                 if sugg and cursor_pos == len(buffer):
                                     lines = buffer.split('\n')
@@ -1691,14 +1771,14 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
                                     buffer = '\n'.join(lines)
                                     cursor_pos = len(buffer)
                                     active_suggestion_idx = -1
-                                    _draw_line(buffer, cursor_pos)
+                                    _draw_line(buffer, cursor_pos, line_index=get_line_index())
                                 elif cursor_pos < len(buffer):
                                     cursor_pos += 1
-                                    _draw_line(buffer, cursor_pos, ghost_text)
+                                    _draw_line(buffer, cursor_pos, ghost_text, line_index=get_line_index())
                             elif ch3 == 'D':
                                 if cursor_pos > 0:
                                     cursor_pos -= 1
-                                    _draw_line(buffer, cursor_pos, ghost_text)
+                                    _draw_line(buffer, cursor_pos, ghost_text, line_index=get_line_index())
                 elif ch in ('\x7f', '\b'):
                     if cursor_pos > 0:
                         buffer = buffer[:cursor_pos-1] + buffer[cursor_pos:]
@@ -1707,7 +1787,7 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
                         sugg = get_suggestions()
                         current_line = buffer.split('\n')[-1]
                         ghost_text = sugg[0][len(current_line):] if sugg and sugg[0].startswith(current_line) else ""
-                        _draw_line(buffer, cursor_pos, ghost_text)
+                        _draw_line(buffer, cursor_pos, ghost_text, line_index=get_line_index())
                 elif ch == '\t':
                     if sugg:
                         lines = buffer.split('\n')
@@ -1715,7 +1795,7 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
                         buffer = '\n'.join(lines)
                         cursor_pos = len(buffer)
                         active_suggestion_idx = -1
-                        _draw_line(buffer, cursor_pos)
+                        _draw_line(buffer, cursor_pos, line_index=get_line_index())
                 elif len(ch) == 1 and ch.isprintable():
                     buffer = buffer[:cursor_pos] + ch + buffer[cursor_pos:]
                     cursor_pos += 1
@@ -1723,7 +1803,7 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
                     sugg = get_suggestions()
                     current_line = buffer.split('\n')[-1]
                     ghost_text = sugg[0][len(current_line):] if sugg and sugg[0].startswith(current_line) else ""
-                    _draw_line(buffer, cursor_pos, ghost_text)
+                    _draw_line(buffer, cursor_pos, ghost_text, line_index=get_line_index())
         except Exception:
             return None
         finally:
@@ -1744,6 +1824,11 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
             if not current_line.startswith("/"):
                 return []
             return [c for c in commands if c.startswith(current_line)]
+
+        def get_line_index():
+            if '\n' not in buffer:
+                return 0
+            return buffer[:cursor_pos].count('\n')
 
         sys.stdout.write(PROMPT_TEXT)
         sys.stdout.flush()
@@ -1770,7 +1855,7 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
                     cursor_pos += 1
                     active_suggestion_idx = -1
                     sys.stdout.write("\n")
-                    _draw_line(buffer, cursor_pos, "")
+                    _draw_line(buffer, cursor_pos, "", line_index=get_line_index())
                 elif ch2 == 'H':
                     if sugg:
                         active_suggestion_idx = (active_suggestion_idx - 1) % len(sugg)
@@ -1778,13 +1863,13 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
                         lines[-1] = sugg[active_suggestion_idx]
                         buffer = '\n'.join(lines)
                         cursor_pos = len(buffer)
-                        _draw_line(buffer, cursor_pos)
+                        _draw_line(buffer, cursor_pos, line_index=get_line_index())
                     elif history.entries:
                         if history_idx == len(history.entries): current_input = buffer
                         history_idx = max(0, history_idx - 1)
                         buffer = history.entries[history_idx]
                         cursor_pos = len(buffer)
-                        _draw_line(buffer, cursor_pos)
+                        _draw_line(buffer, cursor_pos, line_index=get_line_index())
                 elif ch2 == 'P':
                     if sugg:
                         active_suggestion_idx = (active_suggestion_idx + 1) % len(sugg)
@@ -1792,12 +1877,12 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
                         lines[-1] = sugg[active_suggestion_idx]
                         buffer = '\n'.join(lines)
                         cursor_pos = len(buffer)
-                        _draw_line(buffer, cursor_pos)
+                        _draw_line(buffer, cursor_pos, line_index=get_line_index())
                     elif history_idx < len(history.entries):
                         history_idx += 1
                         buffer = current_input if history_idx == len(history.entries) else history.entries[history_idx]
                         cursor_pos = len(buffer)
-                        _draw_line(buffer, cursor_pos)
+                        _draw_line(buffer, cursor_pos, line_index=get_line_index())
                 elif ch2 == 'M':
                     if sugg and cursor_pos == len(buffer):
                         lines = buffer.split('\n')
@@ -1805,14 +1890,14 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
                         buffer = '\n'.join(lines)
                         cursor_pos = len(buffer)
                         active_suggestion_idx = -1
-                        _draw_line(buffer, cursor_pos)
+                        _draw_line(buffer, cursor_pos, line_index=get_line_index())
                     elif cursor_pos < len(buffer):
                         cursor_pos += 1
-                        _draw_line(buffer, cursor_pos, ghost_text)
+                        _draw_line(buffer, cursor_pos, ghost_text, line_index=get_line_index())
                 elif ch2 == 'K':
                     if cursor_pos > 0:
                         cursor_pos -= 1
-                        _draw_line(buffer, cursor_pos, ghost_text)
+                        _draw_line(buffer, cursor_pos, ghost_text, line_index=get_line_index())
             elif ch in ('\x08', '\x7f'):
                 if cursor_pos > 0:
                     buffer = buffer[:cursor_pos-1] + buffer[cursor_pos:]
@@ -1821,7 +1906,7 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
                     sugg = get_suggestions()
                     current_line = buffer.split('\n')[-1]
                     ghost_text = sugg[0][len(current_line):] if sugg and sugg[0].startswith(current_line) else ""
-                    _draw_line(buffer, cursor_pos, ghost_text)
+                    _draw_line(buffer, cursor_pos, ghost_text, line_index=get_line_index())
             elif ch == '\t':
                 if sugg:
                     lines = buffer.split('\n')
@@ -1829,7 +1914,7 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
                     buffer = '\n'.join(lines)
                     cursor_pos = len(buffer)
                     active_suggestion_idx = -1
-                    _draw_line(buffer, cursor_pos)
+                    _draw_line(buffer, cursor_pos, line_index=get_line_index())
             elif ch.isprintable():
                 buffer = buffer[:cursor_pos] + ch + buffer[cursor_pos:]
                 cursor_pos += 1
@@ -1837,7 +1922,7 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
                 sugg = get_suggestions()
                 current_line = buffer.split('\n')[-1]
                 ghost_text = sugg[0][len(current_line):] if sugg and sugg[0].startswith(current_line) else ""
-                _draw_line(buffer, cursor_pos, ghost_text)
+                _draw_line(buffer, cursor_pos, ghost_text, line_index=get_line_index())
 
     try:
         if sys.platform == 'win32':
@@ -1914,7 +1999,7 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
     renderer = StreamRenderer(config)
     history = PersistentHistory(APP_HISTORY_FILE)
 
-    slash_commands = ["/exit", "/quit", "/help", "/config", "/forget", "/skills", "/clear-history", "/clear-files", "/models", "/files", "/workspace", "/load", "/unload", "/lock", "/hide", "/unhide"]
+    slash_commands = ["/exit", "/quit", "/help", "/config", "/shell", "/forget", "/skills", "/clear-history", "/clear-files", "/clear-scratchpad", "/models", "/files", "/workspace", "/load", "/unload", "/lock", "/hide", "/unhide"]
     
     # Display a safe, truncated workspace path to the user
     ws_path_display = Path(config.workspace_path).resolve()
@@ -1929,7 +2014,7 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
         f"[cyan]Workspace:[/cyan] {ws_path_display}",
         f"[cyan]Model:[/cyan]      {config.model_name}",
         f"[cyan]Binding:[/cyan]    {config.llm_binding}",
-        f"[dim]Commands: 'exit', 'help', 'config', 'forget', 'skills', 'clear-history', 'clear-files', 'workspace', 'files', 'load', 'unload', 'lock', 'hide'[/dim]"
+        f"[dim]Commands: 'exit', 'help', 'config', 'shell', 'forget', 'skills', 'clear-history', 'clear-files', 'clear-scratchpad', 'workspace', 'files', 'load', 'unload', 'lock', 'hide'[/dim]"
     ]
 
     ctx_status = get_context_fill_status(personality, client)
@@ -2019,6 +2104,17 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
             ASCIIColors.green("  Conversation history cleared.")
             continue
 
+        if user_input.lower() == "/clear-scratchpad":
+            if hasattr(personality, "_execute_scratchpad_clear"):
+                result_msg = personality._execute_scratchpad_clear()
+                if "✅" in result_msg:
+                    ASCIIColors.green(f"  {result_msg}")
+                else:
+                    ASCIIColors.red(f"  {result_msg}")
+            else:
+                ASCIIColors.yellow("  Scratchpad is not initialized for this workspace.")
+            continue
+
         if user_input.lower() in ("/clear-files", "/unload-all"):
             if not hasattr(personality, '_artefact_manager') or not personality._artefact_manager:
                 ASCIIColors.yellow("  Artefact system not initialized.")
@@ -2065,6 +2161,145 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
             from lollms_client.lollms_config_cli_env import run_wizard_and_save
             run_wizard_and_save()
             ASCIIColors.green("  Configuration updated. Restart lollms-code for changes to take effect.")
+            continue
+
+        if user_input.lower() == "/shell":
+            ASCIIColors.rule("[bold cyan]⚙️ Shell Autonomy Configuration[/bold cyan]")
+            current_mode = config.shell_autonomy_level
+            mode_color = "red" if current_mode == "full_access" else "green"
+            ASCIIColors.info(f"Current shell autonomy level: [{mode_color}]{current_mode}[/{mode_color}]")
+
+            if current_mode == "safe":
+                ASCIIColors.red("\n  ⚠️  WARNING: Switching to 'full_access' mode grants the agent UNRESTRICTED access to your system shell.")
+                ASCIIColors.red("  This means it can potentially execute destructive commands (e.g., `rm -rf`, `format`), modify system files, or install software without asking.")
+                ASCIIColors.yellow("  Only enable this if you trust the agent and the task requires elevated privileges.")
+
+                try:
+                    confirm = input("\n  ❓ Type 'ENABLE FULL ACCESS' to proceed, or anything else to abort: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    ASCIIColors.yellow("\n  ❌ Aborted. Shell remains in 'safe' mode.")
+                    continue
+
+                if confirm == "ENABLE FULL ACCESS":
+                    config.shell_autonomy_level = "full_access"
+                    config.save()
+
+                    if hasattr(client, 'tools') and hasattr(client.tools, 'mounted_libraries'):
+                        if 'system_shell' in client.tools.mounted_libraries:
+                            lib = client.tools.mounted_libraries['system_shell']
+                            if hasattr(lib, 'init_tools_library'):
+                                lib.init_tools_library({"autonomy_level": "full_access"})
+                                ASCIIColors.red("\n  🔓 Shell autonomy set to 'full_access'. The agent now has unrestricted shell access.")
+                            else:
+                                ASCIIColors.yellow("\n  ⚠️ Config saved, but the active tool library does not support hot-reloading. Please restart lollms-code.")
+                        else:
+                            try:
+                                client.tools.mount_tool_library('system_shell')
+                                lib = client.tools.mounted_libraries['system_shell']
+                                if hasattr(lib, 'init_tools_library'):
+                                    lib.init_tools_library({"autonomy_level": "full_access"})
+                                    ASCIIColors.red("\n  🔓 Shell library mounted and autonomy set to 'full_access'.")
+                                else:
+                                    ASCIIColors.yellow("\n  ⚠️ Config saved, but the active tool library does not support hot-reloading. Please restart lollms-code.")
+                            except Exception as e:
+                                ASCIIColors.yellow(f"\n  ⚠️ Failed to mount system_shell library: {e}. Please restart lollms-code.")
+                    else:
+                        ASCIIColors.yellow("\n  ⚠️ Config saved, but client tool binding is unavailable for hot-reload. Please restart lollms-code.")
+                else:
+                    ASCIIColors.green("\n  ✅ Aborted. Shell remains in 'safe' mode.")
+            else:
+                ASCIIColors.green("\n  Shell is currently in 'full_access' mode.")
+                try:
+                    confirm = input("\n  ❓ Switch back to 'safe' mode? (y/n): ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    ASCIIColors.yellow("\n  ❌ Aborted.")
+                    continue
+
+                if confirm in ("y", "yes"):
+                    config.shell_autonomy_level = "safe"
+                    config.save()
+
+                    if hasattr(client, 'tools') and hasattr(client.tools, 'mounted_libraries'):
+                        if 'system_shell' in client.tools.mounted_libraries:
+                            lib = client.tools.mounted_libraries['system_shell']
+                            if hasattr(lib, 'init_tools_library'):
+                                lib.init_tools_library({"autonomy_level": "safe"})
+                                ASCIIColors.green("\n  🛡️ Shell autonomy set back to 'safe'.")
+                            else:
+                                ASCIIColors.yellow("\n  ⚠️ Config saved, but the active tool library does not support hot-reloading. Please restart lollms-code.")
+                        else:
+                            ASCIIColors.yellow("\n  ⚠️ Config saved, but the 'system_shell' library is not mounted. Please restart lollms-code.")
+                    else:
+                        ASCIIColors.yellow("\n  ⚠️ Config saved, but client tool binding is unavailable for hot-reload. Please restart lollms-code.")
+                else:
+                    ASCIIColors.yellow("\n  ❌ Aborted. Shell remains in 'full_access' mode.")
+
+            ASCIIColors.rule()
+            continue
+
+        if user_input.lower() == "/shell":
+            ASCIIColors.rule("[bold cyan]⚙️ Shell Autonomy Configuration[/bold cyan]")
+            current_mode = config.shell_autonomy_level
+            mode_color = "red" if current_mode == "full_access" else "green"
+            ASCIIColors.info(f"Current shell autonomy level: [{mode_color}]{current_mode}[/{mode_color}]")
+
+            if current_mode == "safe":
+                ASCIIColors.red("\n  ⚠️  WARNING: Switching to 'full_access' mode grants the agent UNRESTRICTED access to your system shell.")
+                ASCIIColors.red("  This means it can potentially execute destructive commands (e.g., `rm -rf`, `format`), modify system files, or install software without asking.")
+                ASCIIColors.yellow("  Only enable this if you trust the agent and the task requires elevated privileges.")
+
+                try:
+                    confirm = input("\n  ❓ Type 'ENABLE FULL ACCESS' to proceed, or anything else to abort: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    ASCIIColors.yellow("\n  ❌ Aborted. Shell remains in 'safe' mode.")
+                    continue
+
+                if confirm == "ENABLE FULL ACCESS":
+                    config.shell_autonomy_level = "full_access"
+                    config.save()
+
+                    if hasattr(client, 'tools') and hasattr(client.tools, 'mounted_libraries'):
+                        if 'system_shell' in client.tools.mounted_libraries:
+                            lib = client.tools.mounted_libraries['system_shell']
+                            if hasattr(lib, 'init_tools_library'):
+                                lib.init_tools_library({"autonomy_level": "full_access"})
+                                ASCIIColors.red("\n  🔓 Shell autonomy set to 'full_access'. The agent now has unrestricted shell access.")
+                            else:
+                                ASCIIColors.yellow("\n  ⚠️ Config saved, but the active tool library does not support hot-reloading. Please restart lollms-code.")
+                        else:
+                            ASCIIColors.yellow("\n  ⚠️ Config saved, but the 'system_shell' library is not mounted. Please restart lollms-code.")
+                    else:
+                        ASCIIColors.yellow("\n  ⚠️ Config saved, but client tool binding is unavailable for hot-reload. Please restart lollms-code.")
+                else:
+                    ASCIIColors.green("\n  ✅ Aborted. Shell remains in 'safe' mode.")
+            else:
+                ASCIIColors.green("\n  Shell is currently in 'full_access' mode.")
+                try:
+                    confirm = input("\n  ❓ Switch back to 'safe' mode? (y/n): ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    ASCIIColors.yellow("\n  ❌ Aborted.")
+                    continue
+
+                if confirm in ("y", "yes"):
+                    config.shell_autonomy_level = "safe"
+                    config.save()
+
+                    if hasattr(client, 'tools') and hasattr(client.tools, 'mounted_libraries'):
+                        if 'system_shell' in client.tools.mounted_libraries:
+                            lib = client.tools.mounted_libraries['system_shell']
+                            if hasattr(lib, 'init_tools_library'):
+                                lib.init_tools_library({"autonomy_level": "safe"})
+                                ASCIIColors.green("\n  🛡️ Shell autonomy set back to 'safe'.")
+                            else:
+                                ASCIIColors.yellow("\n  ⚠️ Config saved, but the active tool library does not support hot-reloading. Please restart lollms-code.")
+                        else:
+                            ASCIIColors.yellow("\n  ⚠️ Config saved, but the 'system_shell' library is not mounted. Please restart lollms-code.")
+                    else:
+                        ASCIIColors.yellow("\n  ⚠️ Config saved, but client tool binding is unavailable for hot-reload. Please restart lollms-code.")
+                else:
+                    ASCIIColors.yellow("\n  ❌ Aborted. Shell remains in 'full_access' mode.")
+
+            ASCIIColors.rule()
             continue
 
         if user_input.lower() == "/files":
@@ -2162,6 +2397,7 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
             ASCIIColors.yellow("\n\n⚠️  Cancelled.")
             continue
         except Exception as e:
+            trace_exception(e)
             ASCIIColors.red(f"\n💥 Error: {e}")
             continue
 

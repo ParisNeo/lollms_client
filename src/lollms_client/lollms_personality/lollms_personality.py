@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import ast
+import builtins
 import base64
 import hashlib
 import importlib
@@ -23,7 +25,7 @@ import re
 import traceback
 import uuid
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -32,6 +34,19 @@ from ascii_colors import ASCIIColors, trace_exception
 from .skills_manager import SkillsManager
 from .handbag import Handbag
 from .lollms_agent_state import _AgentStreamState, _sanitize_tool_result, _ToolsManager
+
+if not callable(getattr(builtins, 'compile', None)) or builtins.compile.__module__ != 'builtins':
+    import importlib as _importlib
+    _builtins_mod = _importlib.import_module('builtins')
+    if hasattr(_builtins_mod, 'compile') and _builtins_mod.compile.__module__ == 'builtins':
+        builtins.compile = _builtins_mod.compile
+    else:
+        ASCIIColors.error("[LollmsPersonality] CRITICAL: builtins.compile is shadowed or missing. Tool execution may fail.")
+
+_compile = getattr(builtins, 'compile', None)
+if _compile is None or not callable(_compile) or _compile.__module__ != 'builtins':
+    ASCIIColors.error("[LollmsPersonality] CRITICAL: Could not restore native compile(). exec() fallback will be used.")
+    _compile = None
 
 
 try:
@@ -587,7 +602,14 @@ class ToolsManager:
         module_name = f"lollms_tools_{fp.stem}_{uuid.uuid4().hex[:8]}"
         module = ModuleType(module_name)
         module.__file__ = str(fp)
-        exec(compile(content, str(fp), "exec"), module.__dict__)
+        try:
+            exec(compile(content, str(fp), "exec"), module.__dict__)
+        except TypeError as te:
+            if "compile()" in str(te):
+                ASCIIColors.warning(f"[ToolsManager] compile() signature error for {fp.name}. Falling back to direct exec. Error: {te}")
+                exec(content, module.__dict__)
+            else:
+                raise
         if hasattr(module, "init_tools_library"):
             try:
                 module.init_tools_library()
@@ -2206,13 +2228,21 @@ class LollmsPersonality:
     # ------------------------------------------------------------------ script
 
     def _prepare_script(self) -> None:
+        import builtins as _builtins_mod
+        _current_compile = getattr(_builtins_mod, 'compile', None)
+        if _current_compile is None or getattr(_current_compile, '__module__', '') != 'builtins':
+            ASCIIColors.error(f"[{self.name}] CRITICAL SHADOW DETECTED: builtins.compile is not the native function (module: {getattr(_current_compile, '__module__', 'None')}). Restoring it.")
+            import importlib as _importlib
+            _real_builtins = _importlib.import_module('builtins')
+            _builtins_mod.compile = _real_builtins.compile
+
         if not self.script:
             return
         try:
             module_name = f"lollms_personality_script_{self.personality_id}"
             spec        = importlib.util.spec_from_loader(module_name, loader=None)
             module      = importlib.util.module_from_spec(spec)
-            exec(compile(self.script, f"<personality:{self.name}>", "exec"),
+            exec(_builtins_mod.compile(self.script, f"<personality:{self.name}>", "exec"),
                  module.__dict__)
             self.script_module = module
             ASCIIColors.success(f"[{self.name}] Custom script loaded successfully.")
@@ -3291,6 +3321,13 @@ JSON:"""
             if self.skills_manager:
                 active_tools.update(self.skills_manager.build_skill_tools())
 
+        if self.capabilities and self.capabilities.enable_skill_creation:
+            if self.skills_manager:
+                skill_tools = self.skills_manager.build_skill_tools()
+                for t_name, t_spec in skill_tools.items():
+                    if t_name in ("tool_create_skill", "tool_update_skill", "tool_append_to_skill", "tool_remove_skill"):
+                        active_tools[t_name] = t_spec
+
         if self._sub_agent_spawner and self.capabilities and self.capabilities.enable_sub_agents:
             def tool_spawn_sub_agent(instruction: str, personality_conditioning: str = "", model_name: str = "") -> dict:
                 return self._sub_agent_spawner.spawn(instruction=instruction, personality_conditioning=personality_conditioning or None, model_name=model_name or None)
@@ -3510,6 +3547,12 @@ JSON:"""
         try:
             default_content = "# Agent Persistent Scratchpad\n\nUse this space to store critical state, file lists, and architectural decisions.\n"
             self._scratchpad_path.write_text(default_content, encoding="utf-8")
+            try:
+                _cb = getattr(self, '_active_streaming_callback', None)
+                if _cb:
+                    _cb("", MSG_TYPE.MSG_TYPE_SCRATCHPAD_UPDATE, {"action": "scratchpad_clear", "status": "success", "message": "Scratchpad cleared successfully."})
+            except Exception:
+                pass
             return "✅ Scratchpad cleared successfully."
         except Exception as e:
             return f"[SYSTEM ERROR] Failed to clear scratchpad: {e}"
@@ -3531,6 +3574,12 @@ JSON:"""
             )
             self._user_profile_path.write_text(default_content, encoding="utf-8")
             object.__setattr__(self, '_user_profile_content', default_content)
+            try:
+                _cb = getattr(self, '_active_streaming_callback', None)
+                if _cb:
+                    _cb("", MSG_TYPE.MSG_TYPE_SCRATCHPAD_UPDATE, {"action": "user_profile_clear", "status": "success", "message": "User profile cleared successfully."})
+            except Exception:
+                pass
             return "✅ Global user profile cleared successfully."
         except Exception as e:
             return f"[SYSTEM ERROR] Failed to clear user profile: {e}"
@@ -3546,20 +3595,28 @@ JSON:"""
 
         try:
             current_content = self._scratchpad_path.read_text(encoding="utf-8", errors="ignore")
+            action_verb = "updated"
+            preview = stripped_body[:200].replace('\n', ' | ')
 
             if tag_name == "scratchpad_append":
                 new_content = current_content + "\n" + stripped_body + "\n"
                 self._scratchpad_path.write_text(new_content, encoding="utf-8")
-                return "✅ Content appended to scratchpad successfully."
-
+                action_verb = "appended to"
             elif tag_name == "scratchpad_patch":
-                # Reuse the robust Aider patch logic from ArtefactManager
                 from lollms_client.lollms_artefact import ArtefactManager
                 patched_content = ArtefactManager.apply_aider_patch(current_content, body)
                 self._scratchpad_path.write_text(patched_content, encoding="utf-8")
-                return "✅ Scratchpad patched successfully."
+                action_verb = "patched"
+            else:
+                return "[SYSTEM ERROR] Unknown scratchpad operation."
 
-            return "[SYSTEM ERROR] Unknown scratchpad operation."
+            try:
+                _cb = getattr(self, '_active_streaming_callback', None)
+                if _cb:
+                    _cb("", MSG_TYPE.MSG_TYPE_SCRATCHPAD_UPDATE, {"action": tag_name, "status": "success", "message": f"Scratchpad {action_verb} successfully.", "preview": preview})
+            except Exception:
+                pass
+            return f"✅ Content {action_verb} scratchpad successfully."
         except Exception as e:
             return f"[SYSTEM ERROR] Failed to update scratchpad: {e}"
 
@@ -3573,9 +3630,15 @@ JSON:"""
             from lollms_client.lollms_artefact import ArtefactManager
             patched_content = ArtefactManager.apply_aider_patch(current_content, body)
             self._user_profile_path.write_text(patched_content, encoding="utf-8")
-
-            # Update the in-memory cache so the next system prompt build reflects the change
             object.__setattr__(self, '_user_profile_content', patched_content)
+
+            preview = body[:200].replace('\n', ' | ')
+            try:
+                _cb = getattr(self, '_active_streaming_callback', None)
+                if _cb:
+                    _cb("", MSG_TYPE.MSG_TYPE_SCRATCHPAD_UPDATE, {"action": "user_profile_update", "status": "success", "message": "User profile updated successfully.", "preview": preview})
+            except Exception:
+                pass
             return "✅ Global user profile updated successfully."
         except Exception as e:
             return f"[SYSTEM ERROR] Failed to update user profile: {e}"
@@ -4215,6 +4278,7 @@ JSON:"""
         object.__setattr__(self, '_consecutive_empty_responses', 0)
         object.__setattr__(self, '_consecutive_stall_count', 0)
         object.__setattr__(self, '_consecutive_artifact_rounds', 0)
+        object.__setattr__(self, '_max_rounds', max_reasoning_steps)
 
         if self._sub_agent_spawner:
             self._sub_agent_spawner.reset_turn()
@@ -4233,7 +4297,24 @@ JSON:"""
                     self._init_artefact_system()
                     ASCIIColors.info(f"[{self.name}] ✅ Artefact system initialized for workspace: {self._resolved_workspace}")
 
+        import builtins as _builtins_mod_check
+        _current_compile = getattr(_builtins_mod_check, 'compile', None)
+        if _current_compile is None or _current_compile.__module__ != 'builtins':
+            ASCIIColors.error(f"[{self.name}] CRITICAL SHADOW DETECTED in chat(): builtins.compile is not native (module: {_current_compile.__module__ if _current_compile else 'None'}). Restoring it.")
+            import importlib as _importlib_check
+            _real_builtins = _importlib_check.import_module('builtins')
+            _builtins_mod_check.compile = _real_builtins.compile
+
+        import builtins as _builtins_mod_check
+        _current_compile = getattr(_builtins_mod_check, 'compile', None)
+        if _current_compile is None or getattr(_current_compile, '__module__', '') != 'builtins':
+            ASCIIColors.error(f"[{self.name}] CRITICAL SHADOW DETECTED in chat(): builtins.compile is not native (module: {getattr(_current_compile, '__module__', 'None')}). Restoring it.")
+            import importlib as _importlib_check
+            _real_builtins = _importlib_check.import_module('builtins')
+            _builtins_mod_check.compile = _real_builtins.compile
+
         self._init_scratchpad()
+        object.__setattr__(self, '_active_streaming_callback', streaming_callback)
 
         cleaned_prompt = prompt
         enable_data_tools_flag = kwargs.get("enable_data_tools", True)
@@ -4322,7 +4403,7 @@ JSON:"""
             round_count += 1
 
             if getattr(self, 'debug_mode', False):
-                ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} START ===")
+                ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count}/{self._max_rounds} START ===")
 
             if hasattr(self.lollms_client, 'llm') and hasattr(self.lollms_client.llm, 'reset_cancel'):
                 try:
@@ -5389,6 +5470,25 @@ JSON:"""
             has_new_actions_this_round = bool(ss.completed_actions) or bool(raw_round_text.strip())
             text_is_repetitive = False
 
+            _xml_tool_pattern = re.compile(r'^\s*<tool_\w+[\s/>]', re.MULTILINE | re.IGNORECASE)
+            if _xml_tool_pattern.search(raw_round_text):
+                ASCIIColors.warning(f"[{self.name}] Malformed XML tool syntax detected (Round {round_count}). Injecting format correction.")
+                clean_history_text = self._sanitize_history_for_context(raw_round_text)
+                virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text))
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content=(
+                        "[SYSTEM: CRITICAL FORMAT ERROR. You emitted a tool call using XML self-closing syntax like `<tool_read_document_content file_name=\"...\" />`. "
+                        "This is WRONG. The system does NOT execute XML-attribute tool calls. "
+                        "You MUST use the JSON format inside a `<tool>` tag. The correct syntax is:\n"
+                        "<tool>{\"name\": \"tool_read_document_content\", \"parameters\": {\"file_name\": \"...\", \"page_or_sheet\": \"...\", \"max_chars\": 15000}}</tool>\n"
+                        "Output the corrected tool call NOW using the JSON format. Do NOT repeat the XML syntax.]"
+                    )
+                ))
+                object.__setattr__(self, '_consecutive_stall_count', 0)
+                ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
+                continue
+
             stripped_round_text = raw_round_text.strip()
             if stripped_round_text and len(virtual_history) > 0:
                 last_assistant_text = None
@@ -5407,12 +5507,22 @@ JSON:"""
                             last_assistant_text = vh.content.strip()
                             break
                 if last_assistant_text and not _is_continuation_context:
-                    if stripped_round_text == last_assistant_text:
-                        text_is_repetitive = True
-                    elif len(stripped_round_text) > 80 and stripped_round_text in last_assistant_text:
-                        text_is_repetitive = True
-                    elif len(last_assistant_text) > 80 and last_assistant_text in stripped_round_text:
-                        text_is_repetitive = True
+                    _last_clean = re.sub(r'<[^>]+>', '', last_assistant_text).strip()
+                    _current_clean = re.sub(r'<[^>]+>', '', stripped_round_text).strip()
+                    if _current_clean and _last_clean:
+                        if _current_clean == _last_clean:
+                            text_is_repetitive = True
+                        elif len(_current_clean) > 80 and _current_clean in _last_clean:
+                            text_is_repetitive = True
+                        elif len(_last_clean) > 80 and _last_clean in _current_clean:
+                            text_is_repetitive = True
+                        elif len(_current_clean) > 60:
+                            words_last = set(_last_clean.split())
+                            words_current = set(_current_clean.split())
+                            if len(words_last) > 0 and len(words_current) > 0:
+                                overlap = len(words_last & words_current) / max(len(words_last), len(words_current))
+                                if overlap > 0.85:
+                                    text_is_repetitive = True
 
             if not text_is_repetitive and stripped_round_text:
                 lines_in_response = stripped_round_text.splitlines()
@@ -5429,23 +5539,28 @@ JSON:"""
                 ASCIIColors.warning(f"[{self.name}] Repetitive text preamble detected (Round {round_count}). Injecting correction — NOT terminating.")
                 clean_history_text = self._sanitize_history_for_context(raw_round_text)
                 virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant produced repetitive text]"))
+
+                consecutive_stall_count = getattr(self, '_consecutive_stall_count', 0) + 1
+                object.__setattr__(self, '_consecutive_stall_count', consecutive_stall_count)
+
+                if consecutive_stall_count >= 2:
+                    ASCIIColors.error(f"[{self.name}] Breaking after {consecutive_stall_count} consecutive repetition+stall cycles.")
+                    final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
+                    if not final_response:
+                        final_response = "[Task terminated: The agent produced repetitive text multiple times due to a tool failure or sandbox restriction. The last tool call may have been blocked.]"
+                    break
+
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
                     content=(
-                        "[SYSTEM: You are producing repetitive conversational preambles (e.g., 'Je vais lire...') without varying your approach. "
-                        "If you are reading a document page-by-page, continue with the next pages — do NOT re-read pages you already processed. "
-                        "If you have finished reading and are ready to act, emit your final answer or the next action tag now. "
-                        "If you are stuck, explain the situation to the user and emit <done/>.]"
+                        "[SYSTEM: CRITICAL ERROR. You are producing repetitive conversational preambles (e.g., 'Je vais utiliser...') without varying your approach or emitting functional tags. "
+                        "This usually happens when a tool call failed and you are trying to find an alternative, but you are stuck in a text loop.\n\n"
+                        "MANDATORY ACTION: Stop writing prose. You must either:\n"
+                        "1. Emit the next `<tool>` or `<artifact>` tag immediately with the correct parameters, OR\n"
+                        "2. If all tools failed, explain the situation to the user (e.g., 'The file copy was blocked by the sandbox') and emit `<done/>`.\n"
+                        "Do NOT repeat the same sentence again.]"
                     )
                 ))
-                consecutive_stall_count = getattr(self, '_consecutive_stall_count', 0) + 1
-                object.__setattr__(self, '_consecutive_stall_count', consecutive_stall_count)
-                if consecutive_stall_count >= 3:
-                    ASCIIColors.warning(f"[{self.name}] Breaking after {consecutive_stall_count} consecutive repetition+stall cycles.")
-                    final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
-                    if not final_response:
-                        final_response = "[Task paused: The agent produced repetitive text multiple times. It may need user guidance to continue.]"
-                    break
                 ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
                 continue
 
@@ -5604,6 +5719,27 @@ JSON:"""
             if getattr(self, 'debug_mode', False):
                 ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Clean exit ===")
             break
+
+        context_health = {"used_tokens": 0, "max_tokens": 0, "fill_percentage": 0.0}
+        try:
+            if self.lollms_client and hasattr(self.lollms_client, 'get_ctx_size'):
+                max_ctx = self.lollms_client.get_ctx_size() or 0
+                if max_ctx > 0:
+                    total_used = 0
+                    if hasattr(self.lollms_client, 'count_tokens'):
+                        total_used = self.lollms_client.count_tokens(stable_system_prompt)
+                        for msg in base_conversation:
+                            total_used += self.lollms_client.count_tokens(msg.get("content", ""))
+                        for vh in virtual_history:
+                            total_used += self.lollms_client.count_tokens(vh.content)
+                        total_used += self.lollms_client.count_tokens(final_response)
+                    context_health = {
+                        "used_tokens": total_used,
+                        "max_tokens": max_ctx,
+                        "fill_percentage": round((total_used / max_ctx) * 100, 1)
+                    }
+        except Exception:
+            pass
 
         if not final_response and ss:
             final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
