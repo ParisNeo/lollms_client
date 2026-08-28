@@ -3217,7 +3217,7 @@ JSON:"""
 
         return surviving_history
 
-    def _discover_tools(self, explicit_tools: Optional[Dict] = None, tool_files: Optional[List] = None, *args, **kwargs) -> Dict[str, Dict[str, Any]]:
+    def _discover_tools(self, explicit_tools: Optional[Dict] = None, tool_files: Optional[List] = None, enable_data_tools: bool = False, *args, **kwargs) -> Dict[str, Dict[str, Any]]:
         active_tools = {}
 
         try:
@@ -3225,14 +3225,6 @@ JSON:"""
             current_user_name = getpass.getuser()
         except Exception:
             current_user_name = "Unknown User"
-
-        if current_user_name and current_user_name != "Unknown User":
-            user_annotation_rule = (
-                f"\n\n**CRITICAL ANNOTATION RULE**: When using `tool_annotate_document` to add comments to a PDF or DOCX, "
-                f"you MUST set the `commenter_name` parameter to '{current_user_name}' (the current OS user account)."
-            )
-            if "description" in active_tools.get("tool_annotate_document", {}):
-                active_tools["tool_annotate_document"]["description"] += user_annotation_rule
 
         if self.capabilities and self.capabilities.enable_workspace_tools and self._resolved_workspace:
             ws_path = self._resolved_workspace
@@ -3354,7 +3346,7 @@ JSON:"""
             lcp_binding = None
 
 
-        if lcp_binding is None and (tool_files or self._resolved_workspace):
+        if enable_data_tools and lcp_binding is None and (tool_files or self._resolved_workspace):
             try:
                 import lollms_client as _lollms_client_pkg
                 from lollms_client.tools_bindings.lcp import LCPBinding
@@ -3364,33 +3356,65 @@ JSON:"""
             except Exception:
                 lcp_binding = None
 
-        if lcp_binding and hasattr(lcp_binding, 'mount_tool_library'):
-            # Auto-mount essential discovery, execution, and as-is document tools
-            _ESSENTIAL_LIBRARIES = ["system_shell", "grep_files", "find_files", "as_is_document_tools", "document_editor"]
-            for lib_name in _ESSENTIAL_LIBRARIES:
+        if enable_data_tools and lcp_binding and hasattr(lcp_binding, 'mount_tool_library'):
+            ws_path = self._resolved_workspace
+            has_data_files = False
+            has_document_files = False
+            if ws_path and ws_path.exists():
+                _DATA_EXTS = {".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"}
+                _DOC_EXTS = {".pdf", ".docx", ".pptx", ".odt", ".doc", ".txt", ".md"}
+                if current_user_name and current_user_name != "Unknown User":
+                    user_annotation_rule = (
+                        f"\n\n**CRITICAL ANNOTATION RULE**: When using `tool_annotate_document` to add comments to a PDF or DOCX, "
+                        f"you MUST set the `commenter_name` parameter to '{current_user_name}' (the current OS user account)."
+                    )
+                    if "description" in active_tools.get("tool_annotate_document", {}):
+                        active_tools["tool_annotate_document"]["description"] += user_annotation_rule
+
+                try:
+                    for f in ws_path.rglob("*"):
+                        if f.is_file():
+                            ext = f.suffix.lower()
+                            if ext in _DATA_EXTS:
+                                has_data_files = True
+                            elif ext in _DOC_EXTS:
+                                has_document_files = True
+                            if has_data_files and has_document_files:
+                                break
+                except Exception:
+                    pass
+
+            _LIBRARIES_TO_MOUNT: List[str] = []
+            if has_document_files:
+                _LIBRARIES_TO_MOUNT.extend(["as_is_document_tools", "document_editor"])
+            if has_data_files:
+                _LIBRARIES_TO_MOUNT.append("semantic_data_engineer")
+
+            for lib_name in _LIBRARIES_TO_MOUNT:
                 try:
                     lcp_binding.mount_tool_library(lib_name)
                 except Exception as e:
                     ASCIIColors.warning(f"[LollmsPersonality] Failed to mount LCP tool library '{lib_name}': {e}")
 
-            try:
-                lcp_tools = lcp_binding.to_chat_tool_specs()
-                # Expose all tools from the essential libraries (system_shell, grep, find, document tools)
-                for t_name, t_spec in lcp_tools.items():
-                    if t_name.startswith("tool_execute_shell_command") or \
-                       t_name.startswith("tool_grep_") or \
-                       t_name.startswith("tool_find_") or \
-                       t_name.startswith("tool_inspect_document") or \
-                       t_name.startswith("tool_read_document_content") or \
-                       t_name.startswith("tool_grep_document") or \
-                       t_name.startswith("tool_modify_docx") or \
-                       t_name.startswith("tool_modify_excel") or \
-                       t_name.startswith("tool_modify_pptx_slide") or \
-                       t_name.startswith("tool_edit_document_text") or \
-                       t_name.startswith("tool_annotate_document"):
-                        active_tools[t_name] = t_spec
-            except Exception as e:
-                ASCIIColors.warning(f"[LollmsPersonality] Failed to extract LCP tool specs: {e}")
+            if _LIBRARIES_TO_MOUNT:
+                try:
+                    lcp_tools = lcp_binding.to_chat_tool_specs()
+                    for t_name, t_spec in lcp_tools.items():
+                        if has_document_files and (
+                            t_name.startswith("tool_inspect_document") or
+                            t_name.startswith("tool_read_document_content") or
+                            t_name.startswith("tool_grep_document") or
+                            t_name.startswith("tool_modify_docx") or
+                            t_name.startswith("tool_modify_excel") or
+                            t_name.startswith("tool_modify_pptx_slide") or
+                            t_name.startswith("tool_edit_document_text") or
+                            t_name.startswith("tool_annotate_document")
+                        ):
+                            active_tools[t_name] = t_spec
+                        if has_data_files and t_name == "tool_execute_python_data_query":
+                            active_tools[t_name] = t_spec
+                except Exception as e:
+                    ASCIIColors.warning(f"[LollmsPersonality] Failed to extract LCP tool specs: {e}")
 
         if tool_files:
             try:
@@ -4212,7 +4236,8 @@ JSON:"""
         self._init_scratchpad()
 
         cleaned_prompt = prompt
-        active_tools = self._discover_tools(tools, tool_files or [])
+        enable_data_tools_flag = kwargs.get("enable_data_tools", True)
+        active_tools = self._discover_tools(tools, tool_files or [], enable_data_tools=enable_data_tools_flag)
 
         stable_system_prompt = self._build_system_prompt(active_tools)
         stable_system_prompt += self._build_user_profile_context()
