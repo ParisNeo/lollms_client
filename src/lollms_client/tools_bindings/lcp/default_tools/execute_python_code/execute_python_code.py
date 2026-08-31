@@ -12,11 +12,15 @@ TOOL_LIBRARY_DESC = "Executes arbitrary sandboxed Python code and returns stdout
 TOOL_LIBRARY_ICON = "🐍"
 
 def init_tools_library(config: dict = None) -> None:
-    import pipmaster as pm
-    pm.ensure_packages(["matplotlib", "pipmaster"])
-    global matplotlib
-    import matplotlib
-    matplotlib.use('Agg')
+    try:
+        import pipmaster as pm
+        pm.ensure_packages(["matplotlib", "pipmaster"])
+        global matplotlib
+        import matplotlib
+        matplotlib.use('Agg')
+    except Exception as e:
+        import ascii_colors
+        ascii_colors.ASCIIColors.warning(f"[execute_python_code] Failed to ensure dependencies: {e}")
 
 def _ensure_import(module_name: str, package_name: str = None):
     try:
@@ -55,11 +59,27 @@ def tool_execute_python_code(
     if not code:
         return {
             "success": False,
-            "error": "No code provided for execution."
+            "error": "No code provided for execution.",
+            "output": "",
+            "stderr": ""
         }
 
-    import numpy as np
-    import matplotlib.pyplot as plt
+    _np = None
+    _plt = None
+
+    try:
+        import numpy as _np_mod
+        _np = _np_mod
+    except Exception:
+        pass
+
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as _plt_mod
+        _plt = _plt_mod
+    except Exception:
+        pass
 
     pandas_mod = _ensure_import("pandas", "pandas")
     seaborn_mod = _ensure_import("seaborn", "seaborn")
@@ -69,8 +89,8 @@ def tool_execute_python_code(
     local_vars = {
         "Path": Path,
         "pd": pandas_mod,
-        "np": np,
-        "plt": plt,
+        "np": _np,
+        "plt": _plt,
         "sns": seaborn_mod,
         "sklearn": sklearn_mod,
         "scipy": scipy_mod,
@@ -88,17 +108,37 @@ def tool_execute_python_code(
 
     try:
         ASCIIColors.info(f"⚡ Executing arbitrary Python code (CWD: {os.getcwd()})")
-        plt.clf()
-        plt.close('all')
+        if _plt is not None:
+            _plt.clf()
+            _plt.close('all')
 
-        exec(code, local_vars)
+        try:
+            exec(code, local_vars)
+        except SystemExit as se:
+            raise RuntimeError(f"User code called sys.exit() with code {se.code}. This is not permitted in sandboxed execution.") from se
+        except KeyboardInterrupt:
+            raise RuntimeError("Execution interrupted by KeyboardInterrupt.")
+        except Exception:
+            import traceback
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+            raw_output = redirected_output.getvalue()
+            raw_error = redirected_error.getvalue()
+            raw_traceback = traceback.format_exc()
+            ASCIIColors.error(f"❌ Execution Failed:\n{raw_traceback}")
+            return {
+                "success": False,
+                "error": f"Execution Error:\n{raw_traceback}",
+                "output": raw_output,
+                "stderr": raw_error
+            }
 
-        fig_nums = plt.get_fignums()
+        fig_nums = _plt.get_fignums() if _plt is not None else []
         if fig_nums:
             ASCIIColors.success(f"[Sandbox] Intercepted {len(fig_nums)} generated plot figure(s)!")
             for idx, f_num in enumerate(fig_nums):
                 buf = io.BytesIO()
-                fig = plt.figure(f_num)
+                fig = _plt.figure(f_num)
                 fig.savefig(buf, format="png", bbox_inches='tight', facecolor=fig.get_facecolor())
                 buf.seek(0)
                 plot_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
@@ -107,19 +147,19 @@ def tool_execute_python_code(
                 plot_path = Path(".") / plot_filename
                 fig.savefig(str(plot_path), bbox_inches='tight', facecolor=fig.get_facecolor())
 
-            plt.close('all')
+            _plt.close('all')
 
-    except Exception as e:
+    except BaseException as outer_err:
         import traceback
         sys.stdout = old_stdout
         sys.stderr = old_stderr
         raw_output = redirected_output.getvalue()
         raw_error = redirected_error.getvalue()
         raw_traceback = traceback.format_exc()
-        ASCIIColors.error(f"❌ Execution Failed:\n{raw_traceback}")
+        ASCIIColors.error(f"❌ Unexpected execution failure:\n{raw_traceback}")
         return {
             "success": False,
-            "error": f"Execution Error:\n{raw_traceback}",
+            "error": f"Unexpected execution failure:\n{raw_traceback}",
             "output": raw_output,
             "stderr": raw_error
         }
@@ -130,8 +170,11 @@ def tool_execute_python_code(
     out_str = redirected_output.getvalue()
     err_str = redirected_error.getvalue()
 
+    if not out_str.strip():
+        out_str = "Code executed successfully (no stdout prints)."
+
     return {
         "success": True,
-        "output": out_str or "Code executed successfully (no stdout prints).",
+        "output": out_str,
         "stderr": err_str
     }

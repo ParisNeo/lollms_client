@@ -5,7 +5,7 @@ import re
 import json
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional 
+from typing import Any, Dict, Optional
 from ascii_colors import ASCIIColors
 
 TOOL_LIBRARY_NAME = "Execute Python Data Query"
@@ -13,11 +13,38 @@ TOOL_LIBRARY_DESC = "Executes sandboxed Python code to analyze or modify dataset
 TOOL_LIBRARY_ICON = "📊"
 
 def init_tools_library(config: dict = None) -> None:
-    import pipmaster as pm
-    pm.ensure_packages(["pandas", "numpy", "matplotlib", "openpyxl", "sqlalchemy"])
-    global matplotlib
-    import matplotlib
-    matplotlib.use('Agg')
+    try:
+        import pipmaster as pm
+        pm.ensure_packages(["pandas", "numpy", "matplotlib", "openpyxl", "sqlalchemy"])
+        global matplotlib
+        import matplotlib
+        matplotlib.use('Agg')
+    except Exception as e:
+        import ascii_colors
+        ascii_colors.ASCIIColors.warning(f"[execute_python_data_query] Failed to ensure all dependencies: {e}")
+
+def _lazy_import_libs():
+    _np = None
+    _pd = None
+    _plt = None
+    try:
+        import numpy as _np_mod
+        _np = _np_mod
+    except Exception:
+        pass
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as _plt_mod
+        _plt = _plt_mod
+    except Exception:
+        pass
+    try:
+        import pandas as _pd_mod
+        _pd = _pd_mod
+    except Exception:
+        ASCIIColors.warning("[execute_python_data_query] pandas unavailable — df auto-load and CSV persistence disabled.")
+    return _np, _pd, _plt
 
 def tool_execute_python_data_query(
     code: str = "",
@@ -43,29 +70,36 @@ def tool_execute_python_data_query(
 
     code = str(code).strip()
 
+    if not code:
+        return {
+            "success": False,
+            "error": "No code provided for execution.",
+            "output": ""
+        }
+
     if code.endswith(".py") and Path(code).exists():
         filename = code
         code = Path(code).read_text(encoding="utf-8")
         ASCIIColors.info(f"[execute_python_data_query] Loaded code from file: {filename}")
 
     import base64
-    import numpy as np
-    import matplotlib.pyplot as plt
-    import pandas as pd
+
+    _np, _pd, _plt = _lazy_import_libs()
 
     local_vars = {
-        "Path": Path, 
-        "pd": pd,
-        "np": np,
-        "plt": plt,
+        "Path": Path,
+        "pd": _pd,
+        "np": _np,
+        "plt": _plt,
         "__builtins__": __builtins__
     }
 
     uses_df = re.search(r'\bdf\b', code) is not None
     defines_df = re.search(r'\bdf\s*=\s*', code) is not None
     auto_loaded_df_file = None
+    auto_loaded_sep = ","
 
-    if uses_df and not defines_df:
+    if uses_df and not defines_df and _pd is not None:
         data_files = list(Path(".").glob("*.csv")) + list(Path(".").glob("*.xlsx"))
         if data_files:
             first_file = data_files[0]
@@ -73,12 +107,15 @@ def tool_execute_python_data_query(
             ASCIIColors.info(f"[execute_python_data_query] Auto-loading df from {first_file.name}")
             try:
                 if first_file.suffix.lower() == ".csv":
-                    sep = ";" if ";" in first_file.read_text(encoding="utf-8", errors="ignore").splitlines()[0] else ","
-                    local_vars["df"] = pd.read_csv(first_file, sep=sep, encoding="utf-8-sig")
+                    first_line = first_file.read_text(encoding="utf-8", errors="ignore").splitlines()[0] if first_file.stat().st_size > 0 else ""
+                    auto_loaded_sep = ";" if ";" in first_line else ","
+                    local_vars["df"] = _pd.read_csv(first_file, sep=auto_loaded_sep, encoding="utf-8-sig")
                 elif first_file.suffix.lower() in (".xlsx", ".xls"):
-                    local_vars["df"] = pd.read_excel(first_file)
+                    local_vars["df"] = _pd.read_excel(first_file)
             except Exception as load_err:
                 ASCIIColors.warning(f"[execute_python_data_query] Failed to auto-load df: {load_err}")
+    elif uses_df and not defines_df and _pd is None:
+        ASCIIColors.warning("[execute_python_data_query] Code references 'df' but pandas is unavailable. User must load data manually.")
 
     uses_conn = re.search(r'\bconn\b', code) is not None
     defines_conn = re.search(r'\bconn\s*=\s*', code) is not None
@@ -122,8 +159,9 @@ def tool_execute_python_data_query(
 
     try:
         ASCIIColors.info(f"⚡ Executing Python code (CWD: {os.getcwd()})")
-        plt.clf()
-        plt.close('all')
+        if _plt is not None:
+            _plt.clf()
+            _plt.close('all')
 
         try:
             import builtins
@@ -133,15 +171,27 @@ def tool_execute_python_data_query(
                 exec(compiled_code, local_vars)
             else:
                 exec(code, local_vars)
-        except TypeError:
-            exec(code, local_vars)
+        except SystemExit as se:
+            raise RuntimeError(f"User code called sys.exit() with code {se.code}. This is not permitted in sandboxed execution.") from se
+        except KeyboardInterrupt:
+            raise RuntimeError("Execution interrupted by KeyboardInterrupt.")
+        except Exception:
+            import traceback
+            sys.stdout = old_stdout
+            raw_output = redirected_output.getvalue()
+            raw_traceback = traceback.format_exc()
+            ASCIIColors.error(f"❌ Execution Failed:\n{raw_traceback}")
+            return {
+                "success": False,
+                "error": f"Execution Error:\n{raw_traceback}",
+                "output": raw_output
+            }
 
-        if auto_loaded_df_file and "df" in local_vars and isinstance(local_vars["df"], pd.DataFrame):
+        if auto_loaded_df_file and "df" in local_vars and _pd is not None and isinstance(local_vars["df"], _pd.DataFrame):
             try:
                 ASCIIColors.info(f"[execute_python_data_query] Persisting modified df back to {auto_loaded_df_file.name}")
                 if auto_loaded_df_file.suffix.lower() == ".csv":
-                    sep = ";" if ";" in auto_loaded_df_file.read_text(encoding="utf-8", errors="ignore").splitlines()[0] else ","
-                    local_vars["df"].to_csv(auto_loaded_df_file, sep=sep, index=False, encoding="utf-8-sig")
+                    local_vars["df"].to_csv(auto_loaded_df_file, sep=auto_loaded_sep, index=False, encoding="utf-8-sig")
                 elif auto_loaded_df_file.suffix.lower() in (".xlsx", ".xls"):
                     local_vars["df"].to_excel(auto_loaded_df_file, index=False)
 
@@ -156,7 +206,7 @@ def tool_execute_python_data_query(
                     if existing_art:
                         discussion_instance.artefacts.update(
                             title=art_title,
-                            new_content=local_vars["df"].to_csv(index=False, sep=sep if auto_loaded_df_file.suffix.lower() == ".csv" else ","),
+                            new_content=local_vars["df"].to_csv(index=False, sep=auto_loaded_sep if auto_loaded_df_file.suffix.lower() == ".csv" else ","),
                             bump_version=True,
                             active=True
                         )
@@ -164,12 +214,12 @@ def tool_execute_python_data_query(
             except Exception as save_err:
                 ASCIIColors.warning(f"[execute_python_data_query] Failed to persist df: {save_err}")
 
-        fig_nums = plt.get_fignums()
+        fig_nums = _plt.get_fignums() if _plt is not None else []
         if fig_nums:
             ASCIIColors.success(f"[Sandbox] Intercepted {len(fig_nums)} generated plot figure(s)!")
             for idx, f_num in enumerate(fig_nums):
                 buf = io.BytesIO()
-                fig = plt.figure(f_num)
+                fig = _plt.figure(f_num)
                 fig.savefig(buf, format="png", bbox_inches='tight', facecolor=fig.get_facecolor())
                 buf.seek(0)
                 plot_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
@@ -210,17 +260,17 @@ def tool_execute_python_data_query(
                     except Exception as sync_err:
                         ASCIIColors.warning(f"[execute_python_data_query] Failed to sync plot to artefact system: {sync_err}")
 
-            plt.close('all')
+            _plt.close('all')
 
-    except Exception as e:
+    except BaseException as outer_err:
         import traceback
         sys.stdout = old_stdout
         raw_output = redirected_output.getvalue()
         raw_traceback = traceback.format_exc()
-        ASCIIColors.error(f"❌ Execution Failed:\n{raw_traceback}")
+        ASCIIColors.error(f"❌ Unexpected execution failure:\n{raw_traceback}")
         return {
-            "success": False, 
-            "error": f"Execution Error:\n{raw_traceback}", 
+            "success": False,
+            "error": f"Unexpected execution failure:\n{raw_traceback}",
             "output": raw_output
         }
     finally:
@@ -234,7 +284,11 @@ def tool_execute_python_data_query(
                 pass
 
     out_str = redirected_output.getvalue()
+
+    if not out_str.strip():
+        out_str = "Code executed successfully (no stdout prints)."
+
     return {
         "success": True,
-        "output": out_str or "Code executed successfully (no stdout prints)."
+        "output": out_str
     }

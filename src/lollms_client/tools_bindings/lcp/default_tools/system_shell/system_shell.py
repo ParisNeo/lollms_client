@@ -49,14 +49,16 @@ def _is_safe_command(command: str) -> bool:
             if base_cmd in safe_commands:
                 return True
             for safe in safe_commands:
-                if stripped.lower().startswith(safe + " "):
+                sl = safe.lower()
+                if stripped.lower() == sl or stripped.lower().startswith(sl + " ") or stripped.lower().startswith(sl + '"'):
                     return True
             return False
     except ValueError:
         pass
     stripped_lower = command.strip().lower()
     for safe in safe_commands:
-        if stripped_lower == safe or stripped_lower.startswith(safe + " "):
+        sl = safe.lower()
+        if stripped_lower == sl or stripped_lower.startswith(sl + " ") or stripped_lower.startswith(sl + '"'):
             return True
     return False
 

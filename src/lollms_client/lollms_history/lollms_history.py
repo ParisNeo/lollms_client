@@ -15,6 +15,7 @@ class _MessageWrapper:
     into a consistent interface for HistoryManager.
     """
     def __init__(self, msg: Union[Dict, Any]):
+        self._original_msg = msg
         if isinstance(msg, dict):
             self.id = msg.get("id", "")
             self.sender = msg.get("sender", msg.get("role", ""))
@@ -35,7 +36,7 @@ class _MessageWrapper:
             self.active_images = getattr(msg, "active_images", [])
 
     def get_active_images(self) -> list:
-        if hasattr(self, '_original_msg') and hasattr(self._original_msg, 'get_active_images'):
+        if hasattr(self._original_msg, 'get_active_images'):
             return self._original_msg.get_active_images()
         return self.active_images or []
 
@@ -45,6 +46,9 @@ class HistoryManager:
     Handles the export of discussion history, integration of agentic virtual_history,
     and normalization of messages for specific LLM APIs (e.g., OpenAI).
     This class is shared between LollmsDiscussion and LollmsPersonality.
+
+    It implements the Strict Non-Placeholder Strategy to prevent cognitive thread loss
+    and hallucination loops in agentic executions.
     """
 
     @staticmethod
@@ -59,6 +63,157 @@ class HistoryManager:
             if branch_list[i].sender_type == 'user':
                 return i
         return -1
+
+    @staticmethod
+    def _sanitize_for_context(text: str, distance_from_end: int) -> str:
+        """
+        Sanitizes assistant message content for LLM context export.
+        Enforces a strict non-placeholder strategy for the last 4 actions to prevent
+        cognitive thread loss, while aggressively compressing older history.
+
+        KV-Cache Note: The distance_from_end must be calculated based on the total
+        message count (history + virtual_history) to ensure that sanitization
+        boundaries remain stable across rounds as the history grows.
+        """
+        if not text:
+            return ""
+
+        if distance_from_end < 4:
+            # ── 🔒 STRICT PRESERVATION ZONE (Last 4 Actions) ──
+            # CRITICAL: For recent messages, we MUST NOT mutate the LLM's raw output.
+            # We only strip system-generated infrastructure blocks (<processing>, status comments)
+            # to clean up the context, but we leave all functional tags (<tool>, <artifact>) intact.
+            # This prevents cognitive thread loss and stops the LLM from mimicking system placeholders.
+            text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'<!-- status:[^>]*-->', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'</processing>', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'<lollms_artifact[^/]*/>', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'<artefact_image[^/]*/>', '', text, flags=re.IGNORECASE)
+
+            # If after stripping infrastructure blocks the text is completely empty,
+            # it means the LLM emitted ONLY a functional tag with no conversational text.
+            # We preserve the tag exactly as it was by recovering it from the original text.
+            if not text.strip():
+                import re as _re
+                functional_tags = _re.search(r'<(tool|art(?:ifact|efact)|unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|mem_new|mem_update|user_profile_update|user_profile_clear|refactor_history)\b[^>]*>(?:.*?</\1>)?', text, _re.DOTALL | _re.IGNORECASE)
+                if functional_tags:
+                    text = functional_tags.group(0)
+                else:
+                    text = "[Action executed with no conversational text]"
+
+        else:
+            # ── 🧹 AGGRESSIVE COMPRESSION ZONE (Older Actions, distance >= 4) ──
+            # For older messages, apply full compression with synthetic summaries.
+            # This is where the [Action: ...] summaries are appropriate.
+            import json as _json
+
+            raw_text_copy = text
+
+            text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'<!-- status:[^>]*-->', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'</processing>', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'<lollms_artifact[^/]*/>', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'<artefact_image[^/]*/>', '', text, flags=re.IGNORECASE)
+
+            has_functional_tags = bool(re.search(
+                r'<(tool|artifact|artefact|unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|mem_new|mem_update|user_profile_update|user_profile_clear|refactor_history)\b',
+                raw_text_copy,
+                re.IGNORECASE
+            ))
+
+            stripped_text_for_check = re.sub(r'<[^>]+>', '', raw_text_copy).strip()
+
+            if has_functional_tags and not stripped_text_for_check:
+                # Extract intent statements if present
+                intent_markers = [
+                    r'\b(?:let me|let\'s)\b',
+                    r'\bI\'ll\b', r'\bI will\b', r'\bI\'m going to\b', r'\bI am going to\b',
+                    r'\bnow I\b', r'\bnext I\b', r'\bfirst I\b', r'\bI need to\b',
+                    r'\bI\'ll now\b', r'\bI\'ll start\b', r'\bI\'ll create\b', r'\bI\'ll read\b',
+                    r'\bI\'ll check\b', r'\bI\'ll annotate\b', r'\bI\'ll write\b', r'\bI\'ll patch\b',
+                    r'\bI\'ll search\b', r'\bI\'ll inspect\b', r'\bI\'ll look\b', r'\bI\'ll find\b',
+                    r'\bI\'ll update\b', r'\bI\'ll modify\b', r'\bI\'ll edit\b', r'\bI\'ll add\b',
+                    r'\bI\'ll remove\b', r'\bI\'ll delete\b', r'\bI\'ll run\b', r'\bI\'ll execute\b',
+                ]
+                combined_intent_re = re.compile('|'.join(intent_markers), re.IGNORECASE)
+
+                matches = list(combined_intent_re.finditer(raw_text_copy))
+
+                if matches:
+                    first_match = matches[0]
+                    last_match = matches[-1]
+                    start = first_match.start()
+                    end_pos = last_match.end()
+                    end_boundary = len(raw_text_copy)
+                    tag_after_intent = re.search(
+                        r'<(?:tool|artifact|artefact|unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|mem_new|mem_update|user_profile_update|user_profile_clear|refactor_history)\b',
+                        raw_text_copy[end_pos:],
+                        re.IGNORECASE
+                    )
+                    if tag_after_intent:
+                        end_boundary = end_pos + tag_after_intent.start()
+                    extracted_intent = raw_text_copy[start:end_boundary].strip()
+                    cleaned_intent = re.sub(r'<[^>]+>', '', extracted_intent).strip()
+                    if cleaned_intent:
+                        text = cleaned_intent
+                    else:
+                        text = re.sub(r'<[^>]+>', '', raw_text_copy).strip()
+                else:
+                    text = re.sub(r'<[^>]+>', '', raw_text_copy).strip()
+
+                # Build synthetic action summaries for older history
+                action_summaries = []
+
+                for tool_match in raw_text_copy.split('</tool>'):
+                    tool_tag = re.search(r'<tool>(.*)', tool_match, re.DOTALL | re.IGNORECASE)
+                    if tool_tag:
+                        json_body = tool_tag.group(1).strip()
+                        try:
+                            call_data = _json.loads(json_body)
+                            tool_name = call_data.get("name", "unknown")
+                            tool_params = call_data.get("parameters", {})
+                            param_summary_parts = []
+                            for val in tool_params.values():
+                                if isinstance(val, str) and len(val) > 100:
+                                    param_summary_parts.append(f'"{val[:100]}..."')
+                                else:
+                                    param_summary_parts.append(_json.dumps(val, default=str))
+                            param_summary = ", ".join(param_summary_parts)
+                            action_summaries.append(f"[Action: Called tool `{tool_name}({param_summary})`]")
+                        except Exception:
+                            pass
+
+                for art_match in re.finditer(r'<art(?:ifact|efact)[^>]*>(.*?)</art(?:ifact|efact)>', raw_text_copy, re.DOTALL | re.IGNORECASE):
+                    art_xml = art_match.group(0)
+                    attrs_match = re.search(r'<art(?:ifact|efact)[^>]*>', art_xml, re.IGNORECASE)
+                    attrs_str = attrs_match.group(0) if attrs_match else ""
+                    title = "unknown"
+                    for m_attr in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
+                        if m_attr.group(1).lower() in ("name", "title"):
+                            title = m_attr.group(2)
+                    action_summaries.append(f"[Action: Created/Updated artifact `{title}`]")
+
+                for ctx_match in re.finditer(r'<(unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|mem_new|mem_update|user_profile_update|user_profile_clear|refactor_history)[^>]*>(.*?)</\1>', raw_text_copy, re.DOTALL | re.IGNORECASE):
+                    action_summaries.append(f"[Action: Executed context operation `{ctx_match.group(1)}`]")
+
+                if action_summaries:
+                    if text:
+                        text = text + "\n" + "\n".join(action_summaries)
+                    else:
+                        text = "\n".join(action_summaries)
+            else:
+                text = re.sub(r'<art(?:ifact|efact)[^>]*>.*?</art(?:ifact|efact)>', '[🔒 Artifact stripped]', text, flags=re.DOTALL | re.IGNORECASE)
+                text = re.sub(r'<tool>.*?</tool>', '[🔒 Tool stripped]', text, flags=re.DOTALL | re.IGNORECASE)
+                text = re.sub(r'<(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>.*?</(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>', '[🔒 Context op stripped]', text, flags=re.DOTALL | re.IGNORECASE)
+                text = re.sub(r'<scratchpad_(?:append|patch)>.*?</scratchpad_(?:append|patch)>', '[🔒 Scratchpad update]', text, flags=re.DOTALL | re.IGNORECASE)
+                text = re.sub(r'<scratchpad_clear\s*/?>', '[🔒 Scratchpad cleared]', text, flags=re.IGNORECASE)
+                text = re.sub(r'<mem_new[^/]*/?>', '[🔒 Memory created]', text, flags=re.IGNORECASE)
+                text = re.sub(r'<mem_update[^/]*/?>', '[🔒 Memory updated]', text, flags=re.IGNORECASE)
+                text = re.sub(r'<user_profile_update>.*?</user_profile_update>', '[🔒 User profile updated]', text, flags=re.DOTALL | re.IGNORECASE)
+                text = re.sub(r'<user_profile_clear\s*/?>', '[🔒 User profile cleared]', text, flags=re.IGNORECASE)
+                text = re.sub(r'<refactor_history\s*/?>', '[🔒 History refactored]', text, flags=re.IGNORECASE)
+
+        return text.strip()
 
     @staticmethod
     def export(
@@ -82,6 +237,26 @@ class HistoryManager:
         if virtual_history:
             virtual_history = [_MessageWrapper(vh) for vh in virtual_history]
 
+        seen_image_hashes: set = set()
+        def _deduplicate_images(images: list) -> list:
+            unique_images = []
+            for img in images:
+                if isinstance(img, dict):
+                    img_data = img.get("data", "")
+                elif isinstance(img, str):
+                    img_data = img
+                else:
+                    continue
+
+                if not img_data:
+                    continue
+
+                img_hash = hash(img_data)
+                if img_hash not in seen_image_hashes:
+                    seen_image_hashes.add(img_hash)
+                    unique_images.append(img)
+            return unique_images
+
         if not branch and format_type in ["lollms_text", "openai_chat", "ollama_chat", "markdown"]:
             return "" if format_type in ["lollms_text", "markdown"] else []
 
@@ -100,6 +275,14 @@ class HistoryManager:
         if pruning_summary:
             data_zone_part = f"--- PROJECT SYNOPSIS ---\n{pruning_summary}\n\n" + data_zone_part
 
+        memory_manager = getattr(context, 'memory_manager', None)
+        memory_block = ""
+        if memory_manager:
+            memory_block = context._build_memory_context_block(
+                memory_manager,
+                token_counter=context.lollmsClient.count_tokens
+            )
+
         if not suppress_system_prompt:
             if system_prompt_part and data_zone_part:
                 full_system_prompt = f"{system_prompt_part}\n\n{data_zone_part}"
@@ -108,10 +291,10 @@ class HistoryManager:
             else:
                 full_system_prompt = data_zone_part
 
-        _scratchpad = getattr(context, "scratchpad", "") or ""
+            if memory_block:
+                full_system_prompt += f"\n\n=== ACTIVE MEMORIES ===\n{memory_block}"
 
-        FUNCTIONAL_QUOTA = 2
-        functional_skip_count = 0
+        _scratchpad = getattr(context, "scratchpad", "") or ""
 
         if format_type == "lollms_text":
             final_parts = []
@@ -139,18 +322,17 @@ class HistoryManager:
                     current_tokens += st
 
             last_user_idx = HistoryManager._last_user_index(messages_to_render)
+            history_len = len(messages_to_render)
 
             for idx, msg in enumerate(reversed(messages_to_render)):
-                fwd_idx = len(messages_to_render) - 1 - idx
+                fwd_idx = history_len - 1 - idx
+                distance_from_end = idx
                 sender_str = msg.sender.replace(':', '').replace('!@>', '')
 
-                is_recent_functional = False
-                if msg.sender_type == 'assistant' and HistoryManager._has_functional_tags(msg.content):
-                    if functional_skip_count < FUNCTIONAL_QUOTA:
-                        functional_skip_count += 1
-                        is_recent_functional = True
+                content = msg.content.strip()
+                if msg.sender_type == 'assistant':
+                    content = HistoryManager._sanitize_for_context(content, distance_from_end)
 
-                content = context._apply_three_view_protocol(msg, msg.content.strip(), 0 if is_recent_functional else 99)
                 active_images = msg.get_active_images()
                 if active_images:
                     content += f"\n({len(active_images)} image(s) attached)"
@@ -190,7 +372,7 @@ class HistoryManager:
             if img.get("data") and img["data"] not in system_level_images:
                 system_level_images.append(img["data"])
 
-        active_discussion_b64 = system_level_images
+        active_discussion_b64 = _deduplicate_images(system_level_images)
         if full_system_prompt or (active_discussion_b64 and format_type in ["openai_chat", "ollama_chat", "markdown"] and not suppress_images):
             discussion_level_images = build_image_dicts(active_discussion_b64) if not suppress_images else []
             if format_type == "openai_chat":
@@ -224,21 +406,19 @@ class HistoryManager:
                 if full_system_prompt:
                     messages.append({"role": "system", "content": full_system_prompt})
 
+        total_history_len = len(branch) + (len(virtual_history) if virtual_history else 0)
         last_user_idx = HistoryManager._last_user_index(branch)
+        history_len = len(branch)
 
         for idx, msg in enumerate(branch):
             role = msg.sender_type
-            distance_from_end = len(branch) - 1 - idx
+            distance_from_end = total_history_len - 1 - idx
 
-            is_recent_functional = False
-            if msg.sender_type == 'assistant' and HistoryManager._has_functional_tags(msg.content):
-                if functional_skip_count < FUNCTIONAL_QUOTA:
-                    functional_skip_count += 1
-                    is_recent_functional = True
+            content = msg.content.strip()
+            if msg.sender_type == 'assistant':
+                content = HistoryManager._sanitize_for_context(content, distance_from_end)
 
-            content = context._apply_three_view_protocol(msg, msg.content.strip(), 0 if is_recent_functional else 99)
-
-            active_images_b64 = msg.get_active_images()
+            active_images_b64 = _deduplicate_images(msg.get_active_images())
             images_dicts = build_image_dicts(active_images_b64)
 
             is_historical_assistant = (role == "assistant")

@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-08-31 22:22]
+
+- feat(client): update history, personality, and LCP tool bindings
+
 ## [2026-08-31 00:21]
 
 - feat: enhance lollms discussion and personality modules

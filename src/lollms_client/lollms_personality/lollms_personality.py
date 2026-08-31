@@ -73,6 +73,7 @@ from lollms_client.lollms_memory import FailureMemory
 from lollms_client.lollms_artefact import ArtefactVisibility, ArtefactManager
 from lollms_client.lollms_artefact.lollms_artefact import ArtefactManager as _ArtefactManager
 from lollms_client.lollms_history import HistoryManager
+from lollms_client.lollms_history.lollms_history import HistoryManager
 
 
 _TEXT_RAG_EXTS = {
@@ -82,6 +83,12 @@ _TEXT_RAG_EXTS = {
     ".ps1", ".bat", ".toml", ".ini", ".cfg", ".log", ".rdf", ".ttl",
 }
 
+class _NullArtefactManager:
+    """Null-safe stand-in for ArtefactManager when no workspace is configured."""
+    def get_context_images(self) -> list:
+        return []
+
+
 class _HistoryContextAdapter:
     """
     Adapter to provide LollmsDiscussion-like interface to HistoryManager
@@ -89,14 +96,18 @@ class _HistoryContextAdapter:
     """
     def __init__(self, personality: 'LollmsPersonality', stable_system_prompt: str):
         self._personality = personality
-        self._system_prompt = stable_system_prompt
+        self._system_prompt_ref = stable_system_prompt
         self.lollmsClient = personality.lollms_client
         self.scratchpad = getattr(personality, '_scratchpad_content', '')
         self.pruning_summary = None
         self.pruning_point_id = None
-        self.artefacts = getattr(personality, '_artefact_manager', None) or SimpleNamespace(get_context_images=lambda: [])
+        self.artefacts = getattr(personality, '_artefact_manager', None) or _NullArtefactManager()
         self.memory_manager = personality.memory_manager
         self.workspace_data_path = str(personality._resolved_workspace) if personality._resolved_workspace else "."
+
+    @property
+    def _system_prompt(self) -> str:
+        return self._system_prompt_ref
 
     def get_full_data_zone(self) -> str:
         return ""
@@ -107,7 +118,24 @@ class _HistoryContextAdapter:
     def _apply_three_view_protocol(self, msg, raw_content: str, distance_from_end: int = 0) -> str:
         return raw_content
 
+    def _build_memory_context_block(self, memory_manager, token_counter=None) -> str:
+        if not memory_manager:
+            return ""
+        try:
+            if hasattr(memory_manager, 'build_working_zone'):
+                return memory_manager.build_working_zone(token_counter=token_counter)
+        except Exception:
+            pass
+        return ""
+
     def _inject_memory_into_messages(self, messages, memory_manager, format_type, token_counter):
+        if not memory_manager:
+            return messages
+        try:
+            if hasattr(memory_manager, 'inject_into_messages'):
+                return memory_manager.inject_into_messages(messages, format_type, token_counter=token_counter)
+        except Exception:
+            pass
         return messages
 
 _STOP_WORDS = {
@@ -3247,12 +3275,69 @@ JSON:"""
         except Exception as dump_err:
             ASCIIColors.warning(f"[{self.name}] Failed to write error dump: {dump_err}")
 
-    def _sanitize_history_for_context(self, text: str) -> str:
-        text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r'<!-- status:[^>]*-->', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'</processing>', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'<lollms_artifact[^/]*/>', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'<artefact_image[^/]*/>', '', text, flags=re.IGNORECASE)
+    def _sanitize_history_for_context(self, text: str, round_index: int = 0, distance_from_end: int = 99) -> str:
+        """
+        Sanitizes assistant message content for LLM context export.
+        Enforces a strict non-placeholder strategy for the last 4 actions to prevent
+        cognitive thread loss, while aggressively compressing older history.
+        """
+        if distance_from_end < 4:
+            # ── 🔒 STRICT PRESERVATION ZONE (Last 4 Actions) ──
+            # Preserve the LLM's raw conversational text and intent statements VERBATIM.
+            # Only strip bulky XML tag *bodies* (full artifact content, full tool JSON)
+            # to save context, but keep the LLM's own words exactly as it wrote them.
+            # NEVER replace with synthetic placeholders or [Action: ...] summaries here.
+
+            text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'<!-- status:[^>]*-->', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'</processing>', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'<lollms_artifact[^/]*/>', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'<artefact_image[^/]*/>', '', text, flags=re.IGNORECASE)
+
+            # Strip bulky tag BODIES but preserve surrounding conversational text
+            text = re.sub(
+                r'<art(?:ifact|efact)[^>]*>.*?</art(?:ifact|efact)>',
+                lambda m: re.sub(r'<art(?:ifact|efact)[^>]*>', '[🔒 Artifact body stripped]', m.group(0), flags=re.IGNORECASE),
+                text, flags=re.DOTALL | re.IGNORECASE
+            )
+            text = re.sub(
+                r'<tool>.*?</tool>',
+                lambda m: re.sub(r'<tool>', '[🔒 Tool body stripped]', m.group(0), flags=re.IGNORECASE),
+                text, flags=re.DOTALL | re.IGNORECASE
+            )
+            text = re.sub(
+                r'<(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>.*?</(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>',
+                lambda m: re.sub(r'<(unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>', r'[🔒 \1 body stripped]', m.group(0), flags=re.IGNORECASE),
+                text, flags=re.DOTALL | re.IGNORECASE
+            )
+            text = re.sub(r'<scratchpad_(?:append|patch)>.*?</scratchpad_(?:append|patch)>', '[🔒 Scratchpad update]', text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'<scratchpad_clear\s*/?>', '[🔒 Scratchpad cleared]', text, flags=re.IGNORECASE)
+            text = re.sub(r'<mem_new[^/]*/?>', '[🔒 Memory created]', text, flags=re.IGNORECASE)
+            text = re.sub(r'<mem_update[^/]*/?>', '[🔒 Memory updated]', text, flags=re.IGNORECASE)
+            text = re.sub(r'<user_profile_update>.*?</user_profile_update>', '[🔒 User profile updated]', text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'<user_profile_clear\s*/?>', '[🔒 User profile cleared]', text, flags=re.IGNORECASE)
+            text = re.sub(r'<refactor_history\s*/?>', '[🔒 History refactored]', text, flags=re.IGNORECASE)
+
+            stripped_for_check = re.sub(r'\[🔒[^\]]*\]', '', text).strip()
+            if not stripped_for_check:
+                text = "[Action executed with no conversational text]"
+        else:
+            # ── 🧹 AGGRESSIVE COMPRESSION ZONE (Older Actions, distance >= 4) ──
+            text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'<!-- status:[^>]*-->', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'</processing>', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'<lollms_artifact[^/]*/>', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'<artefact_image[^/]*/>', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'<art(?:ifact|efact)[^>]*>.*?</art(?:ifact|efact)>', '[🔒 Artifact stripped]', text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'<tool>.*?</tool>', '[🔒 Tool stripped]', text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'<(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>.*?</(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>', '[🔒 Context op stripped]', text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'<scratchpad_(?:append|patch)>.*?</scratchpad_(?:append|patch)>', '[🔒 Scratchpad update]', text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'<scratchpad_clear\s*/?>', '[🔒 Scratchpad cleared]', text, flags=re.IGNORECASE)
+            text = re.sub(r'<mem_new[^/]*/?>', '[🔒 Memory created]', text, flags=re.IGNORECASE)
+            text = re.sub(r'<mem_update[^/]*/?>', '[🔒 Memory updated]', text, flags=re.IGNORECASE)
+            text = re.sub(r'<user_profile_update>.*?</user_profile_update>', '[🔒 User profile updated]', text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'<user_profile_clear\s*/?>', '[🔒 User profile cleared]', text, flags=re.IGNORECASE)
+            text = re.sub(r'<refactor_history\s*/?>', '[🔒 History refactored]', text, flags=re.IGNORECASE)
         return text.strip()
 
     def _sync_base_context_artifacts(self, base_conversation: List[Dict[str, str]], virtual_history: List) -> None:
@@ -3331,7 +3416,17 @@ JSON:"""
 
         return surviving_history
 
-    def _discover_tools(self, explicit_tools: Optional[Dict] = None, tool_files: Optional[List] = None, enable_data_tools: bool = False, *args, **kwargs) -> Dict[str, Dict[str, Any]]:
+    def _discover_tools(
+        self,
+        explicit_tools: Optional[Dict] = None,
+        tool_files: Optional[List] = None,
+        enable_data_tools: bool = False,
+        enable_workspace_tools: bool = True,
+        enable_shell: bool = False,
+        enable_python_exec: bool = False,
+        enable_web_tools: bool = False,
+        *args, **kwargs
+    ) -> Dict[str, Dict[str, Any]]:
         active_tools = {}
 
         try:
@@ -3340,62 +3435,62 @@ JSON:"""
         except Exception:
             current_user_name = "Unknown User"
 
-        if self.capabilities and self.capabilities.enable_workspace_tools and self._resolved_workspace:
-            ws_path = self._resolved_workspace
+        lcp_binding = getattr(self.lollms_client, 'tools', None)
+        if not _is_tool_binding(lcp_binding) or hasattr(lcp_binding, "_mock_return_value"):
+            lcp_binding = None
 
-            def tool_write_file(file_name: str, content: str) -> dict:
-                """Write content to a file in the workspace."""
+        if lcp_binding is None and self._resolved_workspace:
+            try:
+                from lollms_client.tools_bindings.lcp import LCPBinding
+                lcp_binding = LCPBinding()
+                if hasattr(self.lollms_client, 'tools'):
+                    self.lollms_client.tools = lcp_binding
+            except Exception as e:
+                ASCIIColors.warning(f"[{self.name}] Failed to initialize LCPBinding: {e}")
+                lcp_binding = None
+
+        if lcp_binding and hasattr(lcp_binding, 'mount_tool_library'):
+            _libraries_to_mount: List[str] = []
+
+            if enable_workspace_tools and self.capabilities and self.capabilities.enable_workspace_tools and self._resolved_workspace:
+                _libraries_to_mount.append("workspace_tools")
+            if enable_shell:
+                _libraries_to_mount.append("system_shell")
+            if enable_python_exec:
+                _libraries_to_mount.append("execute_python_code")
+
+            for lib_name in _libraries_to_mount:
                 try:
-                    p = ws_path / file_name
-                    p.parent.mkdir(parents=True, exist_ok=True)
-                    p.write_text(content, encoding="utf-8")
-                    return {"success": True, "output": f"File '{file_name}' written successfully."}
+                    lcp_binding.mount_tool_library(lib_name)
                 except Exception as e:
-                    return {"success": False, "error": str(e)}
+                    ASCIIColors.warning(f"[{self.name}] Failed to mount LCP library '{lib_name}': {e}")
 
-            def tool_read_file(file_name: str) -> dict:
-                """Read content from a file in the workspace."""
+            if _libraries_to_mount:
                 try:
-                    p = ws_path / file_name
-                    if not p.exists():
-                        return {"success": False, "error": f"File '{file_name}' not found."}
-                    return {"success": True, "output": p.read_text(encoding="utf-8", errors="ignore")}
-                except Exception as e:
-                    return {"success": False, "error": str(e)}
+                    all_lcp_tools = lcp_binding.to_chat_tool_specs(
+                        discussion_instance=getattr(self, '_artefact_proxy', None),
+                        lollms_client_instance=self.lollms_client
+                    )
+                    _WS_TOOL_NAMES = {
+                        "tool_write_file", "tool_read_file", "tool_list_files",
+                        "tool_find_files", "tool_grep_files"
+                    }
+                    _SHELL_TOOL_NAMES = {"tool_execute_shell_command"}
+                    _PY_EXEC_TOOL_NAMES = {"tool_execute_python_code"}
 
-            def tool_list_files(directory: str = ".") -> dict:
-                """List all files in the workspace."""
-                try:
-                    files = [str(f.relative_to(ws_path)) for f in ws_path.rglob("*") if f.is_file()]
-                    return {"success": True, "files": sorted(files), "output": "\n".join(sorted(files))}
-                except Exception as e:
-                    return {"success": False, "error": str(e)}
+                    allowed_tool_names = set()
+                    if enable_workspace_tools and self.capabilities and self.capabilities.enable_workspace_tools and self._resolved_workspace:
+                        allowed_tool_names.update(_WS_TOOL_NAMES)
+                    if enable_shell:
+                        allowed_tool_names.update(_SHELL_TOOL_NAMES)
+                    if enable_python_exec:
+                        allowed_tool_names.update(_PY_EXEC_TOOL_NAMES)
 
-            active_tools["tool_write_file"] = {
-                "name": "tool_write_file",
-                "description": "Write content to a file in the workspace.",
-                "parameters": [
-                    {"name": "file_name", "type": "str", "description": "The path of the file to write."},
-                    {"name": "content", "type": "str", "description": "The content to write into the file."}
-                ],
-                "callable": tool_write_file
-            }
-            active_tools["tool_read_file"] = {
-                "name": "tool_read_file",
-                "description": "Read content from a file in the workspace.",
-                "parameters": [
-                    {"name": "file_name", "type": "str", "description": "The path of the file to read."}
-                ],
-                "callable": tool_read_file
-            }
-            active_tools["tool_list_files"] = {
-                "name": "tool_list_files",
-                "description": "List all files in the workspace.",
-                "parameters": [
-                    {"name": "directory", "type": "str", "description": "Directory to list (optional).", "optional": True}
-                ],
-                "callable": tool_list_files
-            }
+                    for t_name, t_spec in all_lcp_tools.items():
+                        if t_name in allowed_tool_names:
+                            active_tools[t_name] = t_spec
+                except Exception as e:
+                    ASCIIColors.warning(f"[{self.name}] Failed to extract LCP tool specs: {e}")
 
         if BindingToolsBuilder and self.lollms_client and self.capabilities:
             binding_tools = BindingToolsBuilder.build_tools(self.lollms_client, self.capabilities, self._resolved_workspace)
@@ -4331,7 +4426,16 @@ JSON:"""
 
                 try:
                     result = tool_def["callable"](**call_kwargs)
-                    return result if isinstance(result, dict) else {"success": True, "output": str(result)}
+                    if isinstance(result, dict):
+                        if result.get("success") is False and not result.get("error"):
+                            result["error"] = (
+                                f"Tool '{tool_name}' returned success=False with no error message. "
+                                f"Raw keys: {list(result.keys())}. "
+                                f"This may indicate a library initialization failure, a missing dependency, or an import error."
+                            )
+                            ASCIIColors.error(f"[{self.name}] Tool '{tool_name}' returned bare success=False. Synthesized error: {result['error']}")
+                        return result
+                    return {"success": True, "output": str(result)}
                 except Exception as exec_err:
                     trace_exception(exec_err)
                     return {"success": False, "error": f"Tool '{tool_name}' crashed: {exec_err}", "traceback": traceback.format_exc()}
@@ -4347,22 +4451,32 @@ JSON:"""
                     if isinstance(result, dict):
                         inner = result.get("output")
                         if isinstance(inner, dict):
-                            if inner.get("success") is False or "error" in inner:
+                            if inner.get("success") is False:
+                                if not inner.get("error"):
+                                    inner["error"] = f"LCP tool '{tool_name}' returned success=False without a descriptive error. Raw keys: {list(inner.keys())}"
+                                return inner
+                            if "error" in inner:
                                 return inner
                             return inner if "output" in inner else {"success": True, "output": inner}
                         if result.get("status_code", 200) not in (200, 201):
+                            err_msg = result.get("error") or f"LCP tool '{tool_name}' returned status_code {result.get('status_code')} with no error message."
+                            if result.get("traceback"):
+                                err_msg = f"{err_msg}\n\nTraceback:\n{result.get('traceback')}"
                             return {
                                 "success": False,
-                                "error": result.get("error", f"LCP tool '{tool_name}' returned status_code {result.get('status_code')}"),
+                                "error": err_msg,
                                 "traceback": result.get("traceback"),
                             }
                         if inner is not None:
                             return {"success": True, "output": inner}
                         if "error" in result:
-                            return {"success": False, "error": result["error"], "traceback": result.get("traceback")}
+                            err_msg = result["error"]
+                            if result.get("traceback"):
+                                err_msg = f"{err_msg}\n\nTraceback:\n{result.get('traceback')}"
+                            return {"success": False, "error": err_msg, "traceback": result.get("traceback")}
                         return {"success": True, "output": str(result)}
                     if result is None:
-                        return {"success": False, "error": f"LCP tool '{tool_name}' returned None (no output)."}
+                        return {"success": False, "error": f"LCP tool '{tool_name}' returned None (no output). This may indicate a crash in the tool's initialization or execution."}
                     return {"success": True, "output": str(result)}
                 except Exception as lcp_err:
                     trace_exception(lcp_err)
@@ -4387,6 +4501,10 @@ JSON:"""
         n_predict: Optional[int] = None,
         enable_artefacts: bool = True,
         use_internal_history: bool = True,
+        enable_workspace_tools: bool = True,
+        enable_shell: bool = False,
+        enable_python_exec: bool = False,
+        enable_web_tools: bool = False,
         **kwargs
     ) -> Dict[str, Any]:
         resolved_max_rounds = max_nb_rounds if max_nb_rounds is not None else max_reasoning_steps
@@ -4443,7 +4561,15 @@ JSON:"""
 
         cleaned_prompt = prompt
         enable_data_tools_flag = kwargs.get("enable_data_tools", True)
-        active_tools = self._discover_tools(tools, tool_files or [], enable_data_tools=enable_data_tools_flag)
+        active_tools = self._discover_tools(
+            tools,
+            tool_files or [],
+            enable_data_tools=enable_data_tools_flag,
+            enable_workspace_tools=enable_workspace_tools,
+            enable_shell=enable_shell,
+            enable_python_exec=enable_python_exec,
+            enable_web_tools=enable_web_tools
+        )
 
         stable_system_prompt = self._build_system_prompt(active_tools)
         stable_system_prompt += self._build_user_profile_context()
@@ -4504,9 +4630,8 @@ JSON:"""
         dynamic_suffix = "\n\n".join(dynamic_suffix_parts)
 
         if dynamic_suffix:
-            fused_prompt = f"=== CURRENT WORKSPACE CONTEXT ===\n{dynamic_suffix}\n=== END WORKSPACE CONTEXT ===\n\n{cleaned_prompt}"
-        else:
-            fused_prompt = cleaned_prompt
+            stable_system_prompt += "\n\n" + dynamic_suffix
+        fused_prompt = cleaned_prompt
 
         base_conversation.append({"role": "user", "content": fused_prompt})
 
@@ -4515,7 +4640,6 @@ JSON:"""
         tool_results_this_turn: List[Dict[str, Any]] = []
         round_count = 0
         was_cancelled = False
-        tool_signature_counts: Dict[str, int] = {}
         successful_tool_signatures: set = set()
         seen_context_signatures: set = set()
         final_response = ""
@@ -4554,6 +4678,7 @@ JSON:"""
                 format_type="openai_chat",
                 branch=base_conversation,
                 virtual_history=virtual_history,
+                system_prompt_override=stable_system_prompt
             )
 
             if getattr(self, 'debug_mode', False):
@@ -4730,11 +4855,28 @@ JSON:"""
             if ss.was_done_detected():
                 final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
 
-                if ss.completed_actions:
-                    raw_round_text = final_response
-                    clean_history_text = self._sanitize_history_for_context(raw_round_text)
-                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant executed batched actions]"))
+                if not ss.completed_actions and not tool_calls_this_turn and not workspace_changes and round_count == 1:
+                    sanitized_final_response_check = re.sub(r'<[^>]+>', '', final_response).strip()
+                    if sanitized_final_response_check:
+                        ASCIIColors.warning(f"[{self.name}] Round 1 preamble stall with <done/> (text produced, no actions). Injecting continuation mandate.")
+                        virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text()))
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="user",
+                            content=(
+                                "[SYSTEM: CRITICAL. You emitted <done/> after writing a conversational preamble, "
+                                "but you did NOT execute any actions. Stating intent DOES NOT execute it.\n\n"
+                                "MANDATORY ACTION: You MUST NOW emit the functional tag to perform the action you just described.\n"
+                                "- If you said you would unlock files, emit: <unlock_file>filename.pdf</unlock_file>\n"
+                                "- If you said you would read a document, emit the appropriate <tool> tag.\n"
+                                "- If your task is truly complete, output your final answer and end with <done/>.\n\n"
+                                "Do NOT write another preamble. Emit the functional tag NOW.]"
+                            )
+                        ))
+                        ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
+                        continue
 
+                if ss.completed_actions:
+                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text()))
                     files_before = self._take_workspace_snapshot()
                     action_reports = []
                     actions_executed_count = 0
@@ -5121,6 +5263,29 @@ JSON:"""
                     ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
                     continue
 
+                if not ss.completed_actions and not tool_calls_this_turn and not workspace_changes and not ss.was_done_detected() and round_count == 1:
+                    if raw_round_text.strip():
+                        ASCIIColors.warning(f"[{self.name}] Round 1 preamble stall (text produced, no actions, no <done/>). Injecting continuation mandate.")
+                        virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text()))
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="user",
+                            content=(
+                                "[SYSTEM: CRITICAL. You wrote a conversational preamble but you STOPPED without executing "
+                                "the actual action. Stating intent DOES NOT execute it.\n\n"
+                                "MANDATORY ACTION: You MUST NOW emit the functional tag to perform the action you just described.\n"
+                                "- If you said you would unlock files, emit: <unlock_file>filename.pdf</unlock_file>\n"
+                                "- If your task is truly complete, output your final answer and end with <done/>.\n\n"
+                                "Do NOT write another preamble. Emit the functional tag NOW.]"
+                            )
+                        ))
+                        ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
+                        continue
+
+                if not final_response.strip():
+                    ASCIIColors.warning(f"[{self.name}] Empty response after <done/> with no prior actions. Terminating.")
+                    final_response = "[Task terminated: The agent produced no actionable output.]"
+                    break
+
                 sanitized_final_response = re.sub(r'<[^>]+>', '', final_response).strip()
 
                 if not sanitized_final_response and not tool_calls_this_turn and not workspace_changes and not ss.completed_actions and round_count == 1:
@@ -5144,8 +5309,7 @@ JSON:"""
 
             if ss.completed_actions:
                 raw_round_text = ss.get_clean_text()
-                clean_history_text = self._sanitize_history_for_context(raw_round_text)
-                virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant executed batched actions]"))
+                virtual_history.append(SimpleNamespace(sender_type="assistant", content=raw_round_text))
 
                 files_before = self._take_workspace_snapshot()
                 actions_executed_count = 0
@@ -5570,6 +5734,11 @@ JSON:"""
                 if action_reports:
                     report_text = "\n\n".join(str(r) for r in action_reports) + "\n\nAnalyze these results and continue your task, or emit <done/> if finished."
                     virtual_history.append(SimpleNamespace(sender_type="user", content=report_text))
+                elif not raw_round_text.strip():
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content="[SYSTEM: Your context visibility operation was executed. Continue your task or emit <done/> if finished.]"
+                    ))
 
                 ss.completed_actions = []
                 ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
@@ -5581,6 +5750,16 @@ JSON:"""
                 if getattr(self, 'debug_mode', False):
                     ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: <done/> detected (no actions) ===")
                 break
+
+            raw_round_text = ss.get_clean_text()
+
+            # ── 🧹 DYNAMIC HISTORY SANITIZATION (Strict Non-Placeholder Strategy) ──
+            if virtual_history:
+                history_len = len(virtual_history)
+                for idx, vh in enumerate(virtual_history):
+                    if vh.sender_type == "assistant":
+                        distance = history_len - 1 - idx
+                        vh.content = HistoryManager._sanitize_for_context(vh.content, distance_from_end=distance)
 
             # ── 🛑 TERTIARY <done/> / <end/> FALLBACK ──
             raw_round_text = ss.get_clean_text()
@@ -5605,23 +5784,22 @@ JSON:"""
                 if _has_artifact_evidence:
                     ASCIIColors.warning(f"[{self.name}] Phantom artifact detected (processing markers in stream but no completed actions). Forcing continuation.")
                     virtual_history.append(SimpleNamespace(
-                        sender_type="assistant",
-                        content=self._sanitize_history_for_context(raw_round_text).strip() or "[Assistant emitted an artifact block]"
-                    ))
+                            sender_type="assistant",
+                            content=raw_round_text.strip()
+                        ))
                     virtual_history.append(SimpleNamespace(
                         sender_type="user",
                         content="[SYSTEM: Your previous artifact was detected but not fully processed. If you intended to write a file, emit the <artifact> tag again with the complete content. If your task is complete, output your final answer and end with <done/>.]"
                     ))
                     continue
 
-            has_new_actions_this_round = bool(ss.completed_actions) or bool(raw_round_text.strip())
             text_is_repetitive = False
+            has_new_actions_this_round = bool(ss.completed_actions) or bool(raw_round_text.strip())
 
             _xml_tool_pattern = re.compile(r'^\s*<tool_\w+[\s/>]', re.MULTILINE | re.IGNORECASE)
             if _xml_tool_pattern.search(raw_round_text):
                 ASCIIColors.warning(f"[{self.name}] Malformed XML tool syntax detected (Round {round_count}). Injecting format correction.")
-                clean_history_text = self._sanitize_history_for_context(raw_round_text)
-                virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text))
+                virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text()))
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
                     content=(
@@ -5666,7 +5844,7 @@ JSON:"""
             if not text_is_repetitive and stripped_round_text and not has_new_actions_this_round:
                 lines_in_response = stripped_round_text.splitlines()
                 non_empty_lines = [l.strip() for l in lines_in_response if l.strip()]
-                if len(non_empty_lines) >= 3:
+                if len(non_empty_lines) >= 2:
                     from collections import Counter as _Counter
                     line_counts = _Counter(non_empty_lines)
                     most_common_line, most_common_count = line_counts.most_common(1)[0]
@@ -5674,21 +5852,37 @@ JSON:"""
                         repetition_ratio = most_common_count / len(non_empty_lines)
                         if repetition_ratio >= 0.5:
                             text_is_repetitive = True
-                            ASCIIColors.warning(f"[{self.name}] Intra-round text duplication detected (line repeated {most_common_count}x, ratio: {repetition_ratio:.0%}).")
+                            deduplicated_lines = []
+                            seen_lines = set()
+                            for l in non_empty_lines:
+                                if l not in seen_lines:
+                                    deduplicated_lines.append(l)
+                                    seen_lines.add(l)
+                            if deduplicated_lines:
+                                stripped_round_text = "\n".join(deduplicated_lines)
+                                raw_round_text = stripped_round_text
+                                ss.content = stripped_round_text
+                            ASCIIColors.warning(f"[{self.name}] Intra-round text duplication detected (line repeated {most_common_count}x, ratio: {repetition_ratio:.0%}). Deduplicated to {len(deduplicated_lines)} unique line(s).")
                         elif most_common_count >= 2:
                             consecutive_dup_count = 0
                             for i in range(1, len(non_empty_lines)):
                                 if non_empty_lines[i] == non_empty_lines[i - 1]:
                                     consecutive_dup_count += 1
-                            if consecutive_dup_count >= 2:
+                            if consecutive_dup_count >= 1:
                                 text_is_repetitive = True
-                                ASCIIColors.warning(f"[{self.name}] Intra-round consecutive text duplication detected ({consecutive_dup_count} consecutive duplicate lines).")
+                                deduplicated_lines = []
+                                prev_line = None
+                                for l in non_empty_lines:
+                                    if l != prev_line:
+                                        deduplicated_lines.append(l)
+                                    prev_line = l
+                                if deduplicated_lines:
+                                    stripped_round_text = "\n".join(deduplicated_lines)
+                                    raw_round_text = stripped_round_text
+                                    ss.content = stripped_round_text
+                                ASCIIColors.warning(f"[{self.name}] Intra-round consecutive text duplication detected ({consecutive_dup_count} consecutive duplicate lines). Deduplicated to {len(deduplicated_lines)} unique line(s).")
 
             if text_is_repetitive:
-                ASCIIColors.warning(f"[{self.name}] Repetitive text preamble detected (Round {round_count}). Injecting correction — NOT terminating.")
-                clean_history_text = self._sanitize_history_for_context(raw_round_text)
-                virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant produced repetitive text]"))
-
                 consecutive_stall_count = getattr(self, '_consecutive_stall_count', 0) + 1
                 object.__setattr__(self, '_consecutive_stall_count', consecutive_stall_count)
 
@@ -5699,6 +5893,8 @@ JSON:"""
                         final_response = "[Task terminated: The agent produced repetitive text multiple times due to a tool failure or sandbox restriction. The last tool call may have been blocked.]"
                     break
 
+                ASCIIColors.warning(f"[{self.name}] Repetitive text preamble detected (Round {round_count}, streak: {consecutive_stall_count}/2). Injecting correction — NOT terminating.")
+                virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text()))
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
                     content=(
@@ -5739,19 +5935,17 @@ JSON:"""
                     break
 
                 ASCIIColors.warning(f"[{self.name}] Mid-task stall detected (Round {round_count}, consecutive: {consecutive_stall_count}). LLM stopped without <done/> or new actions. Forcing continuation.")
-                clean_history_text = self._sanitize_history_for_context(raw_round_text)
-                virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant stalled without output]"))
+                virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text()))
                 recent_tool_names = [tc.get("name", "") for tc in tool_calls_this_turn[-3:]]
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
                     content=self._build_progressive_continuation_prompt(consecutive_stall_count, recent_tool_names)
                 ))
                 continue
-            elif has_new_actions_this_round:
+            elif has_new_actions_this_round and not text_is_repetitive:
                 object.__setattr__(self, '_consecutive_stall_count', 0)
-                clean_history_text = self._sanitize_history_for_context(raw_round_text)
-                if clean_history_text.strip():
-                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text))
+                if raw_round_text.strip():
+                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text()))
             if not text_is_repetitive and stripped_round_text:
                 object.__setattr__(self, '_consecutive_stall_count', 0)
 
@@ -5778,7 +5972,7 @@ JSON:"""
 
             has_actions_this_round = bool(ss.completed_actions)
             if len(tool_calls_this_turn) > 0 or getattr(ss, 'context_trigger', False) or getattr(ss, 'artifact_trigger', False) or has_actions_this_round:
-                if not raw_round_text.strip():
+                if not raw_round_text.strip() and not has_actions_this_round:
                     empty_response_count = getattr(self, '_consecutive_empty_responses', 0) + 1
                     object.__setattr__(self, '_consecutive_empty_responses', empty_response_count)
 
@@ -5790,8 +5984,7 @@ JSON:"""
                     ASCIIColors.warning(f"[{self.name}] Empty LLM response detected after action (attempt {empty_response_count}). Injecting continuation mandate.")
                 else:
                     object.__setattr__(self, '_consecutive_empty_responses', 0)
-                    clean_history_text = self._sanitize_history_for_context(raw_round_text)
-                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant provided no output]"))
+                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text()))
 
                 recent_tool_names = [tc.get("name", "") for tc in tool_calls_this_turn[-3:]]
 
@@ -5826,10 +6019,9 @@ JSON:"""
             ):
                 ASCIIColors.warning(f"[{self.name}] Round 1 preamble stall detected (text produced, no actions, no <done/>). Injecting continuation mandate.")
 
-                clean_history_text = self._sanitize_history_for_context(raw_round_text)
                 virtual_history.append(SimpleNamespace(
                     sender_type="assistant",
-                    content=clean_history_text.strip() if clean_history_text.strip() else "[Assistant produced a text-only preamble]"
+                    content=ss.get_clean_text().strip()
                 ))
 
                 virtual_history.append(SimpleNamespace(
@@ -5865,8 +6057,7 @@ JSON:"""
                     object.__setattr__(self, '_consecutive_stall_count', 0)
 
                 ASCIIColors.warning("[LollmsPersonality.chat] Malformed functional tag detected. Injecting format correction.")
-                clean_history_text = self._sanitize_history_for_context(raw_round_text)
-                virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text))
+                virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text()))
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
                     content=(
@@ -5891,8 +6082,7 @@ JSON:"""
                     break
 
                 ASCIIColors.warning(f"[{self.name}] LLM stopped without <done/> after tools were executed (stall #{consecutive_stall_count}). Injecting continuation mandate.")
-                clean_history_text = self._sanitize_history_for_context(raw_round_text)
-                virtual_history.append(SimpleNamespace(sender_type="assistant", content=clean_history_text if clean_history_text.strip() else "[Assistant produced text-only preamble]"))
+                virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text()))
                 recent_tool_names = [tc.get("name", "") for tc in tool_calls_this_turn[-3:]]
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
@@ -5905,37 +6095,41 @@ JSON:"""
             if not final_response:
                 final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
 
+            stripped_final_check = re.sub(r'<[^>]+>', '', final_response).strip()
+
             if (
                 not was_cancelled
-                and round_count == 1
                 and not tool_calls_this_turn
                 and not workspace_changes
                 and not getattr(self, '_consecutive_stall_count', 0) >= 3
+                and stripped_final_check
+                and len(stripped_final_check) > 10
             ):
-                stripped_final = re.sub(r'<[^>]+>', '', final_response).strip()
-                if stripped_final and len(stripped_final) > 10:
-                    ASCIIColors.warning(f"[{self.name}] Round 1 clean exit with text but no actions. Intercepting to enforce action or <done/>.")
+                consecutive_stall_count = getattr(self, '_consecutive_stall_count', 0) + 1
+                object.__setattr__(self, '_consecutive_stall_count', consecutive_stall_count)
 
-                    clean_history_text = self._sanitize_history_for_context(final_response)
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="assistant",
-                        content=clean_history_text.strip() if clean_history_text.strip() else "[Assistant produced a text-only preamble]"
-                    ))
+                if consecutive_stall_count >= 3:
+                    ASCIIColors.warning(f"[{self.name}] Terminating after {consecutive_stall_count} consecutive text-only stalls. LLM is stuck in preamble mode.")
+                    if not final_response:
+                        final_response = "[Task terminated: The agent repeatedly produced text preambles without executing any actions.]"
+                    break
 
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="user",
-                        content=(
-                            "[SYSTEM: CRITICAL. You wrote a conversational preamble stating your intent "
-                            "but you STOPPED without executing the actual action or emitting a <done/> tag. "
-                            "Stating intent DOES NOT execute it.\n\n"
-                            "MANDATORY ACTION: You MUST NOW emit the functional tag to perform the action you just described, OR if your task is truly complete, output your final answer and end with a <done/> tag on a new line.\n\n"
-                            "Do NOT write another preamble. Emit the functional tag NOW.]"
-                        )
-                    ))
-                    ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
-                    if getattr(self, 'debug_mode', False):
-                        ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Clean exit intercepted, enforcing continuation ===")
-                    continue
+                ASCIIColors.warning(f"[{self.name}] Text-only stall detected (Round {round_count}, consecutive: {consecutive_stall_count}). No actions, no <done/>. Injecting continuation mandate.")
+
+                virtual_history.append(SimpleNamespace(
+                    sender_type="assistant",
+                    content=ss.get_clean_text()
+                ))
+
+                recent_tool_names = [tc.get("name", "") for tc in tool_calls_this_turn[-3:]]
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content=self._build_progressive_continuation_prompt(consecutive_stall_count, recent_tool_names)
+                ))
+                ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
+                if getattr(self, 'debug_mode', False):
+                    ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Text-only stall intercepted, enforcing continuation ===")
+                continue
 
             if getattr(self, 'debug_mode', False):
                 ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Clean exit ===")

@@ -50,16 +50,19 @@ def tool_inspect_document(file_name: str) -> Dict[str, Any]:
             try:
                 from pypdf import PdfReader
             except ImportError:
-                return {"success": False, "error": "pypdf is not installed. Please install it to read PDF files."}
-            reader = PdfReader(str(path))
-            return {
-                "success": True,
-                "file_name": file_name,
-                "format": "PDF",
-                "size_bytes": file_size,
-                "pages_count": len(reader.pages),
-                "output": f"PDF '{file_name}': {len(reader.pages)} page(s), {file_size:,} bytes."
-            }
+                return {"success": False, "error": "pypdf is not installed. Please install it via 'pip install pypdf' to inspect PDF files."}
+            try:
+                reader = PdfReader(str(path))
+                return {
+                    "success": True,
+                    "file_name": file_name,
+                    "format": "PDF",
+                    "size_bytes": file_size,
+                    "pages_count": len(reader.pages),
+                    "output": f"PDF '{file_name}': {len(reader.pages)} page(s), {file_size:,} bytes."
+                }
+            except Exception as pdf_err:
+                return {"success": False, "error": f"Failed to read PDF '{file_name}': {pdf_err}. The file may be corrupted, encrypted, or require a password."}
 
         elif ext == ".docx":
             import docx
@@ -114,7 +117,8 @@ def tool_inspect_document(file_name: str) -> Dict[str, Any]:
             }
 
     except Exception as e:
-        return {"success": False, "error": f"Failed to inspect document '{file_name}': {e}"}
+        import traceback as _tb
+        return {"success": False, "error": f"Failed to inspect document '{file_name}': {e}", "traceback": _tb.format_exc()}
 
 
 def tool_read_document_content(
@@ -141,9 +145,12 @@ def tool_read_document_content(
             try:
                 from pypdf import PdfReader
             except ImportError:
-                return {"success": False, "error": "pypdf is not installed. Please install it to read PDF files."}
-            reader = PdfReader(str(path))
-            total_pages = len(reader.pages)
+                return {"success": False, "error": "pypdf is not installed. Please install it via 'pip install pypdf' to read PDF files."}
+            try:
+                reader = PdfReader(str(path))
+                total_pages = len(reader.pages)
+            except Exception as pdf_err:
+                return {"success": False, "error": f"Failed to open PDF '{file_name}': {pdf_err}. The file may be corrupted, encrypted, or require a password."}
 
             target_pages = list(range(total_pages))
             if page_or_sheet:

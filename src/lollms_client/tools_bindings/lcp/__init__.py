@@ -405,9 +405,11 @@ class LCPBinding(LollmsToolBinding):
                             ASCIIColors.success(f"[LCP Lazy Init] ✅ Initialized library for '{library_name}' with host configs.")
                     except Exception as init_ex:
                         ASCIIColors.error(f"[LCP execute_tool] ❌ Toolset '{python_file_path.stem}' FAILED lazy init: {init_ex}")
+                        import traceback as _lcp_tb
+                        tb_str = _lcp_tb.format_exc()
                         if module_name in sys.modules:
                             del sys.modules[module_name]
-                        return {"error": f"Tool initialization failed: {init_ex}", "status_code": 500}
+                        return {"error": f"Tool initialization failed: {init_ex}", "status_code": 500, "traceback": tb_str}
                 else:
                     tool_module = sys.modules[module_name]
             else:
@@ -442,6 +444,16 @@ class LCPBinding(LollmsToolBinding):
 
             if not isinstance(result, dict):
                 result = {"success": True, "output": result}
+
+            if result.get("success") is False:
+                if not result.get("output"):
+                    result["output"] = result.get("error", "Tool failed with no output.")
+                return {
+                    "output": result,
+                    "error": result.get("error"),
+                    "success": False,
+                    "status_code": 500
+                }
 
             return {"output": result, "status_code": 200}
 

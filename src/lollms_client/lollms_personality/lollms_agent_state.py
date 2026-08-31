@@ -134,6 +134,8 @@ def _sanitize_tool_result(tool_res: Any, max_chars: Optional[int] = None, client
 
     if isinstance(tool_res, dict):
         inner_dict = tool_res.get("output") if isinstance(tool_res.get("output"), dict) else {}
+        if not inner_dict and tool_res.get("success") is False:
+            inner_dict = tool_res
 
         # Comprehensive Failure Detection
         # An "error" string alone does not indicate failure unless success is explicitly False
@@ -169,10 +171,24 @@ def _sanitize_tool_result(tool_res: Any, max_chars: Optional[int] = None, client
 
             error_msg = tool_res.get("error") or (inner_dict.get("error") if inner_dict else None)
             if not error_msg:
+                raw_keys = list(tool_res.keys()) if isinstance(tool_res, dict) else type(tool_res).__name__
+                raw_preview = ""
+                if isinstance(tool_res, dict):
+                    preview_parts = []
+                    for k, v in tool_res.items():
+                        if k not in ("error", "traceback"):
+                            val_str = str(v)[:300] if v is not None else "None"
+                            preview_parts.append(f"  {k}: {val_str}")
+                    if preview_parts:
+                        raw_preview = "\nRaw content:\n" + "\n".join(preview_parts)
                 error_msg = (
-                    f"Tool returned success=False but did not provide an error message. "
-                    f"Raw keys: {list(tool_res.keys()) if isinstance(tool_res, dict) else type(tool_res).__name__}. "
-                    f"This may indicate a library initialization failure or an import error."
+                    f"Tool execution failed (success=False) but the tool did not provide a descriptive error message. "
+                    f"Raw keys: {raw_keys}.{raw_preview}\n\n"
+                    f"Possible causes:\n"
+                    f"1. The target file may not exist in the current working directory.\n"
+                    f"2. The search_text may not be found in the document (try a shorter, more specific fragment).\n"
+                    f"3. The document may be image-based (scanned PDF) and requires OCR.\n"
+                    f"4. A required library (pymupdf, python-docx) may not be installed."
                 )
             error_parts.append(f"**Error Details:**\n{error_msg}")
 
@@ -204,6 +220,29 @@ def _sanitize_tool_result(tool_res: Any, max_chars: Optional[int] = None, client
             if len(error_text) > max_chars:
                 error_text = error_text[:max_chars] + f"\n... [truncated, {len(error_text) - max_chars} more chars]"
             return error_text
+
+        pinj = _find_prompt_injection(tool_res)
+        if pinj:
+            return f"✓ Success\n{pinj}"
+
+        unwrapped = tool_res
+        if isinstance(tool_res, dict):
+            if "output" in tool_res:
+                unwrapped = tool_res["output"]
+                if isinstance(unwrapped, dict):
+                    for key in ("content", "text", "result", "data", "page_content", "summary"):
+                        if key in unwrapped:
+                            unwrapped = unwrapped[key]
+                            break
+            elif "content" in tool_res:
+                unwrapped = tool_res["content"]
+            elif "result" in tool_res:
+                unwrapped = tool_res["result"]
+            elif "data" in tool_res:
+                unwrapped = tool_res["data"]
+
+        if unwrapped is None:
+            return "⚠️ Tool returned success=True but NO output content was extracted. This likely means the document is image-based (scanned PDF), encrypted, or the extraction returned empty text. Try a different approach: use <unlock_file> to load the file natively, or use tool_grep_document to search for specific keywords."
 
     pinj = _find_prompt_injection(tool_res)
     if pinj:

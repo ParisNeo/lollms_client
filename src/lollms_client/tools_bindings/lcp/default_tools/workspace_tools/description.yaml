@@ -1,0 +1,5 @@
+name: Workspace Tools
+description: Tools for reading, writing, and listing files in the agent's workspace.
+icon: 📁
+version: 1.0.0
+author: lollms_client
