@@ -4061,7 +4061,7 @@ class ChatMixin:
         # Initialize pending memory searches list for this turn
         object.__setattr__(self, '_pending_memory_searches', [])
 
-        while round_count < max_reasoning_steps:
+        while round_count < resolved_max_rounds:
             # Check cancellation at the start of each reasoning round
             if self.is_generation_cancelled():
                 was_cancelled = True
