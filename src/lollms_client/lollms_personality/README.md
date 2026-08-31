@@ -321,6 +321,18 @@ Factory to construct a personality from a Handbag folder.
 - **`workspace_path`**: Optional workspace path for standalone mode.
 - **`enable_git_management`**: If `True`, dynamically mounts Git Manager Toolset if `.git` is detected.
 
+#### `chat(...)`
+- **`prompt`**: The user's input message or task.
+- **`lollms_client`**: The `LollmsClient` instance used for generation.
+- **`streaming_callback`**: Optional callback for streaming tokens.
+- **`tools`**: Optional dict of explicit tools.
+- **`max_nb_rounds`** (`Optional[int]`): The maximum number of agentic reasoning rounds. Defaults to `20` if `None`.
+- **`max_reasoning_steps`** (`Optional[int]`): **Deprecated**. Backward-compatible alias for `max_nb_rounds`.
+- **`temperature`**: Generation temperature.
+- **`n_predict`**: Maximum tokens to generate.
+- **`enable_artefacts`**: Toggles the artifact creation system.
+- **`use_internal_history`**: If `True`, maintains a separate internal conversation history.
+
 #### `tool_specs(client_binding=None, **discover_kwargs) -> Dict[str, Dict[str, Any]]`
 Resolves the tool allowlist against the available binding and returns the tool specifications formatted for the `LollmsDiscussion.chat()` method.
 

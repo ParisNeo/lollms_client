@@ -429,10 +429,19 @@ class LCPBinding(LollmsToolBinding):
 
             result = execute_function(**clean_params)
 
-            if isinstance(result, dict) and result.get("success") is False and result.get("error"):
-                if "traceback" not in result:
-                    result["traceback"] = None
-                ASCIIColors.error(f"[LCP Error Tracking] Tool '{tool_name}' reported failure: {result['error']}")
+            if isinstance(result, dict) and result.get("success") is False:
+                if not result.get("error"):
+                    result["error"] = (
+                        f"Tool '{tool_name}' returned success=False with no error message. "
+                        f"Raw keys: {list(result.keys())}. "
+                        f"This may indicate a sandbox block, a missing dependency, or an initialization failure."
+                    )
+                    ASCIIColors.error(f"[LCP Error Tracking] Tool '{tool_name}' returned bare success=False. Synthesized error: {result['error']}")
+                else:
+                    ASCIIColors.error(f"[LCP Error Tracking] Tool '{tool_name}' reported failure: {result['error']}")
+
+            if not isinstance(result, dict):
+                result = {"success": True, "output": result}
 
             return {"output": result, "status_code": 200}
 

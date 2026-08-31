@@ -153,7 +153,7 @@ response = discussion.chat(
     user_message="How do we authenticate requests to the /orders endpoint, and what table does it insert into?",
     personality=personality,
     prehydrate_rag=True,
-    max_reasoning_steps=5
+    max_nb_rounds=5
 )
 
 print("AI Response:", response["ai_message"].content)
@@ -419,7 +419,8 @@ def chat(
     enable_auto_dream:            bool = True,
     enable_deep_memory_pulling:   bool = True,
     prehydrate_rag:               bool = True,
-    max_reasoning_steps:          int = 20,
+    max_nb_rounds:                Optional[int] = None,
+    max_reasoning_steps:          Optional[int] = None,
     enable_in_message_status:     bool = False,
     enable_sub_agents:            bool = False,
     forward_artefact_chunks:      bool = False,
@@ -497,7 +498,8 @@ The tool registry follows a **Strict Sovereign Opt-In Doctrine**. The system wil
 *   `enable_data_tools` (`bool`): If `True` (Default), allows the system to auto-mount the `semantic_data_engineer` library if data files are detected in the workspace.
 *   `allow_dynamic_tools` (`bool`): **Security Gate**. If `True`, allows the LLM to write and execute its own Python tools on the fly via `type="tool"` artifacts. Defaults to `False`.
 *   `enable_code_execution` (`bool`): **Security Gate**. If `True`, registers the `tool_execute_python_code` LCP tool, allowing the LLM to execute arbitrary Python code strings. Defaults to `False`.
-*   `max_reasoning_steps` (`int`): The maximum number of agentic reasoning rounds before the loop forces a final answer. Prevents infinite cycles.
+*   `max_nb_rounds` (`Optional[int]`): The maximum number of agentic reasoning rounds before the loop forces a final answer. Prevents infinite cycles. Defaults to `20` if `None`.
+*   `max_reasoning_steps` (`Optional[int]`): **Deprecated**. Backward-compatible alias for `max_nb_rounds`. If `max_nb_rounds` is provided, this parameter is ignored.
 
 #### 🗂️ Multi-Source Tool Orchestration (LCP)
 
@@ -863,6 +865,47 @@ graph LR
 *   **`active_branch_id`**: Points to the leaf node of the current conversation path.
 *   **`get_branch(leaf_id)`**: Recursively walks parents to root, returning a chronological list.
 *   **`regenerate_branch`**: Deletes the current AI leaf and restarts the loop from the user parent.
+
+### Message Branching & Regeneration
+Messages are not a linear list. They are a **Directed Acyclic Graph (DAG)**.
+
+```mermaid
+graph LR
+    Root[Root Message] --> User1[User Msg 1]
+    User1 --> AI1a[AI Reply 1a]
+    User1 --> AI1b[AI Reply 1b - Regenerated]
+    AI1a --> User2[User Msg 2]
+    AI1b --> User3[User Msg 3]
+```
+
+The active conversation path is determined by `active_branch_id`, which points to the leaf node of the current branch.
+
+#### `regenerate_branch(branch_tip_id=None, **kwargs)`
+Regenerates the AI response for a specific branch. This is the programmatic equivalent of a user clicking "Regenerate" on an AI message in a chat interface.
+
+**How it works:**
+1.  **Target Resolution**: If `branch_tip_id` is `None`, the method targets the current `active_branch_id`.
+2.  **Parent Identification**: It walks up the DAG from the target tip to find its parent (which should be a `user` message).
+3.  **Pruning**: The existing AI message (the target tip) is permanently deleted from the branch. If the AI message had any descendants (e.g., follow-up user messages), they are **orphaned** and remain attached to the deleted node's ID, but are no longer reachable from the main branch.
+4.  **Re-generation**: The `chat()` loop is invoked internally with `add_user_message=False`, using the parent user message's content to generate a fresh AI response. The new response is appended as a new leaf, creating a new branch path.
+
+**Parameters:**
+*   `branch_tip_id` (`Optional[str]`): The message ID of the AI response to regenerate. If `None`, uses `active_branch_id`.
+*   `**kwargs`: Additional keyword arguments passed directly to the internal `chat()` call (e.g., `personality`, `temperature`, `prehydrate_rag`).
+
+**Returns:**
+*   `Dict[str, Any]`: The standard `chat()` result dictionary containing the new `ai_message`, `artefacts`, etc.
+
+**Example:**
+```python
+# Regenerate the last AI response
+new_result = discussion.regenerate_branch()
+print("New AI Response:", new_result["ai_message"].content)
+
+# Regenerate a specific historical AI message
+msg_to_regenerate = "msg_004"
+new_result = discussion.regenerate_branch(branch_tip_id=msg_to_regenerate)
+```
 
 ### Artefact Versioning
 Every update to an artefact creates a new version (Git-like).

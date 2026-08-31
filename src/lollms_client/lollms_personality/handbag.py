@@ -18,7 +18,7 @@ class Handbag:
         self.soul_path = self.path / "SOUL.md"
         self.coworkers_dir = self.path / "coworkers"
         self.tools_dir = self.path / "tools"
-        self.skills_dir = self.path / "skills"
+        self._skills_dir = self.path / "skills"
         self.assets_dir = self.path / "assets"
         self.memory_dir = self.path / "memory"
         self.rag_dir = self.path / "rag"
@@ -27,10 +27,15 @@ class Handbag:
         self.manifest = self._load_manifest()
 
         self.tool_files: List[Path] = self._load_tools()
-        self.skills_dirs: List[Path] = [self.skills_dir.resolve()] if self.skills_dir.exists() else []
+        self.skills_dirs: List[Path] = [self._skills_dir.resolve()] if self._skills_dir.exists() else []
         self.rag_files: List[Path] = self._load_rag_files()
         self.memory_db_path: Optional[str] = f"sqlite:///{self.memory_dir / 'memory.db'}" if self.memory_dir.exists() else None
         self.assets: Dict[str, str] = self._load_assets()
+
+    @property
+    def skills_dir(self) -> Path:
+        """Returns the canonical skills directory for this handbag."""
+        return self._skills_dir
 
     def _load_manifest(self) -> Dict[str, Any]:
         manifest_path = self.path / "handbag.yaml"

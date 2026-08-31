@@ -1534,31 +1534,59 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
 
 
 def get_context_fill_status(personality: LollmsPersonality, client: LollmsClient) -> Optional[Dict[str, Any]]:
-    """Safely calculates the initial system prompt context fill status."""
+    """Safely calculates the full context fill status, including memories and loaded files."""
     try:
         max_ctx = client.get_ctx_size() or 0
         if max_ctx <= 0:
             return None
 
+        breakdown = {
+            "system_prompt": 0,
+            "workspace_tree": 0,
+            "loaded_files": 0,
+            "scratchpad": 0,
+            "active_memories": 0
+        }
+
         active_tools = personality._discover_tools(None, [])
         full_system_prompt = personality._build_system_prompt(active_tools)
+        breakdown["system_prompt"] = client.count_tokens(full_system_prompt) or 0
 
-        used_tokens = client.count_tokens(full_system_prompt) or 0
-        
         ws_ctx = personality._build_workspace_context_block()
         if ws_ctx:
-            used_tokens += client.count_tokens(ws_ctx) or 0
-            
+            breakdown["workspace_tree"] = client.count_tokens(ws_ctx) or 0
+
         scratchpad_ctx = personality._build_scratchpad_context()
         if scratchpad_ctx:
-            used_tokens += client.count_tokens(scratchpad_ctx) or 0
+            breakdown["scratchpad"] = client.count_tokens(scratchpad_ctx) or 0
 
+        if hasattr(personality, "_artefact_manager") and personality._artefact_manager:
+            from lollms_client.lollms_artefact import ArtefactVisibility
+            all_arts = personality._artefact_manager._get_all_raw()
+            loaded_files_tokens = 0
+            for art in all_arts:
+                if art.get("visibility") == ArtefactVisibility.FULL:
+                    content = art.get("content", "")
+                    if content and not art.get("title", "").endswith("::images"):
+                        loaded_files_tokens += client.count_tokens(content) or 0
+            breakdown["loaded_files"] = loaded_files_tokens
+
+        if hasattr(personality, "memory_manager") and personality.memory_manager:
+            try:
+                mem_zone = personality.memory_manager.build_working_zone()
+                if mem_zone:
+                    breakdown["active_memories"] = client.count_tokens(mem_zone) or 0
+            except Exception:
+                pass
+
+        used_tokens = sum(breakdown.values())
         fill_pct = round((used_tokens / max_ctx) * 100, 1)
 
         return {
             "used_tokens": used_tokens,
             "max_tokens": max_ctx,
-            "fill_percentage": fill_pct
+            "fill_percentage": fill_pct,
+            "breakdown": breakdown
         }
     except Exception:
         return None
@@ -1728,7 +1756,6 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
                         buffer = buffer[:cursor_pos] + '\n' + buffer[cursor_pos:]
                         cursor_pos += 1
                         active_suggestion_idx = -1
-                        sys.stdout.write("\n")
                         _draw_line(buffer, cursor_pos, "", line_index=get_line_index())
                     else:
                         ch3 = sys.stdin.read(1)
@@ -1811,6 +1838,21 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
 
     def _native_prompt_windows() -> Optional[str]:
         import msvcrt
+        import ctypes
+
+        VK_SHIFT = 0x10
+        VK_LSHIFT = 0xA0
+        VK_RSHIFT = 0xA1
+
+        def _is_shift_pressed() -> bool:
+            """Checks if either Shift key is currently held down using the Windows API."""
+            try:
+                return bool(
+                    ctypes.windll.user32.GetAsyncKeyState(VK_LSHIFT) & 0x8000
+                    or ctypes.windll.user32.GetAsyncKeyState(VK_RSHIFT) & 0x8000
+                )
+            except Exception:
+                return False
 
         buffer = ""
         cursor_pos = 0
@@ -1842,20 +1884,33 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
             ghost_text = ""
 
             if ch == '\r':
-                if buffer:
-                    sys.stdout.write("\n")
-                    sys.stdout.flush()
-                    if not buffer.strip().startswith("/"):
-                        history.add(buffer)
-                return buffer
-            elif ch == '\x00' or ch == '\xe0':
-                ch2 = msvcrt.getwch()
-                if ch2 == '\r':
+                if _is_shift_pressed():
                     buffer = buffer[:cursor_pos] + '\n' + buffer[cursor_pos:]
                     cursor_pos += 1
                     active_suggestion_idx = -1
-                    sys.stdout.write("\n")
                     _draw_line(buffer, cursor_pos, "", line_index=get_line_index())
+                else:
+                    if buffer:
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                        if not buffer.strip().startswith("/"):
+                            history.add(buffer)
+                    return buffer
+            elif ch == '\x00' or ch == '\xe0':
+                ch2 = msvcrt.getwch()
+                if ch2 == '\r':
+                    if _is_shift_pressed():
+                        buffer = buffer[:cursor_pos] + '\n' + buffer[cursor_pos:]
+                        cursor_pos += 1
+                        active_suggestion_idx = -1
+                        _draw_line(buffer, cursor_pos, "", line_index=get_line_index())
+                    else:
+                        if buffer:
+                            sys.stdout.write("\n")
+                            sys.stdout.flush()
+                            if not buffer.strip().startswith("/"):
+                                history.add(buffer)
+                        return buffer
                 elif ch2 == 'H':
                     if sugg:
                         active_suggestion_idx = (active_suggestion_idx - 1) % len(sugg)

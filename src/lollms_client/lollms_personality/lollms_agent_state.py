@@ -168,8 +168,13 @@ def _sanitize_tool_result(tool_res: Any, max_chars: Optional[int] = None, client
             error_parts = ["⚠️ **Tool Execution Failed**"]
 
             error_msg = tool_res.get("error") or (inner_dict.get("error") if inner_dict else None)
-            if error_msg:
-                error_parts.append(f"**Error Details:**\n{error_msg}")
+            if not error_msg:
+                error_msg = (
+                    f"Tool returned success=False but did not provide an error message. "
+                    f"Raw keys: {list(tool_res.keys()) if isinstance(tool_res, dict) else type(tool_res).__name__}. "
+                    f"This may indicate a library initialization failure or an import error."
+                )
+            error_parts.append(f"**Error Details:**\n{error_msg}")
 
             stderr = tool_res.get("stderr") or (inner_dict.get("stderr") if inner_dict else None)
             if stderr and str(stderr).strip():
@@ -1334,6 +1339,9 @@ class _AgentStreamState:
             self._try_complete_tool()
             if self._is_accumulating_tool:
                 self._is_accumulating_tool = False
+                if self.completed_actions and self.completed_actions[-1].get("type") == "malformed_json":
+                    self.completed_actions.pop()
+                    ASCIIColors.warning("[AgentStreamState] Discarded phantom tool call with unparseable JSON from premature stream end.")
             return
 
         if self._is_accumulating_artifact:

@@ -72,6 +72,7 @@ except ImportError:
 from lollms_client.lollms_memory import FailureMemory
 from lollms_client.lollms_artefact import ArtefactVisibility, ArtefactManager
 from lollms_client.lollms_artefact.lollms_artefact import ArtefactManager as _ArtefactManager
+from lollms_client.lollms_history import HistoryManager
 
 
 _TEXT_RAG_EXTS = {
@@ -80,6 +81,34 @@ _TEXT_RAG_EXTS = {
     ".swift", ".c", ".cpp", ".h", ".hpp", ".sql", ".sh", ".bash",
     ".ps1", ".bat", ".toml", ".ini", ".cfg", ".log", ".rdf", ".ttl",
 }
+
+class _HistoryContextAdapter:
+    """
+    Adapter to provide LollmsDiscussion-like interface to HistoryManager
+    for LollmsPersonality context generation.
+    """
+    def __init__(self, personality: 'LollmsPersonality', stable_system_prompt: str):
+        self._personality = personality
+        self._system_prompt = stable_system_prompt
+        self.lollmsClient = personality.lollms_client
+        self.scratchpad = getattr(personality, '_scratchpad_content', '')
+        self.pruning_summary = None
+        self.pruning_point_id = None
+        self.artefacts = getattr(personality, '_artefact_manager', None) or SimpleNamespace(get_context_images=lambda: [])
+        self.memory_manager = personality.memory_manager
+        self.workspace_data_path = str(personality._resolved_workspace) if personality._resolved_workspace else "."
+
+    def get_full_data_zone(self) -> str:
+        return ""
+
+    def get_discussion_images(self) -> list:
+        return []
+
+    def _apply_three_view_protocol(self, msg, raw_content: str, distance_from_end: int = 0) -> str:
+        return raw_content
+
+    def _inject_memory_into_messages(self, messages, memory_manager, format_type, token_counter):
+        return messages
 
 _STOP_WORDS = {
     "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
@@ -1829,7 +1858,11 @@ class LollmsPersonality:
 
         # Initialize Skills
         skills_mode = meta.get("skills_mode") or hb.manifest.get("skills_mode", "mixed")
-        sm = SkillsManager(skills_dirs=hb.skills_dirs, mode=skills_mode) if hb.skills_dirs else None
+        # CRITICAL: Explicitly pass the handbag's skills directory as the primary target.
+        # This ensures tool_create_skill and tool_update_skill route file writes to the
+        # correct physical handbag folder, even if external dirs are merged later.
+        handbag_skills_dir = [hb.skills_dir.resolve()] if hb.skills_dir.exists() else []
+        sm = SkillsManager(skills_dirs=handbag_skills_dir, mode=skills_mode) if handbag_skills_dir else None
 
         # Initialize RAG data sources from handbag rag/ folder
         rag_data_sources: List[RAGDataSource] = []
@@ -1870,13 +1903,18 @@ class LollmsPersonality:
             metadata=meta,
             tools=tool_binding,
             skills_manager=sm,
-            skills_dirs=hb.skills_dirs,
+            skills_dirs=handbag_skills_dir,
             memory_manager=mm,
             handbag_path=hb.path,
             data_sources=rag_data_sources if rag_data_sources else None,
             workspace_path=hb.workspace_dir if hb.workspace_dir.exists() else None,
             lollms_client=lollms_client,
         )
+
+        # CRITICAL: Explicitly bind the resolved handbag path to the personality instance.
+        # This guarantees that downstream systems (like _StreamState in _mixin_chat.py)
+        # can access the physical handbag directory for tool/skill file updates.
+        object.__setattr__(pers, 'handbag_path', hb.path.resolve())
 
         # Parse Coworkers (Crew Handbag)
         if hb.coworkers_dir.exists():
@@ -2915,6 +2953,52 @@ JSON:"""
                 telemetry["virtual_history"] += self.lollms_client.count_tokens(vh.content)
 
             telemetry["total"] = sum(telemetry.values())
+
+            max_ctx = 0
+            if hasattr(self.lollms_client, 'get_ctx_size'):
+                max_ctx = self.lollms_client.get_ctx_size() or 0
+
+            if max_ctx > 0:
+                threshold = int(max_ctx * 0.50)
+                if telemetry["loaded_contents"] > threshold:
+                    ASCIIColors.warning(f"[{self.name}] 🚨 Hard Context Budget Guard: Loaded files consume {telemetry['loaded_contents']:,} tokens (> 50% of {max_ctx:,}). Autonomously locking large files to prevent collapse.")
+
+                    if hasattr(self, '_artefact_manager') and self._artefact_manager:
+                        from lollms_client.lollms_artefact import ArtefactVisibility
+                        all_arts = self._artefact_manager._get_all_raw()
+
+                        loaded_files = []
+                        for art in all_arts:
+                            if art.get("visibility") == ArtefactVisibility.FULL and not art.get("title", "").endswith("::images"):
+                                try:
+                                    size = art.get("size", 0)
+                                    if not size:
+                                        fp = self._resolved_workspace / art["title"]
+                                        if fp.exists():
+                                            size = fp.stat().st_size
+                                    loaded_files.append({"title": art["title"], "size": size or 0})
+                                except Exception:
+                                    loaded_files.append({"title": art["title"], "size": 0})
+
+                        loaded_files.sort(key=lambda x: x.get("size", 0), reverse=True)
+
+                        if loaded_files:
+                            targets_to_lock = [f["title"] for f in loaded_files[:3]]
+                            if targets_to_lock:
+                                self._execute_context_visibility("lock_file", "\n".join(targets_to_lock))
+                                object.__setattr__(self, '_last_ws_sync_time', 0.0)
+                                ws_ctx = self._build_workspace_context_block()
+                                if ws_ctx:
+                                    telemetry["workspace_tree"] = self.lollms_client.count_tokens(ws_ctx)
+                                    if "## Fully Loaded File Contents [C]" in ws_ctx:
+                                        parts = ws_ctx.split("## Fully Loaded File Contents [C]", 1)
+                                        if len(parts) == 2:
+                                            telemetry["loaded_contents"] = self.lollms_client.count_tokens(parts[1])
+                                            telemetry["workspace_tree"] = self.lollms_client.count_tokens(parts[0])
+                                    else:
+                                        telemetry["loaded_contents"] = 0
+                                    telemetry["total"] = sum(telemetry.values())
+
         except Exception:
             pass
 
@@ -3400,13 +3484,6 @@ JSON:"""
             if ws_path and ws_path.exists():
                 _DATA_EXTS = {".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"}
                 _DOC_EXTS = {".pdf", ".docx", ".pptx", ".odt", ".doc", ".txt", ".md"}
-                if current_user_name and current_user_name != "Unknown User":
-                    user_annotation_rule = (
-                        f"\n\n**CRITICAL ANNOTATION RULE**: When using `tool_annotate_document` to add comments to a PDF or DOCX, "
-                        f"you MUST set the `commenter_name` parameter to '{current_user_name}' (the current OS user account)."
-                    )
-                    if "description" in active_tools.get("tool_annotate_document", {}):
-                        active_tools["tool_annotate_document"]["description"] += user_annotation_rule
 
                 try:
                     for f in ws_path.rglob("*"):
@@ -3452,6 +3529,14 @@ JSON:"""
                             active_tools[t_name] = t_spec
                 except Exception as e:
                     ASCIIColors.warning(f"[LollmsPersonality] Failed to extract LCP tool specs: {e}")
+
+            if has_document_files and current_user_name and current_user_name != "Unknown User":
+                user_annotation_rule = (
+                    f"\n\n**CRITICAL ANNOTATION RULE**: When using `tool_annotate_document` to add comments to a PDF or DOCX, "
+                    f"you MUST set the `commenter_name` parameter to '{current_user_name}' (the current OS user account)."
+                )
+                if "tool_annotate_document" in active_tools:
+                    active_tools["tool_annotate_document"]["description"] += user_annotation_rule
 
         if tool_files:
             try:
@@ -3894,7 +3979,25 @@ JSON:"""
                 param_desc = ", ".join([f"{p['name']}: {p['type']}" for p in params_list])
                 tool_desc += f"- {t_name}({param_desc}): {desc}\n"
 
-        return sys_prompt + "\n" + rules + skills_ctx + memory_instructions + tool_desc
+        document_annotation_workflow = ""
+        has_annotation_tools = "tool_annotate_document" in active_tools or "tool_edit_document_text" in active_tools
+        has_reading_tools = "tool_read_document_content" in active_tools or "tool_inspect_document" in active_tools
+        if has_annotation_tools and has_reading_tools:
+            document_annotation_workflow = (
+                "\n=== DOCUMENT ANNOTATION WORKFLOW (MANDATORY FOR PROOFREADING TASKS) ===\n"
+                "When asked to annotate, proofread, or correct a document (PDF, DOCX, PPTX), you MUST follow this workflow:\n"
+                "1. **INSPECT**: Call `tool_inspect_document` to get the page/slide count.\n"
+                "2. **READ IN BATCHES**: Call `tool_read_document_content` with `page_or_sheet` set to a 10-page range (e.g., \"1-10\") and `max_chars` set to at least 20000.\n"
+                "3. **COLLECT EXACT QUOTES**: As you read, note the EXACT text of each issue (spelling, grammar, clarity, logic, structure). You need the exact text for the `search_text` parameter of the annotation tool.\n"
+                "4. **ANNOTATE IMMEDIATELY**: After reading each batch, call `tool_annotate_document` (for comments) or `tool_edit_document_text` (for corrections) for EVERY issue you found in that batch. Do NOT wait until you have read the entire document to start annotating.\n"
+                "5. **BE CONSTRUCTIVE**: Your comments should explain WHY something is wrong and suggest a fix. For example: \"Grammar: 'start' should be 'starts' (subject-verb agreement).\"\n"
+                "6. **COVER ALL PAGES**: Continue reading and annotating in 10-page batches until you have covered the entire document.\n"
+                "7. **SUMMARIZE**: After annotating all pages, provide a summary of the main issues found and emit `<done/>`.\n"
+                "**CRITICAL**: You MUST call `tool_annotate_document` or `tool_edit_document_text` at least once per batch of issues found. Reading without annotating is a failure.\n"
+                "=== END DOCUMENT ANNOTATION WORKFLOW ===\n"
+            )
+
+        return sys_prompt + "\n" + rules + skills_ctx + memory_instructions + tool_desc + document_annotation_workflow
     
     
     def change_file_visibility(self, targets: List[str], action: str) -> Dict[str, Any]:
@@ -4241,9 +4344,26 @@ JSON:"""
                         discussion_instance=getattr(self, '_artefact_proxy', None),
                         lollms_client_instance=self.lollms_client
                     )
-                    if isinstance(result, dict) and "output" in result:
-                        return result["output"]
-                    return result if isinstance(result, dict) else {"success": True, "output": str(result)}
+                    if isinstance(result, dict):
+                        inner = result.get("output")
+                        if isinstance(inner, dict):
+                            if inner.get("success") is False or "error" in inner:
+                                return inner
+                            return inner if "output" in inner else {"success": True, "output": inner}
+                        if result.get("status_code", 200) not in (200, 201):
+                            return {
+                                "success": False,
+                                "error": result.get("error", f"LCP tool '{tool_name}' returned status_code {result.get('status_code')}"),
+                                "traceback": result.get("traceback"),
+                            }
+                        if inner is not None:
+                            return {"success": True, "output": inner}
+                        if "error" in result:
+                            return {"success": False, "error": result["error"], "traceback": result.get("traceback")}
+                        return {"success": True, "output": str(result)}
+                    if result is None:
+                        return {"success": False, "error": f"LCP tool '{tool_name}' returned None (no output)."}
+                    return {"success": True, "output": str(result)}
                 except Exception as lcp_err:
                     trace_exception(lcp_err)
                     return {"success": False, "error": f"LCP tool '{tool_name}' crashed: {lcp_err}", "traceback": traceback.format_exc()}
@@ -4261,13 +4381,18 @@ JSON:"""
         streaming_callback: Optional[Callable] = None,
         tools: Optional[Dict[str, Any]] = None,
         tool_files: Optional[List[Union[str, Path]]] = None,
-        max_reasoning_steps: int = 20,
+        max_nb_rounds: Optional[int] = None,
+        max_reasoning_steps: Optional[int] = None,
         temperature: float = 0.7,
         n_predict: Optional[int] = None,
         enable_artefacts: bool = True,
         use_internal_history: bool = True,
         **kwargs
     ) -> Dict[str, Any]:
+        resolved_max_rounds = max_nb_rounds if max_nb_rounds is not None else max_reasoning_steps
+        if resolved_max_rounds is None:
+            resolved_max_rounds = 20
+
         if lollms_client is not None:
             self.lollms_client = lollms_client
 
@@ -4278,7 +4403,7 @@ JSON:"""
         object.__setattr__(self, '_consecutive_empty_responses', 0)
         object.__setattr__(self, '_consecutive_stall_count', 0)
         object.__setattr__(self, '_consecutive_artifact_rounds', 0)
-        object.__setattr__(self, '_max_rounds', max_reasoning_steps)
+        object.__setattr__(self, '_max_rounds', resolved_max_rounds)
 
         if self._sub_agent_spawner:
             self._sub_agent_spawner.reset_turn()
@@ -4352,6 +4477,7 @@ JSON:"""
         scratchpad_ctx = self._build_scratchpad_context()
         if scratchpad_ctx:
             dynamic_suffix_parts.append(scratchpad_ctx.strip())
+            object.__setattr__(self, '_scratchpad_content', scratchpad_ctx)
 
         if self.memory_manager:
             try:
@@ -4395,7 +4521,7 @@ JSON:"""
         final_response = ""
         workspace_changes: List[Dict[str, Any]] = []
 
-        while round_count < max_reasoning_steps:
+        while round_count < resolved_max_rounds:
             if self.is_generation_cancelled():
                 was_cancelled = True
                 break
@@ -4422,6 +4548,14 @@ JSON:"""
                 if not virtual_history or virtual_history[-1].sender_type == "assistant":
                     messages.append({"role": "user", "content": "[SYSTEM: Continue your task.]"})
 
+            context_adapter = _HistoryContextAdapter(self, stable_system_prompt)
+            messages = HistoryManager.export(
+                context=context_adapter,
+                format_type="openai_chat",
+                branch=base_conversation,
+                virtual_history=virtual_history,
+            )
+
             if getattr(self, 'debug_mode', False):
                 try:
                     debug_dir = self._resolved_workspace / ".lollms_code" / "_debug_dumps"
@@ -4433,6 +4567,10 @@ JSON:"""
                         for i, msg in enumerate(messages):
                             role = msg.get("role", "unknown").upper()
                             content = msg.get("content", "")
+                            if isinstance(content, list):
+                                content = "\n".join([item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"])
+                            if not isinstance(content, str):
+                                content = str(content)
                             if len(content) > 1000:
                                 short_content = content[:500] + "\n\n[... truncated ...]\n\n" + content[-500:]
                             else:
@@ -4456,7 +4594,16 @@ JSON:"""
                             role = msg.get("role", "unknown").upper()
                             content = msg.get("content", "")
                             f.write(f"\n--- MSG [{i}] ROLE: {role} ---\n")
-                            f.write(content + "\n")
+                            if isinstance(content, list):
+                                for item in content:
+                                    if isinstance(item, dict) and item.get("type") == "text":
+                                        f.write(item.get("text", "") + "\n")
+                                    elif isinstance(item, dict) and item.get("type") == "image_url":
+                                        f.write("[IMAGE ATTACHED]\n")
+                                    else:
+                                        f.write(str(item) + "\n")
+                            else:
+                                f.write(str(content) + "\n")
                         f.write("\n" + "="*80 + "\n")
                 except Exception as debug_err:
                     ASCIIColors.warning(f"Failed to write full prompt log: {debug_err}")
@@ -5492,21 +5639,13 @@ JSON:"""
             stripped_round_text = raw_round_text.strip()
             if stripped_round_text and len(virtual_history) > 0:
                 last_assistant_text = None
-                _last_vh = virtual_history[-1]
-                _is_continuation_context = (
-                    _last_vh.sender_type == "user"
-                    and "[SYSTEM:" in _last_vh.content
-                )
-                if _is_continuation_context and len(virtual_history) >= 2:
-                    _candidate = virtual_history[-2]
-                    if _candidate.sender_type == "assistant" and _candidate.content.strip():
-                        last_assistant_text = _candidate.content.strip()
-                else:
-                    for vh in reversed(virtual_history):
-                        if vh.sender_type == "assistant" and vh.content.strip():
-                            last_assistant_text = vh.content.strip()
-                            break
-                if last_assistant_text and not _is_continuation_context:
+                for vh in reversed(virtual_history):
+                    if vh.sender_type == "assistant" and vh.content.strip():
+                        candidate = vh.content.strip()
+                        if not candidate.startswith("[Assistant executed batched actions]"):
+                            last_assistant_text = candidate
+                        break
+                if last_assistant_text:
                     _last_clean = re.sub(r'<[^>]+>', '', last_assistant_text).strip()
                     _current_clean = re.sub(r'<[^>]+>', '', stripped_round_text).strip()
                     if _current_clean and _last_clean:
@@ -5524,16 +5663,26 @@ JSON:"""
                                 if overlap > 0.85:
                                     text_is_repetitive = True
 
-            if not text_is_repetitive and stripped_round_text:
+            if not text_is_repetitive and stripped_round_text and not has_new_actions_this_round:
                 lines_in_response = stripped_round_text.splitlines()
                 non_empty_lines = [l.strip() for l in lines_in_response if l.strip()]
                 if len(non_empty_lines) >= 3:
                     from collections import Counter as _Counter
                     line_counts = _Counter(non_empty_lines)
                     most_common_line, most_common_count = line_counts.most_common(1)[0]
-                    if most_common_count >= 3 and len(most_common_line) > 20:
-                        text_is_repetitive = True
-                        ASCIIColors.warning(f"[{self.name}] Intra-round text duplication detected (line repeated {most_common_count}x).")
+                    if most_common_count >= 2 and len(most_common_line) > 20:
+                        repetition_ratio = most_common_count / len(non_empty_lines)
+                        if repetition_ratio >= 0.5:
+                            text_is_repetitive = True
+                            ASCIIColors.warning(f"[{self.name}] Intra-round text duplication detected (line repeated {most_common_count}x, ratio: {repetition_ratio:.0%}).")
+                        elif most_common_count >= 2:
+                            consecutive_dup_count = 0
+                            for i in range(1, len(non_empty_lines)):
+                                if non_empty_lines[i] == non_empty_lines[i - 1]:
+                                    consecutive_dup_count += 1
+                            if consecutive_dup_count >= 2:
+                                text_is_repetitive = True
+                                ASCIIColors.warning(f"[{self.name}] Intra-round consecutive text duplication detected ({consecutive_dup_count} consecutive duplicate lines).")
 
             if text_is_repetitive:
                 ASCIIColors.warning(f"[{self.name}] Repetitive text preamble detected (Round {round_count}). Injecting correction — NOT terminating.")
@@ -5553,12 +5702,12 @@ JSON:"""
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
                     content=(
-                        "[SYSTEM: CRITICAL ERROR. You are producing repetitive conversational preambles (e.g., 'Je vais utiliser...') without varying your approach or emitting functional tags. "
-                        "This usually happens when a tool call failed and you are trying to find an alternative, but you are stuck in a text loop.\n\n"
-                        "MANDATORY ACTION: Stop writing prose. You must either:\n"
-                        "1. Emit the next `<tool>` or `<artifact>` tag immediately with the correct parameters, OR\n"
-                        "2. If all tools failed, explain the situation to the user (e.g., 'The file copy was blocked by the sandbox') and emit `<done/>`.\n"
-                        "Do NOT repeat the same sentence again.]"
+                        "[SYSTEM: CRITICAL ERROR. You are producing repetitive conversational preambles without emitting functional tags. "
+                        "This usually happens when a tool call failed or the stream was interrupted.\n\n"
+                        "MANDATORY ACTION: Stop writing prose entirely. You must output the RAW JSON object for the tool inside `<tool>` tags immediately. "
+                        "Do not include any conversational text before or after the tag. "
+                        "Example:\n"
+                        "<tool>{\"name\": \"tool_annotate_document\", \"parameters\": {\"file_name\": \"file.pdf\", \"annotation_type\": \"comment\", \"search_text\": \"text\", \"comment\": \"comment\"}}</tool>"
                     )
                 ))
                 ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
@@ -5661,6 +5810,46 @@ JSON:"""
             if has_artifact_this_round:
                 virtual_history = self._apply_rolling_artifact_compaction(virtual_history, base_conversation)
 
+            # ── 🛡️ ROUND 1 PREAMBLE STALL INTERCEPTOR ──
+            # If the LLM produced text on Round 1 but emitted NO functional tags
+            # and NO <done/>, it wrote a conversational preface and stopped.
+            # We MUST inject a continuation mandate instead of breaking cleanly.
+            # This prevents the agent from terminating before doing any work.
+            if (
+                round_count == 1
+                and not ss.was_done_detected()
+                and not ss.was_action_dispatched()
+                and not has_new_actions_this_round
+                and not tool_calls_this_turn
+                and stripped_round_text
+                and not text_is_repetitive
+            ):
+                ASCIIColors.warning(f"[{self.name}] Round 1 preamble stall detected (text produced, no actions, no <done/>). Injecting continuation mandate.")
+
+                clean_history_text = self._sanitize_history_for_context(raw_round_text)
+                virtual_history.append(SimpleNamespace(
+                    sender_type="assistant",
+                    content=clean_history_text.strip() if clean_history_text.strip() else "[Assistant produced a text-only preamble]"
+                ))
+
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content=(
+                        "[SYSTEM: CRITICAL. You wrote a conversational preamble stating your intent "
+                        "(e.g., 'Let me check...' or 'I'll create...') but you STOPPED without executing "
+                        "the actual action. Stating intent DOES NOT execute it.\n\n"
+                        "MANDATORY ACTION: You MUST NOW emit the functional tag to perform the action you just described.\n"
+                        "- If you said you would check skills, emit: <tool>{\"name\": \"tool_list_skills\", \"parameters\": {}}</tool>\n"
+                        "- If you said you would create a skill, emit: <tool>{\"name\": \"tool_create_skill\", \"parameters\": {...}}</tool>\n"
+                        "- If your task is truly complete, output your final answer and end with <done/>.\n\n"
+                        "Do NOT write another preamble. Emit the functional tag NOW.]"
+                    )
+                ))
+                ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
+                if getattr(self, 'debug_mode', False):
+                    ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Round 1 preamble stall intercepted, continuing ===")
+                continue
+
             has_malformed_tag = "<tool" in raw_round_text.lower() or "<art" in raw_round_text.lower()
 
             if has_malformed_tag:
@@ -5715,6 +5904,38 @@ JSON:"""
 
             if not final_response:
                 final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
+
+            if (
+                not was_cancelled
+                and round_count == 1
+                and not tool_calls_this_turn
+                and not workspace_changes
+                and not getattr(self, '_consecutive_stall_count', 0) >= 3
+            ):
+                stripped_final = re.sub(r'<[^>]+>', '', final_response).strip()
+                if stripped_final and len(stripped_final) > 10:
+                    ASCIIColors.warning(f"[{self.name}] Round 1 clean exit with text but no actions. Intercepting to enforce action or <done/>.")
+
+                    clean_history_text = self._sanitize_history_for_context(final_response)
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="assistant",
+                        content=clean_history_text.strip() if clean_history_text.strip() else "[Assistant produced a text-only preamble]"
+                    ))
+
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content=(
+                            "[SYSTEM: CRITICAL. You wrote a conversational preamble stating your intent "
+                            "but you STOPPED without executing the actual action or emitting a <done/> tag. "
+                            "Stating intent DOES NOT execute it.\n\n"
+                            "MANDATORY ACTION: You MUST NOW emit the functional tag to perform the action you just described, OR if your task is truly complete, output your final answer and end with a <done/> tag on a new line.\n\n"
+                            "Do NOT write another preamble. Emit the functional tag NOW.]"
+                        )
+                    ))
+                    ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
+                    if getattr(self, 'debug_mode', False):
+                        ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Clean exit intercepted, enforcing continuation ===")
+                    continue
 
             if getattr(self, 'debug_mode', False):
                 ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Clean exit ===")

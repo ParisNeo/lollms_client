@@ -140,6 +140,9 @@ class SkillsManager:
         if not skill or not skill.file_path:
             return None
 
+        if not skill.modifiable:
+            return None
+
         target_dir = skill.file_path.parent
         safe_title = self._sanitize_title(title)
         skill_path = target_dir / "SKILL.md"
@@ -157,6 +160,7 @@ class SkillsManager:
         if tags_str:
             frontmatter += f"tags: [{tags_str}]\n"
         frontmatter += f"visibility: {skill.visibility}\n"
+        frontmatter += f"modifiable: {'true' if skill.modifiable else 'false'}\n"
         frontmatter += "---\n\n"
 
         skill_path.write_text(frontmatter + content.strip() + "\n", encoding="utf-8")
@@ -178,6 +182,9 @@ class SkillsManager:
         if not skill or not skill.file_path:
             return None
 
+        if not skill.modifiable:
+            return None
+
         existing_content = skill.file_path.read_text(encoding="utf-8", errors="ignore")
         
         separator = "\n\n---\n\n"
@@ -195,6 +202,9 @@ class SkillsManager:
                 skill = matches[0]
         
         if not skill or not skill.file_path:
+            return False
+
+        if not skill.modifiable:
             return False
 
         skill_path = skill.file_path
@@ -235,6 +245,9 @@ class SkillsManager:
                 lines.append(f"\n--- Skill: {skill.title} ---")
                 if skill.description:
                     lines.append(f"Description: {skill.description}")
+                if not skill.modifiable:
+                    lines.append("\n🚨 **READ-ONLY SKILL (UNMODIFIABLE)** 🚨")
+                    lines.append("You are STRICTLY FORBIDDEN from updating, patching, or appending to this skill. Any `<skill>` tag attempting to modify it WILL BE BLOCKED by the system.\n")
                 lines.append(f"\n{skill.content}")
                 lines.append(f"--- End Skill: {skill.title} ---")
             lines.append("=== END ACTIVE SKILLS ===")
@@ -248,7 +261,8 @@ class SkillsManager:
             for skill in loadable:
                 desc = skill.description or (skill.content.splitlines()[0][:100] if skill.content else "No description")
                 cat = f" [{skill.category}]" if skill.category else ""
-                lines.append(f"- **{skill.title}**{cat}: {desc}")
+                mod_str = " (Read-Only)" if not skill.modifiable else ""
+                lines.append(f"- **{skill.title}**{cat}{mod_str}: {desc}")
             lines.append("=== END AVAILABLE SKILLS ===")
             parts.append("\n".join(lines))
 
@@ -285,11 +299,17 @@ class SkillsManager:
     def load_skill(self, title: str) -> Optional[str]:
         skill = self.skills.get(title.lower())
         if skill:
-            return f"--- Skill: {skill.title} ---\n{skill.content}\n--- End Skill: {skill.title} ---"
+            mod_prefix = ""
+            if not skill.modifiable:
+                mod_prefix = "🚨 **READ-ONLY SKILL (UNMODIFIABLE)** 🚨\nYou are STRICTLY FORBIDDEN from updating, patching, or appending to this skill.\n\n"
+            return f"--- Skill: {skill.title} ---\n{mod_prefix}{skill.content}\n--- End Skill: {skill.title} ---"
         matches = self.search_skills(title)
         if matches:
             skill = matches[0]
-            return f"--- Skill: {skill.title} ---\n{skill.content}\n--- End Skill: {skill.title} ---"
+            mod_prefix = ""
+            if not skill.modifiable:
+                mod_prefix = "🚨 **READ-ONLY SKILL (UNMODIFIABLE)** 🚨\nYou are STRICTLY FORBIDDEN from updating, patching, or appending to this skill.\n\n"
+            return f"--- Skill: {skill.title} ---\n{mod_prefix}{skill.content}\n--- End Skill: {skill.title} ---"
         return None
 
     def list_skills(self) -> List[Dict[str, Any]]:
@@ -448,20 +468,33 @@ class SkillsManager:
                 tags (str, optional): New comma-separated tags. If empty, keeps existing.
             """
             tags_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
-            skill = self.update_skill(
+            
+            skill = self.skills.get(title.lower())
+            if not skill:
+                matches = self.search_skills(title)
+                if matches:
+                    skill = matches[0]
+            
+            if not skill:
+                return {"success": False, "error": f"Skill '{title}' not found."}
+                
+            if not skill.modifiable:
+                return {"success": False, "error": f"Skill '{title}' is marked as READ-ONLY (unmodifiable) and cannot be updated."}
+                
+            updated_skill = self.update_skill(
                 title=title,
                 content=content,
                 description=description if description else None,
                 category=category if category else None,
                 tags=tags_list
             )
-            if skill:
+            if updated_skill:
                 return {"success": True, "output": f"Skill '{title}' updated successfully."}
-            return {"success": False, "error": f"Skill '{title}' not found."}
+            return {"success": False, "error": "Failed to update skill."}
 
         tools["tool_update_skill"] = {
             "name": "tool_update_skill",
-            "description": "Update an existing skill with new content. Overwrites the existing content.",
+            "description": "Update an existing skill with new content. Overwrites the existing content. Will fail if the skill is marked as read-only.",
             "parameters": [
                 {"name": "title", "type": "str", "description": "The exact title of the existing skill to update."},
                 {"name": "content", "type": "str", "description": "The new full Markdown content."},
@@ -480,14 +513,26 @@ class SkillsManager:
                 title (str): The exact title of the existing skill.
                 content (str): The Markdown content to append.
             """
-            skill = self.append_to_skill(title=title, content=content)
-            if skill:
+            skill = self.skills.get(title.lower())
+            if not skill:
+                matches = self.search_skills(title)
+                if matches:
+                    skill = matches[0]
+            
+            if not skill:
+                return {"success": False, "error": f"Skill '{title}' not found."}
+                
+            if not skill.modifiable:
+                return {"success": False, "error": f"Skill '{title}' is marked as READ-ONLY (unmodifiable) and cannot be appended to."}
+                
+            updated_skill = self.append_to_skill(title=title, content=content)
+            if updated_skill:
                 return {"success": True, "output": f"Content appended to skill '{title}' successfully."}
-            return {"success": False, "error": f"Skill '{title}' not found."}
+            return {"success": False, "error": "Failed to append to skill."}
 
         tools["tool_append_to_skill"] = {
             "name": "tool_append_to_skill",
-            "description": "Append new content to the end of an existing skill.",
+            "description": "Append new content to the end of an existing skill. Will fail if the skill is marked as read-only.",
             "parameters": [
                 {"name": "title", "type": "str", "description": "The exact title of the existing skill."},
                 {"name": "content", "type": "str", "description": "The Markdown content to append."}
@@ -502,14 +547,26 @@ class SkillsManager:
             Args:
                 title (str): The exact title of the skill to delete.
             """
+            skill = self.skills.get(title.lower())
+            if not skill:
+                matches = self.search_skills(title)
+                if matches:
+                    skill = matches[0]
+            
+            if not skill:
+                return {"success": False, "error": f"Skill '{title}' not found."}
+                
+            if not skill.modifiable:
+                return {"success": False, "error": f"Skill '{title}' is marked as READ-ONLY (unmodifiable) and cannot be removed."}
+                
             success = self.remove_skill(title=title)
             if success:
                 return {"success": True, "output": f"Skill '{title}' removed successfully."}
-            return {"success": False, "error": f"Skill '{title}' not found."}
+            return {"success": False, "error": "Failed to remove skill."}
 
         tools["tool_remove_skill"] = {
             "name": "tool_remove_skill",
-            "description": "Permanently delete a skill from the library.",
+            "description": "Permanently delete a skill from the library. Will fail if the skill is marked as read-only.",
             "parameters": [
                 {"name": "title", "type": "str", "description": "The exact title of the skill to delete."}
             ],

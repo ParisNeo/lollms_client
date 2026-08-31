@@ -703,8 +703,13 @@ def _sanitize_tool_result(
             error_parts = ["⚠️ **Tool Execution Failed**"]
 
             error_msg = tool_res.get("error") or (inner_dict.get("error") if inner_dict else None)
-            if error_msg:
-                error_parts.append(f"**Error Details:**\n{error_msg}")
+            if not error_msg:
+                error_msg = (
+                    f"Tool returned success=False but did not provide an error message. "
+                    f"Raw keys: {list(tool_res.keys()) if isinstance(tool_res, dict) else type(tool_res).__name__}. "
+                    f"This may indicate a library initialization failure or an import error."
+                )
+            error_parts.append(f"**Error Details:**\n{error_msg}")
 
             stderr = tool_res.get("stderr") or (inner_dict.get("stderr") if inner_dict else None)
             if stderr and str(stderr).strip():
@@ -2310,8 +2315,125 @@ class _StreamState:
             title = attrs.get("title") or attrs.get("name") or f"skill_{uuid.uuid4().hex[:8]}"
             desc = attrs.get("description", "")
             cat = attrs.get("category", "")
-
             is_patch = "<<<<<<< SEARCH" in body
+
+            # ── HANDBAG / EXTERNAL SKILL ROUTING ──
+            # Check if a personality with a SkillsManager is attached to this discussion.
+            # The `personality` object is injected into _StreamState during ChatMixin.chat() execution.
+            personality = getattr(self.discussion, '_active_personality', None)
+            skills_mgr = getattr(personality, 'skills_manager', None) if personality else None
+
+            if skills_mgr:
+                # Route to the SkillsManager (Handbag or external folder)
+                existing_skill = skills_mgr.skills.get(title.lower())
+                if not existing_skill:
+                    # Fuzzy search if exact title not found
+                    matches = skills_mgr.search_skills(title)
+                    if matches:
+                        existing_skill = matches[0]
+
+                if existing_skill:
+                    if not existing_skill.modifiable:
+                        # BLOCK: Skill is marked as read-only
+                        self._last_dispatch_failed = True
+                        proc_open = f'\n<processing type="skill" title="{title}">\n'
+                        proc_body = f'* 🚫 BLOCKED: Skill \'{existing_skill.title}\' is marked as READ-ONLY (unmodifiable).\n'
+                        proc_close = f'<!-- status:failure -->\n</processing>\n'
+                        proc_block = proc_open + proc_body + proc_close
+
+                        self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
+                        _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        return True
+
+                    # Skill exists and is modifiable. Attempt patch or update via SkillsManager.
+                    if is_patch:
+                        try:
+                            patched_content = self.discussion.artefacts.apply_aider_patch(existing_skill.content, body)
+                        except Exception as patch_err:
+                            ASCIIColors.error(f"[StreamState] Handbag skill patch failed: {patch_err}")
+                            self._last_dispatch_failed = True
+                            proc_open = f'\n<processing type="skill" title="{title}">\n'
+                            proc_body = f'* ❌ Failed to apply patch to skill: {patch_err}\n'
+                            proc_close = f'<!-- status:failure -->\n</processing>\n'
+                            proc_block = proc_open + proc_body + proc_close
+                            self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
+                            _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                            _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                            _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                            return True
+                    else:
+                        patched_content = body
+
+                    updated_skill = skills_mgr.update_skill(
+                        title=existing_skill.title,
+                        content=patched_content,
+                        description=desc if desc else None,
+                        category=cat if cat else None
+                    )
+
+                    if updated_skill:
+                        proc_open = f'\n<processing type="skill" title="{existing_skill.title}">\n'
+                        proc_body = f'* 🧠 Skill \'{existing_skill.title}\' updated successfully in your handbag.\n'
+                        proc_close = f'<!-- status:finished -->\n</processing>\n'
+                        proc_block = proc_open + proc_body + proc_close
+                        self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
+                        _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                        _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+                            "type": "artifact_updated",
+                            "title": existing_skill.title,
+                            "art_type": "skill"
+                        })
+                        return True
+                    else:
+                        # update_skill returned None (failed write)
+                        self._last_dispatch_failed = True
+                        proc_open = f'\n<processing type="skill" title="{existing_skill.title}">\n'
+                        proc_body = f'* ❌ Failed to write skill updates to disk.\n'
+                        proc_close = f'<!-- status:failure -->\n</processing>\n'
+                        proc_block = proc_open + proc_body + proc_close
+                        self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
+                        _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        return True
+                else:
+                    # Skill doesn't exist in manager. Create it.
+                    new_skill = skills_mgr.create_skill(
+                        title=title,
+                        content=body,
+                        description=desc,
+                        category=cat,
+                        visibility="loadable"
+                    )
+                    if new_skill:
+                        proc_open = f'\n<processing type="skill" title="{title}">\n'
+                        proc_body = f'* 🧠 Skill \'{title}\' created successfully in your handbag.\n'
+                        proc_close = f'<!-- status:finished -->\n</processing>\n'
+                        proc_block = proc_open + proc_body + proc_close
+                        self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
+                        _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+                            "type": "artifact_created",
+                            "title": title,
+                            "art_type": "skill"
+                        })
+                        return True
+                    else:
+                        self._last_dispatch_failed = True
+                        ASCIIColors.warning(f"[StreamState] Failed to create skill '{title}' via SkillsManager. Falling back to artifact store.")
+                        # Fall through to generic artifact creation below
+
+            # ── FALLBACK: GENERIC ARTIFACT CREATION (No SkillsManager or Hardcoded Skill) ──
+            # If we reach here, either there is no skills_manager, or creation failed.
+            # Hardcoded skills (passed directly to chat) should be treated as unmodifiable.
+            # Since we cannot enforce mutability on generic artifacts, we just save it.
             if is_patch:
                 existing = self.discussion.artefacts.get(title)
                 if existing:
@@ -2322,11 +2444,11 @@ class _StreamState:
                         )
                     except Exception as patch_err:
                         ASCIIColors.error(f"[StreamState] Skill patch failed: {patch_err}")
+                        self._last_dispatch_failed = True
                         proc_open = f'\n<processing type="skill" title="{title}">\n'
                         proc_body = f'* ❌ Failed to apply patch to skill: {patch_err}\n'
                         proc_close = f'<!-- status:failure -->\n</processing>\n'
                         proc_block = proc_open + proc_body + proc_close
-
                         self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
                         _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                         _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
@@ -3171,7 +3293,8 @@ class ChatMixin:
         enable_auto_dream:            bool = True,
         enable_deep_memory_pulling:   bool = True,
         prehydrate_rag:               bool = True,
-        max_reasoning_steps:          int = 20,
+        max_nb_rounds:                Optional[int] = None,
+        max_reasoning_steps:          Optional[int] = None,
         enable_in_message_status:     bool = False,
         enable_sub_agents:            bool = False,
         forward_artefact_chunks:      bool = False,
@@ -3216,7 +3339,8 @@ class ChatMixin:
             enable_auto_dream (bool): Enable automatic memory dream/consolidation cycles. Default True.
             enable_deep_memory_pulling (bool): Enable automatic pulling of relevant deep memories. Default True.
             prehydrate_rag (bool): Pre-hydrate RAG context before generation. Default True.
-            max_reasoning_steps (int): Maximum number of agentic reasoning rounds. Default 20.
+            max_nb_rounds (Optional[int]): Maximum number of agentic reasoning rounds. Primary parameter. Defaults to 20 if None.
+            max_reasoning_steps (Optional[int]): Deprecated. Backward-compatible alias for max_nb_rounds.
             enable_in_message_status (bool): Show in-message status updates. Default False.
             enable_sub_agents (bool): Enable spinoff sub-agent tools. Default False.
             forward_artefact_chunks (bool): Forward artifact chunks to callback. Default False.
@@ -3242,6 +3366,10 @@ class ChatMixin:
                 - dream_report: Report of dream cycle (if enabled)
                 - was_cancelled: Boolean indicating if generation was cancelled
         """
+        resolved_max_rounds = max_nb_rounds if max_nb_rounds is not None else max_reasoning_steps
+        if resolved_max_rounds is None:
+            resolved_max_rounds = 20
+
         # Store tolerance level on active discussion for downstream execution tools (like execute_python_data_query)
         if not hasattr(self, "tolerance_level") or tolerance_level:
             object.__setattr__(self, "tolerance_level", tolerance_level or "strict")
@@ -3905,6 +4033,10 @@ class ChatMixin:
             model_name=getattr(self.lollmsClient.llm, "model_name", "unknown") if self.lollmsClient else "unknown",
             binding_name=getattr(self.lollmsClient.llm, "binding_name", "unknown") if self.lollmsClient else "unknown"
         )
+
+        # CRITICAL: Expose the active personality to _StreamState so it can access the SkillsManager
+        # for Handbag skill routing (modifiable/read-only enforcement) during <skill> tag dispatch.
+        object.__setattr__(self, '_active_personality', personality)
 
         object.__setattr__(self, "_consecutive_text_only_stalls", 0)
         if callback:

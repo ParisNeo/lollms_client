@@ -17,6 +17,7 @@ class Skill:
     file_path: Optional[Path] = None
     visibility: str = "loadable"
     has_metadata: bool = False
+    modifiable: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -26,6 +27,7 @@ class Skill:
             "tags": self.tags,
             "visibility": self.visibility,
             "has_metadata": self.has_metadata,
+            "modifiable": self.modifiable,
             "file_path": str(self.file_path) if self.file_path else None,
         }
 
@@ -51,6 +53,7 @@ def parse_skill_md(file_path: Path, default_visibility: str = "loadable") -> Opt
             fm_text = fm_match.group(1)
             body = fm_match.group(2)
             visibility = default_visibility
+            modifiable = True
             for line in fm_text.splitlines():
                 line = line.strip()
                 if line.startswith("title:"):
@@ -72,13 +75,19 @@ def parse_skill_md(file_path: Path, default_visibility: str = "loadable") -> Opt
                     val = line.split(":", 1)[1].strip().strip('"\'').lower()
                     if val in ("visible", "loadable", "searchable"):
                         visibility = val
+                elif line.startswith("modifiable:"):
+                    val = line.split(":", 1)[1].strip().strip('"\'').lower()
+                    if val in ("false", "no", "0", "off"):
+                        modifiable = False
             if visibility == "mixed":
                 visibility = "visible"
         else:
             visibility = "visible"
+            modifiable = True
     else:
         has_metadata = False
         visibility = "visible"
+        modifiable = True
         h1_match = re.match(r'^#\s+(.+)', raw_content)
         if h1_match:
             title = h1_match.group(1).strip()
@@ -96,4 +105,5 @@ def parse_skill_md(file_path: Path, default_visibility: str = "loadable") -> Opt
         file_path=file_path,
         visibility=visibility,
         has_metadata=has_metadata,
+        modifiable=modifiable,
     )

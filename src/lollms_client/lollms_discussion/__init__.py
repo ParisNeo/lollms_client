@@ -38,8 +38,9 @@ from ._mixin_chat   import ChatMixin
 from ._mixin_utils  import UtilsMixin
 from ._mixin_branch import BranchMixin, BranchInfo, MessageNode
 from ._mixin_memory import MemoryMixin
+from ._mixin_history import HistoryMixin
 
-class LollmsDiscussion(CoreMixin, PromptMixin, ChatMixin, UtilsMixin, BranchMixin, MemoryMixin, FileImportMixin, InternetImportMixin, ExportMixin):
+class LollmsDiscussion(CoreMixin, PromptMixin, ChatMixin, HistoryMixin, UtilsMixin, BranchMixin, MemoryMixin, FileImportMixin, InternetImportMixin, ExportMixin):
     """
     Represents and manages a single discussion.
 
