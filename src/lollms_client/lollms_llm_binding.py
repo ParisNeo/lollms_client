@@ -578,7 +578,7 @@ class LollmsLLMBinding(LollmsBaseBinding):
 class LollmsLLMBindingManager:
     """Manages binding discovery and instantiation"""
 
-    def __init__(self, llm_bindings_dir: Union[str, Path] = Path(__file__).parent.parent / "llm_bindings"):
+    def __init__(self, llm_bindings_dir: Union[str, Path] = Path(__file__).parent / "llm_bindings"):
         self.llm_bindings_dir = Path(llm_bindings_dir)
         self.available_bindings = {}
 

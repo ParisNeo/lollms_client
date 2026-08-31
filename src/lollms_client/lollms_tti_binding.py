@@ -246,7 +246,7 @@ class LollmsTTIBinding(LollmsBaseBinding):
 class LollmsTTIBindingManager:
     """Manages TTI binding discovery and instantiation."""
 
-    def __init__(self, tti_bindings_dir: Union[str, Path] = Path(__file__).parent.parent / "tti_bindings"):
+    def __init__(self, tti_bindings_dir: Union[str, Path] = Path(__file__).parent / "tti_bindings"):
         self.tti_bindings_dir = Path(tti_bindings_dir)
         self.available_bindings = {}
 

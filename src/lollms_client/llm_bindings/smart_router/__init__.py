@@ -6,6 +6,8 @@ from ascii_colors import ASCIIColors
 from lollms_client.lollms_llm_binding import LollmsLLMBinding, LollmsLLMBindingManager
 from lollms_client.lollms_types import MSG_TYPE
 
+BindingName = "LollmsSmartBinding"
+
 class LollmsSmartBinding(LollmsLLMBinding):
     """
     A proxy binding that routes generation to child bindings based on routing profiles.
@@ -41,17 +43,53 @@ class LollmsSmartBinding(LollmsLLMBinding):
         else: # balanced
             return {"subject": 0.35, "complexity": 0.35, "cost": 0.15, "latency": 0.15}
 
+    def _normalize_binding_name(self, name: Optional[str]) -> Optional[str]:
+        if not name:
+            return None
+        cleaned = name.strip().lower()
+        mappings = {
+            "open router": "open_router",
+            "open_router": "open_router",
+            "open-router": "open_router",
+            "open webui": "openwebui",
+            "openwebui": "openwebui",
+            "llamacpp": "llama_cpp_server",
+            "llama_cpp": "llama_cpp_server",
+            "llama.cpp": "llama_cpp_server",
+            "llama-cpp": "llama_cpp_server",
+            "llama_cpp_server": "llama_cpp_server",
+            "azure openai": "azure_openai",
+            "azure_openai": "azure_openai",
+            "hugging face": "hugging_face_inference_api",
+            "huggingface": "hugging_face_inference_api",
+            "hf": "hugging_face_inference_api",
+            "tensor rt": "tensor_rt",
+            "tensor_rt": "tensor_rt",
+        }
+        return mappings.get(cleaned, cleaned.replace(" ", "_"))
+
     def _init_child_bindings(self):
         """Instantiates the child bindings defined in the profiles."""
         for alias, profile in self.model_profiles.items():
-            b_name = profile.get("binding_name")
-            b_config = profile.get("binding_config", {}) or {}
-            
+            raw_name = profile.get("binding_name") or profile.get("binding_alias")
+            if not raw_name and "/" in alias:
+                raw_name = alias.split("/", 1)[0]
+
+            b_name = self._normalize_binding_name(raw_name)
+            b_config = profile.get("binding_config", {}).copy() if profile.get("binding_config") else {}
+
+            # Inject model_name if specified or extract from alias
+            if "model_name" not in b_config:
+                if profile.get("model_name"):
+                    b_config["model_name"] = profile["model_name"]
+                elif "/" in alias:
+                    b_config["model_name"] = alias.split("/", 1)[1]
+
             # Inject client-level config into child
             b_config['user_name'] = self.user_name
             b_config['ai_name'] = self.ai_name
             b_config['debug'] = self.debug
-            
+
             try:
                 binding = self._binding_manager.create_binding(
                     binding_name=b_name,
@@ -64,7 +102,7 @@ class LollmsSmartBinding(LollmsLLMBinding):
                     self.child_bindings[alias] = binding
                     ASCIIColors.info(f"[SmartRouter] Initialized child binding: {alias} ({b_name})")
                 else:
-                    ASCIIColors.error(f"[SmartRouter] Failed to create child binding: {alias}")
+                    ASCIIColors.error(f"[SmartRouter] Failed to create child binding: {alias} (resolved binding_name: {b_name})")
             except Exception as e:
                 ASCIIColors.error(f"[SmartRouter] Error initializing child {alias}: {e}")
 

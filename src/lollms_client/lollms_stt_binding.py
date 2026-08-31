@@ -58,7 +58,7 @@ class LollmsSTTBinding(LollmsBaseBinding):
 class LollmsSTTBindingManager:
     """Manages STT binding discovery and instantiation."""
 
-    def __init__(self, stt_bindings_dir: Union[str, Path] = Path(__file__).parent.parent / "stt_bindings"):
+    def __init__(self, stt_bindings_dir: Union[str, Path] = Path(__file__).parent / "stt_bindings"):
         self.stt_bindings_dir = Path(stt_bindings_dir)
         self.available_bindings = {}
 

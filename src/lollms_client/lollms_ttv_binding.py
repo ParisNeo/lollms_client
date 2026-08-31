@@ -49,7 +49,7 @@ class LollmsTTVBinding(LollmsBaseBinding):
 class LollmsTTVBindingManager:
     """Manages TTV binding discovery and instantiation."""
 
-    def __init__(self, ttv_bindings_dir: Union[str, Path] = Path(__file__).parent.parent / "ttv_bindings"):
+    def __init__(self, ttv_bindings_dir: Union[str, Path] = Path(__file__).parent / "ttv_bindings"):
         self.ttv_bindings_dir = Path(ttv_bindings_dir)
         self.available_bindings = {}
 

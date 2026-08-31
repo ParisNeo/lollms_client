@@ -256,7 +256,7 @@ class LollmsTOOLBindingManager:
         """
         self.tools_bindings_dir = Path(tools_bindings_dir)
         if not self.tools_bindings_dir.is_absolute():
-            self.tools_bindings_dir = (Path(__file__).parent.parent / tools_bindings_dir).resolve()
+            self.tools_bindings_dir = (Path(__file__).parent / tools_bindings_dir).resolve()
 
         self.available_bindings: Dict[str, type[LollmsToolBinding]] = {}
 

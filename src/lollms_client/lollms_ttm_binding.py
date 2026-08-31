@@ -65,7 +65,7 @@ class LollmsTTMBinding(LollmsBaseBinding):
 class LollmsTTMBindingManager:
     """Manages TTM binding discovery and instantiation."""
 
-    def __init__(self, ttm_bindings_dir: Union[str, Path] = Path(__file__).parent.parent / "ttm_bindings"):
+    def __init__(self, ttm_bindings_dir: Union[str, Path] = Path(__file__).parent / "ttm_bindings"):
         self.ttm_bindings_dir = Path(ttm_bindings_dir)
         self.available_bindings = {}
 
