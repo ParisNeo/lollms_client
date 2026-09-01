@@ -613,6 +613,80 @@ class CodeAgentConfig:
         return True
     
 
+def _resolve_modality_from_env(modality: str) -> Optional[Dict[str, Any]]:
+    """
+    Resolves a modality (tti, tts, stt, etc.) binding+profile from the
+    ~/.lollms-client/.env file (GUI wizard format) AND the legacy
+    ~/.lollms_client/config.yaml file (CLI wizard format).
+    Returns a dict with binding_name, model_name, host_address, api_key, verify_ssl
+    or None if not configured.
+    """
+    prefix = modality.upper()
+
+    # ── TIER 1: Read from ~/.lollms-client/.env (GUI wizard format) ──
+    env_file = Path.home() / ".lollms-client" / ".env"
+    if env_file.exists():
+        env_map: Dict[str, str] = {}
+        try:
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    env_map[k.strip()] = v.strip().strip("'\"")
+        except Exception:
+            pass
+
+        default_alias = None
+        for k, v in env_map.items():
+            if k.startswith(f"{prefix}_PROFILES_") and k.endswith("_IS_DEFAULT") and v.lower() in ("true", "1", "yes"):
+                default_alias = k[len(f"{prefix}_PROFILES_"):-len("_IS_DEFAULT")]
+                break
+
+        if not default_alias:
+            profile_aliases = [k[len(f"{prefix}_PROFILES_"):-len("_BINDING_ALIAS")] for k in env_map if k.startswith(f"{prefix}_PROFILES_") and k.endswith("_BINDING_ALIAS")]
+            if profile_aliases:
+                default_alias = profile_aliases[0]
+
+        if default_alias:
+            binding_alias = env_map.get(f"{prefix}_PROFILES_{default_alias}_BINDING_ALIAS", default_alias)
+            binding_name = env_map.get(f"{prefix}_BINDINGS_{binding_alias}_BINDING_NAME")
+            if binding_name:
+                return {
+                    "binding_name": binding_name,
+                    "model_name": env_map.get(f"{prefix}_PROFILES_{default_alias}_MODEL_NAME", ""),
+                    "host_address": env_map.get(f"{prefix}_BINDINGS_{binding_alias}_HOST_ADDRESS", "http://localhost:9642"),
+                    "api_key": env_map.get(f"{prefix}_BINDINGS_{binding_alias}_SERVICE_KEY", ""),
+                    "verify_ssl": env_map.get(f"{prefix}_BINDINGS_{binding_alias}_VERIFY_SSL_CERTIFICATE", "false").lower() in ("true", "1", "yes"),
+                }
+
+    # ── TIER 2: Read from ~/.lollms_client/config.yaml (legacy CLI format) ──
+    config_obj = CodeAgentConfig()
+    env_data = config_obj._read_yaml_config()
+    if config_obj._has_modality_configured(env_data, modality):
+        binding_alias = None
+        for k, v in env_data.items():
+            if k.startswith(f"{prefix}_PROFILES_") and k.endswith("_IS_DEFAULT") and v.lower() in ("true", "1", "yes"):
+                binding_alias = k[len(f"{prefix}_PROFILES_"):-len("_IS_DEFAULT")]
+                break
+        if not binding_alias:
+            aliases = [k[len(f"{prefix}_PROFILES_"):-len("_BINDING_ALIAS")] for k, v in env_data.items() if k.startswith(f"{prefix}_PROFILES_") and k.endswith("_BINDING_ALIAS")]
+            if aliases:
+                binding_alias = aliases[0]
+
+        if binding_alias:
+            binding_name = env_data.get(f"{prefix}_BINDINGS_{binding_alias}_BINDING_NAME")
+            if binding_name:
+                return {
+                    "binding_name": binding_name,
+                    "model_name": env_data.get(f"{prefix}_PROFILES_{binding_alias}_MODEL_NAME", ""),
+                    "host_address": env_data.get(f"{prefix}_BINDINGS_{binding_alias}_HOST_ADDRESS", "http://localhost:9642"),
+                    "api_key": env_data.get(f"{prefix}_BINDINGS_{binding_alias}_SERVICE_KEY", ""),
+                    "verify_ssl": env_data.get(f"{prefix}_BINDINGS_{binding_alias}_VERIFY_SSL_CERTIFICATE", "false").lower() in ("true", "1", "yes"),
+                }
+
+    return None
+
+
 def create_client(config: CodeAgentConfig) -> LollmsClient:
     if config.llm_binding_config:
         llm_config = dict(config.llm_binding_config)
@@ -651,15 +725,70 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
         }
     }
 
-    client = LollmsClient(
-        llm_binding_name=config.llm_binding,
-        llm_binding_config=llm_config,
-        tools_binding_name="lcp",
-        tools_binding_config={
+    client_kwargs = {
+        "llm_binding_name": config.llm_binding,
+        "llm_binding_config": llm_config,
+        "tools_binding_name": "lcp",
+        "tools_binding_config": {
             "tools_folders": tools_folders,
             "host_tool_configs": host_tool_configs
         },
-    )
+    }
+
+    # ── TTI (Text-to-Image) ──
+    try:
+        tti_resolved = _resolve_modality_from_env("tti")
+        if tti_resolved:
+            tti_config: Dict[str, Any] = {
+                "host_address": tti_resolved["host_address"],
+                "model_name": tti_resolved["model_name"],
+                "verify_ssl_certificate": tti_resolved["verify_ssl"],
+            }
+            if tti_resolved["api_key"]:
+                tti_config["service_key"] = tti_resolved["api_key"]
+            client_kwargs["tti_binding_name"] = tti_resolved["binding_name"]
+            client_kwargs["tti_binding_config"] = tti_config
+            ASCIIColors.success(f"[CLI] ✅ TTI Binding '{tti_resolved['binding_name']}' mounted for image generation.")
+        else:
+            ASCIIColors.info("[CLI] No TTI binding configured. Image generation tools will not be available.")
+    except Exception as e:
+        ASCIIColors.warning(f"[CLI] Failed to configure TTI binding: {e}")
+
+    # ── TTS (Text-to-Speech) ──
+    try:
+        tts_resolved = _resolve_modality_from_env("tts")
+        if tts_resolved:
+            tts_config: Dict[str, Any] = {
+                "host_address": tts_resolved["host_address"],
+                "model_name": tts_resolved["model_name"],
+                "verify_ssl_certificate": tts_resolved["verify_ssl"],
+            }
+            if tts_resolved["api_key"]:
+                tts_config["service_key"] = tts_resolved["api_key"]
+            client_kwargs["tts_binding_name"] = tts_resolved["binding_name"]
+            client_kwargs["tts_binding_config"] = tts_config
+            ASCIIColors.success(f"[CLI] ✅ TTS Binding '{tts_resolved['binding_name']}' mounted for speech synthesis.")
+    except Exception as e:
+        ASCIIColors.warning(f"[CLI] Failed to configure TTS binding: {e}")
+
+    # ── STT (Speech-to-Text) ──
+    try:
+        stt_resolved = _resolve_modality_from_env("stt")
+        if stt_resolved:
+            stt_config: Dict[str, Any] = {
+                "host_address": stt_resolved["host_address"],
+                "model_name": stt_resolved["model_name"],
+                "verify_ssl_certificate": stt_resolved["verify_ssl"],
+            }
+            if stt_resolved["api_key"]:
+                stt_config["service_key"] = stt_resolved["api_key"]
+            client_kwargs["stt_binding_name"] = stt_resolved["binding_name"]
+            client_kwargs["stt_binding_config"] = stt_config
+            ASCIIColors.success(f"[CLI] ✅ STT Binding '{stt_resolved['binding_name']}' mounted for transcription.")
+    except Exception as e:
+        ASCIIColors.warning(f"[CLI] Failed to configure STT binding: {e}")
+
+    client = LollmsClient(**client_kwargs)
 
     if config.enable_shell_execution and client.tools:
         try:
@@ -712,8 +841,10 @@ def ensure_sandbox_structure(config: CodeAgentConfig):
     sandbox_dir = Path(config.workspace_path) / ".lollms_code"
     scripts_dir = sandbox_dir / "scripts"
     scratchpad = sandbox_dir / "scratchpad.md"
+    memory_dir = sandbox_dir / "memory"
 
     sandbox_dir.mkdir(parents=True, exist_ok=True)
+    memory_dir.mkdir(parents=True, exist_ok=True)
 
     if scripts_dir.exists():
         for f in scripts_dir.glob("*"):
@@ -783,6 +914,10 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
     ensure_handbag_structure(config)
     ensure_sandbox_structure(config)
 
+    has_tti = hasattr(client, 'tti') and client.tti is not None
+    has_tts = hasattr(client, 'tts') and client.tts is not None
+    has_stt = hasattr(client, 'stt') and client.stt is not None
+
     caps = CapabilityFlags(
         enable_sub_agents=config.enable_sub_agents,
         enable_model_switching=config.enable_model_switching,
@@ -791,16 +926,78 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
         enable_workspace_tools=True,
         skills_mode=config.skills_mode,
         max_sub_agent_depth=config.max_sub_agent_depth,
-        max_sub_agents_per_turn=config.max_sub_agents_per_turn
+        max_sub_agents_per_turn=config.max_sub_agents_per_turn,
+        enable_image_generation=has_tti,
+        enable_image_editing=has_tti,
+        enable_tts=has_tts,
+        enable_stt=has_stt,
     )
+
+    if has_tti:
+        ASCIIColors.success(f"[CLI] ✅ Image generation tools enabled (TTI binding detected on client).")
+    if has_tts:
+        ASCIIColors.success(f"[CLI] ✅ Text-to-Speech tools enabled (TTS binding detected on client).")
+    if has_stt:
+        ASCIIColors.success(f"[CLI] ✅ Speech-to-Text tools enabled (STT binding detected on client).")
 
     personality = LollmsPersonality.from_handbag(config.handbag_path)
     personality.lollms_client = client
 
     personality.workspace_path = Path(config.workspace_path)
 
+    # ── 🧠 PROJECT-LOCAL MEMORY ISOLATION ──
+    # Override the handbag's global memory with a project-specific database.
+    # This prevents Project A's memories from polluting Project B.
+    if config.enable_memory:
+        try:
+            from lollms_client.lollms_memory import LollmsMemoryManager, MemoryConfig
+            project_memory_db = Path(config.workspace_path) / ".lollms_code" / "memory" / "memory.db"
+            project_memory_db.parent.mkdir(parents=True, exist_ok=True)
+
+            personality.memory_manager = LollmsMemoryManager(
+                db_path=f"sqlite:///{project_memory_db}",
+                owner_id=f"project_{Path(config.workspace_path).name}",
+                config=MemoryConfig(working_token_budget=2000)
+            )
+            ASCIIColors.info(f"[CLI] ✅ Project-local memory initialized at: {project_memory_db}")
+        except Exception as e:
+            ASCIIColors.warning(f"[CLI] Failed to initialize project memory: {e}. Falling back to handbag memory.")
+
+    # ── 💾 PROJECT-LOCAL HISTORY ISOLATION ──
+    # Load the project-specific conversation history.
+    project_history_file = Path(config.workspace_path) / ".lollms_code" / "history.json"
+    personality.load_history_from_disk(project_history_file)
+    personality._project_history_file = project_history_file
+
     env_context = build_environment_context(config)
     personality.system_prompt = personality.system_prompt + "\n" + env_context
+
+    if has_tti:
+        personality.system_prompt += (
+            "\n\n=== IMAGE GENERATION CAPABILITY (ACTIVE) ===\n"
+            "You have access to a Text-to-Image (TTI) binding. You CAN generate images.\n"
+            "Use the `tool_generate_image` tool to create images from text prompts.\n"
+            "Use the `tool_edit_image` tool to modify existing images in the workspace.\n"
+            "Generated images are saved to the workspace automatically.\n"
+            "When a user asks you to generate, draw, create, or make an image, you MUST use `tool_generate_image`.\n"
+            "=== END IMAGE GENERATION CAPABILITY ==="
+        )
+
+    if has_tts:
+        personality.system_prompt += (
+            "\n\n=== TEXT-TO-SPEECH CAPABILITY (ACTIVE) ===\n"
+            "You have access to a Text-to-Speech (TTS) binding. You CAN generate speech audio.\n"
+            "Use the `tool_text_to_speech` tool to convert text to speech.\n"
+            "=== END TEXT-TO-SPEECH CAPABILITY ==="
+        )
+
+    if has_stt:
+        personality.system_prompt += (
+            "\n\n=== SPEECH-TO-TEXT CAPABILITY (ACTIVE) ===\n"
+            "You have access to a Speech-to-Text (STT) binding. You CAN transcribe audio.\n"
+            "Use the `tool_speech_to_text` tool to transcribe audio files.\n"
+            "=== END SPEECH-TO-TEXT CAPABILITY ==="
+        )
 
     personality.capabilities = caps
     personality.max_tokens_per_turn = config.max_tokens_per_turn
@@ -1460,6 +1657,10 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
     if config.debug:
         dump_startup_context(personality, client)
 
+    # Use project-local history for this session
+    project_history_file = Path(config.workspace_path) / ".lollms_code" / "history.json"
+    history = PersistentHistory(project_history_file)
+
     renderer = StreamRenderer(config)
 
     config_panel_content = (
@@ -1524,6 +1725,10 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
 
     # Flush the renderer to ensure any unclosed tags are printed
     renderer.flush()
+
+    # Save the updated conversation history to the project directory
+    if hasattr(personality, "_project_history_file"):
+        personality.save_history_to_disk(personality._project_history_file)
 
     elapsed = time.time() - start_time
     display_result(result, config, elapsed)
@@ -2052,7 +2257,10 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
         dump_startup_context(personality, client)
 
     renderer = StreamRenderer(config)
-    history = PersistentHistory(APP_HISTORY_FILE)
+
+    # Use project-local history for autocomplete (up-arrow) and persist it
+    project_history_file = Path(config.workspace_path) / ".lollms_code" / "history.json"
+    history = PersistentHistory(project_history_file)
 
     slash_commands = ["/exit", "/quit", "/help", "/config", "/shell", "/forget", "/skills", "/clear-history", "/clear-files", "/clear-scratchpad", "/models", "/files", "/workspace", "/load", "/unload", "/lock", "/hide", "/unhide"]
     
@@ -2156,7 +2364,17 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
 
         if user_input.lower() in ("/clear-history", "/clear"):
             personality._conversation = []
-            ASCIIColors.green("  Conversation history cleared.")
+            # Also clear the project-local history file from disk
+            project_history_file = Path(config.workspace_path) / ".lollms_code" / "history.json"
+            if project_history_file.exists():
+                try:
+                    project_history_file.unlink()
+                except Exception:
+                    pass
+            # Clear the in-memory autocomplete history as well
+            history.entries = []
+            history._save()
+            ASCIIColors.green("  Project conversation history cleared.")
             continue
 
         if user_input.lower() == "/clear-scratchpad":
@@ -2459,6 +2677,10 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
         # Flush the renderer to ensure any unclosed tags are printed
         renderer.flush()
 
+        # Save the updated conversation history to the project directory
+        if hasattr(personality, "_project_history_file"):
+            personality.save_history_to_disk(personality._project_history_file)
+
         if hasattr(client, 'llm') and hasattr(client.llm, 'flush_stream'):
             try:
                 client.llm.flush_stream()
@@ -2532,12 +2754,27 @@ Examples:
     parser.add_argument("--config", action="store_true", help="Run configuration wizard and exit.")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
     parser.add_argument("--version", action="version", version=f"lollms_code v{APP_VERSION}")
+    subparsers = parser.add_subparsers(dest="command", help="Additional commands")
+    gui_parser = subparsers.add_parser("gui", help="Launch the lollms_code GUI (NiceGUI native window).")    
     return parser
 
 
 def main():
     parser = build_arg_parser()
     args = parser.parse_args()
+
+    if getattr(args, "command", None) == "gui":
+        try:
+            from lollms_client.apps.lollms_code.gui.main import main as gui_main
+            gui_main()
+            return 0
+        except ImportError as e:
+            ASCIIColors.red(f"Failed to import GUI dependencies: {e}")
+            ASCIIColors.yellow("Please install the GUI requirements: pip install nicegui pywebview")
+            return 1
+        except Exception as e:
+            ASCIIColors.red(f"GUI crashed: {e}")
+            return 1
 
     config = CodeAgentConfig.load(args)
 

@@ -48,15 +48,6 @@ def init_tools_library(config: dict = None) -> None:
             import ascii_colors
             ascii_colors.ASCIIColors.error("[Document Editor] PyMuPDF (fitz) could not be imported. PDF annotation and editing will fail.")
 
-def _get_output_path(file_name: str, suffix: str = "_edited") -> str:
-    p = Path(file_name)
-    stem = p.stem
-    for existing_suffix in ["_annotated", "_edited", "_inserted", "_updated", "_removed", "_pasted", "_global_replace", "_page_deleted"]:
-        if stem.endswith(existing_suffix):
-            stem = stem[:-len(existing_suffix)]
-            break
-    return str(p.with_name(f"{stem}{suffix}{p.suffix}"))
-
 def _check_file_exists(file_name: str) -> Optional[Dict[str, Any]]:
     if not Path(file_name).is_file():
         return {
@@ -283,7 +274,7 @@ def tool_edit_document_text(
     if operation in ("update", "insert") and not replacement_text and operation != "remove":
         return {"success": False, "error": "replacement_text is required for 'update' and 'insert' operations."}
 
-    output_path = _get_output_path(file_name, f"_{operation}ed")
+    output_path = file_name
     file_ext = Path(file_name).suffix.lower()
 
     try:
@@ -445,7 +436,7 @@ def tool_annotate_document(
     if not commenter_name:
         commenter_name = _DEFAULT_COMMENTER
 
-    output_path = _get_output_path(file_name, "_annotated")
+    output_path = file_name
     file_ext = Path(file_name).suffix.lower()
 
     color_map = {
@@ -568,7 +559,7 @@ def tool_batch_annotate_document(
     except json.JSONDecodeError as e:
         return {"success": False, "error": f"Invalid JSON in batch_operations: {e}"}
 
-    output_path = _get_output_path(file_name, "_batch_annotated")
+    output_path = file_name
     file_ext = Path(file_name).suffix.lower()
     color_map = {
         "yellow": (1, 1, 0),
@@ -719,7 +710,7 @@ def tool_copy_paste_between_documents(
     if src_ext != ".pdf" or tgt_ext != ".pdf":
         return {"success": False, "error": "Copy-paste is currently only supported for PDF to PDF."}
 
-    output_path = _get_output_path(target_file, "_pasted")
+    output_path = target_file
 
     try:
         if fitz is None:
@@ -807,7 +798,7 @@ def tool_delete_document_page(
         return err
 
     file_ext = Path(file_name).suffix.lower()
-    output_path = _get_output_path(file_name, "_page_deleted")
+    output_path = file_name
 
     try:
         if file_ext == ".pdf":
@@ -883,7 +874,7 @@ def tool_replace_text_globally(
         return err
 
     file_ext = Path(file_name).suffix.lower()
-    output_path = _get_output_path(file_name, "_global_replace")
+    output_path = file_name
     total_replaced = 0
 
     try:

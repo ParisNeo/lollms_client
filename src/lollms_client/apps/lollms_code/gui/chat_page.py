@@ -86,6 +86,10 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 if tools_toggle is None:
                     tools_toggle = ui.switch("Tool panels", value=prefs.show_tool_calls).props("dense")
                 ui.button(
+                    "Scratchpad", icon="edit_note",
+                    on_click=lambda: open_scratchpad_dialog(),
+                ).props("flat dense size=sm no-caps").tooltip("View the agent's persistent notes and thoughts")
+                ui.button(
                     "Copy as Markdown", icon="content_copy",
                     on_click=lambda: copy_debug_markdown(),
                 ).props("flat dense size=sm no-caps").tooltip("Copy the full discussion, including tool calls, for debugging")
@@ -185,6 +189,26 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         md_text = build_debug_markdown()
         ui.clipboard.write(md_text)
         ui.notify("Discussion copied as Markdown.", type="positive")
+
+    def open_scratchpad_dialog():
+        dialog = ui.dialog().props("maximized")
+        with dialog, ui.card().classes("w-full h-full flex flex-col"):
+            with ui.row().classes("w-full items-center justify-between mb-2"):
+                ui.label("📝 Agent Scratchpad").classes("text-lg font-bold")
+                with ui.row().classes("gap-2"):
+                    def _refresh_scratchpad():
+                        try:
+                            session.ensure_ready()
+                            content = agent_bridge.get_scratchpad_content(session.personality)
+                            scratchpad_md.set_content(content if content.strip() else "_(scratchpad is empty)_")
+                            ui.notify("Scratchpad refreshed.", type="positive")
+                        except Exception as e:
+                            ui.notify(f"Failed to read scratchpad: {e}", type="negative")
+                    ui.button("Refresh", icon="refresh", on_click=_refresh_scratchpad).props("flat size=sm no-caps")
+                    ui.button("Close", icon="close", on_click=dialog.close).props("flat size=sm no-caps")
+            scratchpad_md = ui.markdown("").classes("flex-1 overflow-auto p-2 bg-gray-50 dark:bg-gray-900 rounded")
+            _refresh_scratchpad()
+        dialog.open()
 
     def _strip_processing_tags(text: str) -> str:
         return re.sub(r"<processing.*?</processing>", "", text, flags=re.DOTALL)

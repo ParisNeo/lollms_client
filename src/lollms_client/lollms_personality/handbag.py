@@ -33,6 +33,11 @@ class Handbag:
         self.assets: Dict[str, str] = self._load_assets()
 
     @property
+    def global_memory_db_path(self) -> Optional[str]:
+        """Returns the path to the global handbag memory database."""
+        return self.memory_db_path
+
+    @property
     def skills_dir(self) -> Path:
         """Returns the canonical skills directory for this handbag."""
         return self._skills_dir

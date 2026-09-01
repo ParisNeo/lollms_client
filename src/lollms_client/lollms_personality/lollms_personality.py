@@ -151,68 +151,91 @@ _STOP_WORDS = {
     "such", "only", "own", "same", "than", "too", "very", "just", "now",
 }
 
-_IGNORED_WS_DIRS = {"__pycache__", ".venv", "venv", ".git", ".idea", ".vscode", "node_modules", ".lollms", "build", "dist", ".next", "env", ".env"}
+_IGNORED_WS_DIRS = {"__pycache__", ".venv", "venv", ".git", ".idea", ".vscode", "node_modules", ".lollms", "build", "dist", ".next", "env", ".env", ".lollms_code", ".lollms_metadata", "egg-info", "dist-info", ".pytest_cache", ".mypy_cache", ".ruff_cache", "htmlcov", "site-packages", "artefacts_metadata", "discussions", ".git"}
 _IGNORED_WS_EXTS = {".pyc", ".pyo", ".pyd", ".so", ".dll", ".dylib"}
 _TEXT_EXTS = {".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".scss", ".sql", ".md", ".txt", ".json", ".yaml", ".yml", ".xml", ".csv", ".log", ".toml", ".ini", ".cfg", ".sh", ".bash", ".ps1", ".bat", ".rdf", ".ttl", ".rs", ".go", ".rb", ".php", ".java", ".kt", ".swift", ".c", ".cpp", ".h", ".hpp"}
 _BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp", ".zip", ".tar", ".gz", ".pdf", ".docx", ".mp3", ".wav", ".mp4", ".avi", ".mov"}
 
+_MAX_TREE_DEPTH = 2
+_MAX_DIR_ITEMS = 15
 
-def _build_workspace_context(workspace_path: Path, max_file_size: int = 12000, max_total_chars: int = 30000) -> str:
+
+def _build_workspace_tree_r(directory: Path, workspace_root: Path, current_depth: int, collapsed_set: set, max_depth: int, max_items: int) -> List[str]:
+    if current_depth >= max_depth:
+        return []
+
+    entries = []
+    try:
+        sorted_items = sorted(directory.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except Exception:
+        return []
+
+    if len(sorted_items) > max_items:
+        remaining = len(sorted_items) - max_items
+        sorted_items = sorted_items[:max_items]
+        entries.append(f"{'  ' * current_depth}... ({remaining} more items in this folder. Use <uncollapse_folder> to see them.)")
+
+    for item in sorted_items:
+        if item.name in _IGNORED_WS_DIRS or item.name.startswith("."):
+            continue
+        if item.is_dir():
+            rel_dir_path = str(item.relative_to(workspace_root)).replace("\\", "/")
+            if rel_dir_path in collapsed_set:
+                entries.append(f"{'  ' * current_depth}[📁 COLLAPSED] {item.name}/ ({_count_files_recursive(item, collapsed_set, max_depth, current_depth)} items)")
+            elif current_depth + 1 >= max_depth:
+                entries.append(f"{'  ' * current_depth}[📁 DEEP] {item.name}/ (Use <uncollapse_folder> to explore)")
+            else:
+                entries.append(f"{'  ' * current_depth}[📁] {item.name}/")
+                entries.extend(_build_workspace_tree_r(item, workspace_root, current_depth + 1, collapsed_set, max_depth, max_items))
+        elif item.is_file():
+            if item.suffix.lower() in _IGNORED_WS_EXTS:
+                continue
+            rel_path = str(item.relative_to(workspace_root)).replace("\\", "/")
+            size = item.stat().st_size
+            entries.append(f"{'  ' * current_depth}- {rel_path} ({size:,} bytes)")
+
+    return entries
+
+def _count_files_recursive(directory: Path, collapsed_set: set, max_depth: int, current_depth: int) -> int:
+    if current_depth >= max_depth:
+        return 0
+    count = 0
+    try:
+        for item in directory.iterdir():
+            if item.name in _IGNORED_WS_DIRS or item.name.startswith("."):
+                continue
+            if item.is_dir():
+                count += _count_files_recursive(item, collapsed_set, max_depth, current_depth + 1)
+            elif item.is_file():
+                if item.suffix.lower() not in _IGNORED_WS_EXTS:
+                    count += 1
+    except Exception:
+        pass
+    return count
+
+def _build_workspace_context(workspace_path: Path, max_file_size: int = 12000, max_total_chars: int = 30000, collapsed_folders: Optional[set] = None) -> str:
     if not workspace_path or not workspace_path.exists():
         return ""
 
-    lines = ["=== WORKSPACE FILES ==="]
-    file_entries = []
-    content_entries = []
-    total_content_chars = 0
+    collapsed_set = collapsed_folders or set()
+    lines = ["=== WORKSPACE TREE ==="]
 
-    for f_path in sorted(workspace_path.rglob("*")):
-        if not f_path.is_file():
-            continue
-        rel_parts = f_path.relative_to(workspace_path).parts
-        if any(part in _IGNORED_WS_DIRS for part in rel_parts):
-            continue
-        if any(part.startswith(".") for part in rel_parts[:-1]):
-            continue
-        file_name = f_path.name
-        file_ext = f_path.suffix.lower()
-        if file_ext in _IGNORED_WS_EXTS or file_name.startswith("."):
-            continue
+    tree_entries = _build_workspace_tree_r(
+        directory=workspace_path,
+        workspace_root=workspace_path,
+        current_depth=0,
+        collapsed_set=collapsed_set,
+        max_depth=_MAX_TREE_DEPTH,
+        max_items=_MAX_DIR_ITEMS
+    )
 
-        size = f_path.stat().st_size
-        rel_path = f_path.relative_to(workspace_path)
-        size_str = f"{size:,} bytes"
-
-        if file_ext in _TEXT_EXTS and size <= max_file_size:
-            file_entries.append(f"- {rel_path} ({size_str}, text)")
-            if total_content_chars < max_total_chars:
-                try:
-                    content = f_path.read_text(encoding="utf-8", errors="ignore")
-                    remaining_budget = max_total_chars - total_content_chars
-                    if len(content) > remaining_budget:
-                        content = content[:remaining_budget] + f"\n... [truncated, {len(content) - remaining_budget} more chars]"
-                    content_entries.append(f"\n--- {rel_path} ---\n```{file_ext.lstrip('.')}\n{content}\n```\n")
-                    total_content_chars += len(content)
-                except Exception:
-                    file_entries.append(f"- {rel_path} ({size_str}, unreadable)")
-        elif file_ext in _BINARY_EXTS:
-            file_entries.append(f"- {rel_path} ({size_str}, binary)")
-        else:
-            file_entries.append(f"- {rel_path} ({size_str})")
-
-    if not file_entries:
+    if not tree_entries:
         lines.append("(Workspace is empty)")
-        lines.append("=== END WORKSPACE FILES ===")
+        lines.append("=== END WORKSPACE TREE ===")
         return "\n".join(lines)
 
-    lines.append("Files in workspace:")
-    lines.extend(file_entries)
-
-    if content_entries:
-        lines.append("\nFile Contents:")
-        lines.extend(content_entries)
-
-    lines.append("=== END WORKSPACE FILES ===")
+    lines.extend(tree_entries)
+    lines.append("=== END WORKSPACE TREE ===")
     return "\n".join(lines)
 
 
@@ -1788,6 +1811,36 @@ class LollmsPersonality:
         """Clears the agent's internal multi-turn conversation memory."""
         self._conversation = []
 
+    def save_history_to_disk(self, history_file: Path) -> None:
+        """Persists the internal conversation history to a JSON file."""
+        if not history_file:
+            return
+        try:
+            history_file.parent.mkdir(parents=True, exist_ok=True)
+            import json as _json
+            history_file.write_text(
+                _json.dumps(self._conversation, indent=2, ensure_ascii=False),
+                encoding="utf-8"
+            )
+        except Exception as e:
+            ASCIIColors.warning(f"[{self.name}] Failed to save history to disk: {e}")
+
+    def load_history_from_disk(self, history_file: Path) -> None:
+        """Loads the internal conversation history from a JSON file."""
+        if not history_file or not history_file.exists():
+            self._conversation = []
+            return
+        try:
+            import json as _json
+            data = _json.loads(history_file.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                self._conversation = data
+            else:
+                self._conversation = []
+        except Exception as e:
+            ASCIIColors.warning(f"[{self.name}] Failed to load history from disk: {e}")
+            self._conversation = []
+
     def generate(
         self,
         prompt: str,
@@ -2585,6 +2638,21 @@ class LollmsPersonality:
             ASCIIColors.error(f"[{self.name}] Failed to wipe memories: {e}")
             return False
 
+    def _get_collapsed_folders_from_db(self) -> set:
+        if not hasattr(self, '_state_db_path'):
+            return set()
+        try:
+            import sqlite3 as _sqlite3
+            conn = _sqlite3.connect(str(self._state_db_path))
+            cursor = conn.cursor()
+            cursor.execute("SELECT path FROM collapsed_folders")
+            return {row[0] for row in cursor.fetchall()}
+        except Exception:
+            return set()
+        finally:
+            if 'conn' in locals():
+                conn.close()
+
     def _build_workspace_context_block(self) -> str:
         import time as _time
         current_time = _time.time()
@@ -2595,11 +2663,13 @@ class LollmsPersonality:
                     if zone:
                         return "\n" + zone
                     if self._resolved_workspace:
-                        return "\n" + _build_workspace_context(self._resolved_workspace)
+                        collapsed = self._get_collapsed_folders_from_db()
+                        return "\n" + _build_workspace_context(self._resolved_workspace, collapsed_folders=collapsed)
                 except Exception:
                     pass
             elif self._resolved_workspace:
-                return "\n" + _build_workspace_context(self._resolved_workspace)
+                collapsed = self._get_collapsed_folders_from_db()
+                return "\n" + _build_workspace_context(self._resolved_workspace, collapsed_folders=collapsed)
             return ""
 
         object.__setattr__(self, '_last_ws_sync_time', current_time)
@@ -2610,15 +2680,17 @@ class LollmsPersonality:
                 zone = self._artefact_manager.build_artefacts_context_zone()
                 if zone:
                     return "\n" + zone
-                # Fallback if artefact manager returns empty string but workspace exists
                 if self._resolved_workspace:
-                    return "\n" + _build_workspace_context(self._resolved_workspace)
+                    collapsed = self._get_collapsed_folders_from_db()
+                    return "\n" + _build_workspace_context(self._resolved_workspace, collapsed_folders=collapsed)
             except Exception as e:
                 ASCIIColors.warning(f"[{self.name}] Failed to build workspace context: {e}")
                 if self._resolved_workspace:
-                    return "\n" + _build_workspace_context(self._resolved_workspace)
+                    collapsed = self._get_collapsed_folders_from_db()
+                    return "\n" + _build_workspace_context(self._resolved_workspace, collapsed_folders=collapsed)
         elif self._resolved_workspace:
-            return "\n" + _build_workspace_context(self._resolved_workspace)
+            collapsed = self._get_collapsed_folders_from_db()
+            return "\n" + _build_workspace_context(self._resolved_workspace, collapsed_folders=collapsed)
         return ""
     
     
@@ -2664,6 +2736,22 @@ class LollmsPersonality:
                 lower_name = dir_name.lower()
                 if lower_name in _COLLAPSED_DIRS: return True
                 if lower_name.endswith(".egg-info") or lower_name.endswith(".dist-info"): return True
+                return False
+
+            def _is_pinned(path_str: str) -> bool:
+                if not hasattr(self, '_artefact_manager') or not self._artefact_manager:
+                    return False
+                try:
+                    norm_path = path_str.replace("\\", "/").strip().lower()
+                    if norm_path.startswith("./"):
+                        norm_path = norm_path[2:]
+                    arts = self._artefact_manager._get_all_raw()
+                    for art in arts:
+                        title = art.get("title", "").replace("\\", "/").strip().lower()
+                        if title == norm_path:
+                            return art.get("visibility") == ArtefactVisibility.PINNED
+                except Exception:
+                    pass
                 return False
 
             def _scan_dir(directory: Path):
@@ -2989,7 +3077,7 @@ JSON:"""
             if max_ctx > 0:
                 threshold = int(max_ctx * 0.50)
                 if telemetry["loaded_contents"] > threshold:
-                    ASCIIColors.warning(f"[{self.name}] 🚨 Hard Context Budget Guard: Loaded files consume {telemetry['loaded_contents']:,} tokens (> 50% of {max_ctx:,}). Autonomously locking large files to prevent collapse.")
+                    ASCIIColors.warning(f"[{self.name}] 🚨 Hard Context Budget Guard: Loaded files consume {telemetry['loaded_contents']:,} tokens (> 50% of {max_ctx:,}). Autonomously locking large non-pinned files to prevent collapse.")
 
                     if hasattr(self, '_artefact_manager') and self._artefact_manager:
                         from lollms_client.lollms_artefact import ArtefactVisibility
@@ -3031,6 +3119,92 @@ JSON:"""
             pass
 
         return telemetry
+
+    def _apply_rolling_artifact_compaction(self, virtual_history: List, base_conversation: List[Dict[str, str]]) -> List:
+        """
+        Enforces the Rolling Window Compaction Protocol.
+        Keeps only the last 4 consecutive artifact operations in virtual_history.
+        Evicts older ones and syncs their final state into the Base Context.
+        Pinned files are exempt from eviction.
+        """
+        if not virtual_history:
+            return virtual_history
+
+        artifact_indices = [
+            i for i, vh in enumerate(virtual_history)
+            if vh.sender_type == "assistant" and ("<artifact" in vh.content.lower() or "<artefact" in vh.content.lower())
+        ]
+
+        if len(artifact_indices) <= 4:
+            return virtual_history
+
+        oldest_artifact_idx = artifact_indices[0]
+        next_user_idx = oldest_artifact_idx + 1
+        while next_user_idx < len(virtual_history) and virtual_history[next_user_idx].sender_type != "user":
+            next_user_idx += 1
+
+        if next_user_idx < len(virtual_history):
+            next_user_idx += 1
+
+        evicted_history = virtual_history[:next_user_idx]
+        surviving_history = virtual_history[next_user_idx:]
+
+        self._sync_base_context_artifacts(base_conversation, evicted_history)
+
+        return surviving_history
+
+    def _compact_virtual_history(self, virtual_history: List, base_conversation: List[Dict[str, str]], streaming_callback: Optional[Callable]) -> List:
+        """
+        Autonomously summarizes the virtual history to free up context space.
+        Pinned files are exempt from eviction.
+        """
+        if not virtual_history or not self.lollms_client:
+            return virtual_history
+
+        self._sync_base_context_artifacts(base_conversation, virtual_history)
+
+        if streaming_callback:
+            compaction_msg = '\n<processing type="context_compaction" title="Autonomous Context Compaction">\n* 🧹 Context window approaching limit. Summarizing history to free up space...\n</processing>\n'
+            try:
+                streaming_callback(compaction_msg, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            except Exception:
+                pass
+
+        history_text = "\n\n".join([f"[{vh.sender_type}]: {vh.content}" for vh in virtual_history])
+
+        summary_prompt = (
+            "You are a context compaction engine. Summarize the following conversation history into a dense, factual summary.\n"
+            "Focus on retaining: user goals, key data retrieved from tools, file names created/modified, and final conclusions.\n"
+            "Discard: conversational pleasantries, intermediate reasoning steps, and verbose tool outputs.\n\n"
+            f"=== HISTORY TO COMPACT ===\n{history_text}\n=== END HISTORY ==="
+        )
+
+        try:
+            summary = self.lollms_client.generate_text(
+                prompt=summary_prompt,
+                temperature=0.1,
+                n_predict=1024
+            )
+            if not isinstance(summary, str) or not summary.strip():
+                return virtual_history
+
+            compacted_history = [SimpleNamespace(
+                sender_type="user",
+                content=f"[SYSTEM: AUTONOMOUS CONTEXT COMPACTION]\nThe previous history has been summarized to save space. Use this summary as your working context:\n\n{summary.strip()}"
+            )]
+
+            if streaming_callback:
+                success_msg = f'\n<processing type="context_compaction" title="Autonomous Context Compaction">\n* ✅ History compacted successfully. Context freed.\n</processing>\n'
+                try:
+                    streaming_callback(success_msg, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                except Exception:
+                    pass
+
+            return compacted_history
+
+        except Exception as e:
+            ASCIIColors.warning(f"[{self.name}] Context compaction failed: {e}")
+            return virtual_history
 
     def _build_telemetry_block(self, telemetry: Dict[str, int]) -> str:
         """Formats the telemetry dictionary into a readable string for the LLM."""
@@ -3189,11 +3363,16 @@ JSON:"""
                     hash TEXT
                 )
             """)
-            # Migration for existing DBs
             try:
                 cursor.execute("ALTER TABLE file_states ADD COLUMN hash TEXT")
             except _sqlite3.OperationalError:
                 pass
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS collapsed_folders (
+                    path TEXT PRIMARY KEY
+                )
+            """)
             conn.commit()
             conn.close()
 
@@ -3287,12 +3466,22 @@ JSON:"""
             # Only strip bulky XML tag *bodies* (full artifact content, full tool JSON)
             # to save context, but keep the LLM's own words exactly as it wrote them.
             # NEVER replace with synthetic placeholders or [Action: ...] summaries here.
+            # CRITICAL: Preserve <tool_result> content inside <processing> blocks so the
+            # model retains access to its own tool outputs in subsequent reasoning rounds.
 
-            text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
             text = re.sub(r'<!-- status:[^>]*-->', '', text, flags=re.IGNORECASE)
-            text = re.sub(r'</processing>', '', text, flags=re.IGNORECASE)
             text = re.sub(r'<lollms_artifact[^/]*/>', '', text, flags=re.IGNORECASE)
             text = re.sub(r'<artefact_image[^/]*/>', '', text, flags=re.IGNORECASE)
+
+            def _preserve_tool_results_in_processing(m):
+                block = m.group(0)
+                tool_result_match = re.search(r'<tool_result[^>]*>.*?</tool_result>', block, re.DOTALL | re.IGNORECASE)
+                if tool_result_match:
+                    return tool_result_match.group(0)
+                return ''
+
+            text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', _preserve_tool_results_in_processing, text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'</processing>', '', text, flags=re.IGNORECASE)
 
             # Strip bulky tag BODIES but preserve surrounding conversational text
             text = re.sub(
@@ -3323,11 +3512,21 @@ JSON:"""
                 text = "[Action executed with no conversational text]"
         else:
             # ── 🧹 AGGRESSIVE COMPRESSION ZONE (Older Actions, distance >= 4) ──
-            text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
+            # CRITICAL: Even in the compression zone, preserve <tool_result> content
+            # so the model can reference data from older rounds without re-querying.
             text = re.sub(r'<!-- status:[^>]*-->', '', text, flags=re.IGNORECASE)
-            text = re.sub(r'</processing>', '', text, flags=re.IGNORECASE)
             text = re.sub(r'<lollms_artifact[^/]*/>', '', text, flags=re.IGNORECASE)
             text = re.sub(r'<artefact_image[^/]*/>', '', text, flags=re.IGNORECASE)
+
+            def _preserve_tool_results_in_processing_old(m):
+                block = m.group(0)
+                tool_result_match = re.search(r'<tool_result[^>]*>.*?</tool_result>', block, re.DOTALL | re.IGNORECASE)
+                if tool_result_match:
+                    return tool_result_match.group(0)
+                return ''
+
+            text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', _preserve_tool_results_in_processing_old, text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'</processing>', '', text, flags=re.IGNORECASE)
             text = re.sub(r'<art(?:ifact|efact)[^>]*>.*?</art(?:ifact|efact)>', '[🔒 Artifact stripped]', text, flags=re.DOTALL | re.IGNORECASE)
             text = re.sub(r'<tool>.*?</tool>', '[🔒 Tool stripped]', text, flags=re.DOTALL | re.IGNORECASE)
             text = re.sub(r'<(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>.*?</(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>', '[🔒 Context op stripped]', text, flags=re.DOTALL | re.IGNORECASE)
@@ -3895,7 +4094,23 @@ JSON:"""
             "    - Example of WRONG behavior: `<tool>{\"name\": \"find_file\", \"parameters\": {\"pattern\": \"config.yml\"}}</tool>` followed by `<tool>{\"name\": \"read_file\", \"parameters\": {\"path\": \"./config.yml\"}}</tool>` (The path is guessed).\n"
             "    - Example of CORRECT behavior: Emit `<tool>{\"name\": \"find_file\", \"parameters\": {\"pattern\": \"config.yml\"}}</tool>` and end your turn. In the next turn, use the returned path to call `read_file`.\n"
             "11. **EXPLANATION BEFORE ARTIFACTS (MANDATORY)**: Before emitting an `<artifact>` tag, you MUST provide a brief, 2-3 sentence explanation of what you are about to write and why. Do NOT emit the `<artifact>` tag as the very first token of your response.\n"
-            "\n=== TOOL CALLING DISCIPLINE (CRITICAL) ===\n"
+            "\n=== TOOL CALLING DISCIPLINE (XML HYBRID PROTOCOL) ===\n"
+            "To call a tool, you have TWO options. **Option 1 is strongly preferred for code execution** to avoid escaping errors.\n\n"
+            "OPTION 1: Raw XML Parameters (No JSON escaping needed)\n"
+            "Use this for tools with code or long text parameters. Wrap each parameter in its own tag.\n"
+            "<tool>\n"
+            "  <tool_name name=\"tool_execute_python_code\" />\n"
+            "  <parameter name=\"code\">\n"
+            "import sys\n"
+            "print(\"Hello World\")\n"
+            "  </parameter>\n"
+            "</tool>\n\n"
+            "OPTION 2: JSON Parameters (For simple, non-code parameters)\n"
+            "Use this for simple parameters (filenames, booleans, numbers).\n"
+            "<tool>\n"
+            "  <tool_name name=\"tool_find_files\" />\n"
+            "  <parameters>{\"pattern\": \"*.py\", \"path\": \".\"}</parameters>\n"
+            "</tool>\n\n"
             "1. **Tool Results ≠ Tool Calls**: When a tool returns JSON, it's a RESULT, not a new call.\n"
             "2. **One Call Per Task**: Once a tool succeeds, analyze and answer.\n"
             "3. **Loop Prevention**: Repeating a successful tool call with identical parameters is a CRITICAL ERROR.\n"
@@ -3976,16 +4191,12 @@ JSON:"""
             f"{onboarding_block}"
             "\n=== THINKING & REASONING CONSTRAINT ===\n"
             "If you output thoughts enclosed in  tags, you MUST output all functional XML tags AFTER the closing tag.\n"
-            "\n=== TOOL CALLING DISCIPLINE (CRITICAL) ===\n"
+            "\n=== TOOL CALLING SYNTAX (STRICT) ===\n"
             "1. **EXACT CLOSING TAG**: The closing tag is `</tool>`. You MUST NOT write ``` or any other variation.\n"
             "2. **NEW LINE ONLY**: The `<tool>` tag MUST start on a brand new line.\n"
             "3. **NO PROSE AROUND IT**: Do NOT write introductory text before the tag, and do NOT write text after it on the same line.\n"
-            "4. **EXACT JSON FORMAT**: The content inside the `<tool>` tag MUST be a valid JSON object with `name` and `parameters` keys.\n"
-            "\nExample of CORRECT behavior:\n"
-            "<tool>{\"name\": \"tool_search_files\", \"parameters\": {\"pattern\": \"TODO\"}}</tool>\n\n"
-            "Example of WRONG (XML attributes, forbidden):\n"
-            "<tool_execute_shell_command command=\"type ..\\README.md\" />\n\n"
-            "=== END TOOL CALLING DISCIPLINE ===\n"
+            "4. **XML HYBRID FORMAT**: You MUST use `<tool_name name=\"...\" />` inside the `<tool>` tag.\n"
+            "=== END TOOL CALLING SYNTAX ===\n"
             "\n=== ANTI-MIMICRY PROTOCOL (CRITICAL) ===\n"
             "1. **NEVER OUTPUT SYSTEM MARKERS**: You are STRICTLY FORBIDDEN from generating `<processing>` blocks or `[SYSTEM:` markers.\n"
             "2. **USE REAL TAGS**: To call tools, use the actual `<tool>` XML tags.\n"
@@ -4035,6 +4246,27 @@ JSON:"""
             "<refactor_history></refactor_history>\n"
             "This will trigger an autonomous background process that summarizes the older conversation history into a dense, factual block,\n"
             "freeing up massive amounts of context space without losing critical state.\n"
+            "\n=== EPHEMERAL CONTEXT & SCRATCHPAD ENFORCEMENT (CRITICAL) ===\n"
+            "When you load a file into your context using `<unlock_file>`, its content is visible to you ONLY for the current turn.\n"
+            "Once you emit `<done/>` or the turn ends, the file content is EVICTED from the active context window.\n"
+            "If you need to remember specific details from that file for future turns (e.g., a variable name, a function signature, a configuration value),\n"
+            "you MUST extract those notes and write them to your Scratchpad using `<scratchpad_append>` BEFORE finishing your turn.\n"
+            "Do not rely on your ability to 're-read' the file later, as context budget may prevent re-loading.\n"
+            "=== END EPHEMERAL CONTEXT ENFORCEMENT ===\n"
+            "\n=== WORKSPACE TREE COMPACTION PROTOCOL ===\n"
+            "The workspace tree is COMPACTED to save context tokens. Deep directories are marked as `[📁 DEEP]`.\n"
+            "Large directories are auto-collapsed and marked as `[📁 COLLAPSED]` with an item count.\n"
+            "To see the contents of a collapsed or deep folder, emit:\n"
+            "<uncollapse_folder>folder_name/</uncollapse_folder>\n"
+            "To collapse it again (saving context), emit:\n"
+            "<collapse_folder>folder_name/</collapse_folder>\n"
+            "\n=== STICKY CONTEXT & PINNING (CRITICAL FOR CODING) ===\n"
+            "When performing complex coding tasks or cross-file refactoring, you need to keep the exact source code of the files you are editing in your context.\n"
+            "To prevent the system from auto-locking or evicting these files, you can PIN them:\n"
+            "- `<pin_file>filename.py</pin_file>`: Pins a file. It will be marked as [📌 Pinned] and its content will NEVER be evicted or auto-locked.\n"
+            "- `<unpin_file>filename.py</unpin_file>`: Unpins a file, returning it to normal [C] loaded state (subject to budget guards).\n"
+            "You can pin multiple files simultaneously to see them side-by-side in your context.\n"
+            "=== END STICKY CONTEXT & PINNING ===\n"
         )
 
         memory_instructions = ""
@@ -4133,6 +4365,12 @@ JSON:"""
         elif tag_name == "uncollapse_folder":
             target_visibility = ArtefactVisibility.TREE_UNLOCKABLE
             action_verb = "Uncollapsing"
+        elif tag_name == "pin_file":
+            target_visibility = ArtefactVisibility.PINNED
+            action_verb = "Pinning"
+        elif tag_name == "unpin_file":
+            target_visibility = ArtefactVisibility.FULL
+            action_verb = "Unpinning"
 
         clean_body = body
         if "<" in body and ">" in body:
@@ -4190,6 +4428,31 @@ JSON:"""
 
         for t_target in targets:
             if tag_name in ("collapse_folder", "uncollapse_folder"):
+                import sqlite3 as _sqlite3
+
+                folder_path_normalized = t_target.strip().replace("\\", "/").rstrip("/")
+                if not folder_path_normalized:
+                    continue
+
+                try:
+                    conn = _sqlite3.connect(str(self._state_db_path))
+                    cursor = conn.cursor()
+                    if tag_name == "collapse_folder":
+                        cursor.execute("INSERT OR REPLACE INTO collapsed_folders (path) VALUES (?)", (folder_path_normalized,))
+                        action_verb = "Collapsing"
+                    else:
+                        cursor.execute("DELETE FROM collapsed_folders WHERE path = ?", (folder_path_normalized,))
+                        action_verb = "Uncollapsing"
+                    conn.commit()
+                    conn.close()
+
+                    processed_files.append(folder_path_normalized)
+                    object.__setattr__(self, '_last_ws_sync_time', 0.0)
+                    continue
+                except Exception as db_err:
+                    ASCIIColors.warning(f"[{self.name}] Failed to update collapsed_folders DB: {db_err}")
+                    continue
+
                 folder_prefix = t_target.rstrip('/') + '/'
                 matched_arts = [a for a in all_arts if a.get("physical_path", "").replace("\\", "/").startswith(folder_prefix)]
 
@@ -4342,19 +4605,28 @@ JSON:"""
             )
 
         active_files_list = []
+        pinned_files_list = []
         if hasattr(self, '_artefact_manager') and self._artefact_manager:
             current_arts = self._artefact_manager._get_all_raw()
-            active_files_list = [
-                a.get("title", "") for a in current_arts
-                if a.get("visibility") == ArtefactVisibility.FULL
-                and not a.get("title", "").endswith("::images")
-            ]
+            for a in current_arts:
+                title = a.get("title", "")
+                if title.endswith("::images"):
+                    continue
+                vis = a.get("visibility")
+                if vis == ArtefactVisibility.PINNED:
+                    pinned_files_list.append(title)
+                elif vis == ArtefactVisibility.FULL:
+                    active_files_list.append(title)
 
+        if pinned_files_list:
+            status_parts.append("\n📌 Pinned in Context (Sticky):")
+            for f_name in sorted(pinned_files_list):
+                status_parts.append(f"  - {f_name}")
         if active_files_list:
-            status_parts.append("\n📂 Currently Loaded in Context [C]:")
+            status_parts.append("\n📂 Loaded in Context [C]:")
             for f_name in sorted(active_files_list):
                 status_parts.append(f"  - {f_name}")
-        else:
+        if not active_files_list and not pinned_files_list:
             status_parts.append("\n📂 No files are currently loaded in context.")
 
         status_meta = "failure" if (not_found or blocked_files) else "success"
@@ -4624,6 +4896,30 @@ JSON:"""
 
         telemetry = self._calculate_context_telemetry(stable_system_prompt, base_conversation, ws_ctx or "", [])
         telemetry_block = self._build_telemetry_block(telemetry)
+
+        if telemetry.get("total", 0) > 0 and telemetry.get("fill_percentage", 0) > 90.0:
+            ASCIIColors.warning(f"[{self.name}] 🚨 PRE-GENERATION CONTEXT OVERFLOW: {telemetry.get('fill_percentage', 0):.1f}% fill detected before LLM generation. Triggering emergency context recovery.")
+
+            if hasattr(self, '_artefact_manager') and self._artefact_manager:
+                try:
+                    from lollms_client.lollms_artefact import ArtefactVisibility
+                    all_arts = self._artefact_manager._get_all_raw()
+                    loaded_files = [
+                        a.get("title", "") for a in all_arts
+                        if a.get("visibility") == ArtefactVisibility.FULL
+                        and a.get("visibility") != ArtefactVisibility.PINNED
+                        and not a.get("title", "").endswith("::images")
+                    ]
+                    if loaded_files:
+                        ASCIIColors.warning(f"[{self.name}] 🚨 Emergency-locking {len(loaded_files)} non-pinned loaded file(s) to prevent context collapse.")
+                        self._execute_context_visibility("lock_file", "\n".join(loaded_files))
+                        object.__setattr__(self, '_last_ws_sync_time', 0.0)
+                        ws_ctx = self._build_workspace_context_block()
+                        telemetry = self._calculate_context_telemetry(stable_system_prompt, base_conversation, ws_ctx or "", [])
+                        telemetry_block = self._build_telemetry_block(telemetry)
+                except Exception as emergency_err:
+                    ASCIIColors.warning(f"[{self.name}] Emergency context recovery failed: {emergency_err}")
+
         if telemetry_block:
             dynamic_suffix_parts.append(telemetry_block)
 
@@ -4654,6 +4950,45 @@ JSON:"""
 
             if getattr(self, 'debug_mode', False):
                 ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count}/{self._max_rounds} START ===")
+
+            pre_gen_telemetry = self._calculate_context_telemetry(
+                stable_system_prompt, base_conversation,
+                self._build_workspace_context_block() if hasattr(self, '_build_workspace_context_block') else "",
+                virtual_history
+            )
+            pre_gen_fill = pre_gen_telemetry.get("fill_percentage", 0.0)
+            if pre_gen_fill > 98.0 and round_count == 1:
+                ASCIIColors.error(f"[{self.name}] 🛑 CONTEXT WINDOW EXHAUSTED ({pre_gen_fill:.1f}% fill). Cannot generate — the system prompt + workspace context exceeds the model's context window ({pre_gen_telemetry.get('total', 0):,} / {pre_gen_telemetry.get('max_tokens', 0):,} tokens). Refusing to generate to prevent silent empty-response exit.")
+
+                if streaming_callback:
+                    try:
+                        diagnostic_msg = (
+                            f"\n⚠️ **Context Window Exhausted** ({pre_gen_fill:.1f}% fill)\n\n"
+                            f"The combined system prompt, workspace tree, and loaded file contents "
+                            f"({pre_gen_telemetry.get('total', 0):,} tokens) exceed your model's context "
+                            f"window ({pre_gen_telemetry.get('max_tokens', 0):,} tokens).\n\n"
+                            f"**Breakdown:**\n"
+                            f"- System Prompt: {pre_gen_telemetry.get('system_prompt', 0):,} tokens\n"
+                            f"- History: {pre_gen_telemetry.get('history', 0):,} tokens\n"
+                            f"- Workspace Tree: {pre_gen_telemetry.get('workspace_tree', 0):,} tokens\n"
+                            f"- Loaded Files: {pre_gen_telemetry.get('loaded_contents', 0):,} tokens\n"
+                            f"- Virtual History: {pre_gen_telemetry.get('virtual_history', 0):,} tokens\n\n"
+                            f"**Suggested actions:**\n"
+                            f"1. Use `/clear-files` to unload all files from context\n"
+                            f"2. Use `/clear-history` to clear conversation history\n"
+                            f"3. Lock or hide large directories (e.g., `exports/`)\n"
+                            f"4. Switch to a model with a larger context window\n"
+                        )
+                        streaming_callback(diagnostic_msg, MSG_TYPE.MSG_TYPE_CHUNK, {})
+                    except Exception:
+                        pass
+
+                final_response = (
+                    f"[Context Window Exhausted: The system prompt + workspace context ({pre_gen_telemetry.get('total', 0):,} tokens) "
+                    f"exceeds the model's context window ({pre_gen_telemetry.get('max_tokens', 0):,} tokens). "
+                    f"Please unload files, clear history, or use a model with a larger context window.]"
+                )
+                break
 
             if hasattr(self.lollms_client, 'llm') and hasattr(self.lollms_client.llm, 'reset_cancel'):
                 try:
@@ -5188,7 +5523,7 @@ JSON:"""
                                         action_reports.append(f"✅ Memory updated successfully: {mem_id}")
                                     continue
 
-                                body_match = re.search(r'<(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>(.*?)</(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>', raw_xml, re.DOTALL | re.IGNORECASE)
+                                body_match = re.search(r'<(?:unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder)[^>]*>(.*?)</(?:unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder)>', raw_xml, re.DOTALL | re.IGNORECASE)
                                 body_content = body_match.group(1).strip() if body_match else ""
 
                                 context_sig = f"{tag_name}::{body_content}"
@@ -5650,7 +5985,7 @@ JSON:"""
                                         streaming_callback(f'<status>success</status>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                                 continue
 
-                            body_match = re.search(r'<(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)[^>]*>(.*?)</(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>', raw_xml, re.DOTALL | re.IGNORECASE)
+                            body_match = re.search(r'<(?:unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder)[^>]*>(.*?)</(?:unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder)>', raw_xml, re.DOTALL | re.IGNORECASE)
                             body_content = body_match.group(1).strip() if body_match else ""
 
                             if not body_content:
@@ -6096,6 +6431,41 @@ JSON:"""
                 final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
 
             stripped_final_check = re.sub(r'<[^>]+>', '', final_response).strip()
+
+            if (
+                not was_cancelled
+                and not tool_calls_this_turn
+                and not workspace_changes
+                and not getattr(self, '_consecutive_stall_count', 0) >= 3
+                and not stripped_final_check
+                and round_count == 1
+                and not ss.was_done_detected()
+                and not ss.was_action_dispatched()
+            ):
+                empty_response_count = getattr(self, '_consecutive_empty_responses', 0) + 1
+                object.__setattr__(self, '_consecutive_empty_responses', empty_response_count)
+
+                if empty_response_count >= 2:
+                    ASCIIColors.warning(f"[{self.name}] Consecutive empty responses with no actions or <done/> ({empty_response_count}). Likely context exhaustion or model failure. Terminating.")
+                    final_response = (
+                        "[Empty response: The LLM produced 0 tokens. This typically indicates the context window is exhausted "
+                        "(input exceeds the model's maximum context length). Try unloading files with /clear-files, "
+                        "clearing history with /clear-history, or switching to a model with a larger context window.]"
+                    )
+                    break
+
+                ASCIIColors.warning(f"[{self.name}] Empty LLM response on round 1 (no actions, no <done/>). Possible context exhaustion. Injecting continuation mandate (attempt {empty_response_count}).")
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content=(
+                        "[SYSTEM: Your previous response was completely empty (0 tokens generated). "
+                        "This usually means the context window is full. "
+                        "If you can see this message, respond with a brief status and emit <done/>. "
+                        "If you cannot generate any text, the user needs to reduce the context load.]"
+                    )
+                ))
+                ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
+                continue
 
             if (
                 not was_cancelled

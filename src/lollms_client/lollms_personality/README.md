@@ -262,6 +262,10 @@ When an agent or discussion emits `<skill title="..." description="..." category
 2. **Discussion Artefact Destination**: If the personality has no handbag (manual in-code definition), the skill is saved as an artifact (`ArtefactType.SKILL`) in the discussion workspace.
 3. **Live Telemetry**: During generation, the stream emits `MSG_TYPE_SKILL_CHUNK` (`42`) on every token and `MSG_TYPE_SKILL_DONE` (`43`) upon completion.
 
+#### Automatic Functional Tag Sanitization
+When a skill is created or updated via `tool_create_skill` or `tool_update_skill`, the `SkillsManager` automatically sanitizes the content to remove any LLM-generated functional tags (e.g., `<tool>`, `<artifact>`, `<unlock_file>`, `<mem_new>`).
+**Why**: The LLM often includes examples of how to use these tags inside the skill documentation. If left intact, these tags can be intercepted by the system's XML parser during context export, leading to truncated or corrupted `SKILL.md` files. The `_strip_functional_tags` method ensures that the persisted skill is pure Markdown text.
+
 ---
 
 ## ⚡ 4. Buffered Execution Strategy & Streaming Protocol

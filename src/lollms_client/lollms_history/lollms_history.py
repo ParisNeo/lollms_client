@@ -82,11 +82,21 @@ class HistoryManager:
             return ""
 
         # Step 1: Strip system-generated runner execution blocks and comments in all tiers
-        text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
+        # CRITICAL: Preserve <tool_result> content inside <processing> blocks so the model
+        # retains access to its own tool outputs in subsequent reasoning rounds.
         text = re.sub(r'<!--\s*status:[^>]*-->', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'</processing>', '', text, flags=re.IGNORECASE)
         text = re.sub(r'<lollms_artifact[^/]*/>', '', text, flags=re.IGNORECASE)
         text = re.sub(r'<artefact_image[^/]*/>', '', text, flags=re.IGNORECASE)
+
+        def _preserve_tool_results_in_processing(m):
+            block = m.group(0)
+            tool_result_match = re.search(r'<tool_result[^>]*>.*?</tool_result>', block, re.DOTALL | re.IGNORECASE)
+            if tool_result_match:
+                return tool_result_match.group(0)
+            return ''
+
+        text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', _preserve_tool_results_in_processing, text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'</processing>', '', text, flags=re.IGNORECASE)
 
         if distance_from_end < 4:
             # ── 🔒 STRICT PRESERVATION ZONE (Last 4 Actions) ──

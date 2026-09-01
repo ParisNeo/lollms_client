@@ -874,8 +874,8 @@ class _AgentStreamState:
             self._try_complete_context_tag()
             return True
 
-        if not self._in_think_block and not self._in_code_fence and not self._in_inline_code:
-            tool_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<tool>', self._pending_buffer, re.IGNORECASE)
+        if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence and not self._in_inline_code:
+            tool_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<tool(?:\s+name=["\'][^"\']*["\'])?\s*>', self._pending_buffer, re.IGNORECASE)
             if tool_match:
                 tag_start_idx = tool_match.start()
                 text_before = self._pending_buffer[:tag_start_idx]
@@ -1005,7 +1005,7 @@ class _AgentStreamState:
                 self._try_complete_context_tag()
                 return True
 
-            context_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<(unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|user_profile_update|user_profile_clear|mem_new|mem_update)\b', self._pending_buffer, re.IGNORECASE)
+            context_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<(unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|user_profile_update|user_profile_clear|mem_new|mem_update)\b', self._pending_buffer, re.IGNORECASE)
             if context_match:
                 tag_start_idx = context_match.start()
                 tag_name = context_match.group(1).lower()
@@ -1031,7 +1031,7 @@ class _AgentStreamState:
 
         def _ends_with_partial_tag(buffer: str) -> int:
             tags_to_check = [
-                "<tool", "<done", "<artifact", "<artefact", "<unlock_file", "<lock_file",
+                "<tool", "<tool_name", "<done", "<artifact", "<artefact", "<unlock_file", "<lock_file",
                 "<hide_file", "<refactor_history", "<collapse_folder", "<uncollapse_folder",
                 "<scratchpad_append", "<scratchpad_patch", "<scratchpad_clear",
                 "<user_profile_update", "<user_profile_clear", "<mem_new", "<mem_update", "<think"
@@ -1118,6 +1118,38 @@ class _AgentStreamState:
 
         return None
 
+    def _parse_xml_tool_block(self, content_between_tags: str) -> Optional[Dict[str, Any]]:
+        """
+        Parses the XML-based tool calling protocol.
+        Supports <parameters>{"json": "..."}</parameters> and <parameter name="...">raw text</parameter>.
+        """
+        import re as _re
+        import json as _json
+
+        tool_name_match = _re.search(r'<tool_name\s+name=["\']([^"\']+)["\']\s*/>', content_between_tags, _re.IGNORECASE)
+        if not tool_name_match:
+            return None
+
+        tool_name = tool_name_match.group(1).strip()
+        params = {}
+
+        json_params_match = _re.search(r'<parameters>(.*?)</parameters>', content_between_tags, _re.DOTALL | _re.IGNORECASE)
+        if json_params_match:
+            json_str = json_params_match.group(1).strip()
+            try:
+                parsed_json = _json.loads(json_str)
+                if isinstance(parsed_json, dict):
+                    params.update(parsed_json)
+            except _json.JSONDecodeError:
+                pass
+
+        for m in _re.finditer(r'<parameter\s+name=["\']([^"\']+)["\']\s*>(.*?)</parameter>', content_between_tags, _re.DOTALL | _re.IGNORECASE):
+            param_name = m.group(1).strip()
+            param_value = m.group(2).strip()
+            params[param_name] = param_value
+
+        return {"name": tool_name, "parameters": params}
+
     def _try_complete_tool(self) -> None:
         close_match = re.search(r'</tool>\s*', self._tool_buffer, re.IGNORECASE)
         if not close_match:
@@ -1134,12 +1166,6 @@ class _AgentStreamState:
         else:
             content_between_tags = full_tool_call[:end_idx]
 
-        json_body = self._extract_balanced_json(content_between_tags)
-        if json_body is None:
-            json_body = content_between_tags.strip()
-            if not json_body:
-                json_body = "{}"
-
         self._is_accumulating_tool = False
         remaining = self._tool_buffer[end_idx + end_len:]
         self._tool_buffer = ""
@@ -1152,35 +1178,32 @@ class _AgentStreamState:
         resolved_tool_name = "malformed_tool_call"
         resolved_params = {}
 
-        def _fix_unescaped_backslashes(text: str) -> str:
-            valid_json_escapes = r'\\(["\\/bfnrtu])'
-            def replacer(m):
-                if m.group(1) in ('"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u'):
-                    return m.group(0)
-                return '\\\\' + m.group(1)
-            return re.sub(valid_json_escapes, replacer, text)
+        xml_data = self._parse_xml_tool_block(content_between_tags)
+        if xml_data:
+            raw_data = xml_data
+            resolved_tool_name = raw_data.get("name", "malformed_tool_call")
+            resolved_params = raw_data.get("parameters", {})
+            if not isinstance(resolved_params, dict):
+                resolved_params = {}
+        else:
+            json_body = self._extract_balanced_json(content_between_tags)
+            if json_body is None:
+                json_body = content_between_tags.strip()
+                if not json_body:
+                    json_body = "{}"
 
-        sanitized_json_body = _fix_unescaped_backslashes(json_body)
+            def _fix_unescaped_backslashes(text: str) -> str:
+                valid_json_escapes = r'\\(["\\/bfnrtu])'
+                def replacer(m):
+                    if m.group(1) in ('"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u'):
+                        return m.group(0)
+                    return '\\\\' + m.group(1)
+                return re.sub(valid_json_escapes, replacer, text)
 
-        try:
-            raw_data = json.loads(sanitized_json_body)
-            json_body = sanitized_json_body
-            if isinstance(raw_data, dict):
-                resolved_tool_name = raw_data.get("name", "malformed_tool_call")
-                if not resolved_tool_name:
-                    resolved_tool_name = "malformed_tool_call"
-                resolved_params = raw_data.get("parameters", {})
-                if not isinstance(resolved_params, dict):
-                    resolved_params = {}
-        except json.JSONDecodeError:
-            repaired = sanitized_json_body
-            while repaired.count('{') > repaired.count('}'):
-                repaired += '}'
-            while repaired.count('[') > repaired.count(']'):
-                repaired += ']'
+            sanitized_json_body = _fix_unescaped_backslashes(json_body)
+
             try:
-                raw_data = json.loads(repaired)
-                json_body = repaired
+                raw_data = json.loads(sanitized_json_body)
                 if isinstance(raw_data, dict):
                     resolved_tool_name = raw_data.get("name", "malformed_tool_call")
                     if not resolved_tool_name:
@@ -1189,9 +1212,24 @@ class _AgentStreamState:
                     if not isinstance(resolved_params, dict):
                         resolved_params = {}
             except json.JSONDecodeError:
-                raw_data = None
-                resolved_tool_name = "malformed_tool_call"
-                resolved_params = {}
+                repaired = sanitized_json_body
+                while repaired.count('{') > repaired.count('}'):
+                    repaired += '}'
+                while repaired.count('[') > repaired.count(']'):
+                    repaired += ']'
+                try:
+                    raw_data = json.loads(repaired)
+                    if isinstance(raw_data, dict):
+                        resolved_tool_name = raw_data.get("name", "malformed_tool_call")
+                        if not resolved_tool_name:
+                            resolved_tool_name = "malformed_tool_call"
+                        resolved_params = raw_data.get("parameters", {})
+                        if not isinstance(resolved_params, dict):
+                            resolved_params = {}
+                except json.JSONDecodeError:
+                    raw_data = None
+                    resolved_tool_name = "malformed_tool_call"
+                    resolved_params = {}
 
         if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
             try:
@@ -1206,26 +1244,10 @@ class _AgentStreamState:
         if self._event_mode == EventMode.PROCESSING_TAG_MODE:
             self._cb('\n</processing>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
-        normalized_json = json_body
-        if isinstance(raw_data, dict):
-            if "parameters" in raw_data and isinstance(raw_data["parameters"], dict):
-                if not raw_data.get("name"):
-                    params_dict = raw_data["parameters"]
-                    nested_name = params_dict.get("tool_name") or params_dict.get("name")
-                    if nested_name:
-                        params_cleaned = {k: v for k, v in params_dict.items() if k not in ("tool_name", "name")}
-                        normalized = {"name": nested_name, "parameters": params_cleaned}
-                        normalized_json = json.dumps(normalized)
-            else:
-                t_name = raw_data.get("name", "")
-                params = {k: v for k, v in raw_data.items() if k != "name"}
-                normalized = {"name": t_name, "parameters": params}
-                normalized_json = json.dumps(normalized)
-        else:
-            normalized_json = json.dumps({
-                "name": "malformed_tool_call",
-                "parameters": {"raw_body": json_body[:500]}
-            })
+        if raw_data is None:
+            raw_data = {"name": resolved_tool_name, "parameters": resolved_params}
+
+        normalized_json = json.dumps(raw_data)
 
         self.tool_json_data = normalized_json
         self.tool_trigger = True
@@ -1234,7 +1256,7 @@ class _AgentStreamState:
         if resolved_tool_name == "malformed_tool_call":
             self.completed_actions.append({
                 "type": "malformed_json",
-                "raw_body": json_body[:1000]
+                "raw_body": content_between_tags[:1000]
             })
         else:
             self.completed_actions.append({"type": "tool", "json": normalized_json})

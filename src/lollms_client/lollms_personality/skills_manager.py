@@ -91,6 +91,18 @@ class SkillsManager:
         safe_title = re.sub(r'[^\w\-]', '_', title).strip('_')
         return safe_title or "unnamed_skill"
 
+    def _strip_functional_tags(self, content: str) -> str:
+        functional_tags = [
+            r'<tool>.*?</tool>',
+            r'<art(?:ifact|efact)\b[^>]*>.*?</art(?:ifact|efact)>',
+            r'<(?:unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|user_profile_update|user_profile_clear|mem_new|mem_update|done|end|processing|tool_result|refactor_history)\b[^>]*/?>',
+            r'</(?:unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|user_profile_update|user_profile_clear|mem_new|mem_update|done|end|processing|tool_result|refactor_history)>',
+        ]
+        cleaned = content
+        for pattern in functional_tags:
+            cleaned = re.sub(pattern, '', cleaned, flags=re.DOTALL | re.IGNORECASE)
+        return cleaned.strip()
+
     def create_skill(
         self,
         title: str,
@@ -126,8 +138,9 @@ class SkillsManager:
         frontmatter += f"visibility: {visibility}\n"
         frontmatter += "---\n\n"
 
-        skill_path.write_text(frontmatter + content.strip() + "\n", encoding="utf-8")
-        
+        clean_content = self._strip_functional_tags(content)
+        skill_path.write_text(frontmatter + clean_content.strip() + "\n", encoding="utf-8")
+
         self.reload()
         return self.skills.get(title.lower())
 
@@ -171,8 +184,9 @@ class SkillsManager:
         frontmatter += f"modifiable: {'true' if skill.modifiable else 'false'}\n"
         frontmatter += "---\n\n"
 
-        skill_path.write_text(frontmatter + content.strip() + "\n", encoding="utf-8")
-        
+        clean_content = self._strip_functional_tags(content)
+        skill_path.write_text(frontmatter + clean_content.strip() + "\n", encoding="utf-8")
+
         self.reload()
         return self.skills.get(skill.title.lower())
 
@@ -194,11 +208,12 @@ class SkillsManager:
             return None
 
         existing_content = skill.file_path.read_text(encoding="utf-8", errors="ignore")
-        
+
         separator = "\n\n---\n\n"
-        new_content = existing_content.rstrip() + separator + content.strip() + "\n"
+        clean_content = self._strip_functional_tags(content)
+        new_content = existing_content.rstrip() + separator + clean_content.strip() + "\n"
         skill.file_path.write_text(new_content, encoding="utf-8")
-        
+
         self.reload()
         return self.skills.get(skill.title.lower())
 

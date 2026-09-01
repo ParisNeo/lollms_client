@@ -36,6 +36,17 @@ def apply_theme(prefs: GuiPrefs):
     ui.query("body").style(f"font-family: {prefs.font_family}")
 
 
+def main():
+    p = state["prefs"]
+    ui.run(
+        title="lollms_code",
+        native=True,
+        window_size=(p.window_width, p.window_height),
+        reload=False,
+        dark=p.dark_mode,
+    )
+
+
 @ui.page("/")
 def main_page():
     env = state["env"]
@@ -126,11 +137,4 @@ def settings_page_route():
 
 
 if __name__ in {"__main__", "__mp_main__"}:
-    p = state["prefs"]
-    ui.run(
-        title="lollms_code",
-        native=True,
-        window_size=(p.window_width, p.window_height),
-        reload=False,
-        dark=p.dark_mode,
-    )
+    main()

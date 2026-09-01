@@ -149,10 +149,17 @@ def _to_bool(v: Any) -> bool:
     return v.lower().strip() in ("true", "1", "yes", "y") if isinstance(v, str) else bool(v)
 
 
+def _resolve_modality(env: EnvStore, modality: str) -> Optional[Dict[str, Any]]:
+    """Resolves a modality binding from the EnvStore (GUI .env format)."""
+    resolved = env.resolve_default_connection(modality)
+    if not resolved.get("binding_name"):
+        return None
+    return resolved
+
+
 def create_client(env: EnvStore, prefs: GuiPrefs):
-    """Builds the LollmsClient from the active .env's default LLM profile —
-    same resolution CodeAgentConfig.load() used in the CLI — then attaches
-    the shell tool binding on top, exactly like the CLI's create_client()."""
+    """Builds the LollmsClient from the active .env's default profiles for
+    LLM, TTI, TTS, and STT — then attaches the shell tool binding."""
     if LollmsClient is None:
         raise RuntimeError(
             "lollms_client is not importable in this environment. "
@@ -180,15 +187,56 @@ def create_client(env: EnvStore, prefs: GuiPrefs):
 
     host_tool_configs = {"system_shell": {"autonomy_level": prefs.shell_autonomy_level}}
 
-    client = LollmsClient(
-        llm_binding_name=resolved["binding_name"],
-        llm_binding_config=llm_config,
-        tools_binding_name="lcp",
-        tools_binding_config={
+    client_kwargs: Dict[str, Any] = {
+        "llm_binding_name": resolved["binding_name"],
+        "llm_binding_config": llm_config,
+        "tools_binding_name": "lcp",
+        "tools_binding_config": {
             "tools_folders": tools_folders,
             "host_tool_configs": host_tool_configs,
         },
-    )
+    }
+
+    # ── TTI (Text-to-Image) ──
+    tti_resolved = _resolve_modality(env, "tti")
+    if tti_resolved:
+        tti_config: Dict[str, Any] = {
+            "host_address": tti_resolved.get("host_address", "http://localhost:9642"),
+            "model_name": tti_resolved.get("model_name", ""),
+            "verify_ssl_certificate": _to_bool(tti_resolved.get("verify_ssl")),
+        }
+        if tti_resolved.get("api_key"):
+            tti_config["service_key"] = tti_resolved["api_key"]
+        client_kwargs["tti_binding_name"] = tti_resolved["binding_name"]
+        client_kwargs["tti_binding_config"] = tti_config
+
+    # ── TTS (Text-to-Speech) ──
+    tts_resolved = _resolve_modality(env, "tts")
+    if tts_resolved:
+        tts_config: Dict[str, Any] = {
+            "host_address": tts_resolved.get("host_address", ""),
+            "model_name": tts_resolved.get("model_name", ""),
+            "verify_ssl_certificate": _to_bool(tts_resolved.get("verify_ssl")),
+        }
+        if tts_resolved.get("api_key"):
+            tts_config["service_key"] = tts_resolved["api_key"]
+        client_kwargs["tts_binding_name"] = tts_resolved["binding_name"]
+        client_kwargs["tts_binding_config"] = tts_config
+
+    # ── STT (Speech-to-Text) ──
+    stt_resolved = _resolve_modality(env, "stt")
+    if stt_resolved:
+        stt_config: Dict[str, Any] = {
+            "host_address": stt_resolved.get("host_address", ""),
+            "model_name": stt_resolved.get("model_name", ""),
+            "verify_ssl_certificate": _to_bool(stt_resolved.get("verify_ssl")),
+        }
+        if stt_resolved.get("api_key"):
+            stt_config["service_key"] = stt_resolved["api_key"]
+        client_kwargs["stt_binding_name"] = stt_resolved["binding_name"]
+        client_kwargs["stt_binding_config"] = stt_config
+
+    client = LollmsClient(**client_kwargs)
 
     if prefs.enable_shell_execution and client.tools:
         try:
@@ -203,6 +251,10 @@ def create_personality(prefs: GuiPrefs, client):
     ensure_handbag_structure(prefs)
     ensure_sandbox_structure(prefs)
 
+    has_tti = hasattr(client, 'tti') and client.tti is not None
+    has_tts = hasattr(client, 'tts') and client.tts is not None
+    has_stt = hasattr(client, 'stt') and client.stt is not None
+
     caps = CapabilityFlags(
         enable_sub_agents=prefs.enable_sub_agents,
         enable_model_switching=prefs.enable_model_switching,
@@ -212,6 +264,10 @@ def create_personality(prefs: GuiPrefs, client):
         skills_mode=prefs.skills_mode,
         max_sub_agent_depth=prefs.max_sub_agent_depth,
         max_sub_agents_per_turn=prefs.max_sub_agents_per_turn,
+        enable_image_generation=has_tti,
+        enable_image_editing=has_tti,
+        enable_tts=has_tts,
+        enable_stt=has_stt,
     )
 
     personality = LollmsPersonality.from_handbag(prefs.handbag_path)
@@ -220,6 +276,34 @@ def create_personality(prefs: GuiPrefs, client):
     personality.system_prompt = (
         personality.system_prompt + "\n" + build_environment_context(prefs.workspace_path)
     )
+
+    if has_tti:
+        personality.system_prompt += (
+            "\n\n=== IMAGE GENERATION CAPABILITY (ACTIVE) ===\n"
+            "You have access to a Text-to-Image (TTI) binding. You CAN generate images.\n"
+            "Use the `tool_generate_image` tool to create images from text prompts.\n"
+            "Use the `tool_edit_image` tool to modify existing images in the workspace.\n"
+            "Generated images are saved to the workspace automatically.\n"
+            "When a user asks you to generate, draw, create, or make an image, you MUST use `tool_generate_image`.\n"
+            "=== END IMAGE GENERATION CAPABILITY ==="
+        )
+
+    if has_tts:
+        personality.system_prompt += (
+            "\n\n=== TEXT-TO-SPEECH CAPABILITY (ACTIVE) ===\n"
+            "You have access to a Text-to-Speech (TTS) binding. You CAN generate speech audio.\n"
+            "Use the `tool_text_to_speech` tool to convert text to speech.\n"
+            "=== END TEXT-TO-SPEECH CAPABILITY ==="
+        )
+
+    if has_stt:
+        personality.system_prompt += (
+            "\n\n=== SPEECH-TO-TEXT CAPABILITY (ACTIVE) ===\n"
+            "You have access to a Speech-to-Text (STT) binding. You CAN transcribe audio.\n"
+            "Use the `tool_speech_to_text` tool to transcribe audio files.\n"
+            "=== END SPEECH-TO-TEXT CAPABILITY ==="
+        )
+
     personality.capabilities = caps
     personality.max_tokens_per_turn = prefs.max_tokens_per_turn
     return personality
@@ -294,6 +378,18 @@ def clear_all_loaded_files(personality) -> Dict[str, Any]:
     if not loaded_files:
         return {"status_str": "No files are currently loaded in context."}
     return change_file_visibility(personality, loaded_files, "unload")
+
+
+def get_scratchpad_content(personality) -> str:
+    """Reads the live scratchpad file for the current workspace so the GUI
+    can display the agent's persistent notes and intermediate thoughts."""
+    scratchpad_path = getattr(personality, "_scratchpad_path", None)
+    if scratchpad_path is None or not Path(scratchpad_path).exists():
+        return ""
+    try:
+        return Path(scratchpad_path).read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
 
 
 class QueueStreamingCallback:

@@ -20,6 +20,8 @@ class ArtefactVisibility:
     TREE_LOCKED     = "tree_locked"      # Level 1: In tree, cannot be unlocked
     TREE_UNLOCKABLE = "tree_unlockable"  # Level 2: In tree, can be unlocked by LLM
     FOLDER_COLLAPSED= "folder_collapsed" # Level 2.5: Hidden because parent folder is collapsed
+    FOLDER_PINNED   = "folder_pinned"
+    PINNED          = "pinned"    
     METADATA        = "metadata"         # Level 3: Visible with schema/signatures only
     FULL            = "full"             # Level 4: Fully loaded in context
 

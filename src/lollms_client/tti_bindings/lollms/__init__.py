@@ -34,10 +34,11 @@ class LollmsTTIBinding(LollmsTTIBinding):
         if not self.service_key:
             self.service_key = os.getenv("LOLLMS_API_KEY")
 
-        self.verify = True
-
         if not self.verify_ssl_certificate:
-            self.verify = False
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            self.verify = ssl_context
 
         elif self.certificate_file_path:
             cert_path = Path(self.certificate_file_path)
