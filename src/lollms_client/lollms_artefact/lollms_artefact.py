@@ -780,6 +780,17 @@ class ArtefactManager:
         if tags:
             tag_set = set(tags)
             result = [a for a in result if tag_set.issubset(set(a.get('tags', [])))]
+        # ── AUTO-PRUNING / ROLLING SQUASH FOR HIGH-FREQUENCY EDITS ──
+        # When an artifact exceeds 10 versions in history, automatically squash intermediate versions
+        # to prevent SQLite metadata explosion while preserving the baseline and the last 5 versions.
+        try:
+            versions = [a for a in self._get_all_raw() if a.get('title') == target_title]
+            if len(versions) > 10:
+                self.squash_versions(target_title, keep_last_n=5)
+                ASCIIColors.info(f"[ArtefactManager] Auto-squashed '{target_title}' (pruned intermediate versions, kept last 5).")
+        except Exception as sq_err:
+            ASCIIColors.warning(f"[ArtefactManager] Auto-squash warning: {sq_err}")
+
         return result
 
     def update_lam(self, title: str, new_lam_content: str) -> Optional[Dict[str, Any]]:

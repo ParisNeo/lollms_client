@@ -1164,7 +1164,7 @@ EXAMPLE OF CORRECT FORM:
         # ── 6. Skills ─────────────────────────────────────────────────────────
         if has_skill:
             skill_pattern = re.compile(
-                r'^[ \t]*``<skill\s*([^>]*)>(.*?)</skill>``',
+                r'^[ \t]*<skill\s*([^>]*)>(.*?)</skill>',
                 re.DOTALL | re.IGNORECASE | re.MULTILINE,
             )
 
@@ -1183,20 +1183,41 @@ EXAMPLE OF CORRECT FORM:
                 description = attrs.get('description', '')
                 category    = attrs.get('category', '')
 
-                skill_artefact = self.artefacts.add(
-                    title         = title,
-                    artefact_type = ArtefactType.SKILL,
-                    content       = content.strip(),
-                    active        = auto_activate_artefacts,
-                    description   = description,
-                    category      = category,
+                personality = getattr(self, '_active_personality', None)
+                is_handbag = bool(
+                    personality 
+                    and getattr(personality, 'handbag_path', None) 
+                    and getattr(personality, 'skills_manager', None)
                 )
-                affected_artefacts.append(skill_artefact)
-                ASCIIColors.success(
-                    f"Skill '{title}' saved"
-                    + (f" [{category}]" if category else "") + "."
-                )
-                return f'`<skill {match.group(1)}>\n[content stripped, refer to the artefact for details]\n</skill>`'
+
+                if is_handbag and personality.skills_manager:
+                    try:
+                        personality.skills_manager.create_skill(
+                            title=title,
+                            content=content.strip(),
+                            description=description,
+                            category=category
+                        )
+                        ASCIIColors.success(f"Skill '{title}' saved to handbag '{personality.handbag_path.name}'.")
+                    except Exception as sm_err:
+                        ASCIIColors.warning(f"Handbag skill creation error: {sm_err}")
+                else:
+                    skill_artefact = self.artefacts.add(
+                        title         = title,
+                        artefact_type = ArtefactType.SKILL,
+                        content       = content.strip(),
+                        active        = auto_activate_artefacts,
+                        description   = description,
+                        category      = category,
+                    )
+                    affected_artefacts.append(skill_artefact)
+                    ASCIIColors.success(
+                        f"Skill '{title}' saved as discussion artefact"
+                        + (f" [{category}]" if category else "") + "."
+                    )
+
+                return f'<skill {match.group(1)}>\n[content stripped, refer to the artefact for details]\n</skill>'
+
 
             cleaned = skill_pattern.sub(handle_skill, cleaned)
 

@@ -273,6 +273,7 @@ For lightweight, text-only integrations (such as passing an artifact via an API 
 ## 🛠️ 9. Class Reference
 
 *   **`ArtefactType`**: Registry defining the supported categories (`DATA`, `CODE`, `DOCUMENT`, `IMAGE`, `PRESENTATION`, `NOTE`, `SKILL`, `TOOL`, `SCRATCHPAD`).
+    *   `SKILL`: Represents persistent knowledge or behavior capsules. When created in a discussion with a Handbag personality, skills are routed to `handbag/skills/<name>/SKILL.md`. For manual/stateless personalities, they are versioned and stored directly as discussion artefacts.
 *   **`ArtefactVisibility`**: Enum-like class defining the context tiers (`FULL`, `TREE_UNLOCKABLE`, `METADATA`, `TREE_LOCKED`, `HIDDEN`).
 *   **`ArtefactStatus`**: Enum-like class defining the lifecycle states (`DRAFTING`, `STABLE`, `REVISING`, `ERROR`).
 *   **`ArtefactManager`**: Orchestrates database CRUD operations, applies search-and-replace patches, manages version history squashing, and gates dynamic tool registration.

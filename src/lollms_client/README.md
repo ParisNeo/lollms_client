@@ -641,6 +641,31 @@ blocks = client.extract_code_blocks(text_with_code)
 # Returns: [{"language": "python", "code": "def hello():\n    print(\"world\")"}]
 ```
 
+### Dynamic Skill & Note Generation
+
+Agents can learn continuously by creating persistent skills and notes during conversation turns:
+
+```python
+# Streaming callback with secondary channel handling
+from lollms_client.lollms_types import MSG_TYPE
+
+def my_stream_listener(chunk: str, msg_type: MSG_TYPE, meta: dict):
+    if msg_type == MSG_TYPE.MSG_TYPE_SKILL_CHUNK:
+        print(f"[Skill Streaming: {meta.get('title')}] {chunk}", end="", flush=True)
+    elif msg_type == MSG_TYPE.MSG_TYPE_SKILL_DONE:
+        print(f"\n[Skill Complete] {meta.get('title')} saved.")
+    elif msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
+        print(chunk, end="", flush=True)
+    return True
+
+# If the personality is loaded from a Handbag, skills are saved to handbag/skills/
+# If manual/stateless, skills are saved as discussion workspace artefacts.
+response = discussion.chat(
+    user_message="Teach yourself how to format YouTube Shorts and save it as a skill.",
+    streaming_callback=my_stream_listener
+)
+```
+
 ### Thinking Block Extraction
 
 ```python

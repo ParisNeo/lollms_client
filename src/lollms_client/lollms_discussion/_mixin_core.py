@@ -702,7 +702,7 @@ class CoreMixin:
     def get_workspace_data_path(self) -> Optional[str]:
         """
         Returns the absolute path to the discussion's isolated workspace_data subfolder.
-        
+
         This is the recommended CWD (Current Working Directory) for executing 
         scripts and tools so relative paths resolve correctly.
 
@@ -710,19 +710,6 @@ class CoreMixin:
             str | None: The resolved workspace_data path, or None if not configured.
         """
         return getattr(self, 'workspace_data_path', None)
-
-
-    def get_workspace_path(self) -> Optional[str]:
-        """
-        Returns the absolute path to the discussion's isolated workspace directory.
-
-        This method provides backward compatibility for frontend code expecting
-        a method call rather than direct attribute access.
-
-        Returns:
-            str | None: The resolved workspace path, or None if not configured.
-        """
-        return getattr(self, 'workspace_path', None)
 
     def get_active_file_path(self, file_name: str, create_if_missing: bool = True) -> Optional[str]:
         """

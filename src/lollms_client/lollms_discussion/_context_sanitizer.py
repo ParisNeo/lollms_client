@@ -1,11 +1,22 @@
 # lollms_discussion/_context_sanitizer.py
-# Pure-functional execution layer for the Context Diet Protocol.
+# Pure-functional execution layer for the Context Diet & Anti-Mimicry Protocol.
 
+import json
 import re
 from typing import Dict, List, Optional, Any
 
 _ARTIFACT_PATTERN = re.compile(
-    r'<artifact\s+([^>]*)>(.*?)</artifact>',
+    r'<art(?:ifact|efact)\s+([^>]*)>(.*?)</art(?:ifact|efact)>',
+    re.DOTALL | re.IGNORECASE
+)
+
+_SKILL_PATTERN = re.compile(
+    r'<skill\s+([^>]*)>(.*?)</skill>',
+    re.DOTALL | re.IGNORECASE
+)
+
+_NOTE_PATTERN = re.compile(
+    r'<note\s+([^>]*)>(.*?)</note>',
     re.DOTALL | re.IGNORECASE
 )
 
@@ -29,61 +40,50 @@ _ARTEFACT_IMAGE_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+_ACTION_RESULT_PATTERN = re.compile(
+    r'<action_result[^>]*>.*?</action_result>',
+    re.DOTALL | re.IGNORECASE
+)
+
+
 def _extract_attrs(attr_str: str) -> Dict[str, str]:
     return {m.group(1): m.group(2) for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attr_str)}
 
-def compress_artifacts_to_anchors(text: str) -> str:
-    """
-    Replaces full <artifact> XML blocks with compact system anchors.
-    """
-    def _replace_artifact(match: re.Match) -> str:
-        attrs = _extract_attrs(match.group(1))
-        title = attrs.get('name', 'unknown')
-        return f"[🔒SYSTEM_ARTIFACT_ANCHOR:{title}]"
-    
-    return _ARTIFACT_PATTERN.sub(_replace_artifact, text)
 
-def compress_tool_calls_to_anchors(text: str) -> str:
+def scrub_processing_and_status_blocks(text: str) -> str:
     """
-    Replaces full <tool> JSON blocks with compact system anchors.
+    Removes system-generated execution logs (<processing> blocks, status comments)
+    without touching the LLM's conversational text or functional action tags.
     """
-    def _replace_tool(match: re.Match) -> str:
-        body = match.group(1).strip()
-        try:
-            data = json.loads(body)
-            tool_name = data.get("name", "unknown")
-        except Exception:
-            tool_name = "unknown"
-        return f"[🔒SYSTEM_TOOL_EXECUTED:{tool_name}]"
-    
-    return _TOOL_PATTERN.sub(_replace_tool, text)
-
-def scrub_processing_blocks(text: str) -> str:
-    """
-    Removes <processing> execution logs completely.
-    """
+    if not text:
+        return ""
     text = _PROCESSING_PATTERN.sub('', text)
     text = _ORPHAN_PROCESSING_PATTERN.sub('', text)
-    return text
+    text = re.sub(r'<!--\s*status:[^>]*-->', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'</processing>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'<lollms_artifact[^/]*/>', '', text, flags=re.IGNORECASE)
+    text = _ARTEFACT_IMAGE_PATTERN.sub('', text)
+    return text.strip()
+
 
 def sanitize_context_for_llm(text: str) -> str:
     """
-    Applies the full sanitization pipeline: 
-    compress artifacts & tools, scrub processing logs, and remove image anchors.
+    Sanitizes older messages (beyond the active cognitive window)
+    by stripping bulky processing logs while avoiding placeholder mimicry.
     """
-    text = compress_artifacts_to_anchors(text)
-    text = compress_tool_calls_to_anchors(text)
-    text = scrub_processing_blocks(text)
-    text = _ARTEFACT_IMAGE_PATTERN.sub('', text)
-    return text.strip()
+    if not text:
+        return ""
+    return scrub_processing_and_status_blocks(text)
+
 
 def build_anti_mimicry_directives() -> str:
     """
     Returns the strict anti-mimicry directives to be injected into the system prompt.
     """
     return (
-        "=== ANTI-MIMICRY PROTOCOL (CRITICAL) ===\n"
-        "1. **NEVER OUTPUT SYSTEM MARKERS**: You are STRICTLY FORBIDDEN from generating text patterns like `[🔒SYSTEM_ARTIFACT_ANCHOR:...`, `[🔒SYSTEM_TOOL_EXECUTED:...`, `[SYSTEM:`, or `[content stripped...`. These are **INFRASTRUCTURE-ONLY** markers used in history to save space. If you output them, NO ACTION will occur.\n"
-        "2. **USE REAL TAGS**: To create artifacts, you MUST use the actual `<artifact name=\"...\">` XML tags. To call tools, use `<tool>`. Do NOT mimic the placeholder markers from past messages.\n"
+        "=== ANTI-MIMICRY & OUTPUT INTEGRITY PROTOCOL (CRITICAL) ===\n"
+        "1. **NEVER OUTPUT SYSTEM MARKERS**: You are STRICTLY FORBIDDEN from generating text patterns like `[🔒...`, `[SYSTEM:`, `<action_result>`, `<tool_result>`, or `<processing>`. These are **INFRASTRUCTURE-ONLY** tags used by the runner to communicate with you. If you output them, your generation is invalid.\n"
+        "2. **USE REAL FUNCTIONAL TAGS**: To create artifacts use `<artifact name=\"...\">`, to create skills use `<skill title=\"...\">`, to save notes use `<note title=\"...\">`, and to invoke tools use `<tool>`. Do NOT simulate results or mimic past system messages.\n"
+        "3. **NO META-COMMENTARY ON ROUNDS**: Do not talk about 'the previous turn', 'this 3-round task', or 'system status'. Speak directly and naturally to the user about the content of their request.\n"
         "=== END ANTI-MIMICRY PROTOCOL ==="
     )

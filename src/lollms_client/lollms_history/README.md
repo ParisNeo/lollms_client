@@ -4,20 +4,25 @@ The `HistoryManager` is the single source of truth for formatting, sanitizing, a
 
 It ensures that the LLM receives a perfectly structured context window that maximizes cognitive retention while strictly adhering to token limits and API schemas.
 
-## 🧠 The Strict Non-Placeholder Strategy (Anti-Hallucination)
+## 🧠 Zero-Amnesia & Anti-Mimicry Strategy
 
-A critical issue in autonomous agentic loops is **Cognitive Thread Loss**. When an agent executes a tool or writes an artifact, the raw XML/JSON can consume massive amounts of the context window. Historically, systems solved this by replacing the assistant's message with an opaque placeholder like `[Assistant executed batched actions]`. 
+A critical issue in autonomous agentic loops is balancing **Cognitive Recall (No Amnesia)** with **Output Purity (No Mimicry)**:
 
-**The Problem:** After 3-4 rounds, the LLM's context is filled with opaque placeholders. It forgets what it actually said or did, hallucinates that it hasn't done anything, and enters infinite repetition loops trying to execute the same action.
+*   **Amnesia Risk**: If the system replaces the assistant's code or skills with opaque placeholders like `[🔒 Action stripped]`, the model forgets what it generated 2 rounds ago and hallucinates that the task is still unstarted or repeats it.
+*   **Mimicry Risk**: If the system inserts artificial markers like `[SYSTEM: ...]` or `[🔒 Tool stripped]`, the LLM adopts these templates and begins outputting mock status markers instead of executing real tags (`<skill>`, `<artifact>`, `<tool>`).
 
-**The Solution:** `HistoryManager` enforces a **Strict Non-Placeholder Strategy** via `_sanitize_for_context()`.
+### 🛡️ The Two-Zone Solution in `HistoryManager._sanitize_for_context()`
 
-When exporting history, the manager evaluates the `distance_from_end` (how many messages ago the action occurred):
+When exporting context to the model, `HistoryManager` splits history into two strictly managed zones based on `distance_from_end`:
 
-1. **Strict Preservation Zone (Last 4 Actions)**: For the most recent 4 assistant messages, the manager preserves the LLM's raw reasoning and conversational text verbatim. Only bulky structural tags (`<tool>`, `<artifact>`) are stripped to lightweight `[🔒 Tool stripped]` markers. The agent can always see exactly what it said and why it said it for its current active thread.
-2. **Aggressive Compression Zone (Older Actions)**: For messages older than 4 rounds, the manager applies aggressive compression, replacing the entire message content with opaque placeholders to maximize context budget for older history.
+1. **Strict Preservation Zone (Last 4 Actions — Zero Amnesia)**:
+   - Preserves all functional XML tags (`<skill>`, `<artifact>`, `<note>`, `<tool>`) and their verbatim code/markdown bodies.
+   - Strips **only** system runner logs (`<processing>` blocks, `<!-- status:... -->` comments).
+   - The model can read its exact prior code and reasoning without cognitive loss.
 
-This guarantees the agent never loses its train of thought on the active task, while still maintaining long-term context efficiency.
+2. **Clean Compression Zone (Older Actions ≥ 4 — Zero Mimicry)**:
+   - For deeply historical messages, bulky tag bodies are compressed into clean self-closing reference tags (e.g. `<artifact name="file.py" type="code" status="saved" />` and `<skill title="name" status="saved" />`).
+   - **Eliminates all `[🔒 ...]` placeholder strings**, ensuring the LLM is never exposed to fake markers it could imitate.
 
 ## 🔄 Virtual History Integration
 

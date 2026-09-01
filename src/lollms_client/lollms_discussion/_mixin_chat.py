@@ -92,22 +92,6 @@ _SECONDARY_TAG_MAP = {
     "<mem_update":    ("memory_update",       MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</mem_update>"),
     "<think>":        ("thought_start",       MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK,  MSG_TYPE.MSG_TYPE_INFO,              "</think>"),
     "<think":         ("thought_start",       MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK,  MSG_TYPE.MSG_TYPE_INFO,              "</think>"),
-    "<unlock_file":   ("context_unlock",      MSG_TYPE.MSG_TYPE_INFO,    MSG_TYPE.MSG_TYPE_INFO,              "</unlock_file>"),
-    "lock_file":     ("context_lock",        MSG_TYPE.MSG_TYPE_INFO,    MSG_TYPE.MSG_TYPE_INFO,              "</lock_file>"),
-    "hide_file":     ("context_hide",        MSG_TYPE.MSG_TYPE_INFO,    MSG_TYPE.MSG_TYPE_INFO,              "</hide_file>"),
-}
-
-_SECONDARY_TAG_MAP = {
-    "<artifact":      ("artifact_update",     MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK, MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,    "</artifact>"),
-    "<artefact":      ("artifact_update",     MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK, MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,    "</artefact>"),
-    "<note":          ("note_start",          MSG_TYPE.MSG_TYPE_NOTE_CHUNK,     MSG_TYPE.MSG_TYPE_NOTE_DONE,         "</note>"),
-    "<skill":         ("skill_start",         MSG_TYPE.MSG_TYPE_SKILL_CHUNK,    MSG_TYPE.MSG_TYPE_SKILL_DONE,        "</skill>"),
-    "<lollms_inline": ("inline_widget_start", MSG_TYPE.MSG_TYPE_WIDGET_CHUNK,   MSG_TYPE.MSG_TYPE_WIDGET_DONE,       "</lollms_inline>"),
-    "<lollms_form":   ("form_start",          MSG_TYPE.MSG_TYPE_FORM_READY,     MSG_TYPE.MSG_TYPE_FORM_READY,        "</lollms_form>"),
-    "<mem_new":       ("memory_new",          MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</mem_new>"),
-    "<mem_update":    ("memory_update",       MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</mem_update>"),
-    "":        ("thought_start",       MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK,  MSG_TYPE.MSG_TYPE_INFO,              ""),
-    "<think":         ("thought_start",       MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK,  MSG_TYPE.MSG_TYPE_INFO,              ""),
     "<unlock_file":   ("context_unlock",      MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</unlock_file>"),
     "<lock_file":     ("context_lock",        MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</lock_file>"),
     "<hide_file":     ("context_hide",        MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</hide_file>"),
@@ -1797,19 +1781,15 @@ class _StreamState:
 
         # ── Generic Secondary Tag Interception (<skill>, <note>, <lollms_inline>, etc.) ──
         if not is_inside_thoughts and not self._is_accumulating_secondary:
-            # Check if we are ENTERING a secondary tag
             lower_buffer = self._pending_buffer.lower()
             secondary_entered = False
-            # REMOVED "<lollms_inline" so the host application can handle it directly.
             for tag_prefix in ("<skill", "<note", "<scratchpad", "<lollms_form", "<generate_image", "<edit_image", "<unlock_file", "<lock_file", "<hide_file"):
-                # STRICT WHITELIST: Only match if the tag starts at the absolute beginning of a line (ignoring whitespace).
-                # CRITICAL FIX: Exclude lines that start with markdown table/code characters (` or |)
                 pattern = r'(?m)^\s*(?!`)(?!.*\|)' + re.escape(tag_prefix)
                 open_match = re.search(pattern, lower_buffer)
                 if open_match:
-                    tag_start_idx = self._pending_buffer.find(tag_prefix, open_match.start())
+                    tag_start_idx = lower_buffer.find(tag_prefix, open_match.start())
                     if tag_start_idx == -1:
-                        continue
+                        tag_start_idx = open_match.start()
                     end_of_tag_idx = self._pending_buffer.find(">", tag_start_idx)
                     if end_of_tag_idx != -1:
                         opening_tag = self._pending_buffer[tag_start_idx:end_of_tag_idx+1]
@@ -1821,22 +1801,23 @@ class _StreamState:
                             self._secondary_open_tag = opening_tag
                             self._is_accumulating_secondary = True
 
-                            # Forward text BEFORE the tag to the UI and save it
+                            # Parse attributes for streaming metadata
+                            attrs = {}
+                            for m_attr in re.finditer(r'(\w+)=["\']([^"\']*)["\']', opening_tag):
+                                attrs[m_attr.group(1).lower()] = m_attr.group(2)
+                            self._secondary_attrs = attrs
+
                             text_before_tag = self._pending_buffer[:tag_start_idx]
                             if text_before_tag:
                                 self.ai_message.content += text_before_tag
                                 _cb(self.callback, text_before_tag, MSG_TYPE.MSG_TYPE_CHUNK)
 
-                            # Start the secondary buffer with the opening tag
                             self._secondary_buffer = opening_tag
                             self._pending_buffer = ""
 
-                            # Emit a processing block opening for UI feedback
                             proc_type = self._secondary_tag_name
-                            # Extract title from attributes if present
-                            title_match = re.search(r'(?:title|name)=["\']([^"\']*)["\']', opening_tag, re.IGNORECASE)
-                            proc_title = title_match.group(1) if title_match else self._secondary_tag_name.capitalize()
-                            proc_open = f'\n<processing type="{proc_type}" title="{proc_title}">\n'
+                            title_val = attrs.get("title") or attrs.get("name") or self._secondary_tag_name.capitalize()
+                            proc_open = f'\n<processing type="{proc_type}" title="{title_val}">\n'
                             self.ai_message.content += proc_open
                             _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
@@ -1844,6 +1825,17 @@ class _StreamState:
                             status_line = f'{status_msg}\n'
                             self.ai_message.content += status_line
                             _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                            # Emit open event announcement
+                            tag_info = _SECONDARY_TAG_MAP.get(f"<{self._secondary_tag_name}")
+                            if tag_info:
+                                open_evt = tag_info[0]
+                                _cb(self.callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
+                                    "type": open_evt,
+                                    "title": title_val,
+                                    "category": attrs.get("category", ""),
+                                    "description": attrs.get("description", "")
+                                })
 
                             secondary_entered = True
                             break
@@ -1860,21 +1852,34 @@ class _StreamState:
 
         # ── Handle Secondary Tag Body Accumulation & Closing ──
         if self._is_accumulating_secondary:
+            chunk_delta = self._pending_buffer
             self._secondary_buffer += self._pending_buffer
             self._pending_buffer = ""
 
-            # Check if the closing tag arrived (case-insensitive regex search)
             close_match = re.search(re.escape(self._secondary_closing_tag), self._secondary_buffer, re.IGNORECASE)
             if close_match:
-                # Closing tag found! Extract the full match.
                 close_idx = close_match.start()
                 close_len = close_match.end() - close_match.start()
-                
+
                 body_content = self._secondary_buffer[len(self._secondary_open_tag):close_idx]
                 closing_tag = self._secondary_buffer[close_idx:close_idx+close_len]
                 full_match_text = self._secondary_open_tag + body_content + closing_tag
 
                 self._is_accumulating_secondary = False
+
+                # Emit final *_DONE stream event
+                sec_attrs = getattr(self, '_secondary_attrs', {}) or {}
+                title_val = sec_attrs.get("title") or sec_attrs.get("name") or self._secondary_tag_name
+                tag_info = _SECONDARY_TAG_MAP.get(f"<{self._secondary_tag_name}")
+                if tag_info:
+                    done_msg_type = tag_info[2]
+                    _cb(self.callback, body_content.strip(), done_msg_type, {
+                        "title": title_val,
+                        "content": body_content.strip(),
+                        "category": sec_attrs.get("category", ""),
+                        "description": sec_attrs.get("description", ""),
+                        "attrs": sec_attrs
+                    })
 
                 # Dispatch to _dispatch_closed_tag for processing
                 if full_match_text not in self.processed_tags:
@@ -1891,25 +1896,34 @@ class _StreamState:
                 self.ai_message.content += proc_close_tag
                 _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
-                # Preserve any text that came after the closing tag
                 remaining_text = self._secondary_buffer[close_idx + close_len:]
-                
-                # Reset secondary state
+
                 self._secondary_tag_name = ""
                 self._secondary_closing_tag = ""
                 self._secondary_open_tag = ""
                 self._secondary_buffer = ""
+                self._secondary_attrs = {}
 
                 if remaining_text.strip():
                     self._pending_buffer = remaining_text
-                # ── ONE-ACTION-PER-TURN: Halt generation immediately ──
+
                 self._action_dispatched = True
                 return False
             else:
-                # Still accumulating body. Emit lightweight status if enabled.
-                # (No structural analysis for secondary tags — just suppress raw output)
-                pass
+                # Emit live *_CHUNK stream events as content arrives
+                sec_attrs = getattr(self, '_secondary_attrs', {}) or {}
+                title_val = sec_attrs.get("title") or sec_attrs.get("name") or self._secondary_tag_name
+                tag_info = _SECONDARY_TAG_MAP.get(f"<{self._secondary_tag_name}")
+                if tag_info and chunk_delta:
+                    chunk_msg_type = tag_info[1]
+                    _cb(self.callback, chunk_delta, chunk_msg_type, {
+                        "title": title_val,
+                        "chunk": chunk_delta,
+                        "category": sec_attrs.get("category", ""),
+                        "description": sec_attrs.get("description", "")
+                    })
             return True
+
 
         # ── Default Forwarding ──
         # Robust partial tag detection: Check if the buffer ends with a prefix of any known tag.
@@ -2315,174 +2329,175 @@ class _StreamState:
             title = attrs.get("title") or attrs.get("name") or f"skill_{uuid.uuid4().hex[:8]}"
             desc = attrs.get("description", "")
             cat = attrs.get("category", "")
+            tags_attr = attrs.get("tags", "")
+            tags_list = [t.strip() for t in tags_attr.split(",") if t.strip()] if tags_attr else []
             is_patch = "<<<<<<< SEARCH" in body
 
-            # ── HANDBAG / EXTERNAL SKILL ROUTING ──
-            # Check if a personality with a SkillsManager is attached to this discussion.
-            # The `personality` object is injected into _StreamState during ChatMixin.chat() execution.
             personality = getattr(self.discussion, '_active_personality', None)
-            skills_mgr = getattr(personality, 'skills_manager', None) if personality else None
+            is_handbag = bool(
+                personality 
+                and getattr(personality, 'handbag_path', None) 
+                and getattr(personality, 'skills_manager', None)
+            )
 
-            if skills_mgr:
-                # Route to the SkillsManager (Handbag or external folder)
-                existing_skill = skills_mgr.skills.get(title.lower())
-                if not existing_skill:
-                    # Fuzzy search if exact title not found
-                    matches = skills_mgr.search_skills(title)
-                    if matches:
-                        existing_skill = matches[0]
+            if is_handbag:
+                # ── HANDBAG MODE: Save directly into handbag's skills/ directory ──
+                skills_mgr = personality.skills_manager
+                existing_skill = skills_mgr.skills.get(title.lower()) or (skills_mgr.search_skills(title)[0] if skills_mgr.search_skills(title) else None)
 
-                if existing_skill:
-                    if not existing_skill.modifiable:
-                        # BLOCK: Skill is marked as read-only
+                if existing_skill and not existing_skill.modifiable:
+                    self._last_dispatch_failed = True
+                    proc_open = f'\n<processing type="skill" title="{title}">\n'
+                    proc_body = f'* 🚫 BLOCKED: Skill \'{existing_skill.title}\' in handbag is marked as READ-ONLY (unmodifiable).\n'
+                    proc_close = f'<!-- status:failure -->\n</processing>\n'
+                    proc_block = proc_open + proc_body + proc_close
+                    if full_match_text in self.ai_message.content:
+                        self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
+                    else:
+                        self.ai_message.content += proc_block
+                    return True
+
+                if is_patch and existing_skill:
+                    try:
+                        patched_content = self.discussion.artefacts.apply_aider_patch(existing_skill.content, body)
+                    except Exception as patch_err:
+                        ASCIIColors.error(f"[StreamState] Handbag skill patch failed: {patch_err}")
                         self._last_dispatch_failed = True
                         proc_open = f'\n<processing type="skill" title="{title}">\n'
-                        proc_body = f'* 🚫 BLOCKED: Skill \'{existing_skill.title}\' is marked as READ-ONLY (unmodifiable).\n'
+                        proc_body = f'* ❌ Failed to apply patch to handbag skill: {patch_err}\n'
                         proc_close = f'<!-- status:failure -->\n</processing>\n'
                         proc_block = proc_open + proc_body + proc_close
-
-                        self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
-                        _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                        _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                        _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                        return True
-
-                    # Skill exists and is modifiable. Attempt patch or update via SkillsManager.
-                    if is_patch:
-                        try:
-                            patched_content = self.discussion.artefacts.apply_aider_patch(existing_skill.content, body)
-                        except Exception as patch_err:
-                            ASCIIColors.error(f"[StreamState] Handbag skill patch failed: {patch_err}")
-                            self._last_dispatch_failed = True
-                            proc_open = f'\n<processing type="skill" title="{title}">\n'
-                            proc_body = f'* ❌ Failed to apply patch to skill: {patch_err}\n'
-                            proc_close = f'<!-- status:failure -->\n</processing>\n'
-                            proc_block = proc_open + proc_body + proc_close
+                        if full_match_text in self.ai_message.content:
                             self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
-                            _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                            _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                            _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                            return True
-                    else:
-                        patched_content = body
-
-                    updated_skill = skills_mgr.update_skill(
+                        else:
+                            self.ai_message.content += proc_block
+                        return True
+                    skills_mgr.update_skill(
                         title=existing_skill.title,
                         content=patched_content,
-                        description=desc if desc else None,
-                        category=cat if cat else None
+                        description=desc or None,
+                        category=cat or None,
+                        tags=tags_list
                     )
-
-                    if updated_skill:
-                        proc_open = f'\n<processing type="skill" title="{existing_skill.title}">\n'
-                        proc_body = f'* 🧠 Skill \'{existing_skill.title}\' updated successfully in your handbag.\n'
-                        proc_close = f'<!-- status:finished -->\n</processing>\n'
-                        proc_block = proc_open + proc_body + proc_close
-                        self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
-                        _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                        _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                        _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-
-                        _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
-                            "type": "artifact_updated",
-                            "title": existing_skill.title,
-                            "art_type": "skill"
-                        })
-                        return True
-                    else:
-                        # update_skill returned None (failed write)
-                        self._last_dispatch_failed = True
-                        proc_open = f'\n<processing type="skill" title="{existing_skill.title}">\n'
-                        proc_body = f'* ❌ Failed to write skill updates to disk.\n'
-                        proc_close = f'<!-- status:failure -->\n</processing>\n'
-                        proc_block = proc_open + proc_body + proc_close
-                        self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
-                        _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                        _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                        _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                        return True
                 else:
-                    # Skill doesn't exist in manager. Create it.
-                    new_skill = skills_mgr.create_skill(
-                        title=title,
-                        content=body,
-                        description=desc,
-                        category=cat,
-                        visibility="loadable"
-                    )
-                    if new_skill:
-                        proc_open = f'\n<processing type="skill" title="{title}">\n'
-                        proc_body = f'* 🧠 Skill \'{title}\' created successfully in your handbag.\n'
-                        proc_close = f'<!-- status:finished -->\n</processing>\n'
-                        proc_block = proc_open + proc_body + proc_close
-                        self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
-                        _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                        _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                        _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                        _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
-                            "type": "artifact_created",
-                            "title": title,
-                            "art_type": "skill"
-                        })
-                        return True
-                    else:
-                        self._last_dispatch_failed = True
-                        ASCIIColors.warning(f"[StreamState] Failed to create skill '{title}' via SkillsManager. Falling back to artifact store.")
-                        # Fall through to generic artifact creation below
-
-            # ── FALLBACK: GENERIC ARTIFACT CREATION (No SkillsManager or Hardcoded Skill) ──
-            # If we reach here, either there is no skills_manager, or creation failed.
-            # Hardcoded skills (passed directly to chat) should be treated as unmodifiable.
-            # Since we cannot enforce mutability on generic artifacts, we just save it.
-            if is_patch:
-                existing = self.discussion.artefacts.get(title)
-                if existing:
-                    try:
-                        patched_content = self.discussion.artefacts.apply_aider_patch(existing["content"], body)
-                        art = self.discussion.artefacts.update(
-                            title=title, new_content=patched_content, bump_version=True, active=self.auto_activate
+                    if existing_skill:
+                        skills_mgr.update_skill(
+                            title=existing_skill.title,
+                            content=body,
+                            description=desc or None,
+                            category=cat or None,
+                            tags=tags_list
                         )
-                    except Exception as patch_err:
-                        ASCIIColors.error(f"[StreamState] Skill patch failed: {patch_err}")
-                        self._last_dispatch_failed = True
-                        proc_open = f'\n<processing type="skill" title="{title}">\n'
-                        proc_body = f'* ❌ Failed to apply patch to skill: {patch_err}\n'
-                        proc_close = f'<!-- status:failure -->\n</processing>\n'
-                        proc_block = proc_open + proc_body + proc_close
-                        self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
-                        _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                        _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                        _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                        return True
+                    else:
+                        skills_mgr.create_skill(
+                            title=title,
+                            content=body,
+                            description=desc,
+                            category=cat,
+                            tags=tags_list,
+                            visibility="loadable"
+                        )
+
+                skill_entry = {
+                    "title": title,
+                    "type": "skill",
+                    "content": body,
+                    "category": cat,
+                    "description": desc,
+                    "destination": "handbag"
+                }
+                self.affected_artefacts.append(skill_entry)
+
+                proc_open = f'\n<processing type="skill" title="{title}">\n'
+                proc_body = f'* 🧠 Skill \'{title}\' created/updated in handbag \'{personality.handbag_path.name}\'.\n'
+                proc_close = f'<!-- status:finished -->\n</processing>\n'
+                proc_block = proc_open + proc_body + proc_close
+
+                if full_match_text in self.ai_message.content:
+                    self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
                 else:
-                    ASCIIColors.warning(f"[StreamState] Skill patch ignored (skill '{title}' not found). Creating new.")
-                    art = self.discussion.artefacts.add(
-                        title=title, artefact_type=ArtefactType.SKILL, content=body, active=self.auto_activate, description=desc, category=cat
-                    )
+                    self.ai_message.content += proc_block
+
+                _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+                    "type": "artifact_created",
+                    "title": title,
+                    "art_type": "skill"
+                })
+                return True
+
             else:
-                art = self.discussion.artefacts.add(
-                    title=title, artefact_type=ArtefactType.SKILL, content=body, active=self.auto_activate, description=desc, category=cat
-                )
+                # ── ARTEFACT MODE (Manual / Stateless Personality): Save as Discussion Artefact ──
+                art_title = f"{title}.md" if not title.lower().endswith(".md") else title
+                if is_patch:
+                    existing = self.discussion.artefacts.get(art_title) or self.discussion.artefacts.get(title)
+                    if existing:
+                        try:
+                            patched_content = self.discussion.artefacts.apply_aider_patch(existing["content"], body)
+                            art = self.discussion.artefacts.update(
+                                title=existing["title"],
+                                new_content=patched_content,
+                                bump_version=True,
+                                active=self.auto_activate,
+                                description=desc,
+                                category=cat
+                            )
+                        except Exception as patch_err:
+                            ASCIIColors.error(f"[StreamState] Skill artifact patch failed: {patch_err}")
+                            art = self.discussion.artefacts.add(
+                                title=art_title,
+                                artefact_type=ArtefactType.SKILL,
+                                content=body,
+                                active=self.auto_activate,
+                                description=desc,
+                                category=cat
+                            )
+                    else:
+                        art = self.discussion.artefacts.add(
+                            title=art_title,
+                            artefact_type=ArtefactType.SKILL,
+                            content=body,
+                            active=self.auto_activate,
+                            description=desc,
+                            category=cat
+                        )
+                else:
+                    art = self.discussion.artefacts.add(
+                        title=art_title,
+                        artefact_type=ArtefactType.SKILL,
+                        content=body,
+                        active=self.auto_activate,
+                        description=desc,
+                        category=cat
+                    )
 
-            if art:
-                self.affected_artefacts.append(art)
+                if art:
+                    self.affected_artefacts.append(art)
 
-            proc_open = f'\n<processing type="skill" title="{title}">\n'
-            proc_body = f'* 🧠 Skill captured and saved to workspace.\n'
-            proc_close = f'<!-- status:finished -->\n</processing>\n'
-            proc_block = proc_open + proc_body + proc_close
+                proc_open = f'\n<processing type="skill" title="{title}">\n'
+                proc_body = f'* 🧠 Skill \'{title}\' captured and saved as discussion artefact.\n'
+                proc_close = f'<!-- status:finished -->\n</processing>\n'
+                proc_block = proc_open + proc_body + proc_close
 
-            self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
-            _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-            _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-            _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                if full_match_text in self.ai_message.content:
+                    self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
+                else:
+                    self.ai_message.content += proc_block
 
-            _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
-                "type": "artifact_created",
-                "title": title,
-                "art_type": "skill"
-            })
-            return True
+                _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+                    "type": "artifact_created",
+                    "title": title,
+                    "art_type": "skill"
+                })
+                return True
+
 
         # 5. Multi-tier Context Visibility Management
         elif tag_name in ("unlock_file", "lock_file", "hide_file"):
@@ -3921,35 +3936,47 @@ class ChatMixin:
         executed_memory_searches = set()
         object.__setattr__(self, '_executed_memory_searches', executed_memory_searches)
 
-        # ── 🔄 ROLLING WINDOW HELPER FUNCTION ──
+        # ── 🔄 ROLLING WINDOW & SUPERSEDED ARTIFACT FOLDING ──
         def _compress_virtual_history_if_needed():
             """
-            Compresses older rounds in virtual_history if it exceeds the token budget
-            or if we have more than ROLLING_WINDOW_SIZE rounds.
-
-            Strategy:
-            1. Keep the last ROLLING_WINDOW_SIZE rounds in full detail
-            2. Compress older rounds into summaries
-            3. Always preserve the first round (initial user context)
+            Compresses older rounds and folds superseded versions of the same file
+            in virtual_history to prevent context window explosion during long loops.
             """
             nonlocal virtual_history
 
             if not virtual_history:
                 return
 
-            # Estimate token count
+            # ── 1. SUPERSEDED ARTIFACT FOLDING (Same-File Compaction) ──
+            # Find all artifact modifications per file
+            artifact_occurrences: Dict[str, List[int]] = {}
+            for idx, vh in enumerate(virtual_history):
+                if vh.sender_type == "assistant":
+                    for match in re.finditer(r'<art(?:ifact|efact)\s+[^>]*name=["\']([^"\']+)["\']', vh.content, re.I):
+                        fname = match.group(1)
+                        artifact_occurrences.setdefault(fname, []).append(idx)
+
+            # If a file was modified 3+ times in this turn, fold earlier full bodies
+            for fname, indices in artifact_occurrences.items():
+                if len(indices) > 2:
+                    # Fold all but the last 2 occurrences into self-closing anchors
+                    for old_idx in indices[:-2]:
+                        old_msg = virtual_history[old_idx]
+                        old_msg.content = re.sub(
+                            rf'<art(?:ifact|efact)\s+([^>]*name=["\']{re.escape(fname)}["\'][^>]*)>.*?</art(?:ifact|efact)>',
+                            rf'<artifact name="{fname}" status="superseded" />',
+                            old_msg.content,
+                            flags=re.DOTALL | re.IGNORECASE
+                        )
+
+            # ── 2. GENERAL TOKEN BUDGET COMPRESSION ──
             total_chars = sum(len(vh.content) for vh in virtual_history)
             estimated_tokens = total_chars // 4
 
-            # Check if compression is needed
             needs_compression = estimated_tokens > VIRTUAL_HISTORY_TOKEN_BUDGET or len(virtual_history) > (ROLLING_WINDOW_SIZE * 2)
-
             if not needs_compression:
                 return
 
-            ASCIIColors.info(f"[ChatMixin] Virtual history compression triggered: {len(virtual_history)} messages, ~{estimated_tokens} tokens")
-
-            # Separate into rounds (each round = assistant message + user response)
             rounds = []
             current_round = []
             for vh in virtual_history:
@@ -3957,72 +3984,53 @@ class ChatMixin:
                 if vh.sender_type == "user":
                     rounds.append(current_round)
                     current_round = []
-
-            # Add any remaining messages (incomplete round)
             if current_round:
                 rounds.append(current_round)
 
-            # If we have more rounds than the window size, compress older ones
             if len(rounds) > ROLLING_WINDOW_SIZE:
-                # Keep the first round (initial context) and the last ROLLING_WINDOW_SIZE rounds
-                rounds_to_compress = rounds[1:-ROLLING_WINDOW_SIZE]  # Skip first, compress middle
-                rounds_to_keep = [rounds[0]] + rounds[-ROLLING_WINDOW_SIZE:]  # Keep first + last N
+                rounds_to_compress = rounds[1:-ROLLING_WINDOW_SIZE]
+                rounds_to_keep = [rounds[0]] + rounds[-ROLLING_WINDOW_SIZE:]
 
-                # Compress the middle rounds into a summary
-                compressed_summary = "[COMPRESSED EARLIER ROUNDS]\n"
-                compressed_summary += f"The following {len(rounds_to_compress)} rounds were compressed to save context:\n\n"
+                compressed_summary_lines = ["<action_result type=\"history_summary\" status=\"COMPACTED\">"]
+                compressed_summary_lines.append(f"The preceding {len(rounds_to_compress)} intermediate iteration rounds were summarized to preserve context:")
 
                 for idx, round_msgs in enumerate(rounds_to_compress, 1):
                     assistant_msg = next((m for m in round_msgs if m.sender_type == "assistant"), None)
                     user_msg = next((m for m in round_msgs if m.sender_type == "user"), None)
 
                     if assistant_msg:
-                        # Extract key actions from the assistant message
                         actions = []
-                        if "<tool>" in assistant_msg.content:
-                            tool_match = re.search(r'<tool>\s*{"name":\s*"([^"]+)"', assistant_msg.content)
-                            if tool_match:
-                                actions.append(f"Called tool: {tool_match.group(1)}")
-                        if "<artifact" in assistant_msg.content or "<artefact" in assistant_msg.content:
-                            art_match = re.search(r'<(?:artifact|artefact)\s+name=["\']([^"\']+)["\']', assistant_msg.content)
-                            if art_match:
-                                actions.append(f"Created artifact: {art_match.group(1)}")
-                        if "<mem_search" in assistant_msg.content:
-                            search_match = re.search(r'<mem_search\s+query=["\']([^"\']+)["\']', assistant_msg.content)
-                            if search_match:
-                                actions.append(f"Searched memory: {search_match.group(1)}")
+                        for m in re.finditer(r'<tool>\s*{"name":\s*"([^"]+)"', assistant_msg.content):
+                            actions.append(f"Tool `{m.group(1)}`")
+                        for m in re.finditer(r'<(?:artifact|artefact)\s+name=["\']([^"\']+)["\']', assistant_msg.content):
+                            actions.append(f"Updated `{m.group(1)}`")
+                        for m in re.finditer(r'<skill\s+title=["\']([^"\']+)["\']', assistant_msg.content):
+                            actions.append(f"Created skill `{m.group(1)}`")
 
                         if actions:
-                            compressed_summary += f"Round {idx}: {'; '.join(actions)}\n"
+                            compressed_summary_lines.append(f"• Round {idx}: {', '.join(actions)}")
                         else:
-                            # Fallback: include first 100 chars of response
-                            compressed_summary += f"Round {idx}: {assistant_msg.content[:100]}...\n"
+                            clean_txt = re.sub(r'<[^>]+>', '', assistant_msg.content).strip()
+                            if clean_txt:
+                                compressed_summary_lines.append(f"• Round {idx}: {clean_txt[:80]}...")
 
                     if user_msg and "<tool_result" in user_msg.content:
-                        compressed_summary += f"  → Tool executed successfully\n"
-                    elif user_msg and "[MEMORY SEARCH RESULTS" in user_msg.content:
-                        compressed_summary += f"  → Memory search completed\n"
+                        compressed_summary_lines.append(f"  → Result received.")
 
-                compressed_summary += "[END COMPRESSED ROUNDS]\n"
+                compressed_summary_lines.append("Note: The latest code and files are fully available in the workspace context above.")
+                compressed_summary_lines.append("</action_result>")
 
-                # Rebuild virtual_history with compression
                 new_virtual_history = []
-
-                # Add first round (initial context)
                 new_virtual_history.extend(rounds[0])
-
-                # Add compressed summary as a user message
                 new_virtual_history.append(SimpleNamespace(
                     sender_type="user",
-                    content=compressed_summary
+                    content="\n".join(compressed_summary_lines)
                 ))
-
-                # Add recent rounds in full detail
-                for round_msgs in rounds_to_keep[1:]:  # Skip first (already added)
+                for round_msgs in rounds_to_keep[1:]:
                     new_virtual_history.extend(round_msgs)
 
                 virtual_history = new_virtual_history
-                ASCIIColors.success(f"[ChatMixin] Virtual history compressed: {len(virtual_history)} messages (was {len(rounds)} rounds)")
+                ASCIIColors.success(f"[ChatMixin] Virtual history compressed: {len(virtual_history)} messages (from {len(rounds)} rounds)")
 
         # Initialize the single, clean database assistant message ONCE before entering the loop
         ai_msg = self.add_message(
@@ -4247,8 +4255,35 @@ class ChatMixin:
             ss.flush_remaining_buffer()
 
             # ── 🏁 TERMINATION TAG PROTOCOL ──
-            # If the LLM emitted <done/> or <end/>, the task is explicitly complete. Break immediately.
             if ss.was_done_detected():
+                # ── 🛡️ PHANTOM <done/> REJECTION GUARD ──
+                # If the user explicitly requested creating/writing a skill, artifact, or tool,
+                # but zero actions were executed in the entire turn, reject the termination!
+                user_req_lower = user_message.lower()
+                explicitly_requested_action = any(
+                    kw in user_req_lower for kw in ("build a skill", "create a skill", "make a skill", "write a skill", "create an artifact", "write an artifact", "save a note")
+                )
+                has_executed_actions = bool(ss.affected_artefacts or tool_calls_this_turn or ss.was_action_dispatched())
+
+                if explicitly_requested_action and not has_executed_actions and round_count < resolved_max_rounds:
+                    ASCIIColors.warning("[ChatMixin] 🛑 Phantom <done/> rejected. User requested skill/artifact creation but none was emitted.")
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="assistant",
+                        content=ss.get_clean_text_so_far().strip()
+                    ))
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content=(
+                            "<action_directive status=\"REJECTED\">\n"
+                            "REJECTED <done/>: You claimed the skill/artifact was created, but NO `<skill>` or `<artifact>` tag was emitted.\n"
+                            "Stating that a skill exists in conversational text does NOT save it to disk.\n"
+                            "MANDATORY: You MUST NOW emit the actual `<skill title=\"...\" description=\"...\" category=\"...\">` tag with the complete Markdown instructions on a new line.\n"
+                            "Do NOT emit <done/> until the tag is output.\n"
+                            "</action_directive>"
+                        )
+                    ))
+                    continue
+
                 ASCIIColors.info("[ChatMixin] Termination tag detected. Terminating agentic loop.")
                 break
 
@@ -4557,80 +4592,63 @@ class ChatMixin:
                 raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
 
                 # Sanitize the raw text to remove processing blocks and HTML comments
-                clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
-                clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
-                clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
-                clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
-                clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                from ._context_sanitizer import scrub_processing_and_status_blocks
+                clean_history_text = scrub_processing_and_status_blocks(raw_round_text)
 
+                # ── 🧠 VERBATIM TAG RECONSTRUCTION (ZERO AMNESIA) ──
+                # If conversational wrapper was stripped, reconstruct the exact functional XML tag
+                # (<skill>, <artifact>, <note>, etc.) so the assistant message retains its exact content.
                 if not clean_history_text.strip() and ss.affected_artefacts:
+                    reconstructed_tags = []
                     for art in ss.affected_artefacts:
-                        title = art.get("title", "artifact")
-                        atype = art.get("type", "code")
-                        lang = art.get("language", "")
+                        title = art.get("title", "untitled")
+                        atype = art.get("type", "document")
                         content = art.get("content", "")
-                        ephemeral_attr = ' ephemeral="true"' if art.get("ephemeral") else ""
-                        clean_history_text += f'<artifact name="{title}" type="{atype}" language="{lang}"{ephemeral_attr}>\n{content}\n</artifact>\n'
-
-                # Append the sanitized assistant text (containing the raw <artifact> tag) to virtual_history
-                # Ensure content is always a string, never a dict
-                if isinstance(clean_history_text, dict):
-                    # If somehow a dict got in, extract the content field
-                    clean_history_text = clean_history_text.get("content", str(clean_history_text))
-                elif not isinstance(clean_history_text, str):
-                    clean_history_text = str(clean_history_text)
+                        if atype == "skill":
+                            desc_attr = f' description="{art.get("description", "")}"' if art.get("description") else ""
+                            cat_attr = f' category="{art.get("category", "")}"' if art.get("category") else ""
+                            reconstructed_tags.append(f'<skill title="{title}"{desc_attr}{cat_attr}>\n{content}\n</skill>')
+                        elif atype == "note":
+                            reconstructed_tags.append(f'<note title="{title}">\n{content}\n</note>')
+                        else:
+                            lang = art.get("language", "")
+                            ephemeral_attr = ' ephemeral="true"' if art.get("ephemeral") else ""
+                            reconstructed_tags.append(f'<artifact name="{title}" type="{atype}" language="{lang}"{ephemeral_attr}>\n{content}\n</artifact>')
+                    clean_history_text = "\n\n".join(reconstructed_tags)
 
                 virtual_history.append(SimpleNamespace(
                     sender_type="assistant",
                     content=clean_history_text.strip()
                 ))
 
-                # Determine the action type and title for the system marker
+                # Determine the action type and title
                 action_type = "artifact"
                 action_title = ""
+                action_dest = "workspace"
                 if ss.affected_artefacts:
                     last_art = ss.affected_artefacts[-1]
                     action_type = last_art.get("type", "artifact")
                     action_title = last_art.get("title", "")
+                    if last_art.get("destination") == "handbag":
+                        action_dest = f"handbag '{last_art.get('handbag_name', 'personality')}'"
 
-                # 🧠 CONTEXTUAL ANCHORING PROTOCOL
-                # If the sanitized history is empty, it means the artifact was emitted with 
-                # no conversational wrapper. We inject the RAW artifact XML into virtual_history
-                # so the LLM can literally "see" the code it just wrote. This enables multi-step
-                # workflows (e.g., Code -> Review -> Patch) and prevents blind recreation loops.
-                if not clean_history_text.strip() and ss.affected_artefacts:
-                    for art in ss.affected_artefacts:
-                        title = art.get("title", "artifact")
-                        atype = art.get("type", "code")
-                        lang = art.get("language", "")
-                        content = art.get("content", "")
-                        ephemeral_attr = ' ephemeral="true"' if art.get("ephemeral") else ""
-                        clean_history_text += f'<artifact name="{title}" type="{atype}" language="{lang}"{ephemeral_attr}>\n{content}\n</artifact>\n'
-
-                # Update the assistant message to contain the real content (if we injected it)
-                virtual_history[-1].content = clean_history_text.strip()
-
-                # ── 🔄 COMPRESS VIRTUAL HISTORY IF NEEDED ──
-                # After adding the artifact creation, check if we need to compress older rounds
                 _compress_virtual_history_if_needed()
 
-                # 🧠 STATUS CHECK PROTOCOL (Replaces Forced Done)
-                # We anchor the LLM to the fact that the artifact is saved, and ask it if it is finished.
-                # This allows multi-step workflows (verification, patching) before final termination.
-                title_str = f" '{action_title}'" if action_title else ""
-                system_marker = (
-                    f"[SYSTEM: The {action_type}{title_str} has been successfully created and saved to the workspace. "
-                    f"You can see its full content in your previous message. "
-                    f"Are you finished with the user's request? "
-                    f"If YES, provide your final conversational answer to the user and end your generation with a `<done/>` tag. "
-                    f"If NO, and you need to perform more tasks (e.g., reviewing the code, patching imports, running tests), do that now.]"
+                # ── 🛡️ CLEAN ENVELOPE NOTIFICATION (ZERO MIMICRY) ──
+                # Use structured <action_result> envelopes rather than conversational prompts
+                # that invite the LLM to mimic system reasoning or round-count commentary.
+                system_envelope = (
+                    f'<action_result type="{action_type}" name="{action_title}" status="SUCCESS" destination="{action_dest}">\n'
+                    f"The {action_type} '{action_title}' has been successfully created and saved to {action_dest}.\n"
+                    f"Its complete content is recorded in your previous message above.\n"
+                    f"Provide your final answer to the user and append `<done/>` on a new line when complete.\n"
+                    f"</action_result>"
                 )
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
-                    content=system_marker
+                    content=system_envelope
                 ))
 
-                # Force another reasoning round
                 continue
 
             if ss.tool_trigger:
@@ -5638,16 +5656,42 @@ class ChatMixin:
 
                 ASCIIColors.warning(f"[ChatMixin] Text-only stall detected (#{text_only_stall_count}). LLM stopped without <done/> or actions. Forcing continuation.")
 
+                # ── 🎯 UNFINISHED INTENT DETECTOR ──
+                last_response_lower = raw_round_text.lower()
+                unfinished_intent = any(
+                    phrase in last_response_lower for phrase in (
+                        "into a skill", "draft the skill", "create the skill", "encode all of this",
+                        "let me create", "i'll create", "i will create", "now i'll write", "now i'll encode",
+                        "let me write", "i'll draft", "i will draft", "into an artifact"
+                    )
+                )
+
                 if ss.context_unlock_requested and not was_cancelled:
                     unlock_files_str = ', '.join(ss.context_unlocked_files)
-                    continuation_prompt = f"[SYSTEM: The following files have been processed: {unlock_files_str}. You can now read their full content and use them. Please continue your task.]"
+                    continuation_prompt = (
+                        f'<action_result type="context_unlock" status="SUCCESS">\n'
+                        f"The following files are now fully loaded in your context: {unlock_files_str}.\n"
+                        f"Proceed with your task using the loaded content.\n"
+                        f"</action_result>"
+                    )
                     ss.context_unlock_requested = False
+                elif unfinished_intent:
+                    continuation_prompt = (
+                        "<action_directive status=\"REQUIRED\">\n"
+                        "UNFINISHED INTENT DETECTED: You stated an intent to create a skill or artifact, but stopped before emitting the tag.\n"
+                        "No file has been saved yet.\n"
+                        "MANDATORY: Emit the complete `<skill title=\"...\" description=\"...\" category=\"...\">` or `<artifact name=\"...\">` tag NOW on a new line.\n"
+                        "Do NOT output <done/> until the tag is generated.\n"
+                        "</action_directive>"
+                    )
                 else:
                     continuation_prompt = (
-                        "[SYSTEM: CRITICAL. You stopped generation without emitting a <done/> tag and without executing any tool or artifact. "
-                        "If your task is complete, output your final conversational summary and end with a <done/> tag on a new line. "
-                        "If you need to continue working, emit the next `<tool>` or `<artifact>` tag NOW. "
-                        "Do NOT write prose preambles like 'Je vais...' or 'Let me...' without following through with the actual action tag.]"
+                        "<action_directive status=\"REQUIRED\">\n"
+                        "You stopped generation without emitting an action tag or <done/>.\n"
+                        "• If you have work to perform: emit the next `<skill>`, `<artifact>`, or `<tool>` tag NOW.\n"
+                        "• If your response to the user is complete: provide your final text and end with `<done/>` on a new line.\n"
+                        "Do NOT write introductory preambles without the action tag.\n"
+                        "</action_directive>"
                     )
 
                 virtual_history.append(SimpleNamespace(

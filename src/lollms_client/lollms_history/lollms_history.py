@@ -53,8 +53,8 @@ class HistoryManager:
 
     @staticmethod
     def _has_functional_tags(text: str) -> bool:
-        """Check if the text contains functional tags like <tool> or <artifact>."""
-        return bool(re.search(r'<(tool|artifact|artefact)\b[^>]*>', text or '', re.IGNORECASE))
+        """Check if the text contains functional tags like <tool>, <artifact>, <skill>, or <note>."""
+        return bool(re.search(r'<(tool|art(?:ifact|efact)|skill|note|unlock_file|lock_file|hide_file)\b[^>]*>', text or '', re.IGNORECASE))
 
     @staticmethod
     def _last_user_index(branch_list: list) -> int:
@@ -68,150 +68,73 @@ class HistoryManager:
     def _sanitize_for_context(text: str, distance_from_end: int) -> str:
         """
         Sanitizes assistant message content for LLM context export.
-        Enforces a strict non-placeholder strategy for the last 4 actions to prevent
-        cognitive thread loss, while aggressively compressing older history.
 
-        KV-Cache Note: The distance_from_end must be calculated based on the total
-        message count (history + virtual_history) to ensure that sanitization
-        boundaries remain stable across rounds as the history grows.
+        • Recent Messages (distance_from_end < 4): ZERO AMNESIA
+          Preserves the exact functional tags (<skill>, <artifact>, <tool>, <note>)
+          and conversational reasoning verbatim. Only strips system execution logs
+          (<processing> blocks, status comments).
+
+        • Older Messages (distance_from_end >= 4): ZERO MIMICRY
+          Compresses bulky bodies using clean, non-mimicable self-closing syntax
+          without generating [🔒 ...] markers that LLMs could copy.
         """
         if not text:
             return ""
 
+        # Step 1: Strip system-generated runner execution blocks and comments in all tiers
+        text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<!--\s*status:[^>]*-->', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'</processing>', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'<lollms_artifact[^/]*/>', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'<artefact_image[^/]*/>', '', text, flags=re.IGNORECASE)
+
         if distance_from_end < 4:
             # ── 🔒 STRICT PRESERVATION ZONE (Last 4 Actions) ──
-            # CRITICAL: For recent messages, we MUST NOT mutate the LLM's raw output.
-            # We only strip system-generated infrastructure blocks (<processing>, status comments)
-            # to clean up the context, but we leave all functional tags (<tool>, <artifact>) intact.
-            # This prevents cognitive thread loss and stops the LLM from mimicking system placeholders.
-            text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
-            text = re.sub(r'<!-- status:[^>]*-->', '', text, flags=re.IGNORECASE)
-            text = re.sub(r'</processing>', '', text, flags=re.IGNORECASE)
-            text = re.sub(r'<lollms_artifact[^/]*/>', '', text, flags=re.IGNORECASE)
-            text = re.sub(r'<artefact_image[^/]*/>', '', text, flags=re.IGNORECASE)
+            # Return text verbatim so the model has full recall of its code, skills, and tools
+            return text.strip()
 
-            # If after stripping infrastructure blocks the text is completely empty,
-            # it means the LLM emitted ONLY a functional tag with no conversational text.
-            # We preserve the tag exactly as it was by recovering it from the original text.
-            if not text.strip():
-                import re as _re
-                functional_tags = _re.search(r'<(tool|art(?:ifact|efact)|unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|mem_new|mem_update|user_profile_update|user_profile_clear|refactor_history)\b[^>]*>(?:.*?</\1>)?', text, _re.DOTALL | _re.IGNORECASE)
-                if functional_tags:
-                    text = functional_tags.group(0)
-                else:
-                    text = "[Action executed with no conversational text]"
+        # ── 🧹 CLEAN DEEP COMPRESSION ZONE (Older Actions, distance >= 4) ──
+        # Replaces bulky tag bodies with clean self-closing tags (no [🔒 ...] markers)
+        def _compress_artifact_tag(m):
+            attrs = m.group(1)
+            title = "file"
+            title_m = re.search(r'(?:name|title)=["\']([^"\']*)["\']', attrs, re.IGNORECASE)
+            if title_m:
+                title = title_m.group(1)
+            type_m = re.search(r'type=["\']([^"\']*)["\']', attrs, re.IGNORECASE)
+            atype = type_m.group(1) if type_m else "code"
+            return f'<artifact name="{title}" type="{atype}" status="saved" />'
 
-        else:
-            # ── 🧹 AGGRESSIVE COMPRESSION ZONE (Older Actions, distance >= 4) ──
-            # For older messages, apply full compression with synthetic summaries.
-            # This is where the [Action: ...] summaries are appropriate.
+        def _compress_skill_tag(m):
+            attrs = m.group(1)
+            title_m = re.search(r'(?:name|title)=["\']([^"\']*)["\']', attrs, re.IGNORECASE)
+            title = title_m.group(1) if title_m else "skill"
+            return f'<skill title="{title}" status="saved" />'
+
+        def _compress_note_tag(m):
+            attrs = m.group(1)
+            title_m = re.search(r'(?:name|title)=["\']([^"\']*)["\']', attrs, re.IGNORECASE)
+            title = title_m.group(1) if title_m else "note"
+            return f'<note title="{title}" status="saved" />'
+
+        def _compress_tool_tag(m):
+            body = m.group(1).strip()
             import json as _json
+            tname = "tool"
+            try:
+                data = _json.loads(body)
+                tname = data.get("name", "tool")
+            except Exception:
+                pass
+            return f'<tool_called name="{tname}" />'
 
-            raw_text_copy = text
-
-            text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
-            text = re.sub(r'<!-- status:[^>]*-->', '', text, flags=re.IGNORECASE)
-            text = re.sub(r'</processing>', '', text, flags=re.IGNORECASE)
-            text = re.sub(r'<lollms_artifact[^/]*/>', '', text, flags=re.IGNORECASE)
-            text = re.sub(r'<artefact_image[^/]*/>', '', text, flags=re.IGNORECASE)
-
-            has_functional_tags = bool(re.search(
-                r'<(tool|artifact|artefact|unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|mem_new|mem_update|user_profile_update|user_profile_clear|refactor_history)\b',
-                raw_text_copy,
-                re.IGNORECASE
-            ))
-
-            stripped_text_for_check = re.sub(r'<[^>]+>', '', raw_text_copy).strip()
-
-            if has_functional_tags and not stripped_text_for_check:
-                # Extract intent statements if present
-                intent_markers = [
-                    r'\b(?:let me|let\'s)\b',
-                    r'\bI\'ll\b', r'\bI will\b', r'\bI\'m going to\b', r'\bI am going to\b',
-                    r'\bnow I\b', r'\bnext I\b', r'\bfirst I\b', r'\bI need to\b',
-                    r'\bI\'ll now\b', r'\bI\'ll start\b', r'\bI\'ll create\b', r'\bI\'ll read\b',
-                    r'\bI\'ll check\b', r'\bI\'ll annotate\b', r'\bI\'ll write\b', r'\bI\'ll patch\b',
-                    r'\bI\'ll search\b', r'\bI\'ll inspect\b', r'\bI\'ll look\b', r'\bI\'ll find\b',
-                    r'\bI\'ll update\b', r'\bI\'ll modify\b', r'\bI\'ll edit\b', r'\bI\'ll add\b',
-                    r'\bI\'ll remove\b', r'\bI\'ll delete\b', r'\bI\'ll run\b', r'\bI\'ll execute\b',
-                ]
-                combined_intent_re = re.compile('|'.join(intent_markers), re.IGNORECASE)
-
-                matches = list(combined_intent_re.finditer(raw_text_copy))
-
-                if matches:
-                    first_match = matches[0]
-                    last_match = matches[-1]
-                    start = first_match.start()
-                    end_pos = last_match.end()
-                    end_boundary = len(raw_text_copy)
-                    tag_after_intent = re.search(
-                        r'<(?:tool|artifact|artefact|unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|mem_new|mem_update|user_profile_update|user_profile_clear|refactor_history)\b',
-                        raw_text_copy[end_pos:],
-                        re.IGNORECASE
-                    )
-                    if tag_after_intent:
-                        end_boundary = end_pos + tag_after_intent.start()
-                    extracted_intent = raw_text_copy[start:end_boundary].strip()
-                    cleaned_intent = re.sub(r'<[^>]+>', '', extracted_intent).strip()
-                    if cleaned_intent:
-                        text = cleaned_intent
-                    else:
-                        text = re.sub(r'<[^>]+>', '', raw_text_copy).strip()
-                else:
-                    text = re.sub(r'<[^>]+>', '', raw_text_copy).strip()
-
-                # Build synthetic action summaries for older history
-                action_summaries = []
-
-                for tool_match in raw_text_copy.split('</tool>'):
-                    tool_tag = re.search(r'<tool>(.*)', tool_match, re.DOTALL | re.IGNORECASE)
-                    if tool_tag:
-                        json_body = tool_tag.group(1).strip()
-                        try:
-                            call_data = _json.loads(json_body)
-                            tool_name = call_data.get("name", "unknown")
-                            tool_params = call_data.get("parameters", {})
-                            param_summary_parts = []
-                            for val in tool_params.values():
-                                if isinstance(val, str) and len(val) > 100:
-                                    param_summary_parts.append(f'"{val[:100]}..."')
-                                else:
-                                    param_summary_parts.append(_json.dumps(val, default=str))
-                            param_summary = ", ".join(param_summary_parts)
-                            action_summaries.append(f"[Action: Called tool `{tool_name}({param_summary})`]")
-                        except Exception:
-                            pass
-
-                for art_match in re.finditer(r'<art(?:ifact|efact)[^>]*>(.*?)</art(?:ifact|efact)>', raw_text_copy, re.DOTALL | re.IGNORECASE):
-                    art_xml = art_match.group(0)
-                    attrs_match = re.search(r'<art(?:ifact|efact)[^>]*>', art_xml, re.IGNORECASE)
-                    attrs_str = attrs_match.group(0) if attrs_match else ""
-                    title = "unknown"
-                    for m_attr in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
-                        if m_attr.group(1).lower() in ("name", "title"):
-                            title = m_attr.group(2)
-                    action_summaries.append(f"[Action: Created/Updated artifact `{title}`]")
-
-                for ctx_match in re.finditer(r'<(unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|mem_new|mem_update|user_profile_update|user_profile_clear|refactor_history)[^>]*>(.*?)</\1>', raw_text_copy, re.DOTALL | re.IGNORECASE):
-                    action_summaries.append(f"[Action: Executed context operation `{ctx_match.group(1)}`]")
-
-                if action_summaries:
-                    if text:
-                        text = text + "\n" + "\n".join(action_summaries)
-                    else:
-                        text = "\n".join(action_summaries)
-            else:
-                text = re.sub(r'<art(?:ifact|efact)[^>]*>.*?</art(?:ifact|efact)>', '[🔒 Artifact stripped]', text, flags=re.DOTALL | re.IGNORECASE)
-                text = re.sub(r'<tool>.*?</tool>', '[🔒 Tool stripped]', text, flags=re.DOTALL | re.IGNORECASE)
-                text = re.sub(r'<(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>.*?</(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>', '[🔒 Context op stripped]', text, flags=re.DOTALL | re.IGNORECASE)
-                text = re.sub(r'<scratchpad_(?:append|patch)>.*?</scratchpad_(?:append|patch)>', '[🔒 Scratchpad update]', text, flags=re.DOTALL | re.IGNORECASE)
-                text = re.sub(r'<scratchpad_clear\s*/?>', '[🔒 Scratchpad cleared]', text, flags=re.IGNORECASE)
-                text = re.sub(r'<mem_new[^/]*/?>', '[🔒 Memory created]', text, flags=re.IGNORECASE)
-                text = re.sub(r'<mem_update[^/]*/?>', '[🔒 Memory updated]', text, flags=re.IGNORECASE)
-                text = re.sub(r'<user_profile_update>.*?</user_profile_update>', '[🔒 User profile updated]', text, flags=re.DOTALL | re.IGNORECASE)
-                text = re.sub(r'<user_profile_clear\s*/?>', '[🔒 User profile cleared]', text, flags=re.IGNORECASE)
-                text = re.sub(r'<refactor_history\s*/?>', '[🔒 History refactored]', text, flags=re.IGNORECASE)
+        text = re.sub(r'<art(?:ifact|efact)\s+([^>]*)>.*?</art(?:ifact|efact)>', _compress_artifact_tag, text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<skill\s+([^>]*)>.*?</skill>', _compress_skill_tag, text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<note\s+([^>]*)>.*?</note>', _compress_note_tag, text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<tool>(.*?)</tool>', _compress_tool_tag, text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>.*?</(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<scratchpad_(?:append|patch)>.*?</scratchpad_(?:append|patch)>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<user_profile_update>.*?</user_profile_update>', '', text, flags=re.DOTALL | re.IGNORECASE)
 
         return text.strip()
 

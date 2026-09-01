@@ -27,8 +27,13 @@ class SkillsManager:
         if skills_dirs:
             for d in skills_dirs:
                 p = Path(d)
-                if p.exists() and p.is_dir():
-                    self._skills_dirs.append(p.resolve())
+                p.mkdir(parents=True, exist_ok=True)
+                self._skills_dirs.append(p.resolve())
+        else:
+            default_p = Path("./skills").resolve()
+            default_p.mkdir(parents=True, exist_ok=True)
+            self._skills_dirs.append(default_p)
+
         self.skills: Dict[str, Skill] = {}
         self.reload()
 
@@ -96,9 +101,12 @@ class SkillsManager:
         visibility: str = "loadable"
     ) -> Optional[Skill]:
         if not self._skills_dirs:
-            return None
+            default_p = Path("./skills").resolve()
+            default_p.mkdir(parents=True, exist_ok=True)
+            self._skills_dirs.append(default_p)
 
         target_dir = self._skills_dirs[0]
+        target_dir.mkdir(parents=True, exist_ok=True)
         safe_title = self._sanitize_title(title)
         
         skill_dir = target_dir / safe_title
@@ -144,7 +152,7 @@ class SkillsManager:
             return None
 
         target_dir = skill.file_path.parent
-        safe_title = self._sanitize_title(title)
+        target_dir.mkdir(parents=True, exist_ok=True)
         skill_path = target_dir / "SKILL.md"
 
         tags_str = ", ".join(tags) if tags else (", ".join(skill.tags) if skill.tags else "")

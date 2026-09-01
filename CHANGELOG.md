@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-01 01:13]
+
+- refactor(client): update core components and improve documentation
+
 ## [2026-08-31 22:43]
 
 - feat(smart_router): improve binding resolution and fix manager path discovery

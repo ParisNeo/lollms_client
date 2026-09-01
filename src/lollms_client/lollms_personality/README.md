@@ -248,13 +248,19 @@ The `LollmsPersonality` supports two distinct memory paradigms:
 1. **Independent Life**: If the Handbag contains a `memory/` folder, `from_handbag()` instantiates a `LollmsMemoryManager` and stores it in `personality.memory_manager`. The personality evolves continuously across any host application.
 2. **System-Managed Life**: If the Handbag has no `memory/` folder, `personality.memory_manager` is `None`. The host application (`LollmsDiscussion`) provides its own `MemoryManager`. The personality resets to its baseline `SOUL.md` in new discussions, but the discussion itself remembers the user's interactions.
 
-### Skill Efficiency (Tiered Visibility)
+### Skill Efficiency & Dynamic Creation (Tiered Visibility)
 Skills are `SKILL.md` files managed by the `SkillsManager`. They use a tiered visibility system to manage context budget across personalities with 1 to 10,000 skills:
 *   **`visible`**: Automatically loaded into the system prompt. Costs 0 turns.
 *   **`loadable`**: Listed in the prompt (name + description). The LLM uses `tool_load_skill` to pull the full content (Costs 1 turn).
 *   **`searchable`**: Hidden from the prompt entirely. The LLM uses `tool_search_skills` then `tool_load_skill` (Costs 2 turns). Used for massive skill banks.
 
 The `SkillsManager.build_skill_tools()` method dynamically registers `tool_load_skill` and `tool_search_skills` based on the presence of `loadable` and `searchable` skills.
+
+#### Dynamic Skill Creation & Destination Routing
+When an agent or discussion emits `<skill title="..." description="..." category="...">content</skill>`:
+1. **Handbag Destination**: If the personality was loaded from a Handbag (`personality.handbag_path` is present), `SkillsManager.create_skill()` writes a new `SKILL.md` with YAML frontmatter into `handbag_path / "skills" / <sanitized_title> / "SKILL.md"`. The manager reloads immediately, making the skill a permanent capability of that persona across all discussions.
+2. **Discussion Artefact Destination**: If the personality has no handbag (manual in-code definition), the skill is saved as an artifact (`ArtefactType.SKILL`) in the discussion workspace.
+3. **Live Telemetry**: During generation, the stream emits `MSG_TYPE_SKILL_CHUNK` (`42`) on every token and `MSG_TYPE_SKILL_DONE` (`43`) upon completion.
 
 ---
 

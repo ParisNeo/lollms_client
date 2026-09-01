@@ -1097,6 +1097,63 @@ discussion.import_file(
 )
 ```
 
+## 🎓 7.5 Skill Creation & Secondary Stream Lifecycle
+
+`LollmsDiscussion` supports creating persistent AI skills on-the-fly via the `<skill title="..." description="..." category="...">` XML tag.
+
+### 🏛️ Dual-Destination Skill Routing
+
+Skill creation follows strict personality-aware destination routing:
+
+```
+                      LLM outputs <skill> Tag
+                                │
+                                ▼
+               Is personality from a Handbag?
+              (personality.handbag_path is set)
+                                │
+                 ┌──────────────┴──────────────┐
+                 │ YES                         │ NO
+                 ▼                             ▼
+       ┌──────────────────┐          ┌──────────────────────┐
+       │ Handbag Storage  │          │ Discussion Artefact  │
+       │ Saves to disk:   │          │ Saves to:            │
+       │ handbag/skills/  │          │ discussion.artefacts │
+       │ <title>/SKILL.md │          │ type="skill"         │
+       │ Reloads persona  │          │ Version-controlled   │
+       │ skills index     │          │ in workspace_data    │
+       └──────────────────┘          └──────────────────────┘
+```
+
+1. **Handbag Personality Mode**:
+   - If the active personality was loaded via `LollmsPersonality.from_handbag()` (or has a `handbag_path`), the skill is saved directly as a physical `SKILL.md` inside `handbag_path / "skills" / <sanitized_title> / "SKILL.md"`.
+   - `personality.skills_manager.reload()` is invoked immediately, making the skill permanently available to that persona across all future discussions.
+2. **Manual / Stateless Personality Mode**:
+   - If the personality was instantiated in code without a handbag (or `personality=None`), the skill is registered as a **Discussion Artefact** of type `ArtefactType.SKILL` (`discussion.artefacts`).
+   - It is stored in `workspace_data/`, version-controlled, and injected into the active session context.
+
+---
+
+### 📡 Live Secondary Stream Events
+
+During streaming generation, skills, notes, and interactive widgets do NOT pollute the main conversational chat stream (`MSG_TYPE_CHUNK`). Instead, they stream on dedicated secondary channels:
+
+| Event Type | MSG_TYPE Enum | Value | Payload Metadata (`meta`) |
+| :--- | :--- | :--- | :--- |
+| **Skill Stream Chunk** | `MSG_TYPE_SKILL_CHUNK` | `42` | `{"title": str, "chunk": str, "category": str, "description": str}` |
+| **Skill Stream Done** | `MSG_TYPE_SKILL_DONE` | `43` | `{"title": str, "content": str, "category": str, "description": str, "attrs": dict}` |
+| **Note Stream Chunk** | `MSG_TYPE_NOTE_CHUNK` | `40` | `{"title": str, "chunk": str}` |
+| **Note Stream Done** | `MSG_TYPE_NOTE_DONE` | `41` | `{"title": str, "content": str}` |
+| **Widget Stream Chunk** | `MSG_TYPE_WIDGET_CHUNK` | `44` | `{"title": str, "chunk": str, "widget_type": str}` |
+| **Widget Stream Done** | `MSG_TYPE_WIDGET_DONE` | `45` | `{"title": str, "content": str, "widget_type": str}` |
+
+#### Streaming Contract
+1. **Open Announcement**: As soon as `<skill ...>` is detected, an announcement is emitted on `MSG_TYPE_CHUNK` with meta `{"type": "skill_start", "title": ...}`.
+2. **Chunk Emission**: Every raw fragment inside the tag is emitted via `MSG_TYPE_SKILL_CHUNK`.
+3. **Completion**: When `</skill>` closes, `MSG_TYPE_SKILL_DONE` is fired with the complete body before post-processing, and `MSG_TYPE_ARTEFACTS_STATE_CHANGED` notifies the UI of the newly registered skill.
+
+---
+
 ## 🎛️ 8. Interactive Widgets (`<lollms_inline>`)
 
 Widgets are **ephemeral, in-context, interactive educational demonstrations** rendered directly inside the chat bubble. They are designed for teaching concepts, visualizing data, or providing micro-interactions (similar to platforms like Brilliant.org).
