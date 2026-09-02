@@ -29,6 +29,15 @@ _LIGATURE_MAP = {
 _LIGATURE_TRANS = str.maketrans(_LIGATURE_MAP)
 
 
+def _resolve_fitz_flag(name: str) -> int:
+    """Safely resolves a PyMuPDF (fitz) flag constant by name.
+    Returns 0 if the constant does not exist in the installed version,
+    preventing AttributeError crashes across PyMuPDF versions."""
+    if fitz is None:
+        return 0
+    return getattr(fitz, name, 0)
+
+
 def init_tools_library(config: dict = None) -> None:
     global fitz
     try:
@@ -324,9 +333,9 @@ def tool_edit_document_text(
             
             flags = 0
             if not match_case:
-                flags |= fitz.TEXT_DEHYPHENATE
+                flags |= _resolve_fitz_flag("TEXT_DEHYPHENATE")
             if whole_word:
-                flags |= fitz.TEXT_FIND_WHOLEWORDS
+                flags |= _resolve_fitz_flag("TEXT_FIND_WHOLE_WORDS") or _resolve_fitz_flag("TEXT_FIND_WHOLEWORDS")
 
             for page_num in target_pages:
                 page = doc[page_num]
@@ -496,7 +505,7 @@ def tool_annotate_document(
 
             search_flags = 0
             if fitz is not None:
-                search_flags = fitz.TEXT_DEHYPHENATE
+                search_flags = _resolve_fitz_flag("TEXT_DEHYPHENATE")
 
             for page_num in target_pages:
                 page = doc[page_num]
@@ -636,7 +645,7 @@ def tool_batch_annotate_document(
                 op_count = 0
                 search_flags = 0
                 if fitz is not None:
-                    search_flags = fitz.TEXT_DEHYPHENATE
+                    search_flags = _resolve_fitz_flag("TEXT_DEHYPHENATE")
                 for page_num in target_pages:
                     page = doc[page_num]
                     op_count += _apply_single_pdf_annotation(page, op_type, search_text, comment, rgb_color, commenter, search_flags)

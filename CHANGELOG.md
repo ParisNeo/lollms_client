@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-02 16:03]
+
+- fix(document_editor): resolve PyMuPDF flags safely to prevent version crashes
+
 ## [2026-09-02 16:02]
 
 - refactor(personality): update agent state and document tool bindings
