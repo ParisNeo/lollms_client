@@ -7,6 +7,7 @@ Tools for inspecting, reading, and selectively searching native document formats
 
 import os
 import re
+import base64
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from ascii_colors import ASCIIColors
@@ -15,6 +16,8 @@ from ascii_colors import ASCIIColors
 TOOL_LIBRARY_NAME = "As-Is Document Tools"
 TOOL_LIBRARY_DESC = "Inspect, search, and extract selective content from binary and structured workspace documents."
 TOOL_LIBRARY_ICON = "📄"
+
+_VISION_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp", ".gif"}
 
 
 def init_tools_library() -> None:
@@ -29,6 +32,58 @@ def init_tools_library() -> None:
         })
     except Exception:
         pass
+
+
+def _extract_pdf_images_for_vlm(pdf_path: Path, target_pages: List[int], max_images: int = 5) -> tuple[List[str], List[str]]:
+    """
+    Extracts embedded raster images from specified PDF pages as base64-encoded PNG strings.
+    Uses PyMuPDF (fitz) if available; returns (images, media_types).
+    """
+    images_b64: List[str] = []
+    media_types: List[str] = []
+
+    try:
+        import fitz
+    except ImportError:
+        return images_b64, media_types
+
+    doc = None
+    try:
+        doc = fitz.open(str(pdf_path))
+        for page_num in target_pages:
+            if len(images_b64) >= max_images:
+                break
+            if page_num >= len(doc):
+                continue
+            page = doc[page_num]
+            image_list = page.get_images(full=True)
+            for img_info in image_list:
+                if len(images_b64) >= max_images:
+                    break
+                xref = img_info[0]
+                try:
+                    base_img = doc.extract_image(xref)
+                    img_bytes = base_img.get("image")
+                    if not img_bytes:
+                        continue
+                    img_ext = base_img.get("ext", "png").lower()
+                    if img_ext not in _VISION_IMAGE_EXTS:
+                        img_ext = "png"
+                    b64_str = base64.b64encode(img_bytes).decode("utf-8")
+                    images_b64.append(b64_str)
+                    media_types.append(f"image/{img_ext}")
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    finally:
+        if doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
+
+    return images_b64, media_types
 
 
 def tool_inspect_document(file_name: str) -> Dict[str, Any]:
@@ -184,9 +239,34 @@ def tool_read_document_content(
             full_text = "\n\n".join(pages_text)
             if len(full_text) > max_chars:
                 full_text = full_text[:max_chars] + f"\n\n... [truncated, {len(full_text) - max_chars} more chars]"
-            if not full_text.strip():
-                return {"success": False, "error": f"Pages {page_or_sheet or '1-' + str(total_pages)} extracted but contained no readable text. The PDF may be image-based (scanned) and require OCR, or the page range is outside the document bounds."}
-            return {"success": True, "total_pages": total_pages, "pages_read": [p + 1 for p in target_pages], "content": full_text, "output": full_text}
+
+            images_b64: List[str] = []
+            media_types: List[str] = []
+            has_no_text = not full_text.strip()
+
+            if has_no_text or "[truncated" in full_text:
+                images_b64, media_types = _extract_pdf_images_for_vlm(path, target_pages, max_images=5)
+
+            if has_no_text and not images_b64:
+                return {"success": False, "error": f"Pages {page_or_sheet or '1-' + str(total_pages)} extracted but contained no readable text or extractable images. The PDF may require OCR."}
+            if has_no_text and images_b64:
+                return {
+                    "success": True,
+                    "total_pages": total_pages,
+                    "pages_read": [p + 1 for p in target_pages],
+                    "content": f"[Pages {page_or_sheet} contain no extractable text. {len(images_b64)} embedded figure(s)/image(s) were extracted for visual analysis.]",
+                    "output": f"[Pages {page_or_sheet} contain no extractable text. {len(images_b64)} embedded figure(s)/image(s) were extracted for visual analysis.]",
+                    "images": images_b64,
+                    "image_media_types": media_types,
+                    "prompt_injection": f"\n\n[SYSTEM: {len(images_b64)} image(s) from page(s) {page_or_sheet} have been extracted and attached as vision content for your analysis. Describe what you see in the figures, including any equations, charts, or diagrams.]"
+                }
+
+            result = {"success": True, "total_pages": total_pages, "pages_read": [p + 1 for p in target_pages], "content": full_text, "output": full_text}
+            if images_b64:
+                result["images"] = images_b64
+                result["image_media_types"] = media_types
+                result["prompt_injection"] = f"\n\n[SYSTEM: {len(images_b64)} embedded figure(s)/image(s) from page(s) {page_or_sheet} have been extracted and attached as vision content. Reference them in your analysis of the text.]"
+            return result
 
         elif ext == ".docx":
             import docx

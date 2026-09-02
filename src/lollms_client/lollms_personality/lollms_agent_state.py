@@ -43,6 +43,7 @@ _BINARY_BLOB_KEYS = {
     "plot_b64", "image_b64", "audio_b64", "video_b64", "file_b64",
     "screenshot_b64", "pdf_b64", "thumbnail_b64", "base64",
     "binary", "raw_image", "image_data", "raw_data",
+    "images", "image_media_types",
 }
 
 def _calculate_dynamic_tool_char_limit(client: Optional[Any] = None) -> int:

@@ -4253,57 +4253,82 @@ JSON:"""
             p = p.replace("\\", "/").strip()
             if p.startswith("./"):
                 p = p[2:]
+            if p.startswith("workspace/"):
+                p = p[len("workspace/"):]
+            if p.startswith("data_workspace/"):
+                p = p[len("data_workspace/"):]
             return p.lower()
 
+        all_arts_titles_normalized = {
+            _norm_path(a.get("title", "")): a.get("title", "")
+            for a in all_arts
+            if not a.get("title", "").endswith("::images")
+        }
+
+        def _resolve_target_to_artifact(target_str: str) -> Optional[Dict]:
+            target_norm = _norm_path(target_str)
+            art = next((a for a in all_arts if _norm_path(a.get("title", "")) == target_norm), None)
+            if art:
+                return art
+            art = next((a for a in all_arts if _norm_path(a.get("physical_path", "")) == target_norm), None)
+            if art:
+                return art
+            if target_norm in all_arts_titles_normalized:
+                original_title = all_arts_titles_normalized[target_norm]
+                return next((a for a in all_arts if a.get("title") == original_title), None)
+            from lollms_client.lollms_artefact.lollms_artefact import _find_best_title_match
+            best_match = _find_best_title_match(target_str, list(all_arts_titles_normalized.values()), threshold=0.60)
+            if best_match:
+                return next((a for a in all_arts if a.get("title") == best_match), None)
+            return None
+
         for t_target in targets:
-            if tag_name in ("collapse_folder", "uncollapse_folder"):
-                import sqlite3 as _sqlite3
+            import sqlite3 as _sqlite3
 
-                folder_path_normalized = t_target.strip().replace("\\", "/").rstrip("/")
-                if not folder_path_normalized:
-                    continue
-
-                try:
-                    conn = _sqlite3.connect(str(self._state_db_path))
-                    cursor = conn.cursor()
-                    if tag_name == "collapse_folder":
-                        cursor.execute("INSERT OR REPLACE INTO collapsed_folders (path) VALUES (?)", (folder_path_normalized,))
-                        action_verb = "Collapsing"
-                    else:
-                        cursor.execute("DELETE FROM collapsed_folders WHERE path = ?", (folder_path_normalized,))
-                        action_verb = "Uncollapsing"
-                    conn.commit()
-                    conn.close()
-
-                    processed_files.append(folder_path_normalized)
-                    object.__setattr__(self, '_last_ws_sync_time', 0.0)
-                    continue
-                except Exception as db_err:
-                    ASCIIColors.warning(f"[{self.name}] Failed to update collapsed_folders DB: {db_err}")
-                    continue
-
-                folder_prefix = t_target.rstrip('/') + '/'
-                matched_arts = [a for a in all_arts if a.get("physical_path", "").replace("\\", "/").startswith(folder_prefix)]
-
-                if not matched_arts:
-                    not_found.append(t_target)
-                    continue
-
-                for art in matched_arts:
-                    if art.get("visibility") == target_visibility:
-                        already_in_state.append(art["title"])
-                    else:
-                        art["visibility"] = target_visibility
-                        if target_visibility == ArtefactVisibility.FULL:
-                            art["active"] = True
-                        else:
-                            art["active"] = False
-                            art["content"] = ""
-                        processed_files.append(art["title"])
+            folder_path_normalized = t_target.strip().replace("\\", "/").rstrip("/")
+            if not folder_path_normalized:
                 continue
 
-            target_norm = _norm_path(t_target)
-            art = next((a for a in all_arts if _norm_path(a.get("title", "")) == target_norm), None)
+            try:
+                conn = _sqlite3.connect(str(self._state_db_path))
+                cursor = conn.cursor()
+                if tag_name == "collapse_folder":
+                    cursor.execute("INSERT OR REPLACE INTO collapsed_folders (path) VALUES (?)", (folder_path_normalized,))
+                    action_verb = "Collapsing"
+                else:
+                    cursor.execute("DELETE FROM collapsed_folders WHERE path = ?", (folder_path_normalized,))
+                    action_verb = "Uncollapsing"
+                conn.commit()
+                conn.close()
+
+                processed_files.append(folder_path_normalized)
+                object.__setattr__(self, '_last_ws_sync_time', 0.0)
+                continue
+            except Exception as db_err:
+                ASCIIColors.warning(f"[{self.name}] Failed to update collapsed_folders DB: {db_err}")
+                continue
+
+            folder_prefix = t_target.rstrip('/') + '/'
+            matched_arts = [a for a in all_arts if a.get("physical_path", "").replace("\\", "/").startswith(folder_prefix)]
+
+            if not matched_arts:
+                not_found.append(t_target)
+                continue
+
+            for art in matched_arts:
+                if art.get("visibility") == target_visibility:
+                    already_in_state.append(art["title"])
+                else:
+                    art["visibility"] = target_visibility
+                    if target_visibility == ArtefactVisibility.FULL:
+                        art["active"] = True
+                    else:
+                        art["active"] = False
+                        art["content"] = ""
+                    processed_files.append(art["title"])
+                continue
+
+            art = _resolve_target_to_artifact(t_target)
 
             if not art:
                 not_found.append(t_target)
@@ -4478,6 +4503,51 @@ JSON:"""
         
           
         
+    def _inject_tool_images_for_vlm(self, tool_result: Dict[str, Any]) -> List[Dict[str, str]]:
+        """
+        Extracts base64 images from a tool result and formats them as OpenAI-compatible
+        image_url content blocks for VLM-capable LLMs. Returns an empty list if the
+        client does not support vision or if no images are present.
+        """
+        if not self.lollms_client:
+            return []
+
+        vision_capable = False
+        try:
+            if hasattr(self.lollms_client, 'llm') and hasattr(self.lollms_client.llm, 'supports_vision'):
+                vision_capable = bool(self.lollms_client.llm.supports_vision)
+            elif hasattr(self.lollms_client, 'supports_vision'):
+                vision_capable = bool(self.lollms_client.supports_vision)
+        except Exception:
+            pass
+
+        if not vision_capable:
+            return []
+
+        raw_images = tool_result.get("images") or tool_result.get("image_b64") or []
+        if isinstance(raw_images, str):
+            raw_images = [raw_images]
+        if not raw_images or not isinstance(raw_images, list):
+            return []
+
+        media_types = tool_result.get("image_media_types") or []
+        content_blocks: List[Dict[str, str]] = []
+
+        for idx, img_b64 in enumerate(raw_images):
+            if not isinstance(img_b64, str) or not img_b64.strip():
+                continue
+            mtype = media_types[idx] if idx < len(media_types) else "image/png"
+            if ";" in img_b64 and "base64," in img_b64:
+                url = img_b64
+            else:
+                url = f"data:{mtype};base64,{img_b64}"
+            content_blocks.append({
+                "type": "image_url",
+                "image_url": {"url": url}
+            })
+
+        return content_blocks
+
     def _execute_tool(self, tool_name: str, tool_params: Dict[str, Any], active_tools: Dict) -> Dict[str, Any]:
         old_cwd = os.getcwd()
         if self._resolved_workspace:
@@ -4941,6 +5011,25 @@ JSON:"""
 
             messages = _normalize_messages(messages)
 
+            pending_vlm = getattr(self, '_pending_vlm_images', [])
+            if pending_vlm:
+                last_user_idx = None
+                for i in range(len(messages) - 1, -1, -1):
+                    if messages[i].get("role") == "user":
+                        last_user_idx = i
+                        break
+                if last_user_idx is not None:
+                    orig_content = messages[last_user_idx].get("content", "")
+                    if isinstance(orig_content, str):
+                        content_blocks = [{"type": "text", "text": orig_content}]
+                    elif isinstance(orig_content, list):
+                        content_blocks = list(orig_content)
+                    else:
+                        content_blocks = [{"type": "text", "text": str(orig_content)}]
+                    content_blocks.extend(pending_vlm)
+                    messages[last_user_idx]["content"] = content_blocks
+                object.__setattr__(self, '_pending_vlm_images', [])
+
             event_mode = kwargs.get("event_mode", EventMode.PROCESSING_TAG_MODE)
             ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
 
@@ -5138,6 +5227,13 @@ JSON:"""
                                         continue
 
                                 tool_res = self._execute_tool(tool_name, tool_params, active_tools)
+
+                                vlm_images = self._inject_tool_images_for_vlm(tool_res)
+                                if vlm_images:
+                                    if not hasattr(self, '_pending_vlm_images'):
+                                        object.__setattr__(self, '_pending_vlm_images', [])
+                                    self._pending_vlm_images.extend(vlm_images)
+
                                 tool_success = isinstance(tool_res, dict) and tool_res.get("success", True) is not False
                                 inner_res = tool_res.get("output", tool_res) if isinstance(tool_res, dict) else tool_res
                                 is_failure = (
@@ -5578,6 +5674,12 @@ JSON:"""
                                     continue
 
                             tool_res = self._execute_tool(tool_name, tool_params, active_tools)
+
+                            vlm_images = self._inject_tool_images_for_vlm(tool_res)
+                            if vlm_images:
+                                if not hasattr(self, '_pending_vlm_images'):
+                                    object.__setattr__(self, '_pending_vlm_images', [])
+                                self._pending_vlm_images.extend(vlm_images)
 
                             if isinstance(tool_res, dict) and tool_res.get("success") is False and not tool_res.get("error"):
                                 raw_preview = ""

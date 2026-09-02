@@ -242,6 +242,43 @@ def _apply_single_pdf_annotation(page, annotation_type: str, search_text: str, c
     return annot_count
 
 
+def _save_pdf_safely(doc, output_path: str) -> None:
+    """
+    Saves a fitz document to the given path, handling the case where
+    output_path is the same as the source file.
+
+    PyMuPDF raises 'save to original must be incremental' when attempting
+    to overwrite the currently-open file without incremental=True.
+    Incremental saves can fail with structural changes, so we use the
+    atomic temp-file + replace pattern instead.
+    """
+    import tempfile
+    import shutil
+
+    output_path_obj = Path(output_path).resolve()
+    source_path = Path(doc.name).resolve() if doc.name else None
+
+    if source_path is not None and output_path_obj == source_path:
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            suffix=".pdf",
+            dir=str(output_path_obj.parent)
+        )
+        os.close(tmp_fd)
+        try:
+            doc.save(tmp_path, garbage=3, deflate=True)
+            doc.close()
+            shutil.move(tmp_path, str(output_path_obj))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    else:
+        doc.save(str(output_path_obj), garbage=3, deflate=True)
+        doc.close()
+
+
 def tool_edit_document_text(
     file_name: str,
     operation: str,
@@ -299,8 +336,7 @@ def tool_edit_document_text(
                 doc.close()
                 return {"success": False, "error": f"Search text not found in the specified pages."}
 
-            doc.save(output_path)
-            doc.close()
+            _save_pdf_safely(doc, output_path)
             
         elif file_ext == ".docx":
             import docx
@@ -458,16 +494,19 @@ def tool_annotate_document(
                 return {"success": False, "error": f"No valid pages parsed from '{pages}'. Document has {len(doc)} pages."}
             total_annot = 0
 
+            search_flags = 0
+            if fitz is not None:
+                search_flags = fitz.TEXT_DEHYPHENATE
+
             for page_num in target_pages:
                 page = doc[page_num]
-                total_annot += _apply_single_pdf_annotation(page, annotation_type, search_text, comment, rgb_color, commenter_name, 0)
+                total_annot += _apply_single_pdf_annotation(page, annotation_type, search_text, comment, rgb_color, commenter_name, search_flags)
 
             if total_annot == 0:
                 doc.close()
                 return {"success": False, "error": f"Search text not found for annotation on page(s) {pages or 'all'}. The text may not exist or may be image-based (scanned PDF). Try a shorter, more specific search_text fragment."}
 
-            doc.save(output_path)
-            doc.close()
+            _save_pdf_safely(doc, output_path)
 
         elif file_ext == ".docx":
             import docx
@@ -595,9 +634,12 @@ def tool_batch_annotate_document(
                     continue
                 
                 op_count = 0
+                search_flags = 0
+                if fitz is not None:
+                    search_flags = fitz.TEXT_DEHYPHENATE
                 for page_num in target_pages:
                     page = doc[page_num]
-                    op_count += _apply_single_pdf_annotation(page, op_type, search_text, comment, rgb_color, commenter, 0)
+                    op_count += _apply_single_pdf_annotation(page, op_type, search_text, comment, rgb_color, commenter, search_flags)
                 
                 if op_count == 0:
                     errors.append(f"Text not found: '{search_text[:50]}...'")
@@ -607,9 +649,8 @@ def tool_batch_annotate_document(
             if total_applied == 0:
                 doc.close()
                 return {"success": False, "error": "No annotations applied. " + " | ".join(errors)}
-            
-            doc.save(output_path)
-            doc.close()
+
+            _save_pdf_safely(doc, output_path)
 
         elif file_ext == ".docx":
             import docx
@@ -745,10 +786,24 @@ def tool_copy_paste_between_documents(
         if not extracted_text:
             return {"success": False, "error": f"Source text not found in {source_file}."}
 
-        # 2. Insert into target
         tgt_doc = fitz.open(target_file)
         tgt_target_pages = _parse_page_numbers(target_pages, len(tgt_doc))
         insert_count = 0
+        for page_num in tgt_target_pages:
+            page = tgt_doc[page_num]
+            anchor_instances = _fuzzy_search_pdf_page(page, target_anchor_text, flags=0)
+            if anchor_instances:
+                rect = anchor_instances[0]
+                point = fitz.Point(rect.x1, rect.y0)
+                page.insert_text(point, "\n" + extracted_text + "\n", fontsize=11, fontname="helv")
+                insert_count += 1
+                break
+
+        if insert_count == 0:
+            tgt_doc.close()
+            return {"success": False, "error": f"Anchor text not found in {target_file}."}
+
+        _save_pdf_safely(tgt_doc, output_path)
         
         for page_num in tgt_target_pages:
             page = tgt_doc[page_num]
@@ -814,9 +869,8 @@ def tool_delete_document_page(
             # Delete pages from the end to avoid index shifting
             for page_num in sorted(pages_to_del, reverse=True):
                 doc.delete_page(page_num)
-                
-            doc.save(output_path)
-            doc.close()
+
+            _save_pdf_safely(doc, output_path)
             
         elif file_ext == ".pptx":
             from pptx import Presentation
@@ -896,9 +950,8 @@ def tool_replace_text_globally(
             if total_replaced == 0:
                 doc.close()
                 return {"success": False, "error": "Text not found."}
-                
-            doc.save(output_path)
-            doc.close()
+
+            _save_pdf_safely(doc, output_path)
 
         elif file_ext == ".docx":
             import docx
