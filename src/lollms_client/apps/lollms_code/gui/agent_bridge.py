@@ -411,6 +411,7 @@ class QueueStreamingCallback:
             MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START: "artefact_start",
             MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END: "artefact_end",
             getattr(MSG_TYPE, "MSG_TYPE_ARTEFACT_SYMBOL_DETECTED", None): "artefact_symbol",
+            getattr(MSG_TYPE, "MSG_TYPE_ROUND_INFO", None): "round_info",
             MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE: "context_update",
         }
         mapping.pop(None, None)

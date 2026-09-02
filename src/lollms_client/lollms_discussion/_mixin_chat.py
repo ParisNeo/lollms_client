@@ -867,6 +867,7 @@ class _StreamState:
         fast_artefact_replicas: Optional[List[str]] = None,
         processed_tags: Optional[set] = None,
         event_mode: EventMode = EventMode.PROCESSING_TAG_MODE,
+        remove_thinking_blocks: bool = True,
     ):
         self.discussion = discussion
         self.callback = callback
@@ -876,6 +877,7 @@ class _StreamState:
         self.auto_activate = auto_activate_artefacts
         self.content_offset = content_offset
         self.event_mode = event_mode
+        self.remove_thinking_blocks = remove_thinking_blocks
 
         self.enable_notes = enable_notes if enable_artefacts else False
         self.enable_skills = enable_skills if enable_artefacts else False
@@ -1040,6 +1042,19 @@ class _StreamState:
 
         # CRITICAL FIX: Append to shadow buffer instead of directly to ai_message.content
         self._pending_buffer += chunk
+
+        # ── 🧹 THINKING BLOCK SUPPRESSION ──
+        # If remove_thinking_blocks is True, we strip  ...  blocks from the live stream.
+        if self.remove_thinking_blocks and not self._is_accumulating_tool and not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_secondary and not self._in_code_fence:
+            if "</think>" in self._pending_buffer:
+                end_idx = self._pending_buffer.find(" ")
+                if end_idx != -1:
+                    # Discard the thought block entirely
+                    self._pending_buffer = self._pending_buffer[end_idx + 8:]
+                else:
+                    # Wait for the closing tag in the next chunk
+                    self._pending_buffer = ""
+                    return True
 
         # ── 🛑 DONE TAG DETECTION (SUPPORTS ALL VARIANTS) ──
         # Detect <done/>, <done>, <end/>, <end>, </end> at the start of a line to signal explicit termination.
@@ -3296,9 +3311,9 @@ class ChatMixin:
         enable_image_editing:    bool = True,
         auto_activate_artefacts: bool = True,
         enable_inline_widgets:        bool = False,
+        enable_forms:                 bool = True,
         enable_notes:                 bool = True,
         enable_skills:                bool = True,
-        enable_forms:                 bool = True,
         enable_books:                 bool = False,
         enable_presentations:         bool = False,
         memory_manager=None,
@@ -3392,6 +3407,7 @@ class ChatMixin:
         # 🛡️ SECURITY: Store the dynamic tool execution flag.
         # If False, the ArtefactManager will NOT register type="tool" artefacts as executable LCP tools.
         object.__setattr__(self, "allow_dynamic_tools", allow_dynamic_tools)
+        object.__setattr__(self, "remove_thinking_blocks", remove_thinking_blocks)
 
         # 🛡️ SECURITY: Store the arbitrary code execution flag.
         object.__setattr__(self, "enable_code_execution", enable_code_execution)
@@ -3660,6 +3676,7 @@ class ChatMixin:
 
         if enable_data_tools_flag and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
             lcp_binding.mount_tool_library("as_is_document_tools")
+            lcp_binding.mount_tool_library_if_absent("document_editor")
             try:
                 lcp_tools = lcp_binding.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
                 for t_name, t_spec in lcp_tools.items():
@@ -3668,6 +3685,8 @@ class ChatMixin:
                        t_name.startswith("tool_grep_document") or \
                        t_name.startswith("tool_modify_docx") or \
                        t_name.startswith("tool_modify_excel") or \
+                       t_name.startswith("tool_edit_document_text") or \
+                       t_name.startswith("tool_annotate_document") or \
                        t_name.startswith("tool_modify_pdf_annotation") or \
                        t_name.startswith("tool_modify_pptx_slide"):
                         active_tools[t_name] = t_spec
@@ -4175,7 +4194,8 @@ class ChatMixin:
                 fast_artefact_replicas=fast_artefact_replicas,
                 content_offset=current_content_length,
                 processed_tags=persistent_processed_tags,
-                event_mode=event_mode
+                event_mode=event_mode,
+                remove_thinking_blocks=remove_thinking_blocks
             )
 
             def _inline_relay(chunk, msg_type=None, meta=None):

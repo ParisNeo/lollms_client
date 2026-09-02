@@ -792,10 +792,23 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
 
     if config.enable_shell_execution and client.tools:
         try:
-            client.tools.mount_tool_library('system_shell')
+            if hasattr(client.tools, 'mount_tool_library_if_absent'):
+                client.tools.mount_tool_library_if_absent('system_shell')
+            else:
+                client.tools.mount_tool_library('system_shell')
             ASCIIColors.success("[CLI] ✅ System Shell library mounted.")
         except Exception as e:
             ASCIIColors.warning(f"Failed to pre-mount system_shell library: {e}")
+
+    if client.tools:
+        try:
+            if hasattr(client.tools, 'mount_tool_library_if_absent'):
+                client.tools.mount_tool_library_if_absent('git_manager')
+            else:
+                client.tools.mount_tool_library('git_manager')
+            ASCIIColors.success("[CLI] ✅ Git Manager library mounted.")
+        except Exception as e:
+            ASCIIColors.warning(f"Failed to pre-mount git_manager library: {e}")
 
     return client
 
@@ -911,8 +924,15 @@ You are operating in the following environment:
 
 def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> LollmsPersonality:
     """Creates a coding personality from the handbag structure, injecting client and capabilities."""
+    ASCIIColors.rich_print("\n[bold cyan]🔧 Initializing Agent...[/bold cyan]")
+
+    ASCIIColors.rich_print("  [dim]📂 Ensuring handbag structure...[/dim]", end="")
     ensure_handbag_structure(config)
+    ASCIIColors.rich_print(" [green]✓[/green]")
+
+    ASCIIColors.rich_print("  [dim]🗂️  Preparing sandbox (.lollms_code/)...[/dim]", end="")
     ensure_sandbox_structure(config)
+    ASCIIColors.rich_print(" [green]✓[/green]")
 
     has_tti = hasattr(client, 'tti') and client.tti is not None
     has_tts = hasattr(client, 'tts') and client.tts is not None
@@ -934,21 +954,21 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
     )
 
     if has_tti:
-        ASCIIColors.success(f"[CLI] ✅ Image generation tools enabled (TTI binding detected on client).")
+        ASCIIColors.rich_print("  [green]✓[/green] [dim]Image generation tools enabled (TTI)[/dim]")
     if has_tts:
-        ASCIIColors.success(f"[CLI] ✅ Text-to-Speech tools enabled (TTS binding detected on client).")
+        ASCIIColors.rich_print("  [green]✓[/green] [dim]Text-to-Speech tools enabled (TTS)[/dim]")
     if has_stt:
-        ASCIIColors.success(f"[CLI] ✅ Speech-to-Text tools enabled (STT binding detected on client).")
+        ASCIIColors.rich_print("  [green]✓[/green] [dim]Speech-to-Text tools enabled (STT)[/dim]")
 
+    ASCIIColors.rich_print("  [dim]🧠 Loading handbag & building personality...[/dim]", end="")
     personality = LollmsPersonality.from_handbag(config.handbag_path)
     personality.lollms_client = client
-
     personality.workspace_path = Path(config.workspace_path)
+    ASCIIColors.rich_print(" [green]✓[/green]")
 
     # ── 🧠 PROJECT-LOCAL MEMORY ISOLATION ──
-    # Override the handbag's global memory with a project-specific database.
-    # This prevents Project A's memories from polluting Project B.
     if config.enable_memory:
+        ASCIIColors.rich_print("  [dim]💾 Initializing project-local memory...[/dim]", end="")
         try:
             from lollms_client.lollms_memory import LollmsMemoryManager, MemoryConfig
             project_memory_db = Path(config.workspace_path) / ".lollms_code" / "memory" / "memory.db"
@@ -959,18 +979,22 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
                 owner_id=f"project_{Path(config.workspace_path).name}",
                 config=MemoryConfig(working_token_budget=2000)
             )
-            ASCIIColors.info(f"[CLI] ✅ Project-local memory initialized at: {project_memory_db}")
+            ASCIIColors.rich_print(f" [green]✓[/green] [dim]({project_memory_db.name})[/dim]")
         except Exception as e:
+            ASCIIColors.rich_print(f" [red]✗[/red]")
             ASCIIColors.warning(f"[CLI] Failed to initialize project memory: {e}. Falling back to handbag memory.")
 
     # ── 💾 PROJECT-LOCAL HISTORY ISOLATION ──
-    # Load the project-specific conversation history.
+    ASCIIColors.rich_print("  [dim]📜 Loading conversation history...[/dim]", end="")
     project_history_file = Path(config.workspace_path) / ".lollms_code" / "history.json"
     personality.load_history_from_disk(project_history_file)
     personality._project_history_file = project_history_file
+    ASCIIColors.rich_print(" [green]✓[/green]")
 
+    ASCIIColors.rich_print("  [dim]📝 Assembling system prompt & environment context...[/dim]", end="")
     env_context = build_environment_context(config)
     personality.system_prompt = personality.system_prompt + "\n" + env_context
+    ASCIIColors.rich_print(" [green]✓[/green]")
 
     if has_tti:
         personality.system_prompt += (
@@ -1001,22 +1025,42 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
 
     personality.capabilities = caps
     personality.max_tokens_per_turn = config.max_tokens_per_turn
-
     personality.debug_mode = config.debug
 
+    ASCIIColors.rich_print("  [dim]👤 Loading user profile...[/dim]", end="")
     personality._init_user_profile(APP_USER_PROFILE_FILE)
+    ASCIIColors.rich_print(" [green]✓[/green]")
 
+    ASCIIColors.rich_print("  [dim]📝 Initializing scratchpad...[/dim]", end="")
+    try:
+        if hasattr(personality, "_init_scratchpad"):
+            personality._init_scratchpad()
+        ASCIIColors.rich_print(" [green]✓[/green]")
+    except Exception as e:
+        ASCIIColors.rich_print(f" [red]✗[/red]")
+        ASCIIColors.warning(f"Failed to initialize scratchpad: {e}")
+
+    ASCIIColors.rich_print("  [dim]🔍 Building artefact system...[/dim]", end="")
     try:
         if hasattr(personality, "_init_artefact_system"):
             personality._init_artefact_system()
-        if hasattr(personality, "_sync_artefact_index_with_disk"):
-            personality._sync_artefact_index_with_disk()
-        if hasattr(personality, "_init_scratchpad"):
-            personality._init_scratchpad()
+        ASCIIColors.rich_print(" [green]✓[/green]")
     except Exception as e:
+        ASCIIColors.rich_print(f" [red]✗[/red]")
         ASCIIColors.warning(f"Failed to pre-initialize artefact system for stats: {e}")
 
+    ASCIIColors.rich_print("[bold green]  ✅ Agent initialized and ready.[/bold green]\n")
+
     return personality
+
+def _index_workspace_with_progress(personality: LollmsPersonality, client: LollmsClient):
+    """Validates the workspace path. Full file indexing is no longer performed at startup."""
+    try:
+        ws_path = personality._resolved_workspace
+        if not ws_path or not ws_path.exists():
+            return
+    except Exception as e:
+        ASCIIColors.warning(f"Workspace validation failed: {e}")
 
 
 def _format_bytes(size: int) -> str:
@@ -1348,9 +1392,28 @@ class StreamRenderer:
 
             status_str = "[green]✅ Success[/green]" if success else "[red]❌ Failed[/red]"
 
+            cmd_params = meta.get("parameters", {})
+
+            if not cmd_params and tool_name != "tool_execute_shell_command":
+                ASCIIColors.rich_print("")
+                log_source = output or error or ""
+                if log_source:
+                    log_lines = log_source.splitlines()
+                    max_log_lines = 30
+                    if len(log_lines) > max_log_lines:
+                        log_content = "\n".join(log_lines[:max_log_lines]) + f"\n[dim]... ({len(log_lines) - max_log_lines} more lines truncated)[/dim]"
+                    else:
+                        log_content = log_source
+                else:
+                    log_content = "[dim](No output or error details provided)[/dim]"
+
+                log_label = "Output" if success else "Error"
+                ASCIIColors.rich_print(f"[bold blue]🛠️ Finished:[/bold blue] [yellow]{tool_name}[/yellow] {status_str}")
+                ASCIIColors.rich_print(f"[cyan]{log_label}:[/cyan]\n{log_content}")
+                return
+
             panel_lines = [f"\n[cyan]Status:[/cyan] {status_str}"]
 
-            cmd_params = meta.get("parameters", {})
             if cmd_params:
                 try:
                     params_str = json.dumps(cmd_params, indent=2, ensure_ascii=False, default=str)
@@ -1499,6 +1562,8 @@ class StreamRenderer:
                 if msg_type == MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START:
                     return True
                 if msg_type == MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END:
+                    return True
+                if msg_type == MSG_TYPE.MSG_TYPE_TOOL_END:
                     return True
 
             if msg_type == MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START and meta and meta.get("execution_phase"):
@@ -1654,6 +1719,8 @@ def display_result(result: Dict[str, Any], config: CodeAgentConfig, elapsed: flo
 
 
 def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prompt: str, config: CodeAgentConfig) -> int:
+    _index_workspace_with_progress(personality, client)
+
     if config.debug:
         dump_startup_context(personality, client)
 
@@ -2253,6 +2320,8 @@ def _switch_workspace_interactive(config: CodeAgentConfig, client: LollmsClient)
         return None
 
 def run_interactive(personality: LollmsPersonality, client: LollmsClient, config: CodeAgentConfig) -> int:
+    _index_workspace_with_progress(personality, client)
+
     if config.debug:
         dump_startup_context(personality, client)
 
@@ -2620,6 +2689,7 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
             new_personality = _switch_workspace_interactive(config, client)
             if new_personality:
                 personality = new_personality
+                _index_workspace_with_progress(personality, client)
                 ws_path_display = Path(config.workspace_path).resolve()
                 try:
                     ws_path_display = ws_path_display.relative_to(Path.home())

@@ -170,6 +170,14 @@ def _sanitize_tool_result(tool_res: Any, max_chars: Optional[int] = None, client
             error_parts = ["⚠️ **Tool Execution Failed**"]
 
             error_msg = tool_res.get("error") or (inner_dict.get("error") if inner_dict else None)
+
+            if not error_msg:
+                raw_output = tool_res.get("output")
+                if isinstance(raw_output, str) and raw_output.strip():
+                    error_msg = raw_output.strip()
+                elif isinstance(raw_output, dict) and raw_output.get("error"):
+                    error_msg = raw_output["error"]
+
             if not error_msg:
                 raw_keys = list(tool_res.keys()) if isinstance(tool_res, dict) else type(tool_res).__name__
                 raw_preview = ""
@@ -183,12 +191,7 @@ def _sanitize_tool_result(tool_res: Any, max_chars: Optional[int] = None, client
                         raw_preview = "\nRaw content:\n" + "\n".join(preview_parts)
                 error_msg = (
                     f"Tool execution failed (success=False) but the tool did not provide a descriptive error message. "
-                    f"Raw keys: {raw_keys}.{raw_preview}\n\n"
-                    f"Possible causes:\n"
-                    f"1. The target file may not exist in the current working directory.\n"
-                    f"2. The search_text may not be found in the document (try a shorter, more specific fragment).\n"
-                    f"3. The document may be image-based (scanned PDF) and requires OCR.\n"
-                    f"4. A required library (pymupdf, python-docx) may not be installed."
+                    f"Raw keys: {raw_keys}.{raw_preview}"
                 )
             error_parts.append(f"**Error Details:**\n{error_msg}")
 

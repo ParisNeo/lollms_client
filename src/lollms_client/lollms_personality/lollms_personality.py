@@ -49,25 +49,7 @@ if _compile is None or not callable(_compile) or _compile.__module__ != 'builtin
     _compile = None
 
 
-try:
-    from lollms_client.lollms_types import MSG_TYPE, EventMode
-except ImportError:
-    class MSG_TYPE:
-        MSG_TYPE_CHUNK = "chunk"
-        MSG_TYPE_INFO = "info"
-        MSG_TYPE_NEW_MESSAGE = "new_message"
-        MSG_TYPE_THOUGHT_CHUNK = "thought"
-        MSG_TYPE_TOOL_START = 50
-        MSG_TYPE_TOOL_END = 51
-        MSG_TYPE_ARTEFACT_BUILD_START = 52
-        MSG_TYPE_ARTEFACT_BUILD_END = 53
-        MSG_TYPE_CONTEXT_UPDATE = 54
-
-    class EventMode:
-        PROCESSING_TAG_MODE = 0
-        FULL_CALLBACK_MODE = 1
-        MIXED_MODE = 2
-        SILENT_MODE = 3
+from lollms_client.lollms_types import MSG_TYPE, EventMode
 
 from lollms_client.lollms_memory import FailureMemory
 from lollms_client.lollms_artefact import ArtefactVisibility, ArtefactManager
@@ -2513,31 +2495,51 @@ class LollmsPersonality:
         snapshot = {}
         if not self._resolved_workspace:
             return snapshot
-        for f in self._resolved_workspace.rglob("*"):
-            if not f.is_file():
-                continue
-            rel_parts = f.relative_to(self._resolved_workspace).parts
-            if any(part in _IGNORED_WS_DIRS for part in rel_parts):
-                continue
-            if f.suffix.lower() in _IGNORED_WS_EXTS:
-                continue
-            try:
-                content = f.read_text(encoding="utf-8", errors="ignore")
-                file_hash = hashlib.md5(content.encode("utf-8", errors="ignore")).hexdigest()
-                snapshot[f.relative_to(self._resolved_workspace)] = {
-                    "hash": file_hash,
-                    "size": f.stat().st_size,
-                    "path": f
-                }
-            except Exception:
+
+        _MAX_SNAPSHOT_FILES = 5000
+        _MAX_HASH_SIZE = 512 * 1024  # 512KB — skip hashing files larger than this
+        files_scanned = 0
+
+        try:
+            for f in self._resolved_workspace.rglob("*"):
+                if files_scanned >= _MAX_SNAPSHOT_FILES:
+                    ASCIIColors.warning(f"[{self.name}] Workspace snapshot capped at {_MAX_SNAPSHOT_FILES} files. Larger workspaces are not fully hashed to prevent performance degradation.")
+                    break
+                if not f.is_file():
+                    continue
+                rel_parts = f.relative_to(self._resolved_workspace).parts
+                if any(part in _IGNORED_WS_DIRS for part in rel_parts):
+                    continue
+                if f.suffix.lower() in _IGNORED_WS_EXTS:
+                    continue
+
+                files_scanned += 1
+                rel_path = f.relative_to(self._resolved_workspace)
+
                 try:
-                    snapshot[f.relative_to(self._resolved_workspace)] = {
-                        "hash": None,
-                        "size": f.stat().st_size,
+                    file_size = f.stat().st_size
+                    file_hash = None
+                    if file_size < _MAX_HASH_SIZE:
+                        content = f.read_text(encoding="utf-8", errors="ignore")
+                        file_hash = hashlib.md5(content.encode("utf-8", errors="ignore")).hexdigest()
+
+                    snapshot[rel_path] = {
+                        "hash": file_hash,
+                        "size": file_size,
                         "path": f
                     }
                 except Exception:
-                    pass
+                    try:
+                        snapshot[rel_path] = {
+                            "hash": None,
+                            "size": f.stat().st_size,
+                            "path": f
+                        }
+                    except Exception:
+                        pass
+        except Exception as e:
+            ASCIIColors.warning(f"[{self.name}] Workspace snapshot failed: {e}")
+
         return snapshot
 
     def _sync_workspace(self, files_before: Dict, files_after: Dict) -> List[Dict[str, Any]]:
@@ -2654,231 +2656,46 @@ class LollmsPersonality:
                 conn.close()
 
     def _build_workspace_context_block(self) -> str:
-        import time as _time
-        current_time = _time.time()
-        if hasattr(self, '_last_ws_sync_time') and (current_time - self._last_ws_sync_time < 5.0):
-            if getattr(self, '_artefact_manager', None):
-                try:
-                    zone = self._artefact_manager.build_artefacts_context_zone()
-                    if zone:
-                        return "\n" + zone
-                    if self._resolved_workspace:
-                        collapsed = self._get_collapsed_folders_from_db()
-                        return "\n" + _build_workspace_context(self._resolved_workspace, collapsed_folders=collapsed)
-                except Exception:
-                    pass
-            elif self._resolved_workspace:
-                collapsed = self._get_collapsed_folders_from_db()
-                return "\n" + _build_workspace_context(self._resolved_workspace, collapsed_folders=collapsed)
+        if not self._resolved_workspace:
             return ""
 
-        object.__setattr__(self, '_last_ws_sync_time', current_time)
+        collapsed = self._get_collapsed_folders_from_db()
+        tree_block = _build_workspace_context(self._resolved_workspace, collapsed_folders=collapsed)
+
+        loaded_parts = ["=== FULLY LOADED FILE CONTENTS [C] ==="]
+        has_loaded = False
 
         if getattr(self, '_artefact_manager', None):
             try:
-                self._sync_artefact_index_with_disk()
-                zone = self._artefact_manager.build_artefacts_context_zone()
-                if zone:
-                    return "\n" + zone
-                if self._resolved_workspace:
-                    collapsed = self._get_collapsed_folders_from_db()
-                    return "\n" + _build_workspace_context(self._resolved_workspace, collapsed_folders=collapsed)
+                all_arts = self._artefact_manager._get_all_raw()
+                for art in all_arts:
+                    title = art.get("title", "")
+                    if title.endswith("::images"):
+                        continue
+
+                    vis = art.get("visibility")
+                    if vis in (ArtefactVisibility.FULL, ArtefactVisibility.PINNED):
+                        content = art.get("content", "")
+                        if not content:
+                            file_path = self._resolved_workspace / title
+                            if file_path.exists() and file_path.is_file():
+                                try:
+                                    content = file_path.read_text(encoding="utf-8", errors="ignore")
+                                    art["content"] = content
+                                except Exception:
+                                    pass
+
+                        if content:
+                            has_loaded = True
+                            loaded_parts.append(f"--- File: {title} ---\n{content}\n--- End File: {title} ---")
             except Exception as e:
-                ASCIIColors.warning(f"[{self.name}] Failed to build workspace context: {e}")
-                if self._resolved_workspace:
-                    collapsed = self._get_collapsed_folders_from_db()
-                    return "\n" + _build_workspace_context(self._resolved_workspace, collapsed_folders=collapsed)
-        elif self._resolved_workspace:
-            collapsed = self._get_collapsed_folders_from_db()
-            return "\n" + _build_workspace_context(self._resolved_workspace, collapsed_folders=collapsed)
-        return ""
-    
-    
-    def _sync_artefact_index_with_disk(self):
-        if not hasattr(self, '_artefact_manager') or not self._artefact_manager:
-            return
+                ASCIIColors.warning(f"[{self.name}] Failed to extract loaded contents: {e}")
 
-        if not hasattr(self, '_discussion') or not self._discussion:
-            return
+        loaded_block = "\n".join(loaded_parts) + "\n=== END FULLY LOADED FILE CONTENTS ===" if has_loaded else ""
 
-        try:
-            import sqlite3 as _sqlite3
-            import hashlib as _hashlib
-            
-            if not hasattr(self, '_state_db_path'):
-                ASCIIColors.warning(f"[{self.name}] State DB path missing, cannot delta sync.")
-                return
-
-            ws_path = self._resolved_workspace
-            if not ws_path or not ws_path.exists():
-                return
-
-            conn = _sqlite3.connect(str(self._state_db_path))
-            cursor = conn.cursor()
-            
-            try:
-                cursor.execute("ALTER TABLE file_states ADD COLUMN hash TEXT")
-            except _sqlite3.OperationalError:
-                pass 
-
-            cursor.execute("SELECT title, visibility, hash FROM file_states")
-            db_rows = cursor.fetchall()
-            db_files = {row[0]: {"visibility": row[1], "hash": row[2]} for row in db_rows}
-            conn.close()
-
-            current_files = set()
-            dirty = False
-
-            _BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".zip", ".tar", ".gz", ".pdf", ".docx", ".pptx", ".mp3", ".wav", ".mp4"}
-
-            def _is_noise_directory(dir_name: str) -> bool:
-                _COLLAPSED_DIRS = {"data_workspace", "env", ".venv", "venv", ".git", ".idea", ".vscode", "node_modules", ".lollms", "build", "dist", ".next", "__pycache__", ".lollms_metadata", ".lollms_code", "egg-info", "dist-info", ".pytest_cache", ".mypy_cache", ".ruff_cache", "htmlcov", "site-packages", "artefacts_metadata", "discussions"}
-                lower_name = dir_name.lower()
-                if lower_name in _COLLAPSED_DIRS: return True
-                if lower_name.endswith(".egg-info") or lower_name.endswith(".dist-info"): return True
-                return False
-
-            def _is_pinned(path_str: str) -> bool:
-                if not hasattr(self, '_artefact_manager') or not self._artefact_manager:
-                    return False
-                try:
-                    norm_path = path_str.replace("\\", "/").strip().lower()
-                    if norm_path.startswith("./"):
-                        norm_path = norm_path[2:]
-                    arts = self._artefact_manager._get_all_raw()
-                    for art in arts:
-                        title = art.get("title", "").replace("\\", "/").strip().lower()
-                        if title == norm_path:
-                            return art.get("visibility") == ArtefactVisibility.PINNED
-                except Exception:
-                    pass
-                return False
-
-            def _scan_dir(directory: Path):
-                nonlocal dirty
-                try:
-                    for item in sorted(directory.iterdir()):
-                        if item.is_dir():
-                            if _is_noise_directory(item.name):
-                                continue
-                            _scan_dir(item)
-                        elif item.is_file():
-                            if item.suffix.lower() in _IGNORED_WS_EXTS:
-                                continue
-
-                            rel_path_str = str(item.relative_to(ws_path)).replace("\\", "/")
-                            current_files.add(rel_path_str)
-
-                            try:
-                                stat = item.stat()
-                                if stat.st_size < 1024 * 1024:
-                                    content = item.read_bytes()
-                                    file_hash = _hashlib.md5(content).hexdigest()
-                                else:
-                                    file_hash = f"{stat.st_mtime}:{stat.st_size}"
-                            except Exception:
-                                file_hash = None
-
-                            db_info = db_files.get(rel_path_str)
-                            in_memory_art = self._artefact_manager.get(rel_path_str)
-
-                            if not db_info:
-                                dirty = True
-                                if getattr(self, 'debug_mode', False):
-                                    ASCIIColors.info(f"[{self.name}] 📄 New file detected: {rel_path_str}")
-
-                                if not in_memory_art:
-                                    self._artefact_manager.add(
-                                        title=rel_path_str,
-                                        artefact_type="code" if item.suffix.lower() in _TEXT_EXTS else "document",
-                                        content="",
-                                        active=False,
-                                        visibility=ArtefactVisibility.TREE_UNLOCKABLE,
-                                        skip_disk_sync=True
-                                    )
-
-                                conn = _sqlite3.connect(str(self._state_db_path))
-                                cur = conn.cursor()
-                                cur.execute("INSERT OR REPLACE INTO file_states (title, visibility, hash) VALUES (?, ?, ?)", 
-                                            (rel_path_str, ArtefactVisibility.TREE_UNLOCKABLE, file_hash))
-                                conn.commit()
-                                conn.close()
-
-                            elif db_info.get("hash") != file_hash:
-                                dirty = True
-                                if getattr(self, 'debug_mode', False):
-                                    ASCIIColors.info(f"[{self.name}] ✏️ File changed: {rel_path_str}")
-
-                                art = self._artefact_manager.get(rel_path_str)
-                                if art and art.get("visibility") == ArtefactVisibility.FULL:
-                                    art["content"] = ""
-
-                                conn = _sqlite3.connect(str(self._state_db_path))
-                                cur = conn.cursor()
-                                cur.execute("UPDATE file_states SET hash = ? WHERE title = ?", (file_hash, rel_path_str))
-                                conn.commit()
-                                conn.close()
-                            else:
-                                if not in_memory_art:
-                                    dirty = True
-                                    atype = "code" if item.suffix.lower() in _TEXT_EXTS else "document"
-
-                                    db_vis = db_info.get("visibility", ArtefactVisibility.TREE_UNLOCKABLE)
-                                    resolved_vis = db_vis
-
-                                    self._artefact_manager.add(
-                                        title=rel_path_str,
-                                        artefact_type=atype,
-                                        content="",
-                                        active=(resolved_vis == ArtefactVisibility.FULL),
-                                        visibility=resolved_vis,
-                                        skip_disk_sync=True
-                                    )
-                                    if db_vis != resolved_vis:
-                                        conn = _sqlite3.connect(str(self._state_db_path))
-                                        cur = conn.cursor()
-                                        cur.execute("UPDATE file_states SET visibility = ? WHERE title = ?", (resolved_vis, rel_path_str))
-                                        conn.commit()
-                                        conn.close()
-                                else:
-                                    if in_memory_art.get("visibility") != db_info.get("visibility"):
-                                        dirty = True
-                                        in_memory_art["visibility"] = db_info.get("visibility")
-                                        in_memory_art["active"] = (db_info.get("visibility") == ArtefactVisibility.FULL)
-
-                except Exception as dir_err:
-                    ASCIIColors.warning(f"[{self.name}] Failed to scan directory {directory}: {dir_err}")
-
-            _scan_dir(ws_path)
-
-            deleted_files = set(db_files.keys()) - current_files
-            if deleted_files:
-                dirty = True
-                conn = _sqlite3.connect(str(self._state_db_path))
-                cur = conn.cursor()
-                for d_file in deleted_files:
-                    if not d_file.endswith("::images"):
-                        if getattr(self, 'debug_mode', False):
-                            ASCIIColors.info(f"[{self.name}] 🗑️ Pruned deleted file: {d_file}")
-                        cur.execute("DELETE FROM file_states WHERE title = ?", (d_file,))
-                conn.commit()
-                conn.close()
-
-            if deleted_files:
-                surviving_arts = [
-                    art for art in self._artefact_manager._get_all_raw()
-                    if art.get("title") not in deleted_files or art.get("title", "").endswith("::images")
-                ]
-                self._artefact_manager._save_all(surviving_arts)
-            elif not self._discussion.metadata.get("_artefacts") or dirty:
-                self._artefact_manager._save_all(self._artefact_manager._get_all_raw())
-
-            if not dirty and getattr(self, 'debug_mode', False):
-                ASCIIColors.success(f"[{self.name}] ✅ Workspace index is up-to-date (0 changes).")
-
-        except Exception as e:
-            if getattr(self, 'debug_mode', False):
-                ASCIIColors.warning(f"[{self.name}] Disk sync/prune failed: {e}")          
+        if loaded_block:
+            return "\n" + tree_block + "\n\n" + loaded_block
+        return "\n" + tree_block
 
     def _refresh_workspace_context_in_prompt(self, current_prompt: str, new_ws_block: str) -> str:
         ws_boundary = "=== WORKSPACE CONTEXT BOUNDARY ==="
@@ -3038,7 +2855,8 @@ JSON:"""
         return user_prompt
 
     def _calculate_context_telemetry(self, stable_prompt: str, history: List[Dict], ws_ctx: str, virtual_history: List) -> Dict[str, int]:
-        """Calculates token consumption per context segment using the LLM client's tokenizer."""
+        """Calculates token consumption per context segment using the LLM client's tokenizer.
+        Does NOT trigger workspace sync — uses the provided ws_ctx string as-is."""
         telemetry = {
             "system_prompt": 0,
             "history": 0,
@@ -3353,21 +3171,17 @@ JSON:"""
             state_dir.mkdir(parents=True, exist_ok=True)
             state_db_path = state_dir / "context_state.db"
 
-            # Initialize SQLite state DB with hash column for delta sync
             conn = _sqlite3.connect(str(state_db_path))
             cursor = conn.cursor()
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS file_states (
                     title TEXT PRIMARY KEY,
                     visibility TEXT NOT NULL,
-                    hash TEXT
+                    hash TEXT,
+                    mtime REAL,
+                    size INTEGER
                 )
             """)
-            try:
-                cursor.execute("ALTER TABLE file_states ADD COLUMN hash TEXT")
-            except _sqlite3.OperationalError:
-                pass
-
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS collapsed_folders (
                     path TEXT PRIMARY KEY
@@ -3396,10 +3210,7 @@ JSON:"""
             object.__setattr__(self, '_artefact_proxy', proxy)
             object.__setattr__(self, '_discussion', proxy)
             object.__setattr__(self, '_state_db_path', state_db_path)
-
-            # Delegate the initial population and hash computation to the delta sync engine.
-            # This prevents reading/hashing every file on startup if the DB already knows them.
-            self._sync_artefact_index_with_disk()
+            object.__setattr__(self, '_last_ws_sync_time', 0.0)
 
         except Exception as e:
             ASCIIColors.warning(f"[{self.name}] Failed to initialise artefact system: {e}")
@@ -3624,6 +3435,7 @@ JSON:"""
         enable_shell: bool = False,
         enable_python_exec: bool = False,
         enable_web_tools: bool = False,
+        auto_load_document_editor: bool = True,
         *args, **kwargs
     ) -> Dict[str, Dict[str, Any]]:
         active_tools = {}
@@ -3658,9 +3470,14 @@ JSON:"""
             if enable_python_exec:
                 _libraries_to_mount.append("execute_python_code")
 
+            _libraries_to_mount.append("git_manager")
+
             for lib_name in _libraries_to_mount:
                 try:
-                    lcp_binding.mount_tool_library(lib_name)
+                    if hasattr(lcp_binding, 'mount_tool_library_if_absent'):
+                        lcp_binding.mount_tool_library_if_absent(lib_name)
+                    else:
+                        lcp_binding.mount_tool_library(lib_name)
                 except Exception as e:
                     ASCIIColors.warning(f"[{self.name}] Failed to mount LCP library '{lib_name}': {e}")
 
@@ -3676,6 +3493,11 @@ JSON:"""
                     }
                     _SHELL_TOOL_NAMES = {"tool_execute_shell_command"}
                     _PY_EXEC_TOOL_NAMES = {"tool_execute_python_code"}
+                    _GIT_TOOL_NAMES = {
+                        "tool_git_status", "tool_git_diff", "tool_git_commit",
+                        "tool_git_create_branch", "tool_git_checkout", "tool_git_log",
+                        "tool_git_config_get", "tool_git_config_set"
+                    }
 
                     allowed_tool_names = set()
                     if enable_workspace_tools and self.capabilities and self.capabilities.enable_workspace_tools and self._resolved_workspace:
@@ -3684,6 +3506,8 @@ JSON:"""
                         allowed_tool_names.update(_SHELL_TOOL_NAMES)
                     if enable_python_exec:
                         allowed_tool_names.update(_PY_EXEC_TOOL_NAMES)
+
+                    allowed_tool_names.update(_GIT_TOOL_NAMES)
 
                     for t_name, t_spec in all_lcp_tools.items():
                         if t_name in allowed_tool_names:
@@ -3771,13 +3595,13 @@ JSON:"""
             except Exception:
                 lcp_binding = None
 
-        if enable_data_tools and lcp_binding and hasattr(lcp_binding, 'mount_tool_library'):
+        if enable_data_tools and auto_load_document_editor and lcp_binding and hasattr(lcp_binding, 'mount_tool_library'):
             ws_path = self._resolved_workspace
             has_data_files = False
             has_document_files = False
             if ws_path and ws_path.exists():
-                _DATA_EXTS = {".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"}
-                _DOC_EXTS = {".pdf", ".docx", ".pptx", ".odt", ".doc", ".txt", ".md"}
+                _DATA_EXTS = {".csv", ".db", ".sqlite", ".sqlite3", ".parquet"}
+                _DOC_EXTS = {".pdf", ".docx", ".pptx", ".odt", ".doc", ".txt", ".md", ".xlsx", ".xls"}
 
                 try:
                     for f in ws_path.rglob("*"):
@@ -3794,13 +3618,18 @@ JSON:"""
 
             _LIBRARIES_TO_MOUNT: List[str] = []
             if has_document_files:
-                _LIBRARIES_TO_MOUNT.extend(["as_is_document_tools", "document_editor"])
+                _LIBRARIES_TO_MOUNT.extend(["as_is_document_tools"])
+                if auto_load_document_editor:
+                    _LIBRARIES_TO_MOUNT.append("document_editor")
             if has_data_files:
                 _LIBRARIES_TO_MOUNT.append("semantic_data_engineer")
 
             for lib_name in _LIBRARIES_TO_MOUNT:
                 try:
-                    lcp_binding.mount_tool_library(lib_name)
+                    if hasattr(lcp_binding, 'mount_tool_library_if_absent'):
+                        lcp_binding.mount_tool_library_if_absent(lib_name)
+                    else:
+                        lcp_binding.mount_tool_library(lib_name)
                 except Exception as e:
                     ASCIIColors.warning(f"[LollmsPersonality] Failed to mount LCP tool library '{lib_name}': {e}")
 
@@ -4573,16 +4402,14 @@ JSON:"""
                 conn.commit()
                 conn.close()
 
-                if target_visibility in (ArtefactVisibility.TREE_LOCKED, ArtefactVisibility.HIDDEN):
-                    current_arts = self._artefact_manager._get_all_raw()
-                    for art in current_arts:
-                        if art.get("title") in processed_files:
-                            art["content"] = ""
-                            art["active"] = False
-                            art["visibility"] = target_visibility
-                    self._artefact_manager._save_all(current_arts)
-
-                    object.__setattr__(self, '_last_ws_sync_time', 0.0)
+            if target_visibility in (ArtefactVisibility.TREE_LOCKED, ArtefactVisibility.HIDDEN):
+                current_arts = self._artefact_manager._get_all_raw()
+                for art in current_arts:
+                    if art.get("title") in processed_files:
+                        art["content"] = ""
+                        art["active"] = False
+                        art["visibility"] = target_visibility
+                self._artefact_manager._save_all(current_arts)
 
         except Exception as commit_err:
             ASCIIColors.warning(f"[LollmsPersonality] Failed to persist visibility state: {commit_err}")
@@ -4700,13 +4527,22 @@ JSON:"""
                     result = tool_def["callable"](**call_kwargs)
                     if isinstance(result, dict):
                         if result.get("success") is False and not result.get("error"):
+                            raw_preview = ""
+                            for k, v in result.items():
+                                if k not in ("error", "traceback", "success"):
+                                    raw_preview += f"  {k}: {str(v)[:200]}\n"
                             result["error"] = (
                                 f"Tool '{tool_name}' returned success=False with no error message. "
-                                f"Raw keys: {list(result.keys())}. "
-                                f"This may indicate a library initialization failure, a missing dependency, or an import error."
+                                f"Raw keys: {list(result.keys())}.\n"
+                                f"Raw content:\n{raw_preview}"
+                                if raw_preview else
+                                f"Tool '{tool_name}' returned success=False with no error message. "
+                                f"Raw keys: {list(result.keys())}."
                             )
                             ASCIIColors.error(f"[{self.name}] Tool '{tool_name}' returned bare success=False. Synthesized error: {result['error']}")
                         return result
+                    if result is None:
+                        return {"success": False, "error": f"Tool '{tool_name}' returned None."}
                     return {"success": True, "output": str(result)}
                 except Exception as exec_err:
                     trace_exception(exec_err)
@@ -4725,13 +4561,30 @@ JSON:"""
                         if isinstance(inner, dict):
                             if inner.get("success") is False:
                                 if not inner.get("error"):
-                                    inner["error"] = f"LCP tool '{tool_name}' returned success=False without a descriptive error. Raw keys: {list(inner.keys())}"
+                                    raw_preview = ""
+                                    for k, v in inner.items():
+                                        if k not in ("error", "traceback", "success"):
+                                            raw_preview += f"  {k}: {str(v)[:300]}\n"
+                                    inner["error"] = (
+                                        f"LCP tool '{tool_name}' returned success=False without a descriptive error. "
+                                        f"Raw keys: {list(inner.keys())}.\n"
+                                        f"Raw content:\n{raw_preview}"
+                                        if raw_preview else
+                                        f"LCP tool '{tool_name}' returned success=False without a descriptive error. "
+                                        f"Raw keys: {list(inner.keys())}."
+                                    )
+                                    ASCIIColors.error(f"[{self.name}] LCP Tool '{tool_name}' returned bare success=False. Synthesized error: {inner['error']}")
                                 return inner
-                            if "error" in inner:
+                            if "error" in inner and not inner.get("success", True):
                                 return inner
                             return inner if "output" in inner else {"success": True, "output": inner}
-                        if result.get("status_code", 200) not in (200, 201):
-                            err_msg = result.get("error") or f"LCP tool '{tool_name}' returned status_code {result.get('status_code')} with no error message."
+
+                        if result.get("success") is False or result.get("status_code", 200) not in (200, 201):
+                            err_msg = result.get("error")
+                            if not err_msg and isinstance(inner, str) and inner.strip():
+                                err_msg = inner
+                            if not err_msg:
+                                err_msg = f"LCP tool '{tool_name}' returned status_code {result.get('status_code', 'N/A')} with no error message."
                             if result.get("traceback"):
                                 err_msg = f"{err_msg}\n\nTraceback:\n{result.get('traceback')}"
                             return {
@@ -4777,6 +4630,7 @@ JSON:"""
         enable_shell: bool = False,
         enable_python_exec: bool = False,
         enable_web_tools: bool = False,
+        auto_load_document_editor: bool = True,
         **kwargs
     ) -> Dict[str, Any]:
         resolved_max_rounds = max_nb_rounds if max_nb_rounds is not None else max_reasoning_steps
@@ -4803,6 +4657,7 @@ JSON:"""
             if hasattr(self._failure_memory, 'failures'):
                 self._failure_memory.failures = []
 
+        kwargs["auto_load_document_editor"] = auto_load_document_editor
         if enable_artefacts:
             if not self.workspace_path:
                 ASCIIColors.warning(f"[{self.name}] Workspace path is not set. Artefact system disabled.")
@@ -4830,6 +4685,7 @@ JSON:"""
 
         self._init_scratchpad()
         object.__setattr__(self, '_active_streaming_callback', streaming_callback)
+        auto_load_doc_editor_flag = kwargs.get("auto_load_document_editor", True)
 
         cleaned_prompt = prompt
         enable_data_tools_flag = kwargs.get("enable_data_tools", True)
@@ -4840,8 +4696,14 @@ JSON:"""
             enable_workspace_tools=enable_workspace_tools,
             enable_shell=enable_shell,
             enable_python_exec=enable_python_exec,
-            enable_web_tools=enable_web_tools
+            enable_web_tools=enable_web_tools,
+            auto_load_document_editor=auto_load_doc_editor_flag
         )
+
+        if active_tools:
+            for t_name, t_spec in active_tools.items():
+                if t_name in ("tool_create_skill", "tool_update_skill"):
+                    t_spec["description"] += "\n\n**VISIBILITY CONTROL**: You can control how this skill is stored in your workspace by setting the `output_visibility` parameter.\n- `output_visibility=\"context\"` (default): Loads the skill directly into your context [C].\n- `output_visibility=\"artefact\"`: Saves the skill as a file [U] without loading it, saving context space."
 
         stable_system_prompt = self._build_system_prompt(active_tools)
         stable_system_prompt += self._build_user_profile_context()
@@ -4888,11 +4750,11 @@ JSON:"""
                         dynamic_suffix_parts.append("=== ACTIVE MEMORIES (PERSISTENT ACROSS SESSIONS) ===\n" + mem_zone + "\n=== END MEMORIES ===")
             except Exception as mem_ex:
                 ASCIIColors.warning(f"[{self.name}] Failed to hydrate memories: {mem_ex}")
-
         if use_internal_history:
             base_conversation = list(self._conversation)
         else:
             base_conversation = []
+            
 
         telemetry = self._calculate_context_telemetry(stable_system_prompt, base_conversation, ws_ctx or "", [])
         telemetry_block = self._build_telemetry_block(telemetry)
@@ -4950,6 +4812,15 @@ JSON:"""
 
             if getattr(self, 'debug_mode', False):
                 ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count}/{self._max_rounds} START ===")
+
+            if streaming_callback:
+                try:
+                    streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_INFO, {
+                        "round": round_count,
+                        "max_rounds": self._max_rounds
+                    })
+                except Exception:
+                    pass
 
             pre_gen_telemetry = self._calculate_context_telemetry(
                 stable_system_prompt, base_conversation,
@@ -5267,7 +5138,6 @@ JSON:"""
                                         continue
 
                                 tool_res = self._execute_tool(tool_name, tool_params, active_tools)
-
                                 tool_success = isinstance(tool_res, dict) and tool_res.get("success", True) is not False
                                 inner_res = tool_res.get("output", tool_res) if isinstance(tool_res, dict) else tool_res
                                 is_failure = (
@@ -5280,8 +5150,17 @@ JSON:"""
                                 )
                                 tool_success = not is_failure
 
-                                if tool_success:
-                                    successful_tool_signatures.add(context_aware_sig)
+                                if tool_success and tool_name in ("tool_create_skill", "tool_update_skill"):
+                                    if isinstance(tool_res, dict):
+                                        output_vis = tool_params.get("output_visibility", "context").lower()
+                                        skill_title = tool_params.get("title", tool_params.get("skill_name", ""))
+                                        if output_vis == "artefact" and skill_title:
+                                            try:
+                                                from lollms_client.lollms_artefact import ArtefactVisibility
+                                                self._execute_context_visibility("lock_file", f"skills/{skill_title}.md")
+                                                tool_res["output"] = tool_res.get("output", "") + f"\n\n[SYSTEM: Skill '{skill_title}' saved as an artefact [U]. It will not consume context space until you explicitly unlock it.]"
+                                            except Exception:
+                                                pass
 
                                 tool_calls_this_turn.append({"round": round_count, "name": tool_name, "parameters": tool_params})
                                 tool_results_this_turn.append({"round": round_count, "name": tool_name, "result": tool_res, "success": tool_success})
@@ -5437,14 +5316,10 @@ JSON:"""
                                         self._artefact_manager.update(title=title, new_content=new_content, language=lang, bump_version=True, active=True)
 
                                     actions_executed_count += 1
-                                    file_ext = file_path.suffix.lower()
-                                    _BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".zip", ".tar", ".gz", ".pdf", ".docx", ".pptx", ".mp3", ".wav", ".mp4"}
-                                    if file_ext not in _BINARY_EXTS and len(new_content) < 50000:
-                                        try:
-                                            self._execute_context_visibility("unlock_file", title)
-                                            action_reports.append(f"📂 Auto-loaded '{title}' into context [C].")
-                                        except Exception:
-                                            pass
+                                    try:
+                                        self._execute_context_visibility("lock_file", title)
+                                    except Exception:
+                                        pass
                                 else:
                                     stripped_body = body_content.strip()
                                     if not stripped_body:
@@ -5459,16 +5334,10 @@ JSON:"""
                                     action_reports.append(f"✅ File {title} created/updated successfully.")
                                     actions_executed_count += 1
 
-                                    _BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".zip", ".tar", ".gz", ".pdf", ".docx", ".pptx", ".mp3", ".wav", ".mp4"}
-                                    file_ext = file_path.suffix.lower()
-                                    if file_ext not in _BINARY_EXTS and len(body_content) < 50000:
-                                        try:
-                                            self._execute_context_visibility("unlock_file", title)
-                                            action_reports.append(f"📂 Auto-loaded '{title}' into context [C].")
-                                        except Exception:
-                                            pass
-                                    elif file_ext in _BINARY_EXTS:
-                                        action_reports.append(f"🚫 Skipped auto-loading binary file '{title}' from context.")
+                                    try:
+                                        self._execute_context_visibility("lock_file", title)
+                                    except Exception:
+                                        pass
                             except Exception as e:
                                 if getattr(self, 'debug_mode', False):
                                     self._dump_error(
@@ -5584,7 +5453,15 @@ JSON:"""
                     if changes:
                         workspace_changes.extend(changes)
 
+                    if action_reports:
+                        report_text = "\n\n".join(str(r) for r in action_reports) + "\n\nAnalyze these results and continue your task, or emit <done/> if finished."
+                        virtual_history.append(SimpleNamespace(sender_type="user", content=report_text))
+
                     ss.completed_actions = []
+                    ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
+                    if getattr(self, 'debug_mode', False):
+                        ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Actions dispatched (post-done), continuing ===")
+                    continue
 
                 if has_truncated_artifact:
                     virtual_history.append(SimpleNamespace(
@@ -5701,6 +5578,21 @@ JSON:"""
                                     continue
 
                             tool_res = self._execute_tool(tool_name, tool_params, active_tools)
+
+                            if isinstance(tool_res, dict) and tool_res.get("success") is False and not tool_res.get("error"):
+                                raw_preview = ""
+                                for k, v in tool_res.items():
+                                    if k not in ("error", "traceback", "success"):
+                                        raw_preview += f"  {k}: {str(v)[:300]}\n"
+                                tool_res["error"] = (
+                                    f"Tool '{tool_name}' returned success=False with no error message. "
+                                    f"Raw keys: {list(tool_res.keys())}.\n"
+                                    f"Raw content:\n{raw_preview}"
+                                    if raw_preview else
+                                    f"Tool '{tool_name}' returned success=False with no error message. "
+                                    f"Raw keys: {list(tool_res.keys())}."
+                                )
+                                ASCIIColors.error(f"[{self.name}] Tool '{tool_name}' returned bare success=False. Synthesized error: {tool_res['error']}")
 
                             inner_res = tool_res.get("output", tool_res) if isinstance(tool_res, dict) else tool_res
                             is_failure = (
@@ -5859,14 +5751,10 @@ JSON:"""
                                     self._artefact_manager.update(title=title, new_content=new_content, language=lang, bump_version=True, active=True)
 
                                 actions_executed_count += 1
-                                file_ext = file_path.suffix.lower()
-                                _BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".zip", ".tar", ".gz", ".pdf", ".docx", ".pptx", ".mp3", ".wav", ".mp4"}
-                                if file_ext not in _BINARY_EXTS and len(new_content) < 50000:
-                                    try:
-                                        self._execute_context_visibility("unlock_file", title)
-                                        action_reports.append(f"📂 Auto-loaded '{title}' into context [C].")
-                                    except Exception:
-                                        pass
+                                try:
+                                    self._execute_context_visibility("lock_file", title)
+                                except Exception:
+                                    pass
                             else:
                                 stripped_body = body_content.strip()
                                 if not stripped_body:
@@ -5881,16 +5769,10 @@ JSON:"""
                                 action_reports.append(f"✅ File {title} created/updated successfully.")
                                 actions_executed_count += 1
 
-                                _BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".zip", ".tar", ".gz", ".pdf", ".docx", ".pptx", ".mp3", ".wav", ".mp4"}
-                                file_ext = file_path.suffix.lower()
-                                if file_ext not in _BINARY_EXTS and len(body_content) < 50000:
-                                    try:
-                                        self._execute_context_visibility("unlock_file", title)
-                                        action_reports.append(f"📂 Auto-loaded '{title}' into context [C].")
-                                    except Exception:
-                                        pass
-                                elif file_ext in _BINARY_EXTS:
-                                    action_reports.append(f"🚫 Skipped auto-loading binary file '{title}' from context.")
+                                try:
+                                    self._execute_context_visibility("lock_file", title)
+                                except Exception:
+                                    pass
                         except Exception as e:
                             action_reports.append(f"[SYSTEM ERROR] Failed to process artifact tag: {e}")
 
@@ -6176,7 +6058,7 @@ JSON:"""
                                 if overlap > 0.85:
                                     text_is_repetitive = True
 
-            if not text_is_repetitive and stripped_round_text and not has_new_actions_this_round:
+            if not text_is_repetitive and stripped_round_text:
                 lines_in_response = stripped_round_text.splitlines()
                 non_empty_lines = [l.strip() for l in lines_in_response if l.strip()]
                 if len(non_empty_lines) >= 2:
@@ -6221,24 +6103,24 @@ JSON:"""
                 consecutive_stall_count = getattr(self, '_consecutive_stall_count', 0) + 1
                 object.__setattr__(self, '_consecutive_stall_count', consecutive_stall_count)
 
-                if consecutive_stall_count >= 2:
-                    ASCIIColors.error(f"[{self.name}] Breaking after {consecutive_stall_count} consecutive repetition+stall cycles.")
+                if consecutive_stall_count >= 3:
+                    ASCIIColors.error(f"[{self.name}] Breaking after {consecutive_stall_count} consecutive repetition+stall cycle(s). Repetitive text detected.")
                     final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
                     if not final_response:
-                        final_response = "[Task terminated: The agent produced repetitive text multiple times due to a tool failure or sandbox restriction. The last tool call may have been blocked.]"
+                        final_response = "[Task terminated: The agent produced repetitive text due to a tool failure or sandbox restriction. The last tool call may have been blocked.]"
                     break
 
-                ASCIIColors.warning(f"[{self.name}] Repetitive text preamble detected (Round {round_count}, streak: {consecutive_stall_count}/2). Injecting correction — NOT terminating.")
+                ASCIIColors.warning(f"[{self.name}] Repetitive text preamble detected (Round {round_count}, streak: {consecutive_stall_count}/3). Injecting correction — NOT terminating.")
                 virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text()))
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
                     content=(
-                        "[SYSTEM: CRITICAL ERROR. You are producing repetitive conversational preambles without emitting functional tags. "
-                        "This usually happens when a tool call failed or the stream was interrupted.\n\n"
-                        "MANDATORY ACTION: Stop writing prose entirely. You must output the RAW JSON object for the tool inside `<tool>` tags immediately. "
-                        "Do not include any conversational text before or after the tag. "
-                        "Example:\n"
-                        "<tool>{\"name\": \"tool_annotate_document\", \"parameters\": {\"file_name\": \"file.pdf\", \"annotation_type\": \"comment\", \"search_text\": \"text\", \"comment\": \"comment\"}}</tool>"
+                        "[SYSTEM: You repeated the same transitional text from a previous round. "
+                        "This is acceptable when progressing through batched work (e.g., reading a document page by page), "
+                        "but you MUST vary your transitional phrasing and IMMEDIATELY emit the next functional tag to continue your task.\n\n"
+                        "If you were in the middle of a batched operation (reading pages, annotating sections), emit the next tool call NOW.\n"
+                        "If your task is complete, output your final summary and end with <done/>.\n\n"
+                        "Do NOT repeat the same preamble text again.]"
                     )
                 ))
                 ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
@@ -6479,12 +6361,14 @@ JSON:"""
                 object.__setattr__(self, '_consecutive_stall_count', consecutive_stall_count)
 
                 if consecutive_stall_count >= 3:
-                    ASCIIColors.warning(f"[{self.name}] Terminating after {consecutive_stall_count} consecutive text-only stalls. LLM is stuck in preamble mode.")
+                    if getattr(self, 'debug_mode', False):
+                        ASCIIColors.warning(f"[{self.name}] Terminating after {consecutive_stall_count} consecutive text-only stalls. LLM is stuck in preamble mode.")
                     if not final_response:
                         final_response = "[Task terminated: The agent repeatedly produced text preambles without executing any actions.]"
                     break
 
-                ASCIIColors.warning(f"[{self.name}] Text-only stall detected (Round {round_count}, consecutive: {consecutive_stall_count}). No actions, no <done/>. Injecting continuation mandate.")
+                if getattr(self, 'debug_mode', False):
+                    ASCIIColors.warning(f"[{self.name}] Text-only stall detected (Round {round_count}, consecutive: {consecutive_stall_count}). No actions, no <done/>. Injecting continuation mandate.")
 
                 virtual_history.append(SimpleNamespace(
                     sender_type="assistant",
@@ -6631,16 +6515,10 @@ JSON:"""
                             file_path.write_text(body_content, encoding="utf-8")
                             action_reports.append(f"✅ File {title} created/updated successfully.")
 
-                            _BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".zip", ".tar", ".gz", ".pdf", ".docx", ".pptx", ".mp3", ".wav", ".mp4"}
-                            file_ext = file_path.suffix.lower()
-                            if file_ext not in _BINARY_EXTS and len(body_content) < 50000:
-                                try:
-                                    self._execute_context_visibility("unlock_file", title)
-                                    action_reports.append(f"📂 Auto-loaded '{title}' into context [C].")
-                                except Exception:
-                                    pass
-                            elif file_ext in _BINARY_EXTS:
-                                action_reports.append(f"🚫 Skipped auto-loading binary file '{title}' from context.")
+                            try:
+                                self._execute_context_visibility("lock_file", title)
+                            except Exception:
+                                pass
 
                         if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
                             try:

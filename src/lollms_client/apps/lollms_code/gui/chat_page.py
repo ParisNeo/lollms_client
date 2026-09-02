@@ -307,10 +307,10 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     "task_alt",
                 )
 
-            elif ev.kind == "context_update":
-                files = ev.data.get("files", [])
-                if files:
-                    add_event_panel("📂 Context updated", "", "\n".join(files), "amber-500", "folder_open")
+            elif ev.kind == "round_info":
+                r = ev.data.get("round", "?")
+                m = ev.data.get("max_rounds", "?")
+                status_label.set_text(f"Round {r}/{m}")
 
             elif ev.kind == "done":
                 result = ev.data.get("result", {}) or {}

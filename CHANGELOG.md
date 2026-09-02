@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-02 15:46]
+
+- fix(lollms_code): improve agent state handling and tool bindings across CLI and GUI
+
 ## [2026-09-01 15:27]
 
 - feat(lollms_code): add agent CLI config and update GUI chat and personality modules

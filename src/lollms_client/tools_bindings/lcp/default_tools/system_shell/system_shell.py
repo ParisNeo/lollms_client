@@ -62,6 +62,25 @@ def _is_safe_command(command: str) -> bool:
             return True
     return False
 
+def tool_execute_shell_command_prompt() -> str:
+    """
+    Dynamically generates the description for tool_execute_shell_command.
+    """
+    is_windows = platform.system() == "Windows"
+    os_name = "Windows (cmd/powershell)" if is_windows else "Linux/Unix (bash/sh)"
+    
+    if AUTONOMY_LEVEL == "full_access":
+        return f"""Executes a shell command in the current workspace directory with FULL ACCESS.
+Use this for environment management (e.g., pip install), running tests, or interacting with the OS.
+You are operating in 'full_access' mode, meaning you can run destructive or system-level commands.
+Operating System: {os_name}."""
+    else:
+        return f"""Executes a shell command in the current workspace directory in SAFE MODE.
+Use this for environment management (e.g., pip install), running tests, or interacting with the OS.
+You are operating in 'safe' mode. Only read-only or non-destructive commands are permitted.
+If you need to execute a command outside this list, ask the user to enable 'full_access' mode.
+Operating System: {os_name}."""
+
 def tool_execute_shell_command(
     command: str
 ) -> Dict[str, Any]:
@@ -94,7 +113,15 @@ def tool_execute_shell_command(
             )
         else:
             if not _is_safe_command(command):
-                allowed_list = ", ".join(sorted(safe_commands))
+                allowed_list = ", ".join(sorted([
+                    "dir", "echo", "type", "cd", "pip", "python", "py", "git",
+                    "ls", "pwd", "cat", "head", "tail", "mkdir", "rmdir", "del",
+                    "powershell", "pwsh", "cmd", "node", "npm", "npx",
+                    "where", "which", "set", "env", "copy", "move", "ren", "rename",
+                    "md", "rd", "cls", "chdir", "pushd", "popd", "tree", "find",
+                    "findstr", "sort", "more", "help", "ver", "vol", "label",
+                    "time", "date"
+                ]))
                 return {
                     "success": False,
                     "output": (
@@ -104,7 +131,7 @@ def tool_execute_shell_command(
                         f"⚠️ **ACTION REQUIRED FROM THE USER**: If this task requires elevated privileges (e.g., system configuration, complex shell scripts), "
                         f"please ask the user to enable 'full_access' mode by typing `/shell` in the CLI, or by pressing `Ctrl+C` and restarting with the `--shell-autonomy full_access` flag."
                     ),
-                    "error": "Blocked by sandbox (safe mode)"
+                    "error": f"Blocked by sandbox (safe mode). The command '{command}' is not whitelisted. Use the git_manager toolset for git operations."
                 }
             result = subprocess.run(
                 command,

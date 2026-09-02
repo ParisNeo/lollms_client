@@ -173,6 +173,12 @@ class LCPBinding(LollmsToolBinding):
         if not tool_defs:
             return 0
 
+        try:
+            code_text = py_file.read_text(encoding="utf-8")
+            file_tree = ast.parse(code_text)
+        except Exception:
+            file_tree = None
+
         count = 0
         for tool_def in tool_defs:
             tool_name = tool_def.get("name")
@@ -181,10 +187,59 @@ class LCPBinding(LollmsToolBinding):
             if any(t.get("name") == tool_name for t in self.discovered_tools):
                 continue
 
+            base_tool_name = tool_name[5:] if tool_name.startswith("tool_") else tool_name
+            dynamic_prompt_fn_name = f"tool_{base_tool_name}_prompt"
+            has_dynamic_prompt = False
+            if file_tree:
+                has_dynamic_prompt = any(node.name == dynamic_prompt_fn_name for node in ast.walk(file_tree) if isinstance(node, ast.FunctionDef))
+
+            if has_dynamic_prompt:
+                tool_def["_has_dynamic_prompt"] = True
+                tool_def["_dynamic_prompt_fn_name"] = dynamic_prompt_fn_name
+                tool_def["_python_file_path"] = str(py_file.resolve())
+
             self.discovered_tools.append(tool_def)
             count += 1
 
         return count
+
+    def is_library_mounted(self, library_name: str) -> bool:
+        """Checks if a tool library is already fully mounted by verifying that
+        all expected tool names from the library are present in discovered_tools."""
+        base_dir = Path(__file__).parent / "default_tools"
+        lib_path = base_dir / library_name
+
+        if not lib_path.exists() or not lib_path.is_dir():
+            return False
+
+        expected_tool_names: set = set()
+        for item in lib_path.iterdir():
+            py_file = None
+            if item.is_dir():
+                py_file = item / f"{item.name}.py"
+                if not py_file.exists():
+                    sub_py_files = [f for f in item.iterdir() if f.is_file() and f.suffix == ".py" and f.stem != "__init__"]
+                    for fallback_py in sub_py_files:
+                        expected_tool_names.update(self._extract_tool_names_from_file(fallback_py))
+                    continue
+            elif item.suffix == ".py" and item.stem != "__init__":
+                py_file = item
+
+            if py_file and py_file.exists():
+                expected_tool_names.update(self._extract_tool_names_from_file(py_file))
+
+        if not expected_tool_names:
+            return False
+
+        registered_names = {t.get("name") for t in self.discovered_tools}
+        return expected_tool_names.issubset(registered_names)
+
+    def mount_tool_library_if_absent(self, library_name: str) -> bool:
+        """Mounts a tool library only if it is not already fully mounted.
+        Prevents idempotent mount warnings on repeated calls."""
+        if self.is_library_mounted(library_name):
+            return True
+        return self.mount_tool_library(library_name)
 
     def mount_tool_library(self, library_name: str) -> bool:
         base_dir = Path(__file__).parent / "default_tools"
@@ -194,11 +249,8 @@ class LCPBinding(LollmsToolBinding):
             ASCIIColors.warning(f"[LCP Mount] Library '{library_name}' not found at {lib_path}")
             return False
 
-        if lib_path in self.tools_folders:
-            for t in self.discovered_tools:
-                py_path = t.get('_python_file_path')
-                if py_path and lib_path in Path(py_path).resolve().parents:
-                    return True
+        if self.is_library_mounted(library_name):
+            return True
 
         expected_tool_names: set = set()
         for item in lib_path.iterdir():
@@ -352,7 +404,7 @@ class LCPBinding(LollmsToolBinding):
         return removed
 
     def execute_tool(self, tool_name: str, params: Dict[str, Any], discussion_instance=None, **kwargs) -> Dict[str, Any]:
-        ASCIIColors.info(f"[LCP execute_tool] Calling: '{tool_name}'")
+        ASCIIColors.debug(f"[LCP execute_tool] Calling: '{tool_name}' with params: {params}")
 
         tool_def = next((t for t in self.discovered_tools if t.get("name") == tool_name), None)
         if not tool_def:
@@ -402,7 +454,10 @@ class LCPBinding(LollmsToolBinding):
                             else:
                                 tool_module.init_tools_library()
 
-                            ASCIIColors.success(f"[LCP Lazy Init] ✅ Initialized library for '{library_name}' with host configs.")
+                            if getattr(ASCIIColors, '_force_debug', False):
+                                ASCIIColors.success(f"[LCP Lazy Init] ✅ Initialized library for '{library_name}' with host configs.")
+                            else:
+                                ASCIIColors.debug(f"[LCP Lazy Init] ✅ Initialized library for '{library_name}' with host configs.")
                     except Exception as init_ex:
                         ASCIIColors.error(f"[LCP execute_tool] ❌ Toolset '{python_file_path.stem}' FAILED lazy init: {init_ex}")
                         import traceback as _lcp_tb
@@ -429,9 +484,26 @@ class LCPBinding(LollmsToolBinding):
                 if k in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
                     clean_params[k] = v
 
-            result = execute_function(**clean_params)
+            try:
+                result = execute_function(**clean_params)
+            except BaseException as exec_bex:
+                import traceback as _exec_tb
+                tb_str = _exec_tb.format_exc()
+                ASCIIColors.error(f"[LCP execute_tool] ❌ Tool '{tool_name}' crashed with {type(exec_bex).__name__}: {exec_bex}\n{tb_str}")
+                return {
+                    "output": {"success": False, "error": f"Tool '{tool_name}' crashed: {exec_bex}"},
+                    "error": f"Tool '{tool_name}' crashed: {exec_bex}",
+                    "traceback": tb_str,
+                    "success": False,
+                    "status_code": 500
+                }
 
-            if isinstance(result, dict) and result.get("success") is False:
+            ASCIIColors.debug(f"[LCP execute_tool] Tool '{tool_name}' returned: {str(result)[:500] if result is not None else 'None'}")
+
+            if not isinstance(result, dict):
+                result = {"success": True, "output": result}
+
+            if result.get("success") is False:
                 if not result.get("error"):
                     result["error"] = (
                         f"Tool '{tool_name}' returned success=False with no error message. "
@@ -442,20 +514,24 @@ class LCPBinding(LollmsToolBinding):
                 else:
                     ASCIIColors.error(f"[LCP Error Tracking] Tool '{tool_name}' reported failure: {result['error']}")
 
-            if not isinstance(result, dict):
-                result = {"success": True, "output": result}
-
-            if result.get("success") is False:
                 if not result.get("output"):
                     result["output"] = result.get("error", "Tool failed with no output.")
+
                 return {
-                    "output": result,
+                    "output": result.get("output", result.get("error")),
                     "error": result.get("error"),
                     "success": False,
                     "status_code": 500
                 }
 
-            return {"output": result, "status_code": 200}
+            if not result.get("output"):
+                result["output"] = "Tool executed successfully (no output)."
+
+            return {
+                "output": result.get("output"),
+                "status_code": 200,
+                "success": True
+            }
 
         except Exception as e:
             tb_str = traceback.format_exc()

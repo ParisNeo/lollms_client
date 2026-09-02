@@ -46,6 +46,43 @@ To maximize performance and preserve state across multiple tool calls, LCP loads
 
 ---
 
+## 📦 LCP Default Tools Injection
+
+The LCP binding comes with a rich set of default tools (like `system_shell`, `workspace_tools`, `git_manager`, etc.) located in `src/lollms_client/tools_bindings/lcp/default_tools/`. 
+
+By default, if you instantiate `LCPBinding` without specifying any `tools_folders`, it automatically scans the `default_tools` directory. However, if you are configuring the binding with custom tool directories, you might want to explicitly include the default tools as well.
+
+You can inject the default tools at runtime by passing the `default_tools` path to the `tools_folders` configuration:
+
+```python
+from lollms_client import LollmsClient
+from pathlib import Path
+import lollms_client
+
+# 1. Find the default tools path dynamically
+pkg_root = Path(lollms_client.__file__).resolve().parent
+default_tools_path = pkg_root / "tools_bindings" / "lcp" / "default_tools"
+
+# 2. Configure the client to use both custom tools and default tools
+client = LollmsClient(
+    llm_binding_name="ollama",
+    llm_binding_config={"model_name": "qwen3:32b"},
+    tools_binding_name="lcp",
+    tools_binding_config={
+        "tools_folders": [
+            str(default_tools_path),  # Inject default tools
+            "./my_custom_tools"       # Your custom tools
+        ]
+    }
+)
+
+# 3. Mount specific default libraries at runtime if needed
+client.tools.mount_tool_library("git_manager")
+```
+
+Alternatively, you can mount specific default tool libraries on demand using `mount_tool_library()` without modifying your initial folder configuration, as long as the `default_tools` directory is known to the binding.
+
+---
 ## 🛠️ How to Write an LCP Tool
 
 To create a tool, simply write a Python file and place it inside your LCP tools directory (e.g., `src/lollms_client/tools_bindings/lcp/default_tools/`).
