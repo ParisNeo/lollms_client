@@ -36,26 +36,51 @@ lollms-code --workspace ./myproject "add unit tests for all modules"
 lollms-code --model qwen3:32b "refactor the database layer"
 ```
 
-## Configuration
+## Configuration: Universal Two-Tier Profiles
 
-Configuration is loaded from (in priority order):
-1. CLI arguments
-2. Environment variables (`LOLLMS_CODE_*`)
-3. `.env` file in the current directory
-4. `~/.lollms_hub/lollms_code/config.json`
-5. Built-in defaults
+`lollms_code` uses the unified **Two-Tier Profile Architecture**:
 
-### Key Environment Variables
+1. **Connection Layer (`*_BINDINGS_*`)**: Defines server engines (Ollama, OpenAI, vLLM, etc.)
+2. **Execution Layer (`*_PROFILES_*`)**: Defines models, vision flags, and routing profiles referencing a binding
 
-| Variable | Default | Description |
-|---|---|---|
-| `LOLLMS_CODE_LLM_BINDING` | `ollama` | LLM binding name |
-| `LOLLMS_CODE_MODEL` | `qwen3:32b` | Model name |
-| `LOLLMS_CODE_HOST` | `http://localhost:11434` | Host address |
-| `LOLLMS_CODE_API_KEY` | None | API key for gated services |
-| `LOLLMS_CODE_MAX_STEPS` | `100` | Max reasoning steps |
-| `LOLLMS_CODE_TEMPERATURE` | `0.3` | Sampling temperature |
-| `LOLLMS_CODE_MAX_TOKENS` | `8192` | Max tokens per turn |
+Configuration is automatically resolved from:
+1. CLI arguments (`--profile`, `--model`, `--binding`, `--host`, `--api-key`)
+2. `~/.lollms_client/config.yaml` or `~/.lollms-client/.env` (Config Wizard)
+3. Local `.env` files in the workspace
+4. `~/.lollms_client/lollms_code/config.json`
+
+### Profile Example (`~/.lollms_client/config.yaml`)
+
+```yaml
+llm:
+  bindings:
+    local_ollama:
+      binding_name: ollama
+      host_address: http://localhost:11434
+    cloud_openai:
+      binding_name: openai
+      service_key: sk-...
+  profiles:
+    coder:
+      binding_alias: local_ollama
+      model_name: qwen2.5-coder:7b
+      forced_context_size: 32768
+      is_default: true
+    gpt4o:
+      binding_alias: cloud_openai
+      model_name: gpt-4o
+      vision_enabled: true
+```
+
+### CLI Profile Selection
+
+```bash
+# Use a specific profile declared in your configuration
+lollms-code --profile gpt4o "Refactor the authentication module"
+
+# Quick override of model on the active profile
+lollms-code --model llama3.2:3b "Write a quick test"
+```
 
 ## How It Works
 

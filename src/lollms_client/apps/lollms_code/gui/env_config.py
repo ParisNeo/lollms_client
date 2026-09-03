@@ -38,9 +38,17 @@ try:
         _get_binding_keys as get_binding_keys_raw,
         _get_profile_keys as get_profile_keys_raw,
         get_client_from_env,
+        _extract_bindings_from_env,
+        _extract_profiles_from_env,
     )
 except ImportError as e:
     _IMPORT_ERROR = str(e)
+
+    def _extract_bindings_from_env(prefix, env_data):
+        return {}
+
+    def _extract_profiles_from_env(prefix, bindings, env_data):
+        return {}
 
     def resolve_env_file(cli_env_path=None):
         home_env = Path.home() / ".lollms-client" / ".env"

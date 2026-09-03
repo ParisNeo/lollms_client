@@ -212,11 +212,25 @@ class CoreMixin:
         leaf_id = branch_id if branch_id is not None else self.active_branch_id
         return self.get_branch(leaf_id)
 
+    @property
+    def client(self):
+        return getattr(self, 'lollmsClient', None)
+
+    @client.setter
+    def client(self, value):
+        object.__setattr__(self, 'lollmsClient', value)
+
     def __getattr__(self, name):
         # CRITICAL GUARD: Never proxy private/internal attributes to the ORM.
         # If an underscore-prefixed attribute is missing from __dict__, raise immediately.
         # This prevents infinite recursion and confusing 'object has no attribute' errors.
         if name.startswith('_'):
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+        if name == 'client':
+            return getattr(self, 'lollmsClient', None)
+
+        if '_db_discussion' not in self.__dict__ or self.__dict__['_db_discussion'] is None:
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
         if name == 'metadata':
@@ -227,12 +241,12 @@ class CoreMixin:
 
     def __setattr__(self, name, value):
         internal_attrs = [
-            'lollmsClient', 'db_manager', 'autosave', 'max_context_size', 'scratchpad',
+            'lollmsClient', 'client', 'db_manager', 'autosave', 'max_context_size', 'scratchpad',
             'images', 'artefacts',
             '_session', '_db_discussion', '_message_index', '_messages_to_delete_from_db',
             '_is_db_backed', '_system_prompt',
         ]
-        if name in internal_attrs:
+        if name in internal_attrs or '_db_discussion' not in self.__dict__ or self.__dict__['_db_discussion'] is None:
             object.__setattr__(self, name, value)
         else:
             if name == 'system_prompt':
@@ -380,6 +394,8 @@ class CoreMixin:
     # -------------------------------------------------------- DB session helpers
 
     def touch(self):
+        if '_db_discussion' not in self.__dict__ or self.__dict__['_db_discussion'] is None:
+            return
         metadata = (getattr(self._db_discussion, 'discussion_metadata', {}) or {}).copy()
         if self.images or "discussion_images" in metadata:
             metadata["discussion_images"] = self.images

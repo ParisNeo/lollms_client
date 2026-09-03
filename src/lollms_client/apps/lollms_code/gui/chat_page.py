@@ -399,7 +399,36 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
             ui.navigate.to("/settings")
             return True
 
-        if cmd == "/models":
+if cmd in ("/models", "/model"):
+            try:
+                session.ensure_ready()
+                if session.client and hasattr(session.client, "llm_model_profiles_registry"):
+                    registry = session.client.llm_model_profiles_registry
+                    if arg:
+                        if session.client.switch_model(arg):
+                            active_alias = getattr(session.client, "_active_llm_alias", arg)
+                            active_model = getattr(session.client.llm, "model_name", "unknown")
+                            active_binding = getattr(session.client.llm, "binding_name", "unknown")
+                            add_system_notice(f"🔄 Switched active LLM profile to **{active_alias}** (`{active_binding}` / `{active_model}`).")
+                        else:
+                            available = ", ".join(f"`{k}`" for k in registry.keys())
+                            add_system_notice(f"Failed to switch to profile '{arg}'. Available profiles: {available}", is_error=True)
+                        return True
+                    else:
+                        active_alias = getattr(session.client, "_active_llm_alias", None)
+                        lines = ["**Available LLM Model Profiles:**\n"]
+                        for alias, prof in registry.items():
+                            marker = "⭐ **[ACTIVE]**" if alias == active_alias else "•"
+                            b_name = prof.binding_profile_name
+                            m_name = prof.model_name or "default"
+                            v_flag = " [Vision]" if prof.vision_enabled else ""
+                            lines.append(f"{marker} `{alias}` ({b_name} / {m_name}{v_flag})")
+                        lines.append("\n_Use `/models <alias>` to switch to another profile._")
+                        add_system_notice("\n".join(lines))
+                        return True
+            except Exception as e:
+                add_system_notice(f"Error checking models: {e}", is_error=True)
+                return True
             add_system_notice("Model switching is managed via LLM profiles — open `/config` (Settings).")
             return True
 

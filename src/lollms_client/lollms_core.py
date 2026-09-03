@@ -12,7 +12,7 @@ import time
 import warnings
 from pathlib import Path
 from enum import Enum
-from typing import List, Optional, Callable, Union, Dict, Any
+from typing import List, Optional, Callable, Union, Dict, Any, Tuple
 from dataclasses import dataclass, field
 import urllib3
 import ascii_colors as logging
@@ -219,6 +219,9 @@ class LollmsClient():
         self._active_ttv_alias: Optional[str] = None
         self._active_ttm_alias: Optional[str] = None
 
+        # 🖼️ VLM Image Description Cache (Image Hash -> Text Description)
+        self._image_description_cache: Dict[str, str] = {}
+
         # 🧠 Profile Registries (Declarative Configs - Universal Two-Tier Architecture)
         self.llm_binding_profiles_registry: Dict[str, LollmsBindingProfile] = {}
         self.tti_binding_profiles_registry: Dict[str, LollmsBindingProfile] = {}
@@ -340,7 +343,7 @@ class LollmsClient():
                 else:
                     profile = LollmsModelProfile(
                         name=alias,
-                        binding_profile_name=p_data.get("binding_profile_name", "master"),
+                        binding_profile_name=p_data.get("binding_profile_name") or p_data.get("binding_alias") or "master",
                         model_name=p_data.get("model_name"),
                         is_default=p_data.get("is_default", False),
                         vision_enabled=p_data.get("vision_enabled", False),
@@ -583,6 +586,181 @@ class LollmsClient():
     def _cooperative_unload_llm(self):
         self._cooperative_unload_except("tti")
 
+    def has_vision_capability(self, binding: Optional[Any] = None) -> bool:
+        """
+        Checks if the specified binding (or the currently active LLM) has vision capabilities.
+        """
+        target_binding = binding or self.llm
+        if not target_binding:
+            return False
+
+        if getattr(target_binding, "vision_enabled", False) is True:
+            return True
+        if getattr(target_binding, "supports_vision", False) is True:
+            return True
+
+        if hasattr(target_binding, "child_bindings") and isinstance(target_binding.child_bindings, dict):
+            return any(getattr(child, "vision_enabled", False) or getattr(child, "supports_vision", False)
+                       for child in target_binding.child_bindings.values())
+
+        if hasattr(self, "_active_llm_alias") and self._active_llm_alias in self.llm_model_profiles_registry:
+            active_profile = self.llm_model_profiles_registry[self._active_llm_alias]
+            if getattr(active_profile, "vision_enabled", False):
+                return True
+
+        return False
+
+    def find_available_vlm(self) -> Optional[Any]:
+        """
+        Discovers a vision-capable LLM binding from the instantiated registry,
+        model profiles, or router children.
+        """
+        # 1. Check active LLM router child bindings
+        if self.llm and hasattr(self.llm, "child_bindings") and isinstance(self.llm.child_bindings, dict):
+            for child in self.llm.child_bindings.values():
+                if getattr(child, "vision_enabled", False) or getattr(child, "supports_vision", False):
+                    return child
+
+        # 2. Check instantiated models cache
+        for alias, binding in self.llms.items():
+            if alias != self._active_llm_alias:
+                if getattr(binding, "vision_enabled", False) or getattr(binding, "supports_vision", False):
+                    return binding
+
+        # 3. Check declared model profiles and instantiate VLM lazily if available
+        for alias, profile in self.llm_model_profiles_registry.items():
+            if alias != self._active_llm_alias and getattr(profile, "vision_enabled", False):
+                vlm_binding = self._instantiate_binding_from_profile(alias, profile, self.llm_binding_manager, "llm")
+                if vlm_binding:
+                    self.llms[alias] = vlm_binding
+                    return vlm_binding
+
+        return None
+
+    def get_or_generate_image_description(self, image: Union[str, Dict[str, Any], bytes]) -> str:
+        """
+        Generates and caches a textual description of an image using an available VLM in the bundle.
+        If no VLM is available, returns a clean summary indicator.
+        """
+        raw_str = ""
+        if isinstance(image, dict):
+            raw_str = image.get("data") or image.get("url") or str(image)
+        elif isinstance(image, bytes):
+            raw_str = base64.b64encode(image).decode("utf-8")
+        else:
+            raw_str = str(image)
+
+        image_hash = hashlib.sha256(raw_str.encode("utf-8", errors="ignore")).hexdigest()
+
+        if not hasattr(self, "_image_description_cache"):
+            self._image_description_cache = {}
+
+        if image_hash in self._image_description_cache:
+            return self._image_description_cache[image_hash]
+
+        vlm = self.find_available_vlm()
+        if not vlm:
+            desc = "[Image attached (non-vision model)]"
+            self._image_description_cache[image_hash] = desc
+            return desc
+
+        try:
+            ASCIIColors.info("[LollmsClient] Non-vision active model detected. Generating image description using VLM...")
+            prompt = "Describe this image in detail, including all visible text, layout, objects, and relationships. Be concise, objective, and precise."
+
+            # Format image parameter appropriately for VLM
+            img_payload = [raw_str]
+            description = ""
+            if hasattr(vlm, "generate_text"):
+                res = vlm.generate_text(prompt=prompt, images=img_payload, temperature=0.1, n_predict=512)
+                description = str(res).strip()
+            elif hasattr(vlm, "generate_from_messages"):
+                messages = [
+                    {"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{raw_str}" if not raw_str.startswith("http") else raw_str}}]}
+                ]
+                res = vlm.generate_from_messages(messages=messages, temperature=0.1, n_predict=512)
+                description = str(res).strip()
+
+            if not description:
+                description = "[Image attached]"
+
+            formatted_desc = f"[Image Description: {description}]"
+            self._image_description_cache[image_hash] = formatted_desc
+            return formatted_desc
+        except Exception as e:
+            ASCIIColors.warning(f"[LollmsClient] VLM image description generation failed: {e}")
+            desc = "[Image attached]"
+            self._image_description_cache[image_hash] = desc
+            return desc
+
+    def _sanitize_images_for_active_llm(self, text: str, images: Optional[List[Any]]) -> Tuple[str, Optional[List[Any]]]:
+        """
+        If the active LLM lacks vision, strips all raw images, substitutes descriptions from VLM,
+        and appends descriptions to the prompt text.
+        """
+        if not images:
+            return text, None
+
+        if self.has_vision_capability():
+            return text, images
+
+        descriptions = []
+        for img in images:
+            desc = self.get_or_generate_image_description(img)
+            descriptions.append(desc)
+
+        desc_block = "\n\n".join(descriptions)
+        updated_text = f"{text}\n\n{desc_block}" if text else desc_block
+        return updated_text, None
+
+    def _sanitize_messages_for_active_llm(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        If the active LLM lacks vision, strips image blocks and replaces them with cached VLM descriptions.
+        """
+        if not messages:
+            return messages
+
+        if self.has_vision_capability():
+            return messages
+
+        sanitized_messages = []
+        for msg in messages:
+            msg_copy = dict(msg)
+            content = msg_copy.get("content", "")
+
+            # 1. Handle structured content list (OpenAI-style text and image_url blocks)
+            if isinstance(content, list):
+                new_content_parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        img_info = part.get("image_url", {})
+                        img_data = img_info.get("url", "")
+                        if img_data.startswith("data:image"):
+                            _, b64 = img_data.split(",", 1)
+                            img_data = b64
+                        desc = self.get_or_generate_image_description(img_data)
+                        new_content_parts.append({"type": "text", "text": desc})
+                    else:
+                        new_content_parts.append(part)
+                msg_copy["content"] = new_content_parts
+
+            # 2. Handle direct images field attached to the message
+            if "images" in msg_copy and msg_copy["images"]:
+                raw_images = msg_copy.pop("images", [])
+                descriptions = [self.get_or_generate_image_description(img) for img in raw_images]
+                desc_text = "\n\n".join(descriptions)
+                if isinstance(msg_copy["content"], str):
+                    msg_copy["content"] = f"{msg_copy['content']}\n\n{desc_text}".strip()
+                elif isinstance(msg_copy["content"], list):
+                    msg_copy["content"].append({"type": "text", "text": desc_text})
+
+            if "active_images" in msg_copy:
+                msg_copy.pop("active_images", None)
+
+            sanitized_messages.append(msg_copy)
+
+        return sanitized_messages
+
     def generate_text(self, *args, **kwargs) -> Union[str, dict]:
         self._cooperative_unload_except("llm")
         if not self.llm:
@@ -593,6 +771,18 @@ class LollmsClient():
             kwargs["think"] = False
         else:
             kwargs["think"] = kwargs["think"] is True
+
+        # Non-vision model image stripping and VLM substitution
+        prompt = kwargs.get("prompt", args[0] if len(args) > 0 else "")
+        images = kwargs.get("images")
+        if images is not None or not self.has_vision_capability():
+            new_prompt, new_images = self._sanitize_images_for_active_llm(prompt, images)
+            if "prompt" in kwargs:
+                kwargs["prompt"] = new_prompt
+            elif len(args) > 0:
+                args = (new_prompt,) + args[1:]
+            if "images" in kwargs:
+                kwargs["images"] = new_images
 
         return self.llm.generate_text(*args, **kwargs)
 
@@ -609,6 +799,20 @@ class LollmsClient():
             kwargs["think"] = False
         else:
             kwargs["think"] = kwargs["think"] is True
+
+        # Non-vision model message sanitization and VLM substitution
+        messages = kwargs.get("messages", args[0] if len(args) > 0 else [])
+        if messages:
+            sanitized_messages = self._sanitize_messages_for_active_llm(messages)
+            if "messages" in kwargs:
+                kwargs["messages"] = sanitized_messages
+            elif len(args) > 0:
+                args = (sanitized_messages,) + args[1:]
+
+        images = kwargs.get("images")
+        if images is not None:
+            _, new_images = self._sanitize_images_for_active_llm("", images)
+            kwargs["images"] = new_images
 
         return self.llm.generate_from_messages(*args, **kwargs)
 

@@ -72,5 +72,72 @@ class TestImageSuppression(unittest.TestCase):
         self.assertIsNone(self.client.captured_images, "Images should not be passed to a non-vision LLM.")
 
 
+    def test_vlm_bundle_description_substitution_and_caching(self):
+        """Verify VLM generates image description, substitutes it into text-only model, and caches it."""
+        from lollms_client import LollmsClient, LollmsBindingProfile, LollmsModelProfile
+
+        # Setup mock VLM and Text-Only LLMs
+        client = LollmsClient(
+            llm_binding_profiles={
+                "mock_engine": LollmsBindingProfile(
+                    name="mock_engine",
+                    binding_name="ollama"
+                )
+            },
+            llm_model_profiles={
+                "text_only": LollmsModelProfile(
+                    name="text_only",
+                    binding_profile_name="mock_engine",
+                    model_name="llama3-text",
+                    vision_enabled=False,
+                    is_default=True
+                ),
+                "vlm_model": LollmsModelProfile(
+                    name="vlm_model",
+                    binding_profile_name="mock_engine",
+                    model_name="llava-vision",
+                    vision_enabled=True,
+                    is_default=False
+                )
+            }
+        )
+
+        # Mock the text generation on both models
+        mock_text_llm = MagicMock()
+        mock_text_llm.vision_enabled = False
+        mock_text_llm.generate_text.return_value = "Answer about image"
+
+        mock_vlm = MagicMock()
+        mock_vlm.vision_enabled = True
+        mock_vlm.generate_text.return_value = "A red sports car on a racetrack"
+
+        client.llms["text_only"] = mock_text_llm
+        client.llms["vlm_model"] = mock_vlm
+        client.llm = mock_text_llm
+        client._active_llm_alias = "text_only"
+
+        test_img = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+
+        # Call generate_text with an image on the text-only model
+        response = client.generate_text(prompt="What is this?", images=[test_img])
+
+        # 1. Check that the VLM was called once to produce the description
+        mock_vlm.generate_text.assert_called_once()
+
+        # 2. Check that the text LLM received the prompt with the description substituted and NO images
+        called_kwargs = mock_text_llm.generate_text.call_args.kwargs
+        self.assertIn("[Image Description: A red sports car on a racetrack]", called_kwargs["prompt"])
+        self.assertIsNone(called_kwargs["images"])
+
+        # 3. Call generate_text again with the same image: VLM should NOT be called again (cached)
+        mock_vlm.generate_text.reset_mock()
+        response2 = client.generate_text(prompt="Second question", images=[test_img])
+        mock_vlm.generate_text.assert_not_called()
+
+        called_kwargs2 = mock_text_llm.generate_text.call_args.kwargs
+        self.assertIn("[Image Description: A red sports car on a racetrack]", called_kwargs2["prompt"])
+        self.assertIsNone(called_kwargs2["images"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1212,9 +1212,10 @@ class _AgentStreamState:
                     resolved_tool_name = raw_data.get("name", "malformed_tool_call")
                     if not resolved_tool_name:
                         resolved_tool_name = "malformed_tool_call"
-                    resolved_params = raw_data.get("parameters", {})
-                    if not isinstance(resolved_params, dict):
-                        resolved_params = {}
+                    if "parameters" in raw_data and isinstance(raw_data["parameters"], dict):
+                        resolved_params = raw_data["parameters"]
+                    else:
+                        resolved_params = {k: v for k, v in raw_data.items() if k != "name"}
             except json.JSONDecodeError:
                 repaired = sanitized_json_body
                 while repaired.count('{') > repaired.count('}'):
@@ -1227,9 +1228,10 @@ class _AgentStreamState:
                         resolved_tool_name = raw_data.get("name", "malformed_tool_call")
                         if not resolved_tool_name:
                             resolved_tool_name = "malformed_tool_call"
-                        resolved_params = raw_data.get("parameters", {})
-                        if not isinstance(resolved_params, dict):
-                            resolved_params = {}
+                        if "parameters" in raw_data and isinstance(raw_data["parameters"], dict):
+                            resolved_params = raw_data["parameters"]
+                        else:
+                            resolved_params = {k: v for k, v in raw_data.items() if k != "name"}
                 except json.JSONDecodeError:
                     raw_data = None
                     resolved_tool_name = "malformed_tool_call"
@@ -1248,8 +1250,7 @@ class _AgentStreamState:
         if self._event_mode == EventMode.PROCESSING_TAG_MODE:
             self._cb('\n</processing>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
-        if raw_data is None:
-            raw_data = {"name": resolved_tool_name, "parameters": resolved_params}
+        raw_data = {"name": resolved_tool_name, "parameters": resolved_params}
 
         normalized_json = json.dumps(raw_data)
 

@@ -1,7 +1,6 @@
 # lollms_discussion/_context_sanitizer.py
-# Pure-functional execution layer for the Context Diet & Anti-Mimicry Protocol.
+# Pure-functional execution layer for Context Sanitization and Tag Hygiene.
 
-import json
 import re
 from typing import Dict, List, Optional, Any
 
@@ -68,8 +67,7 @@ def scrub_processing_and_status_blocks(text: str) -> str:
 
 def sanitize_context_for_llm(text: str) -> str:
     """
-    Sanitizes older messages (beyond the active cognitive window)
-    by stripping bulky processing logs while avoiding placeholder mimicry.
+    Sanitizes older messages by stripping processing logs while preserving functional tags.
     """
     if not text:
         return ""
@@ -78,12 +76,12 @@ def sanitize_context_for_llm(text: str) -> str:
 
 def build_anti_mimicry_directives() -> str:
     """
-    Returns the strict anti-mimicry directives to be injected into the system prompt.
+    Returns concise, positive directives for tool and artifact emission.
     """
     return (
-        "=== ANTI-MIMICRY & OUTPUT INTEGRITY PROTOCOL (CRITICAL) ===\n"
-        "1. **NEVER OUTPUT SYSTEM MARKERS**: You are STRICTLY FORBIDDEN from generating text patterns like `[🔒...`, `[SYSTEM:`, `<action_result>`, `<tool_result>`, or `<processing>`. These are **INFRASTRUCTURE-ONLY** tags used by the runner to communicate with you. If you output them, your generation is invalid.\n"
-        "2. **USE REAL FUNCTIONAL TAGS**: To create artifacts use `<artifact name=\"...\">`, to create skills use `<skill title=\"...\">`, to save notes use `<note title=\"...\">`, and to invoke tools use `<tool>`. Do NOT simulate results or mimic past system messages.\n"
-        "3. **NO META-COMMENTARY ON ROUNDS**: Do not talk about 'the previous turn', 'this 3-round task', or 'system status'. Speak directly and naturally to the user about the content of their request.\n"
-        "=== END ANTI-MIMICRY PROTOCOL ==="
+        "=== ACTION & OUTPUT INTEGRITY PROTOCOL (MANDATORY) ===\n"
+        "1. **EMIT REAL FUNCTIONAL TAGS**: To create or edit files use `<artifact name=\"...\">` with complete content or SEARCH/REPLACE blocks. To invoke tools use `<tool>`. To create skills use `<skill title=\"...\">`.\n"
+        "2. **PROSE IS NOT ACTION**: Simply saying 'I will write the code' or 'I created the file' in natural text DOES NOT create or modify files. You MUST output the actual XML tags.\n To create artifacts use `<artifact name=\"...\">`, to create skills use `<skill title=\"...\">`, to save notes use `<note title=\"...\">`, and to invoke tools use `<tool>`. Do NOT simulate results or mimic past system messages.\n"
+        "3. **DIRECT ENGAGEMENT**: Respond naturally and directly to the user's request. Do not provide meta-commentary about turns or system statuses.\n"
+        "=== END ACTION PROTOCOL ==="
     )

@@ -149,36 +149,22 @@ def _to_bool(v: Any) -> bool:
     return v.lower().strip() in ("true", "1", "yes", "y") if isinstance(v, str) else bool(v)
 
 
-def _resolve_modality(env: EnvStore, modality: str) -> Optional[Dict[str, Any]]:
-    """Resolves a modality binding from the EnvStore (GUI .env format)."""
-    resolved = env.resolve_default_connection(modality)
-    if not resolved.get("binding_name"):
-        return None
-    return resolved
-
-
 def create_client(env: EnvStore, prefs: GuiPrefs):
-    """Builds the LollmsClient from the active .env's default profiles for
-    LLM, TTI, TTS, and STT — then attaches the shell tool binding."""
+    """Builds the LollmsClient from the unified two-tier profile architecture
+    (Connection Layer + Execution Layer) across all modalities."""
     if LollmsClient is None:
         raise RuntimeError(
             "lollms_client is not importable in this environment. "
             "Install/point PYTHONPATH at your package and restart the app."
         )
 
-    resolved = env.resolve_default_connection("llm")
-    if not resolved.get("binding_name"):
+    llm_bindings = env.get_binding_profiles("llm")
+    llm_profiles = env.get_model_profiles("llm")
+
+    if not llm_bindings or not llm_profiles:
         raise RuntimeError(
             "No LLM binding configured yet. Open Settings and add a binding + profile."
         )
-
-    llm_config: Dict[str, Any] = {
-        "model_name": resolved.get("model_name") or "",
-        "host_address": resolved.get("host_address") or "",
-        "verify_ssl_certificate": _to_bool(resolved.get("verify_ssl")),
-    }
-    if resolved.get("api_key"):
-        llm_config["service_key"] = resolved["api_key"]
 
     import lollms_client
     package_root = Path(lollms_client.__file__).resolve().parent
@@ -188,8 +174,8 @@ def create_client(env: EnvStore, prefs: GuiPrefs):
     host_tool_configs = {"system_shell": {"autonomy_level": prefs.shell_autonomy_level}}
 
     client_kwargs: Dict[str, Any] = {
-        "llm_binding_name": resolved["binding_name"],
-        "llm_binding_config": llm_config,
+        "llm_binding_profiles": llm_bindings,
+        "llm_model_profiles": llm_profiles,
         "tools_binding_name": "lcp",
         "tools_binding_config": {
             "tools_folders": tools_folders,
@@ -197,44 +183,13 @@ def create_client(env: EnvStore, prefs: GuiPrefs):
         },
     }
 
-    # ── TTI (Text-to-Image) ──
-    tti_resolved = _resolve_modality(env, "tti")
-    if tti_resolved:
-        tti_config: Dict[str, Any] = {
-            "host_address": tti_resolved.get("host_address", "http://localhost:9642"),
-            "model_name": tti_resolved.get("model_name", ""),
-            "verify_ssl_certificate": _to_bool(tti_resolved.get("verify_ssl")),
-        }
-        if tti_resolved.get("api_key"):
-            tti_config["service_key"] = tti_resolved["api_key"]
-        client_kwargs["tti_binding_name"] = tti_resolved["binding_name"]
-        client_kwargs["tti_binding_config"] = tti_config
-
-    # ── TTS (Text-to-Speech) ──
-    tts_resolved = _resolve_modality(env, "tts")
-    if tts_resolved:
-        tts_config: Dict[str, Any] = {
-            "host_address": tts_resolved.get("host_address", ""),
-            "model_name": tts_resolved.get("model_name", ""),
-            "verify_ssl_certificate": _to_bool(tts_resolved.get("verify_ssl")),
-        }
-        if tts_resolved.get("api_key"):
-            tts_config["service_key"] = tts_resolved["api_key"]
-        client_kwargs["tts_binding_name"] = tts_resolved["binding_name"]
-        client_kwargs["tts_binding_config"] = tts_config
-
-    # ── STT (Speech-to-Text) ──
-    stt_resolved = _resolve_modality(env, "stt")
-    if stt_resolved:
-        stt_config: Dict[str, Any] = {
-            "host_address": stt_resolved.get("host_address", ""),
-            "model_name": stt_resolved.get("model_name", ""),
-            "verify_ssl_certificate": _to_bool(stt_resolved.get("verify_ssl")),
-        }
-        if stt_resolved.get("api_key"):
-            stt_config["service_key"] = stt_resolved["api_key"]
-        client_kwargs["stt_binding_name"] = stt_resolved["binding_name"]
-        client_kwargs["stt_binding_config"] = stt_config
+    # ── Other Modalities (TTI, TTS, STT, TTV, TTM) using unified profiles ──
+    for modality in ("tti", "tts", "stt", "ttv", "ttm"):
+        b_profs = env.get_binding_profiles(modality)
+        m_profs = env.get_model_profiles(modality)
+        if b_profs and m_profs:
+            client_kwargs[f"{modality}_binding_profiles"] = b_profs
+            client_kwargs[f"{modality}_model_profiles"] = m_profs
 
     client = LollmsClient(**client_kwargs)
 
