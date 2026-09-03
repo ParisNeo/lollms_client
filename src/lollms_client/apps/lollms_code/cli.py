@@ -59,6 +59,16 @@ APP_DEFAULT_SKILLS_DIR = APP_CONFIG_DIR / "skills"
 APP_DEFAULT_MEMORY_DB = APP_CONFIG_DIR / "memory.db"
 APP_DEFAULT_HANDSAG_DIR = APP_CONFIG_DIR / "handbags"
 
+TTI_CAPABILITY_PROMPT = """
+=== IMAGE GENERATION CAPABILITY (ACTIVE) ===
+You have access to a Text-to-Image (TTI) binding. You CAN generate images.
+Use the `tool_generate_image` tool to create images from text prompts.
+Use the `tool_edit_image` tool to modify existing images in the workspace.
+Generated images are saved to the workspace automatically.
+When a user asks you to generate, draw, create, or make an image, you MUST use `tool_generate_image`.
+=== END IMAGE GENERATION CAPABILITY ===
+"""
+
 CODING_SYSTEM_PROMPT = """\
 You are lollms_code, an elite autonomous software engineering agent.
 
@@ -1100,6 +1110,8 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
     ASCIIColors.rich_print("  [dim]📝 Assembling system prompt & environment context...[/dim]", end="")
     env_context = build_environment_context(config)
     personality.system_prompt = personality.system_prompt + "\n" + env_context
+    if has_tti:
+        personality.system_prompt += TTI_CAPABILITY_PROMPT
     ASCIIColors.rich_print(" [green]✓[/green]")
 
     if has_tti:
