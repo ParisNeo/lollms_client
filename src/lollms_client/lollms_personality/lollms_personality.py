@@ -1005,11 +1005,15 @@ class BindingToolsBuilder:
 
         # TTI (Text-to-Image)
         tti = getattr(client, 'tti', None)
+        if tti is None:
+            tti_registry = getattr(client, 'tti_model_profiles_registry', None)
+            if tti_registry:
+                tti = True
         if tti is not None:
             if caps.enable_image_generation:
-                tools["tool_generate_image"] = BindingToolsBuilder._make_tti_generate_tool(tti, workspace_path)
+                tools["tool_generate_image"] = BindingToolsBuilder._make_tti_generate_tool(client, workspace_path)
             if caps.enable_image_editing:
-                tools["tool_edit_image"] = BindingToolsBuilder._make_tti_edit_tool(tti, workspace_path)
+                tools["tool_edit_image"] = BindingToolsBuilder._make_tti_edit_tool(client, workspace_path)
 
         # TTS (Text-to-Speech)
         tts = getattr(client, 'tts', None)
@@ -1034,7 +1038,7 @@ class BindingToolsBuilder:
         return tools
 
     @staticmethod
-    def _make_tti_generate_tool(tti_binding, workspace_path: Optional[Path]) -> Dict[str, Any]:
+    def _make_tti_generate_tool(client, workspace_path: Optional[Path]) -> Dict[str, Any]:
         def tool_generate_image(prompt: str, width: int = 1024, height: int = 1024, file_name: str = "") -> dict:
             """
             Generate an image from a text prompt using the Text-to-Image binding.
@@ -1046,6 +1050,16 @@ class BindingToolsBuilder:
                 file_name (str, optional): Output filename (without extension). Auto-generated if empty.
             """
             try:
+                tti_binding = getattr(client, 'tti', None)
+                if tti_binding is None:
+                    tti_registry = getattr(client, 'tti_model_profiles_registry', None)
+                    if tti_registry:
+                        default_alias = next((a for a, p in tti_registry.items() if p.is_default), None)
+                        if default_alias and hasattr(client, 'switch_tti'):
+                            client.switch_tti(default_alias)
+                        tti_binding = getattr(client, 'tti', None)
+                if tti_binding is None:
+                    return {"success": False, "error": "No TTI binding available. Configure tti_binding_name or tti_model_profiles."}
                 img_bytes = tti_binding.generate_image(prompt=prompt, width=width, height=height)
                 if not img_bytes:
                     return {"success": False, "error": "Image generation returned no data."}
@@ -1084,7 +1098,7 @@ class BindingToolsBuilder:
         }
 
     @staticmethod
-    def _make_tti_edit_tool(tti_binding, workspace_path: Optional[Path]) -> Dict[str, Any]:
+    def _make_tti_edit_tool(client, workspace_path: Optional[Path]) -> Dict[str, Any]:
         def tool_edit_image(prompt: str, image_file_name: str = "") -> dict:
             """
             Edit an existing image in the workspace using a text prompt.
@@ -1094,6 +1108,16 @@ class BindingToolsBuilder:
                 image_file_name (str): Filename of the image to edit (in the workspace).
             """
             try:
+                tti_binding = getattr(client, 'tti', None)
+                if tti_binding is None:
+                    tti_registry = getattr(client, 'tti_model_profiles_registry', None)
+                    if tti_registry:
+                        default_alias = next((a for a, p in tti_registry.items() if p.is_default), None)
+                        if default_alias and hasattr(client, 'switch_tti'):
+                            client.switch_tti(default_alias)
+                        tti_binding = getattr(client, 'tti', None)
+                if tti_binding is None:
+                    return {"success": False, "error": "No TTI binding available. Configure tti_binding_name or tti_model_profiles."}
                 # Load source image
                 source_b64 = None
                 if image_file_name:
@@ -6693,6 +6717,10 @@ JSON:"""
 
         self._reset_cancel_state()
 
+        _has_tti = False
+        if self.lollms_client:
+            _has_tti = getattr(self.lollms_client, 'tti', None) is not None or bool(getattr(self.lollms_client, 'tti_model_profiles_registry', None))
+
         return {
            "response": final_response,
            "tool_calls": tool_calls_this_turn,
@@ -6700,7 +6728,8 @@ JSON:"""
            "rounds": round_count,
            "workspace_changes": workspace_changes,
            "was_cancelled": was_cancelled,
-           "context_health": context_health
+           "context_health": context_health,
+           "tti_available": _has_tti
        }
 
 Agent = LollmsPersonality

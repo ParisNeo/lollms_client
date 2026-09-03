@@ -2623,6 +2623,11 @@ class _StreamState:
 
             return True
 
+        # 6. Image Generation / Editing (Intercepted during streaming)
+        elif tag_name in ("generate_image", "edit_image"):
+            self._action_dispatched = True
+            return True
+
         return True
 
     def was_action_dispatched(self) -> bool:
@@ -3542,8 +3547,9 @@ class ChatMixin:
         if enable_memory and _mm:
             extra_instructions += _mm.build_system_instructions()
 
-        # Image Generation Instructions (only if image generation/editing is enabled AND TTI binding exists)
-        if (enable_image_generation or enable_image_editing) and getattr(self.lollmsClient, 'tti', None) is not None:
+        # Image Generation Instructions (only if image generation/editing is enabled AND TTI capability exists)
+        _has_tti = getattr(self.lollmsClient, 'tti', None) is not None or bool(getattr(self.lollmsClient, 'tti_model_profiles_registry', None))
+        if (enable_image_generation or enable_image_editing) and _has_tti:
             extra_instructions += self._build_image_generation_instructions()
 
         # Combine core sections (feature rules will be added later after active_tools is built)
@@ -5974,6 +5980,8 @@ class ChatMixin:
             except Exception as dump_err:
                 ASCIIColors.warning(f"[ChatMixin] Failed to write debug context dump: {dump_err}")
 
+        _has_tti = getattr(self.lollmsClient, 'tti', None) is not None or bool(getattr(self.lollmsClient, 'tti_model_profiles_registry', None))
+
         return {
             "user_message": user_msg,
             "ai_message": ai_msg,
@@ -5981,7 +5989,8 @@ class ChatMixin:
             "artefacts": ss.affected_artefacts if ss else [],
             "memory_report": mem_report,
             "dream_report": dream_report,
-            "was_cancelled": was_cancelled
+            "was_cancelled": was_cancelled,
+            "tti_available": _has_tti
         }
 
             

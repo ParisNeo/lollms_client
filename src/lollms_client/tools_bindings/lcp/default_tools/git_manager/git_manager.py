@@ -222,17 +222,23 @@ def tool_git_checkout(branch_name: str) -> Dict[str, Any]:
 def tool_git_log(max_count: int = 10) -> Dict[str, Any]:
     """
     Returns the git commit history.
-    
+
     Args:
         max_count (int, optional): Maximum number of commits to return. Defaults to 10.
     """
     if git is None:
         return {"success": False, "error": "GitPython is not installed."}
-        
+
+    if isinstance(max_count, str):
+        try:
+            max_count = int(max_count)
+        except ValueError:
+            max_count = 10
+
     repo = _get_repo()
     if not repo:
         return {"success": False, "error": "Not a git repository."}
-        
+
     try:
         commits = list(repo.iter_commits(max_count=max_count))
         log_str = ""

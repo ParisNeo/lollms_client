@@ -1,27 +1,32 @@
 # 📦 lollms_artefact: Dynamic Artefact & Context Subsystem
 
-The `lollms_artefact` package implements the core versioning, lifecycle management, and file-tracking layers for Lollms. It introduces a **Hybrid Storage Architecture** designed to bridge the gap between large physical data files on disk and the context window limitations of Large Language Models.
+The `lollms_artefact` package implements the core versioning, lifecycle management, and file-tracking layers for Lollms. It introduces a **Git-like Filesystem-as-Source-of-Truth Architecture** designed to bridge the gap between large physical data files on disk and the context window limitations of Large Language Models.
 
 ---
 
-## 🏛️ 1. The Hybrid Storage Philosophy
+## 🏛️ 1. The Git-like Storage Philosophy
 
 Conversational AI agents often experience a conflict between model attention and tool execution:
 - **Language Models** require high-level summaries, database schemas, and text content to plan queries and reason logically without wasting thousands of tokens on raw binary data.
 - **Local Tools** (Python scripts, SQL queries, executors) require the exact, unmodified physical bytes to perform computations and write outputs.
 
-To solve this, the subsystem uses two distinct storage strategies depending on the file type:
+To solve this, the subsystem uses a **Git-like Filesystem-as-Source-of-Truth** approach:
 
-### A. Single-Stream (Text, Code, Documents)
-For text-based files (`.py`, `.md`, `.pdf`, `.docx`, `.txt`), the system uses a **Single-Stream** approach:
-* **Storage**: The extracted text content is stored directly in the artefact's `content` field and written to `workspace_data/{title}.{ext}`.
-* **Context Injection**: The LLM context zone reads directly from the `content` field. The LLM sees the full, verbatim text of the file.
-* **No `.lam` files**: Text files do NOT generate Logical Artefact Metadata (`.lam`) files. We do not separate the content from the metadata.
+### A. Workspace Root & Confinement (Sandbox)
+All artefacts are strictly confined to a workspace root directory (e.g., `data_workspace/{discussion_id}/workspace_data/`). The `_resolve_confined_path()` method guarantees that no path traversal (`..`) or absolute paths can escape this sandbox. The LLM and tools operate entirely within this box using relative paths.
 
-### B. Dual-Stream (.lam Protocol for Binary & Structured Data)
-For structured data files (`.csv`, `.db`, `.sqlite`, `.xlsx`), the system uses a **Dual-Stream** approach:
-* **Physical Twin**: Saved on the local file system at `workspace_data/{title}.{ext}`. Contains the raw bytes (e.g., raw CSV rows, SQLite binary). Consumed by local tools.
-* **Logical Twin (`.lam`)**: Saved inside `artefacts_metadata/{id}/{name}.lam`. Contains a high-density, text-based abstraction of the file's structure (column names, inferred data types, sample values). Consumed by the LLM context zone.
+### B. Active Files & Version Snapshots
+* **Active File**: The current, working version of a file is written directly to the root of the workspace folder (e.g., `workspace_data/main.py`).
+* **`.versions/` Directory**: A hidden `.versions/` folder inside the workspace root stores historical snapshots. When an artefact is updated, the previous version is archived as `workspace_data/.versions/{uuid}/main_v1.py`. This provides a robust, Git-like local history without relying solely on database blobs.
+
+### C. Single-Stream vs Dual-Stream (`.lam` Protocol)
+* **Single-Stream (Text, Code, Documents)**: For text-based files (`.py`, `.md`, `.pdf`, `.docx`, `.txt`), the system reads directly from the active file in the workspace root when building the LLM context. The database acts as a lightweight index (`content_source: "disk"`) and does not store the raw text to prevent memory bloat.
+* **Dual-Stream (`.lam` Protocol for Binary & Structured Data)**: For structured data files (`.csv`, `.db`, `.sqlite`, `.xlsx`), the system uses a Dual-Stream approach:
+  * **Physical Twin**: Saved at `workspace_data/{title}.{ext}`. Contains the raw bytes (e.g., raw CSV rows, SQLite binary). Consumed by local tools.
+  * **Logical Twin (`.lam`)**: Saved inside `workspace_data/.versions/{id}/{name}.lam`. Contains a high-density, text-based abstraction of the file's structure (column names, inferred data types, sample values). Consumed by the LLM context zone.
+
+### D. Filesystem Synchronization
+If a file is manually deleted from the workspace folder, the `_sync_index_with_disk()` method detects the orphaned database record during the next synchronization cycle and purges it. The workspace folder is the single source of truth.
 
 ---
 
@@ -55,9 +60,9 @@ The `ArtefactManager` interacts directly with `LollmsDiscussion` to orchestrate 
               │
               ├──> ArtefactManager
               │         │
-              │         ├──> [SQLite Metadata Record] (Maintains version logs)
+              │         ├──> [SQLite Metadata Record] (Maintains lightweight index & version logs)
               │         │
-              │         └──> [Physical Workspace] (Writes and version-controls files)
+              │         └──> [Physical Workspace] (Writes active files & archives snapshots in .versions/)
               │
               └──> ChatMixin (Orchestrates tool execution & scans CWD)
 ```
@@ -86,7 +91,7 @@ The chat interface interprets custom tags inserted into the message history. The
 
 ## ✏️ 4. Updating Artefact Content
 
-You can modify the content of an existing artefact using the `update()` method. By default, this creates a new version in the database, preserving the history of previous states.
+You can modify the content of an existing artefact using the `update()` method. By default, this creates a new version snapshot in the `.versions/` directory and updates the active file in the workspace root.
 
 ```python
 art = discussion.artefacts.update(
@@ -98,7 +103,7 @@ art = discussion.artefacts.update(
 
 ### Overwriting the Current Version
 
-If you want to update the content without creating a new version history entry, you can set `bump_version=False`. This will overwrite the content of the current active version without incrementing the version number.
+If you want to update the content without creating a new version history entry, you can set `bump_version=False`. This will overwrite the content of the current active file without incrementing the version number.
 
 ```python
 art = discussion.artefacts.update(
@@ -220,6 +225,7 @@ Every artifact in the system is represented as a dictionary (record) with a spec
 | `logical_content` | `str` | Explicit storage for the `.lam` schema text of `DATA` artifacts. While usually mirrored in `content`, this field is the authoritative source for the logical twin during Dual-Stream sync operations. |
 | `physical_data` | `bytes` | The raw binary bytes of a `DATA` or `IMAGE` artifact. **CRITICAL**: This field is stripped from the database record by `_get_all_raw()` to prevent JSON serialization crashes. It is only present in the dictionary returned directly by `add()` or `update()`. Never assume `art.get("physical_data")` will return bytes from a database query; rehydrate from disk if needed. |
 | `token_count` | `int` | The estimated token count of the `content`. Used by the Context Budget Guard to prevent context overflow. |
+| `content_source` | `str` | Indicates where the content is stored. `disk` means the database is acting as an index and the filesystem is the source of truth. `db` means the content is stored in the database metadata. |
 
 ### Handling Guidelines
 
@@ -267,6 +273,46 @@ For lightweight, text-only integrations (such as passing an artifact via an API 
 *   `export_artefact(title)`: Returns a JSON-serializable dictionary containing all versions and companion image versions.
 *   `import_artefact(artefact_data, activate)`: Reconstructs the artifact and its companion images from a JSON dictionary.
 *   `export_artefact_bundle(title)`: A legacy JSON-based single-artifact export that includes companion image artifacts.
+
+---
+
+## 🗑️ 10. Configurable Versioning Strategy for Deleted Artifacts
+
+By default, the `ArtefactManager` enforces a strict **Disk-Source-of-Truth** invariant. When an artifact is removed via `remove()`, both the active file in the workspace root and its entire version history in the `.versions/` directory are permanently purged. This ensures the filesystem never contains orphaned files that lack database backing.
+
+However, for workflows requiring data recovery or audit trails, this behavior can be softened using the `keep_deleted_versions` flag.
+
+### Configuration
+To enable version preservation, set the `keep_deleted_versions` attribute to `True` on your `LollmsDiscussion` instance before deleting artifacts:
+
+```python
+# Enable preservation of version history on deletion
+discussion.keep_deleted_versions = True
+
+# Deleting the artifact removes the active file but preserves .versions/
+discussion.artefacts.remove("critical_script.py")
+```
+
+### Restoration Tools
+When `keep_deleted_versions=True`, the `.versions/{uuid}/` directory for the deleted artifact is preserved. You can discover and restore these orphaned snapshots using the following tools:
+
+*   **`list_deleted_artifacts()`**: Scans the `.versions/` directory for orphaned snapshots. Returns a list of dictionaries containing the `title`, `version`, and `snapshot_path` of recoverable files.
+*   **`restore_from_version(title, version, activate=True)`**: Re-registers a deleted artifact from its preserved historical snapshot. It reads the physical bytes and logical schema (`.lam`) from the `.versions/` directory and re-introduces it into the active workspace as a fresh `v1`.
+
+```python
+# 1. List recoverable deleted artifacts
+deleted_items = discussion.artefacts.list_deleted_artifacts()
+if deleted_items:
+    # 2. Restore the first found snapshot
+    target = deleted_items[0]
+    restored_art = discussion.artefacts.restore_from_version(
+        title=target["title"],
+        version=target["version"]
+    )
+```
+
+### Defensive Synchronization (`sync_all_active_to_disk`)
+The `sync_all_active_to_disk()` method contains a **defense-in-depth reconciliation pass**. After syncing all active DB artifacts to disk, it scans the workspace root one final time. If it discovers any file on disk that is NOT backed by an active DB record, it immediately unlinks (deletes) it. This guarantees that even if a stale write or a race condition attempts to re-materialize a deleted file, the filesystem is corrected to perfectly match the database state.
 
 ---
 

@@ -301,48 +301,71 @@ class ArtefactManager:
 
     def __init__(self, discussion):
         object.__setattr__(self, '_discussion', discussion)
+        object.__setattr__(self, 'keep_deleted_versions', getattr(discussion, 'keep_deleted_versions', False))
 
     @staticmethod
     def _sanitize_path_segments(path_str: str) -> str:
         if not path_str:
             return "untitled"
         path_str = path_str.replace("\\", "/")
-        path_str = path_str.replace("..", "").replace("//", "/")
         parts = path_str.split("/")
         clean_parts = [sanitize_artifact_filename(p) for p in parts if p.strip()]
         if not clean_parts:
             return "untitled"
         return "/".join(clean_parts)
 
+    def _get_workspace_root(self) -> Path:
+        if getattr(self._discussion, "workspace_data_path", None):
+            return Path(self._discussion.workspace_data_path).resolve()
+        base_ws = Path(self._discussion.workspace_path) if getattr(self._discussion, "workspace_path", None) else Path("./data_workspace")
+        return (base_ws / self._discussion.id / "workspace_data").resolve()
+
+    def _get_versions_root(self) -> Path:
+        return self._get_workspace_root() / ".versions"
+
+    def _resolve_confined_path(self, relative_path: str, ensure_parent: bool = False) -> Path:
+        """
+        Strictly resolves a path inside the workspace sandbox.
+        Prevents path traversal (..) and absolute paths escaping the root.
+        """
+        root = self._get_workspace_root()
+        clean_path = relative_path.replace("\\", "/").lstrip("/")
+        if not clean_path or clean_path == ".":
+            return root
+
+        target = (root / clean_path).resolve()
+
+        try:
+            target.relative_to(root)
+        except ValueError:
+            raise PermissionError(f"Path traversal blocked: '{relative_path}' attempts to escape workspace root.")
+
+        if ensure_parent:
+            target.parent.mkdir(parents=True, exist_ok=True)
+
+        return target
+
     def _get_lam_content(self, art: Dict[str, Any]) -> str:
-        title = art.get("title", "untitled")
-        physical_path = art.get("physical_path") or title
+        """Reads the .lam schema directly from the .versions directory."""
+        physical_path = art.get("physical_path") or art.get("title", "untitled")
         atype = art.get("type", "document")
         language = art.get("language")
-        file_ext = art.get("file_ext") or Path(title).suffix
+        file_ext = art.get("file_ext")
 
-        if getattr(self._discussion, "workspace_data_path", None):
-            meta_dir = Path(self._discussion.artefacts_metadata_path)
-        else:
-            base_workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
-            disc_id = self._discussion.id
-            disc_ws_dir = base_workspace_dir / disc_id
-            meta_dir = disc_ws_dir / "artefacts_metadata"
-
-        clean_path = self._sanitize_path_segments(physical_path.replace("workspace/", "").replace("data_workspace/", ""))
+        clean_path = self._sanitize_path_segments(physical_path)
         filename = self._get_filename_with_ext(clean_path, atype, language, file_ext)
-        name_part, ext_part = os.path.splitext(filename) if '.' in filename else (filename, "")
+        name_part, _ = os.path.splitext(filename) if '.' in filename else (filename, "")
 
         art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_path))
-        lam_filename = f"{name_part}.lam"
-        lam_path = meta_dir / art_id / lam_filename
+        lam_path = self._get_versions_root() / art_id / f"{name_part}.lam"
 
         if lam_path.exists():
             try:
                 return lam_path.read_text(encoding="utf-8", errors="ignore").strip()
             except Exception:
                 pass
-        return art.get("content", "").strip()
+
+        return art.get("logical_content", "").strip()
 
     def _get_all_raw(self) -> List[Dict]:
         metadata = self._discussion.metadata or {}
@@ -380,10 +403,12 @@ class ArtefactManager:
 
             if "active"           not in fixed: fixed["active"]           = (fixed["visibility"] == ArtefactVisibility.FULL); dirty = True
             if "version"          not in fixed: fixed["version"]          = 1; dirty = True
+            if "content_source"   not in fixed: fixed["content_source"]   = "disk"; dirty = True
             if "created_at"       not in fixed: fixed["created_at"]       = now; dirty = True
             if "updated_at"       not in fixed: fixed["updated_at"]       = now; dirty = True
             if "commit_message"   not in fixed: fixed["commit_message"]   = None; dirty = True
             if "version_tags"     not in fixed: fixed["version_tags"]     = []; dirty = True
+            if "content_source"   not in fixed: fixed["content_source"]   = "disk"; dirty = True
             migrated.append(fixed)
         if dirty:
             new_meta = (self._discussion.metadata or {}).copy()
@@ -424,81 +449,64 @@ class ArtefactManager:
         return f"{title}{ext}"
 
     def _sync_to_disk_workspace(self, title: str, content: str, version: int, atype: str, language: Optional[str] = None, file_ext: Optional[str] = None, physical_data: Optional[bytes] = None, logical_content: Optional[str] = None, physical_path: Optional[str] = None):
+        """
+        Git-like filesystem synchronization. 
+        Writes the active file to the workspace root and archives a snapshot in .versions/
+        """
         try:
-            if getattr(self._discussion, "workspace_data_path", None):
-                ws_data_dir = Path(self._discussion.workspace_data_path)
-                meta_dir = Path(self._discussion.workspace_data_path).parent / "artefacts_metadata"
-            else:
-                base_workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
-                disc_id = self._discussion.id
-                disc_ws_dir = base_workspace_dir / disc_id
-                ws_data_dir = disc_ws_dir / "workspace_data"
-                meta_dir = disc_ws_dir / "artefacts_metadata"
-
-            ws_data_dir.mkdir(parents=True, exist_ok=True)
-            meta_dir.mkdir(parents=True, exist_ok=True)
+            ws_root = self._get_workspace_root()
+            versions_root = self._get_versions_root()
+            ws_root.mkdir(parents=True, exist_ok=True)
+            versions_root.mkdir(parents=True, exist_ok=True)
 
             path_source = physical_path or title
-            clean_path = self._sanitize_path_segments(path_source.replace("workspace/", "").replace("data_workspace/", ""))
+            clean_path = self._sanitize_path_segments(path_source)
             filename = self._get_filename_with_ext(clean_path, atype, language, file_ext)
-            name_part, ext_part = os.path.splitext(filename) if '.' in filename else (filename, "")
 
+            # The active file in the workspace root (source of truth for tools)
+            active_file_path = self._resolve_confined_path(filename, ensure_parent=True)
+
+            # The versioned snapshot in .versions/
             art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_path))
-            art_meta_dir = meta_dir / art_id
-            art_meta_dir.mkdir(parents=True, exist_ok=True)
+            art_version_dir = versions_root / art_id
+            art_version_dir.mkdir(parents=True, exist_ok=True)
 
-            primary_path = ws_data_dir / filename
-            versioned_path = art_meta_dir / f"{name_part}_v{version}{ext_part}"
-            lam_filename = f"{name_part}.lam"
-            lam_path = art_meta_dir / lam_filename
+            name_part, ext_part = os.path.splitext(filename) if '.' in filename else (filename, "")
+            versioned_filename = f"{name_part}_v{version}{ext_part}"
+            versioned_file_path = art_version_dir / versioned_filename
 
-            # ── STALE FILE ERADICATION PROTOCOL ──
-            # If the raw physical path differs from the computed filename, 
-            # it means an extension was appended. The extensionless file is stale and must be removed.
-            raw_filename = Path(path_source).name
-            if raw_filename != filename:
-                stale_path = ws_data_dir / raw_filename
-                if stale_path.exists() and stale_path.resolve() != primary_path.resolve():
-                    try:
-                        stale_path.unlink()
-                        ASCIIColors.info(f"[ArtefactManager] Removed stale duplicate file: {stale_path.name}")
-                    except Exception as e:
-                        ASCIIColors.warning(f"Failed to remove stale file '{stale_path}': {e}")
-
+            # 1. Write Active File & Version Snapshot
             wrote_physical = False
             if physical_data is not None:
                 try:
-                    primary_path.parent.mkdir(parents=True, exist_ok=True)
-                    primary_path.write_bytes(physical_data)
-                    versioned_path.write_bytes(physical_data)
+                    active_file_path.write_bytes(physical_data)
+                    versioned_file_path.write_bytes(physical_data)
                     wrote_physical = True
                 except Exception as e:
                     trace_exception(e)
 
-            # Fallback: If no physical bytes were written, attempt to write the string content.
             if not wrote_physical and isinstance(content, str) and content:
                 is_binary_db = file_ext in (".db", ".sqlite", ".sqlite3")
                 if not is_binary_db:
                     title_suffix = Path(title).suffix.lower()
                     is_binary_db = title_suffix in (".db", ".sqlite", ".sqlite3")
 
-                # CRITICAL FIX: SVG files are pure XML text, but may be classified as IMAGE type.
-                # We must detect them and force them to be written as text.
                 is_svg = file_ext == ".svg" or Path(title).suffix.lower() == ".svg"
 
-                # Skip true binary types (images, databases) to prevent writing base64/placeholder text as a file
-                # EXCEPTION: SVG files are text-based and MUST be written.
                 if (atype != ArtefactType.IMAGE and not is_binary_db) or is_svg:
                     try:
-                        primary_path.parent.mkdir(parents=True, exist_ok=True)
-                        primary_path.write_text(content, encoding="utf-8", errors="ignore")
-                        versioned_path.write_text(content, encoding="utf-8", errors="ignore")
+                        active_file_path.write_text(content, encoding="utf-8", errors="ignore")
+                        versioned_file_path.write_text(content, encoding="utf-8", errors="ignore")
                         wrote_physical = True
                     except Exception as e:
                         trace_exception(e)
                 elif is_binary_db:
-                    ASCIIColors.error(f"[ArtefactManager] Refusing to write text content to binary database file '{filename}'. Physical data is missing. Title='{title}', file_ext='{file_ext}'.")
+                    ASCIIColors.error(f"[ArtefactManager] Refusing to write text content to binary database file '{filename}'. Physical data is missing.")
                     return False
+
+            # 2. Write Logical Twin (.lam) into .versions/
+            lam_filename = f"{name_part}.lam"
+            lam_path = art_version_dir / lam_filename
 
             if logical_content:
                 try:
@@ -506,7 +514,7 @@ class ArtefactManager:
                 except Exception as e:
                     trace_exception(e)
             elif wrote_physical and atype in (ArtefactType.DATA, ArtefactType.IMAGE):
-                minimal_lam = f"# Artefact Metadata: {filename}\n- **Type**: {atype}\n- **Version**: {version}\n- **Physical Path**: workspace_data/{filename}\n\n"
+                minimal_lam = f"# Artefact Metadata: {filename}\n- **Type**: {atype}\n- **Version**: {version}\n- **Physical Path**: {filename}\n\n"
                 try:
                     lam_path.write_text(minimal_lam, encoding="utf-8", errors="ignore")
                 except Exception:
@@ -530,29 +538,28 @@ class ArtefactManager:
         return list(seen.keys())
 
     def _read_content_from_disk(self, art: Dict[str, Any]) -> str:
+        """
+        Filesystem-as-Source-of-Truth reader.
+        Reads content directly from the active file in the workspace root.
+        """
         title = art.get("title", "")
         atype = art.get("type", "document")
         language = art.get("language")
         file_ext = art.get("file_ext") or Path(title).suffix
 
-        if getattr(self._discussion, "workspace_data_path", None):
-            ws_data_dir = Path(self._discussion.workspace_data_path)
-        else:
-            base_workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
-            disc_id = self._discussion.id
-            ws_data_dir = base_workspace_dir / disc_id / "workspace_data"
-
         path_source = art.get("physical_path") or title
-        clean_path = self._sanitize_path_segments(path_source.replace("workspace/", "").replace("data_workspace/", ""))
+        clean_path = self._sanitize_path_segments(path_source)
         filename = self._get_filename_with_ext(clean_path, atype, language, file_ext)
-        file_path = ws_data_dir / filename
 
-        if file_path.exists():
-            try:
-                return file_path.read_text(encoding="utf-8", errors="ignore")
-            except Exception as e:
-                ASCIIColors.warning(f"[ArtefactManager] Failed to read content from disk for '{title}': {e}")
-                return ""
+        try:
+            active_file_path = self._resolve_confined_path(filename)
+            if active_file_path.exists():
+                return active_file_path.read_text(encoding="utf-8", errors="ignore")
+        except PermissionError as pe:
+            ASCIIColors.error(f"[ArtefactManager] Security block reading '{title}': {pe}")
+        except Exception as e:
+            ASCIIColors.warning(f"[ArtefactManager] Failed to read content from disk for '{title}': {e}")
+
         return ""
 
     def add(
@@ -807,19 +814,13 @@ class ArtefactManager:
             )
 
         try:
-            if getattr(self._discussion, "workspace_data_path", None):
-                meta_dir = Path(self._discussion.workspace_data_path).parent / "artefacts_metadata"
-            else:
-                base_workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
-                disc_id = self._discussion.id
-                meta_dir = base_workspace_dir / disc_id / "artefacts_metadata"
-
             physical_path = latest.get("physical_path") or title
-            clean_path = self._sanitize_path_segments(physical_path.replace("workspace/", "").replace("data_workspace/", ""))
+            clean_path = self._sanitize_path_segments(physical_path)
             filename = self._get_filename_with_ext(clean_path, atype, latest.get("language"), latest.get("file_ext"))
             name_part, _ = os.path.splitext(filename) if '.' in filename else (filename, "")
+
             art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_path))
-            lam_path = meta_dir / art_id / f"{name_part}.lam"
+            lam_path = self._get_versions_root() / art_id / f"{name_part}.lam"
 
             lam_path.parent.mkdir(parents=True, exist_ok=True)
             lam_path.write_text(new_lam_content, encoding="utf-8", errors="ignore")
@@ -882,15 +883,8 @@ class ArtefactManager:
                     a['active'] = False
             self._save_all(artefacts)
             try:
-                workspace_dir = Path("./data_workspace")
-                try:
-                    from lollms_client.app.Discussion_UI.server import APP_WORKSPACE_DIR as awd
-                    if awd is not None:
-                        workspace_dir = awd
-                except ImportError:
-                    pass
                 old_filename = self._get_filename_with_ext(title, latest.get('type'), latest.get('language'), latest.get('file_ext'))
-                old_path = workspace_dir / "discussions" / self._discussion.id / old_filename
+                old_path = self._resolve_confined_path(old_filename)
                 if old_path.exists():
                     old_path.unlink()
             except Exception as e:
@@ -1042,14 +1036,8 @@ class ArtefactManager:
             self._save_all(artefacts)
             if target_art:
                 try:
-                    if getattr(self._discussion, "workspace_data_path", None):
-                        ws_data_dir = Path(self._discussion.workspace_data_path)
-                    else:
-                        base_workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
-                        ws_data_dir = base_workspace_dir / self._discussion.id / "workspace_data"
-                    
                     old_filename = self._get_filename_with_ext(old_title, target_art.get('type'), target_art.get('language'), target_art.get('file_ext'))
-                    old_path = ws_data_dir / old_filename
+                    old_path = self._resolve_confined_path(old_filename)
                     if old_path.exists():
                         old_path.unlink()
                 except Exception as e:
@@ -1286,7 +1274,7 @@ class ArtefactManager:
 
     def remove(self, title: str, version: Optional[int] = None) -> int:
         self._cleanup_artefact_files(title, version)
-        
+
         artefacts = self._get_all_raw()
         initial = len(artefacts)
         if version is None:
@@ -1298,124 +1286,229 @@ class ArtefactManager:
             self._save_all(artefacts)
         return removed
 
-    def _cleanup_artefact_files(self, title: str, version: Optional[int] = None):
-        try:
-            if getattr(self._discussion, "workspace_data_path", None):
-                ws_data_dir = Path(self._discussion.workspace_data_path)
-                meta_dir = Path(self._discussion.artefacts_metadata_path)
-            else:
-                base_workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
-                disc_id = self._discussion.id
-                disc_ws_dir = base_workspace_dir / disc_id
-                ws_data_dir = disc_ws_dir / "workspace_data"
-                meta_dir = disc_ws_dir / "artefacts_metadata"
+    def list_deleted_artifacts(self) -> List[Dict[str, Any]]:
+        """
+        Scans the .versions/ directory for orphaned snapshots of deleted artifacts.
+        Only relevant when keep_deleted_versions=True.
+        """
+        versions_root = self._get_versions_root()
+        if not versions_root.exists():
+            return []
 
-            if not ws_data_dir.exists():
-                return
+        active_titles = {a.get('title') for a in self._get_all_raw()}
+        deleted_artifacts = []
+
+        for art_dir in versions_root.iterdir():
+            if not art_dir.is_dir():
+                continue
+
+            lam_files = list(art_dir.glob("*.lam"))
+            if not lam_files:
+                continue
+
+            lam_path = lam_files[0]
+            name_part = lam_path.stem
+
+            possible_titles = [
+                name_part,
+                name_part.replace("_", " "),
+                name_part.replace("_", ".")
+            ]
+
+            is_orphan = True
+            matched_title = None
+            for t in possible_titles:
+                if t in active_titles:
+                    is_orphan = False
+                    break
+
+            if is_orphan:
+                version_files = [f for f in art_dir.iterdir() if f.suffix != ".lam" and "_v" in f.stem]
+                for v_file in version_files:
+                    try:
+                        v_str = v_file.stem.split("_v")[-1]
+                        v_num = int(v_str)
+                        file_ext = v_file.suffix
+                        title_candidate = name_part + file_ext
+                        deleted_artifacts.append({
+                            "title": title_candidate,
+                            "version": v_num,
+                            "snapshot_path": str(v_file),
+                            "lam_path": str(lam_path)
+                        })
+                    except Exception:
+                        continue
+
+        return deleted_artifacts
+
+    def restore_from_version(self, title: str, version: int, activate: bool = True) -> Optional[Dict[str, Any]]:
+        """
+        Restores a deleted artifact from a preserved version snapshot in .versions/.
+        """
+        clean_path = self._sanitize_path_segments(title)
+        art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_path))
+        version_dir = self._get_versions_root() / art_id
+
+        name_part, ext_part = os.path.splitext(title) if '.' in title else (title, "")
+        versioned_filename = f"{name_part}_v{version}{ext_part}"
+        versioned_path = version_dir / versioned_filename
+        lam_path = version_dir / f"{name_part}.lam"
+
+        if not versioned_path.exists():
+            raise FileNotFoundError(f"Version {version} for '{title}' not found in .versions/ directory.")
+
+        physical_data = None
+        logical_content = None
+        content = ""
+
+        try:
+            physical_data = versioned_path.read_bytes()
+        except Exception as e:
+            ASCIIColors.warning(f"[ArtefactManager] Failed to read physical bytes for restore: {e}")
+
+        if lam_path.exists():
+            try:
+                logical_content = lam_path.read_text(encoding="utf-8", errors="ignore")
+                content = logical_content
+            except Exception:
+                pass
+
+        file_ext = ext_part.lower() if ext_part else None
+        atype = ArtefactType.DOCUMENT
+        if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql"):
+            atype = ArtefactType.CODE
+        elif file_ext in (".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"):
+            atype = ArtefactType.DATA
+        elif file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
+            atype = ArtefactType.IMAGE
+
+        if not content and physical_data and atype != ArtefactType.IMAGE:
+            try:
+                content = physical_data.decode("utf-8", errors="ignore")
+            except Exception:
+                content = f"[Restored binary file: {title}]"
+
+        return self.add(
+            title=title,
+            artefact_type=atype,
+            content=content,
+            version=1,
+            active=activate,
+            file_ext=file_ext,
+            physical_data=physical_data,
+            logical_content=logical_content
+        )
+
+    def _cleanup_artefact_files(self, title: str, version: Optional[int] = None):
+        """
+        Git-like deletion: removes the active file from the workspace root.
+        If keep_deleted_versions is True, preserves the .versions/ directory for restore.
+        If False (default), purges the entire .versions/{id} history to maintain disk-source-of-truth.
+        """
+        try:
+            ws_root = self._get_workspace_root()
+            versions_root = self._get_versions_root()
 
             arts = self._get_all_raw()
             target_arts = [a for a in arts if a.get('title') == title and (version is None or a.get('version') == version)]
-            
+
             for art in target_arts:
                 phys_path = art.get("physical_path") or art.get("title", "")
-                clean_path = self._sanitize_path_segments(phys_path.replace("workspace/", "").replace("data_workspace/", ""))
+                clean_path = self._sanitize_path_segments(phys_path)
                 filename = self._get_filename_with_ext(clean_path, art.get('type'), art.get('language'), art.get('file_ext'))
 
-                active_path = ws_data_dir / filename
+                # 1. Delete from workspace root
+                active_path = self._resolve_confined_path(filename)
                 if active_path.exists():
                     try:
                         active_path.unlink()
                     except Exception:
                         pass
 
+                # 2. Delete from .versions/ (unless keep_deleted_versions is True)
                 name_part, ext_part = os.path.splitext(filename) if '.' in filename else (filename, "")
                 art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_path))
-                art_meta_dir = meta_dir / art_id
-                
-                if art_meta_dir.exists():
-                    versioned_phys = art_meta_dir / f"{name_part}_v{art.get('version', 1)}{ext_part}"
-                    if versioned_phys.exists():
+                art_version_dir = versions_root / art_id
+
+                if getattr(self, 'keep_deleted_versions', False):
+                    if version is not None and art_version_dir.exists():
+                        versioned_phys = art_version_dir / f"{name_part}_v{version}{ext_part}"
+                        if versioned_phys.exists():
+                            try:
+                                versioned_phys.unlink()
+                            except Exception:
+                                pass
+                    ASCIIColors.info(f"[ArtefactManager] Preserved version history for '{title}' in .versions/ (keep_deleted_versions=True)")
+                else:
+                    if version is not None and art_version_dir.exists():
+                        versioned_phys = art_version_dir / f"{name_part}_v{version}{ext_part}"
+                        if versioned_phys.exists():
+                            try:
+                                versioned_phys.unlink()
+                            except Exception:
+                                pass
+                        versioned_lam = art_version_dir / f"{name_part}.lam"
+                        if versioned_lam.exists():
+                            try:
+                                versioned_lam.unlink()
+                            except Exception:
+                                pass
+                    elif version is None and art_version_dir.exists():
                         try:
-                            versioned_phys.unlink()
-                        except Exception:
-                            pass
-                        
-                    versioned_lam = art_meta_dir / f"{name_part}.lam"
-                    if versioned_lam.exists():
-                        try:
-                            versioned_lam.unlink()
+                            import shutil
+                            shutil.rmtree(str(art_version_dir))
                         except Exception:
                             pass
 
-            if version is None:
-                if target_arts:
-                    phys_path = target_arts[0].get("physical_path") or target_arts[0].get("title", "")
-                    clean_path = self._sanitize_path_segments(phys_path.replace("workspace/", "").replace("data_workspace/", ""))
-                    art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_path))
-                    art_meta_dir = meta_dir / art_id
-                    if art_meta_dir.exists():
-                        try:
-                            import shutil
-                            shutil.rmtree(str(art_meta_dir))
-                        except Exception:
-                            pass
-                        
         except Exception as e:
             ASCIIColors.warning(f"Failed to cleanup artifact files for '{title}': {e}")
 
     def _cleanup_data_artefact_files(self, title: str, version: Optional[int] = None):
+        """Deprecated: Replaced by _cleanup_artefact_files which handles all types generically."""
+        self._cleanup_artefact_files(title, version)
+
+    def _sync_index_with_disk(self) -> None:
+        """
+        Filesystem-as-Source-of-Truth Synchronization.
+        Scans the workspace root and purges database records for files that no longer exist on disk.
+        """
         try:
-            art = self.get(title, version) if version else self.get(title)
-            if not art or art.get('type') != 'data':
+            ws_root = self._get_workspace_root()
+            if not ws_root.exists():
                 return
 
-            workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
-            try:
-                from lollms_client.app.Discussion_UI.server import APP_WORKSPACE_DIR as awd
-                if awd is not None:
-                    workspace_dir = awd
-            except ImportError:
-                pass
+            active_files_on_disk = set()
+            for f in ws_root.rglob("*"):
+                if f.is_file() and ".versions" not in f.relative_to(ws_root).parts:
+                    active_files_on_disk.add(str(f.relative_to(ws_root)).replace("\\", "/"))
 
-            if not workspace_dir.exists():
-                return
+            arts = self._get_all_raw()
+            orphaned_titles = []
+            for a in arts:
+                if a.get("type") == "image" or a.get("title", "").endswith("::images"):
+                    continue
 
-            file_ext = art.get('file_ext', '.csv')
-            files_to_delete = []
+                phys_path = a.get("physical_path") or a.get("title", "")
+                if not phys_path:
+                    continue
 
-            if version is None:
-                all_versions = [a for a in self._get_all_raw() if a.get('title') == title and a.get('type') == 'data']
-                for v_art in all_versions:
-                    v_num = v_art.get('version', 1)
-                    versioned_file = workspace_dir / self._discussion.id / f"{title}_v{v_num}{file_ext}"
-                    if versioned_file.exists():
-                        files_to_delete.append(versioned_file)
-                    if v_num == 1:
-                        bundled_db = workspace_dir / self._discussion.id / f"{title}_consolidated.db"
-                        if bundled_db.exists():
-                            files_to_delete.append(bundled_db)
-            else:
-                if art.get('type') == 'data':
-                    versioned_file = workspace_dir / self._discussion.id / f"{title}_v{version}{file_ext}"
-                    if versioned_file.exists():
-                        files_to_delete.append(versioned_file)
-                    if version == 1:
-                        bundled_db = workspace_dir / self._discussion.id / f"{title}_consolidated.db"
-                        if bundled_db.exists():
-                            files_to_delete.append(bundled_db)
+                clean_path = self._sanitize_path_segments(phys_path)
+                filename = self._get_filename_with_ext(
+                    clean_path,
+                    a.get("type", "document"),
+                    a.get("language"),
+                    a.get("file_ext")
+                )
 
-            for file_path in set(files_to_delete):
-                try:
-                    resolved = file_path.resolve()
-                    ws_resolved = workspace_dir.resolve()
-                    if resolved.parts[:len(ws_resolved.parts)] != ws_resolved.parts:
-                        continue
-                    file_path.unlink()
-                except Exception as e:
-                    trace_exception(e)
+                if filename not in active_files_on_disk:
+                    orphaned_titles.append(a.get("title"))
 
+            if orphaned_titles:
+                ASCIIColors.info(f"[ArtefactManager] Disk sync detected {len(orphaned_titles)} orphaned file(s). Purging from database...")
+                for title in orphaned_titles:
+                    self.remove(title)
         except Exception as e:
-            ASCIIColors.warning(f"Error during cleanup for '{title}': {e}")
+            ASCIIColors.warning(f"[ArtefactManager] Failed to sync index with disk: {e}")
 
     def remove_by_id(self, artefact_id: str) -> bool:
         artefacts = self._get_all_raw()
@@ -1532,24 +1625,15 @@ class ArtefactManager:
         return self.sync_all_active_to_disk()
 
     def sync_all_active_to_disk(self):
+        self._sync_index_with_disk()
+
+        # CRITICAL FIX: Re-fetch active artifacts AFTER _sync_index_with_disk purged orphans.
+        # The previous code held a stale snapshot of active_arts that included
+        # artifacts already removed from the DB, causing _sync_to_disk_workspace
+        # to re-materialize deleted files back onto disk (violating disk-source-of-truth).
         active_arts = self.list(active_only=True)
-
-        if getattr(self._discussion, "workspace_data_path", None):
-            workspace_dir = Path(self._discussion.workspace_data_path)
-        else:
-            base_workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
-            try:
-                from lollms_client.app.Discussion_UI.server import APP_WORKSPACE_DIR as awd
-                if awd is not None:
-                    base_workspace_dir = awd
-            except ImportError:
-                pass
-            disc_id = self._discussion.id
-            workspace_dir = base_workspace_dir / disc_id / "workspace_data"
-
+        workspace_dir = self._get_workspace_root()
         workspace_dir.mkdir(parents=True, exist_ok=True)
-        workspace_dir = workspace_dir.resolve()
-
         synced_files = []
 
         if not active_arts:
@@ -1563,22 +1647,29 @@ class ArtefactManager:
                 file_ext = art.get("file_ext", "")
                 version = art.get("version", 1)
                 title = art["title"]
-                art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, title.replace("workspace/", "").replace("data_workspace/", "").replace("/", "_").replace("\\", "_")))
+                clean_path = self._sanitize_path_segments(title)
+                art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_path))
 
-                versioned_data = workspace_dir.parent / "artefacts_metadata" / art_id / f"{title.replace('.csv','')}_v{version}{file_ext}"
-                dest = workspace_dir / f"{title}{file_ext}"
-                
+                name_part, _ = os.path.splitext(clean_path) if '.' in clean_path else (clean_path, "")
+                versioned_data = self._get_versions_root() / art_id / f"{name_part}_v{version}{file_ext}"
+                dest = self._resolve_confined_path(f"{title}{file_ext}")
+
                 if versioned_data.exists() and not dest.exists():
                     import shutil
                     shutil.copy(str(versioned_data), str(dest))
-                
+
                 if dest.exists() and str(dest.resolve()) not in synced_files:
                     synced_files.append(str(dest.resolve()))
                 continue
 
+            # Use disk content if available to avoid DB bloat
+            content_to_sync = art.get("content", "")
+            if art.get("content_source") == "disk" or not content_to_sync:
+                content_to_sync = self._read_content_from_disk(art)
+
             self._sync_to_disk_workspace(
                 title=art["title"],
-                content=art["content"],
+                content=content_to_sync,
                 version=art["version"],
                 atype=art["type"],
                 language=art.get("language"),
@@ -1586,9 +1677,62 @@ class ArtefactManager:
             )
 
             filename = self._get_filename_with_ext(art["title"], art["type"], art.get("language"), art.get("file_ext"))
-            expected_path = workspace_dir / filename
-            if expected_path.exists() and str(expected_path.resolve()) not in synced_files:
-                synced_files.append(str(expected_path.resolve()))
+            try:
+                expected_path = self._resolve_confined_path(filename)
+                if expected_path.exists() and str(expected_path.resolve()) not in synced_files:
+                    synced_files.append(str(expected_path.resolve()))
+            except PermissionError:
+                pass
+
+        # ── 🛡️ DEFENSE-IN-DEPTH: FINAL DISK RECONCILIATION ──────────────────
+        # After syncing all active DB artifacts to disk, we must verify that
+        # no files exist on disk that are NOT backed by an active DB record.
+        # This catches any stale re-materializations or orphaned physical twins
+        # that slipped through the sync process, guaranteeing the filesystem
+        # is the true source of truth.
+        synced_files_normalized = set()
+        for sf in synced_files:
+            try:
+                synced_files_normalized.add(str(Path(sf).resolve()))
+            except Exception:
+                pass
+
+        valid_db_filenames = set()
+        for a in self.list():
+            phys_path = a.get("physical_path") or a.get("title", "")
+            if not phys_path:
+                continue
+            clean_path = self._sanitize_path_segments(phys_path)
+            fname = self._get_filename_with_ext(
+                clean_path, a.get("type", "document"),
+                a.get("language"), a.get("file_ext")
+            )
+            valid_db_filenames.add(fname)
+
+        try:
+            for f in workspace_dir.rglob("*"):
+                if f.is_file():
+                    rel_path = f.relative_to(workspace_dir)
+                    rel_str = str(rel_path).replace("\\", "/")
+                    if rel_str.startswith(".versions/"):
+                        continue
+                    try:
+                        abs_path = str(f.resolve())
+                    except Exception:
+                        continue
+                    if abs_path in synced_files_normalized:
+                        continue
+                    if rel_str not in valid_db_filenames:
+                        try:
+                            f.unlink()
+                            ASCIIColors.info(
+                                f"[ArtefactManager] Reconciliation: purged orphaned disk file '{rel_str}' "
+                                f"(no active DB record backs it)."
+                            )
+                        except Exception:
+                            pass
+        except Exception as e:
+            ASCIIColors.warning(f"[ArtefactManager] Final disk reconciliation scan failed: {e}")
 
         return workspace_dir, synced_files
 
@@ -2531,8 +2675,8 @@ class ArtefactManager:
         if not paths:
             raise ValueError("Cannot export an empty bundle. Provide a list of file or folder paths.")
 
-        ws_data_dir = Path(self._discussion.workspace_data_path) if getattr(self._discussion, "workspace_data_path", None) else Path("./data_workspace")
-        meta_dir = Path(self._discussion.artefacts_metadata_path) if getattr(self._discussion, "artefacts_metadata_path", None) else ws_data_dir.parent / "artefacts_metadata"
+        ws_data_dir = self._get_workspace_root()
+        versions_root = self._get_versions_root()
 
         output_path = Path(output_path) if output_path else Path(f"artefact_bundle_{uuid.uuid4().hex[:6]}.lab")
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2540,7 +2684,13 @@ class ArtefactManager:
         files_to_zip: Dict[str, Path] = {}
 
         for p_input in paths:
-            p = Path(p_input)
+            # Confine paths strictly to the workspace
+            try:
+                p = self._resolve_confined_path(str(p_input))
+            except PermissionError:
+                ASCIIColors.warning(f"[ExportBundle] Skipped path outside workspace: {p_input}")
+                continue
+
             if p.is_dir():
                 for f in p.rglob("*"):
                     if f.is_file():
@@ -2562,9 +2712,9 @@ class ArtefactManager:
                 if include_versions:
                     title = p.stem
                     art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, str(rel_path)))
-                    art_meta_dir = meta_dir / art_id
-                    if art_meta_dir.exists():
-                        for v_file in art_meta_dir.glob(f"{title}_v*"):
+                    art_version_dir = versions_root / art_id
+                    if art_version_dir.exists():
+                        for v_file in art_version_dir.glob(f"{title}_v*"):
                             if v_file.is_file():
                                 v_arcname = f"_versions/{v_file.name}"
                                 files_to_zip[v_arcname] = v_file
@@ -2581,7 +2731,7 @@ class ArtefactManager:
         if not lab_path.exists():
             raise FileNotFoundError(f"Artefact bundle not found: {lab_path}")
 
-        ws_data_dir = Path(self._discussion.workspace_data_path) if getattr(self._discussion, "workspace_data_path", None) else Path("./data_workspace")
+        ws_data_dir = self._get_workspace_root()
         ws_data_dir.mkdir(parents=True, exist_ok=True)
 
         imported_artefacts = []
@@ -2596,7 +2746,12 @@ class ArtefactManager:
                 if file_info.filename.startswith("_versions/"):
                     continue
 
-                extracted_path = ws_data_dir / file_info.filename
+                try:
+                    extracted_path = self._resolve_confined_path(file_info.filename)
+                except PermissionError:
+                    ASCIIColors.warning(f"[ImportBundle] Skipped path traversal attempt in zip: {file_info.filename}")
+                    continue
+
                 file_name = Path(file_info.filename).name
                 file_ext = Path(file_info.filename).suffix.lower()
 

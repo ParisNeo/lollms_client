@@ -633,7 +633,9 @@ RULES:
     def _build_image_generation_instructions(self) -> str:
         tti = getattr(self.lollmsClient, 'tti', None)
         if tti is None:
-            return ""
+            tti_registry = getattr(self.lollmsClient, 'tti_model_profiles_registry', None)
+            if not tti_registry:
+                return ""
         lines = [
             "",
             "=== IMAGE GENERATION / EDITING ===",

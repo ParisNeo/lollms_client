@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-03 13:36]
+
+- refactor(client): reorganize source files into src directory and update modules
+
 ## [2026-09-02 16:03]
 
 - fix(document_editor): resolve PyMuPDF flags safely to prevent version crashes

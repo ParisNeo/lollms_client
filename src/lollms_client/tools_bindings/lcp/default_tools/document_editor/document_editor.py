@@ -314,9 +314,14 @@ def tool_edit_document_text(
     if err:
         return err
 
+    if isinstance(match_case, str):
+        match_case = match_case.lower() in ("true", "1", "yes")
+    if isinstance(whole_word, str):
+        whole_word = whole_word.lower() in ("true", "1", "yes")
+
     if operation not in ("insert", "update", "remove"):
         return {"success": False, "error": "Invalid operation. Must be 'insert', 'update', or 'remove'."}
-    
+
     if operation in ("update", "insert") and not replacement_text and operation != "remove":
         return {"success": False, "error": "replacement_text is required for 'update' and 'insert' operations."}
 

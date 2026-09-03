@@ -86,6 +86,11 @@ def tool_execute_python_code(
     sklearn_mod = _ensure_import("sklearn", "scikit-learn")
     scipy_mod = _ensure_import("scipy", "scipy")
 
+    class _NoReconfigureStringIO(io.StringIO):
+        """StringIO that silently ignores reconfigure() calls from user code."""
+        def reconfigure(self, *args, **kwargs):
+            pass
+
     local_vars = {
         "Path": Path,
         "pd": pandas_mod,
@@ -95,13 +100,13 @@ def tool_execute_python_code(
         "sklearn": sklearn_mod,
         "scipy": scipy_mod,
         "_ensure_import": _ensure_import,
-        "__builtins__": __builtins__
+        "__builtins__": __builtins__,
     }
 
     old_stdout = sys.stdout
     old_stderr = sys.stderr
-    redirected_output = io.StringIO()
-    redirected_error = io.StringIO()
+    redirected_output = _NoReconfigureStringIO()
+    redirected_error = _NoReconfigureStringIO()
     
     sys.stdout = redirected_output
     sys.stderr = redirected_error

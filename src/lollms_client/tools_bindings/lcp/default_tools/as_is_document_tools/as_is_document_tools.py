@@ -189,6 +189,12 @@ def tool_read_document_content(
         page_or_sheet (str, optional): Specific page number (for PDF/PPTX) or sheet name (for Excel).
         max_chars (int, optional): Maximum characters to extract. Defaults to 8000.
     """
+    if isinstance(max_chars, str):
+        try:
+            max_chars = int(max_chars)
+        except ValueError:
+            max_chars = 8000
+
     path = Path(file_name)
     if not path.exists():
         return {"success": False, "error": f"File '{file_name}' not found."}

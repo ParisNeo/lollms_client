@@ -86,12 +86,17 @@ def tool_execute_python_data_query(
 
     _np, _pd, _plt = _lazy_import_libs()
 
+    class _NoReconfigureStringIO(io.StringIO):
+        """StringIO that silently ignores reconfigure() calls from user code."""
+        def reconfigure(self, *args, **kwargs):
+            pass
+
     local_vars = {
         "Path": Path,
         "pd": _pd,
         "np": _np,
         "plt": _plt,
-        "__builtins__": __builtins__
+        "__builtins__": __builtins__,
     }
 
     uses_df = re.search(r'\bdf\b', code) is not None
@@ -154,7 +159,7 @@ def tool_execute_python_data_query(
                 ASCIIColors.warning(f"[execute_python_data_query] Failed to auto-load conn: {load_err}")
 
     old_stdout = sys.stdout
-    redirected_output = io.StringIO()
+    redirected_output = _NoReconfigureStringIO()
     sys.stdout = redirected_output
 
     try:

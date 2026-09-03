@@ -134,6 +134,12 @@ def tool_find_files(pattern: str, path: str = ".", max_results: int = 50) -> Dic
         path (str): The directory to search in. Defaults to current directory.
         max_results (int): Maximum number of file paths to return. Defaults to 50.
     """
+    if isinstance(max_results, str):
+        try:
+            max_results = int(max_results)
+        except ValueError:
+            max_results = 50
+
     try:
         search_dir = _resolve_safe_path(path)
         if not search_dir.is_dir():
@@ -142,7 +148,7 @@ def tool_find_files(pattern: str, path: str = ".", max_results: int = 50) -> Dic
         matches: List[str] = []
         for root, dirs, files in os.walk(search_dir):
             dirs[:] = [d for d in dirs if d not in _IGNORED_DIRS and not d.startswith('.')]
-            
+
             for filename in files:
                 if fnmatch.fnmatch(filename, pattern):
                     try:
@@ -150,7 +156,7 @@ def tool_find_files(pattern: str, path: str = ".", max_results: int = 50) -> Dic
                         matches.append(rel_path.replace("\\", "/"))
                     except ValueError:
                         pass
-                        
+
             if len(matches) >= max_results:
                 matches = matches[:max_results]
                 break
@@ -207,6 +213,12 @@ def tool_grep_files(
             - 'words': Finds lines containing ALL specified words (subset match).
         sort_by_relevance (bool): If True and mode is 'fuzzy' or 'words', sorts results from best to worst match.
     """
+    if isinstance(max_results, str):
+        try:
+            max_results = int(max_results)
+        except ValueError:
+            max_results = 50
+
     try:
         cwd = Path.cwd()
         results: List[Dict[str, Any]] = []
