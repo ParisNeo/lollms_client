@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-03 14:09]
+
+- fix: improve document editor and code CLI modality resolution
+
 ## [2026-09-03 06:32]
 
 - feat(lollms_code): add TTI capability prompt and refine SSL verification

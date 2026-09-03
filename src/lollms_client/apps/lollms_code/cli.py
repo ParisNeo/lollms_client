@@ -792,36 +792,88 @@ def _resolve_modality_from_env(modality: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _resolve_modality_from_config(config: CodeAgentConfig, modality: str) -> Optional[Dict[str, Any]]:
+    """
+    Resolves a modality (tti, tts, stt, etc.) binding+profile from the already-loaded
+    CodeAgentConfig two-tier profile registries.
+    Returns a dict with binding_name, model_name, host_address, api_key, verify_ssl
+    or None if not configured.
+    """
+    binding_profiles = getattr(config, f"{modality}_binding_profiles", {})
+    model_profiles = getattr(config, f"{modality}_model_profiles", {})
+
+    if not binding_profiles or not model_profiles:
+        return None
+
+    default_model_alias = None
+    for alias, prof in model_profiles.items():
+        if prof.get("is_default"):
+            default_model_alias = alias
+            break
+
+    if not default_model_alias:
+        default_model_alias = next(iter(model_profiles), None)
+
+    if not default_model_alias:
+        return None
+
+    model_profile = model_profiles[default_model_alias]
+    binding_alias = model_profile.get("binding_profile_name") or model_profile.get("binding_alias")
+
+    if not binding_alias or binding_alias not in binding_profiles:
+        return None
+
+    binding_profile = binding_profiles[binding_alias]
+    binding_name = binding_profile.get("binding_name")
+    if not binding_name:
+        return None
+
+    binding_config = binding_profile.get("binding_config", {})
+
+    return {
+        "binding_name": binding_name,
+        "model_name": model_profile.get("model_name", ""),
+        "host_address": binding_config.get("host_address", "http://localhost:9642"),
+        "api_key": binding_config.get("service_key", ""),
+        "verify_ssl": binding_config.get("verify_ssl_certificate", False),
+    }
+
+
 def create_client(config: CodeAgentConfig) -> LollmsClient:
     """Creates a LollmsClient instance from the CodeAgentConfig using the Two-Tier Profile System."""
-    
-    # Extract the active profile configuration
-    active_profile_alias = config.active_profile_alias
-    active_model_name = config.active_model_name
-    active_binding_name = config.active_binding_name
-    
-    # Get the binding profile configuration
-    binding_profile = config.llm_binding_profiles.get(active_profile_alias, {})
+
+    active_model_alias = config.active_profile_alias
+    active_model_profile = config.llm_model_profiles.get(active_model_alias, {})
+
+    binding_alias = active_model_profile.get("binding_profile_name") or active_model_profile.get("binding_alias")
+    if not binding_alias or binding_alias not in config.llm_binding_profiles:
+        for alias, prof in config.llm_model_profiles.items():
+            if prof.get("is_default"):
+                binding_alias = prof.get("binding_profile_name") or prof.get("binding_alias")
+                break
+
+    if not binding_alias or binding_alias not in config.llm_binding_profiles:
+        if config.llm_binding_profiles:
+            binding_alias = next(iter(config.llm_binding_profiles))
+
+    binding_profile = config.llm_binding_profiles.get(binding_alias, {}) if binding_alias else {}
     binding_config = binding_profile.get("binding_config", {}).copy()
-    
-    # Get the model profile configuration  
-    model_profile = config.llm_model_profiles.get(active_profile_alias, {})
-    
-    # Build the LLM binding configuration
+
+    active_model_name = active_model_profile.get("model_name") or config.active_model_name
+    active_binding_name = binding_profile.get("binding_name") or config.active_binding_name
+
     llm_config: Dict[str, Any] = {
         "model_name": active_model_name,
         "host_address": binding_config.get("host_address", "http://localhost:11434"),
         "verify_ssl_certificate": binding_config.get("verify_ssl_certificate", False),
     }
-    
-    # Add service key if present
+
     if binding_config.get("service_key"):
         llm_config["service_key"] = binding_config["service_key"]
-    
-    # Handle llama_cpp_server specific configuration
+
     if active_binding_name == "llama_cpp_server":
-        if model_profile.get("forced_context_size"):
-            llm_config["ctx_size"] = model_profile["forced_context_size"]
+        if active_model_profile.get("forced_context_size"):
+            llm_config["ctx_size"] = active_model_profile["forced_context_size"]
         if binding_config.get("n_gpu_layers"):
             llm_config["n_gpu_layers"] = binding_config["n_gpu_layers"]
         if binding_config.get("models_path"):
@@ -851,58 +903,28 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
         },
     }
 
-    # ── TTI (Text-to-Image) ──
-    try:
-        tti_resolved = _resolve_modality_from_env("tti")
-        if tti_resolved:
-            tti_config: Dict[str, Any] = {
-                "host_address": tti_resolved["host_address"],
-                "model_name": tti_resolved["model_name"],
-                "verify_ssl_certificate": tti_resolved["verify_ssl"],
-            }
-            if tti_resolved["api_key"]:
-                tti_config["service_key"] = tti_resolved["api_key"]
-            client_kwargs["tti_binding_name"] = tti_resolved["binding_name"]
-            client_kwargs["tti_binding_config"] = tti_config
-            ASCIIColors.success(f"[CLI] ✅ TTI Binding '{tti_resolved['binding_name']}' mounted for image generation.")
-        else:
-            ASCIIColors.info("[CLI] No TTI binding configured. Image generation tools will not be available.")
-    except Exception as e:
-        ASCIIColors.warning(f"[CLI] Failed to configure TTI binding: {e}")
+    for modality in ("tti", "tts", "stt"):
+        try:
+            resolved = _resolve_modality_from_config(config, modality)
+            if not resolved:
+                resolved = _resolve_modality_from_env(modality)
 
-    # ── TTS (Text-to-Speech) ──
-    try:
-        tts_resolved = _resolve_modality_from_env("tts")
-        if tts_resolved:
-            tts_config: Dict[str, Any] = {
-                "host_address": tts_resolved["host_address"],
-                "model_name": tts_resolved["model_name"],
-                "verify_ssl_certificate": tts_resolved["verify_ssl"],
-            }
-            if tts_resolved["api_key"]:
-                tts_config["service_key"] = tts_resolved["api_key"]
-            client_kwargs["tts_binding_name"] = tts_resolved["binding_name"]
-            client_kwargs["tts_binding_config"] = tts_config
-            ASCIIColors.success(f"[CLI] ✅ TTS Binding '{tts_resolved['binding_name']}' mounted for speech synthesis.")
-    except Exception as e:
-        ASCIIColors.warning(f"[CLI] Failed to configure TTS binding: {e}")
-
-    # ── STT (Speech-to-Text) ──
-    try:
-        stt_resolved = _resolve_modality_from_env("stt")
-        if stt_resolved:
-            stt_config: Dict[str, Any] = {
-                "host_address": stt_resolved["host_address"],
-                "model_name": stt_resolved["model_name"],
-                "verify_ssl_certificate": stt_resolved["verify_ssl"],
-            }
-            if stt_resolved["api_key"]:
-                stt_config["service_key"] = stt_resolved["api_key"]
-            client_kwargs["stt_binding_name"] = stt_resolved["binding_name"]
-            client_kwargs["stt_binding_config"] = stt_config
-            ASCIIColors.success(f"[CLI] ✅ STT Binding '{stt_resolved['binding_name']}' mounted for transcription.")
-    except Exception as e:
-        ASCIIColors.warning(f"[CLI] Failed to configure STT binding: {e}")
+            if resolved:
+                modality_config: Dict[str, Any] = {
+                    "host_address": resolved["host_address"],
+                    "model_name": resolved["model_name"],
+                    "verify_ssl_certificate": resolved["verify_ssl"],
+                }
+                if resolved["api_key"]:
+                    modality_config["service_key"] = resolved["api_key"]
+                client_kwargs[f"{modality}_binding_name"] = resolved["binding_name"]
+                client_kwargs[f"{modality}_binding_config"] = modality_config
+                modality_label = {"tti": "Image Generation", "tts": "Speech Synthesis", "stt": "Transcription"}[modality]
+                ASCIIColors.success(f"[CLI] ✅ {modality.upper()} Binding '{resolved['binding_name']}' mounted for {modality_label}.")
+            elif modality == "tti":
+                ASCIIColors.info("[CLI] No TTI binding configured. Image generation tools will not be available.")
+        except Exception as e:
+            ASCIIColors.warning(f"[CLI] Failed to configure {modality.upper()} binding: {e}")
 
     client = LollmsClient(**client_kwargs)
 

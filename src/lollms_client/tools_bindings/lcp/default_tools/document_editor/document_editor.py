@@ -354,9 +354,12 @@ def tool_edit_document_text(
             
         elif file_ext == ".docx":
             import docx
+            from docx.oxml.ns import qn
+            from docx.oxml import OxmlElement
+
             doc = docx.Document(file_name)
-            total_matches = 0
-            
+            total_annot = 0
+
             paragraph_texts = [p.text for p in doc.paragraphs]
             matched_indices = _fuzzy_find_in_paragraphs(paragraph_texts, search_text)
             
