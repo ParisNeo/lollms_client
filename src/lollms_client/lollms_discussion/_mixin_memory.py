@@ -138,19 +138,9 @@ class MemoryMixin:
 
         return True
 
-    def _save_episodic_memory_turn(self, user_msg_content: str, ai_msg_content: str, mm: Any):
+    def _save_episodic_memory_turn(self, user_msg_content: str, ai_msg_content: str, mm: Any, level: int = 1):
         """
-        Saves the current turn as an episodic memory (Level 2 - Deep Memory).
-        
-        ARCHITECTURAL CHANGE: Episodic memories are now saved at Level 2 (Deep Memory)
-        instead of Level 1 (Working Memory). This prevents them from being automatically
-        injected into every context, which would be redundant with the actual conversation
-        history and would clutter the context window.
-        
-        Episodic memories are only accessible via:
-        - Deep Memory handles (if they match user query keywords)
-        - Explicit <mem_search> queries
-        - <mem_load> tags to promote them to Working Memory when needed
+        Saves the current turn as an episodic memory (Level 1 Working Memory by default).
         """
         if not mm:
             return
@@ -189,19 +179,18 @@ class MemoryMixin:
                 f"AI responded: \"{clean_ai_content[:500]}\""
             )
 
-            # Save as a Level 2 episodic memory (Deep Memory - only searchable, not auto-injected)
-            # This prevents context clutter and redundancy with actual conversation history
+            # Save as episodic memory (Level 1 by default, configurable)
             mm.add(
                 content=episode_content,
-                importance=0.6,  # Moderate importance - enough to stay in Deep Memory but not auto-promote
+                importance=0.75,
                 tags=["episode", "conversation", "interaction"],
                 subject_group="episodic_history",
                 subject="user",
                 predicate="RELATED_TO",
                 obj="conversation",
-                level=2  # Level 2 = Deep Memory (searchable but not auto-injected into context)
+                level=level
             )
-            ASCIIColors.info(f"[Memory] Saved episodic memory to Deep Memory (Level 2): {episode_content[:80]}...")
+            ASCIIColors.info(f"[Memory] Saved episodic memory (Level {level}): {episode_content[:80]}...")
         except Exception as e:
             ASCIIColors.warning(f"[Memory] Failed to save episodic memory: {e}")
 

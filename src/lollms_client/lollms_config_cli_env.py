@@ -205,6 +205,7 @@ def _extract_profiles_from_env(prefix: str, bindings: Dict[str, Dict[str, Any]],
         resolved_profiles[p_alias] = {
             "binding_name": binding_name,
             "binding_alias": b_alias,
+            "binding_profile_name": b_alias,
             "binding_config": merged_b_config,
             "model_name": p_data.get("model_name"),
             "is_default": p_data.get("is_default", False),

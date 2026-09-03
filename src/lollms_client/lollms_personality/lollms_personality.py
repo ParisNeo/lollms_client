@@ -1924,6 +1924,15 @@ class LollmsPersonality:
                 "rounds": 1
             }
 
+        return self.chat(
+            prompt=prompt,
+            tools=tools,
+            max_nb_rounds=max_tool_rounds,
+            temperature=temperature if temperature is not None else 0.7,
+            streaming_callback=streaming_callback,
+            **kwargs
+        )
+
     def generate_with_tools_sync(self, prompt: str, tools: Optional[List] = None, **kwargs) -> str:
         """Synchronous wrapper returning only the final response string."""
         res = self.generate_with_tools(prompt=prompt, tools=tools, **kwargs)
@@ -2499,6 +2508,26 @@ class LollmsPersonality:
         return True
 
     # ------------------------------------------------------------------ Workspace & Sub-Agents
+
+    def _sync_artefact_index_with_disk(self) -> None:
+        """Synchronizes workspace files on disk with the internal artefact manager."""
+        if hasattr(self, '_artefact_manager') and self._artefact_manager and self._resolved_workspace:
+            ws_path = self._resolved_workspace
+            if ws_path.exists():
+                for f in ws_path.rglob("*"):
+                    if f.is_file():
+                        rel = f.relative_to(ws_path)
+                        if any(p in _IGNORED_WS_DIRS for p in rel.parts):
+                            continue
+                        if f.suffix.lower() in _IGNORED_WS_EXTS:
+                            continue
+                        title = str(rel).replace("\\", "/")
+                        existing = self._artefact_manager.get(title)
+                        if not existing:
+                            try:
+                                self._artefact_manager.import_file(f, title=title, active=False)
+                            except Exception:
+                                pass
 
     def get_workspace_path(self) -> Optional[str]:
         return str(self._resolved_workspace) if self._resolved_workspace else None
@@ -3292,87 +3321,10 @@ JSON:"""
     def _sanitize_history_for_context(self, text: str, round_index: int = 0, distance_from_end: int = 99) -> str:
         """
         Sanitizes assistant message content for LLM context export.
-        Enforces a strict non-placeholder strategy for the last 4 actions to prevent
-        cognitive thread loss, while aggressively compressing older history.
+        Preserves real tags without synthetic bracketed placeholders to prevent mimicry loops.
         """
-        if distance_from_end < 4:
-            # ── 🔒 STRICT PRESERVATION ZONE (Last 4 Actions) ──
-            # Preserve the LLM's raw conversational text and intent statements VERBATIM.
-            # Only strip bulky XML tag *bodies* (full artifact content, full tool JSON)
-            # to save context, but keep the LLM's own words exactly as it wrote them.
-            # NEVER replace with synthetic placeholders or [Action: ...] summaries here.
-            # CRITICAL: Preserve <tool_result> content inside <processing> blocks so the
-            # model retains access to its own tool outputs in subsequent reasoning rounds.
-
-            text = re.sub(r'<!-- status:[^>]*-->', '', text, flags=re.IGNORECASE)
-            text = re.sub(r'<lollms_artifact[^/]*/>', '', text, flags=re.IGNORECASE)
-            text = re.sub(r'<artefact_image[^/]*/>', '', text, flags=re.IGNORECASE)
-
-            def _preserve_tool_results_in_processing(m):
-                block = m.group(0)
-                tool_result_match = re.search(r'<tool_result[^>]*>.*?</tool_result>', block, re.DOTALL | re.IGNORECASE)
-                if tool_result_match:
-                    return tool_result_match.group(0)
-                return ''
-
-            text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', _preserve_tool_results_in_processing, text, flags=re.DOTALL | re.IGNORECASE)
-            text = re.sub(r'</processing>', '', text, flags=re.IGNORECASE)
-
-            # Strip bulky tag BODIES but preserve surrounding conversational text
-            text = re.sub(
-                r'<art(?:ifact|efact)[^>]*>.*?</art(?:ifact|efact)>',
-                lambda m: re.sub(r'<art(?:ifact|efact)[^>]*>', '[🔒 Artifact body stripped]', m.group(0), flags=re.IGNORECASE),
-                text, flags=re.DOTALL | re.IGNORECASE
-            )
-            text = re.sub(
-                r'<tool>.*?</tool>',
-                lambda m: re.sub(r'<tool>', '[🔒 Tool body stripped]', m.group(0), flags=re.IGNORECASE),
-                text, flags=re.DOTALL | re.IGNORECASE
-            )
-            text = re.sub(
-                r'<(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>.*?</(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>',
-                lambda m: re.sub(r'<(unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>', r'[🔒 \1 body stripped]', m.group(0), flags=re.IGNORECASE),
-                text, flags=re.DOTALL | re.IGNORECASE
-            )
-            text = re.sub(r'<scratchpad_(?:append|patch)>.*?</scratchpad_(?:append|patch)>', '[🔒 Scratchpad update]', text, flags=re.DOTALL | re.IGNORECASE)
-            text = re.sub(r'<scratchpad_clear\s*/?>', '[🔒 Scratchpad cleared]', text, flags=re.IGNORECASE)
-            text = re.sub(r'<mem_new[^/]*/?>', '[🔒 Memory created]', text, flags=re.IGNORECASE)
-            text = re.sub(r'<mem_update[^/]*/?>', '[🔒 Memory updated]', text, flags=re.IGNORECASE)
-            text = re.sub(r'<user_profile_update>.*?</user_profile_update>', '[🔒 User profile updated]', text, flags=re.DOTALL | re.IGNORECASE)
-            text = re.sub(r'<user_profile_clear\s*/?>', '[🔒 User profile cleared]', text, flags=re.IGNORECASE)
-            text = re.sub(r'<refactor_history\s*/?>', '[🔒 History refactored]', text, flags=re.IGNORECASE)
-
-            stripped_for_check = re.sub(r'\[🔒[^\]]*\]', '', text).strip()
-            if not stripped_for_check:
-                text = "[Action executed with no conversational text]"
-        else:
-            # ── 🧹 AGGRESSIVE COMPRESSION ZONE (Older Actions, distance >= 4) ──
-            # CRITICAL: Even in the compression zone, preserve <tool_result> content
-            # so the model can reference data from older rounds without re-querying.
-            text = re.sub(r'<!-- status:[^>]*-->', '', text, flags=re.IGNORECASE)
-            text = re.sub(r'<lollms_artifact[^/]*/>', '', text, flags=re.IGNORECASE)
-            text = re.sub(r'<artefact_image[^/]*/>', '', text, flags=re.IGNORECASE)
-
-            def _preserve_tool_results_in_processing_old(m):
-                block = m.group(0)
-                tool_result_match = re.search(r'<tool_result[^>]*>.*?</tool_result>', block, re.DOTALL | re.IGNORECASE)
-                if tool_result_match:
-                    return tool_result_match.group(0)
-                return ''
-
-            text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', _preserve_tool_results_in_processing_old, text, flags=re.DOTALL | re.IGNORECASE)
-            text = re.sub(r'</processing>', '', text, flags=re.IGNORECASE)
-            text = re.sub(r'<art(?:ifact|efact)[^>]*>.*?</art(?:ifact|efact)>', '[🔒 Artifact stripped]', text, flags=re.DOTALL | re.IGNORECASE)
-            text = re.sub(r'<tool>.*?</tool>', '[🔒 Tool stripped]', text, flags=re.DOTALL | re.IGNORECASE)
-            text = re.sub(r'<(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>.*?</(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>', '[🔒 Context op stripped]', text, flags=re.DOTALL | re.IGNORECASE)
-            text = re.sub(r'<scratchpad_(?:append|patch)>.*?</scratchpad_(?:append|patch)>', '[🔒 Scratchpad update]', text, flags=re.DOTALL | re.IGNORECASE)
-            text = re.sub(r'<scratchpad_clear\s*/?>', '[🔒 Scratchpad cleared]', text, flags=re.IGNORECASE)
-            text = re.sub(r'<mem_new[^/]*/?>', '[🔒 Memory created]', text, flags=re.IGNORECASE)
-            text = re.sub(r'<mem_update[^/]*/?>', '[🔒 Memory updated]', text, flags=re.IGNORECASE)
-            text = re.sub(r'<user_profile_update>.*?</user_profile_update>', '[🔒 User profile updated]', text, flags=re.DOTALL | re.IGNORECASE)
-            text = re.sub(r'<user_profile_clear\s*/?>', '[🔒 User profile cleared]', text, flags=re.IGNORECASE)
-            text = re.sub(r'<refactor_history\s*/?>', '[🔒 History refactored]', text, flags=re.IGNORECASE)
-        return text.strip()
+        from lollms_client.lollms_history import HistoryManager
+        return HistoryManager._sanitize_for_context(text, distance_from_end)
 
     def _sync_base_context_artifacts(self, base_conversation: List[Dict[str, str]], virtual_history: List) -> None:
         """
@@ -3545,14 +3497,10 @@ JSON:"""
 
         if self.capabilities and self.capabilities.enable_skill_loading:
             if self.skills_manager:
-                active_tools.update(self.skills_manager.build_skill_tools())
-
-        if self.capabilities and self.capabilities.enable_skill_creation:
-            if self.skills_manager:
-                skill_tools = self.skills_manager.build_skill_tools()
-                for t_name, t_spec in skill_tools.items():
-                    if t_name in ("tool_create_skill", "tool_update_skill", "tool_append_to_skill", "tool_remove_skill"):
-                        active_tools[t_name] = t_spec
+                all_skill_tools = self.skills_manager.build_skill_tools()
+                for t_name in ("tool_load_skill", "tool_search_skills", "tool_list_skills"):
+                    if t_name in all_skill_tools:
+                        active_tools[t_name] = all_skill_tools[t_name]
 
         if self._sub_agent_spawner and self.capabilities and self.capabilities.enable_sub_agents:
             def tool_spawn_sub_agent(instruction: str, personality_conditioning: str = "", model_name: str = "") -> dict:
@@ -4307,30 +4255,31 @@ JSON:"""
             return None
 
         for t_target in targets:
-            import sqlite3 as _sqlite3
+            if tag_name in ("collapse_folder", "uncollapse_folder"):
+                import sqlite3 as _sqlite3
 
-            folder_path_normalized = t_target.strip().replace("\\", "/").rstrip("/")
-            if not folder_path_normalized:
-                continue
+                folder_path_normalized = t_target.strip().replace("\\", "/").rstrip("/")
+                if not folder_path_normalized:
+                    continue
 
-            try:
-                conn = _sqlite3.connect(str(self._state_db_path))
-                cursor = conn.cursor()
-                if tag_name == "collapse_folder":
-                    cursor.execute("INSERT OR REPLACE INTO collapsed_folders (path) VALUES (?)", (folder_path_normalized,))
-                    action_verb = "Collapsing"
-                else:
-                    cursor.execute("DELETE FROM collapsed_folders WHERE path = ?", (folder_path_normalized,))
-                    action_verb = "Uncollapsing"
-                conn.commit()
-                conn.close()
+                try:
+                    conn = _sqlite3.connect(str(self._state_db_path))
+                    cursor = conn.cursor()
+                    if tag_name == "collapse_folder":
+                        cursor.execute("INSERT OR REPLACE INTO collapsed_folders (path) VALUES (?)", (folder_path_normalized,))
+                        action_verb = "Collapsing"
+                    else:
+                        cursor.execute("DELETE FROM collapsed_folders WHERE path = ?", (folder_path_normalized,))
+                        action_verb = "Uncollapsing"
+                    conn.commit()
+                    conn.close()
 
-                processed_files.append(folder_path_normalized)
-                object.__setattr__(self, '_last_ws_sync_time', 0.0)
-                continue
-            except Exception as db_err:
-                ASCIIColors.warning(f"[{self.name}] Failed to update collapsed_folders DB: {db_err}")
-                continue
+                    processed_files.append(folder_path_normalized)
+                    object.__setattr__(self, '_last_ws_sync_time', 0.0)
+                    continue
+                except Exception as db_err:
+                    ASCIIColors.warning(f"[{self.name}] Failed to update collapsed_folders DB: {db_err}")
+                    continue
 
             folder_prefix = t_target.rstrip('/') + '/'
             matched_arts = [a for a in all_arts if a.get("physical_path", "").replace("\\", "/").startswith(folder_prefix)]
@@ -5578,10 +5527,8 @@ JSON:"""
                         virtual_history.append(SimpleNamespace(sender_type="user", content=report_text))
 
                     ss.completed_actions = []
-                    ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
-                    if getattr(self, 'debug_mode', False):
-                        ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Actions dispatched (post-done), continuing ===")
-                    continue
+                    final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
+                    break
 
                 if has_truncated_artifact:
                     virtual_history.append(SimpleNamespace(
@@ -6096,6 +6043,20 @@ JSON:"""
 
             raw_round_text = ss.get_clean_text()
 
+            # ── 🛡️ ROUND 1 CONVERSATIONAL SHORT-CIRCUIT ──
+            if round_count == 1 and not ss.completed_actions and not tool_calls_this_turn and not workspace_changes:
+                unfinished_intent = any(
+                    phrase in raw_round_text.lower() for phrase in (
+                        "into a skill", "draft the skill", "create the skill",
+                        "let me create", "i'll create", "i will create", "now i'll write",
+                        "let me write", "i'll draft", "i will draft", "into an artifact",
+                        "let me check", "let me inspect", "let me search", "i will check", "i'll check"
+                    )
+                )
+                if not unfinished_intent and raw_round_text.strip():
+                    final_response = re.sub(r'(?i)<done\s*/?>', '', raw_round_text).strip()
+                    break
+
             # ── 🧹 DYNAMIC HISTORY SANITIZATION (Strict Non-Placeholder Strategy) ──
             if virtual_history:
                 history_len = len(virtual_history)
@@ -6360,6 +6321,18 @@ JSON:"""
                 and stripped_round_text
                 and not text_is_repetitive
             ):
+                unfinished_intent = any(
+                    phrase in stripped_round_text.lower() for phrase in (
+                        "into a skill", "draft the skill", "create the skill",
+                        "let me create", "i'll create", "i will create", "now i'll write",
+                        "let me write", "i'll draft", "i will draft", "into an artifact",
+                        "let me check", "let me inspect", "let me search", "i will check", "i'll check"
+                    )
+                )
+                if not unfinished_intent:
+                    final_response = stripped_round_text
+                    break
+
                 ASCIIColors.warning(f"[{self.name}] Round 1 preamble stall detected (text produced, no actions, no <done/>). Injecting continuation mandate.")
 
                 virtual_history.append(SimpleNamespace(

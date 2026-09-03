@@ -104,7 +104,8 @@ class HistoryManager:
             return text.strip()
 
         # ── 🧹 CLEAN DEEP COMPRESSION ZONE (Older Actions, distance >= 4) ──
-        # Replaces bulky tag bodies with clean self-closing tags (no [🔒 ...] markers)
+        # Keeps valid XML tag signatures with status="saved" so in-context learning
+        # always sees valid tag syntax rather than unstructured prose.
         def _compress_artifact_tag(m):
             attrs = m.group(1)
             title = "file"
@@ -304,6 +305,11 @@ class HistoryManager:
         for img in active_art_images:
             if img.get("data") and img["data"] not in system_level_images:
                 system_level_images.append(img["data"])
+
+        # Check vision capability on context's client if available
+        client_inst = getattr(context, "lollmsClient", None) or getattr(context, "lollms_client", None)
+        if client_inst and hasattr(client_inst, "has_vision_capability") and not client_inst.has_vision_capability():
+            suppress_images = True
 
         active_discussion_b64 = _deduplicate_images(system_level_images)
         if full_system_prompt or (active_discussion_b64 and format_type in ["openai_chat", "ollama_chat", "markdown"] and not suppress_images):

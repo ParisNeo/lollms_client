@@ -2976,6 +2976,171 @@ The system actively blocks the LLM from unlocking files >50,000 tokens, instruct
 
 ---
 
+## 📦 Artefact Management & As-Is Document Processing
+
+`lollms_client` integrates a full-featured Artefact Management Engine (`lollms_artefact`) paired with **As-Is Document Tools** (`as_is_document_tools` and `document_editor`). This architecture allows AI agents to inspect, read, search, edit, and annotate native documents (`.pdf`, `.docx`, `.xlsx`, `.pptx`, `.txt`, `.csv`) directly on disk without flooding the model's prompt context window.
+
+### 🏛️ Storage Strategies: Text vs. Data vs. As-Is Files
+
+| Storage Strategy | Target Formats | Mechanism | Context Impact |
+| :--- | :--- | :--- | :--- |
+| **Single-Stream** | Code (`.py`, `.js`), Markdown (`.md`), Text (`.txt`) | Extracted text content stored in artifact and synced directly to disk (`workspace_data/file.ext`). | Full text is injected into prompt context when visibility is `[C]`. |
+| **Dual-Stream (`.lam`)** | Datasets (`.csv`, `.db`, `.sqlite`, `.xlsx`) | **Physical Twin** (raw bytes on disk) + **Logical Twin** (`.lam` schema/column summary in `artefacts_metadata/`). | Only schema, column types, and sample rows are injected into prompt context. |
+| **As-Is File (`as_is`)** | Native Documents (`.pdf`, `.docx`, `.pptx`, `.xlsx`, binary) | Raw file preserved verbatim in `workspace_data/` with an `ArtefactType.FILE` descriptor. | Zero context bloat; LLM uses tools to read page ranges or search selectively. |
+
+---
+
+### 🛠️ Artefact Lifecycle Management (CRUD & Versioning)
+
+The `ArtefactManager` (`discussion.artefacts`) provides complete programmatic control over file artifacts:
+
+```python
+from lollms_client import LollmsClient, LollmsDiscussion, LollmsDataManager
+from lollms_client.lollms_artefact import ArtefactType, ArtefactVisibility
+
+# 1. Initialize discussion with a physical workspace
+client = LollmsClient(llm_binding_name="ollama", llm_binding_config={"model_name": "llama3.1:8b"})
+db_manager = LollmsDataManager("sqlite:///discussion.db")
+discussion = LollmsDiscussion.create_new(
+    lollms_client=client,
+    db_manager=db_manager,
+    workspace_path="./my_project_workspace"
+)
+
+# 2. Create a new artifact
+code_art = discussion.artefacts.add(
+    title="data_processor.py",
+    artefact_type=ArtefactType.CODE,
+    content="import pandas as pd\ndef process(df): return df.describe()",
+    language="python",
+    active=True  # Visibility: [C] FULL
+)
+
+# 3. Update artifact with automatic version increment (v1 -> v2)
+updated_art = discussion.artefacts.update(
+    title="data_processor.py",
+    new_content="import pandas as pd\ndef process(df):\n    print('Processing...')\n    return df.describe()",
+    commit_message="Added progress logging"
+)
+
+# 4. Revert to a previous version
+reverted_art = discussion.artefacts.revert(title="data_processor.py", target_version=1)
+
+# 5. Manage multi-tier visibility to control token budget
+discussion.artefacts.set_visibility("data_processor.py", ArtefactVisibility.TREE_UNLOCKABLE) # Demote to [U]
+
+# 6. List and inspect artifacts
+all_active = discussion.artefacts.list(active_only=True)
+history = discussion.artefacts.get_version_history("data_processor.py")
+
+# 7. Export and import portable archives (.laa / .lab)
+discussion.artefacts.export_artefact_to_archive("data_processor.py", "./data_processor.laa")
+discussion.artefacts.export_artefact_bundle(["data_processor.py"], "./bundle.lab")
+```
+
+---
+
+### 📄 The "As-Is" Document Processing Workflow
+
+#### The Problem: Context Window Explosion
+Converting massive multi-page PDFs, 100-page DOCX reports, or multi-sheet Excel workbooks entirely into Markdown and injecting them into the LLM's prompt leads to:
+1. Immediate context overflow or severe context truncation.
+2. Loss of native formatting, tables, annotations, and slide layouts.
+3. High token costs and slow generation latency.
+
+#### The Solution: Native As-Is File Import & Selective Tooling
+1. **Import with `mode="as_is"`**: The file is copied to `workspace_data/` and registered with an `ArtefactType.FILE` metadata card. It is **NOT** converted into huge markdown or dumped into prompt context.
+2. **Inspect Structure**: The LLM calls `tool_inspect_document` to discover page counts, sheet names, or paragraph outlines.
+3. **Read in Batches**: The LLM calls `tool_read_document_content` with specific page/sheet ranges (`page_or_sheet="1-5"`, `max_chars=8000`).
+4. **Grep on Demand**: The LLM calls `tool_grep_document` to search for regex patterns or keywords across the entire file without reading every page.
+5. **Surgically Edit / Annotate**: The LLM calls `tool_edit_document_text` or `tool_annotate_document` to modify text or add review notes directly in the binary format.
+6. **Sync State**: `discussion.sync_workspace_to_artefacts()` automatically detects changes made to disk and updates the artifact records.
+
+---
+
+### 🔧 Complete As-Is Toolset Reference
+
+#### 1. Inspection & Selective Reading (`as_is_document_tools`)
+
+| Tool | Signature & Key Parameters | Description |
+| :--- | :--- | :--- |
+| `tool_inspect_document` | `file_name: str` | Returns structural metadata (page count for PDF/PPTX, sheet list for XLSX, paragraph count for DOCX, file size). |
+| `tool_read_document_content` | `file_name: str, page_or_sheet: Optional[str], max_chars: int = 8000` | Extracts text from specific pages (e.g. `"1-3, 5"`), sheets, or character slices. Automatically extracts embedded figures for vision models if text is sparse. |
+| `tool_grep_document` | `file_name: str, pattern: str, max_matches: int = 20` | Fast regex/keyword search across the document returning matching lines with line numbers. |
+
+#### 2. Surgical Editing & Annotation (`document_editor`)
+
+| Tool | Signature & Key Parameters | Description |
+| :--- | :--- | :--- |
+| `tool_edit_document_text` | `file_name: str, operation: str, search_text: str, replacement_text: str, pages: str = ""` | Surgically performs `"insert"`, `"update"`, or `"remove"` operations on PDF, DOCX, and PPTX using 3-tier fuzzy text matching. |
+| `tool_annotate_document` | `file_name: str, annotation_type: str, search_text: str, comment: str = "", highlight_color: str = "yellow"` | Adds native highlights or comments to PDF (via PyMuPDF) or DOCX (via python-docx runs). |
+| `tool_batch_annotate_document`| `file_name: str, batch_operations: str (JSON), pages: str = ""` | Applies multiple highlight/comment actions in a single atomic pass for fast proofreading. |
+| `tool_copy_paste_between_documents` | `source_file: str, target_file: str, source_search_text: str, target_anchor_text: str` | Extracts a text block from a source PDF and inserts it into a target PDF at a designated anchor. |
+| `tool_delete_document_page` | `file_name: str, pages_to_delete: str` | Deletes specific pages from PDF or slides from PPTX (e.g., `"1, 3, 5-7"`). |
+| `tool_replace_text_globally` | `file_name: str, search_text: str, replacement_text: str, match_case: bool = False` | Global find-and-replace across all pages/slides/paragraphs in PDF, DOCX, or PPTX. |
+
+---
+
+### 🚀 Complete Example: As-Is Document Ingestion, Proofreading & Annotation
+
+```python
+from pathlib import Path
+from lollms_client import LollmsClient, LollmsDiscussion, LollmsDataManager
+from lollms_client.lollms_personality import LollmsPersonality
+
+# 1. Initialize Client and Persistent Workspace
+client = LollmsClient(
+    llm_binding_name="ollama",
+    llm_binding_config={"model_name": "qwen2.5-coder:14b"},
+    tools_binding_name="lcp"
+)
+db_manager = LollmsDataManager("sqlite:///audit_session.db")
+discussion = LollmsDiscussion.create_new(
+    lollms_client=client,
+    db_manager=db_manager,
+    workspace_path="./audit_workspace"
+)
+
+# 2. Import a 50-page PDF report AS-IS (Zero prompt bloat!)
+import_result = discussion.import_file(
+    path="./annual_financial_report.pdf",
+    mode="as_is",
+    activate=False  # Keeps file in [U] state on disk, avoiding context bloat
+)
+print(f"Imported: {import_result['text_artefact']['title']} (Mode: as_is)")
+
+# 3. Create a Document Auditor Personality
+auditor_personality = LollmsPersonality(
+    name="DocumentAuditor",
+    system_prompt=(
+        "You are an expert document review specialist.\n"
+        "When auditing documents:\n"
+        "1. First call `tool_inspect_document` to inspect the structure.\n"
+        "2. Read the document in batches using `tool_read_document_content` (e.g. pages '1-10').\n"
+        "3. For any discrepancies or issues found, immediately call `tool_annotate_document` or `tool_edit_document_text`.\n"
+        "4. When finished, summarize your findings and end with `<done/>`."
+    )
+)
+
+# 4. Run the Agentic Review Turn
+# The LLM automatically mounts and uses as_is_document_tools & document_editor
+response = discussion.chat(
+    user_message="Please inspect 'annual_financial_report.pdf', search for all mentions of 'EBITDA', and highlight any negative margins in red with a comment.",
+    personality=auditor_personality,
+    enable_data_tools=True,
+    max_nb_rounds=15
+)
+
+print("\n--- Final Summary ---")
+print(response["ai_message"].content)
+
+# 5. Sync workspace to ensure all physical modifications on disk are captured in the DB
+sync_report = discussion.sync_workspace_to_artefacts()
+print(f"Workspace sync: {sync_report}")
+```
+
+---
+
 ## 🧬 Advanced Agentic Loop Mechanics (`lollms_discussion`)
 
 The `LollmsDiscussion.chat()` method is an **Agentic State Machine** that goes far beyond simple tool execution.

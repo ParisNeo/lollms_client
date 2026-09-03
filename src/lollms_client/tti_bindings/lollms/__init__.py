@@ -53,6 +53,8 @@ class LollmsTTIBinding(LollmsTTIBinding):
             )
 
             self.verify = ssl_context
+        else:
+            self.verify = self.verify_ssl_certificate
 
 
     def generate_image(self, prompt: str, negative_prompt: Optional[str] = "", width: int = 1024, height: int = 1024, **kwargs) -> bytes:

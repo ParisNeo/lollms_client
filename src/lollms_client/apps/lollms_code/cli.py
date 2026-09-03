@@ -59,6 +59,16 @@ APP_DEFAULT_SKILLS_DIR = APP_CONFIG_DIR / "skills"
 APP_DEFAULT_MEMORY_DB = APP_CONFIG_DIR / "memory.db"
 APP_DEFAULT_HANDSAG_DIR = APP_CONFIG_DIR / "handbags"
 
+TTI_CAPABILITY_PROMPT = """
+=== IMAGE GENERATION CAPABILITY (ACTIVE) ===
+You have access to a Text-to-Image (TTI) binding. You CAN generate images.
+Use the `tool_generate_image` tool to create images from text prompts.
+Use the `tool_edit_image` tool to modify existing images in the workspace.
+Generated images are saved to the workspace automatically.
+When a user asks you to generate, draw, create, or make an image, you MUST use `tool_generate_image`.
+=== END IMAGE GENERATION CAPABILITY ===
+"""
+
 CODING_SYSTEM_PROMPT = """\
 You are lollms_code, an elite autonomous software engineering agent.
 
@@ -413,18 +423,28 @@ class PersistentHistory:
 
 
 class CodeAgentConfig:
+    """
+    Configuration for lollms_code supporting the Universal Two-Tier Profile Architecture:
+    - Connection Layer (*_binding_profiles): Server and backend engine connections.
+    - Execution Layer (*_model_profiles): Specific models, routing, and context limits.
+    """
     def __init__(self):
-        self.llm_binding: str = "ollama"
-        self.model_name: str = "qwen3:32b"
-        self.host_address: str = "http://localhost:11434"
-        self.api_key: Optional[str] = None
-        self.verify_ssl: bool = False
-        self.context_size: int = 8192
-        self.n_gpu_layers: int = -1
-        self.models_path: str = ""
-        self.binaries_path: str = ""
+        # Two-Tier Profile Registries (Universal Modalities)
+        self.llm_binding_profiles: Dict[str, Dict[str, Any]] = {}
+        self.llm_model_profiles: Dict[str, Dict[str, Any]] = {}
+        self.tti_binding_profiles: Dict[str, Dict[str, Any]] = {}
+        self.tti_model_profiles: Dict[str, Dict[str, Any]] = {}
+        self.tts_binding_profiles: Dict[str, Dict[str, Any]] = {}
+        self.tts_model_profiles: Dict[str, Dict[str, Any]] = {}
+        self.stt_binding_profiles: Dict[str, Dict[str, Any]] = {}
+        self.stt_model_profiles: Dict[str, Dict[str, Any]] = {}
+        self.ttv_binding_profiles: Dict[str, Dict[str, Any]] = {}
+        self.ttv_model_profiles: Dict[str, Dict[str, Any]] = {}
+        self.ttm_binding_profiles: Dict[str, Dict[str, Any]] = {}
+        self.ttm_model_profiles: Dict[str, Dict[str, Any]] = {}
+
+        self.active_profile: Optional[str] = None
         self.wizard_completed: bool = False
-        self.llm_binding_config: Dict[str, Any] = {}
         self.max_reasoning_steps: int = 100
         self.temperature: float = 0.3
         self.max_tokens_per_turn: int = 8192
@@ -448,82 +468,167 @@ class CodeAgentConfig:
         self.show_progress: bool = True
         self.debug: bool = False
 
+    @property
+    def active_profile_alias(self) -> str:
+        if self.active_profile and self.active_profile in self.llm_model_profiles:
+            return self.active_profile
+        for alias, prof in self.llm_model_profiles.items():
+            if prof.get("is_default"):
+                return alias
+        if self.llm_model_profiles:
+            return next(iter(self.llm_model_profiles))
+        return "default"
+
+    @property
+    def active_model_name(self) -> str:
+        alias = self.active_profile_alias
+        prof = self.llm_model_profiles.get(alias, {})
+        return prof.get("model_name") or "default"
+
+    @property
+    def active_binding_name(self) -> str:
+        alias = self.active_profile_alias
+        prof = self.llm_model_profiles.get(alias, {})
+        b_alias = prof.get("binding_profile_name") or prof.get("binding_alias")
+        b_data = self.llm_binding_profiles.get(b_alias, {}) if b_alias else {}
+        return b_data.get("binding_name") or prof.get("binding_name") or "ollama"
+
     @classmethod
     def load(cls, cli_args: argparse.Namespace) -> "CodeAgentConfig":
         config = cls()
         APP_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+        # 1. Load saved preferences from JSON
         if APP_CONFIG_FILE.exists():
             try:
                 file_config = json.loads(APP_CONFIG_FILE.read_text(encoding="utf-8"))
                 for key, val in file_config.items():
-                    if key == "workspace_path":
+                    if key in ("workspace_path", "llm_binding_profiles", "llm_model_profiles"):
                         continue
                     if hasattr(config, key):
                         setattr(config, key, val)
             except Exception as e:
                 ASCIIColors.warning(f"Failed to read config file: {e}")
 
-        try:
-            get_client_from_env(
-                create_llm=True,
-                create_tti=False,
-                create_tts=False,
-                create_stt=False,
-                create_ttm=False,
-                create_ttv=False,
-                run_wizard_if_fail=False
-            )
-        except Exception:
-            pass
+        # 2. Extract profiles from environment & config files
+        from lollms_client.lollms_config_cli_env import (
+            load_env_file,
+            load_yaml_file,
+            _flatten_dict_to_env,
+            _extract_bindings_from_env,
+            _extract_profiles_from_env
+        )
 
-        default_binding_alias = None
-        for k, v in os.environ.items():
-            if k.startswith("LLM_PROFILES_") and k.endswith("_IS_DEFAULT") and v.lower() in ("true", "1", "yes"):
-                default_binding_alias = k[len("LLM_PROFILES_"):-len("_IS_DEFAULT")]
-                break
+        resolved_env = dict(os.environ)
 
-        if default_binding_alias:
-            binding_alias = os.getenv(f"LLM_PROFILES_{default_binding_alias}_BINDING_ALIAS", default_binding_alias)
-            config.llm_binding = os.getenv(f"LLM_BINDINGS_{binding_alias}_BINDING_NAME", config.llm_binding)
-            config.model_name = os.getenv(f"LLM_PROFILES_{default_binding_alias}_MODEL_NAME", config.model_name)
-            config.host_address = os.getenv(f"LLM_BINDINGS_{binding_alias}_HOST_ADDRESS", config.host_address)
-            config.api_key = os.getenv(f"LLM_BINDINGS_{binding_alias}_SERVICE_KEY", config.api_key)
+        # Read ~/.lollms-client/.env (GUI wizard path)
+        gui_env = Path.home() / ".lollms-client" / ".env"
+        if gui_env.exists():
+            resolved_env.update(load_env_file(gui_env))
 
-            ssl_env = os.getenv(f"LLM_BINDINGS_{binding_alias}_VERIFY_SSL_CERTIFICATE")
-            if ssl_env is not None:
-                config.verify_ssl = ssl_env.lower() in ("true", "1", "yes")
-        else:
-            config.llm_binding = os.getenv("LLM_BINDING_NAME", config.llm_binding)
-            config.model_name = os.getenv("MODEL_NAME", config.model_name)
-            config.host_address = os.getenv("HOST_ADDRESS", config.host_address)
-            config.api_key = os.getenv("API_KEY", config.api_key)
+        # Read ~/.lollms_client/.env & config.yaml (CLI wizard path)
+        home_dir = Path.home() / ".lollms_client"
+        home_env = home_dir / ".env"
+        if home_env.exists():
+            resolved_env.update(load_env_file(home_env))
 
-            ssl_env = os.getenv("VERIFY_SSL_CERTIFICATE")
-            if ssl_env is not None:
-                config.verify_ssl = ssl_env.lower() in ("true", "1", "yes")
+        home_yaml = home_dir / "config.yaml"
+        if home_yaml.exists():
+            try:
+                yaml_data = load_yaml_file(home_yaml)
+                resolved_env.update(_flatten_dict_to_env(yaml_data))
+            except Exception:
+                pass
 
-        if cli_args.llm_binding:
-            config.llm_binding = cli_args.llm_binding
-        if cli_args.model:
-            config.model_name = cli_args.model
-        if cli_args.host:
-            config.host_address = cli_args.host
-        if cli_args.api_key:
-            config.api_key = cli_args.api_key
-            
+        for local_env in [Path.cwd() / ".env", Path.cwd() / "examples" / ".env"]:
+            if local_env.exists():
+                resolved_env.update(load_env_file(local_env))
+
+        # Extract profiles across all modalities
+        for modality in ("llm", "tti", "tts", "stt", "ttv", "ttm"):
+            prefix = modality.upper()
+            bindings = _extract_bindings_from_env(prefix, resolved_env)
+            profiles = _extract_profiles_from_env(prefix, bindings, resolved_env)
+            setattr(config, f"{modality}_binding_profiles", bindings)
+            setattr(config, f"{modality}_model_profiles", profiles)
+
+        # 3. Handle CLI argument overrides
+        active_b_alias = "default"
+        active_m_alias = "default"
+
+        if getattr(cli_args, "profile", None):
+            config.active_profile = cli_args.profile.strip()
+            # Flag selected profile as default
+            for p_name, p_data in config.llm_model_profiles.items():
+                p_data["is_default"] = (p_name == config.active_profile)
+
+        # Apply specific CLI overrides to the active profile
+        if cli_args.llm_binding or cli_args.model or cli_args.host or cli_args.api_key or cli_args.context_size:
+            # Locate active binding & model profile to update or create
+            curr_alias = config.active_profile_alias
+            if curr_alias not in config.llm_model_profiles:
+                config.llm_binding_profiles["default"] = {
+                    "binding_name": cli_args.llm_binding or "ollama",
+                    "binding_config": {
+                        "host_address": cli_args.host or "http://localhost:11434",
+                        "service_key": cli_args.api_key or "",
+                        "verify_ssl_certificate": False,
+                    },
+                    "is_default": True
+                }
+                config.llm_model_profiles["default"] = {
+                    "binding_profile_name": "default",
+                    "model_name": cli_args.model or "qwen3:32b",
+                    "is_default": True,
+                    "forced_context_size": cli_args.context_size or 8192
+                }
+            else:
+                m_prof = config.llm_model_profiles[curr_alias]
+                b_alias = m_prof.get("binding_profile_name") or m_prof.get("binding_alias") or "default"
+                if b_alias not in config.llm_binding_profiles:
+                    config.llm_binding_profiles[b_alias] = {
+                        "binding_name": cli_args.llm_binding or "ollama",
+                        "binding_config": {},
+                        "is_default": True
+                    }
+                b_prof = config.llm_binding_profiles[b_alias]
+
+                if cli_args.llm_binding:
+                    b_prof["binding_name"] = cli_args.llm_binding
+                if cli_args.model:
+                    m_prof["model_name"] = cli_args.model
+                if cli_args.host:
+                    b_prof.setdefault("binding_config", {})["host_address"] = cli_args.host
+                if cli_args.api_key:
+                    b_prof.setdefault("binding_config", {})["service_key"] = cli_args.api_key
+                if cli_args.context_size:
+                    m_prof["forced_context_size"] = cli_args.context_size
+
+        # Fallback: if no LLM profile exists at all, scaffold a default
+        if not config.llm_binding_profiles or not config.llm_model_profiles:
+            config.llm_binding_profiles["default"] = {
+                "binding_name": "ollama",
+                "binding_config": {"host_address": "http://localhost:11434"},
+                "is_default": True
+            }
+            config.llm_model_profiles["default"] = {
+                "binding_profile_name": "default",
+                "model_name": "qwen3:32b",
+                "is_default": True,
+                "forced_context_size": 8192
+            }
+
         if cli_args.workspace:
             config.workspace_path = str(Path(cli_args.workspace).resolve())
         else:
             config.workspace_path = str(Path.cwd().resolve())
-            
+
         if cli_args.max_steps:
             config.max_reasoning_steps = cli_args.max_steps
         if cli_args.temperature is not None:
             config.temperature = cli_args.temperature
         if cli_args.max_tokens:
             config.max_tokens_per_turn = cli_args.max_tokens
-        if cli_args.context_size:
-            config.context_size = cli_args.context_size
         if cli_args.debug is not None:
             config.debug = cli_args.debug
         else:
@@ -688,30 +793,41 @@ def _resolve_modality_from_env(modality: str) -> Optional[Dict[str, Any]]:
 
 
 def create_client(config: CodeAgentConfig) -> LollmsClient:
-    if config.llm_binding_config:
-        llm_config = dict(config.llm_binding_config)
-    else:
-        llm_config: Dict[str, Any] = {
-            "model_name": config.model_name,
-            "host_address": config.host_address,
-            "verify_ssl_certificate": config.verify_ssl,
-        }
-        if config.llm_binding == "llama_cpp_server":
-            llm_config["ctx_size"] = config.context_size
-            llm_config["n_gpu_layers"] = config.n_gpu_layers
-            if config.models_path:
-                llm_config["models_path"] = config.models_path
-            if config.binaries_path:
-                llm_config["binaries_path"] = config.binaries_path
-
-    if config.model_name and config.model_name != llm_config.get("model_name"):
-        llm_config["model_name"] = config.model_name
-    if config.host_address and config.host_address != llm_config.get("host_address"):
-        llm_config["host_address"] = config.host_address
-    if config.api_key:
-        llm_config["service_key"] = config.api_key
-    if "verify_ssl_certificate" not in llm_config:
-        llm_config["verify_ssl_certificate"] = config.verify_ssl
+    """Creates a LollmsClient instance from the CodeAgentConfig using the Two-Tier Profile System."""
+    
+    # Extract the active profile configuration
+    active_profile_alias = config.active_profile_alias
+    active_model_name = config.active_model_name
+    active_binding_name = config.active_binding_name
+    
+    # Get the binding profile configuration
+    binding_profile = config.llm_binding_profiles.get(active_profile_alias, {})
+    binding_config = binding_profile.get("binding_config", {}).copy()
+    
+    # Get the model profile configuration  
+    model_profile = config.llm_model_profiles.get(active_profile_alias, {})
+    
+    # Build the LLM binding configuration
+    llm_config: Dict[str, Any] = {
+        "model_name": active_model_name,
+        "host_address": binding_config.get("host_address", "http://localhost:11434"),
+        "verify_ssl_certificate": binding_config.get("verify_ssl_certificate", False),
+    }
+    
+    # Add service key if present
+    if binding_config.get("service_key"):
+        llm_config["service_key"] = binding_config["service_key"]
+    
+    # Handle llama_cpp_server specific configuration
+    if active_binding_name == "llama_cpp_server":
+        if model_profile.get("forced_context_size"):
+            llm_config["ctx_size"] = model_profile["forced_context_size"]
+        if binding_config.get("n_gpu_layers"):
+            llm_config["n_gpu_layers"] = binding_config["n_gpu_layers"]
+        if binding_config.get("models_path"):
+            llm_config["models_path"] = binding_config["models_path"]
+        if binding_config.get("binaries_path"):
+            llm_config["binaries_path"] = binding_config["binaries_path"]
 
     import lollms_client
     package_root = Path(lollms_client.__file__).resolve().parent
@@ -726,7 +842,7 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
     }
 
     client_kwargs = {
-        "llm_binding_name": config.llm_binding,
+        "llm_binding_name": active_binding_name,
         "llm_binding_config": llm_config,
         "tools_binding_name": "lcp",
         "tools_binding_config": {
@@ -994,6 +1110,8 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
     ASCIIColors.rich_print("  [dim]📝 Assembling system prompt & environment context...[/dim]", end="")
     env_context = build_environment_context(config)
     personality.system_prompt = personality.system_prompt + "\n" + env_context
+    if has_tti:
+        personality.system_prompt += TTI_CAPABILITY_PROMPT
     ASCIIColors.rich_print(" [green]✓[/green]")
 
     if has_tti:
@@ -1732,8 +1850,8 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
 
     config_panel_content = (
         f"[cyan]Workspace:[/cyan] {config.workspace_path}\n"
-        f"[cyan]Model:[/cyan]      {config.model_name}\n"
-        f"[cyan]Binding:[/cyan]    {config.llm_binding}\n"
+        f"[cyan]Model:[/cyan]      {config.active_model_name}\n"
+        f"[cyan]Binding:[/cyan]    {config.active_binding_name}\n"
         f"[cyan]Max steps:[/cyan]  {config.max_reasoning_steps}\n"
         f"[cyan]Memory:[/cyan]     {'enabled' if config.enable_memory else 'disabled'}\n"
         f"[cyan]Skills:[/cyan]     {config.skills_mode}\n"
@@ -2344,8 +2462,8 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
 
     header_lines = [
         f"[cyan]Workspace:[/cyan] {ws_path_display}",
-        f"[cyan]Model:[/cyan]      {config.model_name}",
-        f"[cyan]Binding:[/cyan]    {config.llm_binding}",
+        f"[cyan]Model:[/cyan]      {config.active_model_name}",
+        f"[cyan]Binding:[/cyan]    {config.active_binding_name}",
         f"[dim]Commands: 'exit', 'help', 'config', 'shell', 'forget', 'skills', 'clear-history', 'clear-files', 'clear-scratchpad', 'workspace', 'files', 'load', 'unload', 'lock', 'hide'[/dim]"
     ]
 

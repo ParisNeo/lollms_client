@@ -2095,11 +2095,7 @@ class _StreamState:
 
             # ── 🛑 CRITICAL FIX: IMMEDIATE PHYSICAL MATERIALIZATION ──
             # The physical twin MUST exist on disk the instant the artifact is created.
-            # If the LLM emits a <tool> tag in the very next token that references this file,
-            # the tool will fail with "File not found" if we rely on deferred syncing.
-            # We force a synchronous write to the workspace_data directory right now.
             try:
-                # Use the discussion's artefact manager to sync this specific file to disk
                 self.discussion.artefacts._sync_to_disk_workspace(
                     title=art.get("title", title),
                     content=art.get("content", body),
@@ -2109,12 +2105,6 @@ class _StreamState:
                 )
             except Exception as sync_ex:
                 ASCIIColors.warning(f"[StreamState] Failed to immediately materialize artifact '{title}' to disk: {sync_ex}")
-
-            # ── CRITICAL: DO NOT MUTATE ai_message.content ──
-            # The raw <artifact> XML is preserved in the message content.
-            # The export() method in _mixin_utils.py will handle replacing it
-            # with the [🔒artefact tag called, content stripped for brievety, do not mimic:title|type] marker when building
-            # history for the LLM. This prevents the marker from leaking into the live UI.
 
             # Fire an event update to the UI so it cleanly rebuilds and replaces the code block
             meta_info = _extract_artefact_meta(body, lang, atype)
@@ -3837,10 +3827,9 @@ class ChatMixin:
         # Anti-Mimicry Protocol (only if agentic features are enabled)
         if enable_artefacts or active_tools:
             feature_rules += (
-                "\n=== ANTI-MIMICRY PROTOCOL (CRITICAL) ===\n"
-                "1. **NEVER OUTPUT SYSTEM MARKERS**: You are STRICTLY FORBIDDEN from generating text patterns like `[🔒SYSTEM_ARTIFACT_ANCHOR:...`, `[SYSTEM:`, or `[content stripped...`. These are **INFRASTRUCTURE-ONLY** markers used in history to save space. If you output them, NO ACTION will occur.\n"
-                "2. **USE REAL TAGS**: To create artifacts, you MUST use the actual `<artifact name=\"...\">` XML tags. To call tools, use `<tool>`. Do NOT mimic the placeholder markers from past messages.\n"
-                "3. **TAG ISOLATION**: Functional tags (`<artifact>`, `<tool>`, `<tool_result>`) MUST NEVER appear inside  warn_tag blocks. They must ONLY appear in the final response body AFTER the closing  warn_tag tag.\n"
+                "\n=== ACTION INTEGRITY PROTOCOL (CRITICAL) ===\n"
+                "1. **USE REAL TAGS**: To create artifacts, you MUST use `<artifact name=\"...\">` XML tags. To call tools, use `<tool>`. Saying you will do something in text without emitting tags produces NO changes.\n"
+                "2. **TAG ISOLATION**: Functional tags (`<artifact>`, `<tool>`) MUST NEVER appear inside <think> blocks. They must ONLY appear in the final response body AFTER the closing </think> tag.\n"
             )
 
         # Inject feature rules into the full system prompt
@@ -4167,7 +4156,14 @@ class ChatMixin:
             # and append their base64 pixels to the active vision context so the LLM can "see" them!
             # CRITICAL FIX: Only hydrate images that are explicitly in FULL visibility context.
             # Injecting pixels for [U] (TREE_UNLOCKABLE) images crashes non-vision LLMs.
-            if suppress_images:
+            # Auto-suppress raw images if active LLM profile lacks vision capabilities
+            has_vision = True
+            if self.lollmsClient and hasattr(self.lollmsClient, "has_vision_capability"):
+                has_vision = self.lollmsClient.has_vision_capability()
+            elif hasattr(self, "lollmsClient") and self.lollmsClient and hasattr(self.lollmsClient, "llm"):
+                has_vision = getattr(self.lollmsClient.llm, "vision_enabled", True)
+
+            if suppress_images or not has_vision:
                 round_images = None
             else:
                 round_images = list(images) if images else []
@@ -4664,6 +4660,7 @@ class ChatMixin:
                 # Use structured <action_result> envelopes rather than conversational prompts
                 # that invite the LLM to mimic system reasoning or round-count commentary.
                 system_envelope = (
+                    f"[SYSTEM: Artifact '{action_title}' created successfully.]\n"
                     f'<action_result type="{action_type}" name="{action_title}" status="SUCCESS" destination="{action_dest}">\n'
                     f"The {action_type} '{action_title}' has been successfully created and saved to {action_dest}.\n"
                     f"Its complete content is recorded in your previous message above.\n"
@@ -5668,10 +5665,61 @@ class ChatMixin:
                 clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
                 clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
 
+                # ── 🛡️ EMPTY RESPONSE GUARD (0 Tokens Generated) ──
+                if not raw_round_text.strip():
+                    ASCIIColors.warning("[ChatMixin] Empty response generated (0 tokens). Breaking immediately.")
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="assistant",
+                        content="[No output generated]"
+                    ))
+                    break
+
+                # ── 🛡️ MIMICRY INTERCEPTION & SUPPRESSION ──
+                has_mimicry = bool(re.search(r'\[🔒[^\]]*\]', raw_round_text))
+                if has_mimicry:
+                    ai_msg.content = re.sub(r'\[🔒[^\]]*\]', '', ai_msg.content)
+                    mimicry_counts = getattr(self, "_mimicry_attempt_counts", [0])
+                    mimicry_counts[0] += 1
+                    if mimicry_counts[0] >= 2:
+                        ASCIIColors.warning("[ChatMixin] Repeated mimicry detected. Breaking loop.")
+                        break
+                    else:
+                        ASCIIColors.warning("[ChatMixin] Mimicry detected. Injecting correction.")
+                        clean_text_no_marker = re.sub(r'\[🔒[^\]]*\]', '', clean_history_text).strip()
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="assistant",
+                            content=clean_text_no_marker
+                        ))
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="user",
+                            content=(
+                                "[SYSTEM: SYSTEM MARKER MIMICRY DETECTED. You emitted a system placeholder like `[🔒...]`. "
+                                "These markers are internal system representations and must NEVER be output by the assistant. "
+                                "To create or modify an artifact, you MUST emit the real `<artifact name=\"...\">` XML tag. "
+                                "Please output the real tag now.]"
+                            )
+                        ))
+                        continue
+
                 virtual_history.append(SimpleNamespace(
                     sender_type="assistant",
                     content=clean_history_text.strip()
                 ))
+
+                # ── 🎯 UNFINISHED INTENT DETECTOR ──
+                last_response_lower = raw_round_text.lower()
+                unfinished_intent = any(
+                    phrase in last_response_lower for phrase in (
+                        "into a skill", "draft the skill", "create the skill", "encode all of this",
+                        "let me create", "i'll create", "i will create", "now i'll write", "now i'll encode",
+                        "let me write", "i'll draft", "i will draft", "into an artifact",
+                        "let me check", "let me inspect", "let me search", "i will check", "i'll check"
+                    )
+                )
+
+                if round_count == 1 and not tool_calls_this_turn and not ss.affected_artefacts and not unfinished_intent and not ss.context_unlock_requested:
+                    ASCIIColors.info("[ChatMixin] Round 1 conversational answer completed. Ending loop.")
+                    break
 
                 text_only_stall_count = getattr(self, "_consecutive_text_only_stalls", 0) + 1
                 object.__setattr__(self, "_consecutive_text_only_stalls", text_only_stall_count)
@@ -5681,16 +5729,6 @@ class ChatMixin:
                     break
 
                 ASCIIColors.warning(f"[ChatMixin] Text-only stall detected (#{text_only_stall_count}). LLM stopped without <done/> or actions. Forcing continuation.")
-
-                # ── 🎯 UNFINISHED INTENT DETECTOR ──
-                last_response_lower = raw_round_text.lower()
-                unfinished_intent = any(
-                    phrase in last_response_lower for phrase in (
-                        "into a skill", "draft the skill", "create the skill", "encode all of this",
-                        "let me create", "i'll create", "i will create", "now i'll write", "now i'll encode",
-                        "let me write", "i'll draft", "i will draft", "into an artifact"
-                    )
-                )
 
                 if ss.context_unlock_requested and not was_cancelled:
                     unlock_files_str = ', '.join(ss.context_unlocked_files)
@@ -5767,6 +5805,9 @@ class ChatMixin:
 
         if remove_thinking_blocks:
             ai_msg.content = self.lollmsClient.remove_thinking_blocks(ai_msg.content)
+
+        # Ensure any mimicked markers are purged from the saved content
+        ai_msg.content = re.sub(r'\[🔒[^\]]*\]', '', ai_msg.content).strip()
 
         # The Dual-Stream Buffer architecture now ensures raw <artifact> XML 
         # never enters ai_msg.content in the first place, so no post-generation
