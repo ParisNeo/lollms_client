@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-04 20:08]
+
+- fix(agent): resolve context tag stall loop by resetting stream state on context actions
+
 ## [2026-09-04 18:28]
 
 - fix(personality): correct parameter name in edit_image call from image to images

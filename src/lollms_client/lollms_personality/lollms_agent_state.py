@@ -691,6 +691,31 @@ class _AgentStreamState:
                 self._pending_buffer = re.sub(r'(?m)^\s*<processing[^>]*>', '', self._pending_buffer, flags=re.IGNORECASE)
                 return False
 
+        if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence and not self._in_inline_code:
+            context_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<(unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|user_profile_update|user_profile_clear|mem_new|mem_update|generate_image|edit_image)\b', self._pending_buffer, re.IGNORECASE)
+            if context_match:
+                tag_start_idx = context_match.start()
+                tag_name = context_match.group(1).lower()
+                text_before = self._pending_buffer[:tag_start_idx]
+                if text_before:
+                    self.content += text_before
+                    self._cb(text_before)
+
+                self._is_accumulating_context = True
+                self.context_trigger = True
+                self._context_tag_name = tag_name
+                self._tool_buffer = self._pending_buffer[tag_start_idx:]
+                self._pending_buffer = ""
+
+                if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                    self._cb("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "streaming"})
+
+                if self._event_mode == EventMode.PROCESSING_TAG_MODE:
+                    self._cb(f'\n<processing type="context" title="{tag_name}">\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                self._try_complete_context_tag()
+                return True
+
         if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact:
             if "```" in self._pending_buffer:
                 self._code_fence_buffer += self._pending_buffer
@@ -1005,30 +1030,6 @@ class _AgentStreamState:
 
                 if self._event_mode == EventMode.PROCESSING_TAG_MODE:
                     self._cb(f'\n<processing type="context" title="refactor_history">\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-
-                self._try_complete_context_tag()
-                return True
-
-            context_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<(unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|user_profile_update|user_profile_clear|mem_new|mem_update|generate_image|edit_image)\b', self._pending_buffer, re.IGNORECASE)
-            if context_match:
-                tag_start_idx = context_match.start()
-                tag_name = context_match.group(1).lower()
-                text_before = self._pending_buffer[:tag_start_idx]
-                if text_before:
-                    self.content += text_before
-                    self._cb(text_before)
-
-                self._is_accumulating_context = True
-                self.context_trigger = True
-                self._context_tag_name = tag_name
-                self._tool_buffer = self._pending_buffer[tag_start_idx:]
-                self._pending_buffer = ""
-
-                if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
-                    self._cb("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "streaming"})
-
-                if self._event_mode == EventMode.PROCESSING_TAG_MODE:
-                    self._cb(f'\n<processing type="context" title="{tag_name}">\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
                 self._try_complete_context_tag()
                 return True

@@ -6130,6 +6130,15 @@ JSON:"""
             text_is_repetitive = False
             has_new_actions_this_round = bool(ss.completed_actions) or bool(raw_round_text.strip())
 
+            if ss.completed_actions and any(act.get("type") == "context" for act in ss.completed_actions):
+                object.__setattr__(self, '_consecutive_stall_count', 0)
+                text_is_repetitive = False
+                if raw_round_text.strip():
+                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text()))
+                ss.completed_actions = []
+                ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
+                continue
+
             _xml_tool_pattern = re.compile(r'^\s*<tool_\w+[\s/>]', re.MULTILINE | re.IGNORECASE)
             if _xml_tool_pattern.search(raw_round_text):
                 ASCIIColors.warning(f"[{self.name}] Malformed XML tool syntax detected (Round {round_count}). Injecting format correction.")
