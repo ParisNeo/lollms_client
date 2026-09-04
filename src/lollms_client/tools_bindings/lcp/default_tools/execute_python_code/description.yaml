@@ -1,0 +1,5 @@
+name: Execute Python Code
+description: Executes arbitrary sandboxed Python code and returns stdout, stderr, and generated plots.
+icon: 🐍
+version: 1.0.0
+author: lollms_client

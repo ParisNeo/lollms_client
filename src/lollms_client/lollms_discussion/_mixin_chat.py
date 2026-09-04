@@ -3665,7 +3665,9 @@ class ChatMixin:
                 lcp_binding = LCPBinding(
                     tools_folders=[Path(__file__).parent.parent / "tools_bindings" / "lcp" / "default_tools"]
                 )
-                self.lollmsClient.tools = lcp_binding
+                if not hasattr(self.lollmsClient, "tools") or self.lollmsClient.tools is None:
+                    self.lollmsClient.tools = lcp_binding
+                ASCIIColors.success("[ChatMixin] Auto-provisioned LCPBinding for data tools.")
             except Exception as ex:
                 trace_exception(ex)
                 lcp_binding = None
@@ -3701,15 +3703,41 @@ class ChatMixin:
                     trace_exception(ex)
 
         # 4. Mount Arbitrary Code Execution Tool if enabled
-        if enable_code_execution and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
-            lcp_binding.mount_tool_library("execute_python_code")
-            try:
-                lcp_tools = lcp_binding.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
-                for t_name, t_spec in lcp_tools.items():
-                    if t_name == "tool_execute_python_code":
-                        active_tools[t_name] = t_spec
-            except Exception as ex:
-                trace_exception(ex)
+        if enable_code_execution:
+            if lcp_binding is None:
+                try:
+                    from lollms_client.tools_bindings.lcp import LCPBinding
+                    lcp_binding = LCPBinding(
+                        tools_folders=[Path(__file__).parent.parent / "tools_bindings" / "lcp" / "default_tools"]
+                    )
+                    if not hasattr(self.lollmsClient, "tools") or self.lollmsClient.tools is None:
+                        self.lollmsClient.tools = lcp_binding
+                    ASCIIColors.success("[ChatMixin] Auto-provisioned LCPBinding for code execution.")
+                except Exception as ex:
+                    trace_exception(ex)
+                    lcp_binding = None
+
+            if lcp_binding is None:
+                ASCIIColors.error(
+                    "[ChatMixin] enable_code_execution=True but failed to auto-provision an LCP tools binding. "
+                    "Python code execution tool will NOT be registered."
+                )
+            elif hasattr(lcp_binding, "mount_tool_library"):
+                lcp_binding.mount_tool_library("execute_python_code")
+                try:
+                    lcp_tools = lcp_binding.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
+                    for t_name, t_spec in lcp_tools.items():
+                        if t_name == "tool_execute_python_code":
+                            active_tools[t_name] = t_spec
+                except Exception as ex:
+                    trace_exception(ex)
+                    ASCIIColors.error(f"[ChatMixin] Failed to register execute_python_code tool: {ex}")
+
+            if "tool_execute_python_code" not in active_tools:
+                ASCIIColors.warning(
+                    "[ChatMixin] enable_code_execution=True but 'tool_execute_python_code' was NOT registered in active_tools. "
+                    "The LLM will not be aware of code execution capabilities."
+                )
 
         if debug and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
             lcp_binding.mount_tool_library("debug_toolset")
