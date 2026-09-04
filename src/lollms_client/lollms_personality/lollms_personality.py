@@ -3872,16 +3872,19 @@ JSON:"""
         sys_prompt = self.system_prompt or ""
         onboarding_block = self._build_onboarding_block()
         rules = (
-          "\n=== ACTION EXECUTION & TERMINATION PROTOCOL (CRITICAL) ===\n"
-          "1. **INTENT ≠ EXECUTION**: Stating 'I will search...' in text DOES NOT execute the action. You MUST output the `<tool>` tag.\n"
-          "2. **MANDATORY TAG EMISSION**: To execute an action, you MUST output the `<tool>` tag immediately.\n"
-          "3. **EXPLICIT TERMINATION WITH `<done/>`**: When all objectives are met and tests pass, end with a `<done/>` tag on a new line.\n"
-          "4. **SAME-SESSION CONTINUATION**: When executing a sequence, emit the next action's tag in your IMMEDIATE NEXT response.\n"
-          "5. **AGENTIC TRIGGER**: If the user requests code generation, file modification, testing, or multi-step work, you MUST enter the agentic loop and use `<tool>` or `<artifact>` tags. Do NOT write code directly in conversational prose.\n"
-          "6. **ROUND 1 SHORT-CIRCUIT**: If the user's request is purely conversational (e.g., greetings, simple questions), respond conversationally without `<done/>` or tool tags.\n"
-          "7. **NO PROSE BEFORE TOOLS**: DO NOT write introductory text like 'Let me check the git status' before a tool call. Output the `<tool>` tag as the VERY FIRST token of your response.\n"
-            "8. **SAME-RESPONSE EXECUTION (CRITICAL)**: If you state an intent to perform an action (e.g., 'Let me unlock file X', 'I will now patch Y'), you MUST execute that action's tag (`<unlock_file>`, `<lock_file>`, `<artifact>`, `<tool>`) IN THE SAME RESPONSE. Stating intent and then emitting `<done/>` without the tag is a CRITICAL ERROR. Never split an intent and its execution across two turns.\n"
-            "9. **BATCH CONTEXT OPERATIONS (MANDATORY)**: When locking, unlocking, or hiding multiple files, you MUST use a SINGLE tag containing all files separated by newlines. DO NOT emit multiple sequential tags for batch operations.\n"
+          "\n=== ACTION EXECUTION & SAME-RESPONSE MANDATE (CRITICAL) ===\n"
+          "1. **INTENT ≠ EXECUTION (SAME-RESPONSE EXECUTION MANDATE)**: Stating an intent to perform an action (search, query, read file, create/modify file, execute tool, save skill/memory) in ANY language (English, Arabic, Chinese, French, etc.) DOES NOT execute the action. Conversational text is completely inert.\n"
+          "   - You MUST output the corresponding functional XML tag (`<tool>`, `<artifact>`, `<skill>`, `<unlock_file>`, `<mem_new>`, etc.) IN THE EXACT SAME RESPONSE immediately after stating your intent.\n"
+          "   - **NEVER SPLIT INTENT AND TAGS**: Never announce what you are going to do and then stop without emitting the tag. If you do not emit the tag in the same response, the turn will end with nothing done.\n"
+          "   - **DESTRUCTIVE VS CONSTRUCTIVE ACTIONS**:\n"
+          "     • If an action is destructive, risky, or irreversible (e.g. deleting files, force-pushing git, dropping database tables), explicitly ask the user for confirmation and wait for their reply before emitting destructive tags.\n"
+          "     • For ALL normal, constructive tasks (creating/editing files, querying data, running tools, reading files), output the functional tag IMMEDIATELY in the same turn without asking or waiting.\n"
+          "2. **EXPLICIT TERMINATION WITH `<done/>`**: When all objectives are met and tests pass, end with a `<done/>` tag on a new line.\n"
+          "3. **SAME-SESSION CONTINUATION**: When executing a sequence, emit the next action's tag in your IMMEDIATE NEXT response.\n"
+          "4. **AGENTIC TRIGGER**: If the user requests code generation, file modification, testing, or multi-step work, you MUST enter the agentic loop and use `<tool>` or `<artifact>` tags. Do NOT write code directly in conversational prose.\n"
+          "5. **ROUND 1 SHORT-CIRCUIT**: If the user's request is purely conversational (e.g., greetings, simple questions), respond conversationally without `<done/>` or tool tags.\n"
+          "6. **NO PROSE BEFORE TOOLS**: DO NOT write verbose introductory text before a tool call. Output the `<tool>` tag immediately after any brief 1-line explanation.\n"
+          "7. **BATCH CONTEXT OPERATIONS (MANDATORY)**: When locking, unlocking, or hiding multiple files, you MUST use a SINGLE tag containing all files separated by newlines. DO NOT emit multiple sequential tags for batch operations.\n"
             "   Example:\n"
             "   <lock_file>\n"
             "   file1.py\n"
@@ -6045,15 +6048,7 @@ JSON:"""
 
             # ── 🛡️ ROUND 1 CONVERSATIONAL SHORT-CIRCUIT ──
             if round_count == 1 and not ss.completed_actions and not tool_calls_this_turn and not workspace_changes:
-                unfinished_intent = any(
-                    phrase in raw_round_text.lower() for phrase in (
-                        "into a skill", "draft the skill", "create the skill",
-                        "let me create", "i'll create", "i will create", "now i'll write",
-                        "let me write", "i'll draft", "i will draft", "into an artifact",
-                        "let me check", "let me inspect", "let me search", "i will check", "i'll check"
-                    )
-                )
-                if not unfinished_intent and raw_round_text.strip():
+                if raw_round_text.strip():
                     final_response = re.sub(r'(?i)<done\s*/?>', '', raw_round_text).strip()
                     break
 
@@ -6308,10 +6303,6 @@ JSON:"""
                 virtual_history = self._apply_rolling_artifact_compaction(virtual_history, base_conversation)
 
             # ── 🛡️ ROUND 1 PREAMBLE STALL INTERCEPTOR ──
-            # If the LLM produced text on Round 1 but emitted NO functional tags
-            # and NO <done/>, it wrote a conversational preface and stopped.
-            # We MUST inject a continuation mandate instead of breaking cleanly.
-            # This prevents the agent from terminating before doing any work.
             if (
                 round_count == 1
                 and not ss.was_done_detected()
@@ -6321,42 +6312,8 @@ JSON:"""
                 and stripped_round_text
                 and not text_is_repetitive
             ):
-                unfinished_intent = any(
-                    phrase in stripped_round_text.lower() for phrase in (
-                        "into a skill", "draft the skill", "create the skill",
-                        "let me create", "i'll create", "i will create", "now i'll write",
-                        "let me write", "i'll draft", "i will draft", "into an artifact",
-                        "let me check", "let me inspect", "let me search", "i will check", "i'll check"
-                    )
-                )
-                if not unfinished_intent:
-                    final_response = stripped_round_text
-                    break
-
-                ASCIIColors.warning(f"[{self.name}] Round 1 preamble stall detected (text produced, no actions, no <done/>). Injecting continuation mandate.")
-
-                virtual_history.append(SimpleNamespace(
-                    sender_type="assistant",
-                    content=ss.get_clean_text().strip()
-                ))
-
-                virtual_history.append(SimpleNamespace(
-                    sender_type="user",
-                    content=(
-                        "[SYSTEM: CRITICAL. You wrote a conversational preamble stating your intent "
-                        "(e.g., 'Let me check...' or 'I'll create...') but you STOPPED without executing "
-                        "the actual action. Stating intent DOES NOT execute it.\n\n"
-                        "MANDATORY ACTION: You MUST NOW emit the functional tag to perform the action you just described.\n"
-                        "- If you said you would check skills, emit: <tool>{\"name\": \"tool_list_skills\", \"parameters\": {}}</tool>\n"
-                        "- If you said you would create a skill, emit: <tool>{\"name\": \"tool_create_skill\", \"parameters\": {...}}</tool>\n"
-                        "- If your task is truly complete, output your final answer and end with <done/>.\n\n"
-                        "Do NOT write another preamble. Emit the functional tag NOW.]"
-                    )
-                ))
-                ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
-                if getattr(self, 'debug_mode', False):
-                    ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Round 1 preamble stall intercepted, continuing ===")
-                continue
+                final_response = stripped_round_text
+                break
 
             has_malformed_tag = "<tool" in raw_round_text.lower() or "<art" in raw_round_text.lower()
 

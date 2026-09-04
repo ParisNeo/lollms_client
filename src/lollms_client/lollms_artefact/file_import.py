@@ -933,10 +933,15 @@ class FileImportMixin:
                 supported_exts = {".csv", ".tsv", ".xlsx", ".xls"} # SQLite handled separately or skipped for now in fusion logic
                 csv_xlsx_files = []
 
-                # 1. SCAN PHASE: Find all relevant files and extract schemas
-                for root, _, filenames in os.walk(path):
+                # 1. SCAN PHASE: Find all relevant files and extract schemas (ignoring compilation dirs)
+                from .lollms_artefact import _is_ignored_path
+                for root, dirs, filenames in os.walk(path):
+                    # Filter out ignored directories in-place to prevent descending into them
+                    dirs[:] = [d for d in dirs if not _is_ignored_path(d)]
                     for fname in filenames:
                         f_path = Path(root) / fname
+                        if _is_ignored_path(f_path):
+                            continue
                         if f_path.suffix.lower() in supported_exts:
                             csv_xlsx_files.append(f_path)
 

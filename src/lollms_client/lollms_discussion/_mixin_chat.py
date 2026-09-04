@@ -3762,30 +3762,23 @@ class ChatMixin:
         # Action Execution & Termination Protocol (only if agentic features are enabled)
         if enable_artefacts or active_tools or enable_memory:
             feature_rules += (
-                "\n=== ACTION EXECUTION & TERMINATION PROTOCOL (CRITICAL) ===\n"
-                "1. **INTENT ≠ EXECUTION**: Stating 'I will search...', 'Let me analyze...', or 'I will create...' in conversational text DOES NOT execute the action. "
-                "Conversational declarations are completely inert. You have NO ability to perform actions unless you emit the exact functional XML tags.\n"
-                "2. **MANDATORY TAG EMISSION**: To execute an action, you MUST output the corresponding functional tag (`<tool>`, `<artifact>`, `<note>`, etc.) immediately. "
-                "Do not promise an action in one turn and expect the system to execute it. If you need another round to perform work, you MUST emit the tag that triggers that work.\n"
-                "3. **EXPLICIT TERMINATION**: You are in control of the agentic loop. When you have finished your task and provided your final conversational answer to the user, "
-                "you MUST end your generation with a termination tag on a new line. If you stop generating without emitting a termination tag, the system will assume you have more work to do and will "
-                "force you to continue. If you have no further actions to take, simply write your final response and append a termination tag at the end.\n"
-                "   **SUPPORTED TERMINATION TAGS** (use any of these):\n"
-                "   - `<done/>` (preferred)\n"
-                "   - `<end/>`\n"
-                "   - `</end>`\n"
-                "   **CRITICAL**: The termination tag must be on its own line, with nothing else on that line.\n"
+                "\n=== ACTION EXECUTION & SAME-RESPONSE MANDATE (CRITICAL) ===\n"
+                "1. **INTENT ≠ EXECUTION (SAME-RESPONSE EXECUTION MANDATE)**: Stating 'I will search...', 'Let me analyze...', 'I am now writing...', or any equivalent declaration in ANY language (English, Arabic, Chinese, French, Spanish, etc.) DOES NOT execute the action. Conversational text is completely inert.\n"
+                "   - You MUST emit the corresponding functional XML tag (`<tool>`, `<artifact>`, `<skill>`, `<note>`, `<unlock_file>`, `<generate_image>`, etc.) IN THE EXACT SAME RESPONSE immediately following your brief statement of intent.\n"
+                "   - **NEVER SPLIT INTENT AND TAGS**: Never announce what you are going to do and then stop without emitting the tag. If you state intent without outputting the XML tag in the same response, the turn will end with nothing done.\n"
+                "   - **DESTRUCTIVE VS CONSTRUCTIVE OPERATIONS**:\n"
+                "     • If an action is risky, destructive, or irreversible (e.g. deleting files, force-pushing git branches, dropping database tables), explicitly ask the user for confirmation and wait for their reply before emitting destructive tags.\n"
+                "     • For ALL normal, constructive tasks (creating/editing files, querying data, reading files, searching memories, generating tools), output the functional tag IMMEDIATELY in the same turn without asking or waiting.\n"
+                "2. **MANDATORY TAG EMISSION**: If your response states that you are writing code, searching, or loading files, the functional tag MUST appear in that same response.\n"
+                "3. **EXPLICIT TERMINATION WITH <done/>**: You control the agentic loop. When you have finished all actions, verified all outputs, and formulated your final conversational response, terminate with `<done/>` on a new line.\n"
                 "   **EXAMPLE**:\n"
                 "   ```\n"
-                "   Here is my final answer to your question.\n"
+                "   Here is my complete answer and solution.\n"
                 "   \n"
                 "   <done/>\n"
                 "   ```\n"
-                "4. **SAME-SESSION CONTINUATION (MULTI-TURN CHAINS)**: When you are executing a sequence of actions across multiple turns (e.g., testing tools one by one), "
-                "you MUST emit the next action's tag in your IMMEDIATE NEXT response. Do NOT wait for the user to prompt you again. The system preserves your exact execution path, "
-                "so you have full visibility of the previous tool results. If you state 'Now testing tool_X...', the VERY NEXT token you generate MUST be `<tool>{\"name\": \"tool_X\"...}`.\n"
-                "5. **ROUND 1 SHORT-CIRCUIT**: If the user's request is purely conversational and requires NO tools or artifacts, simply respond conversationally. The system will terminate after the first round. "
-                "Do NOT emit a termination tag if you are not in an agentic loop.\n"
+                "4. **SAME-SESSION CONTINUATION**: In multi-step workflows, emit the next action tag immediately in your next response upon receiving previous tool/action results.\n"
+                "5. **ROUND 1 CONVERSATIONAL SHORT-CIRCUIT**: When the user's request is purely conversational (greeting, simple conceptual explanation) requiring NO tools, files, or actions, respond conversationally without action tags.\n"
             )
 
         # System Notification Handling (only if context unlocking is possible)
@@ -5706,18 +5699,7 @@ class ChatMixin:
                     content=clean_history_text.strip()
                 ))
 
-                # ── 🎯 UNFINISHED INTENT DETECTOR ──
-                last_response_lower = raw_round_text.lower()
-                unfinished_intent = any(
-                    phrase in last_response_lower for phrase in (
-                        "into a skill", "draft the skill", "create the skill", "encode all of this",
-                        "let me create", "i'll create", "i will create", "now i'll write", "now i'll encode",
-                        "let me write", "i'll draft", "i will draft", "into an artifact",
-                        "let me check", "let me inspect", "let me search", "i will check", "i'll check"
-                    )
-                )
-
-                if round_count == 1 and not tool_calls_this_turn and not ss.affected_artefacts and not unfinished_intent and not ss.context_unlock_requested:
+                if round_count == 1 and not tool_calls_this_turn and not ss.affected_artefacts and not ss.context_unlock_requested:
                     ASCIIColors.info("[ChatMixin] Round 1 conversational answer completed. Ending loop.")
                     break
 
@@ -5739,22 +5721,13 @@ class ChatMixin:
                         f"</action_result>"
                     )
                     ss.context_unlock_requested = False
-                elif unfinished_intent:
-                    continuation_prompt = (
-                        "<action_directive status=\"REQUIRED\">\n"
-                        "UNFINISHED INTENT DETECTED: You stated an intent to create a skill or artifact, but stopped before emitting the tag.\n"
-                        "No file has been saved yet.\n"
-                        "MANDATORY: Emit the complete `<skill title=\"...\" description=\"...\" category=\"...\">` or `<artifact name=\"...\">` tag NOW on a new line.\n"
-                        "Do NOT output <done/> until the tag is generated.\n"
-                        "</action_directive>"
-                    )
                 else:
                     continuation_prompt = (
                         "<action_directive status=\"REQUIRED\">\n"
-                        "You stopped generation without emitting an action tag or <done/>.\n"
-                        "• If you have work to perform: emit the next `<skill>`, `<artifact>`, or `<tool>` tag NOW.\n"
-                        "• If your response to the user is complete: provide your final text and end with `<done/>` on a new line.\n"
-                        "Do NOT write introductory preambles without the action tag.\n"
+                        "You stopped generation without emitting an action tag or `<done/>`.\n"
+                        "• If you intended to perform an action (create an artifact, run a tool, unlock files, write a skill): emit the corresponding tag (`<artifact>`, `<tool>`, `<skill>`, etc.) NOW in this response.\n"
+                        "• If your task is fully completed: provide your final response and end with `<done/>` on a new line.\n"
+                        "Stating intent in text without emitting tags produces no action.\n"
                         "</action_directive>"
                     )
 

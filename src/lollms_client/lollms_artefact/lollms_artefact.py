@@ -295,6 +295,36 @@ _KNOWN_EXTENSIONS = {
     ".asc", ".cir", ".net", ".op", ".sp", ".spi", ".sch",
 }
 
+# Directories and extensions to strictly ignore during artifact discovery, indexing, and context injection
+_IGNORED_ARTEFACT_DIRS = {
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    "build", "dist", "site-packages", ".venv", "venv", "env", ".env",
+    ".git", ".idea", ".vscode", "node_modules", ".lollms", ".lollms_code",
+    ".lollms_metadata", ".versions", "versions", "artefacts_metadata",
+    ".hidden_folder"
+}
+
+_IGNORED_ARTEFACT_EXTS = {
+    ".pyc", ".pyo", ".pyd", ".so", ".dll", ".dylib", ".class", ".coverage",
+    ".lam"
+}
+
+
+def _is_ignored_path(path: Union[str, Path]) -> bool:
+    """Returns True if the given file or directory path matches ignored compilation or internal artifacts."""
+    p = Path(path)
+    if p.suffix.lower() in _IGNORED_ARTEFACT_EXTS:
+        return True
+    for part in p.parts:
+        part_lower = part.lower()
+        if part_lower in _IGNORED_ARTEFACT_DIRS:
+            return True
+        if part_lower.startswith(".") and part_lower not in (".", ".."):
+            return True
+        if part_lower.endswith(".egg-info") or part_lower.endswith(".dist-info"):
+            return True
+    return False
+
 
 class ArtefactManager:
     """Manages the lifecycle of typed artefacts inside a LollmsDiscussion."""
@@ -1467,20 +1497,27 @@ class ArtefactManager:
         """Deprecated: Replaced by _cleanup_artefact_files which handles all types generically."""
         self._cleanup_artefact_files(title, version)
 
-    def _sync_index_with_disk(self) -> None:
+    def _sync_index_with_disk(self) -> List[str]:
         """
         Filesystem-as-Source-of-Truth Synchronization.
         Scans the workspace root and purges database records for files that no longer exist on disk.
+        Strictly ignores compilation files (__pycache__, .pyc, .versions).
+        Returns the list of purged artifact titles.
         """
+        purged: List[str] = []
         try:
             ws_root = self._get_workspace_root()
             if not ws_root.exists():
-                return
+                return purged
 
             active_files_on_disk = set()
             for f in ws_root.rglob("*"):
-                if f.is_file() and ".versions" not in f.relative_to(ws_root).parts:
-                    active_files_on_disk.add(str(f.relative_to(ws_root)).replace("\\", "/"))
+                if f.is_file():
+                    rel = f.relative_to(ws_root)
+                    if _is_ignored_path(rel):
+                        continue
+                    active_files_on_disk.add(str(rel).replace("\\", "/"))
+                    active_files_on_disk.add(f.name)
 
             arts = self._get_all_raw()
             orphaned_titles = []
@@ -1499,16 +1536,34 @@ class ArtefactManager:
                     a.get("language"),
                     a.get("file_ext")
                 )
+                safe_fname = sanitize_artifact_filename(a.get("title", ""))
 
-                if filename not in active_files_on_disk:
+                file_on_disk = (
+                    filename in active_files_on_disk
+                    or clean_path in active_files_on_disk
+                    or a.get("title") in active_files_on_disk
+                    or safe_fname in active_files_on_disk
+                    or (ws_root / filename).exists()
+                    or (ws_root / clean_path).exists()
+                    or (ws_root / safe_fname).exists()
+                )
+
+                if not file_on_disk:
                     orphaned_titles.append(a.get("title"))
 
             if orphaned_titles:
-                ASCIIColors.info(f"[ArtefactManager] Disk sync detected {len(orphaned_titles)} orphaned file(s). Purging from database...")
-                for title in orphaned_titles:
+                ASCIIColors.info(f"[ArtefactManager] Disk sync detected {len(orphaned_titles)} deleted file(s). Purging from database: {orphaned_titles}")
+                for title in set(orphaned_titles):
                     self.remove(title)
+                    purged.append(title)
+
+                meta = dict(getattr(self._discussion, 'metadata', {}) or {})
+                if "_token_cache" in meta:
+                    meta["_token_cache"] = {}
+                    self._discussion.metadata = meta
         except Exception as e:
             ASCIIColors.warning(f"[ArtefactManager] Failed to sync index with disk: {e}")
+        return purged
 
     def remove_by_id(self, artefact_id: str) -> bool:
         artefacts = self._get_all_raw()
@@ -1713,9 +1768,9 @@ class ArtefactManager:
             for f in workspace_dir.rglob("*"):
                 if f.is_file():
                     rel_path = f.relative_to(workspace_dir)
-                    rel_str = str(rel_path).replace("\\", "/")
-                    if rel_str.startswith(".versions/"):
+                    if _is_ignored_path(rel_path):
                         continue
+                    rel_str = str(rel_path).replace("\\", "/")
                     try:
                         abs_path = str(f.resolve())
                     except Exception:
@@ -1817,6 +1872,7 @@ class ArtefactManager:
             if a.get("visibility", ArtefactVisibility.HIDDEN) != ArtefactVisibility.HIDDEN 
             and a.get("visibility", ArtefactVisibility.HIDDEN) != ArtefactVisibility.FOLDER_COLLAPSED
             and not a.get("title", "").endswith("::images")
+            and not _is_ignored_path(a.get("physical_path") or a.get("title", ""))
         ]
 
         if not visible_artifacts:

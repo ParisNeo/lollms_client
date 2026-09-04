@@ -7,6 +7,9 @@ from .lollms_artefact import (
     make_image_id,
     parse_image_id,
     sanitize_artifact_filename,
+    _is_ignored_path,
+    _IGNORED_ARTEFACT_DIRS,
+    _IGNORED_ARTEFACT_EXTS,
 )
 from .file_import import FileImportMixin, ALL_IMPORT_MODES, IMPORT_MODE_AS_IS
 from .internet_import import InternetImportMixin
@@ -21,6 +24,9 @@ __all__ = [
     "make_image_id",
     "parse_image_id",
     "sanitize_artifact_filename",
+    "_is_ignored_path",
+    "_IGNORED_ARTEFACT_DIRS",
+    "_IGNORED_ARTEFACT_EXTS",
     "FileImportMixin",
     "ALL_IMPORT_MODES",
     "IMPORT_MODE_AS_IS",

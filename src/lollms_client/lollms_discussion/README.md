@@ -1173,8 +1173,8 @@ This ensures the LLM's context window (the `.lam` schemas and code contents) per
     Safely resolves the absolute path of a file inside the discussion's `workspace_data/` subfolder. If `create_if_missing` is True, it ensures the directory exists before returning the path (preventing `NoneType.mkdir` errors).
 
 *   `discussion.sync_workspace_to_artefacts() -> Dict[str, int]`
-    Synchronizes the physical `workspace_data/` folder with the Artefact database. 
-    Returns a report dictionary: `{"new_artefacts": int, "updated_artefacts": int, "restored_files": int}`.
+    Synchronizes the physical `workspace_data/` folder with the Artefact database using the filesystem as the single source of truth. Purges deleted disk files from the database and ingests new/modified files.
+    Returns a report dictionary: `{"new_artefacts": int, "updated_artefacts": int, "deleted_artefacts": int}`.
 
 
 ### Import Conflict Resolution

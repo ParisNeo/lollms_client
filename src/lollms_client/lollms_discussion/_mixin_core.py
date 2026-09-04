@@ -12,7 +12,14 @@ from typing import TYPE_CHECKING, Any, Dict, Union, Optional
 from sqlalchemy.orm.exc import NoResultFound
 from ascii_colors import ASCIIColors, trace_exception
 
-from lollms_client.lollms_artefact import ArtefactManager, ArtefactType, sanitize_artifact_filename
+from lollms_client.lollms_artefact import (
+    ArtefactManager,
+    ArtefactType,
+    sanitize_artifact_filename,
+    _is_ignored_path,
+    _IGNORED_ARTEFACT_DIRS,
+    _IGNORED_ARTEFACT_EXTS
+)
 from ._message import LollmsMessage
 
 if TYPE_CHECKING:
@@ -90,7 +97,7 @@ class CoreMixin:
                 metadata_dir = parent_dir / "artefacts_metadata"
         metadata_dir.mkdir(parents=True, exist_ok=True)
 
-        object.__setattr__(self, 'workspace_path', str(parent_dir.resolve()))
+        object.__setattr__(self, '_workspace_path_val', str(parent_dir.resolve()))
         object.__setattr__(self, 'workspace_data_path', str(ws_data_dir.resolve()))
         object.__setattr__(self, 'artefacts_metadata_path', str(metadata_dir.resolve()))
 
@@ -239,14 +246,78 @@ class CoreMixin:
             return [LollmsMessage(self, msg) for msg in self._db_discussion.messages]
         return getattr(self._db_discussion, name)
 
+    @property
+    def workspace_path(self) -> Optional[str]:
+        return getattr(self, '_workspace_path_val', None)
+
+    @workspace_path.setter
+    def workspace_path(self, value: Optional[Union[str, Path]]):
+        if value is None:
+            object.__setattr__(self, '_workspace_path_val', None)
+            object.__setattr__(self, 'workspace_data_path', None)
+            object.__setattr__(self, 'artefacts_metadata_path', None)
+            return
+        self.set_workspace_path(value)
+
+    def set_workspace_path(self, new_workspace_path: Union[str, Path]) -> Dict[str, int]:
+        """
+        Manually points the discussion into a new workspace directory at runtime and refreshes the full context.
+
+        1. Re-resolves and establishes paths (workspace_path, workspace_data_path, artefacts_metadata_path).
+        2. Re-anchors ArtefactManager to the new workspace root.
+        3. Clears the cached token breakdown (_token_cache) so context status reflects the new files.
+        4. Performs a full bidirectional synchronization with disk as the single source of truth.
+        5. Touches and commits the discussion state.
+
+        Returns:
+            Dict[str, int]: A report of the synchronization operations.
+        """
+        parent_dir = Path(new_workspace_path).resolve()
+        parent_dir.mkdir(parents=True, exist_ok=True)
+
+        ws_data_dir = parent_dir
+        if not parent_dir.name.lower() == "workspace_data":
+            ws_data_dir = parent_dir / "workspace_data"
+        ws_data_dir.mkdir(parents=True, exist_ok=True)
+
+        metadata_dir = parent_dir
+        if not parent_dir.name.lower() == "artefacts_metadata":
+            if ws_data_dir.parent != parent_dir or parent_dir.name.lower() != "artefacts_metadata":
+                metadata_dir = parent_dir / "artefacts_metadata"
+        metadata_dir.mkdir(parents=True, exist_ok=True)
+
+        object.__setattr__(self, '_workspace_path_val', str(parent_dir))
+        object.__setattr__(self, 'workspace_data_path', str(ws_data_dir))
+        object.__setattr__(self, 'artefacts_metadata_path', str(metadata_dir))
+
+        # Re-anchor ArtefactManager
+        object.__setattr__(self, 'artefacts', ArtefactManager(self))
+
+        # Invalidate cached context telemetry
+        meta = dict(getattr(self, 'metadata', {}) or {})
+        if "_token_cache" in meta:
+            meta["_token_cache"] = {}
+            self.metadata = meta
+
+        # Full context refresh & disk synchronization
+        sync_report = self.sync_workspace_to_artefacts()
+        self.touch()
+        if self._is_db_backed:
+            self.commit()
+
+        ASCIIColors.success(f"[LollmsDiscussion] Workspace repointed to: {parent_dir} (Context refreshed)")
+        return sync_report
+
     def __setattr__(self, name, value):
         internal_attrs = [
             'lollmsClient', 'client', 'db_manager', 'autosave', 'max_context_size', 'scratchpad',
-            'images', 'artefacts',
+            'images', 'artefacts', '_workspace_path_val', 'workspace_data_path', 'artefacts_metadata_path',
             '_session', '_db_discussion', '_message_index', '_messages_to_delete_from_db',
             '_is_db_backed', '_system_prompt',
         ]
-        if name in internal_attrs or '_db_discussion' not in self.__dict__ or self.__dict__['_db_discussion'] is None:
+        if name == 'workspace_path':
+            self.set_workspace_path(value) if value else object.__setattr__(self, '_workspace_path_val', None)
+        elif name in internal_attrs or '_db_discussion' not in self.__dict__ or self.__dict__['_db_discussion'] is None:
             object.__setattr__(self, name, value)
         else:
             if name == 'system_prompt':
@@ -753,70 +824,60 @@ class CoreMixin:
 
     def sync_workspace_to_artefacts(self) -> Dict[str, int]:
         """
-        Performs a comprehensive bidirectional synchronization between the physical 
+        Performs filesystem-as-source-of-truth synchronization between the physical 
         workspace_data directory and the LollmsDiscussion Artefact database.
 
-        1. Workspace -> DB: Scans the folder. Registers new files as artefacts and 
-           updates DB content if the file on disk is newer.
-        2. DB -> Workspace: Ensures all active text-based artefacts in the DB exist 
-           on disk, writing them out if they are missing.
-
-        Use this after executing scripts externally via subprocess.run to guarantee
-        the UI and LLM context accurately reflect all file changes.
+        1. Purge: Deletes database records for any artefacts whose physical files 
+           have been deleted from disk.
+        2. Ingest: Scans the workspace folder, registering new files and updating 
+           existing artefacts whose disk content has changed.
 
         Returns:
             Dict[str, int]: A report containing counts of synced items:
-            {"new_artefacts": int, "updated_artefacts": int, "restored_files": int}
+            {"new_artefacts": int, "updated_artefacts": int, "deleted_artefacts": int}
         """
         from lollms_client.lollms_artefact import ArtefactVisibility
         import os
 
         ws_data_path = getattr(self, 'workspace_data_path', None)
         if not ws_data_path:
-            return {"new_artefacts": 0, "updated_artefacts": 0, "restored_files": 0}
+            return {"new_artefacts": 0, "updated_artefacts": 0, "deleted_artefacts": 0}
 
         workspace_dir = Path(ws_data_path)
         workspace_dir.mkdir(parents=True, exist_ok=True)
 
-        report = {"new_artefacts": 0, "updated_artefacts": 0, "restored_files": 0}
+        report = {"new_artefacts": 0, "updated_artefacts": 0, "deleted_artefacts": 0}
 
-        # --- 1. WORKSPACE -> DB (Upsert) ---
+        # --- 1. DISK AS SOURCE OF TRUTH: PURGE DELETED ARTIFACTS FROM DB ---
+        purged_titles = self.artefacts._sync_index_with_disk()
+        report["deleted_artefacts"] = len(purged_titles)
+
+        # --- 2. WORKSPACE -> DB (Upsert Active Disk Files) ---
         EXPLICIT_BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet", 
                                 ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", 
                                 ".zip", ".tar", ".gz", ".pdf", ".docx"}
-
-        _IGNORED_SYNC_DIRS = {"__pycache__", ".venv", "venv", ".git", ".idea", ".vscode", "node_modules", ".lollms", "build", "dist", ".next", "env", ".env", ".hidden_folder"}
-        _IGNORED_SYNC_EXTS = {".pyc", ".pyo", ".pyd", ".so", ".dll", ".dylib", ".lam"} # Removed .log to allow tool outputs to be ingested
 
         for f_path in workspace_dir.rglob("*"):
             if not f_path.is_file():
                 continue
 
-            # Skip files in ignored directories (e.g., ./__pycache__/file.pyc)
-            # CRITICAL FIX: Check relative parts to robustly catch nested hidden folders
-            rel_parts = f_path.relative_to(workspace_dir).parts
-            if any(part in _IGNORED_SYNC_DIRS for part in rel_parts):
-                continue
-            if any(part.startswith(".") for part in rel_parts[:-1]): # Ignore files inside any hidden directory
+            rel_parts = f_path.relative_to(workspace_dir)
+            if _is_ignored_path(rel_parts):
                 continue
 
             file_name = f_path.name
             file_ext = f_path.suffix.lower()
 
-            # Skip ignored extensions and hidden files
-            if file_ext in _IGNORED_SYNC_EXTS or file_name.startswith("."):
+            if file_name.startswith("."):
                 continue
 
             existing_art = self.artefacts.get(file_name)
-            if existing_art:
-                existing_ext = Path(existing_art.get("title", "")).suffix.lower()
-                if existing_ext in _IGNORED_SYNC_EXTS:
-                    continue
+            if existing_art and _is_ignored_path(existing_art.get("title", "")):
+                continue
 
             file_size = f_path.stat().st_size
-            disk_mtime = f_path.stat().st_mtime
 
-            # Determine type (🛑 FIX: Explicitly map binary types so they don't fall back to document/.md)
+            # Determine artifact type
             atype = "document"
             if file_ext in (".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".sql", ".cir", ".net", ".op"):
                 atype = "code"
@@ -825,11 +886,9 @@ class CoreMixin:
             elif file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
                 atype = "image"
 
-            existing_art = self.artefacts.get(file_name)
-            if not existing_art:
-                existing_art = self.artefacts.get(f_path.stem)
+            existing_art = self.artefacts.get(file_name) or self.artefacts.get(f_path.stem)
 
-            # Check if file is binary to avoid reading it into memory as text
+            # Check if file is binary
             is_binary = file_ext in EXPLICIT_BINARY_EXTS
             if not is_binary:
                 try:
@@ -857,7 +916,6 @@ class CoreMixin:
                     )
                     report["new_artefacts"] += 1
                 else:
-                    db_updated_at = existing_art.get("updated_at", "")
                     if existing_art.get("content", "").find(f"Size**: {file_size:,}") == -1:
                         self.artefacts.update(
                             title=file_name,
@@ -898,42 +956,11 @@ class CoreMixin:
                         )
                         report["updated_artefacts"] += 1
 
-        # --- 2. DB -> WORKSPACE (Heal/Restore) ---
-        active_arts = self.artefacts.list(active_only=True)
-        for art in active_arts:
-            if not art.get("active", False) or art.get("visibility") == ArtefactVisibility.HIDDEN:
-                continue
-
-            title = art.get("title")
-            atype = art.get("type", "document")
-            content = art.get("content", "")
-
-            # Skip image artifacts: we cannot reconstruct the binary file from the text placeholder.
-            # For 'data' artifacts, we skip true binaries (.db, .sqlite, .xlsx) but allow text-based ones (.csv).
-            if atype == "image":
-                continue
-
-            # CRITICAL: Sanitize the title before constructing the file path to prevent
-            # WinError 123 when titles contain invalid filename characters (e.g., URLs like
-            # "https://lollms.com/the-folding/" passed by the host app's internet import).
-            safe_filename = sanitize_artifact_filename(title)
-            file_path = workspace_dir / safe_filename
-            file_ext = file_path.suffix.lower()
-
-            # Determine if this is a true binary data file that we cannot reconstruct from text
-            is_true_binary = atype == "data" and file_ext in (".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet")
-            if is_true_binary:
-                continue
-
-            # For text-based artifacts (code, document, note, skill, and text-data like CSV), restore them to disk
-            # if they are missing. This heals workspaces that lost physical files.
-            if not file_path.exists() and content:
-                try:
-                    file_path.parent.mkdir(parents=True, exist_ok=True)
-                    file_path.write_text(content, encoding="utf-8")
-                    report["restored_files"] += 1
-                except Exception as heal_ex:
-                    ASCIIColors.warning(f"[Sync] Failed to restore artifact '{title}' to disk: {heal_ex}")
+        if report["deleted_artefacts"] > 0 or report["new_artefacts"] > 0 or report["updated_artefacts"] > 0:
+            meta = dict(getattr(self, 'metadata', {}) or {})
+            if "_token_cache" in meta:
+                meta["_token_cache"] = {}
+                self.metadata = meta
 
         self.commit()
         return report
