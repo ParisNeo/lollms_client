@@ -1131,7 +1131,7 @@ class BindingToolsBuilder:
                 if not source_b64:
                     return {"success": False, "error": f"Source image '{image_file_name}' not found in workspace."}
 
-                img_bytes = tti_binding.edit_image(image=source_b64, prompt=prompt)
+                img_bytes = tti_binding.edit_image(images=source_b64, prompt=prompt)
                 if not img_bytes:
                     return {"success": False, "error": "Image edit returned no data."}
 
