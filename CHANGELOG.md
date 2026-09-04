@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-04 16:41]
+
+- fix(tti): simplify SSL verification and restrict forwarded kwargs
+
 ## [2026-09-04 13:07]
 
 - fix(chat): resolve issue in chat mixin

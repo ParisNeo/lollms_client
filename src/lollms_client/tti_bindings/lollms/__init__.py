@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Union
 from lollms_client.lollms_tti_binding import LollmsTTIBinding, TTIGenerationResult
 import os
-import ssl
 from ascii_colors import trace_exception, ASCIIColors
 
 BindingName = "LollmsTTIBinding"
@@ -36,16 +35,12 @@ class LollmsTTIBinding(LollmsTTIBinding):
             self.service_key = os.getenv("LOLLMS_API_KEY")
 
         if not self.verify_ssl_certificate:
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-            self.verify = ssl_context
+            self.verify = False
         elif self.certificate_file_path:
             cert_path = Path(self.certificate_file_path)
             if not cert_path.exists():
                 raise FileNotFoundError(f"Certificate file not found: {cert_path}")
-            ssl_context = ssl.create_default_context(cafile=str(cert_path))
-            self.verify = ssl_context
+            self.verify = str(cert_path)
         else:
             self.verify = self.verify_ssl_certificate
 
@@ -109,22 +104,36 @@ class LollmsTTIBinding(LollmsTTIBinding):
         url = f"{self.open_ai_host_address}/images/generations"
         headers = self._headers()
 
-        size = f"{width}x{height}"
+        if "size" in kwargs and isinstance(kwargs["size"], str):
+            size_str = kwargs.pop("size")
+            if "x" in size_str:
+                try:
+                    w_str, h_str = size_str.split("x", 1)
+                    width = int(w_str)
+                    height = int(h_str)
+                except ValueError:
+                    pass
+        else:
+            size_str = f"{width}x{height}"
 
         payload: Dict[str, Any] = {
             "prompt": prompt,
-            "model": self.model_name,
-            "size": size,
+            "size": size_str,
             "response_format": "b64_json",
         }
+
+        if self.model_name and "/" in str(self.model_name):
+            payload["model"] = self.model_name
+
         if negative_prompt:
             payload["negative_prompt"] = negative_prompt
 
+        _FORWARDABLE_KWARGS = {
+            "quality", "style", "n", "seed", "num_inference_steps",
+            "guidance_scale", "negative_prompt",
+        }
         for k, v in kwargs.items():
-            if k not in payload and v is not None and k not in (
-                "watermark_path", "watermark_size_x", "watermark_size_y",
-                "watermark_pos_x", "watermark_pos_y", "author", "system", "metadata",
-            ):
+            if k in _FORWARDABLE_KWARGS and v is not None and k not in payload:
                 payload[k] = v
 
         response = requests.post(url, json=payload, headers=headers, timeout=300, verify=self.verify)
@@ -186,7 +195,7 @@ class LollmsTTIBinding(LollmsTTIBinding):
         }
         if negative_prompt:
             data["negative_prompt"] = negative_prompt
-        if self.model_name:
+        if self.model_name and "/" in str(self.model_name):
             data["model"] = self.model_name
 
         response = requests.post(url, files=files, data=data, headers=headers, timeout=300, verify=self.verify)
