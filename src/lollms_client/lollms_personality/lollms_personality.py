@@ -1832,7 +1832,7 @@ class LollmsPersonality:
             ASCIIColors.warning(f"[{self.name}] Failed to save history to disk: {e}")
 
     def load_history_from_disk(self, history_file: Path) -> None:
-        """Loads the internal conversation history from a JSON file."""
+        """Loads the internal conversation history from a JSON file, validating message schemas."""
         if not history_file or not history_file.exists():
             self._conversation = []
             return
@@ -1840,7 +1840,14 @@ class LollmsPersonality:
             import json as _json
             data = _json.loads(history_file.read_text(encoding="utf-8"))
             if isinstance(data, list):
-                self._conversation = data
+                valid_msgs = []
+                for item in data:
+                    if isinstance(item, dict) and "role" in item and "content" in item:
+                        valid_msgs.append({
+                            "role": str(item["role"]),
+                            "content": str(item["content"])
+                        })
+                self._conversation = valid_msgs
             else:
                 self._conversation = []
         except Exception as e:
@@ -2634,26 +2641,24 @@ class LollmsPersonality:
         recent_ctx = f" Recent actions executed: {recent_tools}." if recent_tools else ""
         if stall_count <= 1:
             return (
-                f"[SYSTEM: You stopped generation without emitting a <done/> tag.{recent_ctx}\n"
-                "CRITICAL: Do NOT assume any action succeeded unless you see its result in the conversation history above.\n"
-                "If your previous response stated an intent to perform an action (e.g., 'I will commit', 'I will create a branch'), "
-                "you MUST execute that action's tag NOW. Stating intent and then emitting `<done/>` without executing is a CRITICAL ERROR.\n"
-                "If your task is truly complete, output a final conversational summary and end it with a <done/> tag on a new line. "
-                "If you need to continue working, emit the next functional tag now.]"
+                f"[SYSTEM DIRECTIVE: You wrote conversational text without executing an action tag or emitting `<done/>`.{recent_ctx}\n"
+                "Conversational declarations and apologies DO NOT execute tools or create files.\n"
+                "MANDATORY: Output the functional XML tag (`<tool>`, `<generate_image>`, `<artifact>`, `<unlock_file>`) as the FIRST token of your reply NOW.\n"
+                "- If generating an image: `<generate_image>prompt</generate_image>` or `<tool>{\"name\": \"tool_generate_image\", \"parameters\": {\"prompt\": \"...\"}}</tool>`\n"
+                "- If running tests/commands: `<tool>{\"name\": \"tool_execute_shell_command\", \"parameters\": {\"command\": \"...\"}}</tool>`\n"
+                "- If modifying code: `<artifact name=\"file.py\">...</artifact>`\n"
+                "DO NOT apologize. DO NOT write another introductory sentence. Output the XML tag NOW.]"
             )
         elif stall_count == 2:
             return (
-                f"[SYSTEM: You have stopped without <done/> or any new action for 2 consecutive rounds.{recent_ctx}\n"
-                "This is wasting context. You MUST either:\n"
-                "1. Emit the next <tool> or <artifact> tag to continue your task, OR\n"
-                "2. Write your final response and emit <done/> to terminate.\n"
-                "Do NOT produce another preamble without following through.]"
+                f"[SYSTEM: ACTION REQUIRED — You have produced conversational text without action tags or `<done/>` for 2 consecutive turns.{recent_ctx}\n"
+                "You MUST output the functional tag (`<generate_image>`, `<tool>`, `<artifact>`) IMMEDIATELY as your first token, or output `<done/>` to terminate.\n"
+                "Do NOT output conversational apologies or introductory preambles.]"
             )
         else:
             return (
-                f"[SYSTEM: CRITICAL — You have stalled {stall_count} times without producing output or <done/>.\n"
-                "You are wasting tokens and context. You MUST emit <done/> NOW on a new line.\n"
-                "Write a brief summary of the current situation and immediately emit <done/>.]"
+                f"[SYSTEM: CRITICAL — You have stalled {stall_count} times without producing an action tag or `<done/>`.\n"
+                "Emit `<done/>` on a new line NOW to terminate the turn.]"
             )
 
     # ------------------------------------------------------------------ Independent Agentic Chat
@@ -5902,6 +5907,27 @@ JSON:"""
                                     else: streaming_callback(f'<status>failure</status>\n<error>{res_msg}</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                                 continue
 
+                            if tag_name in ("generate_image", "edit_image"):
+                                prompt_match = re.search(r'prompt\s*=\s*["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
+                                body_match = re.search(r'<(?:generate_image|edit_image)[^>]*>(.*?)</(?:generate_image|edit_image)>', raw_xml, re.DOTALL | re.IGNORECASE)
+                                img_prompt = prompt_match.group(1) if prompt_match else (body_match.group(1).strip() if body_match else "")
+                                img_file_match = re.search(r'name\s*=\s*["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
+                                img_file = img_file_match.group(1) if img_file_match else ""
+
+                                tti_tool_def = active_tools.get("tool_generate_image") if tag_name == "generate_image" else active_tools.get("tool_edit_image")
+                                if tti_tool_def and "callable" in tti_tool_def:
+                                    if tag_name == "generate_image":
+                                        img_res = tti_tool_def["callable"](prompt=img_prompt)
+                                    else:
+                                        img_res = tti_tool_def["callable"](prompt=img_prompt, image_file_name=img_file)
+                                    out_msg = img_res.get("output") or img_res.get("error") or "Image processed."
+                                    action_reports.append(f"🎨 Image Generation: {out_msg}")
+                                    actions_executed_count += 1
+                                    continue
+                                else:
+                                    action_reports.append(f"❌ TTI (Image Generation) binding is not available in current configuration.")
+                                    continue
+
                             if tag_name in ("mem_new", "mem_update"):
                                 if not self.memory_manager:
                                     err_msg = "Memory manager not initialized."
@@ -5911,30 +5937,37 @@ JSON:"""
                                     if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
                                         streaming_callback(f'<status>failure</status>\n<error>{err_msg}</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                                     continue
-                                    if tag_name == "mem_new":
-                                        content_match = re.search(r'content\s*=\s*["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
-                                        tags_match = re.search(r'tags\s*=\s*["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
-                                        level_match = re.search(r'level\s*=\s*["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
-                                        body_match = re.search(r'<mem_new[^>]*>(.*?)</mem_new>', raw_xml, re.DOTALL | re.IGNORECASE)
-                                        mem_content = content_match.group(1) if content_match else (body_match.group(1).strip() if body_match else "")
-                                        mem_tags = tags_match.group(1).split(",") if tags_match else []
-                                        mem_level = int(level_match.group(1)) if level_match else 2
+
+                                if tag_name == "mem_new":
+                                    content_match = re.search(r'content\s*=\s*["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
+                                    tags_match = re.search(r'tags\s*=\s*["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
+                                    level_match = re.search(r'level\s*=\s*["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
+                                    body_match = re.search(r'<mem_new[^>]*>(.*?)</mem_new>', raw_xml, re.DOTALL | re.IGNORECASE)
+                                    mem_content = content_match.group(1) if content_match else (body_match.group(1).strip() if body_match else "")
+                                    mem_tags = tags_match.group(1).split(",") if tags_match else []
+                                    mem_level = int(level_match.group(1)) if level_match else 2
+                                    if mem_content:
                                         self.memory_manager.add(content=mem_content, tags=mem_tags, importance=0.9, level=mem_level)
                                         res_msg = f"✅ Memory saved successfully: {mem_content[:50]}..."
-                                        action_reports.append(res_msg)
-                                        actions_executed_count += 1
-                                        if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
-                                            streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "success", "error": None})
-                                        if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
-                                            streaming_callback(f'<status>success</status>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                    else:
+                                        res_msg = "⚠️ Memory tag received with empty content."
+                                    action_reports.append(res_msg)
+                                    actions_executed_count += 1
+                                    if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                        streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "success", "error": None})
+                                    if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
+                                        streaming_callback(f'<status>success</status>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                                 elif tag_name == "mem_update":
                                     id_match = re.search(r'id\s*=\s*["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
                                     content_match = re.search(r'content\s*=\s*["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
                                     body_match = re.search(r'<mem_update[^>]*>(.*?)</mem_update>', raw_xml, re.DOTALL | re.IGNORECASE)
                                     mem_id = id_match.group(1) if id_match else ""
                                     mem_content = content_match.group(1) if content_match else (body_match.group(1).strip() if body_match else "")
-                                    self.memory_manager.update(memory_id=mem_id, content=mem_content)
-                                    res_msg = f"✅ Memory updated successfully: {mem_id}"
+                                    if mem_id and mem_content:
+                                        self.memory_manager.update(memory_id=mem_id, content=mem_content)
+                                        res_msg = f"✅ Memory updated successfully: {mem_id}"
+                                    else:
+                                        res_msg = "⚠️ Memory update received with missing id or content."
                                     action_reports.append(res_msg)
                                     actions_executed_count += 1
                                     if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
@@ -6047,8 +6080,10 @@ JSON:"""
             raw_round_text = ss.get_clean_text()
 
             # ── 🛡️ ROUND 1 CONVERSATIONAL SHORT-CIRCUIT ──
+            # Only terminate on Round 1 if <done/> was explicitly emitted by the model,
+            # signaling that the conversational answer is intentionally complete.
             if round_count == 1 and not ss.completed_actions and not tool_calls_this_turn and not workspace_changes:
-                if raw_round_text.strip():
+                if ss.was_done_detected() and raw_round_text.strip():
                     final_response = re.sub(r'(?i)<done\s*/?>', '', raw_round_text).strip()
                     break
 
@@ -6303,6 +6338,9 @@ JSON:"""
                 virtual_history = self._apply_rolling_artifact_compaction(virtual_history, base_conversation)
 
             # ── 🛡️ ROUND 1 PREAMBLE STALL INTERCEPTOR ──
+            # If the model emitted conversational prose (e.g., "I'll generate an image...")
+            # but stopped without emitting <done/> and without calling any tools/actions,
+            # we MUST inject a continuation prompt to execute the required action tag.
             if (
                 round_count == 1
                 and not ss.was_done_detected()
@@ -6312,8 +6350,25 @@ JSON:"""
                 and stripped_round_text
                 and not text_is_repetitive
             ):
-                final_response = stripped_round_text
-                break
+                ASCIIColors.info(f"[{self.name}] Round 1 response without `<done/>` or action tag. Forcing action continuation.")
+                virtual_history.append(SimpleNamespace(
+                    sender_type="assistant",
+                    content=ss.get_clean_text().strip()
+                ))
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content=(
+                        "[SYSTEM DIRECTIVE: You stated an intent to perform an action or stopped without `<done/>`.\n"
+                        "Conversational text DOES NOT execute actions. You MUST emit the functional XML tag as the FIRST token of your reply:\n"
+                        "- To generate an image: `<generate_image>detailed prompt</generate_image>` or `<tool>{\"name\": \"tool_generate_image\", \"parameters\": {\"prompt\": \"...\"}}</tool>`\n"
+                        "- To create/edit code: `<artifact name=\"filename.ext\" type=\"code\">content</artifact>`\n"
+                        "- To read files: `<unlock_file>filename</unlock_file>`\n"
+                        "- To run commands: `<tool>{\"name\": \"tool_execute_shell_command\", \"parameters\": {\"command\": \"...\"}}</tool>`\n"
+                        "DO NOT apologize. DO NOT write another introductory sentence. Output the XML tag NOW.]"
+                    )
+                ))
+                ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
+                continue
 
             has_malformed_tag = "<tool" in raw_round_text.lower() or "<art" in raw_round_text.lower()
 

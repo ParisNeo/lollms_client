@@ -1,20 +1,22 @@
 title: "LoLLMS TTI Server"
 author: "ParisNeo"
-version: 1.0.0
+version: 2.0.0
 binding_name: "lollms"
 description: |
   OpenAI-compatible Text-to-Image client that connects to a LoLLMS TTI Server or any OpenAI-compatible TTI API.
+  Supports image generation, image editing (multipart and JSON), watermarking, and metadata embedding.
+  Also provides access to LoLLMS-specific endpoints for capabilities, per-binding model listing, and native image editing.
 
 global_input_parameters:
   - name: "host_address"
     type: "str"
-    description: "The base URL of the LoLLMS TTI Server or OpenAI-compatible TTI service (e.g. 'http://localhost:7860/v1')."
+    description: "The base URL of the LoLLMS TTI Server or OpenAI-compatible TTI service (e.g. 'http://localhost:9642')."
     mandatory: false
-    default: "http://localhost:9642/v1"
+    default: "http://localhost:9642"
 
   - name: "service_key"
     type: "str"
-    description: "Bearer token used to authenticate requests to the server's endpoints. Leave empty if no authentication is required."
+    description: "Bearer token used to authenticate requests to the server's endpoints. Leave empty if no authentication is required. Can also be set via the LOLLMS_API_KEY environment variable."
     mandatory: false
     is_secret: true
     default: ""
@@ -24,7 +26,7 @@ global_input_parameters:
     description: "Whether to verify the SSL certificate of the server. Defaults to true."
     mandatory: false
     default: true
-    
+
   - name: certificate_file_path
     type: str
     description: "Path to a specific SSL certificate file (.pem, .crt) for verifying the server identity. Useful for self-signed certificates."

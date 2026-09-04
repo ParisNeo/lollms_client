@@ -56,27 +56,52 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
     return data
 
 def _serialize_config_map_to_yaml(config_map: Dict[str, str]) -> Dict[str, Any]:
-    """Reconstructs a hierarchical dictionary from flattened env-style keys."""
-    yaml_data = {}
+    """
+    Reconstructs a structured dictionary adhering to the Two-Tier profile schema:
+    <modality>:
+      bindings:
+        <alias>:
+          <param_name>: <value>
+      profiles:
+        <alias>:
+          <param_name>: <value>
+    Preserves multi-word parameter names (e.g., service_key, binding_name, host_address).
+    """
+    yaml_data: Dict[str, Any] = {}
+
+    def _convert_scalar(v: str) -> Any:
+        if v.lower() in ("true", "false"):
+            return v.lower() == "true"
+        try:
+            return int(v)
+        except ValueError:
+            try:
+                return float(v)
+            except ValueError:
+                return v
+
     for k, v in config_map.items():
-        parts = k.lower().split("_")
-        current = yaml_data
-        for i, part in enumerate(parts):
-            if i == len(parts) - 1:
-                if v.lower() in ("true", "false"):
-                    current[part] = v.lower() == "true"
-                else:
-                    try:
-                        current[part] = int(v)
-                    except ValueError:
-                        try:
-                            current[part] = float(v)
-                        except ValueError:
-                            current[part] = v
-            else:
-                if part not in current or not isinstance(current[part], dict):
-                    current[part] = {}
-                current = current[part]
+        if not v:
+            continue
+
+        k_upper = k.upper()
+        parts = k_upper.split("_")
+
+        # Two-Tier Key: <MODALITY>_<CATEGORY>_<ALIAS>_<PARAM_NAME...>
+        if len(parts) >= 4 and parts[1] in ("BINDINGS", "PROFILES"):
+            modality = parts[0].lower()
+            category = parts[1].lower()
+            alias = parts[2].lower()
+            param_name = "_".join(parts[3:]).lower()
+
+            yaml_data.setdefault(modality, {}).setdefault(category, {}).setdefault(alias, {})[param_name] = _convert_scalar(v)
+        elif len(parts) >= 2:
+            modality = parts[0].lower()
+            param_name = "_".join(parts[1:]).lower()
+            yaml_data.setdefault(modality, {})[param_name] = _convert_scalar(v)
+        else:
+            yaml_data[k.lower()] = _convert_scalar(v)
+
     return yaml_data
 
 def load_json_file(file_path: Path) -> Dict[str, Any]:
@@ -499,9 +524,17 @@ def _configure_binding_instance(b_type: str, b_name: str, alias: str, config_map
             val = _prompt_param(pname, p.get("description", ""), p.get("type", "str"), p.get("mandatory", False), p.get("default"))
             config_map[prefix + pname.upper()] = _format_env_value(val)
     else:
-        ASCIIColors.yellow("\n  No description.yaml found. Using basic configuration.\n")
-        val = _prompt_param("host_address", "The host address of the server", "str", False, "http://localhost:8000")
-        config_map[prefix + "HOST_ADDRESS"] = _format_env_value(val)
+        ASCIIColors.yellow("\n  No description.yaml found. Using standard server configuration.\n")
+        default_host = "http://localhost:9642" if b_type in ("tti", "tts", "stt") else "http://localhost:8000"
+        host_val = _prompt_param("host_address", f"The host address of the {b_type.upper()} server", "str", False, default_host)
+        config_map[prefix + "HOST_ADDRESS"] = _format_env_value(host_val)
+
+        key_val = _prompt_param("service_key", f"API / Service Key for the {b_type.upper()} server (leave blank if none)", "str", False, "")
+        if key_val:
+            config_map[prefix + "SERVICE_KEY"] = _format_env_value(key_val)
+
+        ssl_val = _prompt_param("verify_ssl_certificate", "Verify SSL certificate", "bool", False, False)
+        config_map[prefix + "VERIFY_SSL_CERTIFICATE"] = _format_env_value(ssl_val)
 
 def _add_binding_flow(b_type: str, config_map: Dict[str, str]):
     bindings = _list_bindings_by_type(b_type)

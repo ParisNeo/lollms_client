@@ -52,20 +52,29 @@ APP_NAME = "lollms_code"
 APP_VERSION = "2.0.0"
 APP_CONFIG_DIR = Path.home() / ".lollms_client" / "lollms_code"
 APP_CONFIG_FILE = APP_CONFIG_DIR / "config.json"
-APP_HISTORY_FILE = APP_CONFIG_DIR / "history.json"
 APP_USER_PROFILE_FILE = Path.home() / ".lollms_client" / "user_profile.md"
 APP_DEFAULT_WORKSPACE = Path.cwd()
 APP_DEFAULT_SKILLS_DIR = APP_CONFIG_DIR / "skills"
 APP_DEFAULT_MEMORY_DB = APP_CONFIG_DIR / "memory.db"
 APP_DEFAULT_HANDSAG_DIR = APP_CONFIG_DIR / "handbags"
 
+def get_workspace_sandbox_dir(workspace_path: str | Path) -> Path:
+    return Path(workspace_path).resolve() / ".lollms_code"
+
+def get_workspace_conversation_file(workspace_path: str | Path) -> Path:
+    return get_workspace_sandbox_dir(workspace_path) / "conversation_history.json"
+
+def get_workspace_prompt_history_file(workspace_path: str | Path) -> Path:
+    return get_workspace_sandbox_dir(workspace_path) / "prompt_history.json"
+
 TTI_CAPABILITY_PROMPT = """
 === IMAGE GENERATION CAPABILITY (ACTIVE) ===
 You have access to a Text-to-Image (TTI) binding. You CAN generate images.
-Use the `tool_generate_image` tool to create images from text prompts.
-Use the `tool_edit_image` tool to modify existing images in the workspace.
-Generated images are saved to the workspace automatically.
-When a user asks you to generate, draw, create, or make an image, you MUST use `tool_generate_image`.
+When a user asks you to generate, draw, create, or make an image, you MUST emit the `tool_generate_image` tool call in the VERY SAME RESPONSE:
+<tool>{"name": "tool_generate_image", "parameters": {"prompt": "detailed prompt describing image"}}</tool>
+Or using XML tag:
+<generate_image>detailed English prompt describing the image</generate_image>
+NEVER write 'I will generate an image...' and stop without emitting the tool tag!
 === END IMAGE GENERATION CAPABILITY ===
 """
 
@@ -88,11 +97,10 @@ For every task, follow this structured pipeline:
   - Example: "The database layer uses SQLAlchemy with a repository pattern." -> `<mem_new content="Project uses SQLAlchemy repository pattern for DB access" tags="architecture,database" />`
   - Do NOT save trivial code snippets. Save rules, patterns, and structural facts.
 
-### Phase 2: PLANNING
-- Before writing ANY code, state your plan in 3-5 bullet points.
-- Identify which files need to be created, modified, or deleted.
-- Identify potential risks or edge cases.
-- Use the `<scratchpad_append>` tag to save your active task plan and intermediate state. This ensures you can recover your train of thought if the context is compacted.
+### Phase 2: PLANNING & DIRECT ACTION
+- For complex multi-file coding tasks: Briefly state your plan in 2-3 bullet points AND emit the first action tag (`<unlock_file>`, `<artifact>`, or `<tool>`) in the SAME response.
+- For direct commands (e.g., generating images, running a command, querying data): Do NOT write multi-step plans. Emit the `<tool>` or `<generate_image>` tag immediately.
+- Never write a plan and stop without outputting the action tag.
 
 ### Phase 3: IMPLEMENTATION
 - Use `<artifact>` tags to create or overwrite files.
@@ -401,7 +409,7 @@ class PersistentHistory:
             try:
                 data = json.loads(self.history_file.read_text(encoding="utf-8"))
                 if isinstance(data, list):
-                    self.entries = data
+                    self.entries = [str(x) for x in data if isinstance(x, (str, int, float))]
             except Exception:
                 self.entries = []
 
@@ -725,74 +733,71 @@ class CodeAgentConfig:
 
 def _resolve_modality_from_env(modality: str) -> Optional[Dict[str, Any]]:
     """
-    Resolves a modality (tti, tts, stt, etc.) binding+profile from the
-    ~/.lollms-client/.env file (GUI wizard format) AND the legacy
-    ~/.lollms_client/config.yaml file (CLI wizard format).
-    Returns a dict with binding_name, model_name, host_address, api_key, verify_ssl
-    or None if not configured.
+    Resolves a modality (tti, tts, stt, etc.) binding+profile from:
+    1. ~/.lollms-client/.env
+    2. ~/.lollms_client/.env
+    3. ~/.lollms_client/config.yaml
+    Accepts keys configured under either the Binding or Profile layer.
     """
     prefix = modality.upper()
 
-    # ── TIER 1: Read from ~/.lollms-client/.env (GUI wizard format) ──
-    env_file = Path.home() / ".lollms-client" / ".env"
-    if env_file.exists():
-        env_map: Dict[str, str] = {}
-        try:
-            for line in env_file.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    env_map[k.strip()] = v.strip().strip("'\"")
-        except Exception:
-            pass
+    env_map: Dict[str, str] = {}
+    for env_path in [
+        Path.home() / ".lollms-client" / ".env",
+        Path.home() / ".lollms_client" / ".env"
+    ]:
+        if env_path.exists():
+            try:
+                for line in env_path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        env_map[k.strip()] = v.strip().strip("'\"")
+            except Exception:
+                pass
 
-        default_alias = None
-        for k, v in env_map.items():
-            if k.startswith(f"{prefix}_PROFILES_") and k.endswith("_IS_DEFAULT") and v.lower() in ("true", "1", "yes"):
-                default_alias = k[len(f"{prefix}_PROFILES_"):-len("_IS_DEFAULT")]
-                break
-
-        if not default_alias:
-            profile_aliases = [k[len(f"{prefix}_PROFILES_"):-len("_BINDING_ALIAS")] for k in env_map if k.startswith(f"{prefix}_PROFILES_") and k.endswith("_BINDING_ALIAS")]
-            if profile_aliases:
-                default_alias = profile_aliases[0]
-
-        if default_alias:
-            binding_alias = env_map.get(f"{prefix}_PROFILES_{default_alias}_BINDING_ALIAS", default_alias)
-            binding_name = env_map.get(f"{prefix}_BINDINGS_{binding_alias}_BINDING_NAME")
-            if binding_name:
-                return {
-                    "binding_name": binding_name,
-                    "model_name": env_map.get(f"{prefix}_PROFILES_{default_alias}_MODEL_NAME", ""),
-                    "host_address": env_map.get(f"{prefix}_BINDINGS_{binding_alias}_HOST_ADDRESS", "http://localhost:9642"),
-                    "api_key": env_map.get(f"{prefix}_BINDINGS_{binding_alias}_SERVICE_KEY", ""),
-                    "verify_ssl": env_map.get(f"{prefix}_BINDINGS_{binding_alias}_VERIFY_SSL_CERTIFICATE", "false").lower() in ("true", "1", "yes"),
-                }
-
-    # ── TIER 2: Read from ~/.lollms_client/config.yaml (legacy CLI format) ──
     config_obj = CodeAgentConfig()
-    env_data = config_obj._read_yaml_config()
-    if config_obj._has_modality_configured(env_data, modality):
-        binding_alias = None
-        for k, v in env_data.items():
-            if k.startswith(f"{prefix}_PROFILES_") and k.endswith("_IS_DEFAULT") and v.lower() in ("true", "1", "yes"):
-                binding_alias = k[len(f"{prefix}_PROFILES_"):-len("_IS_DEFAULT")]
-                break
-        if not binding_alias:
-            aliases = [k[len(f"{prefix}_PROFILES_"):-len("_BINDING_ALIAS")] for k, v in env_data.items() if k.startswith(f"{prefix}_PROFILES_") and k.endswith("_BINDING_ALIAS")]
-            if aliases:
-                binding_alias = aliases[0]
+    env_map.update(config_obj._read_yaml_config())
 
-        if binding_alias:
-            binding_name = env_data.get(f"{prefix}_BINDINGS_{binding_alias}_BINDING_NAME")
-            if binding_name:
-                return {
-                    "binding_name": binding_name,
-                    "model_name": env_data.get(f"{prefix}_PROFILES_{binding_alias}_MODEL_NAME", ""),
-                    "host_address": env_data.get(f"{prefix}_BINDINGS_{binding_alias}_HOST_ADDRESS", "http://localhost:9642"),
-                    "api_key": env_data.get(f"{prefix}_BINDINGS_{binding_alias}_SERVICE_KEY", ""),
-                    "verify_ssl": env_data.get(f"{prefix}_BINDINGS_{binding_alias}_VERIFY_SSL_CERTIFICATE", "false").lower() in ("true", "1", "yes"),
-                }
+    default_alias = None
+    for k, v in env_map.items():
+        if k.startswith(f"{prefix}_PROFILES_") and k.endswith("_IS_DEFAULT") and v.lower() in ("true", "1", "yes"):
+            default_alias = k[len(f"{prefix}_PROFILES_"):-len("_IS_DEFAULT")]
+            break
+
+    if not default_alias:
+        profile_aliases = [k[len(f"{prefix}_PROFILES_"):-len("_BINDING_ALIAS")] for k in env_map if k.startswith(f"{prefix}_PROFILES_") and k.endswith("_BINDING_ALIAS")]
+        if profile_aliases:
+            default_alias = profile_aliases[0]
+
+    if default_alias:
+        binding_alias = env_map.get(f"{prefix}_PROFILES_{default_alias}_BINDING_ALIAS", default_alias)
+        binding_name = env_map.get(f"{prefix}_BINDINGS_{binding_alias}_BINDING_NAME") or env_map.get(f"{prefix}_PROFILES_{default_alias}_BINDING_NAME")
+        if binding_name:
+            service_key = (
+                env_map.get(f"{prefix}_BINDINGS_{binding_alias}_SERVICE_KEY")
+                or env_map.get(f"{prefix}_BINDINGS_{binding_alias}_API_KEY")
+                or env_map.get(f"{prefix}_PROFILES_{default_alias}_SERVICE_KEY")
+                or env_map.get(f"{prefix}_PROFILES_{default_alias}_API_KEY")
+                or env_map.get(f"{prefix}_SERVICE_KEY")
+                or env_map.get(f"{prefix}_API_KEY")
+                or ""
+            )
+
+            host_addr = (
+                env_map.get(f"{prefix}_BINDINGS_{binding_alias}_HOST_ADDRESS")
+                or env_map.get(f"{prefix}_PROFILES_{default_alias}_HOST_ADDRESS")
+                or env_map.get(f"{prefix}_HOST_ADDRESS")
+                or "http://localhost:9642"
+            )
+
+            return {
+                "binding_name": binding_name,
+                "model_name": env_map.get(f"{prefix}_PROFILES_{default_alias}_MODEL_NAME", ""),
+                "host_address": host_addr,
+                "api_key": service_key,
+                "verify_ssl": env_map.get(f"{prefix}_BINDINGS_{binding_alias}_VERIFY_SSL_CERTIFICATE", "false").lower() in ("true", "1", "yes"),
+            }
 
     return None
 
@@ -801,13 +806,12 @@ def _resolve_modality_from_config(config: CodeAgentConfig, modality: str) -> Opt
     """
     Resolves a modality (tti, tts, stt, etc.) binding+profile from the already-loaded
     CodeAgentConfig two-tier profile registries.
-    Returns a dict with binding_name, model_name, host_address, api_key, verify_ssl
-    or None if not configured.
+    Accepts keys configured under either the Binding or Profile layer.
     """
     binding_profiles = getattr(config, f"{modality}_binding_profiles", {})
     model_profiles = getattr(config, f"{modality}_model_profiles", {})
 
-    if not binding_profiles or not model_profiles:
+    if not binding_profiles and not model_profiles:
         return None
 
     default_model_alias = None
@@ -819,28 +823,40 @@ def _resolve_modality_from_config(config: CodeAgentConfig, modality: str) -> Opt
     if not default_model_alias:
         default_model_alias = next(iter(model_profiles), None)
 
-    if not default_model_alias:
-        return None
+    model_profile = model_profiles.get(default_model_alias, {}) if default_model_alias else {}
+    binding_alias = model_profile.get("binding_profile_name") or model_profile.get("binding_alias") or default_model_alias or "master"
 
-    model_profile = model_profiles[default_model_alias]
-    binding_alias = model_profile.get("binding_profile_name") or model_profile.get("binding_alias")
-
-    if not binding_alias or binding_alias not in binding_profiles:
-        return None
-
-    binding_profile = binding_profiles[binding_alias]
-    binding_name = binding_profile.get("binding_name")
+    binding_profile = binding_profiles.get(binding_alias, {})
+    binding_name = binding_profile.get("binding_name") or model_profile.get("binding_name")
     if not binding_name:
         return None
 
-    binding_config = binding_profile.get("binding_config", {})
+    b_cfg = binding_profile.get("binding_config", {})
+    m_cfg = model_profile.get("binding_config", {})
+
+    service_key = (
+        b_cfg.get("service_key")
+        or b_cfg.get("api_key")
+        or m_cfg.get("service_key")
+        or m_cfg.get("api_key")
+        or model_profile.get("service_key")
+        or model_profile.get("api_key")
+        or ""
+    )
+
+    host_address = (
+        b_cfg.get("host_address")
+        or m_cfg.get("host_address")
+        or model_profile.get("host_address")
+        or "http://localhost:9642"
+    )
 
     return {
         "binding_name": binding_name,
         "model_name": model_profile.get("model_name", ""),
-        "host_address": binding_config.get("host_address", "http://localhost:9642"),
-        "api_key": binding_config.get("service_key", ""),
-        "verify_ssl": binding_config.get("verify_ssl_certificate", False),
+        "host_address": host_address,
+        "api_key": service_key,
+        "verify_ssl": b_cfg.get("verify_ssl_certificate", False) or m_cfg.get("verify_ssl_certificate", False),
     }
 
 
@@ -1129,7 +1145,7 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
 
     # ── 💾 PROJECT-LOCAL HISTORY ISOLATION ──
     ASCIIColors.rich_print("  [dim]📜 Loading conversation history...[/dim]", end="")
-    project_history_file = Path(config.workspace_path) / ".lollms_code" / "history.json"
+    project_history_file = get_workspace_conversation_file(config.workspace_path)
     personality.load_history_from_disk(project_history_file)
     personality._project_history_file = project_history_file
     ASCIIColors.rich_print(" [green]✓[/green]")
@@ -1138,19 +1154,8 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
     env_context = build_environment_context(config)
     personality.system_prompt = personality.system_prompt + "\n" + env_context
     if has_tti:
-        personality.system_prompt += TTI_CAPABILITY_PROMPT
+        personality.system_prompt += "\n" + TTI_CAPABILITY_PROMPT
     ASCIIColors.rich_print(" [green]✓[/green]")
-
-    if has_tti:
-        personality.system_prompt += (
-            "\n\n=== IMAGE GENERATION CAPABILITY (ACTIVE) ===\n"
-            "You have access to a Text-to-Image (TTI) binding. You CAN generate images.\n"
-            "Use the `tool_generate_image` tool to create images from text prompts.\n"
-            "Use the `tool_edit_image` tool to modify existing images in the workspace.\n"
-            "Generated images are saved to the workspace automatically.\n"
-            "When a user asks you to generate, draw, create, or make an image, you MUST use `tool_generate_image`.\n"
-            "=== END IMAGE GENERATION CAPABILITY ==="
-        )
 
     if has_tts:
         personality.system_prompt += (
@@ -1869,9 +1874,10 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
     if config.debug:
         dump_startup_context(personality, client)
 
-    # Use project-local history for this session
-    project_history_file = Path(config.workspace_path) / ".lollms_code" / "history.json"
-    history = PersistentHistory(project_history_file)
+    # Use project-local prompt history for REPL tracking
+    prompt_history_file = get_workspace_prompt_history_file(config.workspace_path)
+    history = PersistentHistory(prompt_history_file)
+    history.add(prompt)
 
     renderer = StreamRenderer(config)
 
@@ -2472,9 +2478,9 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
 
     renderer = StreamRenderer(config)
 
-    # Use project-local history for autocomplete (up-arrow) and persist it
-    project_history_file = Path(config.workspace_path) / ".lollms_code" / "history.json"
-    history = PersistentHistory(project_history_file)
+    # Use project-local prompt history for autocomplete (up-arrow) and persist it
+    prompt_history_file = get_workspace_prompt_history_file(config.workspace_path)
+    history = PersistentHistory(prompt_history_file)
 
     slash_commands = ["/exit", "/quit", "/help", "/config", "/shell", "/forget", "/skills", "/clear-history", "/clear-files", "/clear-scratchpad", "/models", "/files", "/workspace", "/load", "/unload", "/lock", "/hide", "/unhide"]
     
@@ -2578,17 +2584,23 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
 
         if user_input.lower() in ("/clear-history", "/clear"):
             personality._conversation = []
-            # Also clear the project-local history file from disk
-            project_history_file = Path(config.workspace_path) / ".lollms_code" / "history.json"
-            if project_history_file.exists():
+            # Clear the project-local conversation file from disk
+            conv_file = get_workspace_conversation_file(config.workspace_path)
+            if conv_file.exists():
                 try:
-                    project_history_file.unlink()
+                    conv_file.unlink()
                 except Exception:
                     pass
-            # Clear the in-memory autocomplete history as well
+            # Clear the project-local prompt history as well
+            prompt_file = get_workspace_prompt_history_file(config.workspace_path)
+            if prompt_file.exists():
+                try:
+                    prompt_file.unlink()
+                except Exception:
+                    pass
             history.entries = []
             history._save()
-            ASCIIColors.green("  Project conversation history cleared.")
+            ASCIIColors.green("  Workspace conversation and prompt history cleared.")
             continue
 
         if user_input.lower() == "/clear-scratchpad":
@@ -2834,6 +2846,10 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
             new_personality = _switch_workspace_interactive(config, client)
             if new_personality:
                 personality = new_personality
+                # Reload prompt history for the newly active workspace
+                prompt_history_file = get_workspace_prompt_history_file(config.workspace_path)
+                history = PersistentHistory(prompt_history_file)
+
                 _index_workspace_with_progress(personality, client)
                 ws_path_display = Path(config.workspace_path).resolve()
                 try:
@@ -2841,13 +2857,13 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                     ws_path_display = f"~/{ws_path_display}"
                 except ValueError:
                     pass
-                
+
                 ASCIIColors.panel(
                     f"[cyan]New Workspace:[/cyan] {ws_path_display}",
                     title="[bold green]📂 Workspace Switched[/bold green]",
                     border_style="green"
                 )
-                
+
                 ws_stats = get_workspace_stats(personality)
                 if ws_stats["total_indexed"] > 0:
                     stats_content = (
@@ -2855,7 +2871,7 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                         f"[cyan]Loaded in Context:[/cyan] {ws_stats['total_loaded']}"
                     )
                     ASCIIColors.panel(stats_content, title="[bold blue]📂 Workspace Telemetry[/bold blue]", border_style="blue")
-                    
+
                     if ws_stats["loaded_files"]:
                         _render_files_table(ws_stats["loaded_files"], "Pre-loaded Context Files [C]")
             continue
@@ -3009,12 +3025,25 @@ def main():
         return 0
 
     if args.clear_history:
-        history_file = APP_CONFIG_DIR / "conversation.json"
-        if history_file.exists():
-            history_file.unlink()
-            ASCIIColors.green("Conversation history cleared.")
+        conv_file = get_workspace_conversation_file(config.workspace_path)
+        prompt_file = get_workspace_prompt_history_file(config.workspace_path)
+        cleared_any = False
+        if conv_file.exists():
+            try:
+                conv_file.unlink()
+                cleared_any = True
+            except Exception:
+                pass
+        if prompt_file.exists():
+            try:
+                prompt_file.unlink()
+                cleared_any = True
+            except Exception:
+                pass
+        if cleared_any:
+            ASCIIColors.green(f"Conversation and prompt history cleared for workspace: {config.workspace_path}")
         else:
-            ASCIIColors.yellow("No conversation history found.")
+            ASCIIColors.yellow(f"No conversation history found in workspace: {config.workspace_path}")
         return 0
 
     if args.interactive:

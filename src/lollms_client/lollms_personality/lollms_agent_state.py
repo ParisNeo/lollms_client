@@ -1009,7 +1009,7 @@ class _AgentStreamState:
                 self._try_complete_context_tag()
                 return True
 
-            context_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<(unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|user_profile_update|user_profile_clear|mem_new|mem_update)\b', self._pending_buffer, re.IGNORECASE)
+            context_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<(unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|user_profile_update|user_profile_clear|mem_new|mem_update|generate_image|edit_image)\b', self._pending_buffer, re.IGNORECASE)
             if context_match:
                 tag_start_idx = context_match.start()
                 tag_name = context_match.group(1).lower()
@@ -1358,34 +1358,62 @@ class _AgentStreamState:
          
 
     def _try_complete_context_tag(self) -> None:
+        # 1. Check for paired tag: <tag ...>...</tag>
         closing_tag = f"</{self._context_tag_name}>"
         close_match = re.search(re.escape(closing_tag) + r'\s*', self._tool_buffer, re.IGNORECASE)
-        if not close_match:
+        if close_match:
+            end_idx = close_match.start()
+            end_len = len(close_match.group(0))
+
+            full_tag_call = self._tool_buffer[:end_idx + end_len]
+
+            self._is_accumulating_context = False
+            remaining = self._tool_buffer[end_idx + end_len:]
+            self._tool_buffer = ""
+            self._code_fence_hold_buffer = ""
+
+            if remaining:
+                self._pending_buffer = remaining
+
+            if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                try:
+                    self._cb("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": self._context_tag_name, "files": [], "status": "stream_complete"})
+                except Exception:
+                    pass
+
+            if self._event_mode == EventMode.PROCESSING_TAG_MODE:
+                self._cb('\n</processing>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+            self.completed_actions.append({"type": "context", "tag_name": self._context_tag_name, "xml": full_tag_call})
+            self._action_dispatched = True
             return
 
-        end_idx = close_match.start()
-        end_len = len(close_match.group(0))
+        # 2. Check for self-closing tag: <tag ... />
+        self_closing_match = re.search(r'^<(' + re.escape(self._context_tag_name) + r')\b[^>]*/>\s*', self._tool_buffer, re.IGNORECASE | re.DOTALL)
+        if self_closing_match:
+            end_len = len(self_closing_match.group(0))
+            full_tag_call = self._tool_buffer[:end_len].strip()
 
-        full_tag_call = self._tool_buffer[:end_idx + end_len]
+            self._is_accumulating_context = False
+            remaining = self._tool_buffer[end_len:]
+            self._tool_buffer = ""
+            self._code_fence_hold_buffer = ""
 
-        self._is_accumulating_context = False
-        remaining = self._tool_buffer[end_idx + end_len:]
-        self._tool_buffer = ""
-        self._code_fence_hold_buffer = ""
+            if remaining:
+                self._pending_buffer = remaining
 
-        if remaining:
-            self._pending_buffer = remaining
+            if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                try:
+                    self._cb("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": self._context_tag_name, "files": [], "status": "stream_complete"})
+                except Exception:
+                    pass
 
-        if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
-            try:
-                self._cb("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": self._context_tag_name, "files": [], "status": "stream_complete"})
-            except Exception:
-                pass
+            if self._event_mode == EventMode.PROCESSING_TAG_MODE:
+                self._cb('\n</processing>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
-        if self._event_mode == EventMode.PROCESSING_TAG_MODE:
-            self._cb('\n</processing>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-
-        self.completed_actions.append({"type": "context", "tag_name": self._context_tag_name, "xml": full_tag_call})
+            self.completed_actions.append({"type": "context", "tag_name": self._context_tag_name, "xml": full_tag_call})
+            self._action_dispatched = True
+            return
         
          
         
@@ -1438,6 +1466,10 @@ class _AgentStreamState:
             self._pending_buffer = ""
             self._try_complete_context_tag()
             if self._is_accumulating_context:
+                clean_tool_buf = self._tool_buffer.strip()
+                if clean_tool_buf.startswith("<") and (clean_tool_buf.endswith("/>") or clean_tool_buf.endswith(">")):
+                    self.completed_actions.append({"type": "context", "tag_name": self._context_tag_name, "xml": clean_tool_buf})
+                    self._action_dispatched = True
                 self._is_accumulating_context = False
             return
 

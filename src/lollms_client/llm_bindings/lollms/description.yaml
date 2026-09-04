@@ -1,8 +1,13 @@
 title: LoLLMs (OpenAI Compatible)
 author: ParisNeo
 creation_date: 2025-08-13
-last_update_date: 2025-08-13
-description: Connects to a LoLLMs service or any other OpenAI-compatible API endpoint.
+last_update_date: 2026-04-09
+description: |
+  Connects to a LoLLMs service or any other OpenAI-compatible API endpoint.
+  Supports chat completions, streaming, reasoning/thinking, tool calling, embeddings,
+  tokenization/detokenization, context size detection, long context processing,
+  RAG database queries, TTS generation, voice listing, file text extraction,
+  and the OpenAI Responses API.
 global_input_parameters:
   - name: host_address
     type: str

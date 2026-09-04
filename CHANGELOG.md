@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-04 12:17]
+
+- refactor(client): update lollms bindings, personality state, and cli configuration
+
 ## [2026-09-04 09:05]
 
 - refactor(client): update artefact handling and discussion mixins
