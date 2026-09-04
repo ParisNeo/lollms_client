@@ -3649,17 +3649,25 @@ class ChatMixin:
                 except Exception as ex:
                     trace_exception(ex)
 
-        # 3. Auto-Mount Data Tools (ONLY if data files exist AND enable_data_tools is True)
-        lcp_binding = getattr(self.lollmsClient, "tools", None)
-        enable_data_tools_flag = enable_data_tools
-
+        # ── UNIFIED CONTEXT-AWARE LCP TOOL MOUNTING ──
+        # Scans the workspace for data and document files ONCE, then mounts the
+        # appropriate LCP libraries into a single shared binding before extracting
+        # all tool specs in one pass. This prevents state loss and duplicate bindings.
         from pathlib import Path
+        lcp_binding = getattr(self.lollmsClient, "tools", None)
+
         workspace_dir = Path(self.workspace_data_path) if getattr(self, "workspace_data_path", None) else Path("./data_workspace")
 
         data_extensions = {".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"}
-        has_data_files = any(f.suffix.lower() in data_extensions for f in workspace_dir.rglob("*") if f.is_file())
+        doc_extensions = {".pdf", ".docx", ".pptx", ".odt", ".epub", ".txt", ".md", ".json", ".yaml", ".xml"}
 
-        if has_data_files and (lcp_binding is None):
+        all_files = list(workspace_dir.rglob("*")) if workspace_dir.exists() else []
+        has_data_files = any(f.suffix.lower() in data_extensions for f in all_files if f.is_file())
+        has_doc_files = any(f.suffix.lower() in doc_extensions for f in all_files if f.is_file())
+
+        needs_lcp_binding = enable_data_tools or enable_code_execution or has_data_files or has_doc_files
+
+        if needs_lcp_binding and lcp_binding is None:
             try:
                 from lollms_client.tools_bindings.lcp import LCPBinding
                 lcp_binding = LCPBinding(
@@ -3667,77 +3675,63 @@ class ChatMixin:
                 )
                 if not hasattr(self.lollmsClient, "tools") or self.lollmsClient.tools is None:
                     self.lollmsClient.tools = lcp_binding
-                ASCIIColors.success("[ChatMixin] Auto-provisioned LCPBinding for data tools.")
+                ASCIIColors.success("[ChatMixin] Auto-provisioned shared LCPBinding for context-aware tools.")
             except Exception as ex:
                 trace_exception(ex)
                 lcp_binding = None
 
-        if enable_data_tools_flag and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
-            lcp_binding.mount_tool_library("as_is_document_tools")
-            lcp_binding.mount_tool_library_if_absent("document_editor")
+        if lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
+            # 1. Mount Data Tools
+            if enable_data_tools and has_data_files:
+                lcp_binding.mount_tool_library("semantic_data_engineer")
+                ASCIIColors.info("[ChatMixin] Mounted 'semantic_data_engineer' (data files detected).")
+
+            # 2. Mount Document Editing Tools
+            if enable_data_tools and has_doc_files:
+                lcp_binding.mount_tool_library("as_is_document_tools")
+                lcp_binding.mount_tool_library_if_absent("document_editor")
+                ASCIIColors.info("[ChatMixin] Mounted 'document_editor' and 'as_is_document_tools' (document files detected).")
+
+            # 3. Mount Arbitrary Code Execution Tool
+            if enable_code_execution:
+                lcp_binding.mount_tool_library("execute_python_code")
+                ASCIIColors.info("[ChatMixin] Mounted 'execute_python_code' (code execution enabled).")
+
+            # 4. Extract all tool specs in a single pass
             try:
                 lcp_tools = lcp_binding.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
                 for t_name, t_spec in lcp_tools.items():
-                    if t_name.startswith("tool_inspect_document") or \
-                       t_name.startswith("tool_read_document_content") or \
-                       t_name.startswith("tool_grep_document") or \
-                       t_name.startswith("tool_modify_docx") or \
-                       t_name.startswith("tool_modify_excel") or \
-                       t_name.startswith("tool_edit_document_text") or \
-                       t_name.startswith("tool_annotate_document") or \
-                       t_name.startswith("tool_modify_pdf_annotation") or \
-                       t_name.startswith("tool_modify_pptx_slide"):
+                    if t_name == "tool_execute_python_data_query" and enable_data_tools and has_data_files:
+                        active_tools[t_name] = t_spec
+                    elif t_name == "tool_execute_python_code" and enable_code_execution:
+                        active_tools[t_name] = t_spec
+                    elif t_name.startswith(("tool_inspect_document", "tool_read_document_content", "tool_grep_document", "tool_modify_docx", "tool_modify_excel", "tool_edit_document_text", "tool_annotate_document", "tool_modify_pdf_annotation", "tool_modify_pptx_slide")) and enable_data_tools and has_doc_files:
                         active_tools[t_name] = t_spec
             except Exception as ex:
                 trace_exception(ex)
+                ASCIIColors.error(f"[ChatMixin] Failed to extract tool specs from LCP binding: {ex}")
 
-        if enable_data_tools_flag and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
-            if has_data_files:
-                lcp_binding.mount_tool_library("semantic_data_engineer")
-                try:
-                    lcp_tools = lcp_binding.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
-                    for t_name, t_spec in lcp_tools.items():
-                        if t_name == "tool_execute_python_data_query":
-                            active_tools[t_name] = t_spec
-                except Exception as ex:
-                    trace_exception(ex)
-
-        # 4. Mount Arbitrary Code Execution Tool if enabled
-        if enable_code_execution:
-            if lcp_binding is None:
-                try:
-                    from lollms_client.tools_bindings.lcp import LCPBinding
-                    lcp_binding = LCPBinding(
-                        tools_folders=[Path(__file__).parent.parent / "tools_bindings" / "lcp" / "default_tools"]
-                    )
-                    if not hasattr(self.lollmsClient, "tools") or self.lollmsClient.tools is None:
-                        self.lollmsClient.tools = lcp_binding
-                    ASCIIColors.success("[ChatMixin] Auto-provisioned LCPBinding for code execution.")
-                except Exception as ex:
-                    trace_exception(ex)
-                    lcp_binding = None
-
-            if lcp_binding is None:
-                ASCIIColors.error(
-                    "[ChatMixin] enable_code_execution=True but failed to auto-provision an LCP tools binding. "
-                    "Python code execution tool will NOT be registered."
-                )
-            elif hasattr(lcp_binding, "mount_tool_library"):
-                lcp_binding.mount_tool_library("execute_python_code")
-                try:
-                    lcp_tools = lcp_binding.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
-                    for t_name, t_spec in lcp_tools.items():
-                        if t_name == "tool_execute_python_code":
-                            active_tools[t_name] = t_spec
-                except Exception as ex:
-                    trace_exception(ex)
-                    ASCIIColors.error(f"[ChatMixin] Failed to register execute_python_code tool: {ex}")
-
-            if "tool_execute_python_code" not in active_tools:
-                ASCIIColors.warning(
-                    "[ChatMixin] enable_code_execution=True but 'tool_execute_python_code' was NOT registered in active_tools. "
-                    "The LLM will not be aware of code execution capabilities."
-                )
+            # 5. Fallback registration via discovered_tools if to_chat_tool_specs failed
+            for td in lcp_binding.discovered_tools:
+                t_name = td.get("name", "")
+                if t_name not in active_tools:
+                    if (t_name == "tool_execute_python_data_query" and enable_data_tools and has_data_files) or \
+                       (t_name == "tool_execute_python_code" and enable_code_execution) or \
+                       (t_name.startswith(("tool_inspect_document", "tool_read_document_content", "tool_grep_document", "tool_modify_docx", "tool_modify_excel", "tool_edit_document_text", "tool_annotate_document", "tool_modify_pdf_annotation", "tool_modify_pptx_slide")) and enable_data_tools and has_doc_files):
+                        params_list = []
+                        input_schema = td.get("input_schema", {})
+                        for prop_name, prop_info in input_schema.get("properties", {}).items():
+                            params_list.append({
+                                "name": prop_name,
+                                "type": prop_info.get("type", "string"),
+                                "description": prop_info.get("description", ""),
+                            })
+                        active_tools[t_name] = {
+                            "name": t_name,
+                            "description": td.get("description", "Executes tool operation."),
+                            "parameters": params_list,
+                        }
+                        ASCIIColors.success(f"[ChatMixin] Registered {t_name} via direct discovered_tools fallback.")
 
         if debug and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
             lcp_binding.mount_tool_library("debug_toolset")
