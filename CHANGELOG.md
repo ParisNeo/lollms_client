@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-04 07:29]
+
+- feat(apps): implement lollms_loops and remove lollms_discussions
+
 ## [2026-09-03 14:09]
 
 - fix: improve document editor and code CLI modality resolution
