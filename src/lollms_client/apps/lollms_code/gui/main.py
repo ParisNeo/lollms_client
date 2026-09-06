@@ -94,7 +94,7 @@ def main_page():
             ui.label("·").classes("text-xs opacity-40 shrink-0")
             ui.label(prefs.workspace_path).classes("text-xs opacity-70 truncate").style("max-width: 320px;")
             ui.label("·").classes("text-xs opacity-40 shrink-0")
-profile_label = f"{resolved.get('profile_alias', 'default')}: {resolved.get('binding_name') or '?'} / {resolved.get('model_name') or '?'}"
+            profile_label = f"{resolved.get('binding_name') or '?'} / {resolved.get('model_name') or '?'}"
             ui.label(profile_label).classes(
                 "text-xs opacity-70 shrink-0"
             )

@@ -5,6 +5,7 @@ import requests
 import json
 import re
 import base64
+import os
 import numpy as np
 import uuid
 import hashlib
@@ -297,11 +298,29 @@ class LollmsClient():
 
         # 4. Eagerly instantiate ONLY the default models for all modalities
         def _eagerly_instantiate_default(model_registry: dict, switch_method: Callable, modality_name: str):
-            default_alias = next((a for a, p in model_registry.items() if p.is_default), None)
+            default_aliases = [a for a, p in model_registry.items() if p.is_default]
+            if len(default_aliases) > 1:
+                ASCIIColors.warning(
+                    f"[LollmsClient] Multiple default profiles detected for {modality_name}: {default_aliases}. "
+                    f"Using the first: '{default_aliases[0]}'. Remove is_default from the others."
+                )
+            default_alias = default_aliases[0] if default_aliases else None
             if default_alias:
                 switch_method(default_alias, callback=callback)
             elif "master" in model_registry:
                 switch_method("master", callback=callback)
+            elif model_registry:
+                switch_method(next(iter(model_registry)), callback=callback)
+
+        missing_model_names = [
+            alias for alias, prof in self.llm_model_profiles_registry.items()
+            if not prof.model_name
+        ]
+        if missing_model_names:
+            ASCIIColors.warning(
+                f"[LollmsClient] LLM model profiles without a model_name: {missing_model_names}. "
+                "These profiles will fall back to the server's default model."
+            )
 
         _eagerly_instantiate_default(self.llm_model_profiles_registry, self.switch_model, "LLM")
         _eagerly_instantiate_default(self.tts_model_profiles_registry, self.switch_tts, "TTS")
@@ -317,10 +336,14 @@ class LollmsClient():
                 if isinstance(p_data, LollmsBindingProfile):
                     profile = p_data
                 else:
+                    hoisted_config = dict(p_data.get("binding_config", {}) or {})
+                    for ssl_key in ("verify_ssl_certificate", "certificate_file_path"):
+                        if ssl_key in p_data and ssl_key not in hoisted_config:
+                            hoisted_config[ssl_key] = p_data[ssl_key]
                     profile = LollmsBindingProfile(
                         name=alias,
                         binding_name=p_data.get("binding_name"),
-                        binding_config=p_data.get("binding_config", {}) or {},
+                        binding_config=hoisted_config,
                         is_default=p_data.get("is_default", False)
                     )
                 registry[alias] = profile
@@ -372,6 +395,17 @@ class LollmsClient():
         # Base connection config from the binding profile
         b_config = binding_profile.binding_config.copy() if binding_profile.binding_config else {}
 
+        _ssl_debug = os.getenv("LOLLMS_DEBUG_SSL", "").lower() in ("1", "true", "yes")
+        if _ssl_debug:
+            ASCIIColors.yellow(f"[LollmsClient][SSL-DEBUG] instantiating {modality.upper()} '{alias}' from binding profile '{binding_profile.name}' (binding_name='{binding_profile.binding_name}')")
+            ASCIIColors.yellow(f"[LollmsClient][SSL-DEBUG] b_config BEFORE sanitize: {b_config}")
+
+        if "verify_ssl_certificate" in b_config and isinstance(b_config["verify_ssl_certificate"], str):
+            b_config["verify_ssl_certificate"] = b_config["verify_ssl_certificate"].lower().strip() in ("true", "1", "yes", "y", "on")
+
+        if _ssl_debug:
+            ASCIIColors.yellow(f"[LollmsClient][SSL-DEBUG] b_config AFTER sanitize: {b_config}")
+            
         # Inject model_name if specified at the model profile level
         if model_profile.model_name:
             b_config['model_name'] = model_profile.model_name
@@ -417,6 +451,10 @@ class LollmsClient():
 
             if callback: callback(f"✅ Instantiated & mounted {modality.upper()}: `{alias}`", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
 
+        if modality == "llm":
+            self._remote_tokenizer_healthy = True
+            if hasattr(self, "_ctx_size_cache"):
+                self._ctx_size_cache = {}
         object.__setattr__(self, active_alias_attr, alias)
         ASCIIColors.info(f"[LollmsClient] Active {modality.upper()} switched to '{alias}'.")
         return True
@@ -531,14 +569,20 @@ class LollmsClient():
         if text_hash in self._token_count_cache:
             return self._token_count_cache[text_hash]
 
-        if self.llm: 
+        if self.llm:
+            if not getattr(self, "_remote_tokenizer_healthy", True):
+                count = len(text) // 4
+                self._token_count_cache[text_hash] = count
+                return count
             try:
                 # Attempt to get exact token count from active LLM binding
                 count = self.llm.count_tokens(text)
+                self._remote_tokenizer_healthy = True
                 self._token_count_cache[text_hash] = count
                 return count
             except Exception:
                 # Fast offline fallback: estimate tokens to prevent external API flooding on connection errors
+                self._remote_tokenizer_healthy = False
                 count = len(text) // 4
                 self._token_count_cache[text_hash] = count
                 return count

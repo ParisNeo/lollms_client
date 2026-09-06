@@ -399,7 +399,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
             ui.navigate.to("/settings")
             return True
 
-if cmd in ("/models", "/model"):
+        if cmd in ("/models", "/model"):
             try:
                 session.ensure_ready()
                 if session.client and hasattr(session.client, "llm_model_profiles_registry"):

@@ -511,12 +511,28 @@ class CodeAgentConfig:
         config = cls()
         APP_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-        # 1. Load saved preferences from JSON
+        PROFILE_KEYS = (
+            "llm_binding_profiles", "llm_model_profiles",
+            "tti_binding_profiles", "tti_model_profiles",
+            "tts_binding_profiles", "tts_model_profiles",
+            "stt_binding_profiles", "stt_model_profiles",
+            "ttv_binding_profiles", "ttv_model_profiles",
+            "ttm_binding_profiles", "ttm_model_profiles",
+            "active_profile",
+        )
+
+        # 1. Load saved preferences from JSON (preferences only — never profiles)
         if APP_CONFIG_FILE.exists():
             try:
                 file_config = json.loads(APP_CONFIG_FILE.read_text(encoding="utf-8"))
+                stale_profile_keys = [k for k in file_config if k in PROFILE_KEYS and k != "active_profile"]
+                if stale_profile_keys:
+                    ASCIIColors.warning(
+                        "[CLI] Ignoring stale binding/model profiles found in config.json. "
+                        "Profiles are resolved from ~/.lollms_client/config.yaml (or --config path)."
+                    )
                 for key, val in file_config.items():
-                    if key in ("workspace_path", "llm_binding_profiles", "llm_model_profiles"):
+                    if key in PROFILE_KEYS:
                         continue
                     if hasattr(config, key):
                         setattr(config, key, val)
@@ -534,34 +550,52 @@ class CodeAgentConfig:
 
         resolved_env = dict(os.environ)
 
-        # Read ~/.lollms-client/.env (GUI wizard path)
-        gui_env = Path.home() / ".lollms-client" / ".env"
-        if gui_env.exists():
-            resolved_env.update(load_env_file(gui_env))
+        explicit_config = getattr(cli_args, "config_path", None)
+        config_sources: List[Path] = []
 
-        # Read ~/.lollms_client/.env & config.yaml (CLI wizard path)
-        home_dir = Path.home() / ".lollms_client"
-        home_env = home_dir / ".env"
-        if home_env.exists():
-            resolved_env.update(load_env_file(home_env))
+        if explicit_config:
+            p = Path(explicit_config).expanduser()
+            if not p.exists():
+                raise FileNotFoundError(
+                    f"Configuration file not found: {p}. "
+                    "Use --config with an existing .env, .json, or .yaml file."
+                )
+            config_sources.append(p)
+        else:
+            home_dir = Path.home() / ".lollms_client"
+            for source in (
+                home_dir / ".env",
+                Path.cwd() / ".lollms_code" / ".env",
+                home_dir / "config.yaml",
+                Path.cwd() / ".lollms_code" / "config.yaml",
+            ):
+                if source.exists():
+                    config_sources.append(source)
 
-        home_yaml = home_dir / "config.yaml"
-        if home_yaml.exists():
+        for source in config_sources:
             try:
-                yaml_data = load_yaml_file(home_yaml)
-                resolved_env.update(_flatten_dict_to_env(yaml_data))
-            except Exception:
-                pass
-
-        for local_env in [Path.cwd() / ".env", Path.cwd() / "examples" / ".env"]:
-            if local_env.exists():
-                resolved_env.update(load_env_file(local_env))
+                if source.suffix == ".env":
+                    resolved_env.update(load_env_file(source))
+                elif source.suffix == ".json":
+                    from lollms_client.lollms_config_cli_env import load_json_file, _descend_into_entry
+                    data = _descend_into_entry(load_json_file(source), None)
+                    resolved_env.update(_flatten_dict_to_env(data))
+                elif source.suffix in (".yaml", ".yml"):
+                    resolved_env.update(_flatten_dict_to_env(load_yaml_file(source)))
+            except Exception as e:
+                ASCIIColors.warning(f"Failed to parse configuration source {source}: {e}")
 
         # Extract profiles across all modalities
+        _ssl_debug = os.getenv("LOLLMS_DEBUG_SSL", "").lower() in ("1", "true", "yes")
         for modality in ("llm", "tti", "tts", "stt", "ttv", "ttm"):
             prefix = modality.upper()
             bindings = _extract_bindings_from_env(prefix, resolved_env)
             profiles = _extract_profiles_from_env(prefix, bindings, resolved_env)
+            if _ssl_debug and modality == "llm":
+                ssl_keys = {k: v for k, v in resolved_env.items() if "VERIFY_SSL" in k.upper() or (k.upper().startswith("LLM_BINDINGS_") and k.upper().endswith("_HOST_ADDRESS"))}
+                ASCIIColors.yellow(f"[Config.load][SSL-DEBUG] raw LLM SSL/host keys in resolved_env: {ssl_keys}")
+                ASCIIColors.yellow(f"[Config.load][SSL-DEBUG] extracted llm_binding_profiles: {bindings}")
+                ASCIIColors.yellow(f"[Config.load][SSL-DEBUG] extracted llm_model_profiles: {profiles}")
             setattr(config, f"{modality}_binding_profiles", bindings)
             setattr(config, f"{modality}_model_profiles", profiles)
 
@@ -617,16 +651,34 @@ class CodeAgentConfig:
                 if cli_args.context_size:
                     m_prof["forced_context_size"] = cli_args.context_size
 
-        # Fallback: if no LLM profile exists at all, scaffold a default
-        if not config.llm_binding_profiles or not config.llm_model_profiles:
+        # Fallback: only scaffold what is genuinely missing, never overwrite extracted data
+        if os.getenv("LLM_CONFIG_DEBUG", "").lower() in ("1", "true", "yes"):
+            ASCIIColors.yellow(f"[Config.load][DEBUG] config sources: {[str(s) for s in config_sources]}")
+            for modality in ("llm", "tti", "tts", "stt", "ttv", "ttm"):
+                ASCIIColors.yellow(
+                    f"[Config.load][DEBUG] {modality}: bindings={list(getattr(config, f'{modality}_binding_profiles').keys())} "
+                    f"models={list(getattr(config, f'{modality}_model_profiles').keys())}"
+                )
+
+        if not config.llm_binding_profiles:
+            ASCIIColors.warning(
+                "[Config.load] No LLM bindings resolved from configuration files. "
+                "Scaffolding fallback 'ollama' binding — check ~/.lollms_client/config.yaml."
+            )
             config.llm_binding_profiles["default"] = {
                 "binding_name": "ollama",
                 "binding_config": {"host_address": "http://localhost:11434"},
                 "is_default": True
             }
+        if not config.llm_model_profiles:
+            ASCIIColors.warning(
+                "[Config.load] No LLM model profiles resolved from configuration files. "
+                "Scaffolding fallback profile — check ~/.lollms_client/config.yaml."
+            )
+            fallback_binding_alias = next(iter(config.llm_binding_profiles))
             config.llm_model_profiles["default"] = {
-                "binding_profile_name": "default",
-                "model_name": "qwen3:32b",
+                "binding_profile_name": fallback_binding_alias,
+                "binding_alias": fallback_binding_alias,
                 "is_default": True,
                 "forced_context_size": 8192
             }
@@ -665,55 +717,73 @@ class CodeAgentConfig:
 
     def save(self):
         APP_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        data = {k: v for k, v in self.__dict__.items() if not k.startswith("_") and k != "workspace_path"}
+        PROFILE_KEYS = (
+            "llm_binding_profiles", "llm_model_profiles",
+            "tti_binding_profiles", "tti_model_profiles",
+            "tts_binding_profiles", "tts_model_profiles",
+            "stt_binding_profiles", "stt_model_profiles",
+            "ttv_binding_profiles", "ttv_model_profiles",
+            "ttm_binding_profiles", "ttm_model_profiles",
+        )
+        data = {
+            k: v for k, v in self.__dict__.items()
+            if not k.startswith("_")
+            and k not in PROFILE_KEYS
+            and k not in ("workspace_path", "wizard_completed")
+        }
         try:
             APP_CONFIG_FILE.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
         except Exception as e:
             ASCIIColors.warning(f"Failed to save config: {e}")
+    
+    
+    def _resolve_env_map(self, config_path: Optional[str] = None) -> Dict[str, str]:
+        """Reads ALL universal configuration sources into one flattened env map.
 
-    def _read_yaml_config(self) -> Dict[str, str]:
-        """Reads the canonical ~/.lollms_client/config.yaml file into a flattened dictionary."""
-        env_data = {}
-        home_yaml = Path.home() / ".lollms_client" / "config.yaml"
-        if home_yaml.exists():
+        Merge order (later sources override earlier ones):
+        1. ~/.lollms-client/.env   (GUI wizard)
+        2. ~/.lollms_client/.env   (CLI wizard)
+        3. ~/.lollms_client/config.yaml (CLI wizard, structured format)
+        """
+        from lollms_client.lollms_config_cli_env import (
+            load_env_file,
+            load_yaml_file,
+            _flatten_dict_to_env,
+        )
+
+        env_data: Dict[str, str] = {}
+        if config_path:
+            sources = [Path(config_path).expanduser()]
+        else:
+            sources = [
+                Path.home() / ".lollms_client" / ".env",
+                Path.cwd() / ".lollms_code" / ".env",
+                Path.home() / ".lollms_client" / "config.yaml",
+                Path.cwd() / ".lollms_code" / "config.yaml",
+            ]
+
+        for source in sources:
+            if not source.exists():
+                continue
             try:
-                import yaml as _yaml
-                with open(home_yaml, "r", encoding="utf-8") as f:
-                    yaml_data = _yaml.safe_load(f) or {}
-
-                def _flatten_dict(d: Dict[str, Any], parent_key: str = "", sep: str = "_") -> Dict[str, str]:
-                    items = []
-                    for k, v in d.items():
-                        new_key = f"{parent_key}{sep}{k}" if parent_key else str(k)
-                        if isinstance(v, dict):
-                            items.extend(_flatten_dict(v, new_key, sep=sep).items())
-                        elif isinstance(v, list):
-                            for i, item in enumerate(v):
-                                if isinstance(item, dict):
-                                    items.extend(_flatten_dict(item, f"{new_key}{sep}{i}", sep=sep).items())
-                                else:
-                                    items.append((f"{new_key}{sep}{i}", str(item)))
-                        elif isinstance(v, bool):
-                            items.append((new_key, "true" if v else "false"))
-                        elif v is not None:
-                            items.append((new_key, str(v)))
-                    return dict(items)
-
-                env_data.update(_flatten_dict(yaml_data))
-            except Exception:
-                pass
+                if source.suffix in (".yaml", ".yml"):
+                    env_data.update(_flatten_dict_to_env(load_yaml_file(source)))
+                else:
+                    env_data.update(load_env_file(source))
+            except Exception as e:
+                ASCIIColors.warning(f"Failed to read configuration source {source}: {e}")
         return env_data
 
     def _has_modality_configured(self, env_data: Dict[str, str], modality: str) -> bool:
         """Checks if at least one binding and one profile exist for the given modality (e.g., 'llm', 'tti')."""
         mod_upper = modality.upper()
-        has_binding = any(k.startswith(f"{mod_upper}_BINDINGS_") and k.endswith("_BINDING_NAME") and v for k, v in env_data.items())
-        has_profile = any(k.startswith(f"{mod_upper}_PROFILES_") and k.endswith("_BINDING_ALIAS") and v for k, v in env_data.items())
+        has_binding = any(k.upper().startswith(f"{mod_upper}_BINDINGS_") and k.upper().endswith("_BINDING_NAME") and v for k, v in env_data.items())
+        has_profile = any(k.upper().startswith(f"{mod_upper}_PROFILES_") and k.upper().endswith("_BINDING_ALIAS") and v for k, v in env_data.items())
         return has_binding and has_profile
 
     def is_configured(self, require_llm: bool = True, require_tti: bool = False, require_tts: bool = False, require_stt: bool = False, require_ttm: bool = False, require_ttv: bool = False) -> bool:
         """Validates configuration based on required modalities using the Two-Tier Profile System."""
-        env_data = self._read_yaml_config()
+        env_data = self._resolve_env_map()
 
         required_modalities = {
             "llm": require_llm,
@@ -741,23 +811,8 @@ def _resolve_modality_from_env(modality: str) -> Optional[Dict[str, Any]]:
     """
     prefix = modality.upper()
 
-    env_map: Dict[str, str] = {}
-    for env_path in [
-        Path.home() / ".lollms-client" / ".env",
-        Path.home() / ".lollms_client" / ".env"
-    ]:
-        if env_path.exists():
-            try:
-                for line in env_path.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if line and not line.startswith("#") and "=" in line:
-                        k, v = line.split("=", 1)
-                        env_map[k.strip()] = v.strip().strip("'\"")
-            except Exception:
-                pass
-
     config_obj = CodeAgentConfig()
-    env_map.update(config_obj._read_yaml_config())
+    env_map: Dict[str, str] = config_obj._resolve_env_map()
 
     default_alias = None
     for k, v in env_map.items():
@@ -915,14 +970,19 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
     }
 
     client_kwargs = {
-        "llm_binding_name": active_binding_name,
-        "llm_binding_config": llm_config,
         "tools_binding_name": "lcp",
         "tools_binding_config": {
             "tools_folders": tools_folders,
             "host_tool_configs": host_tool_configs
         },
     }
+
+    if config.llm_binding_profiles and config.llm_model_profiles:
+        client_kwargs["llm_binding_profiles"] = config.llm_binding_profiles
+        client_kwargs["llm_model_profiles"] = config.llm_model_profiles
+    else:
+        client_kwargs["llm_binding_name"] = active_binding_name
+        client_kwargs["llm_binding_config"] = llm_config
 
     for modality in ("tti", "tts", "stt"):
         try:
@@ -1393,51 +1453,6 @@ class StreamRenderer:
         spinners = ["⠋", "⠙", "⠹", "⠸"]
         spinner = spinners[self._progress_frame]
 
-        recent_lines = self._live_artifact_buffer.splitlines()[-3:]
-        preview_content = "\n".join(recent_lines)
-        if len(preview_content) > 200:
-            preview_content = "..." + preview_content[-200:]
-
-        lines = []
-        lines.append(f"[bold magenta]{spinner} Streaming content...[/bold magenta]")
-        lines.append(f"[dim]Lines written: {self._live_artifact_line_count}[/dim]")
-        if preview_content.strip():
-            lines.append(f"[cyan]Last lines:[/cyan]")
-            lines.append(f"[dim]{preview_content}[/dim]")
-        else:
-            lines.append("[dim]Composing narrative...[/dim]")
-
-        panel = Panel(
-            "\n".join(lines),
-            title=f"[bold magenta]📝 Writing: {self._live_artifact_title}[/bold magenta]" + (f" [dim]({self._live_artifact_lang})[/dim]" if self._live_artifact_lang else ""),
-            border_style="magenta"
-        )
-
-        if self._live_artifact_panel is None:
-            from rich.live import Live
-            self._live_artifact_panel = Live(panel, console=self._rich_console, refresh_per_second=10, vertical_overflow="visible")
-            self._live_artifact_panel.start()
-        else:
-            self._live_artifact_panel.update(panel)
-        
-        
-    def _update_live_artifact_panel(self, chunk: str, fallback_title: str = "artifact", fallback_lang: str = ""):
-        """Updates the live artifact panel with a simple, rotating progress message."""
-        if not self._live_artifact_panel:
-            self._start_live_artifact_panel(fallback_title, fallback_lang)
-
-        from rich.panel import Panel
-
-        self._live_artifact_buffer += chunk
-        self._live_artifact_line_count += 1
-
-        if not hasattr(self, '_progress_frame'):
-            self._progress_frame = 0
-        self._progress_frame = (self._progress_frame + 1) % 4
-
-        spinners = ["⠋", "⠙", "⠹", "⠸"]
-        spinner = spinners[self._progress_frame]
-
         detected_section = ""
         import re
         header_match = re.search(r'^#+\s+(.+)|^#{1,3}\s+(.+)|^class\s+(\w+)|^def\s+(\w+)|^function\s+(\w+)', self._live_artifact_buffer, re.MULTILINE)
@@ -1457,7 +1472,13 @@ class StreamRenderer:
             title=f"[bold magenta]📝 Writing: {self._live_artifact_title}[/bold magenta]" + (f" [dim]({self._live_artifact_lang})[/dim]" if self._live_artifact_lang else ""),
             border_style="magenta"
         )
-        self._live_artifact_panel.update(panel)
+
+        if self._live_artifact_panel is None:
+            from rich.live import Live
+            self._live_artifact_panel = Live(panel, console=self._rich_console, refresh_per_second=10, vertical_overflow="visible")
+            self._live_artifact_panel.start()
+        else:
+            self._live_artifact_panel.update(panel)
 
     def _stop_live_artifact_panel(self):
         """Stops the live artifact panel."""
@@ -2493,9 +2514,12 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
     except ValueError:
         pass # Keep absolute if outside home directory
 
+    active_alias = config.active_profile_alias
+    active_model = getattr(getattr(client, "llm", None), "model_name", None) or config.active_model_name
     header_lines = [
         f"[cyan]Workspace:[/cyan] {ws_path_display}",
-        f"[cyan]Model:[/cyan]      {config.active_model_name}",
+        f"[cyan]Profile:[/cyan]    {active_alias}",
+        f"[cyan]Model:[/cyan]      {active_model}",
         f"[cyan]Binding:[/cyan]    {config.active_binding_name}",
         f"[dim]Commands: 'exit', 'help', 'config', 'shell', 'forget', 'skills', 'clear-history', 'clear-files', 'clear-scratchpad', 'workspace', 'files', 'load', 'unload', 'lock', 'hide'[/dim]"
     ]
@@ -2657,9 +2681,17 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
             continue
 
         if user_input.lower() == "/config":
-            from lollms_client.lollms_config_cli_env import run_wizard_and_save
-            run_wizard_and_save()
-            ASCIIColors.green("  Configuration updated. Restart lollms-code for changes to take effect.")
+            from lollms_client.lollms_config_cli_env import build_wizard_menu, _load_existing_env_to_map
+            wizard_menu, wizard_state = build_wizard_menu(
+                config_map=_load_existing_env_to_map(),
+                title="⚙️ Lollms Client Configuration",
+                exit_text="↩ Back to Chat",
+                exit_behavior="ask",
+                include_save_exit=True,
+            )
+            wizard_menu.run()
+            if wizard_state["saved"]:
+                ASCIIColors.green("  Configuration updated. Restart lollms-code for changes to take effect.")
             continue
 
         if user_input.lower() == "/shell":
@@ -2983,6 +3015,7 @@ Examples:
     parser.add_argument("--list-skills", action="store_true", help="List all learned skills and exit.")
     parser.add_argument("--clear-history", action="store_true", help="Clear conversation history and exit.")
     parser.add_argument("--config", action="store_true", help="Run configuration wizard and exit.")
+    parser.add_argument("--config-path", type=str, default=None, dest="config_path", help="Path to a specific configuration file (.env, .json or .yaml) used by both the client and the wizard.")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
     parser.add_argument("--version", action="version", version=f"lollms_code v{APP_VERSION}")
     subparsers = parser.add_subparsers(dest="command", help="Additional commands")
@@ -3012,10 +3045,8 @@ def main():
     # The CLI requires at least the LLM modality to be configured.
     if args.config or not config.is_configured(require_llm=True):
         from lollms_client.lollms_config_cli_env import run_wizard_and_save
-        run_wizard_and_save()
+        run_wizard_and_save(cli_env_path=args.config_path)
         config = CodeAgentConfig.load(args)
-        config.wizard_completed = True
-        config.save()
         if args.config:
             ASCIIColors.green("\n✅ Configuration saved successfully!")
             return 0

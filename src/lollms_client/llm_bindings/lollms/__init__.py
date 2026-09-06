@@ -92,8 +92,18 @@ class LollmsBinding(LollmsLLMBinding):
 
         self.model_name = kwargs.get("model_name")
         self.service_key = kwargs.get("service_key") or os.getenv("LOLLMS_API_KEY")
-        self.verify_ssl_certificate = kwargs.get("verify_ssl_certificate", True)
+        raw_verify_ssl = kwargs.get("verify_ssl_certificate", True)
+        if isinstance(raw_verify_ssl, str):
+            self.verify_ssl_certificate = raw_verify_ssl.lower().strip() not in ("false", "0", "no", "off", "")
+        else:
+            self.verify_ssl_certificate = bool(raw_verify_ssl)
         self.certificate_file_path = kwargs.get("certificate_file_path")
+
+        if os.getenv("LOLLMS_DEBUG_SSL", "").lower() in ("1", "true", "yes"):
+            ASCIIColors.yellow(f"[LollmsBinding][SSL-DEBUG] raw verify_ssl_certificate={raw_verify_ssl!r} (type={type(raw_verify_ssl).__name__}) -> resolved={self.verify_ssl_certificate!r}")
+            ASCIIColors.yellow(f"[LollmsBinding][SSL-DEBUG] certificate_file_path={self.certificate_file_path!r}")
+            ASCIIColors.yellow(f"[LollmsBinding][SSL-DEBUG] LOLLMS_SKIP_SSL_VERIFY={os.getenv('LOLLMS_SKIP_SSL_VERIFY', '')!r}")
+            ASCIIColors.yellow(f"[LollmsBinding][SSL-DEBUG] full kwargs keys: {sorted(k for k in kwargs.keys())}")
         self.default_completion_format = kwargs.get(
             "default_completion_format", ELF_COMPLETION_FORMAT.Chat
         )
@@ -108,7 +118,7 @@ class LollmsBinding(LollmsLLMBinding):
         self.verify = True
         verify = True
 
-        if not self.verify_ssl_certificate:
+        if not self.verify_ssl_certificate or os.getenv("LOLLMS_SKIP_SSL_VERIFY", "").lower() in ("1", "true", "yes"):
             ssl_context = ssl.create_default_context()
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
@@ -121,6 +131,10 @@ class LollmsBinding(LollmsLLMBinding):
             ssl_context = ssl.create_default_context(cafile=str(cert_path))
             self.verify = str(cert_path)
             verify = ssl_context
+
+        if os.getenv("LOLLMS_DEBUG_SSL", "").lower() in ("1", "true", "yes"):
+            ASCIIColors.yellow(f"[LollmsBinding][SSL-DEBUG] verify flag for httpx/requests: {self.verify!r} | httpx verify object type: {type(verify).__name__}")
+            ASCIIColors.yellow(f"[LollmsBinding][SSL-DEBUG] base_url={self.open_ai_host_address!r} model={self.model_name!r}")
 
         self._http_client = httpx.Client(verify=verify, timeout=300.0)
         self.client = openai.OpenAI(
@@ -224,12 +238,21 @@ class LollmsBinding(LollmsLLMBinding):
     def tokenize(self, text: str) -> list:
         if text is None:
             return []
+
+        if not getattr(self, "_remote_tokenizer_healthy", True):
+            try:
+                return tiktoken.model.encoding_for_model("gpt-3.5-turbo").encode(text)
+            except Exception:
+                return []
+
         try:
             data = self._lollms_post("/tokenize", {"model": self.model_name, "text": text}, timeout=10)
+            self._remote_tokenizer_healthy = True
             if "tokens" in data:
                 return data["tokens"]
         except Exception as e:
-            ASCIIColors.warning(f"Remote tokenization failed: {e}. Falling back to local tiktoken.")
+            self._remote_tokenizer_healthy = False
+            ASCIIColors.warning(f"Remote tokenization failed: {e}. Falling back to local tiktoken. Further failures will use local encoding silently.")
         try:
             return tiktoken.model.encoding_for_model(self.model_name).encode(text)
         except Exception:
@@ -252,15 +275,27 @@ class LollmsBinding(LollmsLLMBinding):
     def count_tokens(self, text: str) -> int:
         if text is None:
             return 0
+
+        if not getattr(self, "_remote_tokenizer_healthy", True):
+            try:
+                return len(tiktoken.model.encoding_for_model("gpt-3.5-turbo").encode(text))
+            except Exception:
+                return len(text) // 4
+
         try:
             data = self._lollms_post("/tokenize", {"model": self.model_name, "text": text}, timeout=10)
+            self._remote_tokenizer_healthy = True
             if "count" in data:
                 return int(data["count"])
             elif "tokens" in data:
                 return len(data["tokens"])
         except Exception as e:
-            ASCIIColors.warning(f"Remote token count failed: {e}. Falling back to local count.")
-        return len(self.tokenize(text))
+            self._remote_tokenizer_healthy = False
+            ASCIIColors.warning(f"Remote token count failed: {e}. Falling back to local count. Further tokenization will use local tiktoken.")
+        try:
+            return len(tiktoken.model.encoding_for_model("gpt-3.5-turbo").encode(text))
+        except Exception:
+            return len(text) // 4
 
     # ── Context Size ──────────────────────────────────────────────────────
 
@@ -466,6 +501,13 @@ class LollmsBinding(LollmsLLMBinding):
         think = kwargs.pop("think", False)
         reasoning_effort = kwargs.pop("reasoning_effort", "low")
         reasoning_summary = kwargs.pop("reasoning_summary", "auto")
+
+        if not model:
+            raise ValueError(
+                "[LollmsBinding] No model name resolved. "
+                "Set a model_name in your profile (e.g. LLM_PROFILES_<alias>_MODEL_NAME in "
+                "~/.lollms_client/config.yaml) or via --model."
+            )
 
         params: Dict = {"model": model}
         if messages is not None:
@@ -769,6 +811,15 @@ class LollmsBinding(LollmsLLMBinding):
             params["tool_choice"] = "auto"
 
         params = {k: v for k, v in params.items() if v is not None}
+
+        if not params.get("model"):
+            raise ValueError(
+                "[LollmsBinding] No model name resolved. "
+                "Set a model_name in your profile (e.g. LLM_PROFILES_<alias>_MODEL_NAME in "
+                "~/.lollms_client/config.yaml) or via --model."
+            )
+        if not params.get("messages"):
+            raise ValueError("[LollmsBinding] No messages to send.")
 
         if think:
             params["reasoning_effort"] = reasoning_effort or "low"

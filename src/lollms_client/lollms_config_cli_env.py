@@ -4,6 +4,7 @@ Interactive configuration wizard and unified configuration resolver for Lollms C
 Supports Multi-Source Ingestion (env, json, yaml, ini) and the Two-Tier Profile System.
 """
 import os
+import re
 import json
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple, Union
@@ -55,6 +56,12 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
         pass
     return data
 
+_SERIALIZATION_PROFILE_SUFFIXES = (
+    "_BINDING_ALIAS", "_BINDING_NAME", "_MODEL_NAME", "_IS_DEFAULT",
+    "_VISION_ENABLED", "_FORCED_CONTEXT_SIZE", "_VERIFY_SSL_CERTIFICATE",
+)
+
+
 def _serialize_config_map_to_yaml(config_map: Dict[str, str]) -> Dict[str, Any]:
     """
     Reconstructs a structured dictionary adhering to the Two-Tier profile schema:
@@ -65,7 +72,9 @@ def _serialize_config_map_to_yaml(config_map: Dict[str, str]) -> Dict[str, Any]:
       profiles:
         <alias>:
           <param_name>: <value>
-    Preserves multi-word parameter names (e.g., service_key, binding_name, host_address).
+    Alias extraction anchors on known parameter suffixes (the mirror of
+    _extract_profiles_from_env) so aliases containing underscores or spaces
+    (e.g. glm_5_3, GLM 5.3) are never truncated.
     """
     yaml_data: Dict[str, Any] = {}
 
@@ -84,23 +93,40 @@ def _serialize_config_map_to_yaml(config_map: Dict[str, str]) -> Dict[str, Any]:
         if not v:
             continue
 
-        k_upper = k.upper()
-        parts = k_upper.split("_")
+        k_upper = k.upper().strip()
+        parts = k_upper.split("_", 2)
+        if len(parts) < 3:
+            continue
 
-        # Two-Tier Key: <MODALITY>_<CATEGORY>_<ALIAS>_<PARAM_NAME...>
-        if len(parts) >= 4 and parts[1] in ("BINDINGS", "PROFILES"):
-            modality = parts[0].lower()
-            category = parts[1].lower()
-            alias = parts[2].lower()
-            param_name = "_".join(parts[3:]).lower()
+        modality = parts[0].lower()
+        category = parts[1].lower()
+        if category not in ("bindings", "profiles"):
+            continue
+        remainder = parts[2]
 
-            yaml_data.setdefault(modality, {}).setdefault(category, {}).setdefault(alias, {})[param_name] = _convert_scalar(v)
-        elif len(parts) >= 2:
-            modality = parts[0].lower()
-            param_name = "_".join(parts[1:]).lower()
-            yaml_data.setdefault(modality, {})[param_name] = _convert_scalar(v)
+        if category == "profiles":
+            alias = None
+            param_name = None
+            for suffix in _SERIALIZATION_PROFILE_SUFFIXES:
+                if remainder.endswith(suffix):
+                    alias = remainder[: -len(suffix)]
+                    param_name = suffix.lstrip("_").lower()
+                    break
+            if param_name is None and "_ROUTING_" in remainder:
+                idx = remainder.find("_ROUTING_")
+                alias = remainder[:idx]
+                param_name = remainder[idx + 1:].lower()
+            if not alias:
+                continue
+            alias = _sanitize_alias(alias)
+            yaml_data.setdefault(modality, {}).setdefault("profiles", {}).setdefault(alias, {})[param_name] = _convert_scalar(v)
         else:
-            yaml_data[k.lower()] = _convert_scalar(v)
+            idx = remainder.find("_")
+            if idx <= 0:
+                continue
+            alias = _sanitize_alias(remainder[:idx])
+            param_name = remainder[idx + 1:].lower()
+            yaml_data.setdefault(modality, {}).setdefault("bindings", {}).setdefault(alias, {})[param_name] = _convert_scalar(v)
 
     return yaml_data
 
@@ -144,10 +170,13 @@ def _descend_into_entry(data: Dict[str, Any], entry: Optional[str]) -> Dict[str,
     return current if isinstance(current, dict) else {}
 
 def _flatten_dict_to_env(d: Dict[str, Any], parent_key: str = "", sep: str = "_") -> Dict[str, str]:
-    """Flattens nested dicts into environment-style keys (e.g. A_B_C = val)."""
+    """Flattens nested dicts into environment-style keys (e.g. A_B_C = val).
+    Keys are normalized to UPPERCASE so every downstream consumer can rely on
+    a single canonical casing regardless of the source yaml/json casing."""
     items = []
     for k, v in d.items():
-        new_key = f"{parent_key}{sep}{k}" if parent_key else k
+        base_key = f"{parent_key}{sep}{str(k).upper()}" if parent_key else str(k).upper()
+        new_key = base_key
         if isinstance(v, dict):
             items.extend(_flatten_dict_to_env(v, new_key, sep=sep).items())
         elif isinstance(v, list):
@@ -165,59 +194,111 @@ def _flatten_dict_to_env(d: Dict[str, Any], parent_key: str = "", sep: str = "_"
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _convert_to_bool(val: Any) -> bool:
-    if isinstance(val, bool): return val
-    if isinstance(val, str): return val.lower().strip() in ("true", "1", "yes", "y")
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return val != 0
+    if isinstance(val, str):
+        return val.lower().strip() in ("true", "1", "yes", "y", "on")
     return False
+
+def _sanitize_alias(alias: str) -> str:
+    """Normalizes a profile/binding alias into an env-safe, case-insensitive registry key."""
+    cleaned = re.sub(r"[^A-Za-z0-9_]", "_", str(alias).strip().lower())
+    if not cleaned or cleaned[0].isdigit():
+        cleaned = f"a_{cleaned}"
+    return cleaned
+
 
 def _extract_bindings_from_env(prefix: str, env_data: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
     clean_prefix = prefix.rstrip("_").upper()
     bindings = {}
     binding_prefix = f"{clean_prefix}_BINDINGS_"
     for k, v in env_data.items():
-        if k.upper().startswith(binding_prefix):
-            remainder = k[len(binding_prefix):]
-            parts = remainder.split("_", 1)
-            if len(parts) == 2:
-                alias, key = parts[0].lower(), parts[1].lower()
-                if alias not in bindings: bindings[alias] = {}
-                if key == "binding_name":
-                    bindings[alias]["binding_name"] = v
-                elif key == "verify_ssl_certificate":
-                    bindings[alias]["verify_ssl_certificate"] = _convert_to_bool(v)
-                else:
-                    bindings[alias].setdefault("binding_config", {})[key] = v
+        k_upper = k.upper()
+        if not k_upper.startswith(binding_prefix):
+            continue
+        remainder = k_upper[len(binding_prefix):]
+        idx = remainder.find("_")
+        if idx <= 0:
+            continue
+        raw_alias, raw_key = remainder[:idx], remainder[idx + 1:]
+        alias = _sanitize_alias(raw_alias)
+        key = raw_key.lower()
+        if not alias or not key:
+            continue
+        if alias not in bindings:
+            bindings[alias] = {}
+        if key == "binding_name":
+            bindings[alias]["binding_name"] = v
+        elif key == "verify_ssl_certificate":
+            bindings[alias]["verify_ssl_certificate"] = _convert_to_bool(v)
+        else:
+            bindings[alias].setdefault("binding_config", {})[key] = v
     return bindings
+
+_PROFILE_KNOWN_KEYS = (
+    "BINDING_ALIAS", "BINDING_NAME", "MODEL_NAME", "IS_DEFAULT",
+    "VISION_ENABLED", "FORCED_CONTEXT_SIZE", "VERIFY_SSL_CERTIFICATE",
+)
+
 
 def _extract_profiles_from_env(prefix: str, bindings: Dict[str, Dict[str, Any]], env_data: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
     clean_prefix = prefix.rstrip("_").upper()
     profiles = {}
     profile_prefix = f"{clean_prefix}_PROFILES_"
+
     for k, v in env_data.items():
-        if k.upper().startswith(profile_prefix):
-            remainder = k[len(profile_prefix):]
-            parts = remainder.split("_", 1)
-            if len(parts) == 2:
-                alias, key = parts[0].lower(), parts[1].lower()
-                if alias not in profiles: profiles[alias] = {}
-                if key == "binding_alias":
-                    profiles[alias]["binding_alias"] = v.lower()
-                elif key == "model_name":
-                    profiles[alias]["model_name"] = v
-                elif key == "is_default":
-                    profiles[alias]["is_default"] = _convert_to_bool(v)
-                elif key == "vision_enabled":
-                    profiles[alias]["vision_enabled"] = _convert_to_bool(v)
-                elif key == "forced_context_size":
-                    try: profiles[alias]["forced_context_size"] = int(v)
-                    except: pass
-                elif key.startswith("routing_"):
-                    profiles[alias].setdefault("routing_config", {})[key[len("routing_"):]] = v
-                else:
-                    profiles[alias].setdefault("binding_config", {})[key] = v
+        k_upper = k.upper()
+        if not k_upper.startswith(profile_prefix):
+            continue
+        remainder = k_upper[len(profile_prefix):]
+
+        alias = None
+        key = None
+        for known_key in _PROFILE_KNOWN_KEYS:
+            marker = f"_{known_key}"
+            if remainder.endswith(marker):
+                alias = remainder[: -len(marker)]
+                key = known_key
+                break
+        if key is None and "_ROUTING_" in remainder:
+            idx = remainder.find("_ROUTING_")
+            alias = remainder[:idx]
+            key = "ROUTING"
+        if alias is None or not alias:
+            continue
+
+        p_alias = _sanitize_alias(alias)
+        if not p_alias:
+            continue
+        if p_alias not in profiles:
+            profiles[p_alias] = {}
+
+        if key == "BINDING_ALIAS":
+            profiles[p_alias]["binding_alias"] = _sanitize_alias(v)
+        elif key == "BINDING_NAME":
+            profiles[p_alias]["binding_name"] = v
+        elif key == "MODEL_NAME":
+            profiles[p_alias]["model_name"] = v
+        elif key == "IS_DEFAULT":
+            profiles[p_alias]["is_default"] = _convert_to_bool(v)
+        elif key == "VISION_ENABLED":
+            profiles[p_alias]["vision_enabled"] = _convert_to_bool(v)
+        elif key == "FORCED_CONTEXT_SIZE":
+            try:
+                profiles[p_alias]["forced_context_size"] = int(v)
+            except (TypeError, ValueError):
+                pass
+        elif key == "ROUTING":
+            routing_key = remainder[idx + len("_ROUTING_"):].lower()
+            profiles[p_alias].setdefault("routing_config", {})[routing_key] = v
+        elif key == "VERIFY_SSL_CERTIFICATE":
+            profiles[p_alias].setdefault("binding_config", {})["verify_ssl_certificate"] = _convert_to_bool(v)
 
     resolved_profiles = {}
     for p_alias, p_data in profiles.items():
-        b_alias = p_data.get("binding_alias")
+        b_alias = _sanitize_alias(p_data.get("binding_alias") or "") or None
         b_info = bindings.get(b_alias, {}) if b_alias else {}
         binding_name = p_data.get("binding_name") or b_info.get("binding_name")
         base_b_config = b_info.get("binding_config", {})
@@ -225,7 +306,8 @@ def _extract_profiles_from_env(prefix: str, bindings: Dict[str, Dict[str, Any]],
         merged_b_config = {**base_b_config, **profile_b_config}
         if "model_name" in p_data:
             merged_b_config["model_name"] = p_data["model_name"]
-        if not binding_name and not b_alias: continue
+        if not binding_name:
+            continue
 
         resolved_profiles[p_alias] = {
             "binding_name": binding_name,
@@ -543,7 +625,7 @@ def _add_binding_flow(b_type: str, config_map: Dict[str, str]):
     if not selected:
         ASCIIColors.yellow("\n  ⚠️ Binding selection cancelled.")
         return
-    alias = _safe_input("Enter an alias for this binding", "master").strip().upper()
+    alias = _sanitize_alias(_safe_input("Enter an alias for this binding", "master"))
     if alias: _configure_binding_instance(b_type, selected, alias, config_map)
 
 def _bindings_menu(b_type: str, config_map: Dict[str, str]):
@@ -747,7 +829,7 @@ def _configure_profile_instance(b_type: str, alias: str, config_map: Dict[str, s
     ASCIIColors.green(f"\n  ✓ Saved profile: {alias}")
 
 def _add_profile_flow(b_type: str, config_map: Dict[str, str]):
-    alias = _safe_input("Enter alias for the profile", "master").strip().upper()
+    alias = _sanitize_alias(_safe_input("Enter alias for the profile", "master"))
     if alias: _configure_profile_instance(b_type, alias, config_map)
 
 def _profiles_menu(b_type: str, config_map: Dict[str, str]):
@@ -775,89 +857,210 @@ def _modality_menu(b_type: str, config_map: Dict[str, str]):
         menu.add_action(f"Configure {b_type.upper()} Profiles", lambda: _profiles_menu(b_type, config_map))
         if menu.run() is None: break
 
-def _load_existing_env_to_map() -> Dict[str, str]:
+
+def _load_existing_env_to_map(cli_env_path: Optional[Union[str, Path]] = None) -> Dict[str, str]:
     config_map = {}
+
+    if cli_env_path:
+        p = Path(cli_env_path).expanduser()
+        if p.exists():
+            try:
+                if p.suffix in (".yaml", ".yml"):
+                    config_map.update(_flatten_dict_to_env(load_yaml_file(p)))
+                else:
+                    config_map.update(load_env_file(p))
+            except Exception as e:
+                ASCIIColors.warning(f"Failed to load configuration file {p}: {e}")
+        return config_map
+
     home_dir = Path.home() / ".lollms_client"
+    home_yaml = home_dir / "config.yaml"
+    if home_yaml.exists():
+        try:
+            config_map.update(_flatten_dict_to_env(load_yaml_file(home_yaml)))
+        except Exception as e:
+            ASCIIColors.warning(f"Failed to load existing config.yaml: {e}")
 
     home_env = home_dir / ".env"
     if home_env.exists():
         config_map.update(load_env_file(home_env))
 
-    home_yaml = home_dir / "config.yaml"
-    if home_yaml.exists():
-        try:
-            yaml_data = load_yaml_file(home_yaml)
-            config_map.update(_flatten_dict_to_env(yaml_data))
-        except Exception as e:
-            ASCIIColors.warning(f"Failed to load existing config.yaml: {e}")
+    for local_env in (Path.cwd() / ".lollms_code" / ".env", Path.cwd() / ".lollms_code" / "config.yaml"):
+        if local_env.exists():
+            try:
+                if local_env.suffix in (".yaml", ".yml"):
+                    config_map.update(_flatten_dict_to_env(load_yaml_file(local_env)))
+                else:
+                    config_map.update(load_env_file(local_env))
+            except Exception as e:
+                ASCIIColors.warning(f"Failed to load local configuration {local_env}: {e}")
 
     return config_map
 
-def _save_and_validate(config_map: Dict[str, str], test_connection: bool = False) -> bool:
-    target_dir = Path.home() / ".lollms_client"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target_env_file = target_dir / ".env"
-    target_yaml_file = target_dir / "config.yaml"
-
-    try:
-        with open(target_env_file, "w", encoding="utf-8") as f:
-            f.write("# Lollms Client Configuration\n# Generated by wizard\n\n")
-            for k, v in config_map.items():
-                if v: f.write(f"{k}={v}\n")
-
-        if yaml:
+def _save_and_validate(
+    config_map: Dict[str, str],
+    test_connection: bool = False,
+    cli_env_path: Optional[Union[str, Path]] = None,
+) -> bool:
+    explicit_target = Path(cli_env_path).expanduser() if cli_env_path else None
+    if explicit_target:
+        try:
+            explicit_target.parent.mkdir(parents=True, exist_ok=True)
+            if explicit_target.suffix in (".yaml", ".yml"):
+                if not yaml:
+                    raise ImportError("PyYAML is required to save .yaml configuration files.")
+                yaml_data = _serialize_config_map_to_yaml(config_map)
+                with open(explicit_target, "w", encoding="utf-8") as f:
+                    yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False)
+            else:
+                with open(explicit_target, "w", encoding="utf-8") as f:
+                    f.write("# Lollms Client Configuration\n# Generated by wizard\n\n")
+                    for k, v in config_map.items():
+                        if v:
+                            f.write(f"{k}={v}\n")
+            ASCIIColors.panel(
+                f"Configuration saved to: [bold green]{explicit_target}[/bold green]",
+                title="[bold]✅ Success[/bold]",
+                border_style="green"
+            )
+        except Exception as e:
+            ASCIIColors.red(f"\n  ❌ Failed to save configuration to {explicit_target}: {e}")
+            return False
+    else:
+        target_dir = Path.home() / ".lollms_client"
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target_yaml_file = target_dir / "config.yaml"
+            if not yaml:
+                raise ImportError("PyYAML is required to save the configuration.")
             yaml_data = _serialize_config_map_to_yaml(config_map)
             with open(target_yaml_file, "w", encoding="utf-8") as f:
                 yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False)
-            ASCIIColors.panel(f"Configuration saved to: [bold green]{target_yaml_file}[/bold green] and [bold green]{target_env_file}[/bold green]", title="[bold]✅ Success[/bold]", border_style="green")
+            ASCIIColors.panel(
+                f"Configuration saved to: [bold green]{target_yaml_file}[/bold green]",
+                title="[bold]✅ Success[/bold]",
+                border_style="green"
+            )
+        except Exception as e:
+            ASCIIColors.red(f"\n  ❌ Failed to save configuration: {e}")
+            return False
+
+    if test_connection:
+        ASCIIColors.info("\nTesting connection with saved configuration...")
+        try:
+            client = get_client_from_env(cli_env_path=str(explicit_target) if explicit_target else None, run_wizard_if_fail=False)
+            ASCIIColors.green(f"✅ Connection verified successfully! Active model: {getattr(client.llm, 'model_name', 'default')}")
+        except Exception as conn_err:
+            ASCIIColors.warning(f"⚠️ Warning: Connection test failed: {conn_err}")
+
+    return True
+
+def build_wizard_menu(
+    config_map: Optional[Dict[str, str]] = None,
+    title: str = "Lollms Client Configuration",
+    exit_text: str = "↩ Back",
+    exit_behavior: str = "discard",
+    include_save_exit: bool = False,
+    cli_env_path: Optional[Union[str, Path]] = None,
+) -> tuple:
+    """Builds a configuration wizard menu that can run standalone or be
+    embedded as a submenu inside a bigger menu.
+
+    Args:
+        config_map: Mutable configuration map to edit. If None, a fresh map is
+            created and pre-loaded from existing config files when available.
+        title: Title displayed at the top of the menu.
+        exit_text: Label of the menu's exit entry.
+        exit_behavior: Governs what happens when the user selects the exit
+            entry:
+                "save"     -> persist config_map before returning.
+                "ask"      -> prompt Yes/No, then persist if confirmed.
+                "discard"  -> return without persisting (embedder owns saving).
+        include_save_exit: When True, append a "Save & Exit" action that
+            persists config_map and marks state["saved"] = True. When False,
+            the embedder owns persistence.
+
+    Returns:
+        tuple: (menu, state) where menu is a configured Menu instance and
+        state is {"config_map": dict, "saved": bool}. The caller is
+        responsible for invoking menu.run() (standalone) or wiring the menu
+        as a submenu action inside a parent menu.
+    """
+    if exit_behavior not in ("save", "ask", "discard"):
+        raise ValueError(
+            f"Invalid exit_behavior '{exit_behavior}'. Must be 'save', 'ask', or 'discard'."
+        )
+
+    if config_map is None:
+        config_map = _load_existing_env_to_map(cli_env_path)
+        if config_map:
+            source = Path(cli_env_path).expanduser() if cli_env_path else Path.home() / ".lollms_client" / "config.yaml"
+            ASCIIColors.green(f"✅ Loaded existing configuration from: {source}")
+
+    menu = Menu(title, mode=Menu.MODE_EXECUTE, exit_text=exit_text)
+    menu.set_intro("Select a modality to configure, or save your changes.")
+
+    menu.add_action("🧠 Configure LLM", lambda: _modality_menu("llm", config_map))
+    menu.add_action("🎨 Configure TTI", lambda: _modality_menu("tti", config_map))
+    menu.add_action("🗣️ Configure TTS", lambda: _modality_menu("tts", config_map))
+    menu.add_action("👂 Configure STT", lambda: _modality_menu("stt", config_map))
+    menu.add_action("🎵 Configure TTM", lambda: _modality_menu("ttm", config_map))
+    menu.add_action("🎬 Configure TTV", lambda: _modality_menu("ttv", config_map))
+    menu.add_action("💾 Save", lambda: _save_and_validate(config_map, cli_env_path=cli_env_path))
+
+    state = {"config_map": config_map, "saved": False}
+
+    if include_save_exit:
+        if exit_behavior == "save":
+            def _save_and_exit_action():
+                _save_and_validate(state["config_map"], cli_env_path=cli_env_path)
+                state["saved"] = True
+            menu.add_action("💾 Save & Exit", _save_and_exit_action)
+        elif exit_behavior == "ask":
+            def _save_and_exit_action():
+                if _safe_confirm("Save configuration before exiting?", default=True):
+                    _save_and_validate(state["config_map"], cli_env_path=cli_env_path)
+                    state["saved"] = True
+            menu.add_action("💾 Save & Exit", _save_and_exit_action)
         else:
-            ASCIIColors.panel(f"Configuration saved to: [bold green]{target_env_file}[/bold green] (PyYAML not installed, skipped config.yaml)", title="[bold]✅ Success[/bold]", border_style="green")
+            menu.add_action(
+                "🔍 Save & Validate Connection",
+                lambda: _save_and_validate(state["config_map"], test_connection=True, cli_env_path=cli_env_path),
+            )
 
-        if test_connection:
-            ASCIIColors.info("\nTesting connection with saved configuration...")
-            try:
-                client = get_client_from_env(run_wizard_if_fail=False)
-                ASCIIColors.green(f"✅ Connection verified successfully! Active model: {getattr(client.llm, 'model_name', 'default')}")
-            except Exception as conn_err:
-                ASCIIColors.warning(f"⚠️ Warning: Connection test failed: {conn_err}")
+    return menu, state
 
-        return True
-    except Exception as e:
-        ASCIIColors.red(f"\n  ❌ Failed to save configuration: {e}")
-        return False
 
-def run_wizard_and_save():
+def run_wizard_and_save(cli_env_path: Optional[Union[str, Path]] = None):
+    """Standalone wizard entry point (backward-compatible wrapper).
+
+    Runs the wizard as its own top-level menu. On exit, the configuration is
+    saved to `cli_env_path` when provided, otherwise to ~/.lollms_client/config.yaml.
+    """
+    target_desc = Path(cli_env_path).expanduser() if cli_env_path else Path.home() / ".lollms_client" / "config.yaml"
     ASCIIColors.panel(
-        "[bold]Lollms Client Configuration Wizard[/bold]\n[dim]Configure your bindings and profiles.[/dim]",
+        f"[bold]Lollms Client Configuration Wizard[/bold]\n[dim]Configure your bindings and profiles.[/dim]\n[dim]Target file: {target_desc}[/dim]",
         title="[bold magenta]🧙 Wizard[/bold magenta]",
         border_style="magenta"
     )
 
-    config_map = _load_existing_env_to_map()
-    if config_map:
-        ASCIIColors.green("✅ Loaded existing configuration from environment/files.")
-
     while True:
-        menu = Menu("Lollms Client Main Menu", mode=Menu.MODE_EXECUTE, exit_text="🚪 Exit without Saving")
-        menu.set_intro("Select a modality to configure, save your changes, or exit.")
+        config_map = _load_existing_env_to_map(cli_env_path)
+        menu, state = build_wizard_menu(
+            config_map=config_map,
+            title="Lollms Client Main Menu",
+            exit_text="🚪 Exit without Saving",
+            include_save_exit=True,
+            cli_env_path=cli_env_path,
+        )
 
-        menu.add_action("🧠 Configure LLM", lambda: _modality_menu("llm", config_map))
-        menu.add_action("🎨 Configure TTI", lambda: _modality_menu("tti", config_map))
-        menu.add_action("🗣️ Configure TTS", lambda: _modality_menu("tts", config_map))
-        menu.add_action("👂 Configure STT", lambda: _modality_menu("stt", config_map))
-        menu.add_action("🎵 Configure TTM", lambda: _modality_menu("ttm", config_map))
-        menu.add_action("🎬 Configure TTV", lambda: _modality_menu("ttv", config_map))
+        def _validate_action():
+            _save_and_validate(state["config_map"], test_connection=True, cli_env_path=cli_env_path)
+        menu.add_action("🔍 Save & Validate Connection", _validate_action)
 
-        saved_and_exit = [False]
-        def _save_and_exit_action():
-            _save_and_validate(config_map)
-            saved_and_exit[0] = True
-
-        menu.add_action("💾 Save & Exit", _save_and_exit_action)
-        menu.add_action("🔍 Save & Validate Connection", lambda: _save_and_validate(config_map, test_connection=True))
-
-        if menu.run() is None or saved_and_exit[0]:
+        if menu.run() is None or state["saved"]:
             break
+
 
 if __name__ == "__main__":
     run_wizard_and_save()
