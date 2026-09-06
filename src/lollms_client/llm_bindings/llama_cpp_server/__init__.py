@@ -137,8 +137,8 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         # ── Model config ──────────────────────────────────────────────────────
         self.model_name: Optional[str] = _clean(kwargs.get("model_name", "")) or None
 
-        val_ctx = _clean(kwargs.get("ctx_size"), int)
-        self.n_ctx: int = val_ctx if val_ctx is not None else 4096
+        val_ctx = _clean(kwargs.get("ctx_size"), int|None)
+        self.n_ctx: int|None = val_ctx
 
         val_layers = _clean(kwargs.get("n_gpu_layers"), int)
         self.n_gpu_layers: int = val_layers if val_layers is not None else -1
@@ -744,8 +744,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             str(exe),
             "--model", str(model_path),
             "--host", self.host,
-            "--port", str(port),
-            "--ctx-size", str(self.n_ctx),
+            "--port", str(port),           
             "--n-gpu-layers", str(self.n_gpu_layers),
             "--parallel", str(self.n_parallel),
             "--batch-size", str(self.batch_size),
@@ -753,6 +752,10 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             "--reasoning-budget", str(self.reasoning_budget),
             "--embedding",          # always enable the /embedding endpoint
         ]
+        #conditional settings:
+        if self.n_ctx:
+            cmd.append("--ctx-size")
+            cmd.append(str(self.n_ctx))
         if self.n_threads:
             cmd += ["--threads", str(self.n_threads)]
         if self.flash_attn:

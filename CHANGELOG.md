@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-06 20:51]
+
+- fix(doc: update docstring to reflect new `n_ctx` being nullable and adjust command-line arguments)
+
 ## [2026-09-06 16:50]
 
 - fix(artefact): safely handle non-string logical_content when stripping
