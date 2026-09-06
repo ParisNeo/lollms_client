@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-06 16:50]
+
+- fix(artefact): safely handle non-string logical_content when stripping
+
 ## [2026-09-04 20:08]
 
 - fix(agent): resolve context tag stall loop by resetting stream state on context actions

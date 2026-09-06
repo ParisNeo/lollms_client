@@ -394,8 +394,8 @@ class ArtefactManager:
                 return lam_path.read_text(encoding="utf-8", errors="ignore").strip()
             except Exception:
                 pass
-
-        return art.get("logical_content", "").strip()
+        logical_content = art.get("logical_content", "")
+        return logical_content.strip() if isinstance(logical_content, str) else ""
 
     def _get_all_raw(self) -> List[Dict]:
         metadata = self._discussion.metadata or {}
