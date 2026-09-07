@@ -36,7 +36,6 @@ class TranscriptionRequest(BaseModel):
     fp16: Optional[bool] = Field(default=None, description="Override fp16 usage")
     device: Optional[str] = Field(default=None, description="Compute device override: 'cuda', 'cpu', or 'auto' (auto = CUDA if available). On GPU OOM the server degrades to CPU automatically.")
     filename: Optional[str] = Field(default=None, description="Original filename; used only to pick a safe temp-file extension for FFmpeg decoding")
-=======
 
 
 class ModelManager:
@@ -142,12 +141,11 @@ class ModelManager:
 
         if load_error is not None:
             raise RuntimeError(f"Failed to load Whisper model '{model_name}': {load_error}")
-        finally:
-            try:
-                if lock_file.exists() and not lock.is_locked:
-                    lock_file.unlink()
-            except Exception:
-                pass
+        try:
+            if lock_file.exists() and not lock.is_locked:
+                lock_file.unlink()
+        except Exception:
+            pass
 
     def _unload_model(self):
         if self.model is not None:

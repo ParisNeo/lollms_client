@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-07 08:48]
+
+- fix(stt): remove merge conflict artifact and fix lock file cleanup in whisper server
+
 ## [2026-09-07 08:43]
 
 - fix(stt): update whisper binding and server transcription logic
