@@ -34,6 +34,7 @@ class TranscriptionRequest(BaseModel):
     language: Optional[str] = Field(default=None, description="Language code (e.g. 'en')")
     task: str = Field(default="transcribe", description="'transcribe' or 'translate'")
     fp16: Optional[bool] = Field(default=None, description="Override fp16 usage")
+    filename: Optional[str] = Field(default=None, description="Original filename; used only to pick a safe temp-file extension for FFmpeg decoding")
 
 
 class ModelManager:
@@ -195,20 +196,31 @@ async def transcribe(request: TranscriptionRequest):
     import base64
     import tempfile
     
+    model_name = request.model_name or "base"
+    temp_file = None
     try:
-        model_name = request.model_name or "base"
-        
-        # Auto-detect device if not specified globally, default to cuda if available
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        
         manager = state.registry.get_manager(model_name=model_name, device=device)
-        
-        # Decode base64 to temp file
-        audio_bytes = base64.b64decode(request.audio_b64)
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        temp_file.write(audio_bytes)
-        temp_file.close()
-        
+
+        audio_bytes = base64.b64decode(request.audio_b64, validate=False)
+        if len(audio_bytes) == 0:
+            raise HTTPException(status_code=400, detail="Empty audio payload.")
+        max_audio_bytes = 100 * 1024 * 1024
+        if len(audio_bytes) > max_audio_bytes:
+            raise HTTPException(status_code=413, detail=f"Audio payload too large: {len(audio_bytes):,} bytes (limit: {max_audio_bytes:,}).")
+
+        original_ext = ""
+        if request.filename and "." in request.filename:
+            original_ext = Path(request.filename).suffix.lower()
+        allowed_exts = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".wma", ".aiff", ".aif", ".webm", ".mp4", ".mkv"}
+        safe_suffix = original_ext if original_ext in allowed_exts else ".wav"
+
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=safe_suffix)
+        try:
+            temp_file.write(audio_bytes)
+        finally:
+            temp_file.close()
+
         transcribe_args = {
             "language": request.language,
             "task": request.task,
@@ -220,16 +232,35 @@ async def transcribe(request: TranscriptionRequest):
 
         future = Future()
         manager.queue.put((future, model_name, temp_file.name, transcribe_args))
-        
-        text = future.result()  # Blocks until transcription is complete
-        
-        # Cleanup temp file
-        Path(temp_file.name).unlink(missing_ok=True)
-        
+        text = future.result()
         return {"text": text}
+    except HTTPException:
+        raise
     except Exception as e:
         trace_exception(e)
-        raise HTTPException(status_code=500, detail=str(e))
+        error_text = str(e)
+        friendly = f"Whisper transcription failed on the server: {error_text}"
+        lowered = error_text.lower()
+        if "not a valid win32 application" in lowered or "ffmpeg" in lowered:
+            friendly += (
+                " | Likely cause: FFmpeg is missing or incompatible. "
+                "Ensure FFmpeg is installed and available in the server venv PATH "
+                "(whisper uses it to decode audio)."
+            )
+        elif "out of memory" in lowered or "cuda" in lowered:
+            friendly += (
+                " | Likely cause: GPU OOM while loading the Whisper model. "
+                "Try a smaller model_name (e.g. 'base' or 'small') or free VRAM."
+            )
+        elif "download" in lowered or "checksum" in lowered or "connection" in lowered:
+            friendly += (
+                " | Likely cause: failed to download the Whisper model. "
+                "Check network access or pre-download the model into the cache dir."
+            )
+        raise HTTPException(status_code=500, detail=friendly)
+    finally:
+        if temp_file is not None:
+            Path(temp_file.name).unlink(missing_ok=True)
 
 @router.get("/status")
 def status():

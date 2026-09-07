@@ -244,7 +244,8 @@ class WhisperSTTBinding(LollmsSTTBinding):
                 "model_name": model or self.config.get("model_name", "base"),
                 "language": kwargs.get("language"),
                 "task": kwargs.get("task", "transcribe"),
-                "fp16": kwargs.get("fp16")
+                "fp16": kwargs.get("fp16"),
+                "filename": audio_file.name if isinstance(audio_source, (str, Path)) else None
             }
             
             response = self._post_json_request("/transcribe", data=payload)

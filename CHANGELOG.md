@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-07 08:31]
+
+- feat(stt): add filename passthrough and harden Whisper transcription endpoint
+
 ## [2026-09-06 23:53]
 
 - feat(code): add agent config loading to CLI and enhance Lollms binding settings
