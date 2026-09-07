@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-07 14:33]
+
+- fix(chat): preserve verbatim functional tags in latest assistant turn to prevent phantom completions
+
 ## [2026-09-07 08:48]
 
 - fix(stt): remove merge conflict artifact and fix lock file cleanup in whisper server

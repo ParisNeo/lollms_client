@@ -4632,6 +4632,50 @@ class ChatMixin:
                 from ._context_sanitizer import scrub_processing_and_status_blocks
                 clean_history_text = scrub_processing_and_status_blocks(raw_round_text)
 
+                # ── 🧠 VERBATIM TAG PRESERVATION (ANTI-PHANTOM DEMONSTRATION) ──
+                # The most recent assistant turn MUST retain the exact raw functional
+                # tag it emitted. Stripping it teaches the model (by in-context
+                # demonstration) that "prose claim = completed action", which is the
+                # root cause of phantom completions on follow-up turns.
+                # The rolling-window compressor will fold OLDER entries; only the
+                # newest dispatch keeps its verbatim body.
+                if not clean_history_text.strip() and ss.affected_artefacts:
+                    reconstructed_tags = []
+                    for art in ss.affected_artefacts:
+                        title = art.get("title", "untitled")
+                        atype = art.get("type", "document")
+                        content = art.get("content", "")
+                        if atype == "skill":
+                            desc_attr = f' description="{art.get("description", "")}"' if art.get("description") else ""
+                            cat_attr = f' category="{art.get("category", "")}"' if art.get("category") else ""
+                            reconstructed_tags.append(f'<skill title="{title}"{desc_attr}{cat_attr}>\n{content}\n</skill>')
+                        elif atype == "note":
+                            reconstructed_tags.append(f'<note title="{title}">\n{content}\n</note>')
+                        else:
+                            lang = art.get("language", "")
+                            ephemeral_attr = ' ephemeral="true"' if art.get("ephemeral") else ""
+                            reconstructed_tags.append(f'<artifact name="{title}" type="{atype}" language="{lang}"{ephemeral_attr}>\n{content}\n</artifact>')
+                    clean_history_text = "\n\n".join(reconstructed_tags)
+                elif clean_history_text.strip() and ss.affected_artefacts:
+                    # Prose existed around the tag. Append the verbatim tag so the
+                    # demonstration pattern includes BOTH prose AND the raw tag.
+                    appended_tags = []
+                    for art in ss.affected_artefacts:
+                        title = art.get("title", "untitled")
+                        atype = art.get("type", "document")
+                        content = art.get("content", "")
+                        if atype == "skill":
+                            desc_attr = f' description="{art.get("description", "")}"' if art.get("description") else ""
+                            cat_attr = f' category="{art.get("category", "")}"' if art.get("category") else ""
+                            appended_tags.append(f'<skill title="{title}"{desc_attr}{cat_attr}>\n{content}\n</skill>')
+                        elif atype == "note":
+                            appended_tags.append(f'<note title="{title}">\n{content}\n</note>')
+                        else:
+                            lang = art.get("language", "")
+                            ephemeral_attr = ' ephemeral="true"' if art.get("ephemeral") else ""
+                            appended_tags.append(f'<artifact name="{title}" type="{atype}" language="{lang}"{ephemeral_attr}>\n{content}\n</artifact>')
+                    clean_history_text = (clean_history_text.strip() + "\n\n" + "\n\n".join(appended_tags)).strip()
+
                 # ── 🧠 VERBATIM TAG RECONSTRUCTION (ZERO AMNESIA) ──
                 # If conversational wrapper was stripped, reconstruct the exact functional XML tag
                 # (<skill>, <artifact>, <note>, etc.) so the assistant message retains its exact content.
@@ -5677,6 +5721,10 @@ class ChatMixin:
                 clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
                 clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
                 clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
+                # ── PRESERVE FUNCTIONAL TAGS IN LATEST ASSISTANT HISTORY ENTRY ──
+                # Older entries are scrubbed by the Three-View Protocol at export time;
+                # the LATEST assistant turn keeps its raw tags verbatim so the model
+                # retains a positive demonstration of correct tag emission.
                 clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
                 clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
 
@@ -5745,12 +5793,16 @@ class ChatMixin:
                     ss.context_unlock_requested = False
                 else:
                     continuation_prompt = (
+                        "[SYSTEM NOTIFICATION - NOT A USER MESSAGE]\n"
                         "<action_directive status=\"REQUIRED\">\n"
-                        "You stopped generation without emitting an action tag or `<done/>`.\n"
-                        "• If you intended to perform an action (create an artifact, run a tool, unlock files, write a skill): emit the corresponding tag (`<artifact>`, `<tool>`, `<skill>`, etc.) NOW in this response.\n"
-                        "• If your task is fully completed: provide your final response and end with `<done/>` on a new line.\n"
-                        "Stating intent in text without emitting tags produces no action.\n"
-                        "</action_directive>"
+                        "⚠️ INFRASTRUCTURE DIRECTIVE: Generation stopped without a functional tag or `<done/>`.\n"
+                        "This is an automated system message. It is NOT a user request.\n"
+                        "Choose exactly ONE next move:\n"
+                        "1. PERFORM → Emit the real functional XML tag (`<artifact>`, `<tool>`, `<skill>`, `<note>`, `<unlock_file>`) on a new line NOW. Never claim in prose that an action was performed.\n"
+                        "2. TERMINATE → Write your final answer to the user, then emit `<done/>` on a new line.\n"
+                        "File state only changes when the raw tag is emitted in the current response.\n"
+                        "</action_directive>\n"
+                        "[END SYSTEM NOTIFICATION]"
                     )
 
                 virtual_history.append(SimpleNamespace(
