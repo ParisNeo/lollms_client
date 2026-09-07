@@ -245,6 +245,7 @@ class WhisperSTTBinding(LollmsSTTBinding):
                 "language": kwargs.get("language"),
                 "task": kwargs.get("task", "transcribe"),
                 "fp16": kwargs.get("fp16"),
+                "device": kwargs.get("device"),
                 "filename": audio_file.name if isinstance(audio_source, (str, Path)) else None
             }
             

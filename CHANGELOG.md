@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-07 08:43]
+
+- fix(stt): update whisper binding and server transcription logic
+
 ## [2026-09-07 08:31]
 
 - feat(stt): add filename passthrough and harden Whisper transcription endpoint

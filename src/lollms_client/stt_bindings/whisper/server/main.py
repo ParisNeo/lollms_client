@@ -34,7 +34,9 @@ class TranscriptionRequest(BaseModel):
     language: Optional[str] = Field(default=None, description="Language code (e.g. 'en')")
     task: str = Field(default="transcribe", description="'transcribe' or 'translate'")
     fp16: Optional[bool] = Field(default=None, description="Override fp16 usage")
+    device: Optional[str] = Field(default=None, description="Compute device override: 'cuda', 'cpu', or 'auto' (auto = CUDA if available). On GPU OOM the server degrades to CPU automatically.")
     filename: Optional[str] = Field(default=None, description="Original filename; used only to pick a safe temp-file extension for FFmpeg decoding")
+=======
 
 
 class ModelManager:
@@ -43,7 +45,15 @@ class ModelManager:
         self.models_cache_dir = models_cache_dir
         self.model = None
         self.loaded_model_name = None
-        self.device = config.get("device", self._auto_detect_device())
+        requested_device = config.get("device", "auto")
+        if requested_device in ("auto", "", None):
+            self.device = self._auto_detect_device()
+        else:
+            self.device = requested_device
+        self.device = str(self.device).lower()
+        if self.device.startswith("cuda") and not torch.cuda.is_available():
+            ASCIIColors.warning(f"CUDA requested but not available. Falling back to CPU.")
+            self.device = "cpu"
         self.last_used_time = time.time()
         self.lock = threading.Lock()
         self.queue = queue.Queue()
@@ -82,17 +92,56 @@ class ModelManager:
         lock_file = cache_dir / f"{model_name}.lock"
         lock = filelock.FileLock(lock_file, timeout=300)
 
+        load_error: Optional[Exception] = None
         try:
             with lock:
                 ASCIIColors.info(f"Loading Whisper model '{model_name}' on device '{self.device}'...")
                 self.model = whisper.load_model(model_name, device=self.device)
                 self.loaded_model_name = model_name
                 self.last_used_time = time.time()
-                ASCIIColors.green(f"Whisper model '{model_name}' loaded successfully.")
+                ASCIIColors.green(f"Whisper model '{model_name}' loaded successfully on '{self.device}'.")
         except Exception as e:
+            load_error = e
             self.model = None
             self.loaded_model_name = None
-            raise RuntimeError(f"Failed to load Whisper model '{model_name}': {e}")
+
+        if load_error is not None and self.device != "cpu":
+            err_lower = str(load_error).lower()
+            is_memory_error = (
+                "out of memory" in err_lower
+                or "not enough memory" in err_lower
+                or "cuda" in err_lower
+                or "alloc" in err_lower
+                or isinstance(load_error, torch.cuda.OutOfMemoryError)
+            )
+            if is_memory_error:
+                ASCIIColors.warning(
+                    f"GPU memory exhaustion detected while loading '{model_name}' on '{self.device}'. "
+                    f"Falling back to CPU + main memory. Error: {load_error}"
+                )
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                self.device = "cpu"
+                try:
+                    self.model = whisper.load_model(model_name, device="cpu")
+                    self.loaded_model_name = model_name
+                    self.last_used_time = time.time()
+                    ASCIIColors.green(
+                        f"Whisper model '{model_name}' loaded successfully on CPU fallback "
+                        f"(GPU unavailable/out of VRAM)."
+                    )
+                    return
+                except Exception as cpu_err:
+                    self.model = None
+                    self.loaded_model_name = None
+                    raise RuntimeError(
+                        f"Failed to load Whisper model '{model_name}' on both GPU and CPU. "
+                        f"GPU error: {load_error} | CPU error: {cpu_err}"
+                    ) from cpu_err
+
+        if load_error is not None:
+            raise RuntimeError(f"Failed to load Whisper model '{model_name}': {load_error}")
         finally:
             try:
                 if lock_file.exists() and not lock.is_locked:
@@ -132,15 +181,31 @@ class ModelManager:
                     result = self.model.transcribe(str(audio_path), **transcribe_args)
                     future.set_result(result.get("text", "").strip())
                 except Exception as e:
-                    if "out of memory" in str(e).lower():
-                        ASCIIColors.warning("OOM detected during transcription. Attempting to free VRAM.")
+                    err_lower = str(e).lower()
+                    is_memory_error = (
+                        "out of memory" in err_lower
+                        or "not enough memory" in err_lower
+                        or "cuda" in err_lower
+                        or "alloc" in err_lower
+                        or isinstance(e, torch.cuda.OutOfMemoryError)
+                    )
+                    if is_memory_error and self.device != "cpu":
+                        ASCIIColors.warning(
+                            f"GPU OOM during transcription of '{Path(audio_path).name}'. "
+                            f"Unloading model and escalating to CPU + main memory."
+                        )
                         with self.lock:
                             self._unload_model()
+                            self.device = "cpu"
                         try:
                             with self.lock:
                                 self._load_whisper_model(model_name)
+                            transcribe_args["fp16"] = False
                             result = self.model.transcribe(str(audio_path), **transcribe_args)
                             future.set_result(result.get("text", "").strip())
+                            ASCIIColors.success(
+                                f"Transcription of '{Path(audio_path).name}' succeeded on CPU fallback."
+                            )
                             continue
                         except Exception as retry_e:
                             future.set_exception(retry_e)
@@ -199,7 +264,14 @@ async def transcribe(request: TranscriptionRequest):
     model_name = request.model_name or "base"
     temp_file = None
     try:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        requested_device = (request.device or "auto").lower().strip()
+        if requested_device in ("auto", ""):
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        elif requested_device.startswith("cuda") and not torch.cuda.is_available():
+            ASCIIColors.warning("CUDA requested for transcription but not available. Using CPU.")
+            device = "cpu"
+        else:
+            device = requested_device
         manager = state.registry.get_manager(model_name=model_name, device=device)
 
         audio_bytes = base64.b64decode(request.audio_b64, validate=False)
