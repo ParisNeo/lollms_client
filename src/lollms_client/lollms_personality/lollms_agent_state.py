@@ -66,6 +66,113 @@ def _calculate_dynamic_tool_char_limit(client: Optional[Any] = None) -> int:
 
 _MAX_TOOL_RESULT_CHARS = 12000
 
+
+def _repair_llm_tool_json(raw_text: str) -> str:
+    """
+    Repairs LLM-emitted tool-call JSON that strict json.loads rejects.
+
+    Failure modes handled (state machine, in-string only):
+    1. Raw control characters (\\n, \\r, \\t) inside string values.
+    2. Unescaped inner double quotes, e.g. {"q": "INSERT { :x rdfs:label "Name"@en . }"}.
+       A quote terminates the string ONLY when followed by a structural token
+       (',' '}' ']' ':'); otherwise it is escaped as \\".
+    3. Trailing truncation: missing closing braces/brackets are appended.
+
+    Structural whitespace outside strings is never modified.
+    """
+    if not raw_text:
+        return raw_text
+
+    for candidate in (raw_text, raw_text.strip().strip("`")):
+        try:
+            json.loads(candidate)
+            return candidate
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    repaired_chars: List[str] = []
+    in_string = False
+    i = 0
+    n = len(raw_text)
+
+    while i < n:
+        ch = raw_text[i]
+
+        if in_string:
+            if ch == "\\":
+                repaired_chars.append(ch)
+                if i + 1 < n:
+                    repaired_chars.append(raw_text[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                j = i + 1
+                while j < n and raw_text[j] in " \t\r\n":
+                    j += 1
+                if j >= n or raw_text[j] in ",}]:": 
+                    in_string = False
+                    repaired_chars.append(ch)
+                    i += 1
+                    continue
+                repaired_chars.append('\\"')
+                i += 1
+                continue
+            if ch == "\n":
+                repaired_chars.append("\\n")
+                i += 1
+                continue
+            if ch == "\r":
+                repaired_chars.append("\\r")
+                i += 1
+                continue
+            if ch == "\t":
+                repaired_chars.append("\\t")
+                i += 1
+                continue
+            if ord(ch) < 0x20:
+                i += 1
+                continue
+            repaired_chars.append(ch)
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            repaired_chars.append(ch)
+            i += 1
+            continue
+
+        repaired_chars.append(ch)
+        i += 1
+
+    repaired = "".join(repaired_chars)
+
+    try:
+        json.loads(repaired)
+        return repaired
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    balanced = repaired
+    balanced += "}" * max(0, balanced.count("{") - balanced.count("}"))
+    balanced += "]" * max(0, balanced.count("[") - balanced.count("]"))
+    try:
+        json.loads(balanced)
+        return balanced
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    try:
+        start = balanced.find("{")
+        if start != -1:
+            decoder = json.JSONDecoder()
+            obj, _ = decoder.raw_decode(balanced[start:])
+            return json.dumps(obj, ensure_ascii=False)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    return repaired
+
 def _is_large_base64(v: str) -> bool:
     sample = v.replace("\n", "").replace("\r", "").replace(" ", "")
     if len(sample) < 500:
@@ -1234,9 +1341,24 @@ class _AgentStreamState:
                         else:
                             resolved_params = {k: v for k, v in raw_data.items() if k != "name"}
                 except json.JSONDecodeError:
-                    raw_data = None
-                    resolved_tool_name = "malformed_tool_call"
-                    resolved_params = {}
+                    repaired_payload = _repair_llm_tool_json(sanitized_json_body)
+                    try:
+                        raw_data = json.loads(repaired_payload)
+                    except (json.JSONDecodeError, ValueError):
+                        raw_data = None
+
+                    if isinstance(raw_data, dict):
+                        resolved_tool_name = raw_data.get("name") or "malformed_tool_call"
+                        if "parameters" in raw_data and isinstance(raw_data["parameters"], dict):
+                            resolved_params = raw_data["parameters"]
+                        else:
+                            resolved_params = {k: v for k, v in raw_data.items() if k != "name"}
+                        ASCIIColors.success(f"[AgentStreamState] Salvaged malformed tool call JSON via repair pass: '{resolved_tool_name}'.")
+                    else:
+                        raw_data = None
+                        resolved_tool_name = "malformed_tool_call"
+                        resolved_params = {}
+                        ASCIIColors.warning(f"[AgentStreamState] Failed to parse tool call JSON even after repair: {sanitized_json_body[:200]}")
 
         if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
             try:

@@ -3,6 +3,140 @@ import re
 from typing import Any, Callable, Optional, Union, List
 from ascii_colors import ASCIIColors, trace_exception
 
+
+def repair_llm_json(raw_text: str) -> str:
+    """
+    Repairs common LLM JSON malformations so tool calls remain executable.
+
+    Primary failure mode: LLMs embed multi-line payloads (SPARQL INSERT DATA
+    blocks, code, YAML) inside a JSON string value using literal newlines.
+    Strict JSON forbids raw control characters inside strings, so json.loads
+    fails with "Expecting ',' delimiter" or "Invalid control character".
+    This function walks the text with a lightweight state machine and escapes
+    literal \\n, \\r and \\t inside string literals only, leaving structural
+    whitespace between tokens untouched.
+
+    This utility is dependency-free and intended to be imported by host
+    applications that parse <tool> JSON payloads themselves.
+    """
+    if not raw_text:
+        return raw_text
+
+    for candidate in (raw_text, raw_text.replace("`", "")):
+        try:
+            json.loads(candidate)
+            return candidate
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    repaired_chars: List[str] = []
+    in_string = False
+    i = 0
+    n = len(raw_text)
+
+    while i < n:
+        ch = raw_text[i]
+
+        if in_string:
+            if ch == "\\":
+                repaired_chars.append(ch)
+                if i + 1 < n:
+                    repaired_chars.append(raw_text[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+                repaired_chars.append(ch)
+                i += 1
+                continue
+            if ch == "\n":
+                repaired_chars.append("\\n")
+                i += 1
+                continue
+            if ch == "\r":
+                repaired_chars.append("\\r")
+                i += 1
+                continue
+            if ch == "\t":
+                repaired_chars.append("\\t")
+                i += 1
+                continue
+            if ord(ch) < 0x20:
+                i += 1
+                continue
+            repaired_chars.append(ch)
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            repaired_chars.append(ch)
+            i += 1
+            continue
+
+        repaired_chars.append(ch)
+        i += 1
+
+    repaired = "".join(repaired_chars)
+
+    try:
+        json.loads(repaired)
+        return repaired
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    try:
+        start = repaired.find("{")
+        if start != -1:
+            decoder = json.JSONDecoder()
+            obj, _ = decoder.raw_decode(repaired[start:])
+            return json.dumps(obj, ensure_ascii=False)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    return repaired
+
+
+_TOOL_NAME_ALIASES = {
+    "apply_sparql_update": "tool_execute_sparql_update",
+    "sparql_update": "tool_execute_sparql_update",
+    "execute_sparql_update": "tool_execute_sparql_update",
+    "apply_sparql_query": "tool_execute_sparql_query",
+    "sparql_query": "tool_execute_sparql_query",
+    "execute_sparql_query": "tool_execute_sparql_query",
+}
+
+
+def normalize_tool_name(tool_name: str, registered_tools: Optional[List[str]] = None) -> str:
+    """
+    Normalizes an LLM-emitted tool name to a registered tool name.
+
+    LLMs frequently hallucinate short tool names (e.g. "apply_sparql_update")
+    instead of the registered names (e.g. "tool_execute_sparql_update").
+    This resolves known aliases first, then attempts prefix-based matching
+    ("tool_" + name) against the registered tool list if provided.
+    Returns the original name when no mapping is found.
+    """
+    if not tool_name:
+        return tool_name
+
+    normalized = tool_name.strip()
+    canonical = _TOOL_NAME_ALIASES.get(normalized.lower())
+    if canonical:
+        return canonical
+
+    if registered_tools:
+        prefixed = f"tool_{normalized}"
+        if prefixed in registered_tools:
+            return prefixed
+        lowered = normalized.lower()
+        matches = [t for t in registered_tools if t.lower().endswith(f"_{lowered}")]
+        if len(matches) == 1:
+            return matches[0]
+
+    return normalized
+
+
 class LollmsTextProcessor:
     """
     A comprehensive text and code processing layer that sits on top of any LLM.

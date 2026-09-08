@@ -1,18 +1,29 @@
 binding_name: execute_sparql_query
-title: SPARQL Query Runner
+title: SPARQL Query & Update Runner
 author: ParisNeo & Lollms
-version: 1.0.0
-description: Parses local Turtle (.ttl) files and executes fully compliant SPARQL 1.1 queries, returning structured bindings or serialized graphs.
+version: 1.1.0
+description: Parses local Turtle (.ttl)/OWL RDF graphs, executes fully compliant SPARQL 1.1 read queries, and applies SPARQL 1.1 Update operations (INSERT/DELETE DATA, INSERT/DELETE WHERE) with automatic persistence to disk.
 input_parameters:
   - name: file_name
     type: str
-    description: Filename of the .ttl file in the workspace.
-    mandatory: true
+    description: Filename of the .ttl or .owl file in the workspace. Auto-discovered or auto-created for updates.
+    mandatory: false
   - name: sparql_query
     type: str
-    description: The valid SPARQL 1.1 query to execute (SELECT, ASK, CONSTRUCT).
-    mandatory: true
+    description: The valid SPARQL 1.1 read query to execute (SELECT, ASK, CONSTRUCT, DESCRIBE).
+    mandatory: false
+  - name: update_query
+    type: str
+    description: The valid SPARQL 1.1 Update operation to execute (INSERT DATA, DELETE DATA, INSERT/DELETE WHERE). The graph is mutated and persisted to disk.
+    mandatory: false
+  - name: create_file_if_missing
+    type: bool
+    description: If True (default), creates and initializes the ontology file when it does not exist yet. Set to False to avoid implicitly creating graphs.
+    mandatory: false
 commands:
   - name: tool_execute_sparql_query
     title: Execute SPARQL Query
-    description: Runs a SPARQL query against the specified Turtle file and returns structured results.
+    description: Runs a SPARQL read query (SELECT, ASK, CONSTRUCT, DESCRIBE) against the specified RDF graph and returns structured results. SPARQL Update text is automatically routed to the update executor.
+  - name: tool_execute_sparql_update
+    title: Execute SPARQL Update
+    description: Applies a SPARQL 1.1 Update operation (INSERT DATA, DELETE DATA, INSERT/DELETE WHERE) to the RDF graph and persists the mutation to disk. Creates the ontology file automatically if it does not exist.

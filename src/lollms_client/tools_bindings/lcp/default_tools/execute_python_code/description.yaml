@@ -1,5 +1,22 @@
-name: Execute Python Code
-description: Executes arbitrary sandboxed Python code and returns stdout, stderr, and generated plots.
-icon: 🐍
-version: 1.0.0
-author: lollms_client
+binding_name: execute_python_code
+title: Execute Python Code
+author: ParisNeo & Lollms
+version: 1.1.0
+description: Executes arbitrary sandboxed Python code and returns stdout, stderr, and generated plots. Can also run a workspace .py file with command-line style arguments exposed via sys.argv (argparse compatible).
+input_parameters:
+  - name: code
+    type: str
+    description: The raw Python code string to execute (inline mode). Ignored when file_name is provided.
+    mandatory: false
+  - name: file_name
+    type: str
+    description: Name of a .py file inside the workspace to execute (file mode). Path traversal is blocked; only files within the workspace sandbox are allowed.
+    mandatory: false
+  - name: args
+    type: list
+    description: Command-line style arguments passed to the executed script, readable via sys.argv[1:] or argparse. Only used in file mode. All values are stringified.
+    mandatory: false
+commands:
+  - name: tool_execute_python_code
+    title: Execute Python Code
+    description: Runs inline Python code or a workspace .py file with optional argv-style arguments in a sandboxed environment, capturing stdout, stderr, and matplotlib figures.

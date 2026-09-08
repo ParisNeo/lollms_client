@@ -603,6 +603,104 @@ def _is_large_base64(v: str) -> bool:
     return bool(_BASE64_RE.match(sample[:1000]))
 
 
+def _repair_llm_json(raw_text: str) -> str:
+    """
+    Repairs common LLM JSON malformations so tool calls remain executable.
+
+    Primary failure mode: the LLM embeds multi-line payloads (SPARQL INSERT
+    DATA blocks, code, YAML) inside a JSON string value using literal
+    newlines. Strict JSON forbids raw control characters inside strings,
+    so json.loads fails with "Expecting ',' delimiter" or "Invalid control
+    character". This function walks the text with a lightweight state
+    machine and escapes literal \\n, \\r and \\t inside string literals only,
+    leaving structural whitespace between tokens untouched.
+    """
+    if not raw_text:
+        return raw_text
+
+    text = raw_text
+    for attempt_text in (raw_text, raw_text.replace("`", "")):
+        try:
+            json.loads(attempt_text)
+            return attempt_text
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    repaired_chars: List[str] = []
+    in_string = False
+    i = 0
+    n = len(text)
+
+    while i < n:
+        ch = text[i]
+
+        if in_string:
+            if ch == "\\":
+                repaired_chars.append(ch)
+                if i + 1 < n:
+                    repaired_chars.append(text[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+                repaired_chars.append(ch)
+                i += 1
+                continue
+            if ch == "\n":
+                repaired_chars.append("\\n")
+                i += 1
+                continue
+            if ch == "\r":
+                repaired_chars.append("\\r")
+                i += 1
+                continue
+            if ch == "\t":
+                repaired_chars.append("\\t")
+                i += 1
+                continue
+            if ord(ch) < 0x20:
+                i += 1
+                continue
+            repaired_chars.append(ch)
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            repaired_chars.append(ch)
+            i += 1
+            continue
+
+        repaired_chars.append(ch)
+        i += 1
+
+    repaired = "".join(repaired_chars)
+
+    try:
+        json.loads(repaired)
+        return repaired
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    try:
+        decoder = json.JSONDecoder()
+        decoder.raw_decode(repaired)
+        return repaired
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    try:
+        start = repaired.find("{")
+        if start != -1:
+            decoder = json.JSONDecoder()
+            obj, _ = decoder.raw_decode(repaired[start:])
+            return json.dumps(obj, ensure_ascii=False)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    return repaired
+
+
 def _sanitize_tool_result(
     tool_res: Any,
     max_chars: Optional[int] = None,
@@ -2153,22 +2251,31 @@ class _StreamState:
             def _sanitize_tool_json(raw_body: str) -> str:
                 """
                 Safely extracts the first valid JSON object from a tool body.
-                Handles trailing backticks, markdown fences, and stray prose
-                that cause 'Extra data' JSONDecodeError.
+                Handles trailing backticks, markdown fences, stray prose, and
+                multi-line payloads (SPARQL/code) emitted with literal
+                newlines inside JSON string values.
                 """
-                import json as _json
                 stripped = raw_body.strip()
                 if stripped.startswith("```"):
                     lines = stripped.splitlines()
                     if len(lines) >= 2:
                         stripped = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
                 stripped = stripped.strip("`").strip()
+
                 try:
-                    decoder = _json.JSONDecoder()
+                    decoder = json.JSONDecoder()
                     obj, end_idx = decoder.raw_decode(stripped)
-                    return _json.dumps(obj)
-                except (_json.JSONDecodeError, ValueError):
-                    return stripped
+                    return json.dumps(obj, ensure_ascii=False)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+                repaired = _repair_llm_json(stripped)
+                try:
+                    decoder = json.JSONDecoder()
+                    obj, end_idx = decoder.raw_decode(repaired)
+                    return json.dumps(obj, ensure_ascii=False)
+                except (json.JSONDecodeError, ValueError):
+                    return repaired
 
             sanitized_body = _sanitize_tool_json(body)
             try:
@@ -2185,8 +2292,8 @@ class _StreamState:
                 else:
                     self.tool_json_data = sanitized_body
             except json.JSONDecodeError as je:
-                self.tool_json_data = sanitized_body
-                ASCIIColors.error(f"[StreamState] JSON decode failed: {je}")
+                self.tool_json_data = _repair_llm_json(sanitized_body)
+                ASCIIColors.warning(f"[StreamState] JSON decode failed: {je}. Applied LLM JSON repair as fallback.")
 
             # ── 🛑 CRITICAL FIX: IMMEDIATE UI FEEDBACK ──
             # Emit the processing block to the UI INSTANTLY when the </tool> tag closes.
@@ -5965,19 +6072,27 @@ class ChatMixin:
                     )
                     ss.context_unlock_requested = False
                 else:
+                    text_stall_count_now = getattr(self, "_consecutive_text_only_stalls", 0)
                     continuation_prompt = (
                         "[SYSTEM NOTIFICATION - NOT A USER MESSAGE]\n"
                         "<action_directive status=\"REQUIRED\">\n"
                         "⚠️ INFRASTRUCTURE DIRECTIVE: Generation stopped without a functional tag or `<done/>`.\n"
                         "This is an automated system message. It is NOT a user request.\n"
+                        f"You have announced an intention in prose ({text_stall_count_now} time(s) so far) but emitted no functional tag.\n"
+                        "Announcing intent in text does NOT execute anything. Your previous message was cut before the tag.\n"
                         "Choose exactly ONE next move:\n"
-                        "1. PERFORM → Emit the real functional XML tag (`<artifact>`, `<tool>`, `<skill>`, `<note>`, `<unlock_file>`) on a new line NOW. Never claim in prose that an action was performed.\n"
+                        "1. PERFORM → Emit the real functional XML tag (`<artifact>`, `<tool>`, `<skill>`, `<note>`, `<unlock_file>`) on a new line NOW. Never claim in prose that an action was performed. If your previous message described what you were about to do, IMMEDIATELY emit that exact tag at the start of this response.\n"
                         "2. TERMINATE → Write your final answer to the user, then emit `<done/>` on a new line.\n"
                         "File state only changes when the raw tag is emitted in the current response.\n"
+                        f"WARNING: After {3 - text_stall_count_now if text_stall_count_now < 3 else 1} more stall(s), the system will permanently terminate this turn and your announced action will never be executed.\n"
                         "</action_directive>\n"
                         "[END SYSTEM NOTIFICATION]"
                     )
 
+                virtual_history.append(SimpleNamespace(
+                    sender_type="assistant",
+                    content=clean_history_text.strip()
+                ))
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
                     content=continuation_prompt
