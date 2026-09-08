@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-08 11:30]
+
+- feat(discussion): add sovereign discussion module enhancements to core mixins
+
 ## [2026-09-07 14:33]
 
 - fix(chat): preserve verbatim functional tags in latest assistant turn to prevent phantom completions

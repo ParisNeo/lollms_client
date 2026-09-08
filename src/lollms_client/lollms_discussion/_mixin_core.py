@@ -50,6 +50,7 @@ class CoreMixin:
         internet_config: Optional[Dict[str, Any]] = None,
         workspace_path: Optional[str] = None,
         auto_create_db: bool = True,
+        auto_sync_workspace: bool = True,
     ):
         object.__setattr__(self, 'lollmsClient', lollmsClient)
         object.__setattr__(self, 'autosave', autosave)
@@ -156,10 +157,11 @@ class CoreMixin:
         # 2. If the DB has artifacts but the directory is empty/missing files, they are restored (DB → Disk).
         # The previous condition only ran sync if the directory was non-empty, which prevented
         # the heal pass from restoring orphaned DB artifacts when the physical files were missing.
-        try:
-            self.sync_workspace_to_artefacts()
-        except Exception as sync_ex:
-            ASCIIColors.warning(f"[CoreMixin] Auto-ingestion/heal of workspace files failed: {sync_ex}")
+        if auto_sync_workspace:
+            try:
+                self.sync_workspace_to_artefacts()
+            except Exception as sync_ex:
+                ASCIIColors.warning(f"[CoreMixin] Auto-ingestion/heal of workspace files failed: {sync_ex}")
 
         # ── Memory system ─────────────────────────────────────────────────
         self._init_memory(memory_manager)

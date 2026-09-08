@@ -2742,6 +2742,43 @@ class _StreamState:
                         closing_tag = "</artifact>"
                         full_match_text = opening_tag + body_content + closing_tag
 
+                        is_patch = "<<<<<<< SEARCH" in body_content
+                        is_truncated_patch = is_patch and not re.search(
+                            r'^>{6,8}(?:\s*\w+)?\s*$', body_content, re.MULTILINE
+                        )
+                        is_truncated_full = not is_patch
+
+                        if is_truncated_patch or is_truncated_full:
+                            # ── TRUNCATED ARTIFACT REJECTION ──
+                            # Generation stopped before the artifact body was
+                            # complete (or before the final >>>>>>> REPLACE
+                            # sentinel arrived). Registering this as a success
+                            # teaches the model that prose-claims equal
+                            # completed files, which is the root cause of
+                            # phantom completion hallucinations. We flag the
+                            # dispatch as failed and let ChatMixin inject a
+                            # corrective round.
+                            self._last_dispatch_failed = True
+                            self._action_dispatched = True
+                            ASCIIColors.warning(
+                                "[StreamState] Truncated artifact intercepted "
+                                f"(patch={is_patch}). Rejecting dispatch and flagging failure."
+                            )
+
+                            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                                proc_close = (
+                                    f"\n* ⚠️ Artifact generation was INTERRUPTED before completion "
+                                    f"(received {len(body_content)} chars). The file was NOT saved.\n"
+                                    f"<!-- status:failure -->\n</processing>\n"
+                                )
+                                self.ai_message.content += proc_close
+                                _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                            self.artefact_tracker.close()
+                            self._artefact_buffer = ""
+                            self._pending_buffer = ""
+                            return
+
                         if full_match_text not in self.processed_tags:
                             self.processed_tags.add(full_match_text)
                             ASCIIColors.warning("[StreamState] Detected truncated artifact. Attempting best-effort dispatch.")
@@ -2828,6 +2865,56 @@ class ChatMixin:
         if not hasattr(self, '_pending_forms_store'):
             object.__setattr__(self, '_pending_forms_store', {})
         return self._pending_forms_store
+
+    def _dump_error(
+        self,
+        error: Exception,
+        context_desc: str,
+        round_count: int,
+        extra_data: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Writes a detailed error log to the discussion workspace debug dumps directory."""
+        if not getattr(self, "_debug_mode", False):
+            return
+
+        try:
+            from pathlib import Path as _Path
+
+            ws_path = getattr(self, "workspace_data_path", None)
+            if not ws_path:
+                return
+
+            debug_dir = _Path(ws_path) / "_debug_dumps"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+
+            safe_context = re.sub(r"[^a-z0-9_]+", "_", context_desc.lower()).strip("_") or "error"
+            error_log_path = debug_dir / f"error_round_{round_count}_{safe_context}.log"
+
+            with open(error_log_path, "w", encoding="utf-8") as f:
+                f.write("=" * 80 + "\n")
+                f.write(f"🐛 [DEBUG] ERROR DUMP - ROUND {round_count}\n")
+                f.write(f"Context: {context_desc}\n")
+                f.write("=" * 80 + "\n\n")
+
+                f.write("--- EXCEPTION ---\n")
+                f.write(f"Type: {type(error).__name__}\n")
+                f.write(f"Message: {str(error)}\n\n")
+
+                f.write("--- TRACEBACK ---\n")
+                f.write(traceback.format_exc())
+                f.write("\n\n")
+
+                if extra_data:
+                    f.write("--- EXTRA DATA ---\n")
+                    try:
+                        f.write(json.dumps(extra_data, indent=2, default=str, ensure_ascii=False))
+                    except Exception:
+                        f.write(str(extra_data))
+                    f.write("\n\n")
+
+            ASCIIColors.error(f"[ChatMixin] 🐛 Error dumped to: {error_log_path}")
+        except Exception as dump_err:
+            ASCIIColors.warning(f"[ChatMixin] Failed to write error dump: {dump_err}")
 
     def submit_form_response(self, form_id: str, answers: Dict[str, Any]) -> bool:
         pending = self._get_pending_forms()
@@ -3375,8 +3462,10 @@ class ChatMixin:
             enable_data_tools (bool): Enable data manipulation tools (SQL, pandas). Default True.
             enable_code_execution (bool): Enable arbitrary Python code execution tool. Default False.
             suppress_images (bool): Suppress image hydration in context. Default False.
-            debug_export (bool): Enable debug export of context dumps. Default False.
-            debug (bool): Enable debug mode with additional logging. Default False.
+            debug_export (bool): Enable debug export of context dumps for this turn. Default False.
+            debug (bool): Enable debug mode: mounts the debug toolset with additional logging. Default False.
+                Persistent per-discussion debug dumps can also be enabled by setting
+                discussion._debug_mode = True externally (mirrors personality.debug_mode).
             enable_vlm_query (bool): Enable VLM query tool for vision fallback. Default False.
             event_mode (EventMode): Event reporting mode. Default PROCESSING_TAG_MODE.
             **kwargs: Additional generation parameters passed to the LLM binding.
@@ -3394,6 +3483,8 @@ class ChatMixin:
         resolved_max_rounds = max_nb_rounds if max_nb_rounds is not None else max_reasoning_steps
         if resolved_max_rounds is None:
             resolved_max_rounds = 20
+
+        debug_enabled = bool(debug_export) or bool(getattr(self, "_debug_mode", False))
 
         # Store tolerance level on active discussion for downstream execution tools (like execute_python_data_query)
         if not hasattr(self, "tolerance_level") or tolerance_level:
@@ -4082,6 +4173,9 @@ class ChatMixin:
         # Track if we exited due to cancellation
         was_cancelled = False
 
+        raw_llm_output_buffer = [""]
+        raw_llm_output_buffer = [""]
+
         # CRITICAL FIX: Initialize ss to None to prevent UnboundLocalError
         # if the loop breaks before _StreamState is instantiated (e.g., pre-turn cancellation).
         ss = None
@@ -4162,9 +4256,57 @@ class ChatMixin:
                 suppress_system_prompt=False,
                 suppress_images=suppress_images,
                 virtual_history=virtual_history,
-                debug=debug_export,
+                debug=debug_enabled,
                 system_prompt_override=current_system_prompt
             )
+
+            if debug_enabled:
+                try:
+                    from pathlib import Path as _Path
+
+                    debug_dir = _Path(self.workspace_data_path) / "_debug_dumps"
+                    debug_dir.mkdir(parents=True, exist_ok=True)
+
+                    with open(debug_dir / f"full_prompt_round_{round_count}.log", "w", encoding="utf-8") as f:
+                        f.write("=" * 80 + "\n")
+                        f.write(f"🐛 [DEBUG] ROUND {round_count} - FULL PROMPT\n")
+                        f.write("=" * 80 + "\n")
+                        for i, msg in enumerate(messages_list):
+                            role = msg.get("role", "unknown").upper() if isinstance(msg, dict) else "UNKNOWN"
+                            content = msg.get("content", "") if isinstance(msg, dict) else ""
+                            f.write(f"\n--- MSG [{i}] ROLE: {role} ---\n")
+                            if isinstance(content, list):
+                                for item in content:
+                                    if isinstance(item, dict) and item.get("type") == "text":
+                                        f.write(item.get("text", "") + "\n")
+                                    elif isinstance(item, dict) and item.get("type") == "image_url":
+                                        f.write("[IMAGE ATTACHED]\n")
+                                    else:
+                                        f.write(str(item) + "\n")
+                            else:
+                                f.write(str(content) + "\n")
+                        f.write("\n" + "=" * 80 + "\n")
+
+                    with open(debug_dir / f"prompt_dump_round_{round_count}_shortened.md", "w", encoding="utf-8") as f:
+                        f.write(f"# 🐛 Round {round_count} - Shortened Prompt Dump\n\n")
+                        for i, msg in enumerate(messages_list):
+                            role = msg.get("role", "unknown").upper() if isinstance(msg, dict) else "UNKNOWN"
+                            content = msg.get("content", "") if isinstance(msg, dict) else ""
+                            if isinstance(content, list):
+                                content = "\n".join(
+                                    item.get("text", "") for item in content
+                                    if isinstance(item, dict) and item.get("type") == "text"
+                                )
+                            if not isinstance(content, str):
+                                content = str(content)
+                            short_content = (
+                                content[:500] + "\n\n[... truncated ...]\n\n" + content[-500:]
+                                if len(content) > 1000
+                                else content
+                            )
+                            f.write(f"## MSG [{i}] - {role}\n\n```\n{short_content}\n```\n\n")
+                except Exception as debug_err:
+                    ASCIIColors.warning(f"[ChatMixin] Failed to write prompt debug logs: {debug_err}")
 
             # ── 🎨 DYNAMIC VISION HYDRATION ──
             # Retrieve all images generated or modified during previous rounds of this turn
@@ -4223,6 +4365,8 @@ class ChatMixin:
                 if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
                     return ss.passthrough(chunk, msg_type, meta)
                 if isinstance(chunk, str):
+                    if debug_enabled:
+                        raw_llm_output_buffer[0] += chunk
                     # ── ⏱️ TIME TO FIRST TOKEN (TTFT) ──
                     if not getattr(self, "_ttft_logged", True) and chunk:
                         ttft = _time.perf_counter() - _t_gen_start
@@ -4278,6 +4422,13 @@ class ChatMixin:
             except Exception as gen_err:
                 _t_gen_end = _time.perf_counter()
                 ASCIIColors.warning(f"[Trace] Generation round {round_count} failed after {(_t_gen_end - _t_gen_start):.2f} s.")
+                if debug_enabled:
+                    self._dump_error(
+                        error=gen_err,
+                        context_desc="LLM Generation Error",
+                        round_count=round_count,
+                        extra_data={"raw_llm_output": raw_llm_output_buffer[0][-4000:]}
+                    )
                 if self.is_generation_cancelled():
                     was_cancelled = True
                     break
@@ -4288,6 +4439,21 @@ class ChatMixin:
             if self.is_generation_cancelled():
                 was_cancelled = True
                 break
+
+            if debug_enabled and raw_llm_output_buffer[0]:
+                try:
+                    from pathlib import Path as _Path
+                    debug_dir = _Path(self.workspace_data_path) / "_debug_dumps"
+                    debug_dir.mkdir(parents=True, exist_ok=True)
+                    raw_output_log_path = debug_dir / f"raw_llm_output_round_{round_count}.log"
+                    with open(raw_output_log_path, "w", encoding="utf-8") as f:
+                        f.write("=" * 80 + "\n")
+                        f.write(f"🐛 [DEBUG] ROUND {round_count} - RAW LLM STREAM OUTPUT\n")
+                        f.write("=" * 80 + "\n\n")
+                        f.write(raw_llm_output_buffer[0])
+                        f.write("\n\n" + "=" * 80 + "\n")
+                except Exception as debug_err:
+                    ASCIIColors.warning(f"[ChatMixin] Failed to write raw LLM output log: {debug_err}")
 
             ss.flush_remaining_buffer()
 
@@ -5541,6 +5707,13 @@ class ChatMixin:
                                 details_block = f"Output Logs:\n{safe_output}\n"
                     except Exception as e:
                         trace_exception(e)
+                        if debug_enabled:
+                            self._dump_error(
+                                error=e,
+                                context_desc="Tool Execution Error",
+                                round_count=round_count,
+                                extra_data={"tool_name": tool_name, "parameters": tool_params}
+                            )
                         if failure_memory:
                             try:
                                 param_sig = json.dumps(tool_params, sort_keys=True, default=str)
@@ -6026,7 +6199,7 @@ class ChatMixin:
         # ── 🔬 SCIENTIFIC DEBUG: EXPORT CONTEXT DUMP ──
         # Dumps the exact virtual_history (LLM context) and ai_msg.content (UI context)
         # to a JSON file in the discussion workspace to verify context separation.
-        if debug_export:
+        if debug_enabled:
             try:
                 import os as _os
                 from pathlib import Path as _Path

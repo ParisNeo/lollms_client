@@ -4,7 +4,7 @@ This module implements the **Sovereign Discussion Session**, a stateful, thread-
 
 It is composed of nine orthogonal mixins:
 1.  **`CoreMixin`**: Lifecycle, ORM proxy, message CRUD, and thread-safe DB commits.
-2.  **`ChatMixin`**: The agentic reasoning loop, tool execution orchestration, and stream parsing.
+2.  **`ChatMixin`**: The agentic reasoning loop, tool execution orchestration, stream parsing, and the scientific debug-dump instrumentation layer.
 3.  **`UtilsMixin`**: Branch management, export normalization, and context token auditing.
 4.  **`PromptMixin`**: System prompt construction and XML tag post-processing.
 5.  **`MemoryMixin`**: Integration with `LollmsMemoryManager` for tiered persistent memory, episodic memory saving, and graph relationship traversal.
@@ -520,20 +520,20 @@ def chat(
     tools=None,
     add_user_message: bool = True,
     images=None,
-    debug: bool = False,
     remove_thinking_blocks: bool = True,
     enable_image_generation: bool = True,
     enable_image_editing:    bool = True,
     auto_activate_artefacts: bool = True,
     enable_inline_widgets:        bool = False,
+    enable_forms:                 bool = True,
     enable_notes:                 bool = True,
     enable_skills:                bool = True,
-    enable_forms:                 bool = True,
     enable_books:                 bool = False,
     enable_presentations:         bool = False,
     memory_manager=None,
     enable_artefacts:             bool = True,
     enable_memory:                bool = True,
+    enable_episodic_memory:       bool = True,
     enable_auto_dream:            bool = True,
     enable_deep_memory_pulling:   bool = True,
     prehydrate_rag:               bool = True,
@@ -549,6 +549,9 @@ def chat(
     enable_code_execution:        bool = False,
     suppress_images:              bool = False,  # 🛡️ Set to True for non-vision LLMs to prevent passing image data
     debug_export:                 bool = False,
+    debug:                        bool = False,
+    enable_vlm_query:             bool = False,
+    event_mode:                   EventMode = EventMode.PROCESSING_TAG_MODE,
     **kwargs
 ) -> Dict[str, Any]:
 ```
@@ -692,8 +695,10 @@ discussion.chat(user_message="Search for apples", tools=explicit_tools)
 *   `prehydrate_rag` (`bool`): If `True` and the personality has data, queries the RAG database before generation to inject context.
 
 **Debugging & UI Feedback**
-*   `debug` (`bool`): Enables verbose logging of the agentic loop.
-*   `debug_export` (`bool`): Dumps the exact `virtual_history` (LLM context) and `ai_msg.content` (UI context) to a JSON file in the workspace to verify context separation.
+*   `debug` (`bool`): Enables verbose agentic-loop logging and mounts the `debug_toolset` LCP library (exposes the `tool_dump_context` tool to the LLM). Does **not** enable file dumps by itself.
+*   `debug_export` (`bool`): Activates the **Scientific Debug-Dump Protocol** for this single turn (see [🔬 Scientific Debugging & Context Dump Protocol](#-scientific-debugging--context-dump-protocol)). Writes per-round prompt dumps, raw LLM stream dumps, and the final turn context dump to the discussion's `_debug_dumps` directory.
+*   `enable_episodic_memory` (`bool`): If `True` (default), saves substantial conversation turns as episodic memories. Set to `False` for privacy-sensitive sessions or manual memory control.
+*   `enable_vlm_query` (`bool`): If `True` and the active LLM lacks vision, auto-mounts the `tool_vlm_query` tool that routes image questions to a vision-capable fallback binding.
 *   `enable_in_message_status` (`bool`): If `True`, emits detailed status comments inside `<processing>` blocks for UI rendering.
 *   `remove_thinking_blocks` (`bool`): If `True`, strips `_EDEFAULT` or `INSTRUCTION` blocks from the final saved message content.
 *   `event_mode` (`EventMode`): Controls how execution telemetry (tool calls, artifact builds, context updates) is reported to the `streaming_callback`. Defaults to `EventMode.PROCESSING_TAG_MODE`.
@@ -964,6 +969,84 @@ discussion.chat(user_message="New question...") # Works normally
 *   **No Orphaned Tools**: If cancelled *during* tool execution, the system waits for the current tool to finish its `finally` block (to restore CWD and close files) before breaking the loop. It does not kill the process abruptly (which could corrupt files).
 *   **DB Integrity**: The partial message is saved to the database with a cancellation marker. You do not lose the conversation history up to that point.
 *   **Context Cleanliness**: The system ensures no partial XML tags or broken JSON structures are left in the context window for the next turn.
+
+---
+
+### 🐛 5.3 Scientific Debugging & Context Dump Protocol
+
+When an agentic loop misbehaves (phantom tool calls, KV-cache poisoning, context bloat, malformed XML), guessing is not enough. `ChatMixin` ships with a **dump-everything instrumentation layer**, feature-parity with `LollmsPersonality.debug_mode`, that writes the *exact bytes* sent to and received from the LLM to disk for post-mortem analysis.
+
+#### Activation
+
+| Method | Scope | Mechanism |
+| :--- | :--- | :--- |
+| `discussion.chat(..., debug_export=True)` | Single turn | Per-call parameter; enables all dump types below. |
+| `discussion._debug_mode = True` | Persistent (all future turns) | Instance flag, mirroring `personality.debug_mode`. Can be toggled at any time by the host application. |
+
+Internally the two are OR-ed: `debug_enabled = debug_export or discussion._debug_mode`. The separate `debug=True` parameter is **orthogonal** — it only mounts the `debug_toolset` LCP library (giving the LLM a `tool_dump_context` self-inspection tool) and does not write dump files.
+
+#### Dump File Inventory
+
+All artifacts are written to `data_workspace/discussions/{discussion_id}/workspace_data/_debug_dumps/`:
+
+| File | Written When | Contents |
+| :--- | :--- | :--- |
+| `full_prompt_round_N.log` | After `export()` each reasoning round | The **complete, verbatim prompt** (every message, role, and full text) exactly as sent to the LLM binding. Images are represented as `[IMAGE ATTACHED]` markers. |
+| `prompt_dump_round_N_shortened.md` | After `export()` each reasoning round | A human-readable Markdown digest of the same prompt — each message truncated to first/last 500 characters — for quick manual inspection. |
+| `raw_llm_output_round_N.log` | After generation completes each round | The **raw, unfiltered token stream** received from the LLM, captured *before* any stream parsing, tag interception, or sanitization. This reveals what the model *actually* emitted, including partial tags and `<think>` blocks. |
+| `turn_dump_<timestamp>.json` | Once at end of turn | Structured JSON: the final `virtual_history` (the LLM's view), `ai_message.content` (the UI/DB view), and `ai_message.metadata`. Used to verify **context separation** between the two streams. |
+| `export_dump_<timestamp>.json` | When `export(debug=True)` runs | The normalized message list produced by `HistoryManager.export()` at that instant. |
+| `error_round_N_<context>.log` | On uncaught exceptions | Structured error report: exception type, message, **full traceback**, and contextual `extra_data` (e.g., failing tool name + parameters, or the last 4000 chars of raw LLM output). |
+
+> **Note**: The `error_round_*.log` dumps are gated on the persistent `discussion._debug_mode` flag only — they fire even if `debug_export` was not passed for the turn, as long as `_debug_mode` is set. This guarantees crash forensics are never lost on a long-running debug session.
+
+#### Crash Forensics Coverage
+
+`_dump_error()` is wired into the two critical failure points of the agentic loop:
+
+1.  **LLM Generation Failure** — dumps the exception plus `raw_llm_output` (last 4000 chars), revealing whether the model streamed garbage before the binding crashed.
+2.  **Tool Execution Crash** — dumps the exception plus `tool_name` and the exact `parameters` dict, enabling exact reproduction of the failing call.
+
+#### Directory Layout Example
+
+```text
+data_workspace/
+└── discussions/
+    └── {discussion_id}/
+        └── workspace_data/
+            └── _debug_dumps/
+                ├── full_prompt_round_1.log
+                ├── prompt_dump_round_1_shortened.md
+                ├── raw_llm_output_round_1.log
+                ├── full_prompt_round_2.log
+                ├── prompt_dump_round_2_shortened.md
+                ├── raw_llm_output_round_2.log
+                ├── error_round_2_llm_generation_error.log   ← if a round crashed
+                ├── error_round_3_tool_execution_error.log   ← if a tool crashed
+                ├── export_dump_20260908_124459_123456.json
+                └── turn_dump_20260908_124500_654321.json
+```
+
+#### Usage Example
+
+```python
+# One-shot forensic capture of a failing turn
+response = discussion.chat(
+    user_message="Analyze data.csv and build the quarterly report",
+    debug_export=True
+)
+
+# …or enable persistent instrumentation for an entire debugging session
+discussion._debug_mode = True
+response = discussion.chat(user_message="Re-run the analysis")
+discussion._debug_mode = False  # disable when done (zero overhead when off)
+```
+
+#### 🛡️ Security & Privacy Caveats
+
+*   **Full prompt exposure**: `full_prompt_round_*.log` contains the complete system prompt, RAG context, memories, and workspace file contents. Never enable debug dumps in production or when handling sensitive user data.
+*   **Retention**: Dumps are never auto-deleted. Purge `_debug_dumps/` manually after a debugging session, or exclude it from backups.
+*   **No network egress**: All dumps are strictly local writes inside the discussion workspace — nothing leaves the machine.
 
 ---
 

@@ -84,7 +84,7 @@ def create_dynamic_models(
         @declared_attr
         def messages(cls):
             return relationship("Message", back_populates="discussion",
-                                cascade="all, delete-orphan", lazy="joined")
+                                cascade="all, delete-orphan", lazy="select")
 
     class MessageBase:
         __abstract__ = True
@@ -198,10 +198,40 @@ class LollmsDataManager:
     def get_session(self) -> Session:
         return self.SessionLocal()
 
+    _SUMMARY_COLUMNS = ("id", "created_at", "updated_at", "active_branch_id")
+
+    @staticmethod
+    def _extract_summary_title(discussion_metadata) -> str:
+        if isinstance(discussion_metadata, dict):
+            title = discussion_metadata.get("title")
+            if isinstance(title, str) and title.strip():
+                return title
+        return ""
+
     def list_discussions(self, limit=None) -> List[Dict]:
         with self.get_session() as session:
-            discussions = session.query(self.DiscussionModel).all()
-            return [{c.name: getattr(disc, c.name) for c in disc.__table__.columns} for disc in (discussions[:limit] if limit else discussions)]
+            query = session.query(
+                self.DiscussionModel.id,
+                self.DiscussionModel.created_at,
+                self.DiscussionModel.updated_at,
+                self.DiscussionModel.active_branch_id,
+                self.DiscussionModel.discussion_metadata,
+            ).order_by(self.DiscussionModel.updated_at.desc())
+            if limit:
+                query = query.limit(limit)
+            rows = query.all()
+            return [
+                {
+                    "id": row.id,
+                    "created_at": row.created_at,
+                    "updated_at": row.updated_at,
+                    "active_branch_id": row.active_branch_id,
+                    "title": self._extract_summary_title(row.discussion_metadata),
+                    "artefacts_count": len(row.discussion_metadata.get("_artefacts", []))
+                                       if isinstance(row.discussion_metadata, dict) else 0,
+                }
+                for row in rows
+            ]
 
     def get_discussion(self, lollms_client, discussion_id: str, **kwargs):
         from lollms_client.lollms_discussion import LollmsDiscussion
@@ -220,8 +250,25 @@ class LollmsDataManager:
             for key, value in criteria.items():
                 if hasattr(self.DiscussionModel, key):
                     query = query.filter(getattr(self.DiscussionModel, key).ilike(f"%{value}%"))
-            discussions = query.all()
-            return [{c.name: getattr(disc, c.name) for c in disc.__table__.columns} for disc in discussions]
+            rows = query.with_entities(
+                self.DiscussionModel.id,
+                self.DiscussionModel.created_at,
+                self.DiscussionModel.updated_at,
+                self.DiscussionModel.active_branch_id,
+                self.DiscussionModel.discussion_metadata,
+            ).all()
+            return [
+                {
+                    "id": row.id,
+                    "created_at": row.created_at,
+                    "updated_at": row.updated_at,
+                    "active_branch_id": row.active_branch_id,
+                    "title": self._extract_summary_title(row.discussion_metadata),
+                    "artefacts_count": len(row.discussion_metadata.get("_artefacts", [])
+                                           if isinstance(row.discussion_metadata, dict) else []),
+                }
+                for row in rows
+            ]
 
     def delete_discussion(self, discussion_id: str):
         with self.get_session() as session:
