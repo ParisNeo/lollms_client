@@ -59,6 +59,7 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
 _SERIALIZATION_PROFILE_SUFFIXES = (
     "_BINDING_ALIAS", "_BINDING_NAME", "_MODEL_NAME", "_IS_DEFAULT",
     "_VISION_ENABLED", "_FORCED_CONTEXT_SIZE", "_VERIFY_SSL_CERTIFICATE",
+    "_INSTANCE_NAME",
 )
 
 
@@ -202,6 +203,45 @@ def _convert_to_bool(val: Any) -> bool:
         return val.lower().strip() in ("true", "1", "yes", "y", "on")
     return False
 
+
+def _find_first_upper_param_boundary(remainder: str) -> int:
+    """
+    Given a string like "GENERAL_TIMEOUT" or "MY_ALIAS_TIMEOUT",
+    find the position where the alias ends and the parameter key begins.
+
+    Convention: The alias may contain any chars (including underscores).
+    The parameter key starts at the first substring that matches
+    a known binding_config key pattern (all-uppercase word starting
+    with a standard key like HOST_ADDRESS, SERVICE_KEY, MODEL_NAME,
+    TIMEOUT, VERIFY_SSL_CERTIFICATE, etc.).
+
+    Simple heuristic: find the first "_" followed by a substring that
+    looks like a parameter key (starts with a known prefix or is a
+    common connection/LLM config key).
+    """
+    # Common keys we look for as potential parameter starts
+    KNOWN_KEYS = {
+        "HOST_ADDRESS", "SERVICE_KEY", "TIMEOUT", "MODEL_NAME",
+        "INSTANCE_NAME", "VERIFY_SSL_CERTIFICATE", "CERTIFICATE_FILE_PATH",
+        "BINDING_NAME", "N_THREADS", "VERIFY", "SSL", "MODEL",
+        "INSTANCE", "TOKEN", "KEY", "URL", "PORT", "HOST",
+    }
+    # We look for "_" followed by a word that is a known key start
+    parts = remainder.split("_")
+    for i in range(1, len(parts)):
+        candidate_key = "_".join(parts[i:])
+        if candidate_key.upper() in KNOWN_KEYS or any(candidate_key.upper().startswith(k) for k in KNOWN_KEYS):
+            # Reconstruct position: find the index of this "_" in remainder
+            pos = 0
+            for _ in range(i):
+                pos = remainder.find("_", pos)
+                pos += 1
+            return pos - 1  # Return index of the "_" before the key
+    # Fallback: first underscore splits alias from key
+    return remainder.find("_")
+
+
+
 def _sanitize_alias(alias: str) -> str:
     """Normalizes a profile/binding alias into an env-safe, case-insensitive registry key."""
     cleaned = re.sub(r"[^A-Za-z0-9_]", "_", str(alias).strip().lower())
@@ -219,10 +259,17 @@ def _extract_bindings_from_env(prefix: str, env_data: Dict[str, str]) -> Dict[st
         if not k_upper.startswith(binding_prefix):
             continue
         remainder = k_upper[len(binding_prefix):]
-        idx = remainder.find("_")
+
+        # The binding_prefix already ends with a trailing underscore after BINDINGS.
+        # So remainder is e.g. "GENERAL_HOST_ADDRESS" where GENERAL is the alias.
+        # Use the helper to find the boundary between alias and parameter key.
+        idx = _find_first_upper_param_boundary(remainder)
         if idx <= 0:
             continue
-        raw_alias, raw_key = remainder[:idx], remainder[idx + 1:]
+
+        raw_alias = remainder[:idx]
+        raw_key = remainder[idx + 1:]  # skip the underscore separator
+
         alias = _sanitize_alias(raw_alias)
         key = raw_key.lower()
         if not alias or not key:
@@ -240,6 +287,7 @@ def _extract_bindings_from_env(prefix: str, env_data: Dict[str, str]) -> Dict[st
 _PROFILE_KNOWN_KEYS = (
     "BINDING_ALIAS", "BINDING_NAME", "MODEL_NAME", "IS_DEFAULT",
     "VISION_ENABLED", "FORCED_CONTEXT_SIZE", "VERIFY_SSL_CERTIFICATE",
+    "INSTANCE_NAME",
 )
 
 
@@ -259,7 +307,7 @@ def _extract_profiles_from_env(prefix: str, bindings: Dict[str, Dict[str, Any]],
         for known_key in _PROFILE_KNOWN_KEYS:
             marker = f"_{known_key}"
             if remainder.endswith(marker):
-                alias = remainder[: -len(marker)]
+                alias = remainder[:-len(marker)]
                 key = known_key
                 break
         if key is None and "_ROUTING_" in remainder:
@@ -281,6 +329,8 @@ def _extract_profiles_from_env(prefix: str, bindings: Dict[str, Dict[str, Any]],
             profiles[p_alias]["binding_name"] = v
         elif key == "MODEL_NAME":
             profiles[p_alias]["model_name"] = v
+        elif key == "INSTANCE_NAME":
+            profiles[p_alias]["instance_name"] = v
         elif key == "IS_DEFAULT":
             profiles[p_alias]["is_default"] = _convert_to_bool(v)
         elif key == "VISION_ENABLED":
@@ -302,19 +352,25 @@ def _extract_profiles_from_env(prefix: str, bindings: Dict[str, Dict[str, Any]],
         b_info = bindings.get(b_alias, {}) if b_alias else {}
         binding_name = p_data.get("binding_name") or b_info.get("binding_name")
         base_b_config = b_info.get("binding_config", {})
-        profile_b_config = {k: v for k, v in p_data.items() if k not in {"binding_alias", "is_default", "vision_enabled", "forced_context_size", "model_name", "binding_name", "routing_config"}}
+        profile_b_config = {k: v for k, v in p_data.items() if k not in {"binding_alias", "is_default", "vision_enabled", "forced_context_size", "model_name", "instance_name", "binding_name", "routing_config"}}
         merged_b_config = {**base_b_config, **profile_b_config}
         if "model_name" in p_data:
             merged_b_config["model_name"] = p_data["model_name"]
+        # For connection bindings, instance_name maps to model_name conceptually
+        elif "instance_name" in p_data:
+            merged_b_config["model_name"] = p_data["instance_name"]
         if not binding_name:
             continue
+
+        # Use instance_name as model_name for connections when model_name not set
+        effective_model_name = p_data.get("model_name") or p_data.get("instance_name")
 
         resolved_profiles[p_alias] = {
             "binding_name": binding_name,
             "binding_alias": b_alias,
             "binding_profile_name": b_alias,
             "binding_config": merged_b_config,
-            "model_name": p_data.get("model_name"),
+            "model_name": effective_model_name,
             "is_default": p_data.get("is_default", False),
             "vision_enabled": p_data.get("vision_enabled", False),
             "forced_context_size": p_data.get("forced_context_size"),
@@ -363,6 +419,7 @@ def get_client_from_env(
     create_tts: bool = False,
     create_ttm: bool = False,
     create_ttv: bool = False,
+    create_connection: bool = False,
     run_wizard_if_fail: bool = True
 ) -> "LollmsClient":
     from lollms_client import LollmsClient
@@ -435,7 +492,8 @@ def get_client_from_env(
     kwargs = {}
     binding_types = {
         "llm": create_llm, "tti": create_tti, "tts": create_tts,
-        "stt": create_stt, "ttm": create_ttm, "ttv": create_ttv
+        "stt": create_stt, "ttm": create_ttm, "ttv": create_ttv,
+        "connection": create_connection,
     }
 
     for b_type, should_create in binding_types.items():
@@ -519,6 +577,14 @@ def _list_bindings_by_type(b_type: str) -> List[str]:
         from lollms_client.lollms_bindings_utils import list_bindings
         return [b if isinstance(b, str) else b.get("name") for b in list_bindings(b_type) if b]
     except: return []
+
+def _list_connection_bindings() -> List[str]:
+    """List connection bindings by scanning the connection_bindings directory."""
+    try:
+        from lollms_client.lollms_connection_binding import get_available_bindings
+        return [b.get("binding_name") or b.get("title", "") for b in get_available_bindings() if b]
+    except Exception:
+        return []
 
 def _get_binding_description(b_name: str, b_type: str) -> Optional[Dict[str, Any]]:
     try:
@@ -850,6 +916,10 @@ def _profiles_menu(b_type: str, config_map: Dict[str, str]):
         if menu.run() is None: break
 
 def _modality_menu(b_type: str, config_map: Dict[str, str]):
+    if b_type == "connection":
+        _connection_modality_menu(config_map)
+        return
+
     while True:
         menu = Menu(f"{b_type.upper()} Configuration", mode=Menu.MODE_EXECUTE, exit_text="↩ Back")
         menu.set_intro(f"Configure {b_type.upper()} Bindings and Profiles.")
@@ -857,6 +927,303 @@ def _modality_menu(b_type: str, config_map: Dict[str, str]):
         menu.add_action(f"Configure {b_type.upper()} Profiles", lambda: _profiles_menu(b_type, config_map))
         if menu.run() is None: break
 
+
+def _connection_modality_menu(config_map: Dict[str, str]):
+    """Specialized modality menu for CONNECTION bindings (uses instance_name, not model_name)."""
+    while True:
+        menu = Menu("CONNECTION Configuration", mode=Menu.MODE_EXECUTE, exit_text="↩ Back")
+        menu.set_intro(
+            "Configure Connection Bindings (Discord, Telegram, Slack, Webhook, etc.) "
+            "and Instance Profiles (which channel to send to)."
+        )
+        menu.add_action("🔗 Add Connection Binding", lambda: _add_connection_binding_flow(config_map))
+        menu.add_action("📱 Add Instance Profile (Channel)", lambda: _add_connection_profile_flow(config_map))
+        menu.add_action("✏️ Edit Existing", lambda: _connection_edit_menu(config_map))
+        menu.add_action("🗑️ Delete", lambda: _connection_delete_menu(config_map))
+
+        existing = _get_configured_aliases("connection", config_map, "BINDINGS")
+        existing_profiles = _get_configured_aliases("connection", config_map, "PROFILES")
+        if existing:
+            ASCIIColors.info(f"\n  Configured bindings: {', '.join(existing)}")
+        if existing_profiles:
+            ASCIIColors.info(f"  Configured profiles: {', '.join(existing_profiles)}")
+
+        if menu.run() is None: break
+
+
+def _add_connection_binding_flow(config_map: Dict[str, str]):
+    """Add a new connection binding (e.g., generic_webhook) with an alias."""
+    conn_bindings = _list_connection_bindings()
+    if not conn_bindings:
+        ASCIIColors.warning("No connection bindings available. Check connection_bindings/ directory.")
+        return
+
+    selected = _safe_select("Select a connection binding:", conn_bindings)
+    if not selected:
+        return
+
+    alias = _sanitize_alias(_safe_input("Enter an alias for this connection (e.g., 'slack-main', 'discord-ops')", "main"))
+    if not alias:
+        return
+
+    _configure_connection_binding_instance(selected, alias, config_map)
+
+
+def _configure_connection_binding_instance(b_name: str, alias: str, config_map: Dict[str, str]):
+    """Configure a specific connection binding's global parameters."""
+    prefix = f"CONNECTION_BINDINGS_{alias}_"
+    config_map[prefix + "BINDING_NAME"] = b_name
+    ASCIIColors.green(f"\n  ✓ Selected CONNECTION binding: {b_name} (Alias: {alias})")
+
+    # Try to load description.yaml for the binding
+    desc = _get_connection_binding_description(b_name)
+    if desc:
+        params = desc.get("global_input_parameters", [])
+        for p in params:
+            pname = p.get("name", "")
+            if not pname:
+                continue
+            val = _prompt_param(pname, p.get("description", ""), p.get("type", "str"), p.get("mandatory", False), p.get("default"))
+            config_map[prefix + pname.upper()] = _format_env_value(val)
+    else:
+        # Fallback: prompt for standard connection params
+        ASCIIColors.yellow("\n  No description.yaml found. Using standard connection parameters.\n")
+        host_val = _prompt_param("host_address", "Platform API base URL or webhook endpoint", "str", False, "")
+        if host_val:
+            config_map[prefix + "HOST_ADDRESS"] = _format_env_value(host_val)
+        key_val = _prompt_param("service_key", "API key, bot token, or webhook URL (includes credentials)", "str", False, "")
+        if key_val:
+            config_map[prefix + "SERVICE_KEY"] = _format_env_value(key_val)
+        timeout_val = _prompt_param("timeout", "HTTP timeout in seconds", "int", False, 30)
+        config_map[prefix + "TIMEOUT"] = _format_env_value(timeout_val)
+
+
+def _get_connection_binding_description(b_name: str) -> Optional[Dict[str, Any]]:
+    """Load description.yaml for a specific connection binding."""
+    try:
+        from lollms_client.lollms_connection_binding import LollmsConnectionBindingManager
+        bindings_dir = Path(LollmsConnectionBindingManager.__init__.__code__.co_filename).parent / "connection_bindings" / b_name
+        desc_file = bindings_dir / "description.yaml"
+        if desc_file.exists():
+            import yaml
+            with open(desc_file, "r", encoding="utf-8") as f:
+                return yaml.safe_load(f)
+    except Exception:
+        pass
+    return None
+
+
+def _add_connection_profile_flow(config_map: Dict[str, str]):
+    """Add a new instance profile (channel/conversation) for a connection binding."""
+    connection_bindings = _get_configured_aliases("connection", config_map, "BINDINGS")
+    if not connection_bindings:
+        ASCIIColors.warning("No connection bindings configured yet. Add a binding first.")
+        return
+
+    selected_binding = _safe_select("Select connection binding:", connection_bindings)
+    if not selected_binding:
+        return
+
+    alias = _sanitize_alias(_safe_input(
+        "Enter alias for this instance/channel (e.g., 'general', 'alerts', 'support')",
+        "general"
+    ))
+    if not alias:
+        return
+
+    _configure_connection_profile_instance(selected_binding, alias, config_map)
+
+
+def _configure_connection_profile_instance(binding_alias: str, instance_alias: str, config_map: Dict[str, str]):
+    """Configure a connection instance profile (which channel/conversation to target)."""
+    prefix = f"CONNECTION_PROFILES_{instance_alias}_"
+    config_map[prefix + "BINDING_ALIAS"] = binding_alias
+
+    # Prompt for instance_name (channel name/chat ID)
+    instance_name = _safe_input(
+        "Enter the channel name or conversation ID "
+        "(e.g., '#general', 'my-group-chat', or a numeric chat_id)",
+        "general"
+    )
+    if not instance_name.strip():
+        ASCIIColors.warning("Instance name is required. Skipping profile creation.")
+        return
+    config_map[prefix + "INSTANCE_NAME"] = instance_name.strip()
+
+    if _safe_confirm(f"Make '{instance_alias}' the default instance profile?", default=(instance_alias == "general")):
+        config_map[prefix + "IS_DEFAULT"] = "true"
+
+    ASCIIColors.green(f"\n  ✓ Saved connection instance profile: {instance_alias} (→ {binding_alias}:{instance_name})")
+
+
+def _connection_edit_menu(config_map: Dict[str, str]):
+    """Edit an existing connection binding or instance profile."""
+    bindings = _get_configured_aliases("connection", config_map, "BINDINGS")
+    profiles = _get_configured_aliases("connection", config_map, "PROFILES")
+
+    all_choices = []
+    for b in bindings:
+        all_choices.append(f"Binding: {b}")
+    for p in profiles:
+        all_choices.append(f"Profile: {p}")
+
+    if not all_choices:
+        ASCIIColors.warning("No connection bindings or profiles to edit.")
+        return
+
+    selected = _safe_select("Select what to edit:", all_choices)
+    if not selected:
+        return
+
+    if selected.startswith("Binding:"):
+        alias = selected.split(": ", 1)[1].strip()
+        _edit_keys_menu("connection", "BINDINGS", alias, config_map)
+    elif selected.startswith("Profile:"):
+        alias = selected.split(": ", 1)[1].strip()
+        _edit_keys_menu("connection", "PROFILES", alias, config_map)
+
+
+def _connection_delete_menu(config_map: Dict[str, str]):
+    """Delete an existing connection binding or instance profile."""
+    bindings = _get_configured_aliases("connection", config_map, "BINDINGS")
+    profiles = _get_configured_aliases("connection", config_map, "PROFILES")
+
+    all_choices = []
+    for b in bindings:
+        all_choices.append(f"Binding: {b}")
+    for p in profiles:
+        all_choices.append(f"Profile: {p}")
+
+    if not all_choices:
+        ASCIIColors.warning("No connection bindings or profiles to delete.")
+        return
+
+    selected = _safe_select("Select what to delete:", all_choices)
+    if not selected:
+        return
+
+    if selected.startswith("Binding:"):
+        alias = selected.split(": ", 1)[1].strip()
+        _delete_entry("connection", "BINDINGS", alias, config_map)
+    elif selected.startswith("Profile:"):
+        alias = selected.split(": ", 1)[1].strip()
+        _delete_entry("connection", "PROFILES", alias, config_map)
+
+
+def _list_bindings_by_type(b_type: str) -> List[str]:
+    """List bindings by modality type, falling back to manual discovery for 'connection'."""
+    if b_type == "connection":
+        return _list_connection_bindings()
+    try:
+        from lollms_client.lollms_bindings_utils import list_bindings
+        return [b if isinstance(b, str) else b.get("name") for b in list_bindings(b_type) if b]
+    except: return []
+
+
+def _show_tool_registry(persona) -> None:
+    """Discovers and lists available tools on the personality."""
+    from lollms_client.lollms_personality.lollms_personality import LollmsPersonality
+    active = persona._discover_tools(None, None) if isinstance(persona, LollmsPersonality) else {}
+    print("\n🔧 Available Tools:")
+    for t_name, t_spec in active.items():
+        params = t_spec.get("parameters", [])
+        param_str = ", ".join(p["name"] for p in params)
+        print(f"   🛠️  {t_name}({param_str})")
+        print(f"      {t_spec.get('description', '')[:80]}")
+
+def build_client_with_connection() -> "LollmsClient":
+    """
+    Builds a LollmsClient with both LLM and CONNECTION profiles.
+    Resolution order:
+      1. Try get_client_from_env with create_connection=True (uses saved wizard config).
+      2. If no connection profiles found, fall back to interactive webhook prompt.
+    """
+    from lollms_client import LollmsClient
+    from lollms_client.lollms_config_cli_env import get_client_from_env
+
+    ASCIIColors.info("🔧 Resolving LLM + Connection configuration...")
+
+    # First attempt: Load everything from saved config (including CONNECTION profiles)
+    try:
+        full_client = get_client_from_env(
+            create_llm=True,
+            create_connection=True,
+            run_wizard_if_fail=True,
+        )
+        if full_client.connection:
+            ASCIIColors.success("✅ Connection loaded from saved configuration.")
+            return full_client
+    except Exception as e:
+        ASCIIColors.warning(f"Full-config load (with connection) failed: {e}")
+        ASCIIColors.info("Falling back to LLM-only load + interactive webhook setup...")
+
+    # Second attempt: LLM only, then prompt for webhook
+    try:
+        llm_client = get_client_from_env(
+            create_llm=True,
+            run_wizard_if_fail=True,
+        )
+    except Exception as e:
+        ASCIIColors.error(f"LLM config failed: {e}")
+        sys.exit(1)
+
+    active_binding = getattr(llm_client.llm, 'binding_name', '?')
+    active_model = getattr(llm_client.llm, 'model_name', '?')
+    ASCIIColors.success(f"✅ LLM ready: {active_binding} / {active_model}")
+
+    # ── Interactive Connection Setup ──────────────────────────────────
+    webhook_url = os.getenv("LOLLMS_WEBHOOK_URL", "").strip()
+
+    if not webhook_url:
+        print()
+        ASCIIColors.info("No webhook URL found in LOLLMS_WEBHOOK_URL env var.")
+        ASCIIColors.info("You can also create one via the wizard: python -m lollms_client.lollms_config_cli_env")
+        ASCIIColors.info("  - Slack:  https://hooks.slack.com/services/T.../B.../XXX")
+        ASCIIColors.info("  - Discord: (Server Settings → Integrations → Webhooks)")
+        ASCIIColors.info("  - Test:   https://webhook.site")
+        webhook_url = input("\n  Enter webhook URL (or press Enter to skip): ").strip()
+
+    # Re-create the client with connection profiles injected
+    conn_binding_profiles = {}
+    conn_model_profiles = {}
+
+    if webhook_url:
+        ASCIIColors.info(f"📡 Using webhook: {webhook_url[:70]}...")
+        conn_binding_profiles = {
+            "webhook-main": {
+                "binding_name": "generic_webhook",
+                "binding_config": {
+                    "service_key": webhook_url,
+                    "timeout": 30,
+                },
+                "is_default": True,
+            }
+        }
+
+        conn_model_profiles = {
+            "webhook-default": {
+                "binding_profile_name": "webhook-main",
+                "model_name": "default",
+                "is_default": True,
+            },
+            "webhook-alerts": {
+                "binding_profile_name": "webhook-main",
+                "model_name": "alerts",
+                "is_default": False,
+            },
+        }
+
+    client = LollmsClient(
+        llm_binding_name=active_binding or "ollama",
+        llm_binding_config={
+            "model_name": active_model,
+        },
+        user_name="You",
+        ai_name="Assistant",
+        connection_binding_profiles=conn_binding_profiles if conn_binding_profiles else None,
+        connection_model_profiles=conn_model_profiles if conn_model_profiles else None,
+        debug=True,
+    )
 
 def _load_existing_env_to_map(cli_env_path: Optional[Union[str, Path]] = None) -> Dict[str, str]:
     config_map = {}
@@ -964,6 +1331,30 @@ def build_wizard_menu(
     cli_env_path: Optional[Union[str, Path]] = None,
 ) -> tuple:
     """Builds a configuration wizard menu that can run standalone or be
+
+    embedded as a submenu inside a bigger menu.
+
+    Args:
+        config_map: Mutable configuration map to edit. If None, a fresh map is
+            created and pre-loaded from existing config files when available.
+        title: Title displayed at the top of the menu.
+        exit_text: Label of the menu's exit entry.
+        exit_behavior: Governs what happens when the user selects the exit
+            entry:
+                "save"     -> persist config_map before returning.
+                "ask"      -> prompt Yes/No, then persist if confirmed.
+                "discard"  -> return without persisting (embedder owns saving).
+        include_save_exit: When True, append a "Save & Exit" action that
+            persists config_map and marks state["saved"] = True. When False,
+            the embedder owns persistence.
+
+    Returns:
+        tuple: (menu, state) where menu is a configured Menu instance and
+        state is {"config_map": dict, "saved": bool}. The caller is
+        responsible for invoking menu.run() (standalone) or wiring the menu
+        as a submenu action inside a parent menu.
+    """
+    """Builds a configuration wizard menu that can run standalone or be
     embedded as a submenu inside a bigger menu.
 
     Args:
@@ -1006,7 +1397,16 @@ def build_wizard_menu(
     menu.add_action("👂 Configure STT", lambda: _modality_menu("stt", config_map))
     menu.add_action("🎵 Configure TTM", lambda: _modality_menu("ttm", config_map))
     menu.add_action("🎬 Configure TTV", lambda: _modality_menu("ttv", config_map))
+    menu.add_action("🔗 Configure CONNECTION", lambda: _modality_menu("connection", config_map))
     menu.add_action("💾 Save", lambda: _save_and_validate(config_map, cli_env_path=cli_env_path))
+
+    # CONNECTION modality hint for couples counseling
+    if "CONNECTION_BINDINGS_" in str(config_map.keys()):
+        ASCIIColors.info(
+            "\n⭐ Tip: For multi-user apps (e.g., couples counseling), use "
+            "separate CONNECTION profiles per partner. Each partner's channel is "
+            "their own private vault. See examples_perso/proactive_partner/channel_router.py"
+        )
 
     state = {"config_map": config_map, "saved": False}
 

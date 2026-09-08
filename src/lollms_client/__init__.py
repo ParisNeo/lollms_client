@@ -24,9 +24,15 @@ from lollms_client.lollms_personality.handbag import Handbag
 from lollms_client.lollms_utilities import PromptReshaper
 from lollms_client.lollms_tools_binding import LollmsToolBinding, LollmsTOOLBindingManager
 from lollms_client.lollms_llm_binding import LollmsLLMBindingManager
+from lollms_client.lollms_connection_binding import (
+    LollmsConnectionBinding,
+    LollmsConnectionBindingManager,
+    ConnectionSendResult,
+    ConnectionReceiveResult,
+)
 from lollms_client.lollms_bindings_utils import list_bindings, get_binding_desc
 
-__version__ = "1.18.4" # Updated version
+__version__ = "1.19.0" # Connection bindings added
 
 # Optionally, you could define __all__ if you want to be explicit about exports
 __all__ = [
@@ -47,6 +53,10 @@ __all__ = [
     "FailureMemory",
     "PromptReshaper",
     "LollmsToolBinding",
+    "LollmsConnectionBinding",
+    "LollmsConnectionBindingManager",
+    "ConnectionSendResult",
+    "ConnectionReceiveResult",
     "LollmsLLMBindingManager",
     "LollmsTOOLBindingManager",
     "list_bindings",

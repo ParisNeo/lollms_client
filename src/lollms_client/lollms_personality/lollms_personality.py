@@ -1035,6 +1035,12 @@ class BindingToolsBuilder:
         if ttv is not None and caps.enable_ttv:
             tools["tool_generate_video"] = BindingToolsBuilder._make_ttv_tool(ttv, workspace_path)
 
+        # CONNECTION (Communication channels: Discord, Telegram, Slack, Webhook, etc.)
+        connection_registry = getattr(client, 'connection_model_profiles_registry', None)
+        has_connections = bool(connection_registry)
+        if has_connections or getattr(client, 'connection', None) is not None:
+            tools["tool_send_connection"] = BindingToolsBuilder._make_connection_tool(client)
+
         return tools
 
     @staticmethod
@@ -1283,6 +1289,73 @@ class BindingToolsBuilder:
                 {"name": "file_name", "type": "str", "description": "Output filename without extension.", "optional": True},
             ],
             "callable": tool_generate_music,
+        }
+
+    @staticmethod
+    def _make_connection_tool(client) -> Dict[str, Any]:
+        def tool_send_connection(content: str, channel_alias: str = "", sender_name: str = "") -> dict:
+            """
+            Send a message to a communication channel via an active connection binding.
+
+            Args:
+                content (str): The message text to send.
+                channel_alias (str, optional): The connection profile alias to use
+                    (e.g., "slack-alerts", "discord-general"). If empty, uses the active/default connection.
+                sender_name (str, optional): Display name override.
+            """
+            try:
+                conn_binding = getattr(client, 'connection', None)
+                if conn_binding is None:
+                    conn_registry = getattr(client, 'connection_model_profiles_registry', None)
+                    if conn_registry:
+                        target_alias = next(
+                            (a for a, p in conn_registry.items() if p.is_default), None
+                        )
+                        if target_alias and hasattr(client, 'switch_connection'):
+                            client.switch_connection(target_alias)
+                            conn_binding = getattr(client, 'connection', None)
+
+                if conn_binding is None:
+                    return {
+                        "success": False,
+                        "error": "No connection binding available. Configure connection_binding_name or connection_model_profiles.",
+                    }
+
+                result = conn_binding.send_message(
+                    content=content,
+                    sender_name=sender_name or None,
+                )
+
+                if result.get("sent"):
+                    return {
+                        "success": True,
+                        "output": f"Message sent successfully via {conn_binding.binding_name} to channel '{result.get('channel', 'unknown')}'.",
+                        "channel": result.get("channel"),
+                        "message_id": result.get("message_id"),
+                        "prompt_injection": f"\n\n📤 Message sent to {result.get('channel', 'channel')} via {conn_binding.binding_name}.",
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "error": f"Failed to send message: {result.get('error', 'Unknown error')}",
+                    }
+
+            except Exception as e:
+                return {"success": False, "error": f"Connection send failed: {e}"}
+
+        return {
+            "name": "tool_send_connection",
+            "description": (
+                "Send a message to a communication channel (Discord, Telegram, Slack, webhook, etc.) "
+                "via an active connection binding. Optionally specify a channel_alias to pick a different "
+                "connection profile from the registered set."
+            ),
+            "parameters": [
+                {"name": "content", "type": "str", "description": "The message text to send."},
+                {"name": "channel_alias", "type": "str", "description": "Connection profile alias (default = active).", "optional": True},
+                {"name": "sender_name", "type": "str", "description": "Display name override (optional).", "optional": True},
+            ],
+            "callable": tool_send_connection,
         }
 
     @staticmethod

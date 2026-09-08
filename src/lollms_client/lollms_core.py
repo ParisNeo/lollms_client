@@ -31,6 +31,7 @@ from lollms_client.lollms_stt_binding import LollmsSTTBinding, LollmsSTTBindingM
 from lollms_client.lollms_ttv_binding import LollmsTTVBinding, LollmsTTVBindingManager
 from lollms_client.lollms_ttm_binding import LollmsTTMBinding, LollmsTTMBindingManager
 from lollms_client.lollms_tools_binding import LollmsToolBinding, LollmsTOOLBindingManager
+from lollms_client.lollms_connection_binding import LollmsConnectionBinding, LollmsConnectionBindingManager
 from lollms_client.lollms_personality.lollms_personality import ToolsManager
 
 from lollms_client.lollms_discussion import LollmsDiscussion
@@ -76,6 +77,7 @@ class LollmsClient():
         ttv_binding_name: Optional[str] = None,
         ttm_binding_name: Optional[str] = None,
         tools_binding_name: Optional[str] = None,
+        connection_binding_name: Optional[str] = None,
 
         # Modality Binding Directories
         llm_bindings_dir: Path = Path(__file__).parent / "llm_bindings",
@@ -85,6 +87,7 @@ class LollmsClient():
         ttv_bindings_dir: Path = Path(__file__).parent / "ttv_bindings",
         ttm_bindings_dir: Path = Path(__file__).parent / "ttm_bindings",
         tools_bindings_dir: Path = Path(__file__).parent / "tools_bindings",
+        connection_bindings_dir: Path = Path(__file__).parent / "connection_bindings",
 
         # Configurations
         llm_binding_config: Optional[Dict[str, any]] = None,
@@ -94,6 +97,7 @@ class LollmsClient():
         ttv_binding_config: Optional[Dict[str, any]] = None, 
         ttm_binding_config: Optional[Dict[str, any]] = None, 
         tools_binding_config: Optional[Dict[str, any]] = None,
+        connection_binding_config: Optional[Dict[str, any]] = None,
         user_name ="user",
         ai_name = "assistant",
         callback: Optional[Callable[[str, MSG_TYPE, Optional[Dict]], bool]] = None,
@@ -108,6 +112,7 @@ class LollmsClient():
         stt_binding_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
         ttv_binding_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
         ttm_binding_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
+        connection_binding_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
 
         llm_model_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsModelProfile']]] = None,
         tti_model_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsModelProfile']]] = None,
@@ -115,6 +120,7 @@ class LollmsClient():
         stt_model_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsModelProfile']]] = None,
         ttv_model_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsModelProfile']]] = None,
         ttm_model_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsModelProfile']]] = None,
+        connection_model_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsModelProfile']]] = None,
 
         **kwargs
         ):
@@ -196,6 +202,7 @@ class LollmsClient():
         self.ttv_binding_manager = LollmsTTVBindingManager(ttv_bindings_dir)
         self.ttm_binding_manager = LollmsTTMBindingManager(ttm_bindings_dir)
         self.tools_binding_manager = LollmsTOOLBindingManager(tools_bindings_dir)
+        self.connection_binding_manager = LollmsConnectionBindingManager(connection_bindings_dir)
 
         self.llm: Optional[LollmsLLMBinding] = None
         self.tts: Optional[LollmsTTSBinding] = None
@@ -204,6 +211,7 @@ class LollmsClient():
         self.ttv: Optional[LollmsTTVBinding] = None
         self.ttm: Optional[LollmsTTMBinding] = None
         self.tools: Optional[LollmsToolBinding] = None
+        self.connection: Optional[LollmsConnectionBinding] = None
 
         # Multi-Binding Registries (Instantiated Models)
         self.llms: Dict[str, LollmsLLMBinding] = {}
@@ -212,6 +220,7 @@ class LollmsClient():
         self.stts: Dict[str, LollmsSTTBinding] = {}
         self.ttvs: Dict[str, LollmsTTVBinding] = {}
         self.ttms: Dict[str, LollmsTTMBinding] = {}
+        self.connections: Dict[str, LollmsConnectionBinding] = {}
 
         self._active_llm_alias: Optional[str] = None
         self._active_tti_alias: Optional[str] = None
@@ -219,6 +228,7 @@ class LollmsClient():
         self._active_stt_alias: Optional[str] = None
         self._active_ttv_alias: Optional[str] = None
         self._active_ttm_alias: Optional[str] = None
+        self._active_connection_alias: Optional[str] = None
 
         # 🖼️ VLM Image Description Cache (Image Hash -> Text Description)
         self._image_description_cache: Dict[str, str] = {}
@@ -230,6 +240,7 @@ class LollmsClient():
         self.stt_binding_profiles_registry: Dict[str, LollmsBindingProfile] = {}
         self.ttv_binding_profiles_registry: Dict[str, LollmsBindingProfile] = {}
         self.ttm_binding_profiles_registry: Dict[str, LollmsBindingProfile] = {}
+        self.connection_binding_profiles_registry: Dict[str, LollmsBindingProfile] = {}
 
         self.llm_model_profiles_registry: Dict[str, LollmsModelProfile] = {}
         self.tti_model_profiles_registry: Dict[str, LollmsModelProfile] = {}
@@ -237,6 +248,7 @@ class LollmsClient():
         self.stt_model_profiles_registry: Dict[str, LollmsModelProfile] = {}
         self.ttv_model_profiles_registry: Dict[str, LollmsModelProfile] = {}
         self.ttm_model_profiles_registry: Dict[str, LollmsModelProfile] = {}
+        self.connection_model_profiles_registry: Dict[str, LollmsModelProfile] = {}
 
         # Backward compatibility: Map legacy extra_llms to llm_model_profiles
         legacy_extra_llms = kwargs.pop("extra_llms", None)
@@ -262,21 +274,23 @@ class LollmsClient():
         self.user_name = user_name
         self.ai_name = ai_name
 
-        # 1. Register Connection Layer Profiles (Bindings)
+        # 1. Register Connection Layer Profiles (Bindings) — including CONNECTION
         self._register_binding_profiles(llm_binding_profiles, self.llm_binding_profiles_registry, "LLM", llm_binding_name, llm_binding_config)
         self._register_binding_profiles(tts_binding_profiles, self.tts_binding_profiles_registry, "TTS", tts_binding_name, tts_binding_config)
         self._register_binding_profiles(tti_binding_profiles, self.tti_binding_profiles_registry, "TTI", tti_binding_name, tti_binding_config)
         self._register_binding_profiles(stt_binding_profiles, self.stt_binding_profiles_registry, "STT", stt_binding_name, stt_binding_config)
         self._register_binding_profiles(ttv_binding_profiles, self.ttv_binding_profiles_registry, "TTV", ttv_binding_name, ttv_binding_config)
         self._register_binding_profiles(ttm_binding_profiles, self.ttm_binding_profiles_registry, "TTM", ttm_binding_name, ttm_binding_config)
+        self._register_binding_profiles(connection_binding_profiles, self.connection_binding_profiles_registry, "CONNECTION", connection_binding_name, connection_binding_config)
 
-        # 2. Register Execution Layer Profiles (Models)
+        # 2. Register Execution Layer Profiles (Models) — including CONNECTION
         self._register_model_profiles(llm_model_profiles, self.llm_model_profiles_registry, "LLM", self.llm_binding_profiles_registry)
         self._register_model_profiles(tts_model_profiles, self.tts_model_profiles_registry, "TTS", self.tts_binding_profiles_registry)
         self._register_model_profiles(tti_model_profiles, self.tti_model_profiles_registry, "TTI", self.tti_binding_profiles_registry)
         self._register_model_profiles(stt_model_profiles, self.stt_model_profiles_registry, "STT", self.stt_binding_profiles_registry)
         self._register_model_profiles(ttv_model_profiles, self.ttv_model_profiles_registry, "TTV", self.ttv_binding_profiles_registry)
         self._register_model_profiles(ttm_model_profiles, self.ttm_model_profiles_registry, "TTM", self.ttm_binding_profiles_registry)
+        self._register_model_profiles(connection_model_profiles, self.connection_model_profiles_registry, "CONNECTION", self.connection_binding_profiles_registry)
 
         # 3. Tools binding remains direct (not part of the two-tier profile system yet)
         if tools_binding_name:
@@ -328,6 +342,7 @@ class LollmsClient():
         _eagerly_instantiate_default(self.stt_model_profiles_registry, self.switch_stt, "STT")
         _eagerly_instantiate_default(self.ttv_model_profiles_registry, self.switch_ttv, "TTV")
         _eagerly_instantiate_default(self.ttm_model_profiles_registry, self.switch_ttm, "TTM")
+        _eagerly_instantiate_default(self.connection_model_profiles_registry, self.switch_connection, "CONNECTION")
 
     def _register_binding_profiles(self, profiles_dict: Optional[Dict], registry: Dict[str, LollmsBindingProfile], modality_name: str, legacy_binding_name: Optional[str] = None, legacy_binding_config: Optional[Dict] = None):
         """Registers connection layer profiles (binding engines/servers)."""
@@ -477,6 +492,9 @@ class LollmsClient():
     def switch_ttm(self, alias: str, callback=None) -> bool:
         return self._switch_modality(alias, self.ttm_model_profiles_registry, self.ttm_binding_profiles_registry, self.ttms, self.ttm_binding_manager, "ttm", "ttm", "_active_ttm_alias", callback)
 
+    def switch_connection(self, alias: str, callback=None) -> bool:
+        return self._switch_modality(alias, self.connection_model_profiles_registry, self.connection_binding_profiles_registry, self.connections, self.connection_binding_manager, "connection", "connection", "_active_connection_alias", callback)
+
     # Legacy aliases
     def mount_llm(self, alias: str) -> bool: return self.switch_model(alias)
     def mount_tti(self, alias: str) -> bool: return self.switch_tti(alias)
@@ -484,6 +502,7 @@ class LollmsClient():
     def mount_stt(self, alias: str) -> bool: return self.switch_stt(alias)
     def mount_ttv(self, alias: str) -> bool: return self.switch_ttv(alias)
     def mount_ttm(self, alias: str) -> bool: return self.switch_ttm(alias)
+    def mount_connection(self, alias: str) -> bool: return self.switch_connection(alias)
 
     # --- Properties delegating to LLM ---
     @property
@@ -544,6 +563,9 @@ class LollmsClient():
         # Tools binding does not use the profile system yet, fallback to direct instantiation
         self.tools = self.tools_binding_manager.create_binding(binding_name=binding_name, **(config or {}))
         if self.tools is None: raise ValueError(f"Failed to update MCP binding: {binding_name}")
+
+    def update_connection_binding(self, binding_name: str, config: Optional[Dict[str, Any]] = None):
+        return self._update_binding(binding_name, config, self.connection_binding_profiles_registry, self.connection_model_profiles_registry, self.connections, self.switch_connection, "CONNECTION")
 
     # --- Core LLM Methods (Delegated) ---
     def tokenize(self, text: str) -> list:
@@ -1308,6 +1330,34 @@ class LollmsClient():
         if self.tti:
             return self.tti.generate(*args, **kwargs)
         raise RuntimeError("TTI binding not initialized.")
+
+    def send_connection_message(self, content: str, channel_alias: Optional[str] = None, sender_name: Optional[str] = None, **kwargs):
+        """
+        Send a message via a connection binding.
+
+        Args:
+            content: The message text to send.
+            channel_alias: The connection profile alias to use. If None, uses the active/default connection.
+            sender_name: Optional display name override.
+            **kwargs: Platform-specific extra parameters.
+
+        Returns:
+            ConnectionSendResult dict with sent status and metadata.
+        """
+        if channel_alias and channel_alias != self._active_connection_alias:
+            self.switch_connection(channel_alias)
+
+        if self.connection:
+            return self.connection.send_message(content, sender_name=sender_name, **kwargs)
+        raise RuntimeError(
+            "Connection binding not initialized. Configure connection_binding_name or connection_model_profiles."
+        )
+
+    def list_connection_channels(self) -> list:
+        """List available channels on the active connection binding."""
+        if self.connection:
+            return self.connection.list_channels()
+        return []
 
     def generate_audio(self, *args, **kwargs):
         self._cooperative_unload_except("tts")

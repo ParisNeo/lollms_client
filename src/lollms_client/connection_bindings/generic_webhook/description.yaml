@@ -1,0 +1,28 @@
+title: "Generic Webhook Connector"
+author: "ParisNeo"
+version: 1.0.0
+binding_name: "generic_webhook"
+description: |
+  Sends messages to any webhook endpoint (Slack Incoming Webhooks, Discord Webhooks,
+  Telegram Bot API, n8n webhooks, Zapier, custom HTTP endpoints, etc.).
+  Posts a JSON payload: {"text": "message", "sender": "name", "instance": "channel"}.
+
+global_input_parameters:
+  - name: "service_key"
+    type: "str"
+    description: "The webhook URL to POST messages to. Should be the full URL including any tokens/secrets."
+    mandatory: true
+    default: ""
+
+  - name: "timeout"
+    type: "int"
+    description: "HTTP request timeout in seconds."
+    mandatory: false
+    default: 30
+
+model_input_parameters:
+  - name: "instance_name"
+    type: "str"
+    description: "A label for this webhook connection (e.g., 'team-alerts', 'personal-notes'). Used for logging and routing."
+    mandatory: false
+    default: "default"

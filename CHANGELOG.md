@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-08 23:04]
+
+- fix(lollms_client): minor imports and dependency adjustments in core and CLI files
+
 ## [2026-09-08 14:31]
 
 - feat(tools): add SPARQL query tool and enhance Python code execution
