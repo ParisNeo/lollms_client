@@ -28,6 +28,10 @@ All artefacts are strictly confined to a workspace root directory (e.g., `data_w
 ### D. Filesystem Synchronization
 If a file is manually deleted from the workspace folder, the `_sync_index_with_disk()` method detects the orphaned database record during the next synchronization cycle and purges it. The workspace folder is the single source of truth.
 
+**Image artefacts are validated against their physical twin**: an image artefact whose derived filename is absent from the workspace root is treated as orphaned and purged together with its `::images` companion pseudo-artefact. Companion (`::images`) records are skipped only while their parent image artefact still exists in the database; once the parent is gone, they are purged as well, so no ghost image slots remain in the artefact list after a sync.
+
+Purge results are committed to the discussion database immediately (`LollmsDiscussion.commit()`), so a purge survives persistence and is not silently rolled back by a later save.
+
 ---
 
 ## 👁️ 2. Multi-Tier Visibility Control
@@ -313,6 +317,17 @@ if deleted_items:
 
 ### Defensive Synchronization (`sync_all_active_to_disk`)
 The `sync_all_active_to_disk()` method contains a **defense-in-depth reconciliation pass**. After syncing all active DB artifacts to disk, it scans the workspace root one final time. If it discovers any file on disk that is NOT backed by an active DB record, it immediately unlinks (deletes) it. This guarantees that even if a stale write or a race condition attempts to re-materialize a deleted file, the filesystem is corrected to perfectly match the database state.
+
+The reverse direction is covered too: the index sync (`_sync_index_with_disk`) runs first and purges DB records whose physical files were manually deleted from disk — **including image artefacts** (validated via their derived physical filename) and orphaned `::images` companions whose parent is gone. Detected orphans are removed from the database and the purge is explicitly committed, so the artefact list reflects the disk state on the very first sync after deletion.
+
+#### Sync Behavior Summary
+| Situation | Sync result |
+| :--- | :--- |
+| Text/code/data artefact, file deleted from disk | DB record purged |
+| Image artefact, `.png` deleted from disk | DB record purged |
+| `::images` companion, parent image artefact purged | Companion purged (cascade) |
+| File on disk with no active DB record | File unlinked by reconciliation pass |
+| `.versions/` snapshot (with `keep_deleted_versions=True`) | Preserved |
 
 ---
 

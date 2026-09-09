@@ -717,7 +717,7 @@ The `ChatMixin` supports multiple event reporting strategies via the `event_mode
 
 #### Structured Events in `FULL_CALLBACK_MODE`
 
-When `EventMode.FULL_CALLBACK_MODE` is active, the `streaming_callback` receives the following structured events instead of `<processing>` tags:
+When `EventMode.FULL_CALLBACK_MODE` (or `MIXED_MODE`, which emits them alongside the text tags) is active, the `streaming_callback` receives the following structured events instead of `<processing>` tags:
 
 *   **`MSG_TYPE_TOOL_START`**: Fired when a tool execution begins.
     *   Meta: `{"tool_name": str, "parameters": dict}`
@@ -729,6 +729,25 @@ When `EventMode.FULL_CALLBACK_MODE` is active, the `streaming_callback` receives
     *   Meta: `{"title": str, "art_type": str, "version": int, "success": bool, "error": str|None}`
 *   **`MSG_TYPE_CONTEXT_UPDATE`**: Fired when context visibility is updated (unlock/lock/hide).
     *   Meta: `{"action": str ("unlock"|"lock"|"hide"), "files": list[str], "status": str}`
+
+#### Agentic Round Lifecycle Events
+
+`MSG_TYPE_ROUND_START` and `MSG_TYPE_ROUND_END` bracket every reasoning round of the agentic loop, letting apps render per-round progress chips (e.g., "Round 2/20 ⚙️") and final-state markers ("Round 7/20 ✅ done").
+
+*   **`MSG_TYPE_ROUND_START`**: Fires immediately after the round counter increments, before generation begins.
+    *   Meta: `{"round_id": int, "max_rounds": int}`
+*   **`MSG_TYPE_ROUND_END`**: Fires exactly once per round, at its terminal outcome.
+    *   Meta: `{"round_id": int, "status": str}`
+    *   The `status` string is a closed set:
+        *   `"done"` — the LLM emitted the `<done/>` termination tag.
+        *   `"cancelled"` — user cancellation was observed.
+        *   `"action"` — the round dispatched an action (tool, artefact, note, skill); the loop continues.
+        *   `"text_stall"` — the text-only stall limit was reached; the loop terminated.
+        *   `"loop_break"` — a duplicate/phantom/malformed-call guard broke the loop.
+        *   `"max_rounds"` — the round budget was exhausted.
+        *   `"conversational"` — round 1 pure conversational answer completed the turn.
+
+These events are **callback-only**: they are never written into `ai_msg.content` or `virtual_history`, and they are suppressed entirely in `EventMode.SILENT_MODE`. Exactly one `MSG_TYPE_ROUND_END` fires per `MSG_TYPE_ROUND_START` under all exit paths — including cancellation, loop guards, and natural exhaustion of the round budget.
 
 **Example: Using `FULL_CALLBACK_MODE`**
 ```python

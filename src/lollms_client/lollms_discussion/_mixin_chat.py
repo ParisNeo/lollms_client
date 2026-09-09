@@ -3208,8 +3208,8 @@ class ChatMixin:
                         title=file_name,
                         new_content=content_placeholder,
                         new_type=atype,
-                        active=True,
-                        visibility=ArtefactVisibility.FULL,
+                        active=False,
+                        visibility=ArtefactVisibility.TREE_UNLOCKABLE,
                         physical_data=rich_doc_bytes,
                         logical_content=content_placeholder,
                         commit_message=f"Updated rich document by tool '{tool_name}'"
@@ -3219,29 +3219,15 @@ class ChatMixin:
                         title=file_name,
                         artefact_type=atype,
                         content=content_placeholder,
-                        active=True,
-                        visibility=ArtefactVisibility.FULL,
+                        active=False,
+                        visibility=ArtefactVisibility.TREE_UNLOCKABLE,
                         physical_data=rich_doc_bytes,
                         logical_content=content_placeholder,
                         commit_message=f"Created by tool '{tool_name}'"
                     )
                 self.commit()
 
-                if atype == "image":
-                    try:
-                        import base64
-                        raw_img = file_path.read_bytes()
-                        img_b64 = base64.b64encode(raw_img).decode('utf-8')
-                        self.artefacts.update(
-                            title=file_name,
-                            new_images=[img_b64],
-                            new_image_media_types=[f"image/{file_ext[1:]}"],
-                            bump_version=False
-                        )
-                        self.commit()
-                        self._affected_artefacts_this_turn.append(self.artefacts.get(file_name))
-                    except Exception as ex:
-                        trace_exception(ex)
+                self._affected_artefacts_this_turn.append(art)
 
                 if self.active_branch_id:
                     ai_msg_local = self.get_message(self.active_branch_id)
@@ -4465,13 +4451,27 @@ class ChatMixin:
         # Initialize pending memory searches list for this turn
         object.__setattr__(self, '_pending_memory_searches', [])
 
+        round_event_state = {"last_status": None}
+
         while round_count < resolved_max_rounds:
             # Check cancellation at the start of each reasoning round
             if self.is_generation_cancelled():
                 was_cancelled = True
+                _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="cancelled")
                 break
 
             round_count += 1
+
+            def _emit_round_event(msg_type: MSG_TYPE, status: Optional[str] = None) -> None:
+                if event_mode == EventMode.SILENT_MODE:
+                    return
+                if msg_type == MSG_TYPE.MSG_TYPE_ROUND_START:
+                    _cb(callback, "", msg_type, {"round_id": round_count, "max_rounds": resolved_max_rounds})
+                    return
+                round_event_state["last_status"] = status or "action"
+                _cb(callback, "", msg_type, {"round_id": round_count, "status": status or "action"})
+
+            _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_START)
 
             # Make round count accessible to _StreamState for logging
             object.__setattr__(self, '_current_round', round_count)
@@ -4704,6 +4704,7 @@ class ChatMixin:
                     )
                 if self.is_generation_cancelled():
                     was_cancelled = True
+                    _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="cancelled")
                     break
                 else:
                     raise
@@ -4711,6 +4712,7 @@ class ChatMixin:
             # Check cancellation after generation completes
             if self.is_generation_cancelled():
                 was_cancelled = True
+                _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="cancelled")
                 break
 
             if debug_enabled and raw_llm_output_buffer[0]:
@@ -4761,6 +4763,7 @@ class ChatMixin:
                     continue
 
                 ASCIIColors.info("[ChatMixin] Termination tag detected. Terminating agentic loop.")
+                _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="done")
                 break
 
             # ── 🔍 PROCESS PENDING MEMORY SEARCHES (HIGHEST PRIORITY) ──
@@ -5003,6 +5006,7 @@ class ChatMixin:
             # and the LLM attempts to dispatch another artifact, we instantly break the loop.
             if getattr(self, "_force_final_answer", False) and ss.was_action_dispatched() and not ss.tool_trigger:
                 ASCIIColors.warning("[ChatMixin] LLM attempted artifact dispatch after force-final-answer. Breaking loop.")
+                _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="loop_break")
                 break
 
             # ── 🛑 CRITICAL FIX: DISTINGUISH FAILED PATCH FROM TRUE DUPLICATE ──
@@ -5058,6 +5062,7 @@ class ChatMixin:
                         sender_type="user",
                         content="[SYSTEM: CRITICAL. You just attempted to recreate an artifact that already exists with the exact same content. This is a loop. You MUST NOT create or update this artifact again. You MUST now provide your final conversational answer to the user, explaining what you have done, and end with <done/>.]"
                     ))
+                    _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="loop_break")
                     break
 
             # ── 🛑 ONE-ACTION-PER-TURN PROTOCOL ──
@@ -5176,6 +5181,7 @@ class ChatMixin:
                     content=system_envelope
                 ))
 
+                _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
                 continue
 
             if ss.tool_trigger:
@@ -5250,6 +5256,7 @@ class ChatMixin:
                         self._malformed_call_counts[malformed_sig] = self._malformed_call_counts.get(malformed_sig, 0) + 1
                         if self._malformed_call_counts[malformed_sig] >= 2:
                             ASCIIColors.warning("[ChatMixin] Second identical malformed tool call detected. Breaking loop to prevent infinite cycle.")
+                            _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="loop_break")
                             break
 
                         # Force another round to let the LLM correct itself
@@ -5452,6 +5459,7 @@ class ChatMixin:
                         self._phantom_call_counts[phantom_sig] = self._phantom_call_counts.get(phantom_sig, 0) + 1
                         if self._phantom_call_counts[phantom_sig] >= 2:
                             ASCIIColors.warning(f"[ChatMixin] Second identical phantom tool call '{tool_name}' detected. Breaking loop to prevent infinite cycle.")
+                            _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="loop_break")
                             break
 
                         # Force another reasoning round to let the LLM correct itself
@@ -5492,6 +5500,7 @@ class ChatMixin:
                     if has_prev_failure:
                         if self.is_generation_cancelled():
                             was_cancelled = True
+                            _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="cancelled")
                             break
 
                         result_str = (
@@ -5986,19 +5995,42 @@ class ChatMixin:
                         or (isinstance(inner_res, dict) and bool(inner_res.get("error")) and not inner_res.get("success", True))
                         or (isinstance(tool_res, dict) and tool_res.get("return_code", 0) != 0)
                         or (isinstance(inner_res, dict) and inner_res.get("return_code", 0) != 0)
-                        or "crashed" in status_done_line.lower()
-                        or "⚠" in clean_result_str
                     )
+                    if tool_res is None:
+                        is_failure = True
+                    elif "crashed" in status_done_line.lower():
+                        is_failure = True
+                    if isinstance(tool_res, dict):
+                        res_success_flag = tool_res.get("success")
+                        if res_success_flag is True:
+                            is_failure = bool(tool_res.get("error")) and not tool_res.get("success", True)
                     status_meta = "failure" if is_failure else "success"
                     tool_close_tag = f"{status_done_line}{details_block}<!-- status:{status_meta} -->\n</processing>\n\n"
                     ai_msg.content += tool_close_tag
                     _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
                     tool_success = not is_failure
+                    if not tool_success:
+                        clean_result_str = re.sub(
+                            r'<processing[^>]*>.*?(?:</processing>|$)', '',
+                            clean_result_str, flags=re.DOTALL | re.IGNORECASE
+                        )
+                        clean_result_str = re.sub(r'<!-- status:[^>]*-->', '', clean_result_str, flags=re.IGNORECASE)
+                        clean_result_str = re.sub(r'</processing>', '', clean_result_str, flags=re.IGNORECASE)
+                        clean_result_str = re.sub(r'<tool_result[^>]*>.*?(?:</tool_result>|$)', '', clean_result_str, flags=re.DOTALL | re.IGNORECASE)
+                        clean_result_str = clean_result_str.strip()
 
-                    if tool_success :
-                        successful_tool_signatures.add(context_aware_signature)
-                        ASCIIColors.info(f"[ChatMixin] Recorded successful signature for '{tool_name}'. Total successful: {len(successful_tool_signatures)}")
+                    if not tool_success:
+                        clean_result_str = re.sub(
+                            r'<processing[^>]*>.*?(?:</processing>|$)', '',
+                            clean_result_str, flags=re.DOTALL | re.IGNORECASE
+                        )
+                        clean_result_str = re.sub(r'<!-- status:[^>]*-->', '', clean_result_str, flags=re.IGNORECASE)
+                        clean_result_str = re.sub(r'</processing>', '', clean_result_str, flags=re.IGNORECASE)
+                        clean_result_str = re.sub(r'<tool_result[^>]*>.*?(?:</tool_result>|$)', '', clean_result_str, flags=re.DOTALL | re.IGNORECASE)
+
+                    successful_tool_signatures.add(context_aware_signature)
+                    ASCIIColors.info(f"[ChatMixin] Recorded successful signature for '{tool_name}'. Total successful: {len(successful_tool_signatures)}")
 
                     tool_calls_this_turn.append({
                         "name": tool_name,
@@ -6130,8 +6162,10 @@ class ChatMixin:
                             sender_type="user",
                             content=user_part
                         ))
+                    _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
                     continue
                 else:
+                    _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
                     break
             else:
                 full_round_text = ss.get_clean_text_so_far()
@@ -6164,6 +6198,7 @@ class ChatMixin:
                     mimicry_counts[0] += 1
                     if mimicry_counts[0] >= 2:
                         ASCIIColors.warning("[ChatMixin] Repeated mimicry detected. Breaking loop.")
+                        _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="loop_break")
                         break
                     else:
                         ASCIIColors.warning("[ChatMixin] Mimicry detected. Injecting correction.")
@@ -6190,6 +6225,7 @@ class ChatMixin:
 
                 if round_count == 1 and not tool_calls_this_turn and not ss.affected_artefacts and not ss.context_unlock_requested:
                     ASCIIColors.info("[ChatMixin] Round 1 conversational answer completed. Ending loop.")
+                    _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="conversational")
                     break
 
                 text_only_stall_count = getattr(self, "_consecutive_text_only_stalls", 0) + 1
@@ -6197,6 +6233,7 @@ class ChatMixin:
 
                 if text_only_stall_count >= 3:
                     ASCIIColors.warning(f"[ChatMixin] Terminating after {text_only_stall_count} consecutive text-only stalls without <done/> or actions. The LLM is stuck.")
+                    _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="text_stall")
                     break
 
                 ASCIIColors.warning(f"[ChatMixin] Text-only stall detected (#{text_only_stall_count}). LLM stopped without <done/> or actions. Forcing continuation.")
@@ -6239,6 +6276,12 @@ class ChatMixin:
                 continue
 
         # ── 11. Final Post-Processing & Database Commit ──
+
+        if ss is not None and round_event_state["last_status"] is None and round_count >= resolved_max_rounds:
+            _emit_round_end_post_loop = MSG_TYPE.MSG_TYPE_ROUND_END
+            if event_mode != EventMode.SILENT_MODE:
+                _cb(callback, "", _emit_round_end_post_loop, {"round_id": round_count, "status": "max_rounds"})
+            round_event_state["last_status"] = "max_rounds"
 
         # Handle cancellation cleanup
         if was_cancelled:

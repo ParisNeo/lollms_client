@@ -521,36 +521,22 @@ class ArtefactManager:
                     title_suffix = Path(title).suffix.lower()
                     is_binary_db = title_suffix in (".db", ".sqlite", ".sqlite3")
 
-                is_rich_doc = (
-                    file_ext in (".docx", ".pptx", ".odt")
-                    or Path(title).suffix.lower() in (".docx", ".pptx", ".odt")
-                )
-
-                is_svg = file_ext == ".svg" or Path(title).suffix.lower() == ".svg"
-
-                if is_rich_doc:
-                    if active_file_path.exists() and active_file_path.stat().st_size > 0:
-                        ASCIIColors.info(
-                            f"[ArtefactManager] Preserving existing physical rich document '{filename}' "
-                            f"({active_file_path.stat().st_size:,} bytes). Logical twin (.lam) holds extracted text."
-                        )
-                        wrote_physical = True
-                    else:
-                        ASCIIColors.error(
-                            f"[ArtefactManager] Rich document '{filename}' has no physical data and no existing file. "
-                            f"Refusing to write text content over a .docx/.pptx/.odt extension."
-                        )
-                        return False
-                elif (atype != ArtefactType.IMAGE and not is_binary_db) or is_svg:
+                if active_file_path.exists() and active_file_path.stat().st_size > 0:
+                    ASCIIColors.info(
+                        f"[ArtefactManager] Preserving existing physical file '{filename}' "
+                        f"({active_file_path.stat().st_size:,} bytes). Logical twin (.lam) holds metadata/schema."
+                    )
+                    wrote_physical = True
+                elif is_binary_db:
+                    ASCIIColors.error(f"[ArtefactManager] Refusing to write text content to binary database file '{filename}'. Physical data is missing.")
+                    return False
+                elif atype != ArtefactType.IMAGE or file_ext == ".svg":
                     try:
                         active_file_path.write_text(content, encoding="utf-8", errors="ignore")
                         versioned_file_path.write_text(content, encoding="utf-8", errors="ignore")
                         wrote_physical = True
                     except Exception as e:
                         trace_exception(e)
-                elif is_binary_db:
-                    ASCIIColors.error(f"[ArtefactManager] Refusing to write text content to binary database file '{filename}'. Physical data is missing.")
-                    return False
 
             # 2. Write Logical Twin (.lam) into .versions/
             lam_filename = f"{name_part}.lam"
@@ -1538,9 +1524,27 @@ class ArtefactManager:
                     active_files_on_disk.add(f.name)
 
             arts = self._get_all_raw()
+            existing_titles = {a.get("title") for a in arts}
             orphaned_titles = []
             for a in arts:
-                if a.get("type") == "image" or a.get("title", "").endswith("::images"):
+                title = a.get("title", "")
+                if title.endswith("::images"):
+                    parent_title = title.rsplit("::images", 1)[0]
+                    if parent_title in existing_titles:
+                        continue
+                    orphaned_titles.append(title)
+                    continue
+
+                if a.get("type") == "image":
+                    phys_path = a.get("physical_path") or title
+                    clean_path = self._sanitize_path_segments(phys_path)
+                    filename = self._get_filename_with_ext(
+                        clean_path, a.get("type", "image"),
+                        a.get("language"), a.get("file_ext")
+                    )
+                    if filename in active_files_on_disk:
+                        continue
+                    orphaned_titles.append(title)
                     continue
 
                 phys_path = a.get("physical_path") or a.get("title", "")
@@ -1579,6 +1583,7 @@ class ArtefactManager:
                 if "_token_cache" in meta:
                     meta["_token_cache"] = {}
                     self._discussion.metadata = meta
+                self._discussion.commit()
         except Exception as e:
             ASCIIColors.warning(f"[ArtefactManager] Failed to sync index with disk: {e}")
         return purged

@@ -204,7 +204,7 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
         )
         if code_len > 800:
             doctrine_note += (
-                f" ⚠️ Your inline snippet was {code_len} chars — that is substantial code. "
+                f" NOTE: your inline snippet was {code_len} chars, which is substantial code. "
                 "Persist it as a .py artifact and use tool_execute_python_file next time."
             )
         workspace_contract += doctrine_note
@@ -213,6 +213,7 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
             " To run a short, punctual inline snippet instead, use tool_execute_python_code."
         )
     out_str = out_str + workspace_contract
+    out_str = "".join(ch for ch in out_str if ch.isascii() or ch in "\n\t")
 
     return {
         "success": True,

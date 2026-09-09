@@ -166,6 +166,33 @@ class MSG_TYPE(Enum):
     MSG_TYPE_ARTEFACT_SYMBOL_DETECTED  = 55 # a structural symbol (class, method, function, section) was detected
     MSG_TYPE_SCRATCHPAD_UPDATE         = 56 # the persistent scratchpad was updated or cleared
 
+    # ── Agentic round lifecycle events ────────────────────────────────────────
+    # Fired by ChatMixin once per reasoning round so the app can render per-round
+    # progress chips (e.g., "Round 2/20") and final-state markers.
+    #
+    # Contract
+    # --------
+    # MSG_TYPE_ROUND_START fires immediately after the round counter is incremented,
+    # before generation begins.
+    #   meta: {"round_id": int, "max_rounds": int}
+    #
+    # MSG_TYPE_ROUND_END fires exactly once per round, at its terminal outcome.
+    #   meta: {"round_id": int, "status": str}
+    #   status is one of:
+    #     "done"          — LLM emitted <done/> termination tag
+    #     "cancelled"     — user cancellation observed
+    #     "action"        — round dispatched an action; loop continues next round
+    #     "text_stall"    — text-only stall limit reached; loop terminated
+    #     "loop_break"    — duplicate/phantom/malformed-call guard broke the loop
+    #     "max_rounds"    — round budget exhausted
+    #     "conversational"— round 1 pure conversational answer completed the turn
+    #
+    # These events are callback-only: they are never written to ai_msg.content or
+    # virtual_history, and are suppressed entirely in EventMode.SILENT_MODE.
+
+    MSG_TYPE_ROUND_START               = 57 # an agentic reasoning round has begun
+    MSG_TYPE_ROUND_END                 = 58 # an agentic reasoning round has reached its terminal outcome
+
 
 class EventMode(Enum):
     """

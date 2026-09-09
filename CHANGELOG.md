@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-09 21:06]
+
+- feat(artefact): add artefact symbol detection handling in chat pipeline
+
 ## [2026-09-09 14:35]
 
 - feat(tools): update execute_python tool and chat mixin
