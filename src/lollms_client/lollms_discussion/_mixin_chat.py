@@ -5325,6 +5325,11 @@ class ChatMixin:
                             try:
                                 _os.chdir(_lcp_workspace_str)
 
+                                try:
+                                    self.artefacts.sync_all_active_to_disk()
+                                except Exception as sync_ex:
+                                    trace_exception(sync_ex)
+
                                 # ── Take BEFORE Snapshot (LCP Path) ──
                                 _lcp_files_before = {}
                                 _lcp_cwd = _Path(_lcp_workspace_str)

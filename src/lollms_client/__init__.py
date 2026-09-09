@@ -32,7 +32,7 @@ from lollms_client.lollms_connection_binding import (
 )
 from lollms_client.lollms_bindings_utils import list_bindings, get_binding_desc
 
-__version__ = "1.19.1" # Connection bindings added
+__version__ = "1.19.2" # Connection bindings added
 
 # Optionally, you could define __all__ if you want to be explicit about exports
 __all__ = [

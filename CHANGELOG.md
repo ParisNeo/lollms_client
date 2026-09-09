@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-09 13:51]
+
+- fix(chat): sync active artefacts before LCP workspace snapshot and correct workspace root detection
+
 ## [2026-09-09 13:40]
 
 - feat(personality): enhance agent state and personality handling with workspace tools updates

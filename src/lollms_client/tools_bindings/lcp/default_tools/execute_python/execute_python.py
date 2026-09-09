@@ -201,9 +201,14 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
 
 
 def _get_workspace_root() -> Path:
-    """Resolves the workspace root: honors orchestrator CWD, falls back to ./data_workspace."""
+    """
+    Resolves the workspace root.
+    The orchestrator (ChatMixin) chdirs into the sandboxed workspace before
+    invoking this tool, so the process CWD is authoritative. We only fall back
+    to ./data_workspace when running completely standalone (e.g., manual tests).
+    """
     cwd = Path.cwd()
-    if (cwd / "data_workspace").exists() or cwd.name == "data_workspace":
+    if cwd.name in ("workspace_data", "data_workspace") or (cwd / "data_workspace").exists():
         return cwd
     return Path("./data_workspace").resolve()
 
