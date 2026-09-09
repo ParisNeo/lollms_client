@@ -80,7 +80,7 @@ class BeatovenAITTMBinding(LollmsTTMBinding):
             task_result = self._poll_for_completion(task_id)
             track_id = task_result.get("track_id")
             if not track_id:
-                raise Exception("Task completed but did not return a track_id.")
+                raise Exception("\nTask completed but did not return a track_id.")
 
             # Step 3: Get track details to find the audio URL
             track_url = f"{self.base_url}/tracks/{track_id}"

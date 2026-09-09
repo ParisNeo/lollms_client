@@ -1,0 +1,32 @@
+binding_name: execute_python
+title: Execute Python
+author: ParisNeo & Lollms
+version: 2.1.0
+description: >
+  Sandboxed Python execution toolset with two single-purpose tools, both defined
+  in the single library file execute_python.py:
+  - tool_execute_python_code: executes INLINE Python source (the 'code' string).
+    Nothing is saved to disk by the tool itself.
+  - tool_execute_python_file: executes an EXISTING workspace .py file with optional
+    argv-style arguments (sys.argv / argparse compatible). Read-only: never saves,
+    creates, or overwrites files. To persist a new script, emit an artifact first.
+input_parameters:
+  - name: code
+    type: str
+    description: "The raw Python source code to execute inline (tool_execute_python_code only). Nothing is written to disk."
+    mandatory: false
+  - name: file_name
+    type: str
+    description: "Name of an EXISTING .py file inside the workspace to execute (tool_execute_python_file only). Read-only: never saves files. Path traversal is blocked."
+    mandatory: false
+  - name: args
+    type: list
+    description: Command-line style arguments exposed to the script via sys.argv[1:] (tool_execute_python_file only). All values are stringified.
+    mandatory: false
+commands:
+  - name: tool_execute_python_code
+    title: Execute Python Code
+    description: Executes inline Python source code in a sandboxed environment, capturing stdout, stderr, and matplotlib figures.
+  - name: tool_execute_python_file
+    title: Execute Python File
+    description: Executes an existing workspace .py file with optional argv-style arguments in a sandboxed environment, capturing stdout, stderr, and matplotlib figures. Read-only; never saves files.

@@ -3826,7 +3826,19 @@ class ChatMixin:
             try:
                 pers_tools = personality.tools.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
                 active_tools.update(pers_tools)
+                if pers_tools:
+                    ASCIIColors.success(
+                        f"[ChatMixin] Personality binding '{getattr(personality.tools, 'binding_name', '?')}' "
+                        f"registered {len(pers_tools)} tool(s): {list(pers_tools.keys())}"
+                    )
+                else:
+                    raw_disc = personality.tools.discover_tools() if hasattr(personality.tools, "discover_tools") else []
+                    ASCIIColors.warning(
+                        f"[ChatMixin] Personality binding '{getattr(personality.tools, 'binding_name', '?')}' "
+                        f"yielded 0 chat tool specs (discovered_tools count: {len(raw_disc)})."
+                    )
             except Exception as ex:
+                ASCIIColors.error(f"[ChatMixin] Personality tool binding failed to produce specs: {ex}")
                 trace_exception(ex)
         elif personality and hasattr(personality, "tools") and isinstance(personality.tools, dict):
             active_tools.update(personality.tools)
@@ -3868,9 +3880,7 @@ class ChatMixin:
         if needs_lcp_binding and lcp_binding is None:
             try:
                 from lollms_client.tools_bindings.lcp import LCPBinding
-                lcp_binding = LCPBinding(
-                    tools_folders=[Path(__file__).parent.parent / "tools_bindings" / "lcp" / "default_tools"]
-                )
+                lcp_binding = LCPBinding(tools_folders=[])
                 if not hasattr(self.lollmsClient, "tools") or self.lollmsClient.tools is None:
                     self.lollmsClient.tools = lcp_binding
                 ASCIIColors.success("[ChatMixin] Auto-provisioned shared LCPBinding for context-aware tools.")
@@ -3890,10 +3900,10 @@ class ChatMixin:
                 lcp_binding.mount_tool_library_if_absent("document_editor")
                 ASCIIColors.info("[ChatMixin] Mounted 'document_editor' and 'as_is_document_tools' (document files detected).")
 
-            # 3. Mount Arbitrary Code Execution Tool
+            # 3. Mount Arbitrary Code Execution Toolset (inline code + workspace file runner)
             if enable_code_execution:
-                lcp_binding.mount_tool_library("execute_python_code")
-                ASCIIColors.info("[ChatMixin] Mounted 'execute_python_code' (code execution enabled).")
+                lcp_binding.mount_tool_library_if_absent("execute_python")
+                ASCIIColors.info("[ChatMixin] Mounted 'execute_python' (inline + file execution enabled).")
 
             # 4. Extract all tool specs in a single pass
             try:
@@ -3901,7 +3911,7 @@ class ChatMixin:
                 for t_name, t_spec in lcp_tools.items():
                     if t_name == "tool_execute_python_data_query" and enable_data_tools and has_data_files:
                         active_tools[t_name] = t_spec
-                    elif t_name == "tool_execute_python_code" and enable_code_execution:
+                    elif t_name in ("tool_execute_python_code", "tool_execute_python_file") and enable_code_execution:
                         active_tools[t_name] = t_spec
                     elif t_name.startswith(("tool_inspect_document", "tool_read_document_content", "tool_grep_document", "tool_modify_docx", "tool_modify_excel", "tool_edit_document_text", "tool_annotate_document", "tool_modify_pdf_annotation", "tool_modify_pptx_slide")) and enable_data_tools and has_doc_files:
                         active_tools[t_name] = t_spec
@@ -3914,7 +3924,7 @@ class ChatMixin:
                 t_name = td.get("name", "")
                 if t_name not in active_tools:
                     if (t_name == "tool_execute_python_data_query" and enable_data_tools and has_data_files) or \
-                       (t_name == "tool_execute_python_code" and enable_code_execution) or \
+                       (t_name in ("tool_execute_python_code", "tool_execute_python_file") and enable_code_execution) or \
                        (t_name.startswith(("tool_inspect_document", "tool_read_document_content", "tool_grep_document", "tool_modify_docx", "tool_modify_excel", "tool_edit_document_text", "tool_annotate_document", "tool_modify_pdf_annotation", "tool_modify_pptx_slide")) and enable_data_tools and has_doc_files):
                         params_list = []
                         input_schema = td.get("input_schema", {})
@@ -3930,6 +3940,14 @@ class ChatMixin:
                             "parameters": params_list,
                         }
                         ASCIIColors.success(f"[ChatMixin] Registered {t_name} via direct discovered_tools fallback.")
+
+        if active_tools:
+            ASCIIColors.info(
+                f"[ChatMixin] Final active tool registry ({len(active_tools)} tool(s)): "
+                f"{sorted(active_tools.keys())}"
+            )
+        else:
+            ASCIIColors.warning("[ChatMixin] Final active tool registry is EMPTY — no tools available to the LLM this turn.")
 
         if debug and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
             lcp_binding.mount_tool_library("debug_toolset")
@@ -4076,7 +4094,7 @@ class ChatMixin:
                 "5. **NEVER LOOP**: If you have already written your final answer to the user, you are DONE. Do NOT emit another `<tool>` tag. Emitting a tool call after your answer is a CRITICAL ERROR that ruins the completed task.\n"
                 "=== END TASK COMPLETION PROTOCOL ===\n"
             )
-            tools_prompt += "\nExact syntax (copy this pattern exactly):\n<tool>{\"name\": \"tool_name\", \"parameters\": {\"param1\": \"value1\"}}`)`\n\n"
+            tools_prompt += "\nExact syntax (copy this pattern exactly):\n<tool>{\"name\": \"tool_name\", \"parameters\": {\"param1\": \"value1\"}}</tool>\n\n"
             tools_prompt += "Available tools:\n"
             for t_name, t_spec in active_tools.items():
                 desc = t_spec.get("description", "")
@@ -5916,10 +5934,22 @@ class ChatMixin:
                                 f"6. 📊 **DATA GATHERED → BUILD PHASE**: You now have enough data to proceed. "
                                 f"If you have gathered sufficient data for the user's request, your NEXT action should be to "
                                 f"either:\n"
-                                f"   a) Write a Python script artifact to process/visualize the data, OR\n"
+                                f"   a) Run follow-up Python immediately with 'tool_execute_python_code', passing the "
+                                f"script inline through the 'code' parameter, OR\n"
                                 f"   b) Build the HTML animation artifact the user requested, OR\n"
                                 f"   c) Provide your final analysis answer.\n"
                                 f"   Do NOT run another SQL query unless you need genuinely different data.\n"
+                            )
+                        elif tool_name in ("tool_execute_python_code", "tool_execute_python_file"):
+                            next_step_guidance = (
+                                f"6. 🐍 **CODE EXECUTION & FILE ORIENTATION**: 'tool_execute_python_code' runs inline "
+                                f"Python (the 'code' parameter) and never saves files. 'tool_execute_python_file' runs "
+                                f"an EXISTING workspace .py file ('file_name' parameter) and is read-only. The sandbox "
+                                f"CWD IS the workspace root: files created via <artifact> tags sit as siblings of your "
+                                f"code, so import them directly ('from rlc_filter import RLCFilter') with NO 'workspace/' "
+                                f"prefix and NO sys.path manipulation. To persist a new script for later reuse, emit an "
+                                f"<artifact type=\"code\" name=\"...\"> tag first, then run it with "
+                                f"'tool_execute_python_file'.\n"
                             )
 
                         user_part = (

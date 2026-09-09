@@ -35,6 +35,16 @@ class LCPBinding(LollmsToolBinding):
         # Host-provided configurations for tools (e.g., {"system_shell": {"autonomy_level": "safe"}})
         self.host_tool_configs: Dict[str, Dict[str, Any]] = host_tool_configs or {}
         
+        # Resolve Direct Tool Files (must resolve first: explicit tool_files implies an empty folder scan)
+        self.tool_files: List[Path] = []
+        files_input = kwargs.get("tool_files")
+        if files_input:
+            if isinstance(files_input, (str, Path)):
+                self.tool_files.append(Path(files_input))
+            elif isinstance(files_input, list):
+                for f in files_input:
+                    self.tool_files.append(Path(f))
+
         # Resolve Multi-Folder Config
         self.tools_folders: List[Path] = []
         folders_input = kwargs.get("tools_folders") or kwargs.get("tools_folder_path")
@@ -44,18 +54,8 @@ class LCPBinding(LollmsToolBinding):
             elif isinstance(folders_input, list):
                 for f in folders_input:
                     self.tools_folders.append(Path(f))
-        else:
+        elif not self.tool_files:
             self.tools_folders.append(Path(__file__).parent / "default_tools")
-
-        # Resolve Direct Tool Files
-        self.tool_files: List[Path] = []
-        files_input = kwargs.get("tool_files")
-        if files_input:
-            if isinstance(files_input, (str, Path)):
-                self.tool_files.append(Path(files_input))
-            elif isinstance(files_input, list):
-                for f in files_input:
-                    self.tool_files.append(Path(f))
 
         self.discovered_tools: List[Dict[str, Any]] = []
         self._dynamic_tool_modules: Dict[str, types.ModuleType] = {}
@@ -86,8 +86,95 @@ class LCPBinding(LollmsToolBinding):
 
             return tools if tools else None
         except Exception as e:
-            ASCIIColors.warning(f"AST parse failed for '{py_file_path.name}': {e}")
+            ASCIIColors.warning(f"AST parse failed for '{py_file_path.name}': {e}. Attempting regex fallback.")
+            return self._parse_tool_via_regex(py_file_path)
+
+    def _parse_tool_via_regex(self, py_file_path: Path) -> Optional[List[Dict[str, Any]]]:
+        """
+        Lightweight regex-based fallback when AST parsing fails (e.g., partially
+        syntactically invalid files). Extracts 'tool_' function names, docstrings,
+        and simple type-annotated parameters. Never raises.
+        """
+        try:
+            code_text = py_file_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception as read_err:
+            ASCIIColors.error(f"[LCP] Cannot read tool file '{py_file_path.name}': {read_err}")
             return None
+
+        func_pattern = re.compile(
+            r'^[ \t]*def\s+(tool_\w+)\s*\(([^)]*)\)\s*(?:->\s*[^:]+)?:',
+            re.MULTILINE
+        )
+        tools: List[Dict[str, Any]] = []
+
+        for func_match in func_pattern.finditer(code_text):
+            tool_name = func_match.group(1)
+            params_str = func_match.group(2)
+
+            body_start = func_match.end()
+            docstring = ""
+            doc_match = re.search(
+                r'"""(.*?)"""', code_text[body_start:body_start + 4000], re.DOTALL
+            )
+            if doc_match:
+                docstring = doc_match.group(1).strip()
+            description = docstring.split("\n\n")[0].strip() if docstring else f"Executes {tool_name}."
+
+            properties: Dict[str, Any] = {}
+            required: List[str] = []
+
+            for param_raw in params_str.split(","):
+                param = param_raw.strip()
+                if not param or param.startswith("*") or ":" not in param:
+                    if param and param.split("=")[0].strip() and param.split("=")[0].strip() not in ("args", "kwargs"):
+                        p_name = param.split("=")[0].strip()
+                        properties[p_name] = {"type": "string", "description": f"Parameter '{p_name}'"}
+                        if "=" not in param:
+                            required.append(p_name)
+                    continue
+
+                p_name, p_type_raw = param.split(":", 1)
+                p_name = p_name.strip()
+                if not p_name or p_name in ("args", "kwargs"):
+                    continue
+
+                p_type_raw = p_type_raw.strip().lower()
+                p_type = "string"
+                if "int" in p_type_raw:
+                    p_type = "integer"
+                elif "float" in p_type_raw or "number" in p_type_raw:
+                    p_type = "number"
+                elif "bool" in p_type_raw:
+                    p_type = "boolean"
+                elif "list" in p_type_raw or "array" in p_type_raw:
+                    p_type = "array"
+                elif "dict" in p_type_raw or "object" in p_type_raw:
+                    p_type = "object"
+
+                is_optional = "=" in param
+                entry = {"type": p_type, "description": f"Parameter '{p_name}'"}
+                if is_optional:
+                    default_match = re.search(r'=\s*(.+)$', param)
+                    if default_match:
+                        entry["default"] = default_match.group(1).strip().strip("'\"")
+                else:
+                    required.append(p_name)
+                properties[p_name] = entry
+
+            tools.append({
+                "name": tool_name,
+                "description": description,
+                "input_schema": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required
+                },
+                "_python_file_path": str(py_file_path.resolve()),
+                "_parsed_via_regex_fallback": True
+            })
+            ASCIIColors.success(f"[LCP] Regex fallback extracted tool '{tool_name}' from '{py_file_path.name}'.")
+
+        return tools if tools else None
 
     def _extract_single_tool_schema(self, func_node: ast.FunctionDef, file_stem: str) -> Optional[Dict[str, Any]]:
         tool_name = func_node.name
@@ -215,18 +302,17 @@ class LCPBinding(LollmsToolBinding):
         expected_tool_names: set = set()
         for item in lib_path.iterdir():
             py_file = None
+            sibling_py_files: List[Path] = []
             if item.is_dir():
                 py_file = item / f"{item.name}.py"
-                if not py_file.exists():
-                    sub_py_files = [f for f in item.iterdir() if f.is_file() and f.suffix == ".py" and f.stem != "__init__"]
-                    for fallback_py in sub_py_files:
-                        expected_tool_names.update(self._extract_tool_names_from_file(fallback_py))
-                    continue
+                sibling_py_files = [f for f in item.iterdir() if f.is_file() and f.suffix == ".py" and f.stem != "__init__" and f != py_file]
             elif item.suffix == ".py" and item.stem != "__init__":
                 py_file = item
 
             if py_file and py_file.exists():
                 expected_tool_names.update(self._extract_tool_names_from_file(py_file))
+            for sibling_py in sibling_py_files:
+                expected_tool_names.update(self._extract_tool_names_from_file(sibling_py))
 
         if not expected_tool_names:
             return False
@@ -288,21 +374,17 @@ class LCPBinding(LollmsToolBinding):
 
         for item in lib_path.iterdir():
             py_file = None
+            sibling_py_files: List[Path] = []
             if item.is_dir():
                 py_file = item / f"{item.name}.py"
-                if not py_file.exists():
-                    sub_py_files = [f for f in item.iterdir() if f.is_file() and f.suffix == ".py" and f.stem != "__init__"]
-                    if sub_py_files:
-                        for fallback_py in sub_py_files:
-                            self._load_tool_file(fallback_py)
-                        continue
-                    else:
-                        continue
+                sibling_py_files = [f for f in item.iterdir() if f.is_file() and f.suffix == ".py" and f.stem != "__init__" and f != py_file]
             elif item.suffix == ".py" and item.stem != "__init__":
                 py_file = item
 
             if py_file and py_file.exists():
                 self._load_tool_file(py_file)
+            for sibling_py in sibling_py_files:
+                self._load_tool_file(sibling_py)
 
         new_tool_count = len(self.discovered_tools) - initial_tool_count
 
@@ -337,21 +419,17 @@ class LCPBinding(LollmsToolBinding):
 
             for item in folder.iterdir():
                 py_file = None
+                sibling_py_files: List[Path] = []
                 if item.is_dir():
                     py_file = item / f"{item.name}.py"
-                    if not py_file.exists():
-                        sub_py_files = [f for f in item.iterdir() if f.is_file() and f.suffix == ".py" and f.stem != "__init__"]
-                        if sub_py_files:
-                            for fallback_py in sub_py_files:
-                                self._load_tool_file(fallback_py)
-                            continue
-                        else:
-                            continue
+                    sibling_py_files = [f for f in item.iterdir() if f.is_file() and f.suffix == ".py" and f.stem != "__init__" and f != py_file]
                 elif item.suffix == ".py" and item.stem != "__init__":
                     py_file = item
 
                 if py_file and py_file.exists():
                     self._load_tool_file(py_file)
+                for sibling_py in sibling_py_files:
+                    self._load_tool_file(sibling_py)
 
         for py_file in self.tool_files:
             if py_file and py_file.exists() and py_file.suffix == ".py":

@@ -1807,7 +1807,7 @@ class StreamRenderer:
         elif msg_type == MSG_TYPE.MSG_TYPE_INFO:
             if meta and meta.get("done_intercepted"):
                 self._stop_live_artifact_panel()
-                ASCIIColors.rule("[bold green]✅ Task Completed (<done/>)[/bold green]")
+                ASCIIColors.rule("\n[bold green]✅ Task Completed (<done/>)[/bold green]")
                 return True
             else:
                 ASCIIColors.rich_print(f"\n[blue][INFO] {chunk}[/blue]")

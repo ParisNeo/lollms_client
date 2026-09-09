@@ -2067,8 +2067,21 @@ class LollmsPersonality:
             try:
                 from lollms_client.tools_bindings.lcp import LCPBinding
                 tool_binding = LCPBinding(tool_files=[str(f) for f in hb.tool_files])
-            except Exception:
-                pass
+                discovered_count = len(tool_binding.discovered_tools) if tool_binding else 0
+                if discovered_count == 0:
+                    ASCIIColors.error(
+                        f"[Handbag] Tool binding created but discovered 0 tools from {len(hb.tool_files)} "
+                        f"file(s): {[f.name for f in hb.tool_files]}. Check for syntax errors or missing "
+                        f"'tool_' function definitions in each file."
+                    )
+                else:
+                    ASCIIColors.success(
+                        f"[Handbag] Loaded {discovered_count} tool(s) from handbag: "
+                        f"{[t.get('name') for t in tool_binding.discovered_tools]}"
+                    )
+            except Exception as tool_load_err:
+                ASCIIColors.error(f"[Handbag] FAILED to create tool binding from {len(hb.tool_files)} file(s): {tool_load_err}")
+                trace_exception(tool_load_err)
 
         pers = LollmsPersonality(
             name=name,
@@ -3507,7 +3520,7 @@ JSON:"""
         if lcp_binding is None and self._resolved_workspace:
             try:
                 from lollms_client.tools_bindings.lcp import LCPBinding
-                lcp_binding = LCPBinding()
+                lcp_binding = LCPBinding(tools_folders=[])
                 if hasattr(self.lollms_client, 'tools'):
                     self.lollms_client.tools = lcp_binding
             except Exception as e:
@@ -3522,7 +3535,7 @@ JSON:"""
             if enable_shell:
                 _libraries_to_mount.append("system_shell")
             if enable_python_exec:
-                _libraries_to_mount.append("execute_python_code")
+                _libraries_to_mount.append("execute_python")
 
             _libraries_to_mount.append("git_manager")
 
@@ -3640,8 +3653,7 @@ JSON:"""
                 import lollms_client as _lollms_client_pkg
                 from lollms_client.tools_bindings.lcp import LCPBinding
                 pkg_root = Path(_lollms_client_pkg.__file__).resolve().parent
-                default_tools = pkg_root / "tools_bindings" / "lcp" / "default_tools"
-                lcp_binding = LCPBinding(tools_folders=[str(default_tools)] if default_tools.exists() else [])
+                lcp_binding = LCPBinding(tools_folders=[])
             except Exception:
                 lcp_binding = None
 
