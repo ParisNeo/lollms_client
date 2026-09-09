@@ -336,8 +336,10 @@ Factory to construct a personality from a Handbag folder.
 - **`lollms_client`**: The `LollmsClient` instance used for generation.
 - **`streaming_callback`**: Optional callback for streaming tokens.
 - **`tools`**: Optional dict of explicit tools.
-- **`max_nb_rounds`** (`Optional[int]`): The maximum number of agentic reasoning rounds. Defaults to `20` if `None`.
-- **`max_reasoning_steps`** (`Optional[int]`): **Deprecated**. Backward-compatible alias for `max_nb_rounds`.
+* **`max_nb_rounds`**: (`Optional[int]`): The maximum number of agentic reasoning rounds before the loop forces a final answer. Prevents infinite cycles. Defaults to `20` if `None`.
+* **`max_reasoning_steps` (`Optional[int]`)**:: **Deprecated**. Backward-compatible alias for `max_nb_rounds`. If `max_nb_rounds` is provided, this parameter is ignored.
+* **`nudge_threshold` (`int`)**:: Round-budget early warning. When the number of remaining reasoning rounds falls to this value or below, a `[ROUND BUDGET NOTICE]` block is injected into that round's system prompt, telling the LLM exactly how many rounds remain and directing it to prioritize and wrap up (finish remaining work and emit `<done/>`) instead of being hard-stopped by round-budget exhaustion. The notice is recomputed every round and appears only in the per-round system prompt (it never mutates the base system prompt or `tools_prompt`, so KV-cache alignment across turns is preserved). On the final round the notice is an approximate advance warning, since the loop may still terminate by exhaustion immediately after. Suppressed only by setting `0` (or any value `<= 0`); not affected by `EventMode.SILENT_MODE`. Defaults to `3`.
+
 - **`temperature`**: Generation temperature.
 - **`n_predict`**: Maximum tokens to generate.
 - **`enable_artefacts`**: Toggles the artifact creation system.

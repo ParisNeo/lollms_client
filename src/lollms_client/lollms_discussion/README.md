@@ -539,6 +539,7 @@ def chat(
     prehydrate_rag:               bool = True,
     max_nb_rounds:                Optional[int] = None,
     max_reasoning_steps:          Optional[int] = None,
+    nudge_threshold:              int = 3,
     enable_in_message_status:     bool = False,
     enable_sub_agents:            bool = False,
     forward_artefact_chunks:      bool = False,
@@ -619,8 +620,9 @@ The tool registry follows a **Strict Sovereign Opt-In Doctrine**. The system wil
 *   `enable_data_tools` (`bool`): If `True` (Default), allows the system to auto-mount the `semantic_data_engineer` library if data files are detected in the workspace.
 *   `allow_dynamic_tools` (`bool`): **Security Gate**. If `True`, allows the LLM to write and execute its own Python tools on the fly via `type="tool"` artifacts. Defaults to `False`.
 *   `enable_code_execution` (`bool`): **Security Gate**. If `True`, registers the `tool_execute_python_code` LCP tool, allowing the LLM to execute arbitrary Python code strings. Defaults to `False`.
-*   `max_nb_rounds` (`Optional[int]`): The maximum number of agentic reasoning rounds before the loop forces a final answer. Prevents infinite cycles. Defaults to `20` if `None`.
+*   `max_nb_rounds` (`Optional[int]`): The maximum number agentic reasoning rounds before the loop forces a final answer. Prevents infinite cycles. Defaults to `20` if `None`.
 *   `max_reasoning_steps` (`Optional[int]`): **Deprecated**. Backward-compatible alias for `max_nb_rounds`. If `max_nb_rounds` is provided, this parameter is ignored.
+*   `nudge_threshold` (`int`): Round-budget early warning. When the number of remaining reasoning rounds falls to this value or below, a `[ROUND BUDGET NOTICE]` block is injected into that round's system prompt, telling the LLM exactly how many rounds remain and directing it to prioritize and wrap up (finish remaining work and emit `<done/>`) instead of being hard-stopped by round-budget exhaustion. The notice is recomputed every round and appears only in the per-round system prompt (it never mutates the base system prompt or `tools_prompt`, so KV-cache alignment across turns is preserved). On the final round the notice is an approximate advance warning, since the loop may still terminate by exhaustion immediately after. Suppressed only by setting `0` (or any value `<= 0`); not affected by `EventMode.SILENT_MODE`. Defaults to `3`.
 
 #### 🗂️ Multi-Source Tool Orchestration (LCP)
 

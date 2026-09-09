@@ -16,6 +16,7 @@ TOOL SELECTION DOCTRINE:
 """
 
 import os
+import re
 import sys
 import io
 import uuid
@@ -54,6 +55,19 @@ def _ensure_import(module_name: str, package_name: str = None):
         except Exception as install_err:
             ASCIIColors.error(f"[execute_python] Failed to auto-install '{pkg}': {install_err}")
             return None
+
+
+def _sanitize_host_paths(text: str) -> str:
+    """
+    Strips absolute host filesystem paths from tool outputs to preserve
+    sandbox opacity. The LLM must never learn the orchestrator's physical
+    location (user folders, install directories).
+    """
+    if not text:
+        return text
+    root = str(Path.cwd().resolve())
+    sanitized = text.replace(root, ".")
+    return re.sub(r'[A-Za-z]:\\(?:Users|home)[\\/][^\s"\']*', '<host-path>', sanitized)
 
 
 def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]] = None) -> Dict[str, Any]:
@@ -117,11 +131,11 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
         sys.argv = argv
 
     try:
-        ASCIIColors.info(f"⚡ Executing arbitrary Python code (label: {script_label}, CWD: {os.getcwd()})")
+        ASCIIColors.info(f"⚡ Executing arbitrary Python code (label: {script_label})")
         sibling_note = (
-            f"[sandbox] CWD = workspace root ({os.getcwd()}). "
-            f"Artifact .py files are importable as siblings: use 'from <module> import ...' directly; "
-            f"do NOT prepend 'workspace/' or manipulate sys.path."
+            "[sandbox] CWD = workspace root. "
+            "Artifact .py files are importable as siblings: use 'from <module> import ...' directly; "
+            "do NOT prepend 'workspace/' or manipulate sys.path."
         )
         print(sibling_note)
         if _plt is not None:
@@ -144,9 +158,9 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
             ASCIIColors.error(f"❌ Execution Failed:\n{raw_traceback}")
             return {
                 "success": False,
-                "error": f"Execution Error:\n{raw_traceback}",
-                "output": raw_output,
-                "stderr": raw_error
+                "error": f"Execution Error:\n{_sanitize_host_paths(raw_traceback)}",
+                "output": _sanitize_host_paths(raw_output),
+                "stderr": _sanitize_host_paths(raw_error)
             }
 
         fig_nums = _plt.get_fignums() if _plt is not None else []
@@ -175,9 +189,9 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
         ASCIIColors.error(f"❌ Unexpected execution failure:\n{raw_traceback}")
         return {
             "success": False,
-            "error": f"Unexpected execution failure:\n{raw_traceback}",
-            "output": raw_output,
-            "stderr": raw_error
+            "error": f"Unexpected execution failure:\n{_sanitize_host_paths(raw_traceback)}",
+            "output": _sanitize_host_paths(raw_output),
+            "stderr": _sanitize_host_paths(raw_error)
         }
     finally:
         sys.stdout = old_stdout
@@ -217,8 +231,8 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
 
     return {
         "success": True,
-        "output": out_str,
-        "stderr": err_str
+        "output": _sanitize_host_paths(out_str),
+        "stderr": _sanitize_host_paths(err_str)
     }
 
 
