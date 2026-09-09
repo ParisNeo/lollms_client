@@ -1541,6 +1541,17 @@ class _AgentStreamState:
          
         
     def flush_remaining_buffer(self):
+        if self._in_think_block:
+            self._in_think_block = False
+            self._think_buffer += self._pending_buffer
+            self._pending_buffer = ""
+            if not self.content.strip() and self._think_buffer.strip():
+                ASCIIColors.warning("[AgentStreamState] Unclosed reasoning block at end of stream; promoting recovered text as visible response.")
+                recovered = self._think_buffer.strip()
+                self.content = recovered
+                self._cb(recovered)
+            self._think_buffer = ""
+
         if self._in_code_fence:
             self._in_code_fence = False
             hold = self._code_fence_hold_buffer

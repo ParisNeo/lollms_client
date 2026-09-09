@@ -65,6 +65,19 @@ _TEXT_RAG_EXTS = {
     ".ps1", ".bat", ".toml", ".ini", ".cfg", ".log", ".rdf", ".ttl",
 }
 
+_SYNTHETIC_RESPONSE_PREFIXES = (
+    "[Task terminated:",
+    "[Terminated:",
+    "[Empty response:",
+    "[Generation error:",
+    "[Context Window Exhausted:",
+)
+
+
+def _is_synthetic_agent_response(text: str) -> bool:
+    stripped = (text or "").strip()
+    return any(stripped.startswith(prefix) for prefix in _SYNTHETIC_RESPONSE_PREFIXES)
+
 class _NullArtefactManager:
     """Null-safe stand-in for ArtefactManager when no workspace is configured."""
     def get_context_images(self) -> list:
@@ -1916,10 +1929,11 @@ class LollmsPersonality:
                 valid_msgs = []
                 for item in data:
                     if isinstance(item, dict) and "role" in item and "content" in item:
-                        valid_msgs.append({
-                            "role": str(item["role"]),
-                            "content": str(item["content"])
-                        })
+                        role = str(item["role"])
+                        content = str(item["content"])
+                        if role == "assistant" and _is_synthetic_agent_response(content):
+                            continue
+                        valid_msgs.append({"role": role, "content": content})
                 self._conversation = valid_msgs
             else:
                 self._conversation = []
@@ -3972,7 +3986,7 @@ JSON:"""
           "2. **EXPLICIT TERMINATION WITH `<done/>`**: When all objectives are met and tests pass, end with a `<done/>` tag on a new line.\n"
           "3. **SAME-SESSION CONTINUATION**: When executing a sequence, emit the next action's tag in your IMMEDIATE NEXT response.\n"
           "4. **AGENTIC TRIGGER**: If the user requests code generation, file modification, testing, or multi-step work, you MUST enter the agentic loop and use `<tool>` or `<artifact>` tags. Do NOT write code directly in conversational prose.\n"
-          "5. **ROUND 1 SHORT-CIRCUIT**: If the user's request is purely conversational (e.g., greetings, simple questions), respond conversationally without `<done/>` or tool tags.\n"
+          "5. **ROUND 1 SHORT-CIRCUIT**: If the user's request is purely conversational (e.g., greetings, simple questions), respond conversationally. **MANDATORY**: You MUST end EVERY completed turn with `<done/>` on a new line, including pure conversational answers. `<done/>` is the only valid turn terminator; never end a turn without it.\n"
           "6. **NO PROSE BEFORE TOOLS**: DO NOT write verbose introductory text before a tool call. Output the `<tool>` tag immediately after any brief 1-line explanation.\n"
           "7. **BATCH CONTEXT OPERATIONS (MANDATORY)**: When locking, unlocking, or hiding multiple files, you MUST use a SINGLE tag containing all files separated by newlines. DO NOT emit multiple sequential tags for batch operations.\n"
             "   Example:\n"
@@ -4236,6 +4250,44 @@ JSON:"""
         body_content = "\n".join(targets)
         return self._execute_context_visibility(tag_name, body_content)
 
+    def _register_unindexed_workspace_files(self, targets: List[str], all_arts: List[Dict[str, Any]]) -> List[str]:
+        """
+        Resolves targets that exist on disk but are missing from the artefact index.
+
+        The tool layer addresses files relative to the workspace root (matching
+        Path.cwd()), while the artefact index keys files by workspace-relative
+        titles. When a target matches a real file on disk, it is imported into
+        the artefact manager on demand so visibility operations can proceed.
+        Returns the target list with any workspace-prefix ambiguity removed.
+        """
+        if not self._resolved_workspace:
+            return targets
+
+        indexed_titles = {a.get("title", "") for a in all_arts}
+        resolved: List[str] = []
+
+        for target in targets:
+            if target in indexed_titles:
+                resolved.append(target)
+                continue
+
+            candidate = self._resolved_workspace / target
+            if candidate.is_file():
+                try:
+                    imported = self._artefact_manager.import_file(file_path=candidate, title=target, active=False)
+                    if imported:
+                        resolved.append(imported.get("title", target))
+                    else:
+                        resolved.append(target)
+                except Exception as import_err:
+                    ASCIIColors.warning(f"[{self.name}] Failed to import '{target}' into artefact index: {import_err}")
+                    resolved.append(target)
+                continue
+
+            resolved.append(target)
+
+        return resolved
+
     def _execute_context_visibility(self, tag_name: str, body: str) -> Dict[str, Any]:
         if not hasattr(self, '_artefact_manager') or not self._artefact_manager:
             return "[SYSTEM ERROR] Artefact system not initialized. Cannot manage file visibility."
@@ -4276,6 +4328,9 @@ JSON:"""
 
         raw_targets = re.split(r'[\n,;]+', clean_body)
         targets = [t.strip().replace("\\", "/") for t in raw_targets if t.strip()]
+
+        targets = self._register_unindexed_workspace_files(targets, all_arts)
+        all_arts = self._artefact_manager._get_all_raw()
 
         expanded_targets = []
         all_arts_titles = [a.get("title", "") for a in all_arts if not a.get("title", "").endswith("::images")]
@@ -4374,32 +4429,45 @@ JSON:"""
                     ASCIIColors.warning(f"[{self.name}] Failed to update collapsed_folders DB: {db_err}")
                     continue
 
+            is_folder_target = t_target.endswith("/")
             folder_prefix = t_target.rstrip('/') + '/'
             matched_arts = [a for a in all_arts if a.get("physical_path", "").replace("\\", "/").startswith(folder_prefix)]
 
-            if not matched_arts:
-                not_found.append(t_target)
-                continue
-
-            for art in matched_arts:
-                if art.get("visibility") == target_visibility:
-                    already_in_state.append(art["title"])
-                else:
-                    art["visibility"] = target_visibility
-                    if target_visibility == ArtefactVisibility.FULL:
-                        art["active"] = True
+            if not is_folder_target and matched_arts:
+                for art in matched_arts:
+                    if art.get("visibility") == target_visibility:
+                        already_in_state.append(art["title"])
                     else:
-                        art["active"] = False
-                        art["content"] = ""
-                    processed_files.append(art["title"])
+                        art["visibility"] = target_visibility
+                        if target_visibility == ArtefactVisibility.FULL:
+                            art["active"] = True
+                        else:
+                            art["active"] = False
+                            art["content"] = ""
+                        processed_files.append(art["title"])
                 continue
 
             art = _resolve_target_to_artifact(t_target)
 
+            if not art and self._resolved_workspace:
+                disk_path = self._resolved_workspace / t_target
+                if disk_path.is_file():
+                    try:
+                        imported = self._artefact_manager.import_file(file_path=disk_path, title=t_target, active=False)
+                        if imported:
+                            refreshed_arts = self._artefact_manager._get_all_raw()
+                            for refreshed in refreshed_arts:
+                                existing = next((a for a in all_arts if a.get("id") == refreshed.get("id")), None)
+                                if existing is None:
+                                    all_arts.append(refreshed)
+                            art = _resolve_target_to_artifact(t_target)
+                    except Exception as import_err:
+                        ASCIIColors.warning(f"[{self.name}] On-demand import failed for '{t_target}': {import_err}")
+
             if not art:
                 not_found.append(t_target)
                 if getattr(self, 'debug_mode', False):
-                    ASCIIColors.warning(f"[ContextUnlock] File not found in index: {t_target}")
+                    ASCIIColors.warning(f"[ContextUnlock] File not found in index or disk: {t_target}")
                     ASCIIColors.warning(f"[ContextUnlock] Indexed titles sample: {all_arts_titles[:5]}")
                 continue
             elif art.get("visibility") == target_visibility:
@@ -5213,6 +5281,14 @@ JSON:"""
             has_truncated_artifact = False
             truncated_artifact_title = None
 
+            if round_count == 1 and not ss.completed_actions and not tool_calls_this_turn and not workspace_changes:
+                round1_text = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
+                if round1_text:
+                    final_response = round1_text
+                    if not ss.was_done_detected():
+                        ASCIIColors.info(f"[{self.name}] Round 1 conversational answer. Terminating (authoritative short-circuit).")
+                    break
+
             if ss.was_done_detected():
                 final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
 
@@ -5636,7 +5712,7 @@ JSON:"""
                     continue
 
                 if not ss.completed_actions and not tool_calls_this_turn and not workspace_changes and not ss.was_done_detected() and round_count == 1:
-                    if raw_round_text.strip():
+                    if False:
                         ASCIIColors.warning(f"[{self.name}] Round 1 preamble stall (text produced, no actions, no <done/>). Injecting continuation mandate.")
                         virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text()))
                         virtual_history.append(SimpleNamespace(
@@ -5654,6 +5730,19 @@ JSON:"""
                         continue
 
                 if not final_response.strip():
+                    if getattr(self, 'debug_mode', False):
+                        self._dump_error(
+                            error=Exception("Empty clean text after <done/>"),
+                            context_desc="Empty Response After Done",
+                            round_count=round_count,
+                            extra_data={
+                                "raw_stream_chars": len(raw_llm_output_buffer or ""),
+                                "think_buffer_chars": len(getattr(ss, '_think_buffer', '') or ""),
+                                "pending_buffer_chars": len(getattr(ss, '_pending_buffer', '') or ""),
+                                "in_think_block": bool(getattr(ss, '_in_think_block', False)),
+                                "raw_stream_tail": (raw_llm_output_buffer or "")[-2000:],
+                            }
+                        )
                     ASCIIColors.warning(f"[{self.name}] Empty response after <done/> with no prior actions. Terminating.")
                     final_response = "[Task terminated: The agent produced no actionable output.]"
                     break
@@ -6164,12 +6253,15 @@ JSON:"""
 
             raw_round_text = ss.get_clean_text()
 
-            # ── 🛡️ ROUND 1 CONVERSATIONAL SHORT-CIRCUIT ──
-            # Only terminate on Round 1 if <done/> was explicitly emitted by the model,
-            # signaling that the conversational answer is intentionally complete.
+            # ── 🛡️ ROUND 1 CONVERSATIONAL SHORT-CIRCUIT (MANDATORY TERMINATION) ──
+            # Round 1 with pure conversational text and ZERO actions is ALWAYS terminal,
+            # whether or not the model emitted <done/>. A greeting, a clarifying question,
+            # or a complete prose answer must never be force-continued into an agentic loop.
             if round_count == 1 and not ss.completed_actions and not tool_calls_this_turn and not workspace_changes:
-                if ss.was_done_detected() and raw_round_text.strip():
+                if raw_round_text.strip():
                     final_response = re.sub(r'(?i)<done\s*/?>', '', raw_round_text).strip()
+                    if not ss.was_done_detected():
+                        ASCIIColors.info(f"[{self.name}] Round 1 conversational answer without <done/>. Terminating (conversational short-circuit).")
                     break
 
             # ── 🧹 DYNAMIC HISTORY SANITIZATION (Strict Non-Placeholder Strategy) ──
@@ -6741,8 +6833,11 @@ JSON:"""
             ss.completed_actions = []
 
         if use_internal_history and not was_cancelled:
-            self._conversation.append({"role": "user", "content": prompt})
-            self._conversation.append({"role": "assistant", "content": final_response})
+            if _is_synthetic_agent_response(final_response):
+                ASCIIColors.info(f"[{self.name}] Synthetic failure response suppressed from conversation history.")
+            else:
+                self._conversation.append({"role": "user", "content": prompt})
+                self._conversation.append({"role": "assistant", "content": final_response})
 
         object.__setattr__(self, '_compaction_triggered_this_turn', False)
 

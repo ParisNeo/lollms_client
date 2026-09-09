@@ -92,12 +92,14 @@ def tool_read_file(file_name: str) -> Dict[str, Any]:
         return {"success": False, "error": f"Failed to read file '{file_name}': {str(e)}", "traceback": traceback.format_exc()}
 
 
-def tool_list_files(directory: str = ".") -> Dict[str, Any]:
+def tool_list_files(directory: str = ".", recursive: bool = False) -> Dict[str, Any]:
     """
-    List all files in a directory within the workspace.
+    List the immediate contents of a directory within the workspace (non-recursive by default).
 
     Args:
         directory (str, optional): Directory to list. Defaults to current directory ('.').
+        recursive (bool, optional): If True, performs a deep recursive listing while skipping
+            hidden and ignored folders (e.g. .git). Defaults to False.
     """
     try:
         target_path = _resolve_safe_path(directory)
@@ -105,18 +107,34 @@ def tool_list_files(directory: str = ".") -> Dict[str, Any]:
             return {"success": False, "error": f"Directory '{directory}' not found."}
         if not target_path.is_dir():
             return {"success": False, "error": f"Path '{directory}' is not a directory."}
-            
-        files = []
-        for p in target_path.rglob("*"):
-            if p.is_file():
-                if p.suffix.lower() in _BINARY_EXTS:
+
+        entries: List[str] = []
+
+        if not recursive:
+            for item in target_path.iterdir():
+                name = item.name
+                if name in _IGNORED_DIRS or name.startswith("."):
                     continue
-                rel_path = p.relative_to(Path.cwd())
-                files.append(str(rel_path).replace("\\", "/"))
-                
-        files.sort()
-        output_str = "\n".join(files) if files else "Directory is empty."
-        return {"success": True, "files": files, "output": output_str}
+                if item.is_dir():
+                    entries.append(f"{name}/ (dir)")
+                elif item.is_file() and item.suffix.lower() not in _BINARY_EXTS:
+                    entries.append(name)
+
+            entries.sort(key=lambda e: (not e.endswith("/ (dir)"), e.lower()))
+            output_str = "\n".join(entries) if entries else "Directory is empty."
+            return {"success": True, "files": entries, "output": output_str}
+
+        for root, dirs, files in os.walk(target_path):
+            dirs[:] = [d for d in dirs if d not in _IGNORED_DIRS and not d.startswith(".")]
+            for filename in files:
+                if Path(filename).suffix.lower() in _BINARY_EXTS:
+                    continue
+                rel_path = Path(root, filename).relative_to(Path.cwd())
+                entries.append(str(rel_path).replace("\\", "/"))
+
+        entries.sort()
+        output_str = "\n".join(entries) if entries else "Directory is empty."
+        return {"success": True, "files": entries, "output": output_str}
     except PermissionError as pe:
         return {"success": False, "error": str(pe)}
     except Exception as e:
