@@ -111,6 +111,75 @@ def _cb(callback: Optional[Callable], text: str, msg_type: MSG_TYPE, meta: Optio
 
 _BASE64_RE = re.compile(r'^[A-Za-z0-9+/=\s]{500,}$')
 
+
+def _resolve_tool_workspace_root(discussion) -> "Path":
+    from pathlib import Path
+    if getattr(discussion, "workspace_data_path", None):
+        return Path(discussion.workspace_data_path).resolve()
+    base_ws = Path(discussion.workspace_path) if getattr(discussion, "workspace_path", None) else Path("./data_workspace")
+    return (base_ws / discussion.id / "workspace_data").resolve()
+
+
+def _hash_workspace_file_refs(discussion, params: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Builds a context fingerprint from tool parameters that reference existing
+    workspace files. A tool call is only a repetition when the workspace state
+    it depends on is unchanged.
+    """
+    import hashlib
+    from pathlib import Path
+
+    ws_root = _resolve_tool_workspace_root(discussion)
+
+    def _sanitize_candidate(value: str) -> str:
+        cleaned = value.replace("\\", "/").strip()
+        for prefix in ("./workspace/", "./data_workspace/", "workspace/", "data_workspace/"):
+            if cleaned.lower().startswith(prefix):
+                cleaned = cleaned[len(prefix):]
+                break
+        disc_id = getattr(discussion, "id", "")
+        if disc_id and cleaned.lower().startswith(disc_id.lower() + "/"):
+            cleaned = cleaned[len(disc_id) + 1:]
+        return cleaned
+
+    def _resolve_candidate(value: str) -> Optional[Path]:
+        sanitized = _sanitize_candidate(value)
+        candidates = []
+        raw_path = Path(value)
+        if raw_path.is_absolute():
+            candidates.append(raw_path)
+        else:
+            candidates.append(ws_root / sanitized)
+            candidates.append(Path.cwd() / sanitized)
+        for cand in candidates:
+            try:
+                resolved = cand.resolve()
+                if not str(resolved).startswith(str(ws_root)) and not raw_path.is_absolute():
+                    continue
+                if resolved.is_file():
+                    return resolved
+            except Exception:
+                continue
+        return None
+
+    hashes: Dict[str, str] = {}
+    for key, value in params.items():
+        items = value if isinstance(value, list) else [value]
+        found = []
+        for item in items:
+            if not isinstance(item, str) or not item.strip():
+                continue
+            resolved = _resolve_candidate(item)
+            if resolved is None:
+                continue
+            try:
+                found.append(hashlib.md5(resolved.read_bytes()).hexdigest())
+            except Exception:
+                continue
+        if found:
+            hashes[key] = ",".join(found)
+    return hashes
+
 _BINARY_BLOB_KEYS = {
     "plot_b64", "image_b64", "audio_b64", "video_b64", "file_b64",
     "screenshot_b64", "pdf_b64", "thumbnail_b64", "base64",
@@ -3081,6 +3150,15 @@ class ChatMixin:
             elif file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
                 atype = "image"
 
+            rich_doc_bytes = None
+            rich_doc_content = None
+            if file_ext in (".docx", ".pptx", ".odt"):
+                rich_doc_content = self._extract_rich_document_content(file_path, file_ext, tool_name, file_size)
+                try:
+                    rich_doc_bytes = file_path.read_bytes()
+                except Exception as read_err:
+                    ASCIIColors.warning(f"[ChatMixin] Failed to read physical bytes for '{file_name}': {read_err}")
+
             EXPLICIT_BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet",
                                     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
                                     ".zip", ".tar", ".gz"}
@@ -3088,7 +3166,10 @@ class ChatMixin:
             should_read_content = True
             content_placeholder = None
 
-            if file_ext in EXPLICIT_BINARY_EXTS:
+            if rich_doc_content is not None:
+                should_read_content = False
+                content_placeholder = rich_doc_content
+            elif file_ext in EXPLICIT_BINARY_EXTS:
                 should_read_content = False
                 content_placeholder = (
                     f"### Data File Generated: `{file_name}`\n\n"
@@ -3129,7 +3210,9 @@ class ChatMixin:
                         new_type=atype,
                         active=True,
                         visibility=ArtefactVisibility.FULL,
-                        commit_message=f"Updated binary file reference by tool '{tool_name}'"
+                        physical_data=rich_doc_bytes,
+                        logical_content=content_placeholder,
+                        commit_message=f"Updated rich document by tool '{tool_name}'"
                     )
                 else:
                     art = self.artefacts.add(
@@ -3138,6 +3221,8 @@ class ChatMixin:
                         content=content_placeholder,
                         active=True,
                         visibility=ArtefactVisibility.FULL,
+                        physical_data=rich_doc_bytes,
+                        logical_content=content_placeholder,
                         commit_message=f"Created by tool '{tool_name}'"
                     )
                 self.commit()
@@ -3222,6 +3307,15 @@ class ChatMixin:
                 elif file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
                     atype = "image"
 
+                rich_doc_bytes = None
+                rich_doc_content = None
+                if file_ext in (".docx", ".pptx", ".odt"):
+                    rich_doc_content = self._extract_rich_document_content(file_path, file_ext, tool_name, file_path.stat().st_size)
+                    try:
+                        rich_doc_bytes = file_path.read_bytes()
+                    except Exception as read_err:
+                        ASCIIColors.warning(f"[ChatMixin] Failed to read physical bytes for '{file_name}': {read_err}")
+
                 EXPLICIT_BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet",
                                         ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
                                         ".zip", ".tar", ".gz"}
@@ -3229,7 +3323,10 @@ class ChatMixin:
                 should_read_content = True
                 content_placeholder = None
 
-                if file_ext in EXPLICIT_BINARY_EXTS:
+                if rich_doc_content is not None:
+                    should_read_content = False
+                    content_placeholder = rich_doc_content
+                elif file_ext in EXPLICIT_BINARY_EXTS:
                     should_read_content = False
                     content_placeholder = (
                         f"### Data File Modified: `{file_name}`\n\n"
@@ -3353,6 +3450,56 @@ class ChatMixin:
                         if tag not in ai_msg_local.content:
                             ai_msg_local.content += f'\n\n{tag}\n'
                         self.commit()
+
+    def _extract_rich_document_content(
+        self,
+        file_path,
+        file_ext: str,
+        tool_name: str,
+        file_size: int,
+    ) -> str:
+        """
+        Builds the logical twin for OOXML rich documents generated by tools.
+
+        DOCX/PPTX/ODT are ZIP containers, so the generic null-byte binary sniffer
+        misclassifies them and would overwrite the logical content with a metadata
+        card. This helper extracts real text instead, falling back to an
+        information card only when extraction is impossible.
+        """
+        header = (
+            f"### Rich Document: `{file_path.name}`\n\n"
+            f"- **Type**: {file_ext.upper()} (Extracted Document Text)\n"
+            f"- **Size**: {file_size:,} bytes\n"
+            f"- **Location**: `./{file_path.name}`\n\n"
+        )
+        try:
+            if file_ext == ".docx":
+                from lollms_client.lollms_artefact.file_import import _extract_docx_text
+                extracted = _extract_docx_text(file_path).strip()
+            elif file_ext == ".pptx":
+                from lollms_client.lollms_artefact.file_import import _extract_pptx_text
+                extracted = _extract_pptx_text(file_path).strip()
+            else:
+                extracted = ""
+
+            if not extracted:
+                return (
+                    header
+                    + f"No extractable text found. The physical file `./{file_path.name}` "
+                    f"is preserved on disk and can be inspected with the document tools."
+                )
+
+            return header + "#### Extracted Content:\n\n" + extracted
+        except Exception as extract_err:
+            ASCIIColors.warning(
+                f"[ChatMixin] Rich document extraction failed for '{file_path.name}': {extract_err}"
+            )
+            return (
+                header
+                + f"Text extraction failed ({extract_err}). The physical file "
+                f"`./{file_path.name}` is preserved on disk and can be inspected "
+                f"with the document tools."
+            )
 
     def wipe_all_memories(self) -> bool:
         """
@@ -3500,7 +3647,7 @@ class ChatMixin:
         enable_image_editing:    bool = True,
         auto_activate_artefacts: bool = True,
         enable_inline_widgets:        bool = False,
-        enable_forms:                 bool = True,
+        enable_forms:                 bool = False,
         enable_notes:                 bool = True,
         enable_skills:                bool = True,
         enable_books:                 bool = False,
@@ -4167,6 +4314,7 @@ class ChatMixin:
         tool_signature_counts = {}
 
         successful_tool_signatures = set()
+        workspace_revision = 0
 
         # ── 📊 TURN PROGRESS TRACKER ──
         # Tracks all actions taken during this turn so the LLM can see what it has accomplished.
@@ -4916,6 +5064,12 @@ class ChatMixin:
             # If the StreamState dispatched an artifact, note, skill, or context update
             # (but NOT a tool), we must halt generation, hydrate virtual_history, and re-prompt.
             if ss.was_action_dispatched() and not ss.tool_trigger:
+                if ss.affected_artefacts:
+                    workspace_revision += 1
+                    ASCIIColors.info(
+                        f"[ChatMixin] Workspace mutated by LLM dispatch "
+                        f"(revision {workspace_revision}). Success-loop signatures refreshed."
+                    )
                 full_round_text = ss.get_clean_text_so_far()
                 raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
 
@@ -5303,6 +5457,106 @@ class ChatMixin:
                         # Force another reasoning round to let the LLM correct itself
                         continue
 
+                    # ── CONTEXT-AWARE LOOP DETECTION (BEFORE EXECUTION) ──
+                    failure_memory = getattr(self, "_failure_memory", None)
+
+                    try:
+                        param_signature = json.dumps(tool_params, sort_keys=True, default=str)
+                    except Exception:
+                        param_signature = str(tool_params)
+                    full_signature = f"{tool_name}::{param_signature}"
+
+                    try:
+                        current_file_hashes = _hash_workspace_file_refs(self, tool_params)
+                    except Exception:
+                        current_file_hashes = {}
+
+                    if current_file_hashes:
+                        context_token = "files:" + json.dumps(current_file_hashes, sort_keys=True)
+                    else:
+                        context_token = f"wsrev:{workspace_revision}"
+                    context_aware_signature = f"{full_signature}::{context_token}"
+
+                    ASCIIColors.info(
+                        f"[ChatMixin] Loop check: tool='{tool_name}', "
+                        f"sig='{context_aware_signature[:120]}...', "
+                        f"in_success_set={context_aware_signature in successful_tool_signatures}, "
+                        f"success_set_size={len(successful_tool_signatures)}"
+                    )
+
+                    if failure_memory and hasattr(failure_memory, "_signatures"):
+                        has_prev_failure = context_aware_signature in failure_memory._signatures
+                    else:
+                        has_prev_failure = False
+
+                    if has_prev_failure:
+                        if self.is_generation_cancelled():
+                            was_cancelled = True
+                            break
+
+                        result_str = (
+                            f"Error executing tool '{tool_name}': this exact call (identical parameters "
+                            f"AND identical workspace file contents) already failed on a previous round. "
+                            f"To prevent an infinite loop, execution was blocked. If you modified an "
+                            f"artifact since, the signature has changed and the retry is allowed — otherwise "
+                            f"you must change your parameters, fix the referenced artifact, or take a "
+                            f"different approach."
+                        )
+                        status_err_line = f"* Tool call blocked to prevent loop.\n"
+                        details_block = f"Loop Intercepted:\n{result_str}\n"
+                        tool_close_tag = f"{status_err_line}{details_block}<!-- status:failure -->\n</processing>\n\n"
+                        ai_msg.content += tool_close_tag
+                        _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="user",
+                            content=(
+                                f'<tool_result name="{tool_name}" status="FAILED">\n'
+                                f"{result_str}\n"
+                                f"</tool_result>\n\n"
+                                f"⚠️ **Tool Execution Failed & Loop Blocked.**\n"
+                                f"You attempted to retry a failing tool with identical parameters and unchanged inputs. "
+                                f"The system has blocked this to prevent an infinite loop. "
+                                f"You MUST now write a final response to the user explaining that the operation could not "
+                                f"be completed, detailing the error above, and suggesting possible workarounds or "
+                                f"alternative approaches. Do NOT attempt to call the tool again."
+                            )
+                        ))
+                        continue
+
+                    if context_aware_signature in successful_tool_signatures:
+                        ASCIIColors.warning(
+                            f"[ChatMixin] Repetitive SUCCESS loop blocked for '{tool_name}'. "
+                            f"Signature recorded and workspace state unchanged since last success."
+                        )
+                        status_err_line = f"* Tool call blocked to prevent success loop.\n"
+                        details_block = f"Loop Intercepted:\nRepetitive successful tool call blocked (workspace state unchanged)\n<!-- status:failure -->\n</processing>\n\n"
+                        ai_msg.content += status_err_line + details_block
+                        _cb(callback, status_err_line + details_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="user",
+                            content=(
+                                f'<tool_result name="{tool_name}" status="FAILED">\n'
+                                f"Repetitive tool call detected. The output is already in your context.\n"
+                                f"</tool_result>\n\n"
+                                f"⚠️ **Tool Execution Blocked.**\n"
+                                f"You have already successfully called '{tool_name}' with these exact parameters, "
+                                f"and the workspace files it depends on have not changed since. The system has blocked "
+                                f"this duplicate call. If you intentionally modified the target artifact, re-emit the "
+                                f"<artifact> change and try again; otherwise analyze the data already in your context "
+                                f"and write your final answer. Do NOT attempt to call the tool again."
+                            )
+                        ))
+                        continue
+                    else:
+                        tool_signature_counts[full_signature] = tool_signature_counts.get(full_signature, 0) + 1
+
+                    # 2. Strip ONLY the raw <tool> JSON tag from the UI/DB buffer (ai_msg.content).
+                    if tool_call_json_str in ai_msg.content:
+                        ai_msg.content = ai_msg.content.replace(f"<tool>{tool_call_json_str}</tool>", "")
+                        ai_msg.content = ai_msg.content.replace(tool_call_json_str, "")
+
                     tool_res = None
                     _lcp_executed = False
 
@@ -5411,42 +5665,7 @@ class ChatMixin:
                             }
                             _lcp_executed = True
                     elif active_tools and tool_name in active_tools and "callable" in active_tools[tool_name]:
-                        import os as _os
-                        from pathlib import Path as _Path
-                        _old_cwd_direct = _os.getcwd()
-
-                        if hasattr(self, "workspace_data_path") and self.workspace_data_path:
-                            _direct_workspace_dir = _Path(self.workspace_data_path)
-                        else:
-                            _base_ws_direct = _Path(self.workspace_path) if hasattr(self, "workspace_path") and self.workspace_path else _Path("./data_workspace")
-                            _direct_workspace_dir = _base_ws_direct / self.id / "workspace_data"
-
-                        _direct_workspace_dir.mkdir(parents=True, exist_ok=True)
-                        _direct_workspace_str = str(_direct_workspace_dir.resolve())
-
-                        try:
-                            _os.chdir(_direct_workspace_str)
-                            try:
-                                import inspect as _inspect
-                                _direct_sig = _inspect.signature(active_tools[tool_name]["callable"]).parameters
-                                _direct_call_kwargs = dict(tool_params)
-                                if "discussion_instance" in _direct_sig:
-                                    _direct_call_kwargs["discussion_instance"] = self
-                                if "lollms_client_instance" in _direct_sig:
-                                    _direct_call_kwargs["lollms_client_instance"] = self.lollmsClient
-
-                                tool_res = active_tools[tool_name]["callable"](**_direct_call_kwargs)
-                                _lcp_executed = True
-                            except Exception as direct_err:
-                                trace_exception(direct_err)
-                                tool_res = {
-                                    "success": False,
-                                    "error": f"Direct callable execution failed: {direct_err}",
-                                    "traceback": traceback.format_exc()
-                                }
-                                _lcp_executed = True
-                        finally:
-                            _os.chdir(_old_cwd_direct)
+                        _lcp_executed = False
                     else:
                         tool_res = {
                             "success": False,
@@ -5469,108 +5688,8 @@ class ChatMixin:
                     # We MUST NOT emit it again here, or the UI will render duplicate blocks.
                     # We simply proceed directly to tool execution.
 
-                    # ── REFLEXIVE LOOP DETECTION (FailureMemory) ──
-                    failure_memory = getattr(self, "_failure_memory", None)
-
-                    try:
-                        param_signature = json.dumps(tool_params, sort_keys=True, default=str)
-                    except Exception:
-                        param_signature = str(tool_params)
-                    full_signature = f"{tool_name}::{param_signature}"
-
-                    # 🛑 INSTRUMENTATION: Log the state of the signatures set
-                    if failure_memory and hasattr(failure_memory, "_signatures"):
-                        ASCIIColors.warning(f"[LoopTrace] Checking signature: {full_signature}. Current signatures: {failure_memory._signatures}")
-                    else:
-                        ASCIIColors.warning(f"[LoopTrace] FailureMemory or _signatures missing.")
-
-                    has_prev_failure = (
-                        hasattr(failure_memory, "_signatures") and full_signature in failure_memory._signatures
-                    ) if failure_memory else False
-
-                    if has_prev_failure:
-                        if self.is_generation_cancelled():
-                            was_cancelled = True
-                            break
-
-                        result_str = (
-                            f"Error executing tool '{tool_name}': This exact parameters configuration failed on a previous round of this conversation. "
-                            f"To prevent an infinite loop, execution was blocked. You must modify your parameters, inspect the data schemas, "
-                            f"or try a different approach. If you cannot proceed, inform the user of the error and suggest alternatives."
-                        )
-                        status_err_line = f"* Tool call blocked to prevent loop.\n"
-                        details_block = f"Loop Intercepted:\n{result_str}\n"
-                        tool_close_tag = f"{status_err_line}{details_block}<!-- status:failure -->\n</processing>\n\n"
-                        ai_msg.content += tool_close_tag
-                        _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-
-                        virtual_history.append(SimpleNamespace(
-                            sender_type="user",
-                            content=(
-                                f'<tool_result name="{tool_name}" status="FAILED">\n'
-                                f"{result_str}\n"
-                                f"</tool_result>\n\n"
-                                f"⚠️ **Tool Execution Failed & Loop Blocked.**\n"
-                                f"You attempted to retry a failing tool with identical parameters. The system has blocked this to prevent an infinite loop. "
-                                f"You MUST now write a final response to the user explaining that the operation could not be completed, "
-                                f"detailing the error above, and suggesting possible workarounds or alternative approaches. Do NOT attempt to call the tool again."
-                            )
-                        ))
-                        continue
-
                     # Execute the tool sequentially
                     try:
-                        def _get_file_hashes(params: dict) -> dict:
-                            """Returns a dict of {param_name: file_hash} for any param that is an existing file."""
-                            hashes = {}
-                            for k, v in params.items():
-                                if isinstance(v, str):
-                                    p = Path(v)
-                                    if p.is_file():
-                                        try:
-                                            import hashlib
-                                            content = p.read_bytes()
-                                            hashes[k] = hashlib.md5(content).hexdigest()
-                                        except Exception:
-                                            pass
-                            return hashes
-
-                        current_file_hashes = _get_file_hashes(tool_params)
-                        has_real_file_hashes = any(v is not None for v in current_file_hashes.values())
-
-                        if has_real_file_hashes:
-                            context_aware_signature = f"{full_signature}::{json.dumps(current_file_hashes, sort_keys=True)}"
-                        else:
-                            context_aware_signature = full_signature
-
-                        ASCIIColors.info(f"[ChatMixin] Success-loop check: tool='{tool_name}', sig='{context_aware_signature[:120]}...', in_set={context_aware_signature in successful_tool_signatures}, set_size={len(successful_tool_signatures)}")
-
-                        if context_aware_signature in successful_tool_signatures:
-                            ASCIIColors.warning(f"[ChatMixin] Repetitive SUCCESS loop blocked for '{tool_name}'. Signature already in successful set and files unchanged.")
-                            tool_res = {
-                                "success": False,
-                                "error": f"Repetitive tool call detected. You have already successfully called '{tool_name}' with these exact parameters, and the input files have not changed. The output is already in your context. Do not call it again.",
-                                "prompt_injection": f"\n\n🛑 **STOP.** You are calling '{tool_name}' again with the exact same parameters after it already succeeded. This is a loop. The data from the previous execution is already in your context above. Analyze it and move on to answer the user."
-                            }
-                            virtual_history.append(SimpleNamespace(
-                                sender_type="user",
-                                content=(
-                                    f'<tool_result name="{tool_name}" status="FAILED">\n'
-                                    f"Repetitive tool call detected. The output is already in your context.\n"
-                                    f"</tool_result>\n\n"
-                                    f"⚠️ **Tool Execution Blocked.**\n"
-                                    f"You have already successfully called '{tool_name}' with these exact parameters. The system has blocked this duplicate call. "
-                                    f"You MUST now write a final response to the user using the data already retrieved. Do NOT attempt to call the tool again."
-                                )
-                            ))
-                            # Append the processing block to UI
-                            status_err_line = f"* Tool call blocked to prevent success loop.\n"
-                            details_block = f"Loop Intercepted:\nRepetitive successful tool call blocked\n<!-- status:failure -->\n</processing>\n\n"
-                            ai_msg.content += status_err_line + details_block
-                            _cb(callback, status_err_line + details_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                            continue
-                        else:
-                            tool_signature_counts[full_signature] = tool_signature_counts.get(full_signature, 0) + 1
                         if self.is_generation_cancelled():
                             # Generation cancelled (logging removed)
                             tool_res = {
@@ -5718,17 +5837,12 @@ class ChatMixin:
                                 is_404 = tool_res.get("status_code") == 404
 
                                 if failure_memory and not is_404:
-                                    try:
-                                        param_sig = json.dumps(tool_params, sort_keys=True, default=str)
-                                    except Exception:
-                                        param_sig = str(tool_params)
-                                    full_sig = f"{tool_name}::{param_sig}"
                                     if hasattr(failure_memory, "record_failure_by_signature"):
-                                        failure_memory.record_failure_by_signature(full_sig, error_msg)
+                                        failure_memory.record_failure_by_signature(context_aware_signature, error_msg)
                                     else:
                                         if not hasattr(failure_memory, "_signatures"):
                                             object.__setattr__(failure_memory, "_signatures", set())
-                                        failure_memory._signatures.add(full_sig)
+                                        failure_memory._signatures.add(context_aware_signature)
 
                                 # 🛑 ARCHITECTURAL FIX: Removed the flawed has_prev_failure check here.
                                 # The previous code recorded the signature and immediately checked if it existed,
@@ -5816,17 +5930,12 @@ class ChatMixin:
                             result_str = str(tool_res) if tool_res is not None else "No output returned."
                             if "error" in result_str.lower() or "fail" in result_str.lower():
                                 if failure_memory:
-                                    try:
-                                        param_sig = json.dumps(tool_params, sort_keys=True, default=str)
-                                    except Exception:
-                                        param_sig = str(tool_params)
-                                    full_sig = f"{tool_name}::{param_sig}"
                                     if hasattr(failure_memory, "record_failure_by_signature"):
-                                        failure_memory.record_failure_by_signature(full_sig, result_str)
+                                        failure_memory.record_failure_by_signature(context_aware_signature, result_str)
                                     else:
                                         if not hasattr(failure_memory, "_signatures"):
                                             object.__setattr__(failure_memory, "_signatures", set())
-                                        failure_memory._signatures.add(full_sig)
+                                        failure_memory._signatures.add(context_aware_signature)
                                 clean_result_str = result_str
                                 status_done_line = f"* Completed execution with errors.\n"
                                 details_block = f"Error Logs:\n{result_str}\n"
@@ -5845,17 +5954,12 @@ class ChatMixin:
                                 extra_data={"tool_name": tool_name, "parameters": tool_params}
                             )
                         if failure_memory:
-                            try:
-                                param_sig = json.dumps(tool_params, sort_keys=True, default=str)
-                            except Exception:
-                                param_sig = str(tool_params)
-                            full_sig = f"{tool_name}::{param_sig}"
                             if hasattr(failure_memory, "record_failure_by_signature"):
-                                failure_memory.record_failure_by_signature(full_sig, str(e))
+                                failure_memory.record_failure_by_signature(context_aware_signature, str(e))
                             else:
                                 if not hasattr(failure_memory, "_signatures"):
                                     object.__setattr__(failure_memory, "_signatures", set())
-                                failure_memory._signatures.add(full_sig)
+                                failure_memory._signatures.add(context_aware_signature)
                         result_str = f"Error executing tool '{tool_name}': {e}"
                         clean_result_str = f"Error executing tool '{tool_name}': {e}"
                         status_done_line = f"* Execution crashed.\n"

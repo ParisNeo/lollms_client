@@ -521,9 +521,27 @@ class ArtefactManager:
                     title_suffix = Path(title).suffix.lower()
                     is_binary_db = title_suffix in (".db", ".sqlite", ".sqlite3")
 
+                is_rich_doc = (
+                    file_ext in (".docx", ".pptx", ".odt")
+                    or Path(title).suffix.lower() in (".docx", ".pptx", ".odt")
+                )
+
                 is_svg = file_ext == ".svg" or Path(title).suffix.lower() == ".svg"
 
-                if (atype != ArtefactType.IMAGE and not is_binary_db) or is_svg:
+                if is_rich_doc:
+                    if active_file_path.exists() and active_file_path.stat().st_size > 0:
+                        ASCIIColors.info(
+                            f"[ArtefactManager] Preserving existing physical rich document '{filename}' "
+                            f"({active_file_path.stat().st_size:,} bytes). Logical twin (.lam) holds extracted text."
+                        )
+                        wrote_physical = True
+                    else:
+                        ASCIIColors.error(
+                            f"[ArtefactManager] Rich document '{filename}' has no physical data and no existing file. "
+                            f"Refusing to write text content over a .docx/.pptx/.odt extension."
+                        )
+                        return False
+                elif (atype != ArtefactType.IMAGE and not is_binary_db) or is_svg:
                     try:
                         active_file_path.write_text(content, encoding="utf-8", errors="ignore")
                         versioned_file_path.write_text(content, encoding="utf-8", errors="ignore")

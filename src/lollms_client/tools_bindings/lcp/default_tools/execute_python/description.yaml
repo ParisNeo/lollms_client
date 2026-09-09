@@ -1,23 +1,31 @@
 binding_name: execute_python
 title: Execute Python
 author: ParisNeo & Lollms
-version: 2.1.0
+version: 2.2.0
 description: >
   Sandboxed Python execution toolset with two single-purpose tools, both defined
   in the single library file execute_python.py:
   - tool_execute_python_code: executes INLINE Python source (the 'code' string).
-    Nothing is saved to disk by the tool itself.
+    Nothing is saved to disk by the tool itself. STRICTLY RESERVED for short,
+    punctual, throwaway snippets (quick checks, one-liner computations, tiny
+    experiments of a few lines). It must NOT be used for substantial programs.
   - tool_execute_python_file: executes an EXISTING workspace .py file with optional
     argv-style arguments (sys.argv / argparse compatible). Read-only: never saves,
-    creates, or overwrites files. To persist a new script, emit an artifact first.
+    creates, or overwrites files. This is the PREFERRED execution path: to run
+    substantial or reusable code, FIRST emit an <artifact type="code"> tag to
+    create the .py file, THEN call this tool with its file name.
+  SELECTION DOCTRINE (mandatory): privilege tool_execute_python_file. Only fall
+  back to tool_execute_python_code when the code is short, punctual, and
+  disposable. Multi-step logic, algorithms, classes, or anything you may want
+  to inspect, fix, iterate on, or reuse belongs in a persisted .py artifact.
 input_parameters:
   - name: code
     type: str
-    description: "The raw Python source code to execute inline (tool_execute_python_code only). Nothing is written to disk."
+    description: "The raw Python source code to execute inline (tool_execute_python_code only). Use ONLY for short, punctual, throwaway snippets. Nothing is written to disk. For anything substantial, create an artifact .py file and use tool_execute_python_file instead."
     mandatory: false
   - name: file_name
     type: str
-    description: "Name of an EXISTING .py file inside the workspace to execute (tool_execute_python_file only). Read-only: never saves files. Path traversal is blocked."
+    description: "Name of an EXISTING .py file inside the workspace to execute (tool_execute_python_file only). Preferred execution path: emit an <artifact type=\"code\"> tag first, then run it here. Read-only: never saves files. Path traversal is blocked."
     mandatory: false
   - name: args
     type: list
@@ -26,7 +34,16 @@ input_parameters:
 commands:
   - name: tool_execute_python_code
     title: Execute Python Code
-    description: Executes inline Python source code in a sandboxed environment, capturing stdout, stderr, and matplotlib figures.
+    description: >
+      Executes a SHORT, PUNCTUAL inline Python snippet in a sandboxed environment.
+      STRICTLY reserved for brief throwaway code (quick checks, one-liners, tiny
+      experiments). Nothing is saved to disk. For substantial, reusable, or
+      iterative code, create a .py artifact first and use the preferred
+      tool_execute_python_file instead.
   - name: tool_execute_python_file
     title: Execute Python File
-    description: Executes an existing workspace .py file with optional argv-style arguments in a sandboxed environment, capturing stdout, stderr, and matplotlib figures. Read-only; never saves files.
+    description: >
+      Preferred execution path. Executes an existing workspace .py file (created
+      via an <artifact type="code"> tag) with optional argv-style arguments in a
+      sandboxed environment, capturing stdout, stderr, and matplotlib figures.
+      Read-only; never saves files.

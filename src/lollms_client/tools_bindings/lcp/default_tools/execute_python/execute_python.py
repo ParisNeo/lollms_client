@@ -1,6 +1,5 @@
 """
 execute_python.py
-=================
 LCP toolset for sandboxed Python execution. Two single-purpose tools:
   - tool_execute_python_code:   executes INLINE Python source (the 'code' string).
                                 Nothing is saved to disk by the tool itself.
@@ -8,6 +7,12 @@ LCP toolset for sandboxed Python execution. Two single-purpose tools:
                                 argv-style arguments (sys.argv / argparse compatible).
                                 Read-only: never saves, creates, or overwrites files.
 Interception of matplotlib figures and stdout/stderr capture.
+
+TOOL SELECTION DOCTRINE:
+    Privilege tool_execute_python_file. Only fall back to
+    tool_execute_python_code when the code is short, punctual, and disposable.
+    Multi-step logic, algorithms, classes, or anything worth inspecting, fixing,
+    iterating on, or reusing belongs in a persisted .py artifact.
 """
 
 import os
@@ -20,7 +25,7 @@ from typing import Any, Dict, List, Optional
 from ascii_colors import ASCIIColors
 
 TOOL_LIBRARY_NAME = "Execute Python"
-TOOL_LIBRARY_DESC = "Executes arbitrary sandboxed Python code (inline string or existing workspace .py file) and returns stdout, stderr, and generated plots."
+TOOL_LIBRARY_DESC = "Executes sandboxed Python code. PREFERRED path: persist code as a .py artifact and run it with tool_execute_python_file. tool_execute_python_code is strictly reserved for short, punctual inline snippets. Returns stdout, stderr, and generated plots."
 TOOL_LIBRARY_ICON = "🐍"
 
 
@@ -188,9 +193,25 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
     workspace_contract = (
         "\n\n[WORKSPACE NOTE] The sandbox CWD is the workspace root. "
         "Files created via <artifact> tags are siblings of your code: import them directly "
-        "(e.g. 'from rlc_filter import RLCFilter') without path prefixes or sys.path manipulation. "
-        "To execute an existing script as a program, use tool_execute_python_file instead."
+        "(e.g. 'from rlc_filter import RLCFilter') without path prefixes or sys.path manipulation."
     )
+    if script_label == "python_code":
+        code_len = len(source.strip())
+        doctrine_note = (
+            " [TOOL SELECTION DOCTRINE] This tool is STRICTLY for short, punctual snippets. "
+            "For substantial or reusable code, emit an <artifact type=\"code\"> tag to persist "
+            "the .py file, then run it with tool_execute_python_file."
+        )
+        if code_len > 800:
+            doctrine_note += (
+                f" ⚠️ Your inline snippet was {code_len} chars — that is substantial code. "
+                "Persist it as a .py artifact and use tool_execute_python_file next time."
+            )
+        workspace_contract += doctrine_note
+    else:
+        workspace_contract += (
+            " To run a short, punctual inline snippet instead, use tool_execute_python_code."
+        )
     out_str = out_str + workspace_contract
 
     return {
@@ -250,12 +271,17 @@ def _normalize_argv(script_label: str, args: Optional[List[Any]]) -> List[str]:
 
 def tool_execute_python_code(code: str = "") -> Dict[str, Any]:
     """
-    Executes inline Python code and returns stdout, stderr, and generated matplotlib plots.
+    Executes a SHORT, PUNCTUAL inline Python snippet and returns stdout, stderr, and generated plots.
 
-    Runs the raw Python source provided in the 'code' parameter inside a sandboxed
-    workspace. Nothing is written to disk unless your code explicitly saves files.
-    This tool does NOT execute files and never saves the code to a file; to run an
-    existing workspace .py script, use 'tool_execute_python_file' instead.
+    STRICTLY RESERVED for short, punctual, throwaway code: quick checks,
+    one-liner computations, tiny experiments of a few lines. Nothing is written
+    to disk unless your code explicitly saves files. This tool does NOT execute
+    files and never saves the code to a file.
+
+    DO NOT use this tool for substantial programs. For anything multi-step,
+    reusable, or iterative, the PREFERRED path is: emit an
+    <artifact type="code"> tag to persist the .py file, then run it with
+    'tool_execute_python_file'.
 
     The execution environment automatically provides common aliases:
     - pd (pandas), np (numpy), plt (matplotlib.pyplot)
@@ -290,14 +316,17 @@ def tool_execute_python_file(
     args: Optional[List[Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Executes an existing Python file from the workspace and returns stdout, stderr, and generated plots.
+    Preferred execution path: executes an existing Python file from the workspace and returns stdout, stderr, and generated plots.
 
     Reads the .py file that ALREADY EXISTS on disk in the sandboxed workspace and runs it.
     The script is invoked exactly like `python <file_name> <arg1> <arg2> ...`: arguments are
     exposed via sys.argv[1:] or argparse. This tool ONLY READS existing files — it never
-    saves, creates, or overwrites files. To write a new script to disk, emit an
-    <artifact type="code"> tag first, then call this tool with its file name. To run
-    inline code without saving anything, use 'tool_execute_python_code' instead.
+    saves, creates, or overwrites files.
+
+    WORKFLOW (mandatory for substantial code): FIRST emit an <artifact type="code">
+    tag to create the .py file, THEN call this tool with its file name. Persisting
+    scripts makes them inspectable, patchable via SEARCH/REPLACE, and reusable.
+    'tool_execute_python_code' is strictly reserved for short, punctual snippets.
 
     Args:
         file_name (str): Name of an existing .py file in the workspace to execute. Required. Path traversal is blocked.
