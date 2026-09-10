@@ -487,7 +487,17 @@ class ArtefactManager:
             ws_root = self._get_workspace_root()
             versions_root = self._get_versions_root()
             ws_root.mkdir(parents=True, exist_ok=True)
-            versions_root.mkdir(parents=True, exist_ok=True)
+
+            # ── MODE SPLIT: VERSION SNAPSHOTS & .LAM ARE DISCUSSION-MODE ONLY ──
+            # In agentic mode (disable_artefact_versioning=True), thousands of files
+            # may be synced. Writing .versions/{uuid}/ snapshots and .lam twins per
+            # file is prohibitively costly. The host application (or external Git)
+            # owns versioning there. We write ONLY the active file, nothing else.
+            versioning_enabled = not getattr(
+                self._discussion, "disable_artefact_versioning", False
+            )
+            if versioning_enabled:
+                versions_root.mkdir(parents=True, exist_ok=True)
 
             path_source = physical_path or title
             clean_path = self._sanitize_path_segments(path_source)
@@ -496,21 +506,34 @@ class ArtefactManager:
             # The active file in the workspace root (source of truth for tools)
             active_file_path = self._resolve_confined_path(filename, ensure_parent=True)
 
-            # The versioned snapshot in .versions/
-            art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_path))
-            art_version_dir = versions_root / art_id
-            art_version_dir.mkdir(parents=True, exist_ok=True)
+            # ── MODE SPLIT: VERSION SNAPSHOTS & .LAM ARE DISCUSSION-MODE ONLY ──
+            # In agentic mode (disable_artefact_versioning=True), thousands of files
+            # may be synced. Writing .versions/{uuid}/ snapshots and .lam twins per
+            # file is prohibitively costly. The host application (or external Git)
+            # owns versioning there. We write ONLY the active file, nothing else.
+            versioning_enabled = not getattr(
+                self._discussion, "disable_artefact_versioning", False
+            )
 
             name_part, ext_part = os.path.splitext(filename) if '.' in filename else (filename, "")
             versioned_filename = f"{name_part}_v{version}{ext_part}"
-            versioned_file_path = art_version_dir / versioned_filename
+
+            if versioning_enabled:
+                art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_path))
+                art_version_dir = versions_root / art_id
+                art_version_dir.mkdir(parents=True, exist_ok=True)
+                versioned_file_path = art_version_dir / versioned_filename
+            else:
+                art_version_dir = None
+                versioned_file_path = None
 
             # 1. Write Active File & Version Snapshot
             wrote_physical = False
             if physical_data is not None:
                 try:
                     active_file_path.write_bytes(physical_data)
-                    versioned_file_path.write_bytes(physical_data)
+                    if versioned_file_path is not None:
+                        versioned_file_path.write_bytes(physical_data)
                     wrote_physical = True
                 except Exception as e:
                     trace_exception(e)
@@ -521,8 +544,24 @@ class ArtefactManager:
                     title_suffix = Path(title).suffix.lower()
                     is_binary_db = title_suffix in (".db", ".sqlite", ".sqlite3")
 
+                # ── INVARIANT: THE PHYSICAL TWIN IS IMMUTABLE AGAINST .LAM OVERWRITES ──
+                # We MUST NEVER replace a created physical artefact with its logical
+                # twin (.lam). The .lam is a schema/metadata abstraction destined
+                # exclusively for `.versions/{id}/{name}.lam`. When raw physical
+                # bytes are absent, string `content` may still be a legitimate
+                # verbatim text update — but ONLY for pure text artefacts. For
+                # any binary/rich format (docx, xlsx, db, pdf, images), string
+                # content can only be a .lam card, and an existing non-empty
+                # physical file must be preserved byte-for-byte.
+                _BINARY_TWIN_EXTS = {
+                    ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet",
+                    ".docx", ".pptx", ".odt", ".pdf", ".epub",
+                    ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif", ".tiff", ".tif", ".ico",
+                }
+                _target_ext = active_file_path.suffix.lower()
+                _is_binary_twin = _target_ext in _BINARY_TWIN_EXTS
                 if (
-                    atype == ArtefactType.DATA
+                    _is_binary_twin
                     and active_file_path.exists()
                     and active_file_path.stat().st_size > 0
                 ):
@@ -537,7 +576,8 @@ class ArtefactManager:
                 elif atype != ArtefactType.IMAGE or file_ext == ".svg":
                     try:
                         active_file_path.write_text(content, encoding="utf-8", errors="ignore")
-                        versioned_file_path.write_text(content, encoding="utf-8", errors="ignore")
+                        if versioned_file_path is not None:
+                            versioned_file_path.write_text(content, encoding="utf-8", errors="ignore")
                         wrote_physical = True
                     except Exception as e:
                         trace_exception(e)
@@ -547,21 +587,22 @@ class ArtefactManager:
                         int(getattr(self._discussion, "_workspace_write_revision", 0)) + 1,
                     )
 
-            # 2. Write Logical Twin (.lam) into .versions/
-            lam_filename = f"{name_part}.lam"
-            lam_path = art_version_dir / lam_filename
+            # 2. Write Logical Twin (.lam) into .versions/ — DISCUSSION MODE ONLY.
+            if versioning_enabled:
+                lam_filename = f"{name_part}.lam"
+                lam_path = art_version_dir / lam_filename
 
-            if logical_content:
-                try:
-                    lam_path.write_text(logical_content, encoding="utf-8", errors="ignore")
-                except Exception as e:
-                    trace_exception(e)
-            elif wrote_physical and atype in (ArtefactType.DATA, ArtefactType.IMAGE):
-                minimal_lam = f"# Artefact Metadata: {filename}\n- **Type**: {atype}\n- **Version**: {version}\n- **Physical Path**: {filename}\n\n"
-                try:
-                    lam_path.write_text(minimal_lam, encoding="utf-8", errors="ignore")
-                except Exception:
-                    pass
+                if logical_content:
+                    try:
+                        lam_path.write_text(logical_content, encoding="utf-8", errors="ignore")
+                    except Exception as e:
+                        trace_exception(e)
+                elif wrote_physical and atype in (ArtefactType.DATA, ArtefactType.IMAGE):
+                    minimal_lam = f"# Artefact Metadata: {filename}\n- **Type**: {atype}\n- **Version**: {version}\n- **Physical Path**: {filename}\n\n"
+                    try:
+                        lam_path.write_text(minimal_lam, encoding="utf-8", errors="ignore")
+                    except Exception:
+                        pass
 
         except Exception as e:
             ASCIIColors.warning(f"Failed to sync artifact '{title}' to disk: {e}")
@@ -1719,6 +1760,10 @@ class ArtefactManager:
         # user-facing bidirectional sync (sync_workspace_to_artefacts), where
         # disk is the source of truth. Purging here would erase the artifact
         # before the heal pass can restore it.
+        versioning_enabled = not getattr(
+            self._discussion, "disable_artefact_versioning", False
+        )
+
         active_arts = self.list(active_only=True)
         workspace_dir = self._get_workspace_root()
         workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -1746,7 +1791,7 @@ class ArtefactManager:
                 dest = self._resolve_confined_path(filename)
 
                 if not dest.exists():
-                    if versioned_data.exists():
+                    if versioning_enabled and versioned_data.exists():
                         import shutil
                         shutil.copy(str(versioned_data), str(dest))
                     elif file_ext.lower() not in (".db", ".sqlite", ".sqlite3") and isinstance(art.get("content"), str) and art["content"] and not art["content"].startswith("#"):
@@ -2769,6 +2814,12 @@ class ArtefactManager:
     def export_artefact_bundle(self, paths: List[Union[str, Path]], output_path: Optional[Union[str, Path]] = None, include_versions: bool = False) -> Path:
         if not paths:
             raise ValueError("Cannot export an empty bundle. Provide a list of file or folder paths.")
+
+        versioning_enabled = not getattr(
+            self._discussion, "disable_artefact_versioning", False
+        )
+        if include_versions and not versioning_enabled:
+            include_versions = False
 
         ws_data_dir = self._get_workspace_root()
         versions_root = self._get_versions_root()

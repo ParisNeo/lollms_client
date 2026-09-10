@@ -24,6 +24,7 @@ All artefacts are strictly confined to a workspace root directory (e.g., `data_w
 * **Dual-Stream (`.lam` Protocol for Binary & Structured Data)**: For structured data files (`.csv`, `.db`, `.sqlite`, `.xlsx`), the system uses a Dual-Stream approach:
   * **Physical Twin**: Saved at `workspace_data/{title}.{ext}`. Contains the raw bytes (e.g., raw CSV rows, SQLite binary). Consumed by local tools.
   * **Logical Twin (`.lam`)**: Saved inside `workspace_data/.versions/{id}/{name}.lam`. Contains a high-density, text-based abstraction of the file's structure (column names, inferred data types, sample values). Consumed by the LLM context zone.
+  * **🛑 The `.lam` is version-folder-only**: It must NEVER be written to the workspace root or be allowed to overwrite the physical twin it describes (see *The .lam Invariant* in Section 7.2).
 
 ### D. Filesystem Synchronization
 If a file is manually deleted from the workspace folder, the `_sync_index_with_disk()` method detects the orphaned database record during the next synchronization cycle and purges it. The workspace folder is the single source of truth.
@@ -135,6 +136,17 @@ agent = Agent(
 )
 ```
 
+### 🛑 AGENTIC MODE DOCTRINE: No .versions/, No .lam (Application-Managed Versioning)
+
+The `.lam` Dual-Stream and `.versions/{uuid}/` snapshot architecture is a **discussion-mode feature**, designed for conversations with a small number of generated assets. It is **strictly disabled** in agentic mode (`disable_artefact_versioning=True`):
+
+* **No `.versions/` directory is ever created.** `_sync_to_disk_workspace` writes only the active file to the workspace root — no `…​_vN` snapshots, no UUID directories.
+* **No `.lam` logical twins are written.** Logical metadata cards are not computed or persisted; the artifact's context text lives only in its DB record (or on-disk text).
+* **The host application owns versioning.** In agentic deployments (thousands of files), the application or external VCS (Git) manages history. LoLLMS treats the workspace as a plain live tree.
+* Export bundling with `include_versions=True` is a no-op in agentic mode (the flag is force-disabled).
+
+Developers integrating agentic mode must set `discussion.disable_artefact_versioning = True` (or pass `disable_artefact_versioning=True` to the Agent) before any tool syncs run. All `.versions`-dependent features (`update_lam`, `restore_from_version`, `list_deleted_artifacts`, `keep_deleted_versions`) are meaningless in this mode and must not be invoked.
+
 ### The Disk-Source Strategy (Non-Versioned Mode)
 
 When `disable_artefact_versioning=True` is active, the `ArtefactManager` employs a **Disk-Source Strategy** to prevent memory duplication and bloat:
@@ -241,9 +253,14 @@ The architecture decouples the logical database key (`title`) from the unique di
 *   **Retrieval (`get`)**: You may query an artifact by passing either `title="README.md"` OR `physical_path="My_subfolder/README.md"`, but not both. Passing both raises a `ValueError`.
 *   **Deletion (`remove`)**: The `remove()` method uses the `physical_path` to calculate the exact metadata directory UUID and purge all physical files (active, versioned, and `.lam` twins) from disk. This guarantees that deleting an artifact removes all traces, preventing the workspace heal scan from resurrecting orphaned files as inactive artifacts.
 
-#### 2. Data Artifact Safety (Binary Corruption Prevention)
+#### 2. Data Artifact Safety & The .lam Invariant (Binary Corruption Prevention)
+
+**🛑 THE .LAM INVARIANT (ABSOLUTE RULE — NEVER VIOLATE):**
+> The `.lam` logical twin (schema/metadata Markdown) **MUST NEVER replace a created physical artefact** (`.docx`, `.xlsx`, `.db`, `.pdf`, images, or any generated binary). The `.lam` is saved **exclusively** into the version folder (`.versions/{uuid}/{name}.lam`). If `physical_data` is absent but a non-empty physical file already exists at the target workspace path, that file **is the artefact** and is preserved byte-for-byte; only the `.lam` snapshot in `.versions/` is refreshed. Any code path that writes string `content`/`logical_content` over an existing physical file of a binary/rich type is a critical bug and must be rejected.
+
 `DATA` artifacts (like SQLite databases or CSVs) use the Dual-Stream protocol.
 *   **Never write string `content` to a binary file**: The `_sync_to_disk_workspace` method explicitly refuses to write string `content` to `.db`/`.sqlite` files if `physical_data` is missing. This prevents the database header from being overwritten with `.lam` schema text.
+*   **Physical file preservation (all types)**: When a sync is requested without raw bytes but the physical file already exists on disk (e.g., a tool just generated `rapport_final.docx` and the LLM context card is being synced), the existing physical file is never touched. The `.lam` metadata is written only to `.versions/`.
 *   **Rehydration**: When updating a `DATA` artifact's schema, the `update()` method automatically rehydrates `physical_data` by reading the existing bytes from disk *before* calling `add()`. This ensures the raw binary data is preserved across schema updates.
 
 #### 3. Visibility and Context Budget

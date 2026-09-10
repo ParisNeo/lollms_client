@@ -3351,6 +3351,7 @@ class ChatMixin:
 
             if not should_read_content and content_placeholder:
                 existing_art = self.artefacts.get(file_name)
+                _agentic_mode = bool(getattr(self, "disable_artefact_versioning", False))
                 if existing_art:
                     art = self.artefacts.update(
                         title=file_name,
@@ -3359,7 +3360,7 @@ class ChatMixin:
                         active=False,
                         visibility=ArtefactVisibility.TREE_UNLOCKABLE,
                         physical_data=rich_doc_bytes,
-                        logical_content=content_placeholder,
+                        logical_content=None if _agentic_mode else content_placeholder,
                         commit_message=f"Updated rich document by tool '{tool_name}'"
                     )
                 else:
@@ -3370,7 +3371,7 @@ class ChatMixin:
                         active=False,
                         visibility=ArtefactVisibility.TREE_UNLOCKABLE,
                         physical_data=rich_doc_bytes,
-                        logical_content=content_placeholder,
+                        logical_content=None if _agentic_mode else content_placeholder,
                         commit_message=f"Created by tool '{tool_name}'"
                     )
                 self.commit()
