@@ -233,6 +233,10 @@ class LollmsClient():
         # 🖼️ VLM Image Description Cache (Image Hash -> Text Description)
         self._image_description_cache: Dict[str, str] = {}
 
+        # ⚡ Fast token estimation (CLI mode): bypass remote tokenizer round-trips
+        self.use_fast_token_estimate: bool = False
+        self._fast_token_coefficient: float = self._parse_fast_token_coefficient()
+
         # 🧠 Profile Registries (Declarative Configs - Universal Two-Tier Architecture)
         self.llm_binding_profiles_registry: Dict[str, LollmsBindingProfile] = {}
         self.tti_binding_profiles_registry: Dict[str, LollmsBindingProfile] = {}
@@ -578,9 +582,74 @@ class LollmsClient():
         if self.llm: return self.llm.detokenize(tokens)
         raise RuntimeError("LLM binding not initialized.")
 
+    def enable_fast_token_estimate(self, coefficient: Optional[float] = None) -> None:
+        """
+        Activates local heuristic token estimation (no remote tokenizer calls).
+
+        Used by latency-sensitive entry points (lollms-code CLI) where a rough
+        estimate is acceptable and remote tokenization blocks generation start.
+        """
+        self.use_fast_token_estimate = True
+        if coefficient is not None:
+            self._fast_token_coefficient = self._sanitize_coefficient(coefficient)
+        ASCIIColors.info(
+            f"[LollmsClient] ⚡ Fast token estimation enabled "
+            f"(coefficient: {self._fast_token_coefficient})."
+        )
+
+    def disable_fast_token_estimate(self) -> None:
+        """Restores exact remote tokenization for all subsequent calls."""
+        self.use_fast_token_estimate = False
+        ASCIIColors.info("[LollmsClient] Exact remote tokenization restored.")
+
+    @staticmethod
+    def _sanitize_coefficient(value: float) -> float:
+        """Clamps a coefficient into a safe range to guard against bad inputs."""
+        return min(max(value, 0.5), 5.0)
+
+    @staticmethod
+    def _parse_fast_token_coefficient() -> float:
+        """
+        Reads LOLLMS_FAST_TOKEN_COEFFICIENT from the environment with strict
+        sanitization. Falls back to 1.0 on any malformed or out-of-range value.
+        """
+        raw = os.getenv("LOLLMS_FAST_TOKEN_COEFFICIENT")
+        if raw is None:
+            return 1.0
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError):
+            ASCIIColors.warning(
+                f"[LollmsClient] Invalid LOLLMS_FAST_TOKEN_COEFFICIENT '{raw}'. Using 1.0."
+            )
+            return 1.0
+        if not 0.5 <= parsed <= 5.0:
+            ASCIIColors.warning(
+                f"[LollmsClient] LOLLMS_FAST_TOKEN_COEFFICIENT '{parsed}' out of range [0.5, 5.0]. Using 1.0."
+            )
+            return 1.0
+        return parsed
+
+    @staticmethod
+    def _estimate_tokens_locally(text: str, coefficient: float) -> int:
+        """
+        Heuristic estimator: tokens ≈ (words + indentation_chars / 4) × coefficient.
+
+        The indentation term accounts for 4-space indents (one token per level),
+        matching observed tokenizer behavior on formatted source code.
+        """
+        if not text:
+            return 0
+        word_count = len(text.split())
+        indent_chars = len(re.findall(r"[ \t]+", text))
+        return int((word_count + indent_chars / 4.0) * coefficient)
+
     def count_tokens(self, text: str) -> int:
         if text is None:
             text = ""
+
+        if getattr(self, "use_fast_token_estimate", False):
+            return self._estimate_tokens_locally(text, self._fast_token_coefficient)
 
         # In-memory MD5 token-count caching to prevent redundant backend server floods
         import hashlib

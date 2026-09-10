@@ -8,6 +8,7 @@
 
 import re
 import json
+import hashlib
 import uuid
 import traceback
 import threading
@@ -206,6 +207,16 @@ def _calculate_dynamic_tool_char_limit(client: Optional[Any] = None) -> int:
 
 
 import time as _time
+
+from ._context_sanitizer import scrub_processing_and_status_blocks
+
+def _scrub_for_llm_context(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = scrub_processing_and_status_blocks(text)
+    cleaned = re.sub(r'<lollms_artifact[^/]*/>', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'<artefact_image[^/]*/>', '', cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
 
 def _detect_structural_symbols(buffer: str, language: Optional[str] = None, art_type: str = "code") -> List[Dict[str, Any]]:
     """
@@ -1157,6 +1168,44 @@ class _StreamState:
 
         return text
 
+    @staticmethod
+    def _opening_tag_is_malformed(buffer: str, tag_start_idx: int) -> bool:
+        """
+        A functional opening tag must be entirely contained on a single line.
+        Returns True when a newline appears before the closing '>', meaning
+        the tag can never complete (truncated/multi-line tag). Such content
+        must be suppressed as prose, never intercepted.
+        """
+        end_of_tag_idx = buffer.find(">", tag_start_idx)
+        newline_idx = buffer.find("\n", tag_start_idx)
+        if end_of_tag_idx != -1 and newline_idx != -1 and newline_idx < end_of_tag_idx:
+            return True
+        if end_of_tag_idx == -1 and newline_idx != -1:
+            return True
+        return False
+
+    def _suppress_malformed_tag(self, tag_start_idx: int) -> bool:
+        """
+        Handles an opening tag that violates the single-line protocol.
+
+        The dead tag fragment (from tag_start_idx up to and including the
+        first newline) is a known functional tag start that can never
+        complete: it is suppressed instead of leaked into the content
+        stream. Any prose after the newline is requeued into the pending
+        buffer so normal tag detection resumes on the next chunk.
+        """
+        text_before = self._pending_buffer[:tag_start_idx]
+        if text_before:
+            self.ai_message.content += text_before
+            _cb(self.callback, text_before, MSG_TYPE.MSG_TYPE_CHUNK)
+
+        newline_idx = self._pending_buffer.find("\n", tag_start_idx)
+        if newline_idx == -1:
+            self._pending_buffer = ""
+        else:
+            self._pending_buffer = self._pending_buffer[newline_idx + 1:]
+        return True
+
     def _start_artefact_heartbeat(self):
         """Starts a background thread that emits cheering messages every 15s if no content arrives."""
         if self._artefact_heartbeat_thread is not None:
@@ -1614,9 +1663,11 @@ class _StreamState:
                 if open_idx != -1:
                     tag_start_idx = open_idx
 
+                    if self._opening_tag_is_malformed(self._pending_buffer, tag_start_idx):
+                        return self._suppress_malformed_tag(tag_start_idx)
+
                     # Check if we have the full opening tag
                     end_of_tag_idx = self._pending_buffer.find(">", tag_start_idx)
-
                     if end_of_tag_idx != -1:
                         # We have the full opening tag!
                         attrs_str = self._pending_buffer[tag_start_idx:end_of_tag_idx+1]
@@ -1780,6 +1831,8 @@ class _StreamState:
                 open_match = re.search(pattern, lower_buffer)
                 if open_match:
                     open_idx = open_match.start()
+                    if self._opening_tag_is_malformed(self._pending_buffer, open_idx):
+                        return self._suppress_malformed_tag(open_idx)
                     end_of_tag_idx = self._pending_buffer.find(">", open_idx)
 
                     if end_of_tag_idx != -1:
@@ -1882,9 +1935,13 @@ class _StreamState:
                 open_match = re.search(pattern, lower_buffer)
                 if open_match:
                     open_idx = open_match.start()
-                    end_of_tag_idx = self._pending_buffer.find(">", open_idx)
-                    if end_of_tag_idx != -1:
+                    tag_start_idx = lower_buffer.find(tag_prefix, open_idx)
+                    if tag_start_idx == -1:
                         tag_start_idx = open_idx
+                    if self._opening_tag_is_malformed(self._pending_buffer, tag_start_idx):
+                        return self._suppress_malformed_tag(tag_start_idx)
+                    end_of_tag_idx = self._pending_buffer.find(">", tag_start_idx)
+                    if end_of_tag_idx != -1:
                         opening_tag = self._pending_buffer[tag_start_idx:end_of_tag_idx+1]
                         tag_name_match = re.match(r'<(\w+)', opening_tag)
                         if tag_name_match:
@@ -1899,7 +1956,7 @@ class _StreamState:
                                 _cb(self.callback, text_before_tag, MSG_TYPE.MSG_TYPE_CHUNK)
 
                             self._secondary_buffer = opening_tag
-                            self._pending_buffer = ""
+                            self._pending_buffer = self._pending_buffer[end_of_tag_idx+1:]
                             context_tag_entered = True
                             break
                     else:
@@ -1946,17 +2003,18 @@ class _StreamState:
                 _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
                 remaining_text = self._secondary_buffer[close_idx + close_len:]
-                
+
                 self._secondary_tag_name = ""
                 self._secondary_closing_tag = ""
                 self._secondary_open_tag = ""
                 self._secondary_buffer = ""
+                self._secondary_attrs = {}
 
                 if remaining_text.strip():
                     self._pending_buffer = remaining_text
-                else:
-                    self._action_dispatched = True
-                    return False
+
+                self._action_dispatched = True
+                return False
             else:
                 pass
             return True
@@ -1972,6 +2030,8 @@ class _StreamState:
                     tag_start_idx = lower_buffer.find(tag_prefix, open_match.start())
                     if tag_start_idx == -1:
                         tag_start_idx = open_match.start()
+                    if self._opening_tag_is_malformed(self._pending_buffer, tag_start_idx):
+                        return self._suppress_malformed_tag(tag_start_idx)
                     end_of_tag_idx = self._pending_buffer.find(">", tag_start_idx)
                     if end_of_tag_idx != -1:
                         opening_tag = self._pending_buffer[tag_start_idx:end_of_tag_idx+1]
@@ -2191,6 +2251,35 @@ class _StreamState:
 
             is_new = self.discussion.artefacts.get(title) is None
             is_patch = "<<<<<<< SEARCH" in body
+
+            if is_new is False and is_patch is False:
+                existing_art = self.discussion.artefacts.get(title)
+                if existing_art is not None:
+                    existing_raw = existing_art.get("content") if isinstance(existing_art, dict) else None
+                    if isinstance(existing_raw, (bytes, bytearray)):
+                        existing_content = existing_raw.decode("utf-8", errors="ignore")
+                    elif isinstance(existing_raw, str):
+                        existing_content = existing_raw
+                    else:
+                        existing_content = ""
+                    new_body_hash = hashlib.sha256(body.strip().encode("utf-8", errors="ignore")).hexdigest()
+                    existing_hash = hashlib.sha256(
+                        existing_content.strip().encode("utf-8", errors="ignore")
+                    ).hexdigest()
+                    if new_body_hash == existing_hash:
+                        self._last_dispatch_failed = True
+                        ASCIIColors.warning(
+                            f"[StreamState] Redundant full-rewrite of '{title}' rejected "
+                            f"(content identical to active version)."
+                        )
+                        if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                            proc_close = (
+                                f"\n* ⚠️ Redundant rewrite rejected: '{title}' already contains exactly this content.\n"
+                                f"<!-- status:failure -->\n</processing>\n"
+                            )
+                            self.ai_message.content += proc_close
+                            _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        return True
 
             if is_patch and not is_new:
                 existing = self.discussion.artefacts.get(title)
@@ -2852,10 +2941,25 @@ class _StreamState:
 
         # ── Force-dispatch incomplete secondary tags (unclosed <skill>, <note>, etc.) ──
         if self._is_accumulating_secondary:
-            # The LLM finished generation without closing the tag.
-            # Synthesize a closing tag and dispatch what we have.
-            full_match_text = self._secondary_buffer + self._secondary_closing_tag
-            body_content = self._secondary_buffer[len(self._secondary_open_tag):]
+            # Merge any body text still parked in the pending buffer (single-chunk
+            # feeds return from the entry block before the close-check runs, so
+            # the body lives in _pending_buffer until the next feed or this flush).
+            self._secondary_buffer += self._pending_buffer
+            self._pending_buffer = ""
+
+            # Extract the body and closing tag precisely if the closing tag
+            # already arrived inside the merged buffer.
+            close_match = re.search(re.escape(self._secondary_closing_tag), self._secondary_buffer, re.IGNORECASE)
+            if close_match:
+                close_idx = close_match.start()
+                close_len = close_match.end() - close_match.start()
+                body_content = self._secondary_buffer[len(self._secondary_open_tag):close_idx]
+                full_match_text = self._secondary_buffer[:close_idx + close_len]
+                remaining_text = self._secondary_buffer[close_idx + close_len:]
+            else:
+                body_content = self._secondary_buffer[len(self._secondary_open_tag):]
+                full_match_text = self._secondary_buffer + self._secondary_closing_tag
+                remaining_text = ""
 
             self._is_accumulating_secondary = False
 
@@ -2868,15 +2972,21 @@ class _StreamState:
                     full_match_text
                 )
 
-            # Close the processing block
-            proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
-            self.ai_message.content += proc_close_tag
-            _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            # Context visibility tags close their own <processing> block with a
+            # status meta inside the dispatcher; do not emit a duplicate close.
+            if self._secondary_tag_name not in ("unlock_file", "lock_file", "hide_file"):
+                proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
+                self.ai_message.content += proc_close_tag
+                _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
             self._secondary_tag_name = ""
             self._secondary_closing_tag = ""
             self._secondary_open_tag = ""
             self._secondary_buffer = ""
+            self._secondary_attrs = {}
+
+            if remaining_text.strip():
+                self._pending_buffer = remaining_text
 
             # ── ONE-ACTION-PER-TURN: Halt generation immediately ──
             self._action_dispatched = True
@@ -2893,6 +3003,43 @@ class _StreamState:
                 ASCIIColors.info("[StreamState] Post-stream sweep detected missed <done/> or <end/> tag. Setting termination flag.")
                 self._done_detected = True
                 self.ai_message.content = done_pattern.sub('', self.ai_message.content).strip()
+
+        if self._pending_buffer and not self.artefact_tracker.is_inside_artefact \
+                and not self._is_accumulating_tool and not self._is_accumulating_secondary:
+            if not self._done_detected:
+                pending_done_re = re.compile(r'(?i)<(?:done|end)\s*/?>')
+                if pending_done_re.search(self._pending_buffer):
+                    ASCIIColors.info("[StreamState] Post-flush sweep detected <done/> in pending buffer. Setting termination flag.")
+                    self._done_detected = True
+                    self._pending_buffer = pending_done_re.sub('', self._pending_buffer)
+
+            complete_tag_re = re.compile(
+                r'(?ms)^[ \t]*<(artifact|artefact|skill|note)\s([^>]*)>(.*?)</\1>',
+                re.IGNORECASE,
+            )
+            parked_matches = list(complete_tag_re.finditer(self._pending_buffer))
+            for parked_match in parked_matches:
+                full_match_text = parked_match.group(0)
+                if full_match_text in self.processed_tags:
+                    continue
+                self.processed_tags.add(full_match_text)
+                opening_tag_end = full_match_text.index('>') + 1
+                self._dispatch_closed_tag(
+                    parked_match.group(1).lower(),
+                    full_match_text[:opening_tag_end],
+                    parked_match.group(3).strip(),
+                    full_match_text,
+                )
+                self._action_dispatched = True
+            if parked_matches:
+                self._pending_buffer = complete_tag_re.sub('', self._pending_buffer)
+
+            self._pending_buffer = re.sub(
+                r'(?ms)^[ \t]*<(?:artifact|artefact|skill|note|scratchpad|lollms_inline|lollms_form|generate_image|edit_image|tool)\b[^>]*$',
+                '',
+                self._pending_buffer,
+                flags=re.IGNORECASE,
+            )
 
         if self._pending_buffer or self.artefact_tracker.is_inside_artefact:
             # If we are still inside an artifact for some reason (unclosed tag), dump it to the UI
@@ -2982,9 +3129,10 @@ class _StreamState:
                 self._artefact_buffer = ""
                 self.artefact_tracker.close()
             else:
-                # Otherwise, it's just trailing text or a partial tag that never completed
-                self.ai_message.content += self._pending_buffer
-                _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
+                clean_leftover = self._pending_buffer.strip()
+                if clean_leftover:
+                    self.ai_message.content += clean_leftover
+                    _cb(self.callback, clean_leftover, MSG_TYPE.MSG_TYPE_CHUNK)
             self._pending_buffer = ""
 
     def get_tool_call_json(self) -> Optional[str]:
@@ -4294,13 +4442,23 @@ class ChatMixin:
         tool_calls_this_turn = []
         round_count = 0
         conversational_gist = ""  # Accumulates only the conversational text for the final DB message
+        pending_analysis = False
+        pending_analysis_round = 0
+        bare_done_rejections = 0
 
-        # Track the count of exact tool call signatures to prevent infinite loops (Success Loops)
-        # We allow up to 2 identical calls per turn to permit legitimate retries after null/empty output.
-        tool_signature_counts = {}
+        # ── ENVIRONMENT EPOCH: TRUE REPETITION GATING ────────────────────────────
+        # A repetition exists ONLY when the LLM re-issues the exact same call
+        # with the exact same parameters AND the observable environment
+        # (workspace files, artifacts, context) is unchanged since the last
+        # identical call. ANY intervening action — a different tool call, an
+        # artifact build/patch, a context unlock, a tool that wrote files —
+        # increments the epoch and legitimately re-enables the call.
+        environment_epoch = 0
+        _last_failure_epoch = -1
+        successful_tool_signatures: set = set()
 
-        successful_tool_signatures = set()
-        workspace_revision = 0
+        def _current_workspace_revision() -> int:
+            return int(getattr(self, "_workspace_write_revision", 0))
 
         # ── 📊 TURN PROGRESS TRACKER ──
         # Tracks all actions taken during this turn so the LLM can see what it has accomplished.
@@ -4431,6 +4589,7 @@ class ChatMixin:
 
         # Track if we exited due to cancellation
         was_cancelled = False
+        failed_tools_pending_fix = False
 
         raw_llm_output_buffer = [""]
         raw_llm_output_buffer = [""]
@@ -4451,25 +4610,35 @@ class ChatMixin:
         # Initialize pending memory searches list for this turn
         object.__setattr__(self, '_pending_memory_searches', [])
 
+        def _bump_environment_epoch() -> None:
+            nonlocal environment_epoch
+            environment_epoch += 1
+            object.__setattr__(
+                self, "_workspace_write_revision", _current_workspace_revision() + 1
+            )
+
+        object.__setattr__(self, "_bump_environment_epoch", _bump_environment_epoch)
+
         round_event_state = {"last_status": None}
 
+        def _emit_round_event(msg_type: MSG_TYPE, status: Optional[str] = None, round_id: Optional[int] = None) -> None:
+            if event_mode == EventMode.SILENT_MODE:
+                return
+            effective_round_id = round_id if round_id is not None else round_count
+            if msg_type == MSG_TYPE.MSG_TYPE_ROUND_START:
+                _cb(callback, "", msg_type, {"round_id": effective_round_id, "max_rounds": resolved_max_rounds})
+                return
+            round_event_state["last_status"] = status or "action"
+            _cb(callback, "", msg_type, {"round_id": effective_round_id, "status": status or "action"})
+
         while round_count < resolved_max_rounds:
+            round_count += 1
+
             # Check cancellation at the start of each reasoning round
             if self.is_generation_cancelled():
                 was_cancelled = True
                 _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="cancelled")
                 break
-
-            round_count += 1
-
-            def _emit_round_event(msg_type: MSG_TYPE, status: Optional[str] = None) -> None:
-                if event_mode == EventMode.SILENT_MODE:
-                    return
-                if msg_type == MSG_TYPE.MSG_TYPE_ROUND_START:
-                    _cb(callback, "", msg_type, {"round_id": round_count, "max_rounds": resolved_max_rounds})
-                    return
-                round_event_state["last_status"] = status or "action"
-                _cb(callback, "", msg_type, {"round_id": round_count, "status": status or "action"})
 
             _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_START)
 
@@ -4734,6 +4903,36 @@ class ChatMixin:
 
             # ── 🏁 TERMINATION TAG PROTOCOL ──
             if ss.was_done_detected():
+                if pending_analysis and pending_analysis_round == round_count:
+                    bare_done_rejections += 1
+                    if bare_done_rejections >= 3:
+                        ASCIIColors.warning("[ChatMixin] Analysis gate exhausted (3 bare <done/> rejections). Allowing termination.")
+                        pending_analysis = False
+                    else:
+                        ASCIIColors.warning(f"[ChatMixin] <done/> rejected by post-tool analysis gate (rejection #{bare_done_rejections}). Textual analysis of the tool output is required first.")
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="assistant",
+                            content=ss.get_clean_text_so_far().strip()
+                        ))
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="user",
+                            content=(
+                                "[SYSTEM NOTIFICATION - NOT A USER MESSAGE]\n"
+                                "<action_directive status=\"REQUIRED\">\n"
+                                "⚠️ TERMINATION REJECTED: You executed a tool this turn, but the turn is not complete.\n"
+                                "The tool output has NOT been analyzed. A turn must NEVER end with an uninterpreted tool result.\n"
+                                "MANDATORY NEXT STEP: Write a clear textual analysis of the tool output for the user:\n"
+                                "1. Interpret the numbers/logs/plots (what do they mean, do they meet the stated goals?).\n"
+                                "2. State whether the objective was achieved (PASS/FAIL against the requirements).\n"
+                                "3. If the result reveals a problem, propose and execute the fix (corrected artifact + re-run).\n"
+                                "4. Only after the analysis is written, end your response with `<done/>` on a new line.\n"
+                                "Do NOT emit `<done/>` before this analysis.\n"
+                                "</action_directive>\n"
+                                "[END SYSTEM NOTIFICATION]"
+                            )
+                        ))
+                        _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
+                        continue
                 # ── 🛡️ PHANTOM <done/> REJECTION GUARD ──
                 # If the user explicitly requested creating/writing a skill, artifact, or tool,
                 # but zero actions were executed in the entire turn, reject the termination!
@@ -5045,18 +5244,14 @@ class ChatMixin:
                     # ── TRUE DUPLICATE PATH ──
                     ASCIIColors.warning("[ChatMixin] LLM emitted a duplicate artifact tag. Forcing final answer.")
                     object.__setattr__(self, "_force_final_answer", True)
-
-                    full_round_text = ss.get_clean_text_so_far()
-                    raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
-                    clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
-                    clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
-                    clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
-                    clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
-                    clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
-
+                    duplicate_history_text = _scrub_for_llm_context(
+                        ss.get_clean_text_so_far()[current_content_length:]
+                    )
+                    if not duplicate_history_text:
+                        duplicate_history_text = "[Duplicate artifact dispatch with no conversational text]"
                     virtual_history.append(SimpleNamespace(
                         sender_type="assistant",
-                        content=clean_history_text.strip()
+                        content=duplicate_history_text
                     ))
                     virtual_history.append(SimpleNamespace(
                         sender_type="user",
@@ -5070,10 +5265,10 @@ class ChatMixin:
             # (but NOT a tool), we must halt generation, hydrate virtual_history, and re-prompt.
             if ss.was_action_dispatched() and not ss.tool_trigger:
                 if ss.affected_artefacts:
-                    workspace_revision += 1
+                    _bump_environment_epoch()
                     ASCIIColors.info(
                         f"[ChatMixin] Workspace mutated by LLM dispatch "
-                        f"(revision {workspace_revision}). Success-loop signatures refreshed."
+                        f"(epoch {environment_epoch}). Repetition gates reset."
                     )
                 full_round_text = ss.get_clean_text_so_far()
                 raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
@@ -5192,6 +5387,9 @@ class ChatMixin:
                     except Exception:
                         call_data = {}
 
+                    if pending_analysis and pending_analysis_round < round_count:
+                        pending_analysis = False
+
                     # ── 🛑 CRITICAL FIX: PHANTOM TOOL CALL PREVENTION ──
                     # If the LLM emits a <tool> tag but the JSON is malformed or missing
                     # the "name" key, we MUST NOT execute active_tools[""]. 
@@ -5225,19 +5423,8 @@ class ChatMixin:
 
                         full_round_text = ss.get_clean_text_so_far()
                         raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
-                        # 🛑 CRITICAL FIX: Sanitize raw_round_text before appending to virtual_history.
-                        # The _StreamState emits <processing> blocks into ai_msg.content when it
-                        # dispatches the tool tag. If we append this unsanitized, the LLM sees the
-                        # <processing> blocks in its history and mimics them, causing infinite
-                        # nested <processing> generation loops.
-                        clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
-                        clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
-                        clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
-                        clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
-                        clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
-                        # Also strip any raw <tool> tags to prevent the LLM from seeing its own failed call
+                        clean_history_text = _scrub_for_llm_context(raw_round_text)
                         clean_history_text = re.sub(r'<tool>.*?</tool>', '', clean_history_text, flags=re.DOTALL | re.IGNORECASE)
-                        clean_history_text = clean_history_text.strip()
                         if not clean_history_text:
                             clean_history_text = "[Malformed tool call emitted with no conversational text]"
                         virtual_history.append(SimpleNamespace(
@@ -5341,11 +5528,8 @@ class ChatMixin:
                         # Sanitize and append to virtual history
                         full_round_text = ss.get_clean_text_so_far()
                         raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
-                        clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
-                        clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
-                        clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
+                        clean_history_text = _scrub_for_llm_context(raw_round_text)
                         clean_history_text = re.sub(r'<tool>.*?</tool>', '', clean_history_text, flags=re.DOTALL | re.IGNORECASE)
-                        clean_history_text = clean_history_text.strip()
                         if not clean_history_text:
                             clean_history_text = f"[Attempted to call memory tag '{tool_name}' as a tool]"
 
@@ -5363,22 +5547,14 @@ class ChatMixin:
 
                     full_round_text = ss.get_clean_text_so_far()
                     raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
-
-                    # Remove <processing> blocks and HTML status comments for LLM context
-                    # 🛑 CRITICAL FIX 3: Use robust regex that catches partial/malformed blocks.
-                    # The previous regex required a perfect </processing> close tag, but streaming
-                    # fragmentation could leave orphaned opening tags or partial content.
-                    clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
-                    clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
-                    # Remove any orphaned closing tags from partial stripping
-                    clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
-                    # Remove standalone <lollms_artifact> and <artefact_image> tags that were injected outside blocks
-                    clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
-                    clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                    clean_history_text = _scrub_for_llm_context(raw_round_text)
+                    clean_history_text = re.sub(r'<tool>.*?</tool>', '', clean_history_text, flags=re.DOTALL | re.IGNORECASE)
+                    if not clean_history_text:
+                        clean_history_text = f"[Dispatched tool call to '{tool_name}']"
 
                     virtual_history.append(SimpleNamespace(
                         sender_type="assistant",
-                        content=clean_history_text.strip()
+                        content=clean_history_text
                     ))
 
                     # ── 🛡️ PHANTOM TOOL INTERCEPTION ──
@@ -5428,13 +5604,8 @@ class ChatMixin:
                         # nested <processing> generation loops.
                         full_round_text = ss.get_clean_text_so_far()
                         raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
-                        clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
-                        clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
-                        clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
-                        clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
-                        clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                        clean_history_text = _scrub_for_llm_context(raw_round_text)
                         clean_history_text = re.sub(r'<tool>.*?</tool>', '', clean_history_text, flags=re.DOTALL | re.IGNORECASE)
-                        clean_history_text = clean_history_text.strip()
                         if not clean_history_text:
                             clean_history_text = f"[Phantom tool call to '{tool_name}' with no conversational text]"
                         virtual_history.append(SimpleNamespace(
@@ -5480,9 +5651,13 @@ class ChatMixin:
                         current_file_hashes = {}
 
                     if current_file_hashes:
-                        context_token = "files:" + json.dumps(current_file_hashes, sort_keys=True)
+                        context_token = (
+                            f"epoch:{environment_epoch}:"
+                            f"rev:{_current_workspace_revision()}:"
+                            f"files:" + json.dumps(current_file_hashes, sort_keys=True)
+                        )
                     else:
-                        context_token = f"wsrev:{workspace_revision}"
+                        context_token = f"epoch:{environment_epoch}:rev:{_current_workspace_revision()}"
                     context_aware_signature = f"{full_signature}::{context_token}"
 
                     ASCIIColors.info(
@@ -5503,14 +5678,27 @@ class ChatMixin:
                             _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="cancelled")
                             break
 
-                        result_str = (
-                            f"Error executing tool '{tool_name}': this exact call (identical parameters "
-                            f"AND identical workspace file contents) already failed on a previous round. "
-                            f"To prevent an infinite loop, execution was blocked. If you modified an "
-                            f"artifact since, the signature has changed and the retry is allowed — otherwise "
-                            f"you must change your parameters, fix the referenced artifact, or take a "
-                            f"different approach."
-                        )
+                        # ── EPOCH-GATED FAILURE LOOP INTERCEPT ──────────────
+                        # We only hard-block when the agent re-issues the byte-
+                        # identical failing call AND nothing observable changed
+                        # since that failure (same epoch, same file hashes).
+                        # Any intervening action (different tool, artifact
+                        # build, context unlock, tool that wrote files) bumps
+                        # the epoch and re-enables the retry.
+                        if environment_epoch == _last_failure_epoch:
+                            result_str = (
+                                f"Error executing tool '{tool_name}': this exact call (identical parameters "
+                                f"AND no environment change since the last failure) already failed on the "
+                                f"immediately preceding round. To prevent an infinite loop, execution was "
+                                f"blocked. Perform ANY intervening action first (modify an artifact, call a "
+                                f"different tool, fix the referenced file), or change your parameters."
+                            )
+                        else:
+                            result_str = ""
+                        if not result_str:
+                            has_prev_failure = False
+                            failure_memory._signatures.discard(context_aware_signature)
+                            
                         status_err_line = f"* Tool call blocked to prevent loop.\n"
                         details_block = f"Loop Intercepted:\n{result_str}\n"
                         tool_close_tag = f"{status_err_line}{details_block}<!-- status:failure -->\n</processing>\n\n"
@@ -5558,8 +5746,6 @@ class ChatMixin:
                             )
                         ))
                         continue
-                    else:
-                        tool_signature_counts[full_signature] = tool_signature_counts.get(full_signature, 0) + 1
 
                     # 2. Strip ONLY the raw <tool> JSON tag from the UI/DB buffer (ai_msg.content).
                     if tool_call_json_str in ai_msg.content:
@@ -5846,6 +6032,7 @@ class ChatMixin:
                                 is_404 = tool_res.get("status_code") == 404
 
                                 if failure_memory and not is_404:
+                                    _last_failure_epoch = environment_epoch
                                     if hasattr(failure_memory, "record_failure_by_signature"):
                                         failure_memory.record_failure_by_signature(context_aware_signature, error_msg)
                                     else:
@@ -5939,6 +6126,7 @@ class ChatMixin:
                             result_str = str(tool_res) if tool_res is not None else "No output returned."
                             if "error" in result_str.lower() or "fail" in result_str.lower():
                                 if failure_memory:
+                                    _last_failure_epoch = environment_epoch
                                     if hasattr(failure_memory, "record_failure_by_signature"):
                                         failure_memory.record_failure_by_signature(context_aware_signature, result_str)
                                     else:
@@ -5963,6 +6151,7 @@ class ChatMixin:
                                 extra_data={"tool_name": tool_name, "parameters": tool_params}
                             )
                         if failure_memory:
+                            _last_failure_epoch = environment_epoch
                             if hasattr(failure_memory, "record_failure_by_signature"):
                                 failure_memory.record_failure_by_signature(context_aware_signature, str(e))
                             else:
@@ -5974,18 +6163,6 @@ class ChatMixin:
                         status_done_line = f"* Execution crashed.\n"
                         details_block = f"Crash Details:\n{str(e)}\n"
                         tool_res = {"success": False, "error": str(e)}
-
-                        virtual_history.append(SimpleNamespace(
-                            sender_type="user",
-                            content=(
-                                f'<tool_result name="{tool_name}" status="FAILED">\n'
-                                f"{clean_result_str}\n"
-                                f"</tool_result>\n\n"
-                                f"⚠️ **Tool Execution Crashed.**\n"
-                                f"The tool '{tool_name}' encountered an unexpected system error. "
-                                f"Analyze the error and inform the user, or try a different approach."
-                            )
-                        ))
                     inner_res = tool_res.get("output", tool_res) if isinstance(tool_res, dict) else tool_res
 
                     is_failure = (
@@ -6029,14 +6206,22 @@ class ChatMixin:
                         clean_result_str = re.sub(r'</processing>', '', clean_result_str, flags=re.IGNORECASE)
                         clean_result_str = re.sub(r'<tool_result[^>]*>.*?(?:</tool_result>|$)', '', clean_result_str, flags=re.DOTALL | re.IGNORECASE)
 
-                    successful_tool_signatures.add(context_aware_signature)
-                    ASCIIColors.info(f"[ChatMixin] Recorded successful signature for '{tool_name}'. Total successful: {len(successful_tool_signatures)}")
+                    if tool_success:
+                        successful_tool_signatures.add(context_aware_signature)
+                        ASCIIColors.info(f"[ChatMixin] Recorded successful signature for '{tool_name}'. Total successful: {len(successful_tool_signatures)}")
+                    else:
+                        _bump_environment_epoch()
+                        object.__setattr__(self, "_consecutive_text_only_stalls", 0)
 
                     tool_calls_this_turn.append({
                         "name": tool_name,
                         "params": tool_params,
                         "result": {"output": clean_result_str, "success": tool_success}
                     })
+
+                    pending_analysis = True
+                    pending_analysis_round = round_count
+                    object.__setattr__(self, "_consecutive_text_only_stalls", 0)
 
                     # ── 📊 LOG TOOL CALL ACTION ──
                     turn_actions_log.append({
@@ -6151,12 +6336,14 @@ class ChatMixin:
                             f'<tool_result name="{tool_name}" status="FAILED">\n'
                             f"{clean_result_str}\n"
                             f"</tool_result>\n\n"
-                            f"⚠️ **Tool Execution Failed.**\n"
-                            f"The tool '{tool_name}' encountered an error. Here is your mandatory protocol:\n"
-                            f"1. **Analyze**: Read the error log above carefully to understand why it failed.\n"
-                            f"2. **Explore Alternatives**: If there is another way to accomplish the task (e.g., using a different tool, modifying the parameters, or fixing the data), you MUST attempt it.\n"
-                            f"3. **Inform the User**: If you cannot find an alternative approach, you MUST gracefully inform the user about the failure. "
-                            f"Clearly explain what you were trying to do, why it failed (based on the error), and explicitly tell the user what they can do to help (e.g., provide a missing file, change a configuration, or grant permissions)."
+                            f"⚠️ **Tool Execution Failed — SELF-CORRECTION MANDATE (LONG-HORIZON MODE).**\n"
+                            f"The tool '{tool_name}' failed. The turn is NOT over. You MUST fix the problem yourself:\n"
+                            f"1. **DIAGNOSE**: Read the error/traceback above and identify the EXACT offending line or parameter.\n"
+                            f"2. **FIX**: If the error is in a workspace file you previously created, emit a corrected `<artifact>` tag (full rewrite or SEARCH/REPLACE patch) with the fix applied. If the parameters were wrong, re-emit a corrected `<tool>` call.\n"
+                            f"3. **RETRY**: Re-run the tool to verify the fix.\n"
+                            f"4. **ITERATE**: Repeat diagnose→fix→retry until success or until you determine the approach is truly impossible.\n"
+                            f"5. Only after the task genuinely succeeds, or you have exhausted reasonable fixes, write your final analysis to the user and emit `<done/>` on a new line.\n"
+                            f"Do NOT end your response with prose only. Do NOT claim the task is complete while errors remain unverified."
                         )
                         virtual_history.append(SimpleNamespace(
                             sender_type="user",
@@ -6170,6 +6357,13 @@ class ChatMixin:
             else:
                 full_round_text = ss.get_clean_text_so_far()
                 raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
+
+                from ._context_sanitizer import scrub_processing_and_status_blocks
+                analysis_check_text = scrub_processing_and_status_blocks(raw_round_text).strip()
+                if pending_analysis and len(analysis_check_text) >= 80 and not ss.was_action_dispatched():
+                    pending_analysis = False
+                    bare_done_rejections = 0
+                    object.__setattr__(self, "_consecutive_text_only_stalls", 0)
 
                 clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
                 clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
@@ -6223,6 +6417,27 @@ class ChatMixin:
                     content=clean_history_text.strip()
                 ))
 
+                if pending_analysis:
+                    ASCIIColors.warning("[ChatMixin] Text-only round detected with pending tool analysis. Requiring continuation for textual analysis.")
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content=(
+                            "[SYSTEM NOTIFICATION - NOT A USER MESSAGE]\n"
+                            "<action_directive status=\"REQUIRED\">\n"
+                            "⚠️ Your previous round executed a tool, and its result has been delivered to you, but you have not yet analyzed it.\n"
+                            "A turn must NEVER end with an uninterpreted tool result.\n"
+                            "MANDATORY: Write your textual analysis of the tool output NOW:\n"
+                            "- Interpret the output (numbers, logs, plots): what does it tell you?\n"
+                            "- Verdict: does it satisfy the user's requirements (PASS/FAIL)?\n"
+                            "- If it fails, fix the root cause (corrected `<artifact>` + re-run the tool).\n"
+                            "Then end with `<done/>` on a new line.\n"
+                            "</action_directive>\n"
+                            "[END SYSTEM NOTIFICATION]"
+                        )
+                    ))
+                    _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
+                    continue
+
                 if round_count == 1 and not tool_calls_this_turn and not ss.affected_artefacts and not ss.context_unlock_requested:
                     ASCIIColors.info("[ChatMixin] Round 1 conversational answer completed. Ending loop.")
                     _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="conversational")
@@ -6230,8 +6445,9 @@ class ChatMixin:
 
                 text_only_stall_count = getattr(self, "_consecutive_text_only_stalls", 0) + 1
                 object.__setattr__(self, "_consecutive_text_only_stalls", text_only_stall_count)
-
-                if text_only_stall_count >= 3:
+                
+                _TEXT_STALL_LIMIT = 3
+                if text_only_stall_count >= _TEXT_STALL_LIMIT:
                     ASCIIColors.warning(f"[ChatMixin] Terminating after {text_only_stall_count} consecutive text-only stalls without <done/> or actions. The LLM is stuck.")
                     _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="text_stall")
                     break
@@ -6305,6 +6521,11 @@ class ChatMixin:
                 any(vh.sender_type == "user" and "<tool_result" in (vh.content or "") for vh in virtual_history)
                 or any(vh.sender_type == "assistant" and "<tool" in (vh.content or "") for vh in virtual_history)
                 or any("SYSTEM MARKER MIMICRY DETECTED" in (vh.content or "") for vh in virtual_history)
+            )
+            failed_tools_pending_fix = any(
+                vh.sender_type == "user"
+                and "SELF-CORRECTION MANDATE" in (vh.content or "")
+                for vh in virtual_history
             )
 
             ai_msg.metadata = {
@@ -6473,6 +6694,8 @@ class ChatMixin:
         }
         if existing_virtual_history:
             ai_msg.metadata["virtual_history"] = existing_virtual_history
+        if failed_tools_pending_fix and round_count >= resolved_max_rounds:
+            ai_msg.metadata["ended_on_unresolved_failure"] = True
 
         # Auto dream (only if memory is enabled)
         dream_report = None

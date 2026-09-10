@@ -125,8 +125,8 @@ class MockGemmaAgentClient:
 
         # ── Test Scenario D: Arbitrary Python Code Execution ──
         # State Machine: Round 0 (Tool Call) -> Round 1 (Tool Result) -> Final Answer
-        if "factorial" in prompt_text_lower and "tool_execute_python_code" in system_text_lower:
-            if self.scenario_d_round == 0:
+        if "tool_execute_python_code" in system_text_lower:
+            if self.scenario_d_round == 0 and "factorial" in prompt_text_lower:
                 self.scenario_d_round += 1
                 tool_call = {
                     "name": "tool_execute_python_code",
@@ -138,7 +138,7 @@ class MockGemmaAgentClient:
                 if callback:
                     callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
                 return reply
-            elif self.scenario_d_round == 1:
+            elif self.scenario_d_round == 1 and "<tool_result" in prompt_text_lower:
                 self.scenario_d_round = 0
                 reply = "I executed the Python code. The factorial of 5 is 120.<done/>"
                 if callback:
@@ -162,7 +162,7 @@ class MockGemmaAgentClient:
                 if callback:
                     callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
                 return reply
-            elif self.scenario_c_round == 1 and "[system: the" in prompt_text_lower:
+            elif self.scenario_c_round == 1 and ("<action_result" in prompt_text_lower or "[system:" in prompt_text_lower):
                 self.scenario_c_round += 1
                 reply = f'<tool>{json.dumps({"name": "tool_execute_python_data_query", "parameters": {"code": "query.py"}})}</tool>'
                 if callback:
@@ -196,7 +196,7 @@ class MockGemmaAgentClient:
                 callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
             return reply
 
-        if "[system: the" in prompt_text_lower and "has been successfully created" in prompt_text_lower:
+        if ("<action_result" in prompt_text_lower or "[system:" in prompt_text_lower) and "has been successfully created" in prompt_text_lower:
             if "math_ops.py" in prompt_text_lower or "safe_divide" in prompt_text_lower:
                 reply = "I have successfully updated math_ops.py with the safe_divide function.<done/>"
                 if callback:
@@ -436,7 +436,7 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
 
         user_message = "Please calculate the factorial of 5 using Python."
 
-        from lollms_client.tools_bindings.lcp.default_tools.execute_python_code.execute_python_code import tool_execute_python_code
+        from lollms_client.tools_bindings.lcp.default_tools.execute_python.execute_python import tool_execute_python_code
 
         original_tools_binding = getattr(self.client, 'tools', None)
         self.client.tools = None

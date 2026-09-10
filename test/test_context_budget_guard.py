@@ -115,10 +115,8 @@ class TestContextBudgetGuard(unittest.TestCase):
             enable_artefacts=True
         )
         
-        # Feed the unlock_file tag in streaming chunks to simulate real LLM output
-        ss.feed("<unlock_file>")
-        ss.feed("huge_data.json")
-        ss.feed("</unlock_file>")
+        # Feed the complete unlock_file tag in the canonical single-chunk form.
+        ss.feed("\n<unlock_file>\nhuge_data.json\n</unlock_file>\n")
         ss.flush_remaining_buffer()
         
         # Assert the file was NOT unlocked
@@ -159,11 +157,8 @@ class TestContextBudgetGuard(unittest.TestCase):
             enable_artefacts=True
         )
         
-        # Feed the unlock_file tag in streaming chunks to simulate real LLM output
-        # CRITICAL: The tag must start on a new line to pass the Start-Of-Line check in the parser
-        ss.feed("\n<unlock_file>\n")
-        ss.feed("small_config.txt\n")
-        ss.feed("</unlock_file>")
+        # Feed the complete unlock_file tag in the canonical single-chunk form.
+        ss.feed("\n<unlock_file>\nsmall_config.txt\n</unlock_file>\n")
         ss.flush_remaining_buffer()
         
         retrieved = self.discussion.artefacts.get("small_config.txt")

@@ -1009,6 +1009,14 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
 
     client = LollmsClient(**client_kwargs)
 
+    # ⚡ Enable fast token estimation (heuristic, no server round-trips)
+    client.enable_fast_token_estimate()
+    if client.use_fast_token_estimate:
+        ASCIIColors.success(
+            "[CLI] ⚡ Fast token estimation active "
+            f"(coefficient: {client._fast_token_coefficient})."
+        )
+
     if config.enable_shell_execution and client.tools:
         try:
             if hasattr(client.tools, 'mount_tool_library_if_absent'):
@@ -1807,7 +1815,8 @@ class StreamRenderer:
         elif msg_type == MSG_TYPE.MSG_TYPE_INFO:
             if meta and meta.get("done_intercepted"):
                 self._stop_live_artifact_panel()
-                ASCIIColors.rule("\n[bold green]✅ Task Completed (<done/>)[/bold green]")
+                print()
+                ASCIIColors.rule("[bold green]✅ Task Completed (<done/>)[/bold green]")
                 return True
             else:
                 ASCIIColors.rich_print(f"\n[blue][INFO] {chunk}[/blue]")

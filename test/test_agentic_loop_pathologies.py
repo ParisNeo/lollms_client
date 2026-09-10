@@ -220,7 +220,12 @@ class TestAgenticLoopPathologies(unittest.TestCase):
     def test_truncated_artifact_recovery(self):
         """
         Scenario: LLM emits a SEARCH/REPLACE block but stops before </artifact>.
-        Expected: flush_remaining_buffer() synthesizes the closing tag and dispatches.
+        Expected: flush_remaining_buffer() detects the truncated patch (missing
+                  final >>>>>>> REPLACE sentinel and closing tag) and REJECTS it.
+                  Registering truncated patches as successes teaches the model
+                  that prose-claims equal completed files (phantom completion
+                  hallucinations). The dispatch must be flagged as failed so
+                  ChatMixin injects a corrective round.
         """
         ai_msg = SimpleNamespace(content="", thoughts="", id="msg_1")
         ss = _StreamState(
@@ -238,24 +243,27 @@ class TestAgenticLoopPathologies(unittest.TestCase):
         self.assertTrue(ss.artefact_tracker.is_inside_artefact,
                         "Tracker should be inside artefact before flush.")
 
-        # CRITICAL FIX: Explicitly call flush_remaining_buffer() to simulate
-        # the end of the LLM generation stream. This triggers the truncated
-        # artifact recovery logic in _StreamState.
         ss.flush_remaining_buffer()
 
         self.assertFalse(ss.artefact_tracker.is_inside_artefact,
                          "Tracker should be closed after flush.")
         self.assertTrue(ss._action_dispatched,
-                        "Action should be marked as dispatched after recovery.")
-        self.assertIn("status:finished", ai_msg.content,
-                      "Processing block should be closed with status:finished.")
+                        "Action should be marked as dispatched to trigger a corrective round.")
+        self.assertTrue(ss.was_last_dispatch_failed(),
+                        "Truncated patch dispatch must be flagged as FAILED.")
+        self.assertIn("status:failure", ai_msg.content,
+                      "Processing block must be closed with status:failure.")
+        self.assertIn("INTERRUPTED before completion", ai_msg.content,
+                      "The user-facing message must state the artifact was not saved.")
 
         updated_art = self.discussion.artefacts.get("test.py")
-        self.assertIsNotNone(updated_art, "Artifact should exist after best-effort dispatch.")
-        self.assertGreater(updated_art.get("version", 1), 1,
-                           "Artifact version should be bumped if patch was applied.")
-        self.assertIn("def new():", updated_art.get("content", ""),
-                      "Truncated patch content should have been applied.")
+        self.assertIsNotNone(updated_art, "Original artifact must survive a rejected patch.")
+        self.assertEqual(updated_art.get("version", 1), 1,
+                         "Artifact version must NOT be bumped by a rejected truncated patch.")
+        self.assertIn("def old():", updated_art.get("content", ""),
+                      "Original content must be preserved untouched.")
+        self.assertNotIn("def new():", updated_art.get("content", ""),
+                         "Truncated patch content must NOT be applied.")
 
     def test_conversational_closure_after_tool(self):
         """

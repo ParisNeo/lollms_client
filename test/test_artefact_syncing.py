@@ -1,12 +1,11 @@
 import unittest
 import tempfile
 import shutil
-import os
-import json
 from pathlib import Path
-from datetime import datetime
 
-from lollms_client import LollmsClient
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
 from lollms_client.lollms_discussion import LollmsDiscussion, LollmsDataManager, ArtefactType
 from lollms_client.lollms_artefact import ArtefactVisibility
 
@@ -14,7 +13,6 @@ from lollms_client.lollms_artefact import ArtefactVisibility
 class MockClient:
     """Mock LollmsClient for isolated testing without LLM bindings."""
     def __init__(self):
-        self.debug = True
         self.llm = self
         self.model_name = "mock-model"
         self.binding_name = "mock-binding"
@@ -34,10 +32,9 @@ class MockClient:
 
 
 class TestArtefactSyncing(unittest.TestCase):
-    """Comprehensive test suite for bidirectional artefact synchronization."""
+    """Test suite for disk-as-source-of-truth artefact synchronization."""
 
     def setUp(self):
-        """Create a fresh isolated discussion for each test."""
         self.tmp_workspace = tempfile.mkdtemp(prefix="lollms_sync_test_")
         self.client = MockClient()
         self.db_manager = LollmsDataManager("sqlite:///:memory:")
@@ -52,7 +49,6 @@ class TestArtefactSyncing(unittest.TestCase):
         self.ws_data_dir.mkdir(parents=True, exist_ok=True)
 
     def tearDown(self):
-        """Clean up temporary workspace after each test."""
         self.discussion.close()
         shutil.rmtree(self.tmp_workspace, ignore_errors=True)
 
@@ -65,7 +61,6 @@ class TestArtefactSyncing(unittest.TestCase):
 
         self.assertEqual(report["new_artefacts"], 1)
         self.assertEqual(report["updated_artefacts"], 0)
-        self.assertEqual(report["restored_files"], 0)
 
         art = self.discussion.artefacts.get("new_script.py")
         self.assertIsNotNone(art, "Artifact should be registered in DB.")
@@ -87,33 +82,44 @@ class TestArtefactSyncing(unittest.TestCase):
         self.assertIn("Binary/Structured Data", art["content"])
         self.assertEqual(art["visibility"], ArtefactVisibility.TREE_UNLOCKABLE)
 
-    def test_db_to_disk_missing_file_restoration(self):
-        """Verify that a DB artifact missing from disk is restored."""
+    def test_deleted_disk_file_purges_db_record(self):
+        """Disk is source of truth: deleting a file removes its DB record."""
+        text_file = self.ws_data_dir / "temp_note.txt"
+        text_file.write_text("temporary", encoding="utf-8")
+        self.discussion.sync_workspace_to_artefacts()
+        self.assertIsNotNone(self.discussion.artefacts.get("temp_note.txt"))
+
+        text_file.unlink()
+
+        report = self.discussion.sync_workspace_to_artefacts()
+        self.assertGreaterEqual(report["deleted_artefacts"], 1,
+                                "Deleting a disk file must purge its DB record.")
+        self.assertIsNone(self.discussion.artefacts.get("temp_note.txt"))
+
+    def test_sync_all_active_to_disk_restores_missing_text_file(self):
+        """Verify sync_all_active_to_disk heals a missing active artifact on disk."""
+        content = "# Restored Content\nThis was lost."
         self.discussion.artefacts.add(
             title="restored_doc.md",
             artefact_type=ArtefactType.DOCUMENT,
-            content="# Restored Content\nThis was lost.",
+            content=content,
             active=True,
             visibility=ArtefactVisibility.FULL
         )
         self.discussion.commit()
 
-        # Ensure it's on disk initially
         disk_path = self.ws_data_dir / "restored_doc.md"
         self.assertTrue(disk_path.exists())
-
-        # Delete from disk to simulate loss
         disk_path.unlink()
         self.assertFalse(disk_path.exists())
 
-        report = self.discussion.sync_workspace_to_artefacts()
+        self.discussion.artefacts.sync_all_active_to_disk()
 
-        self.assertEqual(report["restored_files"], 1)
-        self.assertTrue(disk_path.exists(), "File should be restored to disk.")
+        self.assertTrue(disk_path.exists(), "Active file should be healed to disk.")
         self.assertIn("# Restored Content", disk_path.read_text(encoding="utf-8"))
 
-    def test_db_to_disk_skips_true_binary_data_restoration(self):
-        """Verify that true binary data artifacts (.db) are NOT restored from text placeholder."""
+    def test_sync_all_active_to_disk_skips_true_binary_data_restoration(self):
+        """Verify true binary data artifacts (.db) are NOT recreated from text placeholder."""
         self.discussion.artefacts.add(
             title="binary_data.db",
             artefact_type=ArtefactType.DATA,
@@ -125,14 +131,32 @@ class TestArtefactSyncing(unittest.TestCase):
         self.discussion.commit()
 
         disk_path = self.ws_data_dir / "binary_data.db"
-        # It shouldn't have been written to disk because _sync_to_disk_workspace skips true binaries
-        # if physical_data is None. But let's ensure sync doesn't try to write it either.
         if disk_path.exists():
             disk_path.unlink()
 
-        report = self.discussion.sync_workspace_to_artefacts()
-        self.assertEqual(report["restored_files"], 0, "True binary files should not be restored from text content.")
-        self.assertFalse(disk_path.exists(), "Binary file should not be recreated from placeholder text.")
+        self.discussion.artefacts.sync_all_active_to_disk()
+
+        self.assertFalse(disk_path.exists(),
+                         "Binary file must not be recreated from placeholder text.")
+
+    def test_sync_all_active_to_disk_skips_hidden_artifacts(self):
+        """Verify HIDDEN artifacts are not restored to disk by sync."""
+        self.discussion.artefacts.add(
+            title="hidden_doc.md",
+            artefact_type=ArtefactType.DOCUMENT,
+            content="secret content",
+            active=False,
+            visibility=ArtefactVisibility.HIDDEN
+        )
+        self.discussion.commit()
+
+        disk_path = self.ws_data_dir / "hidden_doc.md"
+        if disk_path.exists():
+            disk_path.unlink()
+
+        self.discussion.artefacts.sync_all_active_to_disk()
+
+        self.assertFalse(disk_path.exists(), "HIDDEN artifacts should not be restored.")
 
     def test_bidirectional_update_modified_text_file(self):
         """Verify modifying a file on disk updates the DB content."""
@@ -141,11 +165,10 @@ class TestArtefactSyncing(unittest.TestCase):
         text_file.write_text(original_content, encoding="utf-8")
 
         self.discussion.sync_workspace_to_artefacts()
-        
+
         art = self.discussion.artefacts.get("config.json")
         self.assertEqual(art["content"], original_content)
 
-        # Modify the file
         modified_content = '{"key": "new_value", "updated": true}'
         text_file.write_text(modified_content, encoding="utf-8")
 
@@ -165,7 +188,7 @@ class TestArtefactSyncing(unittest.TestCase):
 
         self.assertEqual(report["new_artefacts"], 0)
         self.assertEqual(report["updated_artefacts"], 0)
-        self.assertEqual(report["restored_files"], 0)
+        self.assertEqual(report["deleted_artefacts"], 0)
 
     def test_ignored_directories_and_extensions(self):
         """Verify __pycache__, .git, and .pyc files are ignored."""
@@ -197,7 +220,6 @@ class TestArtefactSyncing(unittest.TestCase):
         report = self.discussion.sync_workspace_to_artefacts()
 
         self.assertEqual(report["new_artefacts"], 1)
-        # The title should be the filename, but the physical_path should preserve subfolders
         arts = self.discussion.artefacts.list()
         tsx_art = next((a for a in arts if a["title"] == "Button.tsx"), None)
         self.assertIsNotNone(tsx_art)
@@ -237,26 +259,7 @@ class TestArtefactSyncing(unittest.TestCase):
         self.assertEqual(len(synced_files), 0)
         self.assertTrue(workspace_dir.exists())
 
-    def test_hidden_artifacts_not_restored(self):
-        """Verify HIDDEN artifacts are not restored to disk by sync."""
-        self.discussion.artefacts.add(
-            title="hidden_doc.md",
-            artefact_type=ArtefactType.DOCUMENT,
-            content="secret content",
-            active=False,
-            visibility=ArtefactVisibility.HIDDEN
-        )
-        self.discussion.commit()
-
-        disk_path = self.ws_data_dir / "hidden_doc.md"
-        if disk_path.exists():
-            disk_path.unlink()
-
-        report = self.discussion.sync_workspace_to_artefacts()
-        self.assertEqual(report["restored_files"], 0, "HIDDEN artifacts should not be restored.")
-        self.assertFalse(disk_path.exists())
-
-    def test_data_artifact_csv_restoration(self):
+    def test_text_based_data_artifact_restoration(self):
         """Verify text-based data artifacts (CSV) are restored to disk if missing."""
         csv_content = "name,age\nAlice,30\nBob,25"
         self.discussion.artefacts.add(
@@ -273,9 +276,9 @@ class TestArtefactSyncing(unittest.TestCase):
         self.assertTrue(disk_path.exists())
         disk_path.unlink()
 
-        report = self.discussion.sync_workspace_to_artefacts()
-        self.assertEqual(report["restored_files"], 1, "CSV file should be restored from DB content.")
-        self.assertTrue(disk_path.exists())
+        self.discussion.artefacts.sync_all_active_to_disk()
+
+        self.assertTrue(disk_path.exists(), "CSV file should be restored from DB content.")
         self.assertEqual(disk_path.read_text(encoding="utf-8"), csv_content)
 
 

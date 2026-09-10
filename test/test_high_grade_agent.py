@@ -391,12 +391,18 @@ class TestBindingToolsBuilder(unittest.TestCase):
 
     def test_no_bindings_returns_empty(self):
         client = MagicMock()
-        client.tti = None
-        client.tts = None
-        client.stt = None
-        client.ttm = None
-        client.ttv = None
-        caps = CapabilityFlags()
+        for attr in ("tti", "tts", "stt", "ttm", "ttv", "connection"):
+            setattr(client, attr, None)
+        for attr in ("tti_model_profiles_registry", "connection_model_profiles_registry"):
+            setattr(client, attr, None)
+        caps = CapabilityFlags(
+            enable_image_generation=False,
+            enable_image_editing=False,
+            enable_workspace_tools=False,
+            enable_sub_agents=False,
+            enable_skill_creation=False,
+            enable_skill_loading=False,
+        )
         tools = BindingToolsBuilder.build_tools(client, caps, None)
         self.assertEqual(len(tools), 0)
 

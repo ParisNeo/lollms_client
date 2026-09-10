@@ -521,7 +521,11 @@ class ArtefactManager:
                     title_suffix = Path(title).suffix.lower()
                     is_binary_db = title_suffix in (".db", ".sqlite", ".sqlite3")
 
-                if active_file_path.exists() and active_file_path.stat().st_size > 0:
+                if (
+                    atype == ArtefactType.DATA
+                    and active_file_path.exists()
+                    and active_file_path.stat().st_size > 0
+                ):
                     ASCIIColors.info(
                         f"[ArtefactManager] Preserving existing physical file '{filename}' "
                         f"({active_file_path.stat().st_size:,} bytes). Logical twin (.lam) holds metadata/schema."
@@ -537,6 +541,11 @@ class ArtefactManager:
                         wrote_physical = True
                     except Exception as e:
                         trace_exception(e)
+                if wrote_physical:
+                    object.__setattr__(
+                        self._discussion, "_workspace_write_revision",
+                        int(getattr(self._discussion, "_workspace_write_revision", 0)) + 1,
+                    )
 
             # 2. Write Logical Twin (.lam) into .versions/
             lam_filename = f"{name_part}.lam"
@@ -1703,12 +1712,13 @@ class ArtefactManager:
         return self.sync_all_active_to_disk()
 
     def sync_all_active_to_disk(self):
-        self._sync_index_with_disk()
-
-        # CRITICAL FIX: Re-fetch active artifacts AFTER _sync_index_with_disk purged orphans.
-        # The previous code held a stale snapshot of active_arts that included
-        # artifacts already removed from the DB, causing _sync_to_disk_workspace
-        # to re-materialize deleted files back onto disk (violating disk-source-of-truth).
+        # HEAL-ONLY CONTRACT: This method guarantees that every ACTIVE artifact
+        # exists on disk before tool execution. It must NOT purge DB records for
+        # files missing from disk — a missing physical twin is precisely the
+        # condition this pass heals. Purging belongs exclusively to the
+        # user-facing bidirectional sync (sync_workspace_to_artefacts), where
+        # disk is the source of truth. Purging here would erase the artifact
+        # before the heal pass can restore it.
         active_arts = self.list(active_only=True)
         workspace_dir = self._get_workspace_root()
         workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -1728,13 +1738,19 @@ class ArtefactManager:
                 clean_path = self._sanitize_path_segments(title)
                 art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_path))
 
-                name_part, _ = os.path.splitext(clean_path) if '.' in clean_path else (clean_path, "")
-                versioned_data = self._get_versions_root() / art_id / f"{name_part}_v{version}{file_ext}"
-                dest = self._resolve_confined_path(f"{title}{file_ext}")
+                filename = self._get_filename_with_ext(
+                    clean_path, art.get("type", "data"), art.get("language"), file_ext
+                )
+                name_part, _ = os.path.splitext(filename) if '.' in filename else (filename, "")
+                versioned_data = self._get_versions_root() / art_id / f"{name_part}_v{version}{file_ext if file_ext else (os.path.splitext(filename)[1] if '.' in filename else '')}"
+                dest = self._resolve_confined_path(filename)
 
-                if versioned_data.exists() and not dest.exists():
-                    import shutil
-                    shutil.copy(str(versioned_data), str(dest))
+                if not dest.exists():
+                    if versioned_data.exists():
+                        import shutil
+                        shutil.copy(str(versioned_data), str(dest))
+                    elif file_ext.lower() not in (".db", ".sqlite", ".sqlite3") and isinstance(art.get("content"), str) and art["content"] and not art["content"].startswith("#"):
+                        dest.write_text(art["content"], encoding="utf-8", errors="ignore")
 
                 if dest.exists() and str(dest.resolve()) not in synced_files:
                     synced_files.append(str(dest.resolve()))

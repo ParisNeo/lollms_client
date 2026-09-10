@@ -54,12 +54,11 @@ class TestDualStreamDataProtocol(unittest.TestCase):
         self.discussion.commit()
 
         ws_data = Path(self.discussion.workspace_data_path)
-        meta_dir = Path(self.discussion.artefacts_metadata_path)
 
         self.assertTrue((ws_data / "users.csv").exists(), "Physical CSV twin must exist.")
-        
-        lam_files = list(meta_dir.rglob("users.lam"))
-        self.assertEqual(len(lam_files), 1, "Logical .lam twin must exist.")
+
+        lam_files = list(ws_data.rglob("users.lam"))
+        self.assertEqual(len(lam_files), 1, "Logical .lam twin must exist under workspace_data/.versions/.")
         self.assertIn("Columns: name", lam_files[0].read_text())
 
     def test_context_zone_injects_lam_not_raw(self):
