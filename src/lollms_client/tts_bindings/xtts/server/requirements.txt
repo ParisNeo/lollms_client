@@ -1,12 +1,12 @@
 # PyTorch (version plus récente) pour CUDA 11.8
-torch==2.1.2+cu118
+torch==2.6.0+cu118
 torchvision==0.16.2+cu118
 torchaudio==2.1.2+cu118
 
 # Extra index pour les wheels CUDA
 --extra-index-url https://download.pytorch.org/whl/cu118
 # Stable version compatible with XTTS to avoid warnings
-transformers==4.46.0
+transformers==5.10.0
 
 # TTS with torch compatible CUDA 11.8
 TTS
@@ -14,7 +14,7 @@ TTS
 # Serveur FastAPI
 fastapi==0.116.1
 uvicorn==0.35.0
-python-multipart==0.0.20
+python-multipart==0.0.30
 numpy<2.0.0
 
 #ParisNeo modules
