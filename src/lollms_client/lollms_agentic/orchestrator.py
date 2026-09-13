@@ -2,6 +2,7 @@
 # OrchestratorAgent: plans, delegates, verifies. Never executes tools.
 
 import re
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ascii_colors import ASCIIColors, trace_exception
@@ -55,26 +56,24 @@ class OrchestratorAgent:
     Two-stage doctrine stage 1: coordination.
 
     Contract:
-      * Its LLM context NEVER contains tool syntax or system-generated
-        templates (structural mimicry immunity). Its history is verbatim:
-        its own <plan>/<delegate>/<verify> moves and the workers' report
-        envelopes (plain facts, no executable grammar).
-      * Every execution verb is intercepted by the runtime, never executed.
+      * Context contains NO tool syntax or execution templates.
+      * Delegates work to WorkerAgent instances.
       * Progress is persisted to progress.md after every state transition.
-      * VERIFY delegates ground-truth inspection to an Inspector Worker; the
-        King never marks a step done from its own textual judgement.
+      * VERIFY delegates ground-truth inspection to an Inspector Worker.
     """
 
     def __init__(
         self,
-        discussion,
-        tools_registry: Dict[str, Dict[str, Any]],
+        context=None,
+        tools_registry: Optional[Dict[str, Dict[str, Any]]] = None,
         worker_factory: Optional[Callable[[], "WorkerAgent"]] = None,
         callback: Optional[Callable] = None,
         event_mode: Any = None,
         max_worker_rounds: int = 8,
+        discussion: Any = None,
     ):
-        self.discussion = discussion
+        self.context = context or discussion
+        self.discussion = self.context
         self.tools_registry = tools_registry or {}
         self.callback = callback
         self.event_mode = event_mode
@@ -82,7 +81,7 @@ class OrchestratorAgent:
 
         self.worker_factory = worker_factory or (
             lambda: WorkerAgent(
-                discussion=discussion,
+                context=self.context,
                 tools_registry=self.tools_registry,
                 callback=callback,
                 event_mode=event_mode,
@@ -90,7 +89,7 @@ class OrchestratorAgent:
             )
         )
 
-        self._worker_specialties: str = _build_worker_specialties(tools_registry)
+        self._worker_specialties: str = _build_worker_specialties(self.tools_registry)
         self.plan: Optional[AgenticPlan] = None
         self.worker_counter = 0
         self.step_reports: Dict[int, Dict[str, Any]] = {}
@@ -116,9 +115,9 @@ class OrchestratorAgent:
     def _bump_workspace_revision(self) -> None:
         try:
             object.__setattr__(
-                self.discussion,
+                self.context,
                 "_workspace_write_revision",
-                int(getattr(self.discussion, "_workspace_write_revision", 0)) + 1,
+                int(getattr(self.context, "_workspace_write_revision", 0)) + 1,
             )
         except Exception:
             pass
@@ -126,27 +125,31 @@ class OrchestratorAgent:
     def _cached_workspace_tree(self) -> str:
         """
         Compact, cached directory tree of the sandboxed workspace.
-
-        The Orchestrator needs the tree to name valid files inside
-        <context_files> blocks. The scan is cached against the discussion's
-        workspace write revision so repeated Orchestrator rounds and spawned
-        Workers never re-walk the filesystem or re-send an ever-growing file
-        list to the LLM.
         """
-        revision = int(getattr(self.discussion, "_workspace_write_revision", 0))
+        revision = int(getattr(self.context, "_workspace_write_revision", 0))
         if self._workspace_tree_cache_revision == revision:
             return self._workspace_tree_cache
 
         lines: List[str] = []
         try:
-            ws_root = self.discussion.artefacts._get_workspace_root()
-            if ws_root.exists():
+            artefacts = getattr(self.context, "artefacts", None)
+            if artefacts and hasattr(artefacts, "_get_workspace_root"):
+                ws_root = artefacts._get_workspace_root()
+            else:
+                ws_root = Path(
+                    getattr(self.context, "workspace_data_path", None)
+                    or getattr(self.context, "_resolved_workspace", None)
+                    or getattr(self.context, "workspace_path", None)
+                    or "."
+                ).resolve()
+
+            if ws_root and ws_root.exists():
                 for f in sorted(ws_root.rglob("*")):
                     if not f.is_file():
                         continue
                     rel = f.relative_to(ws_root)
                     rel_str = str(rel).replace("\\", "/")
-                    if rel_str.startswith(".versions"):
+                    if rel_str.startswith(".versions") or rel_str.startswith(".git"):
                         continue
                     if any(
                         part.startswith(".") and part not in (".", "..")
@@ -164,29 +167,41 @@ class OrchestratorAgent:
     # ───────────────────────────── progress.md ─────────────────────────────
 
     def _write_progress_file(self) -> None:
-        """Persists the plan state as progress.md via the confined ArtefactManager."""
+        """Persists the plan state as progress.md."""
         if self.plan is None:
             return
         try:
-            artefacts = self.discussion.artefacts
+            artefacts = getattr(self.context, "artefacts", None)
             content = self._progress_markdown()
-            existing = artefacts.get(self.plan.progress_artifact_title)
-            if existing is None:
-                artefacts.add(
-                    title=self.plan.progress_artifact_title,
-                    artefact_type="document",
-                    content=content,
-                    active=True,
-                    visibility="full",
-                )
+            if artefacts:
+                existing = artefacts.get(self.plan.progress_artifact_title)
+                if existing is None:
+                    artefacts.add(
+                        title=self.plan.progress_artifact_title,
+                        artefact_type="document",
+                        content=content,
+                        active=True,
+                        visibility="full",
+                    )
+                else:
+                    artefacts.update(
+                        title=self.plan.progress_artifact_title,
+                        new_content=content,
+                        bump_version=True,
+                        active=True,
+                    )
             else:
-                artefacts.update(
-                    title=self.plan.progress_artifact_title,
-                    new_content=content,
-                    bump_version=True,
-                    active=True,
-                )
-            self.discussion.commit()
+                ws_root = Path(
+                    getattr(self.context, "workspace_data_path", None)
+                    or getattr(self.context, "_resolved_workspace", None)
+                    or getattr(self.context, "workspace_path", None)
+                    or "."
+                ).resolve()
+                ws_root.mkdir(parents=True, exist_ok=True)
+                (ws_root / self.plan.progress_artifact_title).write_text(content, encoding="utf-8")
+
+            if hasattr(self.context, "commit"):
+                self.context.commit()
         except Exception as ex:
             trace_exception(ex)
             ASCIIColors.warning(f"[Orchestrator] Failed to persist progress.md: {ex}")
@@ -293,12 +308,6 @@ class OrchestratorAgent:
     def _spawn_inspector(
         self, step: PlanStep, worker_result: Dict[str, Any]
     ) -> bool:
-        """
-        Spawns a verification Worker to perform ground-truth inspection of
-        one step. The King itself never executes tools; the Inspector is a
-        Worker with the full tool doctrine at its disposal. Returns True only
-        when the Inspector's verdict is PASS.
-        """
         task = VERIFICATION_TASK_TEMPLATE.format(
             step_index=step.index,
             step_description=step.description,
@@ -474,8 +483,9 @@ class OrchestratorAgent:
         return merged
 
     def _generate(self, messages: List[Dict[str, str]]) -> Optional[str]:
+        client = getattr(self.context, "lollmsClient", None) or getattr(self.context, "lollms_client", None)
         try:
-            return self.discussion.lollmsClient.generate_from_messages(
+            return client.generate_from_messages(
                 messages=messages,
                 stream=False,
                 streaming_callback=None,
@@ -485,13 +495,6 @@ class OrchestratorAgent:
             return None
 
     def _feed_report(self, result: Dict[str, Any]) -> None:
-        """
-        Appends the worker's report envelope to the King's history.
-
-        The envelope carries facts only (status, files, the worker's own
-        report text). It contains zero executable grammar: no tool syntax,
-        no system templates — nothing the King could learn to mimic.
-        """
         report = (result.get("report") or "(empty report)")[:_MAX_REPORT_CHARS]
         status = "SUCCESS" if result.get("success") else "FAILURE"
         files = result.get("files") or []
@@ -514,6 +517,5 @@ class OrchestratorAgent:
 
 
 def _strip_done(text: str) -> str:
-    """Removes the <done/> termination tag from the King's final answer text."""
     cleaned = _DONE_RE.sub("", text).strip()
     return cleaned

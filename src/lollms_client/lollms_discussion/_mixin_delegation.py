@@ -186,10 +186,27 @@ class DelegationMixin:
         worker_error: Optional[str] = None
         spawned_artifacts: List[str] = []
 
+        def worker_stream_relay(chunk: str, msg_type=None, meta=None):
+            if callback is None:
+                return True
+            try:
+                mt = msg_type if msg_type is not None else MSG_TYPE.MSG_TYPE_CHUNK
+                return callback(chunk, mt, meta or {})
+            except Exception:
+                return True
+
+        from lollms_client.lollms_agentic.prompts import WORKER_SYSTEM_PROMPT
+        from lollms_client.lollms_personality.lollms_personality import LollmsPersonality
+        worker_persona = LollmsPersonality(
+            name="SpecialistWorker",
+            system_prompt=WORKER_SYSTEM_PROMPT,
+            lollms_client=self.lollmsClient
+        )
+
         try:
             result = self.chat(
                 user_message=context_body,
-                personality=None,
+                personality=worker_persona,
                 add_user_message=False,
                 tools=worker_tools,
                 enable_artefacts=True,
@@ -204,6 +221,7 @@ class DelegationMixin:
                 enable_forms=False,
                 orchestrator_mode=False,
                 event_mode=event_meta.get("event_mode"),
+                streaming_callback=worker_stream_relay,
             )
             ai_message = (result or {}).get("ai_message")
             full_text = getattr(ai_message, "content", "") or ""
@@ -216,6 +234,12 @@ class DelegationMixin:
         except Exception as ex:
             trace_exception(ex)
             worker_error = f"Worker runtime crashed: {ex}"
+
+        # Ensure physical workspace disk sync
+        try:
+            self.artefacts.sync_all_active_to_disk()
+        except Exception as sync_err:
+            ASCIIColors.warning(f"[DelegationMixin] Post-worker disk sync: {sync_err}")
 
         report_text = self._extract_worker_report(raw_report)
         if worker_error and not report_text:

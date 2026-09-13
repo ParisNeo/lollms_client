@@ -611,7 +611,10 @@ class ArtefactManager:
         new_meta = (self._discussion.metadata or {}).copy()
         new_meta["_artefacts"] = artefacts
         self._discussion.metadata = new_meta
-        self._discussion.commit()
+        if hasattr(self._discussion, "touch"):
+            self._discussion.touch()
+        if hasattr(self._discussion, "commit"):
+            self._discussion.commit()
 
     def _all_latest_titles(self) -> List[str]:
         seen: Dict[str, int] = {}
@@ -2409,12 +2412,13 @@ class ArtefactManager:
                         if placeholder in v:
                             attrs[k] = v.replace(placeholder, original)
 
-            tag_title   = attrs.pop('name', attrs.pop('title', f'artifact_{uuid.uuid4().hex[:8]}'))
+            has_explicit_name = 'name' in attrs or 'title' in attrs
+            tag_title   = attrs.pop('name', attrs.pop('title', None))
             new_name    = attrs.pop('rename', None)
             atype       = attrs.pop('type', default_type)
             language    = attrs.pop('language', None)
             version_str = attrs.pop('version', '1')
-            version     = int(version_str) if version_str.isdigit() else 1
+            version     = int(version_str) if str(version_str).isdigit() else 1
             is_ephemeral = attrs.pop('ephemeral', 'false').lower() in ('true', '1', 'yes')
             status      = attrs.pop('status', ArtefactStatus.STABLE)
             commit_message = attrs.pop('commit_message', None)
@@ -2427,6 +2431,33 @@ class ArtefactManager:
                     atype = ArtefactType.DOCUMENT
                 else:
                     atype = default_type
+
+            _has_search = bool(
+                re.search(r'<{6,8}\s*SEARCH', content, re.IGNORECASE)
+            )
+
+            # Strip conversational preamble if present before SEARCH
+            if _has_search:
+                s_idx = content.find("<<<<<<< SEARCH")
+                if s_idx > 0:
+                    preamble = content[:s_idx].strip()
+                    if len(preamble) < 150 or "search" in preamble.lower() or "patch" in preamble.lower():
+                        content = content[s_idx:].strip()
+
+            # Self-healing: if tag_title is missing, infer from existing artifacts using SEARCH block
+            if not tag_title and _has_search and existing_titles:
+                first_search_match = re.search(r'<{6,8}\s*SEARCH\n(.*?)\n={5,}', content, re.DOTALL)
+                if first_search_match:
+                    search_snippet = first_search_match.group(1).strip()
+                    for candidate_title in existing_titles:
+                        candidate_art = self.get(candidate_title)
+                        if candidate_art and candidate_art.get('content') and search_snippet in candidate_art.get('content', ''):
+                            tag_title = candidate_title
+                            ASCIIColors.success(f"[ArtefactManager] Self-healed missing artifact title: matched '{candidate_title}' by SEARCH block snippet.")
+                            break
+
+            if not tag_title:
+                tag_title = f'artifact_{uuid.uuid4().hex[:8]}'
 
             resolved_title = tag_title if tag_title in existing_titles else (
                 _find_best_title_match(tag_title, existing_titles) or tag_title
@@ -2448,10 +2479,6 @@ class ArtefactManager:
                 else:
                     resolved_title = tag_title
                     is_new = True
-
-            _has_search = bool(
-                re.search(r'<{6,8}\s*SEARCH', content, re.IGNORECASE)
-            )
 
             result_artefact: Optional[Dict] = None
 

@@ -35,6 +35,22 @@ from .skills_manager import SkillsManager
 from .handbag import Handbag
 from .lollms_agent_state import _AgentStreamState, _sanitize_tool_result, _ToolsManager
 
+from lollms_client.lollms_chat_core import (
+    calculate_dynamic_tool_char_limit as _calculate_dynamic_tool_char_limit,
+    repair_llm_json as _repair_llm_tool_json,
+    is_large_base64 as _is_large_base64,
+    sanitize_tool_result as _core_sanitize_tool_result,
+    detect_structural_symbols as _detect_structural_symbols,
+    extract_artefact_meta as _extract_artefact_meta,
+    build_progressive_continuation_prompt as _build_progressive_continuation_prompt,
+    inject_tool_images_for_vlm as _inject_tool_images_for_vlm_core,
+    dump_error as _core_dump_error,
+    take_workspace_snapshot as _core_take_workspace_snapshot,
+    sync_workspace_diff as _core_sync_workspace_diff,
+    execute_tool_call as _core_execute_tool_call,
+    execute_context_visibility_operation as _core_execute_context_visibility,
+)
+
 if not callable(getattr(builtins, 'compile', None)) or builtins.compile.__module__ != 'builtins':
     import importlib as _importlib
     _builtins_mod = _importlib.import_module('builtins')
@@ -55,7 +71,6 @@ from lollms_client.lollms_memory import FailureMemory
 from lollms_client.lollms_artefact import ArtefactVisibility, ArtefactManager
 from lollms_client.lollms_artefact.lollms_artefact import ArtefactManager as _ArtefactManager
 from lollms_client.lollms_history import HistoryManager
-from lollms_client.lollms_history.lollms_history import HistoryManager
 
 
 _TEXT_RAG_EXTS = {
@@ -1743,7 +1758,7 @@ class LollmsPersonality:
         role: str = AgentRole.IMPLEMENTER,
         model_params: Optional[Dict[str, Any]] = None,
         enable_artefact_system: bool = False,
-        disable_artefact_versioning: bool = False,
+        disable_artefact_versioning: bool = True,
         skills_dirs: Optional[List[Union[str, Path]]] = None,
         _parent_depth: int = 0,
         lc: Optional[Any] = None,
@@ -2443,6 +2458,11 @@ class LollmsPersonality:
         }
 
     @property
+    def artefacts(self) -> Optional[ArtefactManager]:
+        """Exposes the internal ArtefactManager instance."""
+        return getattr(self, '_artefact_manager', None)
+
+    @property
     def has_data(self) -> bool:
         return (
             bool(self.data_sources)
@@ -2659,67 +2679,12 @@ class LollmsPersonality:
         return sorted(result)
 
     def _take_workspace_snapshot(self) -> Dict:
-        snapshot = {}
         if not self._resolved_workspace:
-            return snapshot
-
-        _MAX_SNAPSHOT_FILES = 5000
-        _MAX_HASH_SIZE = 512 * 1024  # 512KB — skip hashing files larger than this
-        files_scanned = 0
-
-        try:
-            for f in self._resolved_workspace.rglob("*"):
-                if files_scanned >= _MAX_SNAPSHOT_FILES:
-                    ASCIIColors.warning(f"[{self.name}] Workspace snapshot capped at {_MAX_SNAPSHOT_FILES} files. Larger workspaces are not fully hashed to prevent performance degradation.")
-                    break
-                if not f.is_file():
-                    continue
-                rel_parts = f.relative_to(self._resolved_workspace).parts
-                if any(part in _IGNORED_WS_DIRS for part in rel_parts):
-                    continue
-                if f.suffix.lower() in _IGNORED_WS_EXTS:
-                    continue
-
-                files_scanned += 1
-                rel_path = f.relative_to(self._resolved_workspace)
-
-                try:
-                    file_size = f.stat().st_size
-                    file_hash = None
-                    if file_size < _MAX_HASH_SIZE:
-                        content = f.read_text(encoding="utf-8", errors="ignore")
-                        file_hash = hashlib.md5(content.encode("utf-8", errors="ignore")).hexdigest()
-
-                    snapshot[rel_path] = {
-                        "hash": file_hash,
-                        "size": file_size,
-                        "path": f
-                    }
-                except Exception:
-                    try:
-                        snapshot[rel_path] = {
-                            "hash": None,
-                            "size": f.stat().st_size,
-                            "path": f
-                        }
-                    except Exception:
-                        pass
-        except Exception as e:
-            ASCIIColors.warning(f"[{self.name}] Workspace snapshot failed: {e}")
-
-        return snapshot
+            return {}
+        return _core_take_workspace_snapshot(self._resolved_workspace)
 
     def _sync_workspace(self, files_before: Dict, files_after: Dict) -> List[Dict[str, Any]]:
-        changes = []
-        new_files = set(files_after.keys()) - set(files_before.keys())
-        for rel_path in new_files:
-            file_info = files_after[rel_path]
-            changes.append({"action": "created", "path": str(rel_path), "size": file_info.get("size", 0)})
-        common_files = set(files_after.keys()) & set(files_before.keys())
-        for rel_path in common_files:
-            if files_before[rel_path].get("hash") != files_after[rel_path].get("hash"):
-                changes.append({"action": "modified", "path": str(rel_path), "size": files_after[rel_path].get("size", 0)})
-        return changes
+        return _core_sync_workspace_diff(files_before, files_after)
 
     def cancel_generation(self) -> bool:
         if hasattr(self, '_cancel_flag'):
@@ -3386,49 +3351,17 @@ JSON:"""
             
     def _dump_error(self, error: Exception, context_desc: str, round_count: int, extra_data: Optional[Dict[str, Any]] = None):
         """Writes a detailed error log to the debug dumps directory."""
-        if not getattr(self, 'debug_mode', False):
-            return
-
-        try:
-            import traceback as _traceback
-            from pathlib import Path
-
-            ws_path = getattr(self, '_resolved_workspace', None)
-            if not ws_path:
-                return
-
-            debug_dir = ws_path / ".lollms_code" / "_debug_dumps"
-            debug_dir.mkdir(parents=True, exist_ok=True)
-
-            error_log_path = debug_dir / f"error_round_{round_count}_{context_desc.replace(' ', '_').lower()}.log"
-
-            with open(error_log_path, "w", encoding="utf-8") as f:
-                f.write("=" * 80 + "\n")
-                f.write(f"🐛 [DEBUG] ERROR DUMP - ROUND {round_count}\n")
-                f.write(f"Context: {context_desc}\n")
-                f.write("=" * 80 + "\n\n")
-
-                f.write("--- EXCEPTION ---\n")
-                f.write(f"Type: {type(error).__name__}\n")
-                f.write(f"Message: {str(error)}\n\n")
-
-                f.write("--- TRACEBACK ---\n")
-                f.write(_traceback.format_exc())
-                f.write("\n\n")
-
-                if extra_data:
-                    f.write("--- EXTRA DATA ---\n")
-                    import json as _json
-                    try:
-                        f.write(_json.dumps(extra_data, indent=2, default=str, ensure_ascii=False))
-                    except Exception:
-                        f.write(str(extra_data))
-                    f.write("\n\n")
-
-            ASCIIColors.error(f"[{self.name}] 🐛 Error dumped to: {error_log_path}")
-
-        except Exception as dump_err:
-            ASCIIColors.warning(f"[{self.name}] Failed to write error dump: {dump_err}")
+        ws_path = getattr(self, '_resolved_workspace', None)
+        if ws_path:
+            debug_dir = ws_path / ".lollms_code"
+            _core_dump_error(
+                error=error,
+                context_desc=context_desc,
+                round_count=round_count,
+                workspace_dir=debug_dir,
+                extra_data=extra_data,
+                debug_mode=getattr(self, 'debug_mode', False)
+            )
 
     def _sanitize_history_for_context(self, text: str, round_index: int = 0, distance_from_end: int = 99) -> str:
         """
@@ -3614,19 +3547,15 @@ JSON:"""
                     if t_name in all_skill_tools:
                         active_tools[t_name] = all_skill_tools[t_name]
 
-        if self._sub_agent_spawner and self.capabilities and self.capabilities.enable_sub_agents:
-            def tool_spawn_sub_agent(instruction: str, personality_conditioning: str = "", model_name: str = "") -> dict:
-                return self._sub_agent_spawner.spawn(instruction=instruction, personality_conditioning=personality_conditioning or None, model_name=model_name or None)
-            active_tools["tool_spawn_sub_agent"] = {
-                "name": "tool_spawn_sub_agent",
-                "description": "Spawn a focused sub-agent to handle a sub-task. The sub-agent shares your workspace but cannot spawn further sub-agents.",
-                "parameters": [
-                    {"name": "instruction", "type": "str", "description": "The specific task for the sub-agent."},
-                    {"name": "personality_conditioning", "type": "str", "description": "Custom system prompt for the sub-agent (optional).", "optional": True},
-                    {"name": "model_name", "type": "str", "description": "Specific model to use (empty = parent's model).", "optional": True},
-                ],
-                "callable": tool_spawn_sub_agent,
-            }
+        if self.capabilities and self.capabilities.enable_sub_agents:
+            from lollms_client.lollms_agentic.spinoff_tools import build_spinoff_agent_tools
+            spinoff_tools = build_spinoff_agent_tools(
+                discussion=self,
+                images=[],
+                orchestrator_mode=False,
+                streaming_callback=getattr(self, '_active_streaming_callback', None)
+            )
+            active_tools.update(spinoff_tools)
 
         if self._model_switcher and self.capabilities and self.capabilities.enable_model_switching:
             def tool_switch_model(model_name: str) -> dict:
@@ -4296,533 +4225,30 @@ JSON:"""
         return resolved
 
     def _execute_context_visibility(self, tag_name: str, body: str) -> Dict[str, Any]:
-        if not hasattr(self, '_artefact_manager') or not self._artefact_manager:
-            return "[SYSTEM ERROR] Artefact system not initialized. Cannot manage file visibility."
-
-        try:
-            from lollms_client.lollms_artefact import ArtefactVisibility
-        except ImportError:
-            return "[SYSTEM ERROR] ArtefactVisibility module not available."
-
-        target_visibility = ArtefactVisibility.FULL
-        action_verb = "Unlocking"
-        if tag_name == "lock_file":
-            target_visibility = ArtefactVisibility.TREE_LOCKED
-            action_verb = "Locking"
-        elif tag_name == "hide_file":
-            target_visibility = ArtefactVisibility.HIDDEN
-            action_verb = "Hiding"
-        elif tag_name == "collapse_folder":
-            target_visibility = ArtefactVisibility.FOLDER_COLLAPSED
-            action_verb = "Collapsing"
-        elif tag_name == "uncollapse_folder":
-            target_visibility = ArtefactVisibility.TREE_UNLOCKABLE
-            action_verb = "Uncollapsing"
-        elif tag_name == "pin_file":
-            target_visibility = ArtefactVisibility.PINNED
-            action_verb = "Pinning"
-        elif tag_name == "unpin_file":
-            target_visibility = ArtefactVisibility.FULL
-            action_verb = "Unpinning"
-
-        clean_body = body
-        if "<" in body and ">" in body:
-            xml_bodies = re.findall(r'<[^>]+>(.*?)</[^>]+>', body, re.DOTALL)
-            if xml_bodies:
-                clean_body = "\n".join(xml_bodies)
-
-        all_arts = self._artefact_manager._get_all_raw()
-
-        raw_targets = re.split(r'[\n,;]+', clean_body)
-        targets = [t.strip().replace("\\", "/") for t in raw_targets if t.strip()]
-
-        targets = self._register_unindexed_workspace_files(targets, all_arts)
-        all_arts = self._artefact_manager._get_all_raw()
-
-        expanded_targets = []
-        all_arts_titles = [a.get("title", "") for a in all_arts if not a.get("title", "").endswith("::images")]
-        for target in targets:
-            target_lower = target.lower()
-            if "all files" in target_lower or "all" == target_lower:
-                exceptions = []
-                if "except" in target_lower:
-                    exceptions_part = target_lower.split("except", 1)[1]
-                    exceptions = [e.strip().replace("\\", "/") for e in re.split(r'[\n,;]+', exceptions_part) if e.strip()]
-                for title in all_arts_titles:
-                    if not any(ex.lower() in title.lower() for ex in exceptions):
-                        expanded_targets.append(title)
-            else:
-                expanded_targets.append(target)
-
-        targets = expanded_targets
-
-        processed_files = []
-        already_in_state = []
-        not_found = []
-        blocked_files = []
-        loaded_contents = {}
-
-        max_ctx = 0
-        if self.lollms_client and hasattr(self.lollms_client, 'get_ctx_size'):
-            try:
-                max_ctx = self.lollms_client.get_ctx_size() or 0
-            except Exception:
-                max_ctx = 0
-
-        if max_ctx > 0:
-            _MAX_UNLOCK_TOKENS = int(max_ctx * 0.95)
-        else:
-            _MAX_UNLOCK_TOKENS = 50000
-
-        _BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".zip", ".tar", ".gz", ".pdf", ".docx", ".pptx", ".mp3", ".wav", ".mp4"}
-
-        def _norm_path(p: str) -> str:
-            p = p.replace("\\", "/").strip()
-            if p.startswith("./"):
-                p = p[2:]
-            if p.startswith("workspace/"):
-                p = p[len("workspace/"):]
-            if p.startswith("data_workspace/"):
-                p = p[len("data_workspace/"):]
-            return p.lower()
-
-        all_arts_titles_normalized = {
-            _norm_path(a.get("title", "")): a.get("title", "")
-            for a in all_arts
-            if not a.get("title", "").endswith("::images")
-        }
-
-        def _resolve_target_to_artifact(target_str: str) -> Optional[Dict]:
-            target_norm = _norm_path(target_str)
-            art = next((a for a in all_arts if _norm_path(a.get("title", "")) == target_norm), None)
-            if art:
-                return art
-            art = next((a for a in all_arts if _norm_path(a.get("physical_path", "")) == target_norm), None)
-            if art:
-                return art
-            if target_norm in all_arts_titles_normalized:
-                original_title = all_arts_titles_normalized[target_norm]
-                return next((a for a in all_arts if a.get("title") == original_title), None)
-            from lollms_client.lollms_artefact.lollms_artefact import _find_best_title_match
-            best_match = _find_best_title_match(target_str, list(all_arts_titles_normalized.values()), threshold=0.60)
-            if best_match:
-                return next((a for a in all_arts if a.get("title") == best_match), None)
-            return None
-
-        for t_target in targets:
-            if tag_name in ("collapse_folder", "uncollapse_folder"):
-                import sqlite3 as _sqlite3
-
-                folder_path_normalized = t_target.strip().replace("\\", "/").rstrip("/")
-                if not folder_path_normalized:
-                    continue
-
-                try:
-                    conn = _sqlite3.connect(str(self._state_db_path))
-                    cursor = conn.cursor()
-                    if tag_name == "collapse_folder":
-                        cursor.execute("INSERT OR REPLACE INTO collapsed_folders (path) VALUES (?)", (folder_path_normalized,))
-                        action_verb = "Collapsing"
-                    else:
-                        cursor.execute("DELETE FROM collapsed_folders WHERE path = ?", (folder_path_normalized,))
-                        action_verb = "Uncollapsing"
-                    conn.commit()
-                    conn.close()
-
-                    processed_files.append(folder_path_normalized)
-                    object.__setattr__(self, '_last_ws_sync_time', 0.0)
-                    continue
-                except Exception as db_err:
-                    ASCIIColors.warning(f"[{self.name}] Failed to update collapsed_folders DB: {db_err}")
-                    continue
-
-            is_folder_target = t_target.endswith("/")
-            folder_prefix = t_target.rstrip('/') + '/'
-            matched_arts = [a for a in all_arts if a.get("physical_path", "").replace("\\", "/").startswith(folder_prefix)]
-
-            if not is_folder_target and matched_arts:
-                for art in matched_arts:
-                    if art.get("visibility") == target_visibility:
-                        already_in_state.append(art["title"])
-                    else:
-                        art["visibility"] = target_visibility
-                        if target_visibility == ArtefactVisibility.FULL:
-                            art["active"] = True
-                        else:
-                            art["active"] = False
-                            art["content"] = ""
-                        processed_files.append(art["title"])
-                continue
-
-            art = _resolve_target_to_artifact(t_target)
-
-            if not art and self._resolved_workspace:
-                disk_path = self._resolved_workspace / t_target
-                if disk_path.is_file():
-                    try:
-                        imported = self._artefact_manager.import_file(file_path=disk_path, title=t_target, active=False)
-                        if imported:
-                            refreshed_arts = self._artefact_manager._get_all_raw()
-                            for refreshed in refreshed_arts:
-                                existing = next((a for a in all_arts if a.get("id") == refreshed.get("id")), None)
-                                if existing is None:
-                                    all_arts.append(refreshed)
-                            art = _resolve_target_to_artifact(t_target)
-                    except Exception as import_err:
-                        ASCIIColors.warning(f"[{self.name}] On-demand import failed for '{t_target}': {import_err}")
-
-            if not art:
-                not_found.append(t_target)
-                if getattr(self, 'debug_mode', False):
-                    ASCIIColors.warning(f"[ContextUnlock] File not found in index or disk: {t_target}")
-                    ASCIIColors.warning(f"[ContextUnlock] Indexed titles sample: {all_arts_titles[:5]}")
-                continue
-            elif art.get("visibility") == target_visibility:
-                already_in_state.append(t_target)
-            elif target_visibility == ArtefactVisibility.FULL:
-                if art.get("visibility") == ArtefactVisibility.FULL:
-                    already_in_state.append(t_target)
-                    continue
-
-                file_path = self._resolved_workspace / art["title"]
-
-                token_count = 0
-                content = ""
-
-                if file_path.exists():
-                    try:
-                        if art.get("content") and art.get("content_source") == "db" and len(art["content"]) > 0:
-                            content = art["content"]
-                        else:
-                            import_art = self._artefact_manager.import_file(
-                                file_path=file_path,
-                                title=art["title"],
-                                active=False
-                            )
-                            content = import_art.get("content", "")
-                            art["content_source"] = "db"
-
-                            if art.get("type") == "data":
-                                content = self._artefact_manager._get_lam_content(import_art).strip()
-
-                        token_count = len(content) // 4
-                    except Exception as read_err:
-                        ASCIIColors.warning(f"[ContextUnlock] Failed to read {art['title']}: {read_err}")
-                        blocked_files.append((art["title"], 0))
-                        continue
-                else:
-                    not_found.append(t_target)
-                    continue
-
-                if token_count > _MAX_UNLOCK_TOKENS:
-                    ASCIIColors.warning(
-                        f"[ContextBudgetGuard] Blocked unlock of '{art['title']}': "
-                        f"~{token_count:,} tokens exceeds limit of {_MAX_UNLOCK_TOKENS:,}."
-                    )
-                    blocked_files.append((art["title"], token_count))
-                else:
-                    art["content"] = content
-                    art["token_count"] = token_count
-                    art["content_source"] = "db"
-                    art["visibility"] = ArtefactVisibility.FULL
-                    art["active"] = True
-                    processed_files.append(art["title"])
-                    if content:
-                        loaded_contents[art["title"]] = content
-
-                    try:
-                        if hasattr(self, '_state_db_path'):
-                            import sqlite3 as _sqlite3
-                            import hashlib as _hashlib
-                            file_hash = _hashlib.md5(content.encode('utf-8', errors='ignore')).hexdigest()
-                            conn = _sqlite3.connect(str(self._state_db_path))
-                            cursor = conn.cursor()
-                            cursor.execute(
-                                "UPDATE file_states SET hash = ? WHERE title = ?",
-                                (file_hash, art["title"])
-                            )
-                            conn.commit()
-                            conn.close()
-                    except Exception:
-                        pass
-            else:
-                art["visibility"] = target_visibility
-                art["active"] = False
-                art["content"] = ""
-                processed_files.append(art["title"])
-
-        if processed_files or already_in_state:
-            self._artefact_manager._save_all(all_arts)
-            object.__setattr__(self, '_last_ws_sync_time', 0.0)
-
-        try:
-            if hasattr(self, '_state_db_path') and hasattr(self, '_artefact_manager'):
-                import sqlite3 as _sqlite3
-                conn = _sqlite3.connect(str(self._state_db_path))
-                cursor = conn.cursor()
-                for t_file in processed_files + already_in_state:
-                    cursor.execute(
-                        "INSERT OR REPLACE INTO file_states (title, visibility) VALUES (?, ?)",
-                        (t_file, target_visibility)
-                    )
-                conn.commit()
-                conn.close()
-
-            if target_visibility in (ArtefactVisibility.TREE_LOCKED, ArtefactVisibility.HIDDEN):
-                current_arts = self._artefact_manager._get_all_raw()
-                for art in current_arts:
-                    if art.get("title") in processed_files:
-                        art["content"] = ""
-                        art["active"] = False
-                        art["visibility"] = target_visibility
-                self._artefact_manager._save_all(current_arts)
-
-        except Exception as commit_err:
-            ASCIIColors.warning(f"[LollmsPersonality] Failed to persist visibility state: {commit_err}")
-
-        status_parts = []
-        if processed_files:
-            status_parts.append(f"✅ {action_verb}: {', '.join(processed_files)}")
-        if already_in_state:
-            status_parts.append(f"⚠️ Already in target state: {', '.join(already_in_state)}")
-        if not_found:
-            status_parts.append(f"❌ Not found: {', '.join(not_found)}")
-        if blocked_files:
-            blocked_desc = "; ".join(
-                f"{bf} (~{tc:,} tokens)" if tc > 0 else f"{bf} (Binary/Read Error)" for bf, tc in blocked_files
-            )
-            status_parts.append(
-                f"🛑 BLOCKED: {blocked_desc}. "
-                f"Use a tool (SQL query, grep, or Python script) to extract "
-                f"specific data from this file instead of loading it fully."
-            )
-
-        active_files_list = []
-        pinned_files_list = []
-        if hasattr(self, '_artefact_manager') and self._artefact_manager:
-            current_arts = self._artefact_manager._get_all_raw()
-            for a in current_arts:
-                title = a.get("title", "")
-                if title.endswith("::images"):
-                    continue
-                vis = a.get("visibility")
-                if vis == ArtefactVisibility.PINNED:
-                    pinned_files_list.append(title)
-                elif vis == ArtefactVisibility.FULL:
-                    active_files_list.append(title)
-
-        if pinned_files_list:
-            status_parts.append("\n📌 Pinned in Context (Sticky):")
-            for f_name in sorted(pinned_files_list):
-                status_parts.append(f"  - {f_name}")
-        if active_files_list:
-            status_parts.append("\n📂 Loaded in Context [C]:")
-            for f_name in sorted(active_files_list):
-                status_parts.append(f"  - {f_name}")
-        if not active_files_list and not pinned_files_list:
-            status_parts.append("\n📂 No files are currently loaded in context.")
-
-        status_meta = "failure" if (not_found or blocked_files) else "success"
-
-        if processed_files or already_in_state:
-            object.__setattr__(self, '_last_ws_sync_time', 0.0)
-
-        error_str = None
-        if status_meta == "failure":
-            error_str = "\n".join([p for p in status_parts if "❌" in p or "🛑" in p])
-
-        status_str = f"{action_verb} context files...\nContext Update:\n{'; '.join(status_parts)}\nstatus:{status_meta}"
-        return {
-            "status_str": status_str,
-            "processed_files": processed_files,
-            "already_in_state": already_in_state,
-            "not_found": not_found,
-            "blocked_files": blocked_files,
-            "error": error_str,
-            "loaded_contents": loaded_contents
-        }
+        return _core_execute_context_visibility(
+            tag_name=tag_name,
+            body=body,
+            artefact_manager=getattr(self, '_artefact_manager', None),
+            workspace_dir=self._resolved_workspace,
+            client=self.lollms_client,
+            state_db_path=getattr(self, '_state_db_path', None)
+        )
         
           
         
     def _inject_tool_images_for_vlm(self, tool_result: Dict[str, Any]) -> List[Dict[str, str]]:
-        """
-        Extracts base64 images from a tool result and formats them as OpenAI-compatible
-        image_url content blocks for VLM-capable LLMs. Returns an empty list if the
-        client does not support vision or if no images are present.
-        """
-        if not self.lollms_client:
-            return []
-
-        vision_capable = False
-        try:
-            if hasattr(self.lollms_client, 'llm') and hasattr(self.lollms_client.llm, 'supports_vision'):
-                vision_capable = bool(self.lollms_client.llm.supports_vision)
-            elif hasattr(self.lollms_client, 'supports_vision'):
-                vision_capable = bool(self.lollms_client.supports_vision)
-        except Exception:
-            pass
-
-        if not vision_capable:
-            return []
-
-        raw_images = tool_result.get("images") or tool_result.get("image_b64") or []
-        if isinstance(raw_images, str):
-            raw_images = [raw_images]
-        if not raw_images or not isinstance(raw_images, list):
-            return []
-
-        media_types = tool_result.get("image_media_types") or []
-        content_blocks: List[Dict[str, str]] = []
-
-        for idx, img_b64 in enumerate(raw_images):
-            if not isinstance(img_b64, str) or not img_b64.strip():
-                continue
-            mtype = media_types[idx] if idx < len(media_types) else "image/png"
-            if ";" in img_b64 and "base64," in img_b64:
-                url = img_b64
-            else:
-                url = f"data:{mtype};base64,{img_b64}"
-            content_blocks.append({
-                "type": "image_url",
-                "image_url": {"url": url}
-            })
-
-        return content_blocks
+        return _inject_tool_images_for_vlm_core(tool_result, self.lollms_client)
 
     def _execute_tool(self, tool_name: str, tool_params: Dict[str, Any], active_tools: Dict) -> Dict[str, Any]:
-        old_cwd = os.getcwd()
-        if self._resolved_workspace:
-            ws_dir = self._resolved_workspace
-        else:
-            ws_dir = Path(".")
-        ws_dir.mkdir(parents=True, exist_ok=True)
-        ws_dir_str = str(ws_dir.resolve())
-
-        try:
-            os.chdir(ws_dir_str)
-
-            if "arguments" in tool_params and isinstance(tool_params["arguments"], dict):
-                extracted_args = tool_params.pop("arguments")
-                extracted_args.update(tool_params)
-                tool_params = extracted_args
-
-            if tool_name == "tool_execute_shell_command":
-                git_block_msg = self._enforce_git_branch_safety(str(tool_params.get("command", "")))
-                if git_block_msg:
-                    return {"success": False, "error": git_block_msg, "output": git_block_msg}
-
-            sanitized_params = {}
-            for key, value in tool_params.items():
-                if isinstance(value, str):
-                    sanitized_value = value
-                    for prefix in ["workspace/", "data_workspace/", "./workspace/", "./data_workspace/"]:
-                        if sanitized_value.lower().startswith(prefix):
-                            sanitized_value = sanitized_value[len(prefix):]
-                            break
-                    sanitized_params[key] = sanitized_value
-                else:
-                    sanitized_params[key] = value
-
-            lcp_binding = getattr(self.lollms_client, 'tools', None)
-            tool_def = active_tools.get(tool_name, {})
-
-            if "callable" in tool_def:
-                call_kwargs = dict(sanitized_params)
-                _tool_sig = inspect.signature(tool_def["callable"]).parameters
-                if "discussion_instance" in _tool_sig:
-                    call_kwargs["discussion_instance"] = getattr(self, '_artefact_proxy', None)
-                if "lollms_client_instance" in _tool_sig:
-                    call_kwargs["lollms_client_instance"] = self.lollms_client
-
-                try:
-                    result = tool_def["callable"](**call_kwargs)
-                    if isinstance(result, dict):
-                        if result.get("success") is False and not result.get("error"):
-                            raw_preview = ""
-                            for k, v in result.items():
-                                if k not in ("error", "traceback", "success"):
-                                    raw_preview += f"  {k}: {str(v)[:200]}\n"
-                            result["error"] = (
-                                f"Tool '{tool_name}' returned success=False with no error message. "
-                                f"Raw keys: {list(result.keys())}.\n"
-                                f"Raw content:\n{raw_preview}"
-                                if raw_preview else
-                                f"Tool '{tool_name}' returned success=False with no error message. "
-                                f"Raw keys: {list(result.keys())}."
-                            )
-                            ASCIIColors.error(f"[{self.name}] Tool '{tool_name}' returned bare success=False. Synthesized error: {result['error']}")
-                        return result
-                    if result is None:
-                        return {"success": False, "error": f"Tool '{tool_name}' returned None."}
-                    return {"success": True, "output": str(result)}
-                except Exception as exec_err:
-                    trace_exception(exec_err)
-                    return {"success": False, "error": f"Tool '{tool_name}' crashed: {exec_err}", "traceback": traceback.format_exc()}
-
-            elif lcp_binding and hasattr(lcp_binding, 'execute_tool'):
-                try:
-                    result = lcp_binding.execute_tool(
-                        tool_name,
-                        sanitized_params,
-                        discussion_instance=getattr(self, '_artefact_proxy', None),
-                        lollms_client_instance=self.lollms_client
-                    )
-                    if isinstance(result, dict):
-                        inner = result.get("output")
-                        if isinstance(inner, dict):
-                            if inner.get("success") is False:
-                                if not inner.get("error"):
-                                    raw_preview = ""
-                                    for k, v in inner.items():
-                                        if k not in ("error", "traceback", "success"):
-                                            raw_preview += f"  {k}: {str(v)[:300]}\n"
-                                    inner["error"] = (
-                                        f"LCP tool '{tool_name}' returned success=False without a descriptive error. "
-                                        f"Raw keys: {list(inner.keys())}.\n"
-                                        f"Raw content:\n{raw_preview}"
-                                        if raw_preview else
-                                        f"LCP tool '{tool_name}' returned success=False without a descriptive error. "
-                                        f"Raw keys: {list(inner.keys())}."
-                                    )
-                                    ASCIIColors.error(f"[{self.name}] LCP Tool '{tool_name}' returned bare success=False. Synthesized error: {inner['error']}")
-                                return inner
-                            if "error" in inner and not inner.get("success", True):
-                                return inner
-                            return inner if "output" in inner else {"success": True, "output": inner}
-
-                        if result.get("success") is False or result.get("status_code", 200) not in (200, 201):
-                            err_msg = result.get("error")
-                            if not err_msg and isinstance(inner, str) and inner.strip():
-                                err_msg = inner
-                            if not err_msg:
-                                err_msg = f"LCP tool '{tool_name}' returned status_code {result.get('status_code', 'N/A')} with no error message."
-                            if result.get("traceback"):
-                                err_msg = f"{err_msg}\n\nTraceback:\n{result.get('traceback')}"
-                            return {
-                                "success": False,
-                                "error": err_msg,
-                                "traceback": result.get("traceback"),
-                            }
-                        if inner is not None:
-                            return {"success": True, "output": inner}
-                        if "error" in result:
-                            err_msg = result["error"]
-                            if result.get("traceback"):
-                                err_msg = f"{err_msg}\n\nTraceback:\n{result.get('traceback')}"
-                            return {"success": False, "error": err_msg, "traceback": result.get("traceback")}
-                        return {"success": True, "output": str(result)}
-                    if result is None:
-                        return {"success": False, "error": f"LCP tool '{tool_name}' returned None (no output). This may indicate a crash in the tool's initialization or execution."}
-                    return {"success": True, "output": str(result)}
-                except Exception as lcp_err:
-                    trace_exception(lcp_err)
-                    return {"success": False, "error": f"LCP tool '{tool_name}' crashed: {lcp_err}", "traceback": traceback.format_exc()}
-
-            else:
-                return {"success": False, "error": f"Tool '{tool_name}' has no callable and no LCP binding available.", "status_code": 404}
-
-        finally:
-            os.chdir(old_cwd)
+        ws_dir = self._resolved_workspace or Path(".")
+        return _core_execute_tool_call(
+            tool_name=tool_name,
+            tool_params=tool_params,
+            active_tools=active_tools,
+            workspace_dir=ws_dir,
+            lollms_client=self.lollms_client,
+            discussion_instance=getattr(self, '_artefact_proxy', None)
+        )
 
     def chat(
         self,
@@ -4843,11 +4269,37 @@ JSON:"""
         enable_web_tools: bool = False,
         auto_load_document_editor: bool = True,
         enforce_end_tag: bool = False,
+        orchestrator_mode: bool = False,
+        event_mode: EventMode = EventMode.PROCESSING_TAG_MODE,
         **kwargs
     ) -> Dict[str, Any]:
         resolved_max_rounds = max_nb_rounds if max_nb_rounds is not None else max_reasoning_steps
         if resolved_max_rounds is None:
             resolved_max_rounds = 20
+
+        if orchestrator_mode:
+            from lollms_client.lollms_agentic.runner import AgenticRunner
+            auto_load_doc_editor_flag = kwargs.get("auto_load_document_editor", True)
+            enable_data_tools_flag = kwargs.get("enable_data_tools", True)
+            active_tools = self._discover_tools(
+                tools,
+                tool_files or [],
+                enable_data_tools=enable_data_tools_flag,
+                enable_workspace_tools=enable_workspace_tools,
+                enable_shell=enable_shell,
+                enable_python_exec=enable_python_exec,
+                enable_web_tools=enable_web_tools,
+                auto_load_document_editor=auto_load_doc_editor_flag,
+            )
+            runner = AgenticRunner(
+                context=self,
+                tools_registry=active_tools,
+                callback=streaming_callback,
+                event_mode=event_mode,
+                max_orchestrator_rounds=resolved_max_rounds,
+                max_worker_rounds=max(2, resolved_max_rounds // 2),
+            )
+            return runner.run(user_message=prompt)
 
         if lollms_client is not None:
             self.lollms_client = lollms_client
@@ -6898,12 +6350,17 @@ JSON:"""
         if self.lollms_client:
             _has_tti = getattr(self.lollms_client, 'tti', None) is not None or bool(getattr(self.lollms_client, 'tti_model_profiles_registry', None))
 
+        all_personality_artefacts = []
+        if hasattr(self, '_artefact_manager') and self._artefact_manager:
+            all_personality_artefacts = self._artefact_manager.list(active_only=True)
+
         return {
            "response": final_response,
            "tool_calls": tool_calls_this_turn,
            "tool_results": tool_results_this_turn,
            "rounds": round_count,
            "workspace_changes": workspace_changes,
+           "artefacts": all_personality_artefacts,
            "was_cancelled": was_cancelled,
            "context_health": context_health,
            "tti_available": _has_tti
@@ -6981,3 +6438,5 @@ def _is_tool_binding(obj: Any) -> bool:
         and hasattr(obj, "execute_tool")
         and hasattr(obj, "to_chat_tool_specs")
     )
+
+is_tool_binding = _is_tool_binding

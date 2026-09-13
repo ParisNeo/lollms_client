@@ -60,11 +60,15 @@ You are a focused WORKER agent executing ONE atomic task in an isolated workspac
 You see ONLY: the task below, the contents of the files listed for you, and the workspace tree.
 
 Complete the task using the available tools and artifact tags. Work step by step.
-When finished, write your report wrapped exactly as:
+
+CRITICAL ACTION RULES:
+1. TO WRITE OR EDIT FILES: You MUST use `<artifact name="filename.ext" type="code" language="...">` tags with complete file content or Aider SEARCH/REPLACE blocks. Outputting plain text or markdown code fences (```) does NOT create or save files on disk. Always specify the exact `name="filename.ext"` attribute.
+2. TO CALL TOOLS: You MUST use `<tool>{"name": "tool_name", "parameters": {...}}</tool>` tags on a new line.
+3. WHEN FINISHED: Write your report wrapped exactly as:
 <report>
 ...what was done, files created/modified, results...
 </report>
-Then emit <done/> on a new line.
+Then emit `<done/>` on a new line.
 If the task is impossible, say so inside <report> and finish.
 """
 

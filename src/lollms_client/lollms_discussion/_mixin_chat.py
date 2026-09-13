@@ -28,38 +28,24 @@ from lollms_client.lollms_types import MSG_TYPE, EventMode
 from ._message import LollmsMessage
 from lollms_client.lollms_artefact import ArtefactType, make_image_id, ArtefactVisibility, ArtefactStatus
 from lollms_client.lollms_memory import FailureMemory
-from lollms_client.lollms_personality.lollms_personality import _is_tool_binding
+from lollms_client.lollms_chat_core import _is_tool_binding
 from lollms_client.lollms_artefact import ArtefactVisibility, ArtefactType
 from ._context_sanitizer import scrub_processing_and_status_blocks
 
 _MAX_BRACKET_BUF = 256
 
-_HOST_ROOT_RE = re.compile(
-    r'(?:[A-Za-z]:\\(?:Users|home|Documents|Program Files|Windows)[\\/][^\s"\'<>|]*'
-    r'|/(?:home|Users|root|var|opt|usr/local)/[^\s"\'<>|]*'
-    r'|(?:[A-Za-z]:)?\.[\\/][^\s"\']*\.versions[\\/][^\s"\'<>|]*)'
+from lollms_client.lollms_chat_core import (
+    sanitize_unicode as _sanitize_unicode,
+    sanitize_host_paths as _sanitize_host_paths,
+    is_large_base64 as _is_large_base64,
+    repair_llm_json as _repair_llm_json,
+    calculate_dynamic_tool_char_limit as _calculate_dynamic_tool_char_limit,
+    sanitize_tool_result as _sanitize_tool_result,
+    build_windowed_output_preview as _build_windowed_output_preview,
+    detect_structural_symbols as _detect_structural_symbols,
+    extract_artefact_meta as _extract_artefact_meta,
+    dump_error as _core_dump_error,
 )
-_USER_PREFIX_RE = re.compile(
-    r'(?:[A-Za-z]:\\)?(?:Users|home)[\\/][^\s"\'<>|]*?[\\/]'
-)
-
-
-def _sanitize_host_paths(text: str) -> str:
-    """
-    Strips absolute host filesystem paths from text destined for the LLM context
-    or the user-facing stream. Preserves sandbox opacity: the model must never
-    learn the orchestrator's physical location (user folders, install dirs,
-    versioned storage roots).
-    """
-    if not text:
-        return text
-    try:
-        cleaned = _HOST_ROOT_RE.sub("<host-path>", text)
-        cleaned = _USER_PREFIX_RE.sub("<host>/", cleaned)
-        cleaned = cleaned.replace("\\\\?\\", "")
-        return cleaned
-    except Exception:
-        return text
 
 _HEARTBEAT_MESSAGES = [
     "✍️ Writing content...",
@@ -253,338 +239,7 @@ def _scrub_for_llm_context(text: str) -> str:
     cleaned = re.sub(r'<artefact_image[^/]*/>', '', cleaned, flags=re.IGNORECASE)
     return cleaned.strip()
 
-def _detect_structural_symbols(buffer: str, language: Optional[str] = None, art_type: str = "code") -> List[Dict[str, Any]]:
-    """
-    Parses an artifact buffer and extracts all detected structural symbols:
-    - Markdown: headings (# H1, ## H2, ### H3, #### H4)
-    - Python: classes, methods (self/cls), functions, async functions, decorators
-    - JS/TS: classes, interfaces, types, enums, functions, arrow functions, React components/hooks
-    - Rust: structs, enums, traits, impls, functions (fn)
-    - Go: structs, interfaces, functions (func), methods
-    - C/C++/C#/Java: classes, structs, interfaces, methods, functions
-    - HTML: major semantic elements (<section>, <article>, <main>, <nav>, <header>, <footer>, <form>, <table>)
-    - CSS: rule selectors (.class, #id, @media, @keyframes)
-    - SQL: statements (CREATE TABLE/VIEW, ALTER, SELECT, INSERT, etc.)
-    """
-    if not buffer:
-        return []
-
-    lines = buffer.splitlines()
-    symbols: List[Dict[str, Any]] = []
-    lang = (language or "").lower()
-    in_py_class: Optional[str] = None
-
-    for idx, line in enumerate(lines):
-        line_str = line.strip()
-        if not line_str:
-            continue
-        line_num = idx + 1
-
-        # ── 1. Markdown / Documentation Headings ──
-        if lang in ("markdown", "md") or art_type in ("document", "note", "skill", "scratchpad", "presentation") or not lang:
-            m = re.match(r'^(#{1,6})\s+(.+)$', line_str)
-            if m:
-                level = len(m.group(1))
-                h_type = "heading"
-                if level == 1:
-                    h_type = "major_section"
-                elif level == 2:
-                    h_type = "section"
-                elif level == 3:
-                    h_type = "subsection"
-                else:
-                    h_type = f"h{level}_heading"
-
-                name = m.group(2).strip()
-                symbols.append({
-                    "symbol_type": h_type,
-                    "symbol_name": name,
-                    "level": level,
-                    "line": line_num,
-                    "detail": f"{h_type.replace('_', ' ').capitalize()}: {name}",
-                    "signature": line_str
-                })
-                continue
-
-        # ── 2. Python Constructs ──
-        if lang == "python" or art_type in ("code", "tool"):
-            m_class = re.match(r'^class\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*\((.*?)\))?\s*:', line_str)
-            if m_class:
-                c_name = m_class.group(1)
-                bases = m_class.group(2) or ""
-                in_py_class = c_name
-                symbols.append({
-                    "symbol_type": "class",
-                    "symbol_name": c_name,
-                    "line": line_num,
-                    "detail": f"Class {c_name}" + (f"({bases})" if bases else ""),
-                    "signature": line_str.rstrip(":")
-                })
-                continue
-
-            m_func = re.match(r'^(?:async\s+)?def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.*?)\)', line_str)
-            if m_func:
-                f_name = m_func.group(1)
-                args = m_func.group(2)
-                is_async = line_str.startswith("async ")
-                indent = len(line) - len(line.lstrip())
-                is_method = bool(indent > 0 and in_py_class) or "self" in args or "cls" in args
-
-                if is_method:
-                    sym_type = "async_method" if is_async else "method"
-                    parent_ctx = f" in {in_py_class}" if in_py_class else ""
-                    detail = f"{'Async Method' if is_async else 'Method'} {f_name}{parent_ctx}"
-                else:
-                    in_py_class = None
-                    sym_type = "async_function" if is_async else "function"
-                    detail = f"{'Async Function' if is_async else 'Function'} {f_name}"
-
-                symbols.append({
-                    "symbol_type": sym_type,
-                    "symbol_name": f_name,
-                    "parent_class": in_py_class if is_method else None,
-                    "line": line_num,
-                    "detail": detail,
-                    "signature": f"{'async ' if is_async else ''}def {f_name}({args})"
-                })
-                continue
-
-        # ── 3. JavaScript / TypeScript / JSX / TSX ──
-        if lang in ("javascript", "js", "typescript", "ts", "jsx", "tsx"):
-            m_ts = re.match(r'^(?:export\s+)?(interface|type|enum)\s+([a-zA-Z_][a-zA-Z0-9_]*)', line_str)
-            if m_ts:
-                kind = m_ts.group(1)
-                name = m_ts.group(2)
-                symbols.append({
-                    "symbol_type": kind,
-                    "symbol_name": name,
-                    "line": line_num,
-                    "detail": f"{kind.capitalize()} {name}",
-                    "signature": line_str
-                })
-                continue
-
-            m_class = re.match(r'^(?:export\s+)?(?:default\s+)?class\s+([a-zA-Z_][a-zA-Z0-9_]*)', line_str)
-            if m_class:
-                c_name = m_class.group(1)
-                symbols.append({
-                    "symbol_type": "class",
-                    "symbol_name": c_name,
-                    "line": line_num,
-                    "detail": f"Class {c_name}",
-                    "signature": line_str
-                })
-                continue
-
-            m_func = re.match(r'^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', line_str)
-            if m_func:
-                f_name = m_func.group(1)
-                is_async = "async " in line_str
-                symbols.append({
-                    "symbol_type": "async_function" if is_async else "function",
-                    "symbol_name": f_name,
-                    "line": line_num,
-                    "detail": f"{'Async Function' if is_async else 'Function'} {f_name}",
-                    "signature": line_str
-                })
-                continue
-
-            m_arrow = re.match(r'^(?:export\s+)?(?:const|let|var)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[a-zA-Z_][a-zA-Z0-9_]*)\s*=>', line_str)
-            if m_arrow:
-                f_name = m_arrow.group(1)
-                is_hook = f_name.startswith("use") and len(f_name) > 3 and f_name[3].isupper()
-                is_component = f_name[0].isupper()
-                sym_type = "react_hook" if is_hook else ("react_component" if is_component else "arrow_function")
-                detail = f"Hook {f_name}" if is_hook else (f"Component <{f_name} />" if is_component else f"Function {f_name}")
-                symbols.append({
-                    "symbol_type": sym_type,
-                    "symbol_name": f_name,
-                    "line": line_num,
-                    "detail": detail,
-                    "signature": line_str
-                })
-                continue
-
-        # ── 4. Rust ──
-        if lang in ("rust", "rs"):
-            m_rust = re.match(r'^(?:pub\s+)?(struct|enum|trait|union|type)\s+([a-zA-Z_][a-zA-Z0-9_]*)', line_str)
-            if m_rust:
-                kind, name = m_rust.group(1), m_rust.group(2)
-                symbols.append({
-                    "symbol_type": kind,
-                    "symbol_name": name,
-                    "line": line_num,
-                    "detail": f"Rust {kind.capitalize()} {name}",
-                    "signature": line_str
-                })
-                continue
-
-            m_impl = re.match(r'^impl(?:\s*<[^>]*>)?\s+(?:([a-zA-Z_][a-zA-Z0-9_]*)\s+for\s+)?([a-zA-Z_][a-zA-Z0-9_]*)', line_str)
-            if m_impl:
-                trait_name, target = m_impl.group(1), m_impl.group(2)
-                desc = f"Impl {trait_name} for {target}" if trait_name else f"Impl {target}"
-                symbols.append({
-                    "symbol_type": "impl",
-                    "symbol_name": target,
-                    "line": line_num,
-                    "detail": desc,
-                    "signature": line_str
-                })
-                continue
-
-            m_fn = re.match(r'^(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+([a-zA-Z_][a-zA-Z0-9_]*)', line_str)
-            if m_fn:
-                f_name = m_fn.group(1)
-                symbols.append({
-                    "symbol_type": "function",
-                    "symbol_name": f_name,
-                    "line": line_num,
-                    "detail": f"Function fn {f_name}()",
-                    "signature": line_str
-                })
-                continue
-
-        # ── 5. Go ──
-        if lang in ("go", "golang"):
-            m_go_type = re.match(r'^type\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+(struct|interface)', line_str)
-            if m_go_type:
-                name, kind = m_go_type.group(1), m_go_type.group(2)
-                symbols.append({
-                    "symbol_type": kind,
-                    "symbol_name": name,
-                    "line": line_num,
-                    "detail": f"Go {kind.capitalize()} {name}",
-                    "signature": line_str
-                })
-                continue
-
-            m_go_func = re.match(r'^func\s+(?:\((?:[^)]+)\)\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', line_str)
-            if m_go_func:
-                f_name = m_go_func.group(1)
-                symbols.append({
-                    "symbol_type": "function",
-                    "symbol_name": f_name,
-                    "line": line_num,
-                    "detail": f"Go Func {f_name}()",
-                    "signature": line_str
-                })
-                continue
-
-        # ── 6. C / C++ / C# / Java ──
-        if lang in ("c", "cpp", "c++", "csharp", "cs", "java"):
-            m_oop = re.match(r'^(?:public|private|protected|internal|static|abstract|sealed|final|\s)*\s*(class|struct|interface|enum)\s+([a-zA-Z_][a-zA-Z0-9_]*)', line_str)
-            if m_oop:
-                kind, name = m_oop.group(1), m_oop.group(2)
-                symbols.append({
-                    "symbol_type": kind,
-                    "symbol_name": name,
-                    "line": line_num,
-                    "detail": f"{kind.capitalize()} {name}",
-                    "signature": line_str
-                })
-                continue
-
-        # ── 7. HTML ──
-        if lang == "html":
-            m_html = re.match(r'<(\w+)(?:\s+[^>]*)?(?:id|class)=["\']([^"\']*)["\']', line_str, re.IGNORECASE)
-            if m_html and m_html.group(1).lower() in ("section", "article", "main", "nav", "header", "footer", "form", "table", "dialog", "aside"):
-                tag, id_or_cls = m_html.group(1), m_html.group(2)
-                symbols.append({
-                    "symbol_type": "html_element",
-                    "symbol_name": f"<{tag} {id_or_cls}>",
-                    "line": line_num,
-                    "detail": f"HTML <{tag}> ({id_or_cls})",
-                    "signature": line_str
-                })
-                continue
-
-        # ── 8. CSS / SCSS ──
-        if lang in ("css", "scss", "sass", "less"):
-            m_css = re.match(r'^([.#@][a-zA-Z0-9_\-:\s,>+~]+)\s*\{', line_str)
-            if m_css:
-                sel = m_css.group(1).strip()
-                symbols.append({
-                    "symbol_type": "css_selector",
-                    "symbol_name": sel,
-                    "line": line_num,
-                    "detail": f"CSS {sel}",
-                    "signature": line_str
-                })
-                continue
-
-        # ── 9. SQL ──
-        if lang == "sql":
-            m_sql = re.match(r'^(CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|VIEW|PROCEDURE|FUNCTION|INDEX)|ALTER\s+TABLE)\s+([a-zA-Z0-9_\."`]+)', line_str, re.IGNORECASE)
-            if m_sql:
-                stmt_type, target = m_sql.group(1).upper(), m_sql.group(2)
-                symbols.append({
-                    "symbol_type": "sql_statement",
-                    "symbol_name": f"{stmt_type} {target}",
-                    "line": line_num,
-                    "detail": f"SQL {stmt_type} {target}",
-                    "signature": line_str
-                })
-                continue
-
-    return symbols
-
-
-def _extract_artefact_meta(buffer: str, language: Optional[str] = None, art_type: str = "code") -> Dict[str, Any]:
-    """
-    Extracts rich structural metadata from an artifact buffer without embedding the full raw content.
-    """
-    if not buffer:
-        return {
-            "line_count": 0,
-            "size_chars": 0,
-            "estimated_tokens": 0,
-            "is_patch": False,
-            "current_section": None,
-            "sections": [],
-            "sections_count": 0,
-            "patch_stats": None,
-            "preview": ""
-        }
-
-    lines = buffer.splitlines()
-    line_count = len(lines)
-    size_chars = len(buffer)
-    estimated_tokens = size_chars // 4
-
-    is_patch = "<<<<<<< SEARCH" in buffer
-    patch_stats = None
-    if is_patch:
-        search_count = len(re.findall(r'^<{6,8}(?:\s*\w+)?\s*$', buffer, re.MULTILINE))
-        replace_count = len(re.findall(r'^={5,}\s*$', buffer, re.MULTILINE))
-        has_end_replace = bool(re.search(r'^>{6,8}(?:\s*\w+)?\s*$', buffer, re.MULTILINE))
-        patch_stats = {
-            "hunks_count": search_count,
-            "is_complete_hunk": search_count > 0 and search_count == replace_count and has_end_replace
-        }
-
-    detected_symbols = _detect_structural_symbols(buffer, language, art_type)
-    current_section = detected_symbols[-1]["detail"] if detected_symbols else None
-
-    # Map detected symbols to sections list for backward compatibility
-    sections = [
-        {"type": s["symbol_type"], "name": s["symbol_name"], "line": s["line"], "detail": s["detail"]}
-        for s in detected_symbols
-    ]
-    capped_sections = sections[-20:] if len(sections) > 20 else sections
-    preview = lines[-1].strip()[:120] if lines else ""
-
-    return {
-        "line_count": line_count,
-        "size_chars": size_chars,
-        "estimated_tokens": estimated_tokens,
-        "is_patch": is_patch,
-        "current_section": current_section,
-        "sections": capped_sections,
-        "sections_count": len(sections),
-        "patch_stats": patch_stats,
-        "preview": preview,
-    }
-
+# Structural symbol and metadata extraction delegated to lollms_chat_core
 
 class _ArtefactStreamTracker:
     """Tracks the state of an artifact being built, emitting events upon discovering new structural symbols."""
@@ -718,273 +373,7 @@ def _is_large_base64(v: str) -> bool:
     return bool(_BASE64_RE.match(sample[:1000]))
 
 
-def _repair_llm_json(raw_text: str) -> str:
-    """
-    Repairs common LLM JSON malformations so tool calls remain executable.
-
-    Primary failure mode: the LLM embeds multi-line payloads (SPARQL INSERT
-    DATA blocks, code, YAML) inside a JSON string value using literal
-    newlines. Strict JSON forbids raw control characters inside strings,
-    so json.loads fails with "Expecting ',' delimiter" or "Invalid control
-    character". This function walks the text with a lightweight state
-    machine and escapes literal \\n, \\r and \\t inside string literals only,
-    leaving structural whitespace between tokens untouched.
-    """
-    if not raw_text:
-        return raw_text
-
-    text = raw_text
-    for attempt_text in (raw_text, raw_text.replace("`", "")):
-        try:
-            json.loads(attempt_text)
-            return attempt_text
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-    repaired_chars: List[str] = []
-    in_string = False
-    i = 0
-    n = len(text)
-
-    while i < n:
-        ch = text[i]
-
-        if in_string:
-            if ch == "\\":
-                repaired_chars.append(ch)
-                if i + 1 < n:
-                    repaired_chars.append(text[i + 1])
-                i += 2
-                continue
-            if ch == '"':
-                in_string = False
-                repaired_chars.append(ch)
-                i += 1
-                continue
-            if ch == "\n":
-                repaired_chars.append("\\n")
-                i += 1
-                continue
-            if ch == "\r":
-                repaired_chars.append("\\r")
-                i += 1
-                continue
-            if ch == "\t":
-                repaired_chars.append("\\t")
-                i += 1
-                continue
-            if ord(ch) < 0x20:
-                i += 1
-                continue
-            repaired_chars.append(ch)
-            i += 1
-            continue
-
-        if ch == '"':
-            in_string = True
-            repaired_chars.append(ch)
-            i += 1
-            continue
-
-        repaired_chars.append(ch)
-        i += 1
-
-    repaired = "".join(repaired_chars)
-
-    try:
-        json.loads(repaired)
-        return repaired
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    try:
-        decoder = json.JSONDecoder()
-        decoder.raw_decode(repaired)
-        return repaired
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    try:
-        start = repaired.find("{")
-        if start != -1:
-            decoder = json.JSONDecoder()
-            obj, _ = decoder.raw_decode(repaired[start:])
-            return json.dumps(obj, ensure_ascii=False)
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    return repaired
-
-
-def _sanitize_tool_result(
-    tool_res: Any,
-    max_chars: Optional[int] = None,
-    client: Optional[Any] = None,
-) -> str:
-    if max_chars is None:
-        max_chars = _calculate_dynamic_tool_char_limit(client)
-
-    def _find_prompt_injection(obj: Any, depth: int = 0) -> Optional[str]:
-        if depth > 4:
-            return None
-        if isinstance(obj, dict):
-            pinj = obj.get("prompt_injection")
-            if isinstance(pinj, str) and pinj.strip():
-                return pinj.strip()
-            for v in obj.values():
-                hit = _find_prompt_injection(v, depth + 1)
-                if hit:
-                    return hit
-        elif isinstance(obj, list):
-            for v in obj:
-                hit = _find_prompt_injection(v, depth + 1)
-                if hit:
-                    return hit
-        return None
-
-    def _walk(obj: Any, depth: int = 0) -> Any:
-        if depth > 6:
-            return "[truncated: depth limit]"
-        if obj is None or isinstance(obj, (bool, int, float)):
-            return obj
-        if isinstance(obj, str):
-            if _is_large_base64(obj):
-                approx_kb = len(obj) * 3 / 4 / 1024
-                return f"[base64 blob stripped: {approx_kb:.1f}KB]"
-            if len(obj) > max_chars:
-                return obj[:max_chars] + f"\n... [truncated, {len(obj) - max_chars} more chars]"
-            return obj
-        if isinstance(obj, dict):
-            cleaned: Dict[str, Any] = {}
-            for k, v in obj.items():
-                if k in _BINARY_BLOB_KEYS:
-                    if isinstance(v, str) and v:
-                        approx_kb = len(v) * 3 / 4 / 1024
-                        cleaned[k] = f"[base64 blob stripped: {approx_kb:.1f}KB]"
-                    elif isinstance(v, (list, tuple)) and v:
-                        approx_kb = sum(len(x) for x in v if isinstance(x, str)) * 3 / 4 / 1024
-                        cleaned[k] = f"[list of {len(v)} base64 blobs stripped: {approx_kb:.1f}KB]"
-                    else:
-                        cleaned[k] = None
-                else:
-                    cleaned[k] = _walk(v, depth + 1)
-            return cleaned
-        if isinstance(obj, (list, tuple)):
-            walked = [_walk(v, depth + 1) for v in obj[:50]]
-            if len(obj) > 50:
-                walked.append(f"... [truncated, {len(obj) - 50} more items]")
-            return walked
-        return str(obj)
-
-    if isinstance(tool_res, str):
-        if len(tool_res) > max_chars:
-            return tool_res[:max_chars] + f"\n... [truncated, {len(tool_res) - max_chars} more chars]"
-        return tool_res
-
-    if isinstance(tool_res, dict):
-        inner_dict = tool_res.get("output") if isinstance(tool_res.get("output"), dict) else {}
-
-        # Comprehensive Failure Detection
-        is_fail = (
-            tool_res.get("success") is False
-            or (inner_dict and inner_dict.get("success") is False)
-            or tool_res.get("status_code", 200) not in (200, 201)
-            or (inner_dict and inner_dict.get("status_code", 200) not in (200, 201))
-            or bool(tool_res.get("error"))
-            or (inner_dict and bool(inner_dict.get("error")))
-            or (tool_res.get("return_code") is not None and tool_res.get("return_code") != 0)
-            or (inner_dict and inner_dict.get("return_code") is not None and inner_dict.get("return_code") != 0)
-        )
-
-        if is_fail:
-            error_parts = ["⚠️ **Tool Execution Failed**"]
-
-            error_msg = tool_res.get("error") or (inner_dict.get("error") if inner_dict else None)
-            if not error_msg:
-                error_msg = (
-                    f"Tool returned success=False but did not provide an error message. "
-                    f"Raw keys: {list(tool_res.keys()) if isinstance(tool_res, dict) else type(tool_res).__name__}. "
-                    f"This may indicate a library initialization failure or an import error."
-                )
-            error_parts.append(f"**Error Details:**\n{error_msg}")
-
-            stderr = tool_res.get("stderr") or (inner_dict.get("stderr") if inner_dict else None)
-            if stderr and str(stderr).strip():
-                error_parts.append(f"**Standard Error (stderr):**\n```\n{str(stderr).strip()}\n```")
-
-            out_val = tool_res.get("output")
-            if isinstance(out_val, dict):
-                inner_stdout = out_val.get("output") or out_val.get("stdout")
-                if inner_stdout and str(inner_stdout).strip() and str(inner_stdout).strip() != str(error_msg).strip():
-                    error_parts.append(f"**Output before failure:**\n{str(inner_stdout).strip()}")
-            elif out_val and str(out_val).strip() and str(out_val).strip() != str(error_msg).strip():
-                error_parts.append(f"**Output before failure:**\n{str(out_val).strip()}")
-
-            tb = tool_res.get("traceback") or (inner_dict.get("traceback") if inner_dict else None)
-            if tb and str(tb).strip() and str(tb).strip() not in str(error_msg):
-                error_parts.append(f"**Stack Trace:**\n```\n{str(tb).strip()}\n```")
-
-            rc = tool_res.get("return_code") if tool_res.get("return_code") is not None else (inner_dict.get("return_code") if inner_dict else None)
-            if rc is not None and rc != 0:
-                error_parts.append(f"**Exit Code:** {rc}")
-
-            pinj = _find_prompt_injection(tool_res)
-            if pinj:
-                error_parts.append(f"\n{pinj}")
-
-            error_text = "\n\n".join(error_parts)
-            if len(error_text) > max_chars:
-                error_text = error_text[:max_chars] + f"\n... [truncated, {len(error_text) - max_chars} more chars]"
-            return error_text
-
-    pinj = _find_prompt_injection(tool_res)
-    if pinj:
-        return f"✓ Success\n{pinj}"
-
-    unwrapped = tool_res
-    if isinstance(tool_res, dict):
-        if "output" in tool_res:
-            unwrapped = tool_res["output"]
-            if isinstance(unwrapped, dict):
-                for key in ("content", "text", "result", "data", "page_content", "summary"):
-                    if key in unwrapped:
-                        unwrapped = unwrapped[key]
-                        break
-        elif "content" in tool_res:
-            unwrapped = tool_res["content"]
-        elif "result" in tool_res:
-            unwrapped = tool_res["result"]
-        elif "data" in tool_res:
-            unwrapped = tool_res["data"]
-
-    if unwrapped is None:
-        return "Tool executed successfully but returned no output content."
-
-    def _replace_none(obj):
-        if obj is None:
-            return "[No output returned by tool]"
-        if isinstance(obj, dict):
-            return {k: _replace_none(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [_replace_none(v) for v in obj]
-        return obj
-
-    sanitized = _walk(_replace_none(unwrapped))
-
-    if isinstance(sanitized, str):
-        if len(sanitized) > max_chars:
-            return sanitized[:max_chars] + f"\n... [truncated, {len(sanitized) - max_chars} more chars]"
-        return sanitized
-
-    try:
-        text = json.dumps(sanitized, indent=2, default=str, ensure_ascii=False)
-    except Exception:
-        text = str(sanitized)
-
-    if len(text) > max_chars:
-        text = text[:max_chars] + f"\n... [truncated, {len(text) - max_chars} more chars]"
-    return text
-
+# Tool sanitization and preview logic delegated to lollms_chat_core
 
 _TOOL_UI_PREVIEW_WINDOW = 6000
 _TOOL_UI_PREVIEW_HALF = _TOOL_UI_PREVIEW_WINDOW // 2
@@ -1117,6 +506,7 @@ class _StreamState:
         self.content_offset = content_offset
         self.event_mode = event_mode
         self.remove_thinking_blocks = remove_thinking_blocks
+        self.enable_tools = enable_tools
 
         self.enable_notes = enable_notes if enable_artefacts else False
         self.enable_skills = enable_skills if enable_artefacts else False
@@ -3368,53 +2758,16 @@ class ChatMixin:
         round_count: int,
         extra_data: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """
-        Writes a detailed, host-path-sanitized error log to the discussion
-        workspace debug dumps directory. Forensic value is preserved locally
-        while ensuring the dump never becomes a source of host path leakage
-        if re-injected into a prompt or shared.
-        """
-        if not getattr(self, "_debug_mode", False):
-            return
-
-        try:
-            ws_path = getattr(self, "workspace_data_path", None)
-            if not ws_path:
-                return
-
-            debug_dir = Path(ws_path) / "_debug_dumps"
-            debug_dir.mkdir(parents=True, exist_ok=True)
-
-            safe_context = re.sub(r"[^a-z0-9_]+", "_", context_desc.lower()).strip("_") or "error"
-            error_log_path = debug_dir / f"error_round_{round_count}_{safe_context}.log"
-
-            with open(error_log_path, "w", encoding="utf-8") as f:
-                f.write("=" * 80 + "\n")
-                f.write(f"🐛 [DEBUG] ERROR DUMP - ROUND {round_count}\n")
-                f.write(f"Context: {context_desc}\n")
-                f.write("=" * 80 + "\n\n")
-
-                f.write("--- EXCEPTION ---\n")
-                f.write(f"Type: {type(error).__name__}\n")
-                f.write(_sanitize_host_paths(str(error)) + "\n\n")
-
-                f.write("--- TRACEBACK ---\n")
-                f.write(_sanitize_host_paths(traceback.format_exc()))
-                f.write("\n\n")
-
-                if extra_data:
-                    f.write("--- EXTRA DATA ---\n")
-                    try:
-                        f.write(_sanitize_host_paths(
-                            json.dumps(extra_data, indent=2, default=str, ensure_ascii=False)
-                        ))
-                    except Exception:
-                        f.write(_sanitize_host_paths(str(extra_data)))
-                    f.write("\n\n")
-
-            ASCIIColors.error(f"[ChatMixin] 🐛 Error dumped to: {error_log_path}")
-        except Exception as dump_err:
-            ASCIIColors.warning(f"[ChatMixin] Failed to write error dump: {dump_err}")
+        """Writes a detailed, host-path-sanitized error log to the discussion debug dumps directory."""
+        ws_path = getattr(self, "workspace_data_path", None)
+        _core_dump_error(
+            error=error,
+            context_desc=context_desc,
+            round_count=round_count,
+            workspace_dir=Path(ws_path) if ws_path else None,
+            extra_data=extra_data,
+            debug_mode=bool(getattr(self, "_debug_mode", False)),
+        )
 
     def submit_form_response(self, form_id: str, answers: Dict[str, Any]) -> bool:
         pending = self._get_pending_forms()
@@ -3979,9 +3332,10 @@ class ChatMixin:
                 self,
                 images or [],
                 orchestrator_mode=orchestrator_mode,
+                streaming_callback=kwargs.get("streaming_callback") or kwargs.get("callback"),
                 **{
                     k: v for k, v in kwargs.items()
-                    if k not in ("streaming_callback", "temperature", "stream")
+                    if k not in ("temperature", "stream")
                 },
             )
         )
@@ -6392,8 +5746,22 @@ class ChatMixin:
                                         full_dump = json.dumps(full_dump, indent=2, default=str, ensure_ascii=False)
                                     except Exception:
                                         full_dump = str(full_dump)
-                                safe_output = _build_windowed_output_preview(full_dump)
-                                details_block = f"Output Logs:\n{safe_output}\n"
+                                # Format user-facing log display cleanly (epurated of raw XML artifacts)
+                                if isinstance(tool_res, dict) and (tool_res.get("artefacts") or tool_res.get("artifacts_created")):
+                                    art_list = tool_res.get("artefacts") or []
+                                    art_names = [a.get("title") for a in art_list if isinstance(a, dict)] or tool_res.get("artifacts_created", [])
+                                    details_block = f"Output Logs:\n✅ Saved artifact(s): {', '.join(art_names)} to workspace and disk.\n"
+                                elif "<artifact" in full_dump or "<artefact" in full_dump or "<<<<<<< SEARCH" in full_dump:
+                                    art_title_match = re.search(r'(?:name|title)=["\']([^"\']+)["\']', full_dump)
+                                    target_name = art_title_match.group(1) if art_title_match else "artifact file"
+                                    if "SEARCH" in full_dump:
+                                        ui_log = f"Applied SEARCH/REPLACE modifications to '{target_name}'."
+                                    else:
+                                        ui_log = f"Created/updated '{target_name}' in workspace."
+                                    details_block = f"Output Logs:\n{ui_log}\n"
+                                else:
+                                    safe_output = _build_windowed_output_preview(full_dump)
+                                    details_block = f"Output Logs:\n{safe_output}\n"
                         else:
                             result_str = str(tool_res) if tool_res is not None else "No output returned."
                             if "error" in result_str.lower() or "fail" in result_str.lower():
@@ -6472,6 +5840,25 @@ class ChatMixin:
                     if tool_success:
                         successful_tool_signatures.add(context_aware_signature)
                         ASCIIColors.info(f"[ChatMixin] Recorded successful signature for '{tool_name}'. Total successful: {len(successful_tool_signatures)}")
+                        
+                        # Ingest any artifacts produced by tools (e.g. spinoff sub-agents)
+                        if isinstance(tool_res, dict) and (tool_res.get("artefacts") or tool_res.get("artifacts_created")):
+                            arts_to_ingest = tool_res.get("artefacts") or []
+                            for a in arts_to_ingest:
+                                if isinstance(a, dict):
+                                    if a not in ss.affected_artefacts:
+                                        ss.affected_artefacts.append(a)
+                                    if a not in getattr(self, "_affected_artefacts_this_turn", []):
+                                        self._affected_artefacts_this_turn.append(a)
+                                    art_title = a.get("title", "")
+                                    art_type = a.get("type", "code")
+                                    art_ver = a.get("version", 1)
+                                    card_tag = f'<lollms_artifact id="{art_title}" type="{art_type}" version="{art_ver}" />'
+                                    if card_tag not in ai_msg.content:
+                                        ai_msg.content += f"\n\n{card_tag}\n"
+
+                            self.touch()
+                            self.commit()
                     else:
                         _bump_environment_epoch()
 
@@ -6934,11 +6321,18 @@ class ChatMixin:
 
         _has_tti = getattr(self.lollmsClient, 'tti', None) is not None or bool(getattr(self.lollmsClient, 'tti_model_profiles_registry', None))
 
+        all_turn_artefacts = []
+        seen_art_titles = set()
+        for a in (getattr(self, "_affected_artefacts_this_turn", []) or []) + (ss.affected_artefacts if ss else []):
+            if isinstance(a, dict) and a.get("title") and a["title"] not in seen_art_titles:
+                seen_art_titles.add(a["title"])
+                all_turn_artefacts.append(a)
+
         return {
             "user_message": user_msg,
             "ai_message": ai_msg,
             "sources": [],
-            "artefacts": ss.affected_artefacts if ss else [],
+            "artefacts": all_turn_artefacts,
             "memory_report": mem_report,
             "dream_report": dream_report,
             "was_cancelled": was_cancelled,
