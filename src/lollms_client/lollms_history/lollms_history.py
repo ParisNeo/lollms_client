@@ -67,85 +67,47 @@ class HistoryManager:
     @staticmethod
     def _sanitize_for_context(text: str, distance_from_end: int) -> str:
         """
-        Sanitizes assistant message content for LLM context export.
+        Two-View Log Scrubber (Placeholder-Free Doctrine).
 
-        • Recent Messages (distance_from_end < 4): ZERO AMNESIA
-          Preserves the exact functional tags (<skill>, <artifact>, <tool>, <note>)
-          and conversational reasoning verbatim. Only strips system execution logs
-          (<processing> blocks, status comments).
+        Applies a single, age-independent scrub to assistant messages:
+        removes system-generated execution telemetry only — <processing>
+        blocks (preserving any <tool_result> payload embedded inside them),
+        status comments, and rendering anchors — while keeping every
+        functional tag and all conversational text verbatim at any age.
 
-        • Older Messages (distance_from_end >= 4): ZERO MIMICRY
-          Compresses bulky bodies using clean, non-mimicable self-closing syntax
-          without generating [🔒 ...] markers that LLMs could copy.
+        Placeholder tokens (self-closing stubs, [🔒...] anchors,
+        status="saved" markers) are FORBIDDEN by doctrine: any synthetic
+        token shown in history is a template the model can learn to mimic.
+        Long-horizon compression is handled upstream by the action-window
+        recollection protocol (turn digest in the system zone) and the
+        cross-session pruning synopsis — never by stubbing history here.
+
+        `distance_from_end` is retained for API compatibility but no longer
+        selects a compression tier.
         """
         if not text:
             return ""
 
-        # Step 1: Strip system-generated runner execution blocks and comments in all tiers
-        # CRITICAL: Preserve <tool_result> content inside <processing> blocks so the model
-        # retains access to its own tool outputs in subsequent reasoning rounds.
         text = re.sub(r'<!--\s*status:[^>]*-->', '', text, flags=re.IGNORECASE)
         text = re.sub(r'<lollms_artifact[^/]*/>', '', text, flags=re.IGNORECASE)
         text = re.sub(r'<artefact_image[^/]*/>', '', text, flags=re.IGNORECASE)
 
         def _preserve_tool_results_in_processing(m):
             block = m.group(0)
-            tool_result_match = re.search(r'<tool_result[^>]*>.*?</tool_result>', block, re.DOTALL | re.IGNORECASE)
+            tool_result_match = re.search(
+                r'<tool_result[^>]*>.*?</tool_result>', block, re.DOTALL | re.IGNORECASE
+            )
             if tool_result_match:
                 return tool_result_match.group(0)
             return ''
 
-        text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', _preserve_tool_results_in_processing, text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(
+            r'<processing[^>]*>.*?(?:</processing>|$)',
+            _preserve_tool_results_in_processing,
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
         text = re.sub(r'</processing>', '', text, flags=re.IGNORECASE)
-
-        if distance_from_end < 4:
-            # ── 🔒 STRICT PRESERVATION ZONE (Last 4 Actions) ──
-            # Return text verbatim so the model has full recall of its code, skills, and tools
-            return text.strip()
-
-        # ── 🧹 CLEAN DEEP COMPRESSION ZONE (Older Actions, distance >= 4) ──
-        # Keeps valid XML tag signatures with status="saved" so in-context learning
-        # always sees valid tag syntax rather than unstructured prose.
-        def _compress_artifact_tag(m):
-            attrs = m.group(1)
-            title = "file"
-            title_m = re.search(r'(?:name|title)=["\']([^"\']*)["\']', attrs, re.IGNORECASE)
-            if title_m:
-                title = title_m.group(1)
-            type_m = re.search(r'type=["\']([^"\']*)["\']', attrs, re.IGNORECASE)
-            atype = type_m.group(1) if type_m else "code"
-            return f'<artifact name="{title}" type="{atype}" status="saved" />'
-
-        def _compress_skill_tag(m):
-            attrs = m.group(1)
-            title_m = re.search(r'(?:name|title)=["\']([^"\']*)["\']', attrs, re.IGNORECASE)
-            title = title_m.group(1) if title_m else "skill"
-            return f'<skill title="{title}" status="saved" />'
-
-        def _compress_note_tag(m):
-            attrs = m.group(1)
-            title_m = re.search(r'(?:name|title)=["\']([^"\']*)["\']', attrs, re.IGNORECASE)
-            title = title_m.group(1) if title_m else "note"
-            return f'<note title="{title}" status="saved" />'
-
-        def _compress_tool_tag(m):
-            body = m.group(1).strip()
-            import json as _json
-            tname = "tool"
-            try:
-                data = _json.loads(body)
-                tname = data.get("name", "tool")
-            except Exception:
-                pass
-            return f'<tool_called name="{tname}" />'
-
-        text = re.sub(r'<art(?:ifact|efact)\s+([^>]*)>.*?</art(?:ifact|efact)>', _compress_artifact_tag, text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r'<skill\s+([^>]*)>.*?</skill>', _compress_skill_tag, text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r'<note\s+([^>]*)>.*?</note>', _compress_note_tag, text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r'<tool>(.*?)</tool>', _compress_tool_tag, text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r'<(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>.*?</(?:unlock_file|lock_file|hide_file|collapse_folder|uncollapse_folder)>', '', text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r'<scratchpad_(?:append|patch)>.*?</scratchpad_(?:append|patch)>', '', text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r'<user_profile_update>.*?</user_profile_update>', '', text, flags=re.DOTALL | re.IGNORECASE)
 
         return text.strip()
 

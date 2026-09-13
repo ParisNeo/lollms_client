@@ -46,6 +46,28 @@ def _lazy_import_libs():
         ASCIIColors.warning("[execute_python_data_query] pandas unavailable — df auto-load and CSV persistence disabled.")
     return _np, _pd, _plt
 
+def _annotate_traceback(raw_traceback: str, source_code: str) -> str:
+    """Appends the exact failing source line(s) to a traceback raised by sandboxed code.
+
+    Frame file names matching "<execute_python_data_query>" carry line numbers relative
+    to the submitted snippet; the model otherwise has to re-count lines in its own code
+    to locate the failure. This shows the line directly so fixes stay surgical."""
+    code_lines = source_code.splitlines()
+    annotated_lines = []
+    for line in raw_traceback.splitlines():
+        annotated_lines.append(line)
+        match = re.search(
+            r'File "<execute_python_data_query>", line (\d+)', line
+        )
+        if match:
+            failing_line_no = int(match.group(1))
+            if 1 <= failing_line_no <= len(code_lines):
+                annotated_lines.append(
+                    f"    >>> LINE {failing_line_no}: {code_lines[failing_line_no - 1]}"
+                )
+    return "\n".join(annotated_lines)
+
+
 def tool_execute_python_data_query(
     code: str = "",
     discussion_instance: Optional[Any] = None,
@@ -76,6 +98,11 @@ def tool_execute_python_data_query(
             "error": "No code provided for execution.",
             "output": ""
         }
+
+    _saved_utf8_env = {}
+    for _env_key in ("PYTHONIOENCODING", "PYTHONUTF8"):
+        _saved_utf8_env[_env_key] = os.environ.get(_env_key)
+        os.environ[_env_key] = "utf-8" if _env_key == "PYTHONIOENCODING" else "1"
 
     if code.endswith(".py") and Path(code).exists():
         filename = code
@@ -185,10 +212,11 @@ def tool_execute_python_data_query(
             sys.stdout = old_stdout
             raw_output = redirected_output.getvalue()
             raw_traceback = traceback.format_exc()
+            annotated_traceback = _annotate_traceback(raw_traceback, code)
             ASCIIColors.error(f"❌ Execution Failed:\n{raw_traceback}")
             return {
                 "success": False,
-                "error": f"Execution Error:\n{raw_traceback}",
+                "error": f"Execution Error:\n{annotated_traceback}",
                 "output": raw_output
             }
 
@@ -280,6 +308,11 @@ def tool_execute_python_data_query(
         }
     finally:
         sys.stdout = old_stdout
+        for _env_key, _saved_val in _saved_utf8_env.items():
+            if _saved_val is None:
+                os.environ.pop(_env_key, None)
+            else:
+                os.environ[_env_key] = _saved_val
         if auto_loaded_engine is not None:
             try:
                 if "conn" in local_vars and hasattr(local_vars["conn"], "close"):

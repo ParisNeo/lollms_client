@@ -1,0 +1,11 @@
+name: inspect_text
+description: >
+  Targeted inspection tools for workspace text files and persisted tool
+  outputs. Read precise line ranges, character-offset windows, or grep with
+  surrounding context — designed for examining stripped/windowed tool logs
+  without reloading the full payload.
+icon: "🔍"
+tools:
+  - tool_read_lines
+  - tool_read_chars
+  - tool_grep_file

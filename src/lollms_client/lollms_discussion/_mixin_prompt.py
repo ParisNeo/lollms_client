@@ -1,13 +1,16 @@
 # lollms_discussion/_mixin_prompt.py
-# PromptMixin: system-prompt instruction builders and LLM response post-processor.
+# PromptMixin: persona-aware system-prompt instruction builders and LLM
+# response post-processor.
 #
-# Changes vs previous version:
-#   • _build_artefact_instructions() now embeds the surgical-update doctrine
-#     (SEARCH/REPLACE patch policy, decision threshold, retry guidance) so the
-#     LLM receives it on EVERY path — fast, no-tools, simplified, agentic.
-#   • Fixed undefined `meta_now2` reference in the silent-artifact guard; the
-#     form-summary branch now iterates over affected_artefacts directly.
-#   • Minor cleanup: consistent quoting, removed redundant blank lines.
+# Single source of truth for ALL prompt doctrine:
+#   • Worker-tier builders (artifact, note, skill, form, image, widget,
+#     presentation, book) — full tool/artifact XML grammar lives here and is
+#     only injected when chat() runs in worker mode.
+#   • Orchestrator-tier builder (_build_orchestrator_instructions) —
+#     reflection + delegation grammar ONLY, zero tool syntax, so tool-use
+#     mimicry is structurally impossible for the Orchestrator persona.
+#   • Worker task wrapper (_build_worker_doctrine) — prepended by
+#     DelegationMixin to the spawned Worker's context.
 
 import re
 import uuid
@@ -857,6 +860,65 @@ EXAMPLE OF CORRECT FORM:
 </lollms_form>
 === END FORM INSTRUCTIONS ===
 """
+
+    def _build_orchestrator_instructions(self) -> str:
+        """
+        Reflection & delegation rules for the Orchestrator persona.
+
+        Deliberately contains ZERO tool syntax and ZERO artifact XML: the
+        Orchestrator must never learn (or mimic) the worker grammar. Delegation
+        is expressed exclusively through <task>/<context_files> blocks, which
+        the stream parser intercepts and routes to a spawned Worker.
+        """
+        return (
+            "\n=== DELEGATION PROTOCOL (ORCHESTRATOR MODE) ===\n"
+            "You coordinate. You do not execute tools yourself.\n"
+            "Each round, choose EXACTLY ONE move:\n"
+            "1. ANSWER — Write your final answer to the user, then emit "
+            "`<done/>` on a new line.\n"
+            "2. DELEGATE — Emit a delegation block when the user's request "
+            "requires building, editing, querying, computing, or verifying "
+            "anything in the workspace:\n"
+            "<task>\n"
+            "Precise, self-contained instructions for the specialist.\n"
+            "</task>\n"
+            "<context_files>\n"
+            "filename.py\n"
+            "data.csv\n"
+            "</context_files>\n"
+            "Rules:\n"
+            "- The task text must be executable by someone who sees ONLY the "
+            "named files and your instructions.\n"
+            "- List ONLY files that exist in the workspace tree; one per line.\n"
+            "- After delegating, stop generating. The specialist's report will "
+            "arrive as `[WORKER REPORT]` in your next round.\n"
+            "- Upon receiving a report: verify it against the request, then "
+            "ANSWER (or delegate a fix if the report shows failure).\n"
+            "- NEVER announce execution in prose. Prose performs nothing.\n"
+            "=== END DELEGATION PROTOCOL ===\n"
+        )
+
+    def _build_worker_doctrine(self, task: str) -> str:
+        """
+        Task wrapper for the Worker persona. Prepended to the worker context;
+        the full tool/artifact doctrine is injected by chat() in worker mode.
+        """
+        return (
+            "You are a focused specialist agent operating in an isolated "
+            "sandbox workspace.\n"
+            "You see ONLY: the task below, the contents of the files listed "
+            "for you, and the workspace file tree.\n\n"
+            f"=== TASK ===\n{task}\n=== END TASK ===\n\n"
+            "Complete the task using the available tools and artifact tags. "
+            "Work step by step; verify your outputs by running them.\n"
+            "When the task is finished, write a concise report of what was "
+            "done, what files were created or modified, and any results or "
+            "failures, wrapped exactly as:\n"
+            "<report>\n...your report...\n</report>\n"
+            "Then emit `<done/>` on a new line.\n"
+            "If the task is impossible with what you were given, say so in "
+            "the report and finish."
+        )
 
     # ─────────────────────────────────── LLM response post-processor ─────────
 

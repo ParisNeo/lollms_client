@@ -13,7 +13,7 @@ import platform
 import queue
 import threading
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from gui_prefs import GuiPrefs
 from env_config import EnvStore
@@ -347,6 +347,19 @@ def get_scratchpad_content(personality) -> str:
         return ""
 
 
+def get_live_skills(personality) -> List[Dict[str, Any]]:
+    """Returns the personality's current skills list. Safe to call while the
+    agent is generating: SkillsManager.list_skills() only reads the in-memory
+    dict (refreshed on each tool_create_skill/tool_update_skill call)."""
+    mgr = getattr(personality, "skills_manager", None)
+    if mgr is None:
+        return []
+    try:
+        return mgr.list_skills() or []
+    except Exception:
+        return []
+
+
 class QueueStreamingCallback:
     """Same event surface as the CLI's StreamRenderer, but pushes AgentEvent
     objects onto a thread-safe queue instead of printing to the terminal.
@@ -368,6 +381,7 @@ class QueueStreamingCallback:
             getattr(MSG_TYPE, "MSG_TYPE_ARTEFACT_SYMBOL_DETECTED", None): "artefact_symbol",
             getattr(MSG_TYPE, "MSG_TYPE_ROUND_INFO", None): "round_info",
             MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE: "context_update",
+            getattr(MSG_TYPE, "MSG_TYPE_SCRATCHPAD_UPDATE", None): "scratchpad_update",
         }
         mapping.pop(None, None)
         if msg_type in mapping:

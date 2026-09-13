@@ -1961,6 +1961,7 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
             enable_artefacts=True,
             use_internal_history=False,
             event_mode=EventMode.FULL_CALLBACK_MODE,
+            enforce_end_tag=True
         )
     except KeyboardInterrupt:
         if hasattr(client, 'cancel'):
@@ -2935,6 +2936,7 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                 enable_artefacts=True,
                 use_internal_history=True,
                 event_mode=EventMode.FULL_CALLBACK_MODE,
+                enforce_end_tag=True
             )
         except KeyboardInterrupt:
             if hasattr(client, 'cancel'):

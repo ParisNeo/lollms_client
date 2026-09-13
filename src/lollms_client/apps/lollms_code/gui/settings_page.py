@@ -520,6 +520,7 @@ def _build_appearance_panel(prefs: GuiPrefs):
         show_tools_switch = ui.switch("Show tool call panels", value=prefs.show_tool_calls)
         show_ws_switch = ui.switch("Show workspace changes", value=prefs.show_workspace_changes)
         show_skills_switch = ui.switch("Show skills activity", value=prefs.show_skills_activity)
+        show_live_sidebar_switch = ui.switch("Show live telemetry sidebar", value=prefs.show_live_sidebar)
 
     def apply(p: GuiPrefs):
         p.dark_mode = dark_switch.value
@@ -530,5 +531,6 @@ def _build_appearance_panel(prefs: GuiPrefs):
         p.show_tool_calls = show_tools_switch.value
         p.show_workspace_changes = show_ws_switch.value
         p.show_skills_activity = show_skills_switch.value
+        p.show_live_sidebar = show_live_sidebar_switch.value
 
     return apply

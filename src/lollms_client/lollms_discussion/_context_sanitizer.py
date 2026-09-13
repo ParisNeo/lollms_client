@@ -76,12 +76,14 @@ def sanitize_context_for_llm(text: str) -> str:
 
 def build_anti_mimicry_directives() -> str:
     """
-    Returns concise, positive directives for tool and artifact emission.
+    Returns concise, positive directives for tool and artifact emission,
+    including the placeholder-free history contract.
     """
     return (
         "=== ACTION & OUTPUT INTEGRITY PROTOCOL (MANDATORY) ===\n"
         "1. **EMIT REAL FUNCTIONAL TAGS**: To create or edit files use `<artifact name=\"...\">` with complete content or SEARCH/REPLACE blocks. To invoke tools use `<tool>`. To create skills use `<skill title=\"...\">`.\n"
         "2. **PROSE IS NOT ACTION**: Simply saying 'I will write the code' or 'I created the file' in natural text DOES NOT create or modify files. You MUST output the actual XML tags.\n To create artifacts use `<artifact name=\"...\">`, to create skills use `<skill title=\"...\">`, to save notes use `<note title=\"...\">`, and to invoke tools use `<tool>`. Do NOT simulate results or mimic past system messages.\n"
         "3. **DIRECT ENGAGEMENT**: Respond naturally and directly to the user's request. Do not provide meta-commentary about turns or system statuses.\n"
+        "4. **NEVER REPRODUCE SYSTEM TEXT**: Bracketed system markers (e.g. `[SYSTEM: ...]`, `[COMPLETED ACTIONS DIGEST]`, `[SYSTEM NOTIFICATION]`), self-closing stub tags (e.g. `<artifact ... status=\"saved\" />`, `<tool_called ... />`), and digest narratives are generated exclusively by the system. NEVER emit them yourself. If you want to reference a past action, describe it in your own words or re-execute it with a real tag.\n"
         "=== END ACTION PROTOCOL ==="
     )

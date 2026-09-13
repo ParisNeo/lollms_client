@@ -8,20 +8,58 @@
 
 import re
 import json
-import hashlib
+import html
 import uuid
+import random
+import base64
+import sqlite3
+import hashlib
+import inspect
+import os
+import time
 import traceback
 import threading
-import random
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Callable, Union
 from types import SimpleNamespace
+from datetime import datetime
 from ascii_colors import ASCIIColors, trace_exception
 from lollms_client.lollms_types import MSG_TYPE, EventMode
 from ._message import LollmsMessage
 from lollms_client.lollms_artefact import ArtefactType, make_image_id, ArtefactVisibility, ArtefactStatus
 from lollms_client.lollms_memory import FailureMemory
 from lollms_client.lollms_personality.lollms_personality import _is_tool_binding
+from lollms_client.lollms_artefact import ArtefactVisibility, ArtefactType
+from ._context_sanitizer import scrub_processing_and_status_blocks
+
 _MAX_BRACKET_BUF = 256
+
+_HOST_ROOT_RE = re.compile(
+    r'(?:[A-Za-z]:\\(?:Users|home|Documents|Program Files|Windows)[\\/][^\s"\'<>|]*'
+    r'|/(?:home|Users|root|var|opt|usr/local)/[^\s"\'<>|]*'
+    r'|(?:[A-Za-z]:)?\.[\\/][^\s"\']*\.versions[\\/][^\s"\'<>|]*)'
+)
+_USER_PREFIX_RE = re.compile(
+    r'(?:[A-Za-z]:\\)?(?:Users|home)[\\/][^\s"\'<>|]*?[\\/]'
+)
+
+
+def _sanitize_host_paths(text: str) -> str:
+    """
+    Strips absolute host filesystem paths from text destined for the LLM context
+    or the user-facing stream. Preserves sandbox opacity: the model must never
+    learn the orchestrator's physical location (user folders, install dirs,
+    versioned storage roots).
+    """
+    if not text:
+        return text
+    try:
+        cleaned = _HOST_ROOT_RE.sub("<host-path>", text)
+        cleaned = _USER_PREFIX_RE.sub("<host>/", cleaned)
+        cleaned = cleaned.replace("\\\\?\\", "")
+        return cleaned
+    except Exception:
+        return text
 
 _HEARTBEAT_MESSAGES = [
     "✍️ Writing content...",
@@ -83,6 +121,7 @@ _FORBIDDEN_TOOL_NAMES = {
 }
 
 _SECONDARY_TAG_MAP = {
+    "<delegate":      ("delegation_start",    MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</delegate>"),
     "<artifact":      ("artifact_update",     MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK, MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,    "</artifact>"),
     "<artefact":      ("artifact_update",     MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK, MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,    "</artefact>"),
     "<note":          ("note_start",          MSG_TYPE.MSG_TYPE_NOTE_CHUNK,     MSG_TYPE.MSG_TYPE_NOTE_DONE,         "</note>"),
@@ -114,7 +153,6 @@ _BASE64_RE = re.compile(r'^[A-Za-z0-9+/=\s]{500,}$')
 
 
 def _resolve_tool_workspace_root(discussion) -> "Path":
-    from pathlib import Path
     if getattr(discussion, "workspace_data_path", None):
         return Path(discussion.workspace_data_path).resolve()
     base_ws = Path(discussion.workspace_path) if getattr(discussion, "workspace_path", None) else Path("./data_workspace")
@@ -127,9 +165,6 @@ def _hash_workspace_file_refs(discussion, params: Dict[str, Any]) -> Dict[str, s
     workspace files. A tool call is only a repetition when the workspace state
     it depends on is unchanged.
     """
-    import hashlib
-    from pathlib import Path
-
     ws_root = _resolve_tool_workspace_root(discussion)
 
     def _sanitize_candidate(value: str) -> str:
@@ -187,23 +222,23 @@ _BINARY_BLOB_KEYS = {
     "binary", "raw_image", "image_data", "raw_data",
 }
 
-_MAX_TOOL_RESULT_CHARS = 12000
+_MAX_TOOL_RESULT_CHARS = 24000
 
 def _calculate_dynamic_tool_char_limit(client: Optional[Any] = None) -> int:
     """
     Calculates the maximum allowed characters for a tool result based on the LLM's context size.
-    Uses 25% of the context window, capped at 50,000 chars to preserve conversation space.
-    Falls back to 12,000 chars if context size is unavailable.
+    Uses 25% of the context window in characters, clamped between 16,000 and
+    90,000 chars. Falls back to 24,000 chars if context size is unavailable.
     """
     if client and hasattr(client, 'get_ctx_size'):
         try:
             ctx_size = client.get_ctx_size() or 0
             if ctx_size > 0:
                 dynamic_limit = int((ctx_size * 0.25) * 4)
-                return min(max(dynamic_limit, 8000), 50000)
+                return min(max(dynamic_limit, 16000), 90000)
         except Exception:
             pass
-    return 12000
+    return 24000
 
 
 import time as _time
@@ -951,6 +986,31 @@ def _sanitize_tool_result(
     return text
 
 
+_TOOL_UI_PREVIEW_WINDOW = 6000
+_TOOL_UI_PREVIEW_HALF = _TOOL_UI_PREVIEW_WINDOW // 2
+
+
+def _build_windowed_output_preview(text: str) -> str:
+    """
+    Builds a head/tail windowed preview of a tool output for UI display.
+
+    Short outputs pass through unchanged. Long outputs show the head half-window,
+    a stripping marker, then the tail half-window — so both the beginning and the
+    end of the execution log remain visible without flooding the chat bubble.
+    """
+    if not isinstance(text, str) or len(text) <= _TOOL_UI_PREVIEW_WINDOW:
+        return text if isinstance(text, str) else str(text)
+    head = text[:_TOOL_UI_PREVIEW_HALF]
+    tail = text[-_TOOL_UI_PREVIEW_HALF:]
+    stripped_chars = len(text) - _TOOL_UI_PREVIEW_WINDOW
+    return (
+        f"{head}\n"
+        f"... [stripped for brevity — {stripped_chars} middle characters omitted "
+        f"(use read file tools to inspect the full output)] ...\n"
+        f"{tail}"
+    )
+
+
 def _resolve_handle(ref: str, branch_messages: List) -> Optional[Dict[str, str]]:
     parts = ref.strip().split(":")
     if len(parts) != 2:
@@ -1041,6 +1101,7 @@ class _StreamState:
         auto_activate_artefacts: bool = True,
         enable_artefacts: bool = True,
         enable_in_message_status: bool = True,
+        enable_tools: bool = True,
         content_offset: int = 0,
         fast_artefact_replicas: Optional[List[str]] = None,
         processed_tags: Optional[set] = None,
@@ -1073,24 +1134,10 @@ class _StreamState:
         # Track context unlock requests to force continuation round
         self.context_unlock_requested = False
         self.context_unlocked_files: List[str] = []
-
-        # CRITICAL FIX: Initialize processed_tags from the persistent reference.
         self.processed_tags = processed_tags if processed_tags is not None else set()
 
-        self._is_accumulating_tool = False
-        self._tool_buffer = ""
-        self._artefact_buffer = ""  # Dedicated buffer for raw artifact content
-        self._artefact_open_tag = "" # Stores the exact opening tag (e.g., <artifact name="x">)
-        self._pending_buffer = ""   # Shadow buffer to safely catch partial tags
-
-        self._in_code_fence = False
-        self._code_fence_buffer = ""
-        self._code_fence_hold_buffer = ""  # Buffers content inside code fences to distinguish closed vs unclosed
-        self._in_inline_code = False  # CRITICAL FIX: Track single backtick state across chunks
-
-        # CRITICAL FIX: processed_tags must be passed in from ChatMixin
-        # to persist across multiple reasoning rounds and prevent duplicate dispatch.
-        self.processed_tags = processed_tags if processed_tags is not None else set()
+        # Orchestrator→Worker delegation payload captured this round.
+        self.delegation_payload: Optional[Dict[str, Any]] = None
 
         # ── ONE-ACTION-PER-TURN PROTOCOL ──
         # Ensures generation halts immediately after dispatching a single functional tag.
@@ -1104,6 +1151,12 @@ class _StreamState:
         # ── DONE TAG DETECTION ──
         # Set to True when the LLM emits <done/> to signal explicit task termination.
         self._done_detected = False
+
+        # ── TOOL-LESS PERSONA REFUSAL STATE ──
+        # Set when a <tool> dispatch is refused because this agent tier has
+        # no execution capability. The chat loop converts it into a
+        # delegation-correction envelope instead of executing anything.
+        self._tool_refusal_detected = False
 
         # ── Generic Secondary Tag Interceptor State ──
         # Handles <skill>, <note>, <lollms_inline>, <lollms_form>, <generate_image>, <edit_image>, etc.
@@ -1124,6 +1177,19 @@ class _StreamState:
         # Fast artefact replicas (user-provided or default)
         self._fast_artefact_replicas = fast_artefact_replicas if fast_artefact_replicas else _DEFAULT_FAST_REPLICAS
 
+        # ── STREAM PARSER CORE STATE ──
+        # Every attribute consumed by feed() / flush_remaining_buffer() must be
+        # initialized here. A stream parser that reaches its first chunk with
+        # missing state crashes the generation thread (AttributeError) and
+        # wedges the turn with no ROUND_END ever emitted.
+        self._pending_buffer = ""
+        self._in_code_fence = False
+        self._code_fence_buffer = ""
+        self._code_fence_hold_buffer = ""
+        self._in_inline_code = False
+        self._is_accumulating_tool = False
+        self._tool_buffer = ""
+        self._artefact_buffer = ""
 
     @staticmethod
     def _sanitize_unicode(text: str) -> str:
@@ -1254,7 +1320,7 @@ class _StreamState:
         # ── ONE-ACTION-PER-TURN: If an action was already dispatched, consume and discard ──
         if self._action_dispatched:
             self._pending_buffer += chunk
-            return True
+            return False
 
         # CRITICAL FIX: Append to shadow buffer instead of directly to ai_message.content
         self._pending_buffer += chunk
@@ -1530,6 +1596,10 @@ class _StreamState:
                 if close_idx != -1:
                     self._stop_artefact_heartbeat()
                     self.artefact_tracker.close()
+                    self._in_code_fence = False
+                    self._code_fence_buffer = ""
+                    self._code_fence_hold_buffer = ""
+                    self._in_inline_code = False
 
                     # Extract the full artifact block cleanly
                     # Find the opening tag first
@@ -1737,6 +1807,10 @@ class _StreamState:
                         if close_idx != -1:
                             self._stop_artefact_heartbeat()
                             self.artefact_tracker.close()
+                            self._in_code_fence = False
+                            self._code_fence_buffer = ""
+                            self._code_fence_hold_buffer = ""
+                            self._in_inline_code = False
 
                             # Extract the body cleanly
                             body_content = remaining_content[:close_idx]
@@ -2023,7 +2097,7 @@ class _StreamState:
         if not is_inside_thoughts and not self._is_accumulating_secondary:
             lower_buffer = self._pending_buffer.lower()
             secondary_entered = False
-            for tag_prefix in ("<skill", "<note", "<scratchpad", "<lollms_form", "<generate_image", "<edit_image", "<unlock_file", "<lock_file", "<hide_file"):
+            for tag_prefix in ("<delegate", "<skill", "<note", "<scratchpad", "<lollms_form", "<generate_image", "<edit_image", "<unlock_file", "<lock_file", "<hide_file"):
                 pattern = r'(?m)^\s*(?!`)(?!.*\|)' + re.escape(tag_prefix)
                 open_match = re.search(pattern, lower_buffer)
                 if open_match:
@@ -2307,6 +2381,11 @@ class _StreamState:
                     self.affected_artefacts.append(art)
 
                 try:
+                    _versions_root_patched = Path(
+                        getattr(self.discussion, "workspace_path", "") or "."
+                    ) / ".versions" / str(getattr(self.discussion, "id", ""))
+                    if not _versions_root_patched.exists():
+                        _versions_root_patched.mkdir(parents=True, exist_ok=True)
                     self.discussion.artefacts._sync_to_disk_workspace(
                         title=art.get("title", title),
                         content=art.get("content", patched),
@@ -2315,7 +2394,10 @@ class _StreamState:
                         language=lang
                     )
                 except Exception as sync_ex:
-                    ASCIIColors.warning(f"[StreamState] Failed to immediately materialize patched artifact '{title}' to disk: {sync_ex}")
+                    ASCIIColors.warning(
+                        "[StreamState] Failed to immediately materialize patched artifact "
+                        f"'{title}' to disk: {_sanitize_host_paths(str(sync_ex))}"
+                    )
 
                 _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
                     "type": "artifact_updated",
@@ -2340,7 +2422,9 @@ class _StreamState:
                 self.affected_artefacts.append(art)
 
                 # ── 📊 LOG ARTIFACT CREATION ACTION ──
-                # Log this action in the turn progress tracker
+                # Log this action in the turn progress tracker. Action-window
+                # recollection registration is performed by the chat loop at
+                # the dispatch-hydration site, which owns round_count.
                 if hasattr(self.discussion, '_turn_actions_log'):
                     self.discussion._turn_actions_log.append({
                         "action": "artifact_created",
@@ -2351,7 +2435,14 @@ class _StreamState:
 
             # ── 🛑 CRITICAL FIX: IMMEDIATE PHYSICAL MATERIALIZATION ──
             # The physical twin MUST exist on disk the instant the artifact is created.
+            # Defense-in-depth: ensure the versioned storage directory exists before
+            # the write, preventing FileNotFoundError on first-time nested paths.
             try:
+                _versions_root = Path(
+                    getattr(self.discussion, "workspace_path", "") or "."
+                ) / ".versions" / str(getattr(self.discussion, "id", ""))
+                if not _versions_root.exists():
+                    _versions_root.mkdir(parents=True, exist_ok=True)
                 self.discussion.artefacts._sync_to_disk_workspace(
                     title=art.get("title", title),
                     content=art.get("content", body),
@@ -2360,7 +2451,10 @@ class _StreamState:
                     language=lang
                 )
             except Exception as sync_ex:
-                ASCIIColors.warning(f"[StreamState] Failed to immediately materialize artifact '{title}' to disk: {sync_ex}")
+                ASCIIColors.warning(
+                    "[StreamState] Failed to immediately materialize artifact "
+                    f"'{title}' to disk: {_sanitize_host_paths(str(sync_ex))}"
+                )
 
             # Fire an event update to the UI so it cleanly rebuilds and replaces the code block
             meta_info = _extract_artefact_meta(body, lang, atype)
@@ -2398,6 +2492,21 @@ class _StreamState:
 
         # 2. Tools Execution Trigger
         elif tag_name in ("tool", "tool"):
+            if not self.enable_tools:
+                ASCIIColors.warning(
+                    "[StreamState] Tool dispatch refused: this agent tier has "
+                    "no execution capability. Only workers may execute tools."
+                )
+                self._tool_refusal_detected = True
+                refused_block = (
+                    '\n<processing type="tool" title="Tool Execution Refused">\n'
+                    "* 🚫 Tool calls are not available to you. You coordinate; "
+                    "workers execute. Delegate the work instead.\n"
+                    '<!-- status:failure -->\n</processing>\n'
+                )
+                self.ai_message.content += refused_block
+                _cb(self.callback, refused_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                return True
             self.tool_trigger = True
 
             # ── ROBUST JSON PARSING & NORMALIZATION (CRITICAL FIX) ──
@@ -2457,7 +2566,6 @@ class _StreamState:
             # Emit the processing block to the UI INSTANTLY when the </tool> tag closes.
             # This guarantees the user sees "Calling tool..." while the tool executes,
             # rather than waiting for the synchronous execution to finish.
-            import html
             try:
                 parsed_for_ui = json.loads(self.tool_json_data)
                 ui_tool_name = parsed_for_ui.get("name", "unknown") if isinstance(parsed_for_ui, dict) else "unknown"
@@ -2883,6 +2991,14 @@ class _StreamState:
             self._action_dispatched = True
             return True
 
+        # 7. Orchestrator→Worker Delegation
+        elif tag_name in ("delegate", "task_block"):
+            self.delegation_payload = {
+                "opening_tag": attrs_str,
+                "body": body,
+            }
+            return True
+
         return True
 
     def was_action_dispatched(self) -> bool:
@@ -2896,6 +3012,10 @@ class _StreamState:
     def was_last_dispatch_failed(self) -> bool:
         """Returns True if the last dispatched artifact tag failed (e.g., SEARCH/REPLACE mismatch)."""
         return self._last_dispatch_failed
+
+    def was_tool_refusal_detected(self) -> bool:
+        """Returns True if a <tool> dispatch was refused for a tool-less agent tier."""
+        return self._tool_refusal_detected
 
     def passthrough(self, chunk, msg_type=None, meta=None) -> bool:
         if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
@@ -3004,6 +3124,10 @@ class _StreamState:
                 self._done_detected = True
                 self.ai_message.content = done_pattern.sub('', self.ai_message.content).strip()
 
+        if self._action_dispatched:
+            self._pending_buffer = ""
+            return
+
         if self._pending_buffer and not self.artefact_tracker.is_inside_artefact \
                 and not self._is_accumulating_tool and not self._is_accumulating_secondary:
             if not self._done_detected:
@@ -3036,6 +3160,12 @@ class _StreamState:
 
             self._pending_buffer = re.sub(
                 r'(?ms)^[ \t]*<(?:artifact|artefact|skill|note|scratchpad|lollms_inline|lollms_form|generate_image|edit_image|tool)\b[^>]*$',
+                '',
+                self._pending_buffer,
+                flags=re.IGNORECASE,
+            )
+            self._pending_buffer = re.sub(
+                r'(?ms)^[ \t]*<processing\b[^>]*$',
                 '',
                 self._pending_buffer,
                 flags=re.IGNORECASE,
@@ -3144,14 +3274,55 @@ class _StreamState:
 # ── ChatMixin Implementation ────────────────────────────────────────────────
 
 class ChatMixin:
-    """ChatMixin: orchestrates RAG, tiered memory, and alternating tool rounds."""
+    """ChatMixin: orchestrates RAG, tiered memory, delegation, and alternating tool rounds."""
+
+    _WORKSPACE_SCAN_CACHE_KEY = "_workspace_scan_cache"
+
+    def _cached_workspace_file_scan(self, workspace_dir: Path):
+        """
+        Cached workspace file classification.
+
+        The full `rglob('*')` walk plus suffix classification is expensive and
+        was previously recomputed on every chat() call — including for every
+        spawned Worker inside a delegation. The cache is invalidated by the
+        workspace write revision (`_workspace_write_revision`), which is
+        bumped whenever an artifact write, tool file mutation, or context
+        visibility change occurs.
+
+        Returns:
+            (all_files, has_data_files, has_doc_files) — identical semantics
+            to the previous inline scan.
+        """
+        data_extensions = {".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"}
+        doc_extensions = {".pdf", ".docx", ".pptx", ".odt", ".epub", ".txt", ".md", ".json", ".yaml", ".xml"}
+
+        revision = int(getattr(self, "_workspace_write_revision", 0))
+        cache = getattr(self, "_workspace_scan_cache", None)
+        if cache is not None and cache.get("revision") == revision:
+            return cache["all_files"], cache["has_data_files"], cache["has_doc_files"]
+
+        if not workspace_dir.exists():
+            all_files: List[Path] = []
+            has_data_files = False
+            has_doc_files = False
+        else:
+            all_files = list(workspace_dir.rglob("*"))
+            has_data_files = any(f.suffix.lower() in data_extensions for f in all_files if f.is_file())
+            has_doc_files = any(f.suffix.lower() in doc_extensions for f in all_files if f.is_file())
+
+        object.__setattr__(
+            self, "_workspace_scan_cache",
+            {"revision": revision, "all_files": all_files, "has_data_files": has_data_files, "has_doc_files": has_doc_files},
+        )
+        return all_files, has_data_files, has_doc_files
 
     def __init__(self, *args, **kwargs):
         """Initialize ChatMixin with sequential cancellation support."""
         # Simple boolean flag for sequential control
         object.__setattr__(self, '_cancel_flag', False)
         super().__init__(*args, **kwargs)
-
+        object.__setattr__(self, '_delegation_depth', 0)
+        object.__setattr__(self, '_worker_counter', 0)
         from ..lollms_memory.lollms_memory import FailureMemory
         object.__setattr__(self, '_failure_memory', FailureMemory())
 
@@ -3197,18 +3368,21 @@ class ChatMixin:
         round_count: int,
         extra_data: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Writes a detailed error log to the discussion workspace debug dumps directory."""
+        """
+        Writes a detailed, host-path-sanitized error log to the discussion
+        workspace debug dumps directory. Forensic value is preserved locally
+        while ensuring the dump never becomes a source of host path leakage
+        if re-injected into a prompt or shared.
+        """
         if not getattr(self, "_debug_mode", False):
             return
 
         try:
-            from pathlib import Path as _Path
-
             ws_path = getattr(self, "workspace_data_path", None)
             if not ws_path:
                 return
 
-            debug_dir = _Path(ws_path) / "_debug_dumps"
+            debug_dir = Path(ws_path) / "_debug_dumps"
             debug_dir.mkdir(parents=True, exist_ok=True)
 
             safe_context = re.sub(r"[^a-z0-9_]+", "_", context_desc.lower()).strip("_") or "error"
@@ -3222,18 +3396,20 @@ class ChatMixin:
 
                 f.write("--- EXCEPTION ---\n")
                 f.write(f"Type: {type(error).__name__}\n")
-                f.write(f"Message: {str(error)}\n\n")
+                f.write(_sanitize_host_paths(str(error)) + "\n\n")
 
                 f.write("--- TRACEBACK ---\n")
-                f.write(traceback.format_exc())
+                f.write(_sanitize_host_paths(traceback.format_exc()))
                 f.write("\n\n")
 
                 if extra_data:
                     f.write("--- EXTRA DATA ---\n")
                     try:
-                        f.write(json.dumps(extra_data, indent=2, default=str, ensure_ascii=False))
+                        f.write(_sanitize_host_paths(
+                            json.dumps(extra_data, indent=2, default=str, ensure_ascii=False)
+                        ))
                     except Exception:
-                        f.write(str(extra_data))
+                        f.write(_sanitize_host_paths(str(extra_data)))
                     f.write("\n\n")
 
             ASCIIColors.error(f"[ChatMixin] 🐛 Error dumped to: {error_log_path}")
@@ -3275,9 +3451,6 @@ class ChatMixin:
         then registers them as artifacts following the Tool-Generated File Visibility Doctrine.
         This logic is shared between the direct-callable and LCP dispatch paths.
         """
-        from pathlib import Path
-        from lollms_client.lollms_artefact import ArtefactVisibility, ArtefactType
-
         # Detect NEW files
         new_files = set(files_after.keys()) - set(files_before.keys())
 
@@ -3496,9 +3669,8 @@ class ChatMixin:
                 if not should_read_content and content_placeholder:
                     if atype == "image":
                         try:
-                            import base64 as _b64_mod
                             raw_img = file_path.read_bytes()
-                            img_b64 = _b64_mod.b64encode(raw_img).decode('utf-8')
+                            img_b64 = base64.b64encode(raw_img).decode('utf-8')
                             img_mtypes = [f"image/{file_ext[1:]}"]
                         except Exception as ex:
                             trace_exception(ex)
@@ -3531,7 +3703,6 @@ class ChatMixin:
 
                     if atype == "image":
                         try:
-                            import base64
                             raw_img = file_path.read_bytes()
                             img_b64 = base64.b64encode(raw_img).decode('utf-8')
                             self.artefacts.update(
@@ -3646,7 +3817,6 @@ class ChatMixin:
             return False
 
         try:
-            import sqlite3
             db_path = self.memory_manager.db_path.replace("sqlite:///", "")
             conn = sqlite3.connect(db_path)
             cursor = conn.cursor()
@@ -3671,103 +3841,173 @@ class ChatMixin:
             ASCIIColors.error(f"[ChatMixin] Failed to wipe memories: {e}")
             return False
 
-    def _get_spinoff_agent_tools(self, current_prompt: str, images: list, **kwargs) -> Dict[str, Dict[str, Any]]:
+    def _resolve_active_tools(
+        self,
+        personality,
+        tools,
+        enable_data_tools: bool,
+        enable_code_execution: bool,
+        debug: bool,
+        user_message: str,
+        suppress_images: bool,
+        images: Optional[List[str]] = None,
+        orchestrator_mode: bool = False,
+        orchestrator_persona: bool = False,
+        **kwargs: dict,
+    ) -> Dict[str, Dict[str, Any]]:
         """
-        Dynamically registers specialized sub-agents as executable in-process tools.
-        Enables the LLM to delegate heavy cognitive, formatting, or parsing tasks on-demand
-        without breaking the main stream or bloating the primary conversation context.
+        Single source of truth for tool-registry resolution (Sovereign Opt-In
+        Doctrine). Used by chat() and by the AgenticRunner so the orchestrator
+        inherits the same registry without ever seeing its grammar.
+
+        When the orchestrator persona is active, personality-owned tool
+        sources (RAG tools, skill tools) are withheld: they carry live
+        callables, and the persona tier must never hold executable grammar.
+        The plain-language catalogue for delegation is derived from the
+        worker-grade registry (LCP execution tools + spinoffs), which is
+        exactly the set the spawned Workers will receive.
         """
-        spinoffs = {}
+        active_tools: Dict[str, Dict[str, Any]] = {}
+        _persona_active = orchestrator_mode or orchestrator_persona
 
-        # Spinoff 1: Surgical Artifact Specialist
-        def tool_spinoff_code_specialist(task_instructions: str) -> dict:
-            """
-            Spawns a specialized Surgical Code Specialist in a focused, low-temperature sandbox.
-            Ideal for generating complete Python scripts, performing exact aider patches, or refactoring logic.
+        if personality and hasattr(personality, "build_rag_tools") and not _persona_active:
+            active_tools.update(personality.build_rag_tools())
 
-            Args:
-                task_instructions (str): The specific coding or refactoring instructions for the specialist.
-            """
-            custom_system = (
-                "You are an expert Surgical Code Specialist.\n"
-                "You operate in a hyper-focused sandbox isolated from the main conversation's noise.\n"
-                "Your sole task is to implement the requested code modifications perfectly.\n\n"
-                "STRICT RULES:\n"
-                "1. Output ONLY a valid <artifact> block containing your code or SEARCH/REPLACE patch.\n"
-                "2. Do NOT use markdown fences or write introductory/concluding prose outside the tags.\n"
-                "3. Ensure character-for-character accuracy in aider SEARCH/REPLACE blocks."
-            )
-            # Fetch active artifacts context
-            art_zone = self.artefacts.build_artefacts_context_zone()
-            payload = f"=== CONTEXT ARTIFACTS ===\n{art_zone}\n\n=== SPECIALIST TASK ===\n{task_instructions}"
+        if personality and hasattr(personality, "skills_manager") and personality.skills_manager and not _persona_active:
+            active_tools.update(personality.skills_manager.build_skill_tools())
+
+        if isinstance(tools, dict):
+            active_tools.update(tools)
+        elif isinstance(tools, list):
+            lcp_binding = getattr(self.lollmsClient, "tools", None)
+            if lcp_binding and hasattr(lcp_binding, "to_chat_tool_specs"):
+                try:
+                    lcp_tools = lcp_binding.to_chat_tool_specs(
+                        discussion_instance=self,
+                        lollms_client_instance=self.lollmsClient,
+                    )
+                    for tool_name in tools:
+                        if tool_name in lcp_tools:
+                            active_tools[tool_name] = lcp_tools[tool_name]
+                        else:
+                            ASCIIColors.warning(
+                                f"[ChatMixin] Requested default tool '{tool_name}' not found in LCP registry."
+                            )
+                except Exception as ex:
+                    trace_exception(ex)
+
+        lcp_binding = getattr(self.lollmsClient, "tools", None)
+
+        workspace_dir = Path(self.workspace_data_path) if getattr(self, "workspace_data_path", None) else Path("./data_workspace")
+
+        data_extensions = {".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"}
+        doc_extensions = {".pdf", ".docx", ".pptx", ".odt", ".epub", ".txt", ".md", ".json", ".yaml", ".xml"}
+
+        all_files, has_data_files, has_doc_files = self._cached_workspace_file_scan(workspace_dir)
+        needs_lcp_binding = enable_data_tools or enable_code_execution or has_data_files or has_doc_files
+
+        if needs_lcp_binding and lcp_binding is None:
             try:
-                res = self.lollmsClient.generate_text(
-                    prompt=payload,
-                    system_prompt=custom_system,
-                    images=images,
-                    temperature=0.1,  # Low temperature for deterministic precision
-                    **{k: v for k, v in kwargs.items() if k not in ("temperature", "streaming_callback")}
-                )
-                return {"success": True, "output": res.strip()}
-            except Exception as e:
-                return {"success": False, "error": str(e)}
+                from lollms_client.tools_bindings.lcp import LCPBinding
+                lcp_binding = LCPBinding(tools_folders=[])
+                if not hasattr(self.lollmsClient, "tools") or self.lollmsClient.tools is None:
+                    self.lollmsClient.tools = lcp_binding
+                ASCIIColors.success("[ChatMixin] Auto-provisioned shared LCPBinding for context-aware tools.")
+            except Exception as ex:
+                trace_exception(ex)
+                lcp_binding = None
 
-        spinoffs["tool_spinoff_code_specialist"] = {
-            "name": "tool_spinoff_code_specialist",
-            "description": "Spawns a specialized Surgical Code Specialist in a focused, low-temperature sandbox to write, patch, or refactor Python/code artifacts.",
-            "parameters": [{"name": "task_instructions", "type": "str", "description": "Specific code or patch instructions."}],
-            "callable": tool_spinoff_code_specialist
-        }
+        if lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
+            if enable_data_tools and has_data_files:
+                lcp_binding.mount_tool_library("semantic_data_engineer")
+                ASCIIColors.info("[ChatMixin] Mounted 'semantic_data_engineer' (data files detected).")
 
-        # Spinoff 2: HTML Slide Presentation Designer
-        def tool_spinoff_presentation_designer(style: str, slide_count: int, structure_hints: str) -> dict:
-            """
-            Spawns a specialized HTML Slide Presentation Designer in a focused sandbox.
-            Converts active artifacts into a styled, structured multi-slide HTML5 presentation deck.
+            if enable_data_tools and has_doc_files:
+                lcp_binding.mount_tool_library("as_is_document_tools")
+                lcp_binding.mount_tool_library_if_absent("document_editor")
+                ASCIIColors.info("[ChatMixin] Mounted 'document_editor' and 'as_is_document_tools' (document files detected).")
 
-            Args:
-                style (str): The design theme (e.g. 'dark', 'light', 'creative').
-                slide_count (int): Expected number of slides.
-                structure_hints (str): Specific topics or structural outlines to focus on.
-            """
-            custom_system = (
-                "You are an expert HTML Slide Presentation Designer.\n"
-                "You design beautiful, modern 16:9 slideshows using semantic HTML5 and CSS.\n\n"
-                "STRICT RULES:\n"
-                "1. Output ONLY a single <artifact> tag containing your complete, valid HTML document.\n"
-                "2. Do NOT write conversational prose or use markdown code blocks outside the tags."
-            )
-            art_zone = self.artefacts.build_artefacts_context_zone()
-            payload = (
-                f"=== CONTEXT ARTIFACTS ===\n{art_zone}\n\n"
-                f"=== DESIGN REQUIREMENTS ===\n"
-                f"• Style Theme: {style}\n"
-                f"• Slides Count: {slide_count}\n"
-                f"• Structure Outlines: {structure_hints}"
-            )
+            if enable_code_execution:
+                lcp_binding.mount_tool_library_if_absent("execute_python")
+                ASCIIColors.info("[ChatMixin] Mounted 'execute_python' (inline + file execution enabled).")
+                lcp_binding.mount_tool_library_if_absent("inspect_text")
+                ASCIIColors.info("[ChatMixin] Mounted 'inspect_text' (targeted log inspection enabled).")
+
             try:
-                res = self.lollmsClient.generate_text(
-                    prompt=payload,
-                    system_prompt=custom_system,
-                    temperature=0.3,
-                    **{k: v for k, v in kwargs.items() if k not in ("temperature", "streaming_callback")}
+                lcp_tools = lcp_binding.to_chat_tool_specs(
+                    discussion_instance=self,
+                    lollms_client_instance=self.lollmsClient,
                 )
-                return {"success": True, "output": res.strip()}
-            except Exception as e:
-                return {"success": False, "error": str(e)}
+                for t_name, t_spec in lcp_tools.items():
+                    if t_name == "tool_execute_python_data_query" and enable_data_tools and has_data_files:
+                        active_tools[t_name] = t_spec
+                    elif t_name in ("tool_execute_python_code", "tool_execute_python_file") and enable_code_execution:
+                        active_tools[t_name] = t_spec
+                    elif t_name in ("tool_read_lines", "tool_read_chars", "tool_grep_file") and enable_code_execution:
+                        active_tools[t_name] = t_spec
+                    elif t_name.startswith(("tool_inspect_document", "tool_read_document_content", "tool_grep_document", "tool_modify_docx", "tool_modify_excel", "tool_edit_document_text", "tool_annotate_document", "tool_modify_pdf_annotation", "tool_modify_pptx_slide")) and enable_data_tools and has_doc_files:
+                        active_tools[t_name] = t_spec
+            except Exception as ex:
+                trace_exception(ex)
+                ASCIIColors.error(f"[ChatMixin] Failed to extract tool specs from LCP binding: {ex}")
 
-        spinoffs["tool_spinoff_presentation_designer"] = {
-            "name": "tool_spinoff_presentation_designer",
-            "description": "Spawns a specialized HTML Slide Presentation Designer in a focused sandbox to synthesize active datasets/artifacts into a highly styled multi-slide HTML5 presentation deck.",
-            "parameters": [
-                {"name": "style", "type": "str", "description": "Design theme (dark, light, creative, minimal)."},
-                {"name": "slide_count", "type": "int", "description": "Expected number of slides."},
-                {"name": "structure_hints", "type": "str", "description": "Outlines and structural hints."}
-            ],
-            "callable": tool_spinoff_presentation_designer
-        }
+            for td in lcp_binding.discovered_tools:
+                t_name = td.get("name", "")
+                if t_name not in active_tools:
+                    if (t_name == "tool_execute_python_data_query" and enable_data_tools and has_data_files) or \
+                       (t_name in ("tool_execute_python_code", "tool_execute_python_file") and enable_code_execution) or \
+                       (t_name in ("tool_read_lines", "tool_read_chars", "tool_grep_file") and enable_code_execution) or \
+                       (t_name.startswith(("tool_inspect_document", "tool_read_document_content", "tool_grep_document", "tool_modify_docx", "tool_modify_excel", "tool_edit_document_text", "tool_annotate_document", "tool_modify_pdf_annotation", "tool_modify_pptx_slide")) and enable_data_tools and has_doc_files):
+                        params_list = []
+                        input_schema = td.get("input_schema", {})
+                        for prop_name, prop_info in input_schema.get("properties", {}).items():
+                            params_list.append({
+                                "name": prop_name,
+                                "type": prop_info.get("type", "string"),
+                                "description": prop_info.get("description", ""),
+                            })
+                        active_tools[t_name] = {
+                            "name": t_name,
+                            "description": td.get("description", "Executes tool operation."),
+                            "parameters": params_list,
+                        }
+                        ASCIIColors.success(f"[ChatMixin] Registered {t_name} via direct discovered_tools fallback.")
 
-        return spinoffs
+        from ..lollms_agentic.spinoff_tools import build_spinoff_agent_tools
+        active_tools.update(
+            build_spinoff_agent_tools(
+                self,
+                images or [],
+                orchestrator_mode=orchestrator_mode,
+                **{
+                    k: v for k, v in kwargs.items()
+                    if k not in ("streaming_callback", "temperature", "stream")
+                },
+            )
+        )
+
+        if active_tools:
+            ASCIIColors.info(
+                f"[ChatMixin] Final active tool registry ({len(active_tools)} tool(s)): "
+                f"{sorted(active_tools.keys())}"
+            )
+        else:
+            ASCIIColors.warning("[ChatMixin] Final active tool registry is EMPTY — no tools available to the LLM this turn.")
+
+        if debug and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
+            lcp_binding.mount_tool_library("debug_toolset")
+            try:
+                lcp_tools = lcp_binding.to_chat_tool_specs(
+                    discussion_instance=self,
+                    lollms_client_instance=self.lollmsClient,
+                )
+                for t_name, t_spec in lcp_tools.items():
+                    if t_name == "tool_dump_context":
+                        active_tools[t_name] = t_spec
+            except Exception as ex:
+                trace_exception(ex)
+
+        return active_tools
 
     def chat(
         self,
@@ -3797,7 +4037,6 @@ class ChatMixin:
         max_nb_rounds:                Optional[int] = None,
         max_reasoning_steps:          Optional[int] = None,
         enable_in_message_status:     bool = False,
-        enable_sub_agents:            bool = False,
         forward_artefact_chunks:      bool = False,
         fast_artefact_replicas:       Optional[List[str]] = None,
         tolerance_level:              Optional[str] = "strict",
@@ -3805,6 +4044,8 @@ class ChatMixin:
         enable_data_tools:            bool = True,
         enable_code_execution:        bool = False,
         suppress_images:              bool = False,
+        orchestrator_mode:            bool = False,
+        orchestrator_persona:         bool = False,
         debug_export:                 bool = False,
         debug:                        bool = False,
         enable_vlm_query:             bool = False,
@@ -3843,7 +4084,6 @@ class ChatMixin:
             max_nb_rounds (Optional[int]): Maximum number of agentic reasoning rounds. Primary parameter. Defaults to 20 if None.
             max_reasoning_steps (Optional[int]): Deprecated. Backward-compatible alias for max_nb_rounds.
             enable_in_message_status (bool): Show in-message status updates. Default False.
-            enable_sub_agents (bool): Enable spinoff sub-agent tools. Default False.
             forward_artefact_chunks (bool): Forward artifact chunks to callback. Default False.
             fast_artefact_replicas (Optional[List[str]]): Custom fast replica messages for artifacts.
             tolerance_level (Optional[str]): Tolerance level for data tools ('strict', 'lenient'). Default 'strict'.
@@ -3851,6 +4091,10 @@ class ChatMixin:
             enable_data_tools (bool): Enable data manipulation tools (SQL, pandas). Default True.
             enable_code_execution (bool): Enable arbitrary Python code execution tool. Default False.
             suppress_images (bool): Suppress image hydration in context. Default False.
+            orchestrator_persona (bool): Run this turn as the delegation-only
+                Orchestrator persona: the prompt shows a plain-language worker
+                capability catalogue (no tool-call grammar), and artifact writes
+                plus tool execution are structurally refused at the dispatcher.
             debug_export (bool): Enable debug export of context dumps for this turn. Default False.
             debug (bool): Enable debug mode: mounts the debug toolset with additional logging. Default False.
                 Persistent per-discussion debug dumps can also be enabled by setting
@@ -3873,6 +4117,32 @@ class ChatMixin:
         if resolved_max_rounds is None:
             resolved_max_rounds = 20
 
+        callback = kwargs.get("streaming_callback")
+
+        if orchestrator_mode:
+            from ..lollms_agentic.runner import AgenticRunner
+            active_tools = self._resolve_active_tools(
+                personality=personality,
+                tools=tools,
+                enable_data_tools=enable_data_tools,
+                enable_code_execution=enable_code_execution,
+                debug=debug,
+                user_message=user_message,
+                suppress_images=suppress_images,
+                images=images,
+                orchestrator_mode=orchestrator_mode,
+                kwargs=kwargs,
+            )
+            runner = AgenticRunner(
+                discussion=self,
+                tools_registry=active_tools,
+                callback=callback,
+                event_mode=event_mode,
+                max_orchestrator_rounds=resolved_max_rounds,
+                max_worker_rounds=max(2, resolved_max_rounds // 2),
+            )
+            return runner.run(user_message=user_message)
+
         debug_enabled = bool(debug_export) or bool(getattr(self, "_debug_mode", False))
 
         # Store tolerance level on active discussion for downstream execution tools (like execute_python_data_query)
@@ -3883,6 +4153,7 @@ class ChatMixin:
         # If False, the ArtefactManager will NOT register type="tool" artefacts as executable LCP tools.
         object.__setattr__(self, "allow_dynamic_tools", allow_dynamic_tools)
         object.__setattr__(self, "remove_thinking_blocks", remove_thinking_blocks)
+        object.__setattr__(self, "_orchestrator_mode", orchestrator_mode)
 
         # 🛡️ SECURITY: Store the arbitrary code execution flag.
         object.__setattr__(self, "enable_code_execution", enable_code_execution)
@@ -3968,6 +4239,14 @@ class ChatMixin:
         # ── 🧹 CORE RULES (ALWAYS ACTIVE) ──
         # These are fundamental behavioral rules that apply regardless of feature flags
         core_rules = (
+            "\n=== SANDBOX OPACITY REQUIREMENT (CRITICAL) ===\n"
+            "1. NEVER reference, print, or embed absolute host paths (C:\\..., /home/..., /Users/...) in code, "
+            "tool parameters, artifacts, or answers. The workspace root is '.' — always use relative paths.\n"
+            "2. NEVER call sys.path.insert with a physical disk location. Import workspace siblings directly "
+            "(e.g. 'from ontology import server').\n"
+            "3. When executing scripts, assume the CWD IS the workspace. Reference files as './filename.ext'.\n"
+            "4. If an error trace reveals a host path, treat it as redacted ('<host-path>') — do not attempt to "
+            "reconstruct or print it.\n\n"
             "\n=== VERACITY & ATTRIBUTION REQUIREMENTS ===\n"
             "Cite retrieved sources as [1],[2]... "
             "Never fabricate facts. Say 'I don't know' when uncertain.\n"
@@ -3990,7 +4269,7 @@ class ChatMixin:
         user_msg_lower = user_message.lower()
 
         # Artifact Instructions (only if artifacts are enabled)
-        if enable_artefacts:
+        if enable_artefacts and not orchestrator_persona:
             extra_instructions += self._build_artefact_instructions()
 
             # Sub-feature instructions (only if their parent feature is enabled)
@@ -4019,7 +4298,7 @@ class ChatMixin:
 
         # Image Generation Instructions (only if image generation/editing is enabled AND TTI capability exists)
         _has_tti = getattr(self.lollmsClient, 'tti', None) is not None or bool(getattr(self.lollmsClient, 'tti_model_profiles_registry', None))
-        if (enable_image_generation or enable_image_editing) and _has_tti:
+        if (enable_image_generation or enable_image_editing) and _has_tti and not orchestrator_persona:
             extra_instructions += self._build_image_generation_instructions()
 
         # Combine core sections (feature rules will be added later after active_tools is built)
@@ -4086,25 +4365,21 @@ class ChatMixin:
         if data_zones:
             full_system_prompt += "\n" + "\n\n".join(data_zones)
 
-        # ── 7. Tool calling registry & Dynamic Library Mounting ──
-        # ── SOVEREIGN OPT-IN DOCTRINE ──
-        active_tools = {}
+        active_tools = self._resolve_active_tools(
+            personality=personality,
+            tools=tools,
+            enable_data_tools=enable_data_tools,
+            enable_code_execution=enable_code_execution,
+            debug=debug,
+            user_message=user_message,
+            suppress_images=suppress_images,
+            images=images,
+            orchestrator_mode=orchestrator_mode,
+            orchestrator_persona=orchestrator_persona,
+            kwargs=kwargs,
+        )
 
-        # 1. Personality Handbag Tools, RAG Tools & Skill Tools
-        if personality and hasattr(personality, "build_rag_tools"):
-            active_tools.update(personality.build_rag_tools())
-
-        if personality and hasattr(personality, "skills_manager") and personality.skills_manager:
-            active_tools.update(personality.skills_manager.build_skill_tools())
-
-        if personality and hasattr(personality, "capabilities") and personality.capabilities and personality.capabilities.enable_skill_creation:
-            if personality.skills_manager:
-                skill_tools = personality.skills_manager.build_skill_tools()
-                for t_name, t_spec in skill_tools.items():
-                    if t_name in ("tool_create_skill", "tool_update_skill", "tool_append_to_skill", "tool_remove_skill"):
-                        active_tools[t_name] = t_spec
-
-        if personality and hasattr(personality, "tools") and _is_tool_binding(personality.tools):
+        if personality and hasattr(personality, "tools") and _is_tool_binding(personality.tools) and not orchestrator_persona:
             try:
                 pers_tools = personality.tools.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
                 active_tools.update(pers_tools)
@@ -4122,7 +4397,7 @@ class ChatMixin:
             except Exception as ex:
                 ASCIIColors.error(f"[ChatMixin] Personality tool binding failed to produce specs: {ex}")
                 trace_exception(ex)
-        elif personality and hasattr(personality, "tools") and isinstance(personality.tools, dict):
+        elif personality and hasattr(personality, "tools") and isinstance(personality.tools, dict) and not orchestrator_persona:
             active_tools.update(personality.tools)
 
         # 2. Explicit User-Supplied Tools (Callables or Default Tool Names)
@@ -4141,95 +4416,7 @@ class ChatMixin:
                 except Exception as ex:
                     trace_exception(ex)
 
-        # ── UNIFIED CONTEXT-AWARE LCP TOOL MOUNTING ──
-        # Scans the workspace for data and document files ONCE, then mounts the
-        # appropriate LCP libraries into a single shared binding before extracting
-        # all tool specs in one pass. This prevents state loss and duplicate bindings.
-        from pathlib import Path
         lcp_binding = getattr(self.lollmsClient, "tools", None)
-
-        workspace_dir = Path(self.workspace_data_path) if getattr(self, "workspace_data_path", None) else Path("./data_workspace")
-
-        data_extensions = {".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"}
-        doc_extensions = {".pdf", ".docx", ".pptx", ".odt", ".epub", ".txt", ".md", ".json", ".yaml", ".xml"}
-
-        all_files = list(workspace_dir.rglob("*")) if workspace_dir.exists() else []
-        has_data_files = any(f.suffix.lower() in data_extensions for f in all_files if f.is_file())
-        has_doc_files = any(f.suffix.lower() in doc_extensions for f in all_files if f.is_file())
-
-        needs_lcp_binding = enable_data_tools or enable_code_execution or has_data_files or has_doc_files
-
-        if needs_lcp_binding and lcp_binding is None:
-            try:
-                from lollms_client.tools_bindings.lcp import LCPBinding
-                lcp_binding = LCPBinding(tools_folders=[])
-                if not hasattr(self.lollmsClient, "tools") or self.lollmsClient.tools is None:
-                    self.lollmsClient.tools = lcp_binding
-                ASCIIColors.success("[ChatMixin] Auto-provisioned shared LCPBinding for context-aware tools.")
-            except Exception as ex:
-                trace_exception(ex)
-                lcp_binding = None
-
-        if lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
-            # 1. Mount Data Tools
-            if enable_data_tools and has_data_files:
-                lcp_binding.mount_tool_library("semantic_data_engineer")
-                ASCIIColors.info("[ChatMixin] Mounted 'semantic_data_engineer' (data files detected).")
-
-            # 2. Mount Document Editing Tools
-            if enable_data_tools and has_doc_files:
-                lcp_binding.mount_tool_library("as_is_document_tools")
-                lcp_binding.mount_tool_library_if_absent("document_editor")
-                ASCIIColors.info("[ChatMixin] Mounted 'document_editor' and 'as_is_document_tools' (document files detected).")
-
-            # 3. Mount Arbitrary Code Execution Toolset (inline code + workspace file runner)
-            if enable_code_execution:
-                lcp_binding.mount_tool_library_if_absent("execute_python")
-                ASCIIColors.info("[ChatMixin] Mounted 'execute_python' (inline + file execution enabled).")
-
-            # 4. Extract all tool specs in a single pass
-            try:
-                lcp_tools = lcp_binding.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
-                for t_name, t_spec in lcp_tools.items():
-                    if t_name == "tool_execute_python_data_query" and enable_data_tools and has_data_files:
-                        active_tools[t_name] = t_spec
-                    elif t_name in ("tool_execute_python_code", "tool_execute_python_file") and enable_code_execution:
-                        active_tools[t_name] = t_spec
-                    elif t_name.startswith(("tool_inspect_document", "tool_read_document_content", "tool_grep_document", "tool_modify_docx", "tool_modify_excel", "tool_edit_document_text", "tool_annotate_document", "tool_modify_pdf_annotation", "tool_modify_pptx_slide")) and enable_data_tools and has_doc_files:
-                        active_tools[t_name] = t_spec
-            except Exception as ex:
-                trace_exception(ex)
-                ASCIIColors.error(f"[ChatMixin] Failed to extract tool specs from LCP binding: {ex}")
-
-            # 5. Fallback registration via discovered_tools if to_chat_tool_specs failed
-            for td in lcp_binding.discovered_tools:
-                t_name = td.get("name", "")
-                if t_name not in active_tools:
-                    if (t_name == "tool_execute_python_data_query" and enable_data_tools and has_data_files) or \
-                       (t_name in ("tool_execute_python_code", "tool_execute_python_file") and enable_code_execution) or \
-                       (t_name.startswith(("tool_inspect_document", "tool_read_document_content", "tool_grep_document", "tool_modify_docx", "tool_modify_excel", "tool_edit_document_text", "tool_annotate_document", "tool_modify_pdf_annotation", "tool_modify_pptx_slide")) and enable_data_tools and has_doc_files):
-                        params_list = []
-                        input_schema = td.get("input_schema", {})
-                        for prop_name, prop_info in input_schema.get("properties", {}).items():
-                            params_list.append({
-                                "name": prop_name,
-                                "type": prop_info.get("type", "string"),
-                                "description": prop_info.get("description", ""),
-                            })
-                        active_tools[t_name] = {
-                            "name": t_name,
-                            "description": td.get("description", "Executes tool operation."),
-                            "parameters": params_list,
-                        }
-                        ASCIIColors.success(f"[ChatMixin] Registered {t_name} via direct discovered_tools fallback.")
-
-        if active_tools:
-            ASCIIColors.info(
-                f"[ChatMixin] Final active tool registry ({len(active_tools)} tool(s)): "
-                f"{sorted(active_tools.keys())}"
-            )
-        else:
-            ASCIIColors.warning("[ChatMixin] Final active tool registry is EMPTY — no tools available to the LLM this turn.")
 
         if debug and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
             lcp_binding.mount_tool_library("debug_toolset")
@@ -4270,17 +4457,13 @@ class ChatMixin:
                     except Exception as ex:
                         trace_exception(ex)
 
-        # Optionally merge spinoff agents as dynamic local tools
-        if enable_sub_agents:
-            spinoff_tools = self._get_spinoff_agent_tools(full_system_prompt, images or [], **kwargs)
-            active_tools.update(spinoff_tools)
 
-        # ── 🎯 CONDITIONAL FEATURE RULES (INJECTED AFTER active_tools IS BUILT) ──
-        # Now that we know which features are actually enabled, inject the appropriate rules
+        # ── 🎯 WORKER-TIER EXECUTION DOCTRINE ──
+        # chat() always runs the worker persona here. The orchestrator persona
+        # lives in lollms_agentic.OrchestratorAgent and never reaches this code.
         feature_rules = ""
 
-        # Action Execution & Termination Protocol (only if agentic features are enabled)
-        if enable_artefacts or active_tools or enable_memory:
+        if (enable_artefacts or active_tools or enable_memory) and not orchestrator_persona:
             feature_rules += (
                 "\n=== ACTION EXECUTION & SAME-RESPONSE MANDATE (CRITICAL) ===\n"
                 "1. **INTENT ≠ EXECUTION (SAME-RESPONSE EXECUTION MANDATE)**: Stating 'I will search...', 'Let me analyze...', 'I am now writing...', or any equivalent declaration in ANY language (English, Arabic, Chinese, French, Spanish, etc.) DOES NOT execute the action. Conversational text is completely inert.\n"
@@ -4288,7 +4471,7 @@ class ChatMixin:
                 "   - **NEVER SPLIT INTENT AND TAGS**: Never announce what you are going to do and then stop without emitting the tag. If you state intent without outputting the XML tag in the same response, the turn will end with nothing done.\n"
                 "   - **DESTRUCTIVE VS CONSTRUCTIVE OPERATIONS**:\n"
                 "     • If an action is risky, destructive, or irreversible (e.g. deleting files, force-pushing git branches, dropping database tables), explicitly ask the user for confirmation and wait for their reply before emitting destructive tags.\n"
-                "     • For ALL normal, constructive tasks (creating/editing files, querying data, reading files, searching memories, generating tools), output the functional tag IMMEDIATELY in the same turn without asking or waiting.\n"
+                "     • For ALL normal, constructive tasks (creating/editing files, querying data, reading files, searching memories), output the functional tag IMMEDIATELY in the same turn without asking or waiting.\n"
                 "2. **MANDATORY TAG EMISSION**: If your response states that you are writing code, searching, or loading files, the functional tag MUST appear in that same response.\n"
                 "3. **EXPLICIT TERMINATION WITH <done/>**: You control the agentic loop. When you have finished all actions, verified all outputs, and formulated your final conversational response, terminate with `<done/>` on a new line.\n"
                 "   **EXAMPLE**:\n"
@@ -4302,7 +4485,7 @@ class ChatMixin:
             )
 
         # System Notification Handling (only if context unlocking is possible)
-        if enable_artefacts:
+        if enable_artefacts and not orchestrator_persona:
             feature_rules += (
                 "\n=== SYSTEM NOTIFICATION HANDLING ===\n"
                 "1. **RECOGNIZE SYSTEM NOTIFICATIONS**: Messages wrapped in `[SYSTEM NOTIFICATION - NOT A USER MESSAGE]...[END SYSTEM NOTIFICATION]` are infrastructure events, not user input.\n"
@@ -4312,7 +4495,7 @@ class ChatMixin:
             )
 
         # Tool Calling Discipline (only if tools are available)
-        if active_tools:
+        if active_tools and not orchestrator_persona:
             feature_rules += (
                 "\n=== TOOL CALLING DISCIPLINE (CRITICAL) ===\n"
                 "1. **Tool Results ≠ Tool Calls**: When a tool returns JSON output (e.g., {\"success\": true, \"output\": ...}), "
@@ -4328,7 +4511,7 @@ class ChatMixin:
             )
 
         # Thinking & Reasoning Constraint (only if agentic features are enabled)
-        if enable_artefacts or active_tools or enable_memory:
+        if (enable_artefacts or active_tools or enable_memory) and not orchestrator_persona:
             feature_rules += (
                 "\n=== THINKING & REASONING CONSTRAINT ===\n"
                 "If you decide to output a thought process enclosed in  tags, "
@@ -4338,7 +4521,7 @@ class ChatMixin:
             )
 
         # Anti-Mimicry Protocol (only if agentic features are enabled)
-        if enable_artefacts or active_tools:
+        if (enable_artefacts or active_tools) and not orchestrator_persona:
             feature_rules += (
                 "\n=== ACTION INTEGRITY PROTOCOL (CRITICAL) ===\n"
                 "1. **USE REAL TAGS**: To create artifacts, you MUST use `<artifact name=\"...\">` XML tags. To call tools, use `<tool>`. Saying you will do something in text without emitting tags produces NO changes.\n"
@@ -4349,8 +4532,24 @@ class ChatMixin:
         if feature_rules:
             full_system_prompt += feature_rules
 
+        # Orchestrator persona: replace all worker doctrine with the
+        # grammar-free delegation protocol (zero tool syntax, zero artifact XML).
+        if orchestrator_persona:
+            full_system_prompt += self._build_orchestrator_instructions()
+
         tools_prompt = ""
-        if active_tools:
+        if orchestrator_persona and active_tools:
+            tools_prompt = (
+                "\n=== WORKER SPECIALTIES (delegation catalogue — NOT callable by you) ===\n"
+                "These are the capabilities held by the specialist workers you spawn.\n"
+                "You cannot invoke them yourself. Never emit tool-call tags or tool "
+                "syntax of any kind. When a specialist needs one of these "
+                "capabilities, describe it in plain words inside your <task> text.\n"
+            )
+            for t_name, t_spec in active_tools.items():
+                tools_prompt += f"- {t_name}: {t_spec.get('description', '')}\n"
+            tools_prompt += "=== END WORKER SPECIALTIES ===\n"
+        elif active_tools:
             tools_prompt = "\n=== TOOLS AVAILABLE ===\n"
             tools_prompt += "To use a tool, you MUST emit a single <tool> tag on a new line with the tool parameters as a JSON object, and then stop generating. Do NOT write prose before or after the tag.\n"
             tools_prompt += (
@@ -4404,12 +4603,11 @@ class ChatMixin:
             ASCIIColors.info("[ChatMixin] FailureMemory cleared for new turn.")
 
         # ── 8. Active Deliberation Loop ──
-        import time as _chat_time
-        _t_branch_start = _chat_time.perf_counter()
+        _t_branch_start = time.perf_counter()
         ASCIIColors.info("[Trace] Retrieving conversation branch...")
         current_branch_tip = branch_tip_id or self.active_branch_id
         branch = self.get_branch(current_branch_tip)
-        _t_branch_end = _chat_time.perf_counter()
+        _t_branch_end = time.perf_counter()
         ASCIIColors.info(f"[Trace] Branch retrieved in {(_t_branch_end - _t_branch_start)*1000:.2f} ms ({len(branch)} messages).")
 
         # ── 🧠 VIRTUAL HISTORY & KV-CACHE PROTOCOL ──
@@ -4433,19 +4631,27 @@ class ChatMixin:
         #    - This ensures the LLM has full situational awareness without overwhelming the context.
 
         virtual_history = []
+        object.__setattr__(self, "_vh_append", virtual_history.append)
 
-        # ── 🔄 ROLLING WINDOW CONFIGURATION ──
-        # Maximum number of recent rounds to keep in full detail
-        ROLLING_WINDOW_SIZE = 4
-        # Maximum total tokens for virtual history before compression kicks in
-        VIRTUAL_HISTORY_TOKEN_BUDGET = 8000
+        # ── 🔄 ACTION-WINDOW RECOLLECTION PROTOCOL (Placeholder-Free) ──
+        # The compression window counts ACTIONS (successful tool calls and
+        # artifact dispatches), not raw message count. When the window
+        # overflows, the oldest action round is removed from virtual_history
+        # entirely and a deterministic narrative digest entry is recorded in
+        # the system-zone digest log instead. No stub tokens, no
+        # status="superseded" anchors, no synthetic history entries.
+        action_window = max(1, int(getattr(self, "history_compression_window", 4) or 4))
+        turn_digest_log: List[str] = []
+        object.__setattr__(self, "_turn_digest_log", turn_digest_log)
+        completed_actions: List[Dict[str, Any]] = []
+        digested_action_count = 0
+        total_actions_this_turn = 0
 
         tool_calls_this_turn = []
+        tool_refusals = 0
         round_count = 0
         conversational_gist = ""  # Accumulates only the conversational text for the final DB message
-        pending_analysis = False
-        pending_analysis_round = 0
-        bare_done_rejections = 0
+        worker_turn = not (orchestrator_mode or orchestrator_persona)
 
         # ── ENVIRONMENT EPOCH: TRUE REPETITION GATING ────────────────────────────
         # A repetition exists ONLY when the LLM re-issues the exact same call
@@ -4474,101 +4680,98 @@ class ChatMixin:
         executed_memory_searches = set()
         object.__setattr__(self, '_executed_memory_searches', executed_memory_searches)
 
-        # ── 🔄 ROLLING WINDOW & SUPERSEDED ARTIFACT FOLDING ──
+        # ── 🔄 ACTION-WINDOW RECOLLECTION COMPRESSION (Placeholder-Free) ──
+        def _digest_params(params: Dict[str, Any]) -> str:
+            try:
+                rendered = json.dumps(params, ensure_ascii=False, default=str)
+            except Exception:
+                rendered = str(params)
+            if len(rendered) > 160:
+                rendered = rendered[:157] + "..."
+            return rendered
+
+        def _split_rounds() -> List[List[Any]]:
+            rounds: List[List[Any]] = []
+            current: List[Any] = []
+            for vh in virtual_history:
+                current.append(vh)
+                if vh.sender_type == "user":
+                    rounds.append(current)
+                    current = []
+            if current:
+                rounds.append(current)
+            return rounds
+
+        def _register_completed_action(action: Dict[str, Any]) -> None:
+            nonlocal total_actions_this_turn, digested_action_count
+            total_actions_this_turn += 1
+            completed_actions.append(action)
+            if len(completed_actions) > action_window:
+                expired = completed_actions.pop(0)
+                expired_round = expired["round"]
+                digest_line = _build_digest_line(expired)
+                if digest_line:
+                    turn_digest_log.append(digest_line)
+                _drop_round_from_virtual_history(expired_round)
+                digested_action_count += 1
+
+        def _build_digest_line(action: Dict[str, Any]) -> str:
+            kind = action.get("kind", "tool")
+            if kind == "tool":
+                name = action.get("name", "unknown")
+                params = _digest_params(action.get("params", {}))
+                verdict = "succeeded" if action.get("success") else "failed"
+                return (
+                    f"- (round {action.get('round', '?')}) Executed tool '{name}' "
+                    f"with parameters {params} — the call {verdict}."
+                )
+            if kind == "artifact":
+                title = action.get("title", "untitled")
+                op = action.get("op", "updated")
+                version = action.get("version")
+                version_str = f" (now v{version})" if version else ""
+                return (
+                    f"- (round {action.get('round', '?')}) {op} artifact '{title}'{version_str} "
+                    f"in the workspace; its current content is loaded in the Active Artifacts zone."
+                )
+            return f"- (round {action.get('round', '?')}) Performed action: {action.get('detail', 'unknown action')}."
+
+        def _drop_round_from_virtual_history(round_id: int) -> None:
+            rounds = _split_rounds()
+            kept: List[Any] = []
+            for i, msgs in enumerate(rounds, start=1):
+                if i == round_id:
+                    continue
+                kept.extend(msgs)
+            virtual_history[:] = kept
+
         def _compress_virtual_history_if_needed():
             """
-            Compresses older rounds and folds superseded versions of the same file
-            in virtual_history to prevent context window explosion during long loops.
+            Enforces the action-window doctrine on virtual_history.
+
+            Called after every completed action. Any action round that has
+            aged out of the window is removed from virtual_history and its
+            narrative digest line is appended to the system-zone digest log
+            (injected into the per-round system prompt). The workspace itself
+            remains the source of truth for artifact content, so dropping the
+            raw round loses nothing that cannot be re-derived.
             """
-            nonlocal virtual_history
-
-            if not virtual_history:
+            nonlocal digested_action_count
+            if not completed_actions:
                 return
-
-            # ── 1. SUPERSEDED ARTIFACT FOLDING (Same-File Compaction) ──
-            # Find all artifact modifications per file
-            artifact_occurrences: Dict[str, List[int]] = {}
-            for idx, vh in enumerate(virtual_history):
-                if vh.sender_type == "assistant":
-                    for match in re.finditer(r'<art(?:ifact|efact)\s+[^>]*name=["\']([^"\']+)["\']', vh.content, re.I):
-                        fname = match.group(1)
-                        artifact_occurrences.setdefault(fname, []).append(idx)
-
-            # If a file was modified 3+ times in this turn, fold earlier full bodies
-            for fname, indices in artifact_occurrences.items():
-                if len(indices) > 2:
-                    # Fold all but the last 2 occurrences into self-closing anchors
-                    for old_idx in indices[:-2]:
-                        old_msg = virtual_history[old_idx]
-                        old_msg.content = re.sub(
-                            rf'<art(?:ifact|efact)\s+([^>]*name=["\']{re.escape(fname)}["\'][^>]*)>.*?</art(?:ifact|efact)>',
-                            rf'<artifact name="{fname}" status="superseded" />',
-                            old_msg.content,
-                            flags=re.DOTALL | re.IGNORECASE
-                        )
-
-            # ── 2. GENERAL TOKEN BUDGET COMPRESSION ──
-            total_chars = sum(len(vh.content) for vh in virtual_history)
-            estimated_tokens = total_chars // 4
-
-            needs_compression = estimated_tokens > VIRTUAL_HISTORY_TOKEN_BUDGET or len(virtual_history) > (ROLLING_WINDOW_SIZE * 2)
-            if not needs_compression:
-                return
-
-            rounds = []
-            current_round = []
-            for vh in virtual_history:
-                current_round.append(vh)
-                if vh.sender_type == "user":
-                    rounds.append(current_round)
-                    current_round = []
-            if current_round:
-                rounds.append(current_round)
-
-            if len(rounds) > ROLLING_WINDOW_SIZE:
-                rounds_to_compress = rounds[1:-ROLLING_WINDOW_SIZE]
-                rounds_to_keep = [rounds[0]] + rounds[-ROLLING_WINDOW_SIZE:]
-
-                compressed_summary_lines = ["<action_result type=\"history_summary\" status=\"COMPACTED\">"]
-                compressed_summary_lines.append(f"The preceding {len(rounds_to_compress)} intermediate iteration rounds were summarized to preserve context:")
-
-                for idx, round_msgs in enumerate(rounds_to_compress, 1):
-                    assistant_msg = next((m for m in round_msgs if m.sender_type == "assistant"), None)
-                    user_msg = next((m for m in round_msgs if m.sender_type == "user"), None)
-
-                    if assistant_msg:
-                        actions = []
-                        for m in re.finditer(r'<tool>\s*{"name":\s*"([^"]+)"', assistant_msg.content):
-                            actions.append(f"Tool `{m.group(1)}`")
-                        for m in re.finditer(r'<(?:artifact|artefact)\s+name=["\']([^"\']+)["\']', assistant_msg.content):
-                            actions.append(f"Updated `{m.group(1)}`")
-                        for m in re.finditer(r'<skill\s+title=["\']([^"\']+)["\']', assistant_msg.content):
-                            actions.append(f"Created skill `{m.group(1)}`")
-
-                        if actions:
-                            compressed_summary_lines.append(f"• Round {idx}: {', '.join(actions)}")
-                        else:
-                            clean_txt = re.sub(r'<[^>]+>', '', assistant_msg.content).strip()
-                            if clean_txt:
-                                compressed_summary_lines.append(f"• Round {idx}: {clean_txt[:80]}...")
-
-                    if user_msg and "<tool_result" in user_msg.content:
-                        compressed_summary_lines.append(f"  → Result received.")
-
-                compressed_summary_lines.append("Note: The latest code and files are fully available in the workspace context above.")
-                compressed_summary_lines.append("</action_result>")
-
-                new_virtual_history = []
-                new_virtual_history.extend(rounds[0])
-                new_virtual_history.append(SimpleNamespace(
-                    sender_type="user",
-                    content="\n".join(compressed_summary_lines)
-                ))
-                for round_msgs in rounds_to_keep[1:]:
-                    new_virtual_history.extend(round_msgs)
-
-                virtual_history = new_virtual_history
-                ASCIIColors.success(f"[ChatMixin] Virtual history compressed: {len(virtual_history)} messages (from {len(rounds)} rounds)")
+            while len(completed_actions) > action_window:
+                expired = completed_actions.pop(0)
+                digest_line = _build_digest_line(expired)
+                if digest_line:
+                    turn_digest_log.append(digest_line)
+                _drop_round_from_virtual_history(expired["round"])
+                digested_action_count += 1
+            if digested_action_count:
+                ASCIIColors.info(
+                    f"[ChatMixin] Action-window recollection: {digested_action_count} "
+                    f"action round(s) digested into the system-zone narrative; "
+                    f"{len(virtual_history)} message(s) remain verbatim in window."
+                )
 
         # Initialize the single, clean database assistant message ONCE before entering the loop
         ai_msg = self.add_message(
@@ -4584,7 +4787,6 @@ class ChatMixin:
         # for Handbag skill routing (modifiable/read-only enforcement) during <skill> tag dispatch.
         object.__setattr__(self, '_active_personality', personality)
 
-        object.__setattr__(self, "_consecutive_text_only_stalls", 0)
         if callback:
             callback(ai_msg.id, MSG_TYPE.MSG_TYPE_NEW_MESSAGE, {"message_id": ai_msg.id})
 
@@ -4693,6 +4895,18 @@ class ChatMixin:
 
                 current_system_prompt += "\n" + progress_summary
 
+            # ── 📜 COMPLETED ACTIONS DIGEST (System Zone, Placeholder-Free) ──
+            # Action rounds that aged out of the window are recalled here as a
+            # plain-language narrative. This lives in the system zone only: it
+            # is never rendered as a history message, so the model cannot learn
+            # to reproduce it as conversational output.
+            if turn_digest_log:
+                digest_block = "\n[COMPLETED ACTIONS DIGEST — earlier rounds of this turn]\n"
+                digest_block += "The following actions were completed in earlier rounds. Their raw transcripts were released to reclaim context; the facts and re-execution recipes are preserved here, and current file contents remain visible in the Active Artifacts zone:\n\n"
+                digest_block += "\n".join(turn_digest_log)
+                digest_block += "\n[END COMPLETED ACTIONS DIGEST]\n"
+                current_system_prompt += "\n" + digest_block
+
             messages_list = self.export(
                 format_type="openai_chat",
                 branch_tip_id=current_branch_tip,
@@ -4705,9 +4919,7 @@ class ChatMixin:
 
             if debug_enabled:
                 try:
-                    from pathlib import Path as _Path
-
-                    debug_dir = _Path(self.workspace_data_path) / "_debug_dumps"
+                    debug_dir = Path(self.workspace_data_path) / "_debug_dumps"
                     debug_dir.mkdir(parents=True, exist_ok=True)
 
                     with open(debug_dir / f"full_prompt_round_{round_count}.log", "w", encoding="utf-8") as f:
@@ -4791,8 +5003,9 @@ class ChatMixin:
                 enable_inline_widgets=enable_inline_widgets,
                 enable_forms=enable_forms,
                 auto_activate_artefacts=auto_activate_artefacts,
-                enable_artefacts=enable_artefacts,
+                enable_artefacts=enable_artefacts and not orchestrator_persona,
                 enable_in_message_status=enable_in_message_status,
+                enable_tools=not orchestrator_persona,
                 fast_artefact_replicas=fast_artefact_replicas,
                 content_offset=current_content_length,
                 processed_tags=persistent_processed_tags,
@@ -4812,7 +5025,7 @@ class ChatMixin:
                         raw_llm_output_buffer[0] += chunk
                     # ── ⏱️ TIME TO FIRST TOKEN (TTFT) ──
                     if not getattr(self, "_ttft_logged", True) and chunk:
-                        ttft = _time.perf_counter() - _t_gen_start
+                        ttft = time.perf_counter() - _t_gen_start
                         ASCIIColors.info(f"[TTFT] First token received in {ttft:.3f} s.")
                         object.__setattr__(self, "_ttft_logged", True)
 
@@ -4849,7 +5062,7 @@ class ChatMixin:
 
             # Execute generation turn (streams and appends to the existing ai_msg.content directly)
             ASCIIColors.info(f"[Trace] Starting generation for round {round_count}...")
-            _t_gen_start = _time.perf_counter()
+            _t_gen_start = time.perf_counter()
             object.__setattr__(self, "_ttft_logged", False)
             try:
                 self.lollmsClient.generate_from_messages(
@@ -4860,17 +5073,17 @@ class ChatMixin:
                     streaming_callback=_inline_relay,
                     **gen_kwargs
                 )
-                _t_gen_end = _time.perf_counter()
+                _t_gen_end = time.perf_counter()
                 ASCIIColors.info(f"[Trace] Generation round {round_count} stream completed in {(_t_gen_end - _t_gen_start):.2f} s.")
             except Exception as gen_err:
-                _t_gen_end = _time.perf_counter()
+                _t_gen_end = time.perf_counter()
                 ASCIIColors.warning(f"[Trace] Generation round {round_count} failed after {(_t_gen_end - _t_gen_start):.2f} s.")
                 if debug_enabled:
                     self._dump_error(
                         error=gen_err,
                         context_desc="LLM Generation Error",
                         round_count=round_count,
-                        extra_data={"raw_llm_output": raw_llm_output_buffer[0][-4000:]}
+                        extra_data={"raw_llm_output": _sanitize_host_paths(raw_llm_output_buffer[0][-4000:])}
                     )
                 if self.is_generation_cancelled():
                     was_cancelled = True
@@ -4887,8 +5100,7 @@ class ChatMixin:
 
             if debug_enabled and raw_llm_output_buffer[0]:
                 try:
-                    from pathlib import Path as _Path
-                    debug_dir = _Path(self.workspace_data_path) / "_debug_dumps"
+                    debug_dir = Path(self.workspace_data_path) / "_debug_dumps"
                     debug_dir.mkdir(parents=True, exist_ok=True)
                     raw_output_log_path = debug_dir / f"raw_llm_output_round_{round_count}.log"
                     with open(raw_output_log_path, "w", encoding="utf-8") as f:
@@ -4903,68 +5115,47 @@ class ChatMixin:
             ss.flush_remaining_buffer()
 
             # ── 🏁 TERMINATION TAG PROTOCOL ──
+            # The <done/> tag is sovereign: any round ending in <done/> terminates
+            # the loop immediately. The former analysis-gate and phantom-done
+            # rejection guards are removed by the Orchestrator/Worker split:
+            # the Orchestrator never executes tools, and the Worker's own
+            # self-verification is enforced by its task prompt, not by
+            # rejecting its termination signal.
             if ss.was_done_detected():
-                if pending_analysis and pending_analysis_round == round_count:
-                    bare_done_rejections += 1
-                    if bare_done_rejections >= 3:
-                        ASCIIColors.warning("[ChatMixin] Analysis gate exhausted (3 bare <done/> rejections). Allowing termination.")
-                        pending_analysis = False
-                    else:
-                        ASCIIColors.warning(f"[ChatMixin] <done/> rejected by post-tool analysis gate (rejection #{bare_done_rejections}). Textual analysis of the tool output is required first.")
-                        virtual_history.append(SimpleNamespace(
-                            sender_type="assistant",
-                            content=ss.get_clean_text_so_far().strip()
-                        ))
-                        virtual_history.append(SimpleNamespace(
-                            sender_type="user",
-                            content=(
-                                "[SYSTEM NOTIFICATION - NOT A USER MESSAGE]\n"
-                                "<action_directive status=\"REQUIRED\">\n"
-                                "⚠️ TERMINATION REJECTED: You executed a tool this turn, but the turn is not complete.\n"
-                                "The tool output has NOT been analyzed. A turn must NEVER end with an uninterpreted tool result.\n"
-                                "MANDATORY NEXT STEP: Write a clear textual analysis of the tool output for the user:\n"
-                                "1. Interpret the numbers/logs/plots (what do they mean, do they meet the stated goals?).\n"
-                                "2. State whether the objective was achieved (PASS/FAIL against the requirements).\n"
-                                "3. If the result reveals a problem, propose and execute the fix (corrected artifact + re-run).\n"
-                                "4. Only after the analysis is written, end your response with `<done/>` on a new line.\n"
-                                "Do NOT emit `<done/>` before this analysis.\n"
-                                "</action_directive>\n"
-                                "[END SYSTEM NOTIFICATION]"
-                            )
-                        ))
-                        _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
-                        continue
-                # ── 🛡️ PHANTOM <done/> REJECTION GUARD ──
-                # If the user explicitly requested creating/writing a skill, artifact, or tool,
-                # but zero actions were executed in the entire turn, reject the termination!
-                user_req_lower = user_message.lower()
-                explicitly_requested_action = any(
-                    kw in user_req_lower for kw in ("build a skill", "create a skill", "make a skill", "write a skill", "create an artifact", "write an artifact", "save a note")
-                )
-                has_executed_actions = bool(ss.affected_artefacts or tool_calls_this_turn or ss.was_action_dispatched())
-
-                if explicitly_requested_action and not has_executed_actions and round_count < resolved_max_rounds:
-                    ASCIIColors.warning("[ChatMixin] 🛑 Phantom <done/> rejected. User requested skill/artifact creation but none was emitted.")
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="assistant",
-                        content=ss.get_clean_text_so_far().strip()
-                    ))
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="user",
-                        content=(
-                            "<action_directive status=\"REJECTED\">\n"
-                            "REJECTED <done/>: You claimed the skill/artifact was created, but NO `<skill>` or `<artifact>` tag was emitted.\n"
-                            "Stating that a skill exists in conversational text does NOT save it to disk.\n"
-                            "MANDATORY: You MUST NOW emit the actual `<skill title=\"...\" description=\"...\" category=\"...\">` tag with the complete Markdown instructions on a new line.\n"
-                            "Do NOT emit <done/> until the tag is output.\n"
-                            "</action_directive>"
-                        )
-                    ))
-                    continue
-
                 ASCIIColors.info("[ChatMixin] Termination tag detected. Terminating agentic loop.")
                 _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="done")
                 break
+
+            # ── 🛑 TOOL-LESS PERSONA REFUSAL HANDLING ──
+            # A tool-less tier (orchestrator persona) attempted a <tool> call.
+            # The dispatcher already refused execution; convert the refusal into
+            # a delegation-correction envelope. Two identical strikes break the loop.
+            if ss.was_tool_refusal_detected():
+                tool_refusals += 1
+                if tool_refusals >= 2:
+                    ASCIIColors.warning("[ChatMixin] Repeated tool attempts from tool-less persona. Breaking loop.")
+                    _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="loop_break")
+                    break
+                refusal_text = _scrub_for_llm_context(
+                    ss.get_clean_text_so_far()[current_content_length:]
+                ).strip()
+                if refusal_text:
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="assistant",
+                        content=refusal_text
+                    ))
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content=(
+                        "[SYSTEM: TOOL CALL REFUSED — You are the orchestrator. "
+                        "You have no tools and cannot execute anything yourself. "
+                        "Delegate the work with a <delegate> block containing "
+                        "<task>...</task>, or, if the user's request needs no "
+                        "workspace action, answer them directly and emit <done/>.]"
+                    )
+                ))
+                _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
+                continue
 
             # ── 🔍 PROCESS PENDING MEMORY SEARCHES (HIGHEST PRIORITY) ──
             # If the LLM emitted a <mem_search> tag, execute it NOW and inject results.
@@ -5247,19 +5438,92 @@ class ChatMixin:
                     object.__setattr__(self, "_force_final_answer", True)
                     duplicate_history_text = _scrub_for_llm_context(
                         ss.get_clean_text_so_far()[current_content_length:]
-                    )
-                    if not duplicate_history_text:
-                        duplicate_history_text = "[Duplicate artifact dispatch with no conversational text]"
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="assistant",
-                        content=duplicate_history_text
-                    ))
+                    ).strip()
+                    if duplicate_history_text:
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="assistant",
+                            content=duplicate_history_text
+                        ))
                     virtual_history.append(SimpleNamespace(
                         sender_type="user",
                         content="[SYSTEM: CRITICAL. You just attempted to recreate an artifact that already exists with the exact same content. This is a loop. You MUST NOT create or update this artifact again. You MUST now provide your final conversational answer to the user, explaining what you have done, and end with <done/>.]"
                     ))
                     _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="loop_break")
                     break
+
+            # ── 🧠 DELEGATION ROUTING (PERSONA-AWARE) ──
+            # Worker persona: <delegate> is never taught; neutralize drift.
+            # Orchestrator persona: route the captured payload to a bounded
+            # Worker via DelegationMixin and feed back ONE plain-data envelope.
+            if ss.delegation_payload is not None:
+                payload = ss.delegation_payload
+                ss.delegation_payload = None
+                if worker_turn:
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content=(
+                            "[SYSTEM: <delegate> is not available in this context. "
+                            "Execute the work yourself with tools or artifacts.]"
+                        ),
+                    ))
+                    continue
+
+                parsed = self._parse_delegation_tag(
+                    payload.get("opening_tag", ""), payload.get("body", "")
+                )
+                if parsed is None:
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content=(
+                            "[SYSTEM: The <delegate> block was malformed (missing or "
+                            "empty <task>). Re-emit a valid delegation block with "
+                            "<task>...</task> and <context_files>...</context_files>.]"
+                        ),
+                    ))
+                    continue
+
+                task, context_files = parsed
+                worker_index = self._worker_counter + 1
+                worker_budget = max(2, (resolved_max_rounds - round_count) // 2)
+                worker_result = self._run_worker(
+                    task=task,
+                    context_files=context_files,
+                    worker_tools=active_tools,
+                    max_worker_rounds=worker_budget,
+                    callback=callback,
+                    event_meta={
+                        "round_id": round_count,
+                        "worker_index": worker_index,
+                        "event_mode": event_mode,
+                    },
+                )
+                object.__setattr__(self, "_worker_counter", worker_index)
+                _bump_environment_epoch()
+
+                full_round_text = ss.get_clean_text_so_far()
+                raw_delegate_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
+                delegate_gist = _scrub_for_llm_context(raw_delegate_text).strip()
+                if delegate_gist:
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="assistant",
+                        content=delegate_gist,
+                    ))
+
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content=self._build_worker_report_envelope(worker_result, worker_index),
+                ))
+
+                _register_completed_action({
+                    "kind": "tool",
+                    "name": f"delegate_worker_{worker_index}",
+                    "params": {"task": task[:200]},
+                    "success": worker_result.get("success", False),
+                    "round": round_count,
+                })
+                _compress_virtual_history_if_needed()
+                _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
+                continue
 
             # ── 🛑 ONE-ACTION-PER-TURN PROTOCOL ──
             # If the StreamState dispatched an artifact, note, skill, or context update
@@ -5275,7 +5539,6 @@ class ChatMixin:
                 raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
 
                 # Sanitize the raw text to remove processing blocks and HTML comments
-                from ._context_sanitizer import scrub_processing_and_status_blocks
                 clean_history_text = scrub_processing_and_status_blocks(raw_round_text)
 
                 # ── 🧠 VERBATIM TAG PRESERVATION (ANTI-PHANTOM DEMONSTRATION) ──
@@ -5359,6 +5622,15 @@ class ChatMixin:
                     if last_art.get("destination") == "handbag":
                         action_dest = f"handbag '{last_art.get('handbag_name', 'personality')}'"
 
+                for dispatched_art in ss.affected_artefacts:
+                    _register_completed_action({
+                        "kind": "artifact",
+                        "title": dispatched_art.get("title", "untitled"),
+                        "op": "created" if dispatched_art.get("version", 1) == 1 else "updated",
+                        "version": dispatched_art.get("version"),
+                        "round": round_count,
+                    })
+
                 _compress_virtual_history_if_needed()
 
                 # ── 🛡️ CLEAN ENVELOPE NOTIFICATION (ZERO MIMICRY) ──
@@ -5387,9 +5659,6 @@ class ChatMixin:
                         call_data = json.loads(tool_call_json_str)
                     except Exception:
                         call_data = {}
-
-                    if pending_analysis and pending_analysis_round < round_count:
-                        pending_analysis = False
 
                     # ── 🛑 CRITICAL FIX: PHANTOM TOOL CALL PREVENTION ──
                     # If the LLM emits a <tool> tag but the JSON is malformed or missing
@@ -5425,13 +5694,12 @@ class ChatMixin:
                         full_round_text = ss.get_clean_text_so_far()
                         raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
                         clean_history_text = _scrub_for_llm_context(raw_round_text)
-                        clean_history_text = re.sub(r'<tool>.*?</tool>', '', clean_history_text, flags=re.DOTALL | re.IGNORECASE)
-                        if not clean_history_text:
-                            clean_history_text = "[Malformed tool call emitted with no conversational text]"
-                        virtual_history.append(SimpleNamespace(
-                            sender_type="assistant",
-                            content=clean_history_text
-                        ))
+                        clean_history_text = re.sub(r'<tool>.*?</tool>', '', clean_history_text, flags=re.DOTALL | re.IGNORECASE).strip()
+                        if clean_history_text:
+                            virtual_history.append(SimpleNamespace(
+                                sender_type="assistant",
+                                content=clean_history_text
+                            ))
                         virtual_history.append(SimpleNamespace(
                             sender_type="user",
                             content=correction_msg
@@ -5548,15 +5816,17 @@ class ChatMixin:
 
                     full_round_text = ss.get_clean_text_so_far()
                     raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
-                    clean_history_text = _scrub_for_llm_context(raw_round_text)
-                    clean_history_text = re.sub(r'<tool>.*?</tool>', '', clean_history_text, flags=re.DOTALL | re.IGNORECASE)
-                    if not clean_history_text:
-                        clean_history_text = f"[Dispatched tool call to '{tool_name}']"
-
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="assistant",
-                        content=clean_history_text
-                    ))
+                    clean_history_text = _scrub_for_llm_context(raw_round_text).strip()
+                    if clean_history_text:
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="assistant",
+                            content=f"{clean_history_text}\n\n<tool>{tool_call_json_str}</tool>"
+                        ))
+                    else:
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="assistant",
+                            content=f"<tool>{tool_call_json_str}</tool>"
+                        ))
 
                     # ── 🛡️ PHANTOM TOOL INTERCEPTION ──
                     # If the LLM hallucinates a tool that is not in the active registry,
@@ -5758,22 +6028,20 @@ class ChatMixin:
 
                     if active_tools and tool_name in active_tools and "callable" not in active_tools[tool_name]:
                         if lcp_binding and hasattr(lcp_binding, "execute_tool"):
-                            import os as _os
-                            from pathlib import Path as _Path
-                            _old_cwd_lcp = _os.getcwd()
+                            _old_cwd_lcp = os.getcwd()
 
                             # Resolve workspace_data path
                             if hasattr(self, "workspace_data_path") and self.workspace_data_path:
-                                _lcp_workspace_dir = _Path(self.workspace_data_path)
+                                _lcp_workspace_dir = Path(self.workspace_data_path)
                             else:
-                                _base_ws = _Path(self.workspace_path) if hasattr(self, "workspace_path") and self.workspace_path else _Path("./data_workspace")
+                                _base_ws = Path(self.workspace_path) if hasattr(self, "workspace_path") and self.workspace_path else Path("./data_workspace")
                                 _lcp_workspace_dir = _base_ws / self.id / "workspace_data"
 
                             _lcp_workspace_dir.mkdir(parents=True, exist_ok=True)
                             _lcp_workspace_str = str(_lcp_workspace_dir.resolve())
 
                             try:
-                                _os.chdir(_lcp_workspace_str)
+                                os.chdir(_lcp_workspace_str)
 
                                 try:
                                     self.artefacts.sync_all_active_to_disk()
@@ -5782,7 +6050,7 @@ class ChatMixin:
 
                                 # ── Take BEFORE Snapshot (LCP Path) ──
                                 _lcp_files_before = {}
-                                _lcp_cwd = _Path(_lcp_workspace_str)
+                                _lcp_cwd = Path(_lcp_workspace_str)
                                 if _lcp_cwd.exists():
                                     for f in _lcp_cwd.rglob("*"):
                                         if f.is_file():
@@ -5814,12 +6082,12 @@ class ChatMixin:
                                        lollms_client_instance=self.lollmsClient, 
                                        discussion_instance=self,
                                     )
-                                except Exception as lcp_exec_err:
-                                    trace_exception(lcp_exec_err)
+                                except Exception as e:
+                                    trace_exception(e)
                                     tool_res = {
-                                       "success": False,
-                                       "error": f"Tool '{tool_name}' crashed: {lcp_exec_err}",
-                                       "traceback": traceback.format_exc()
+                                        "success": False,
+                                        "error": _sanitize_host_paths(f"Tool '{tool_name}' crashed: {e}"),
+                                        "traceback": _sanitize_host_paths(traceback.format_exc())
                                     }
                                 _lcp_executed = True
 
@@ -5852,7 +6120,7 @@ class ChatMixin:
                                 self._sync_tool_artifacts(tool_name, _lcp_files_before, _lcp_files_after, callback)
                             finally:
                                 # 🛑 CRITICAL: Always restore CWD to prevent workspace corruption
-                                _os.chdir(_old_cwd_lcp)
+                                os.chdir(_old_cwd_lcp)
                         else:
                             tool_res = {
                                 "success": False,
@@ -5901,8 +6169,6 @@ class ChatMixin:
                                 trace_exception(ex)
                                 sync_ws, sync_files = None, []
 
-                            import os
-                            from pathlib import Path
                             old_cwd = os.getcwd()
 
                             if hasattr(self, 'workspace_path') and self.workspace_path:
@@ -5945,8 +6211,7 @@ class ChatMixin:
                                 ASCIIColors.info(f"[ChatMixin] Sanitized tool params: {sanitized_params}")
 
                                 call_kwargs = dict(sanitized_params)
-                                import inspect as _inspect
-                                _tool_sig_params = _inspect.signature(active_tools[tool_name]["callable"]).parameters
+                                _tool_sig_params = inspect.signature(active_tools[tool_name]["callable"]).parameters
                                 if "discussion_instance" in _tool_sig_params:
                                     call_kwargs["discussion_instance"] = self
                                 if "lollms_client_instance" in _tool_sig_params:
@@ -6110,7 +6375,13 @@ class ChatMixin:
                                         )
                                         self.commit()
 
-                                        clean_result_str = f"[SYSTEM: Tool returned {tool_output_tokens} tokens of text. It has been saved to '{log_filename}'. Unlock it to read a portion, or save findings to your scratchpad.]"
+                                        clean_result_str = (
+                                            f"[SYSTEM: Tool returned {tool_output_tokens} tokens of text. "
+                                            f"It has been saved to '{log_filename}'. Inspect precisely with "
+                                            f"tool_read_lines / tool_read_chars / tool_grep_file on that file "
+                                            f"(line window, char offset, or grep with context), or <unlock_file> it "
+                                            f"to load a portion. Do not re-run the producing tool.]"
+                                        )
 
                                 status_done_line = f"* Completed execution of '{tool_name}' successfully.\n"
                                 # 🛡️ CRITICAL FIX: Guard against NoneType output from tools
@@ -6121,7 +6392,7 @@ class ChatMixin:
                                         full_dump = json.dumps(full_dump, indent=2, default=str, ensure_ascii=False)
                                     except Exception:
                                         full_dump = str(full_dump)
-                                safe_output = full_dump[:2000] + ("..." if len(full_dump) > 2000 else "")
+                                safe_output = _build_windowed_output_preview(full_dump)
                                 details_block = f"Output Logs:\n{safe_output}\n"
                         else:
                             result_str = str(tool_res) if tool_res is not None else "No output returned."
@@ -6140,7 +6411,7 @@ class ChatMixin:
                             else:
                                 status_done_line = f"* Completed execution of '{tool_name}' successfully.\n"
                                 clean_result_str = _sanitize_tool_result(tool_res, client=self.lollmsClient)
-                                safe_output = result_str[:2000] + ("..." if len(result_str) > 2000 else "")
+                                safe_output = _build_windowed_output_preview(result_str)
                                 details_block = f"Output Logs:\n{safe_output}\n"
                     except Exception as e:
                         trace_exception(e)
@@ -6159,11 +6430,11 @@ class ChatMixin:
                                 if not hasattr(failure_memory, "_signatures"):
                                     object.__setattr__(failure_memory, "_signatures", set())
                                 failure_memory._signatures.add(context_aware_signature)
-                        result_str = f"Error executing tool '{tool_name}': {e}"
-                        clean_result_str = f"Error executing tool '{tool_name}': {e}"
+                        result_str = _sanitize_host_paths(f"Error executing tool '{tool_name}': {e}")
+                        clean_result_str = _sanitize_host_paths(f"Error executing tool '{tool_name}': {e}")
                         status_done_line = f"* Execution crashed.\n"
-                        details_block = f"Crash Details:\n{str(e)}\n"
-                        tool_res = {"success": False, "error": str(e)}
+                        details_block = f"Crash Details:\n{_sanitize_host_paths(str(e))}\n"
+                        tool_res = {"success": False, "error": _sanitize_host_paths(str(e))}
                     inner_res = tool_res.get("output", tool_res) if isinstance(tool_res, dict) else tool_res
 
                     is_failure = (
@@ -6198,31 +6469,17 @@ class ChatMixin:
                         clean_result_str = re.sub(r'<tool_result[^>]*>.*?(?:</tool_result>|$)', '', clean_result_str, flags=re.DOTALL | re.IGNORECASE)
                         clean_result_str = clean_result_str.strip()
 
-                    if not tool_success:
-                        clean_result_str = re.sub(
-                            r'<processing[^>]*>.*?(?:</processing>|$)', '',
-                            clean_result_str, flags=re.DOTALL | re.IGNORECASE
-                        )
-                        clean_result_str = re.sub(r'<!-- status:[^>]*-->', '', clean_result_str, flags=re.IGNORECASE)
-                        clean_result_str = re.sub(r'</processing>', '', clean_result_str, flags=re.IGNORECASE)
-                        clean_result_str = re.sub(r'<tool_result[^>]*>.*?(?:</tool_result>|$)', '', clean_result_str, flags=re.DOTALL | re.IGNORECASE)
-
                     if tool_success:
                         successful_tool_signatures.add(context_aware_signature)
                         ASCIIColors.info(f"[ChatMixin] Recorded successful signature for '{tool_name}'. Total successful: {len(successful_tool_signatures)}")
                     else:
                         _bump_environment_epoch()
-                        object.__setattr__(self, "_consecutive_text_only_stalls", 0)
 
                     tool_calls_this_turn.append({
                         "name": tool_name,
                         "params": tool_params,
-                        "result": {"output": clean_result_str, "success": tool_success}
+                        "result": {"output": _sanitize_host_paths(clean_result_str), "success": tool_success}
                     })
-
-                    pending_analysis = True
-                    pending_analysis_round = round_count
-                    object.__setattr__(self, "_consecutive_text_only_stalls", 0)
 
                     # ── 📊 LOG TOOL CALL ACTION ──
                     turn_actions_log.append({
@@ -6232,8 +6489,17 @@ class ChatMixin:
                         "round": round_count
                     })
 
-                    # ── 🔄 COMPRESS VIRTUAL HISTORY IF NEEDED ──
-                    # After adding the tool result, check if we need to compress older rounds
+                    _register_completed_action({
+                        "kind": "tool",
+                        "name": tool_name,
+                        "params": tool_params,
+                        "success": tool_success,
+                        "round": round_count,
+                    })
+
+                    # ── 🔄 ACTION-WINDOW RECOLLECTION COMPRESSION ──
+                    # Expired action rounds are digested into the system-zone
+                    # narrative; in-window rounds stay verbatim.
                     _compress_virtual_history_if_needed()
 
                     # ── 🛑 SUCCESS LOOP DETECTION & PREVENTION ─────────────────────
@@ -6277,6 +6543,11 @@ class ChatMixin:
                                 f"prefix and NO sys.path manipulation. To persist a new script for later reuse, emit an "
                                 f"<artifact type=\"code\" name=\"...\"> tag first, then run it with "
                                 f"'tool_execute_python_file'.\n"
+                                f"   🚨 **SIZE DOCTRINE**: 'tool_execute_python_code' accepts a MAXIMUM of 2000 "
+                                f"characters. Larger programs are hard-rejected at the gate. For ANY substantial "
+                                f"program (optimization loops, simulations, multi-function scripts, plotting "
+                                f"pipelines), ALWAYS use the artifact + 'tool_execute_python_file' path. Never "
+                                f"attempt to squeeze a large program inline.\n"
                             )
 
                         user_part = (
@@ -6359,138 +6630,42 @@ class ChatMixin:
                 full_round_text = ss.get_clean_text_so_far()
                 raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
 
-                from ._context_sanitizer import scrub_processing_and_status_blocks
-                analysis_check_text = scrub_processing_and_status_blocks(raw_round_text).strip()
-                if pending_analysis and len(analysis_check_text) >= 80 and not ss.was_action_dispatched():
-                    pending_analysis = False
-                    bare_done_rejections = 0
-                    object.__setattr__(self, "_consecutive_text_only_stalls", 0)
-
-                clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
-                clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
-                clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
-                # ── PRESERVE FUNCTIONAL TAGS IN LATEST ASSISTANT HISTORY ENTRY ──
-                # Older entries are scrubbed by the Three-View Protocol at export time;
-                # the LATEST assistant turn keeps its raw tags verbatim so the model
-                # retains a positive demonstration of correct tag emission.
-                clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
-                clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
-
                 # ── 🛡️ EMPTY RESPONSE GUARD (0 Tokens Generated) ──
                 if not raw_round_text.strip():
                     ASCIIColors.warning("[ChatMixin] Empty response generated (0 tokens). Breaking immediately.")
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="assistant",
-                        content="[No output generated]"
-                    ))
                     break
 
-                # ── 🛡️ MIMICRY INTERCEPTION & SUPPRESSION ──
-                has_mimicry = bool(re.search(r'\[🔒[^\]]*\]', raw_round_text))
-                if has_mimicry:
-                    ai_msg.content = re.sub(r'\[🔒[^\]]*\]', '', ai_msg.content)
-                    mimicry_counts = getattr(self, "_mimicry_attempt_counts", [0])
-                    mimicry_counts[0] += 1
-                    if mimicry_counts[0] >= 2:
-                        ASCIIColors.warning("[ChatMixin] Repeated mimicry detected. Breaking loop.")
-                        _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="loop_break")
-                        break
-                    else:
-                        ASCIIColors.warning("[ChatMixin] Mimicry detected. Injecting correction.")
-                        clean_text_no_marker = re.sub(r'\[🔒[^\]]*\]', '', clean_history_text).strip()
-                        virtual_history.append(SimpleNamespace(
-                            sender_type="assistant",
-                            content=clean_text_no_marker
-                        ))
-                        virtual_history.append(SimpleNamespace(
-                            sender_type="user",
-                            content=(
-                                "[SYSTEM: SYSTEM MARKER MIMICRY DETECTED. You emitted a system placeholder like `[🔒...]`. "
-                                "These markers are internal system representations and must NEVER be output by the assistant. "
-                                "To create or modify an artifact, you MUST emit the real `<artifact name=\"...\">` XML tag. "
-                                "Please output the real tag now.]"
-                            )
-                        ))
-                        continue
-
-                virtual_history.append(SimpleNamespace(
-                    sender_type="assistant",
-                    content=clean_history_text.strip()
-                ))
-
-                if pending_analysis:
-                    ASCIIColors.warning("[ChatMixin] Text-only round detected with pending tool analysis. Requiring continuation for textual analysis.")
+                # ── CONTEXT UNLOCK CONTINUATION ──
+                # Unlocking a file is a state change, not an answer: the model
+                # must get a continuation round to actually use the content.
+                if ss.context_unlock_requested and not was_cancelled:
+                    unlock_files_str = ', '.join(ss.context_unlocked_files)
+                    clean_unlock_text = scrub_processing_and_status_blocks(raw_round_text)
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="assistant",
+                        content=clean_unlock_text
+                    ))
                     virtual_history.append(SimpleNamespace(
                         sender_type="user",
                         content=(
-                            "[SYSTEM NOTIFICATION - NOT A USER MESSAGE]\n"
-                            "<action_directive status=\"REQUIRED\">\n"
-                            "⚠️ Your previous round executed a tool, and its result has been delivered to you, but you have not yet analyzed it.\n"
-                            "A turn must NEVER end with an uninterpreted tool result.\n"
-                            "MANDATORY: Write your textual analysis of the tool output NOW:\n"
-                            "- Interpret the output (numbers, logs, plots): what does it tell you?\n"
-                            "- Verdict: does it satisfy the user's requirements (PASS/FAIL)?\n"
-                            "- If it fails, fix the root cause (corrected `<artifact>` + re-run the tool).\n"
-                            "Then end with `<done/>` on a new line.\n"
-                            "</action_directive>\n"
-                            "[END SYSTEM NOTIFICATION]"
+                            f'<action_result type="context_unlock" status="SUCCESS">\n'
+                            f"The following files are now fully loaded in your context: {unlock_files_str}.\n"
+                            f"Proceed with your task using the loaded content.\n"
+                            f"</action_result>"
                         )
                     ))
+                    ss.context_unlock_requested = False
                     _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
                     continue
 
-                if round_count == 1 and not tool_calls_this_turn and not ss.affected_artefacts and not ss.context_unlock_requested:
-                    ASCIIColors.info("[ChatMixin] Round 1 conversational answer completed. Ending loop.")
-                    _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="conversational")
-                    break
-
-                text_only_stall_count = getattr(self, "_consecutive_text_only_stalls", 0) + 1
-                object.__setattr__(self, "_consecutive_text_only_stalls", text_only_stall_count)
-                
-                _TEXT_STALL_LIMIT = 3
-                if text_only_stall_count >= _TEXT_STALL_LIMIT:
-                    ASCIIColors.warning(f"[ChatMixin] Terminating after {text_only_stall_count} consecutive text-only stalls without <done/> or actions. The LLM is stuck.")
-                    _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="text_stall")
-                    break
-
-                ASCIIColors.warning(f"[ChatMixin] Text-only stall detected (#{text_only_stall_count}). LLM stopped without <done/> or actions. Forcing continuation.")
-
-                if ss.context_unlock_requested and not was_cancelled:
-                    unlock_files_str = ', '.join(ss.context_unlocked_files)
-                    continuation_prompt = (
-                        f'<action_result type="context_unlock" status="SUCCESS">\n'
-                        f"The following files are now fully loaded in your context: {unlock_files_str}.\n"
-                        f"Proceed with your task using the loaded content.\n"
-                        f"</action_result>"
-                    )
-                    ss.context_unlock_requested = False
-                else:
-                    text_stall_count_now = getattr(self, "_consecutive_text_only_stalls", 0)
-                    continuation_prompt = (
-                        "[SYSTEM NOTIFICATION - NOT A USER MESSAGE]\n"
-                        "<action_directive status=\"REQUIRED\">\n"
-                        "⚠️ INFRASTRUCTURE DIRECTIVE: Generation stopped without a functional tag or `<done/>`.\n"
-                        "This is an automated system message. It is NOT a user request.\n"
-                        f"You have announced an intention in prose ({text_stall_count_now} time(s) so far) but emitted no functional tag.\n"
-                        "Announcing intent in text does NOT execute anything. Your previous message was cut before the tag.\n"
-                        "Choose exactly ONE next move:\n"
-                        "1. PERFORM → Emit the real functional XML tag (`<artifact>`, `<tool>`, `<skill>`, `<note>`, `<unlock_file>`) on a new line NOW. Never claim in prose that an action was performed. If your previous message described what you were about to do, IMMEDIATELY emit that exact tag at the start of this response.\n"
-                        "2. TERMINATE → Write your final answer to the user, then emit `<done/>` on a new line.\n"
-                        "File state only changes when the raw tag is emitted in the current response.\n"
-                        f"WARNING: After {3 - text_stall_count_now if text_stall_count_now < 3 else 1} more stall(s), the system will permanently terminate this turn and your announced action will never be executed.\n"
-                        "</action_directive>\n"
-                        "[END SYSTEM NOTIFICATION]"
-                    )
-
-                virtual_history.append(SimpleNamespace(
-                    sender_type="assistant",
-                    content=clean_history_text.strip()
-                ))
-                virtual_history.append(SimpleNamespace(
-                    sender_type="user",
-                    content=continuation_prompt
-                ))
-                continue
+                # ── PLAIN TEXT ROUND = THE ANSWER ──
+                # A text-only round without <done/> is the model's final
+                # conversational answer. The stall-counter / forced-continuation
+                # protocol is removed by the Orchestrator/Worker split: the
+                # answer is the answer, and the loop ends here.
+                ASCIIColors.info("[ChatMixin] Conversational answer completed. Ending loop.")
+                _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="conversational")
+                break
 
         # ── 11. Final Post-Processing & Database Commit ──
 
@@ -6722,15 +6897,10 @@ class ChatMixin:
         # to a JSON file in the discussion workspace to verify context separation.
         if debug_enabled:
             try:
-                import os as _os
-                from pathlib import Path as _Path
-                import json as _json
-                from datetime import datetime as _dt
-
-                debug_dir = _Path(self.workspace_data_path) / "_debug_dumps"
+                debug_dir = Path(self.workspace_data_path) / "_debug_dumps"
                 debug_dir.mkdir(parents=True, exist_ok=True)
 
-                timestamp = _dt.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+                timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
                 dump_file = debug_dir / f"turn_dump_{timestamp}.json"
 
                 # Safely serialize SimpleNamespace objects in virtual_history
@@ -6756,7 +6926,7 @@ class ChatMixin:
                 }
 
                 with open(dump_file, "w", encoding="utf-8") as f:
-                    _json.dump(dump_payload, f, indent=2, default=str, ensure_ascii=False)
+                    json.dump(dump_payload, f, indent=2, default=str, ensure_ascii=False)
 
                 ASCIIColors.info(f"[ChatMixin] 🔬 Debug context dump saved to: {dump_file}")
             except Exception as dump_err:

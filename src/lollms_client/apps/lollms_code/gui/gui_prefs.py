@@ -59,6 +59,7 @@ class GuiPrefs:
     show_tool_calls: bool = True
     show_workspace_changes: bool = True
     show_skills_activity: bool = True
+    show_live_sidebar: bool = True
 
     @classmethod
     def load(cls) -> "GuiPrefs":

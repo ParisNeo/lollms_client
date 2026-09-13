@@ -139,6 +139,21 @@ class EnvStore:
                     return False
         return True
 
+    def get_binding_profiles(self, binding_type: str) -> Dict[str, Any]:
+        """Extracts the full two-tier binding profiles for a modality (e.g. 'llm')
+        using the same extractor the CLI uses, so GUI and CLI never drift.
+        Returns {} when lollms_client isn't importable or nothing is configured."""
+        prefix = binding_type.upper()
+        return _extract_bindings_from_env(prefix, self.config_map) or {}
+
+    def get_model_profiles(self, binding_type: str) -> Dict[str, Any]:
+        """Extracts the full two-tier model profiles for a modality (e.g. 'llm')
+        using the same extractor the CLI uses, so GUI and CLI never drift.
+        Returns {} when lollms_client isn't importable or nothing is configured."""
+        prefix = binding_type.upper()
+        bindings = _extract_bindings_from_env(prefix, self.config_map) or {}
+        return _extract_profiles_from_env(prefix, bindings, self.config_map) or {}
+
     def save(self) -> Path:
         target_dir = Path.home() / ".lollms-client"
         target_dir.mkdir(parents=True, exist_ok=True)

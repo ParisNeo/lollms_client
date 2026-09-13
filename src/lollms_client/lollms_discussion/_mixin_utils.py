@@ -63,18 +63,31 @@ class UtilsMixin:
         """
         Applies the Three-View Protocol to LLM context export.
 
-        1. Recent Assistant Messages (Original View): Preserves raw XML tags for KV-cache alignment.
+        1. Recent Assistant Messages (Original View): Preserves functional XML tags
+           (<artifact>, <tool>, <note>, <skill>) for KV-cache alignment and positive
+           tag-emission demonstration, while scrubbing system execution logs.
         2. Older Assistant Messages (Reduced View): Replaces functional tags with opaque placeholders.
         3. User Messages: Always preserved verbatim.
+
+        ANTI-MIMICRY INVARIANT: <processing> blocks and <!-- status:... --> comments
+        are system-generated execution logs. They are NEVER part of the model's
+        intended output and are therefore scrubbed from EVERY assistant message,
+        including the most recent one. Allowing them into context teaches the
+        model (by in-context demonstration) to emit them itself, which trips the
+        anti-mimicry halt guard in _StreamState.feed() and produces empty responses.
         """
-        from ._context_sanitizer import sanitize_context_for_llm
+        from ._context_sanitizer import (
+            sanitize_context_for_llm,
+            scrub_processing_and_status_blocks,
+        )
 
         if msg.sender_type != 'assistant':
             return raw_content
 
-        # C1: KV-Cache Preservation. Keep raw tags if marked as recent functional (distance 0).
         if distance_from_end == 0:
-            return raw_content
+            # C1: KV-Cache Preservation. Keep functional tags verbatim, but strip
+            # system execution logs (<processing>, status comments, rendering anchors).
+            return scrub_processing_and_status_blocks(raw_content)
 
         # C2 & C3: Context Diet & Anti-Mimicry. Sanitize older messages.
         return sanitize_context_for_llm(raw_content)

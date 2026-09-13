@@ -193,6 +193,40 @@ class MSG_TYPE(Enum):
     MSG_TYPE_ROUND_START               = 57 # an agentic reasoning round has begun
     MSG_TYPE_ROUND_END                 = 58 # an agentic reasoning round has reached its terminal outcome
 
+    # ── Orchestrator→Worker delegation lifecycle events ──────────────────────
+    # Fired by DelegationMixin when the Orchestrator tier spawns a bounded
+    # Worker sub-agent to execute a delegated <task>.
+    #
+    # Contract
+    # --------
+    # MSG_TYPE_WORKER_SPAWN_START fires immediately before the Worker's own
+    # chat() loop begins. meta: {
+    #     "round_id": int,             # orchestrator round that delegated
+    #     "worker_index": int,         # 1-based worker counter for the discussion
+    #     "task": str,                 # capped at 500 chars
+    #     "context_files": list[str],  # resolved file names requested for the task
+    #     "max_rounds": int            # the worker's own bounded round budget
+    # }
+    #
+    # MSG_TYPE_WORKER_SPAWN_END fires exactly once when the Worker loop
+    # completes (or crashes — the event always fires; failure is data, not an
+    # exception). meta: {
+    #     "round_id": int,
+    #     "worker_index": int,
+    #     "success": bool,             # True iff a non-empty report was produced
+    #     "report_digest": str,        # capped at 2000 chars
+    #     "files": list[str],          # artifacts created/modified by the worker
+    #     "error": str|None
+    # }
+    #
+    # These events are callback-only telemetry: they never enter
+    # ai_msg.content or virtual_history, and they are suppressed in
+    # EventMode.SILENT_MODE. They describe a SUB-AGENT lifecycle, not a tool
+    # call — do not conflate them with MSG_TYPE_TOOL_START/TOOL_END.
+
+    MSG_TYPE_WORKER_SPAWN_START        = 59 # a delegated worker agent has been spawned
+    MSG_TYPE_WORKER_SPAWN_END          = 60 # a delegated worker agent has completed (or crashed)
+
 
 class EventMode(Enum):
     """

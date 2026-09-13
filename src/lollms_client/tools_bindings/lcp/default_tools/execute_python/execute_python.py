@@ -8,6 +8,11 @@ LCP toolset for sandboxed Python execution. Two single-purpose tools:
                                 Read-only: never saves, creates, or overwrites files.
 Interception of matplotlib figures and stdout/stderr capture.
 
+When captured stdout exceeds the inline preview window, the FULL output is
+persisted to a timestamped .log file in the workspace and the tool result
+embeds a head/tail windowed preview plus an explicit pointer telling the LLM
+which inspection tools to use to read the omitted middle.
+
 TOOL SELECTION DOCTRINE:
     Privilege tool_execute_python_file. Only fall back to
     tool_execute_python_code when the code is short, punctual, and disposable.
@@ -21,13 +26,20 @@ import sys
 import io
 import uuid
 import base64
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from ascii_colors import ASCIIColors
 
 TOOL_LIBRARY_NAME = "Execute Python"
-TOOL_LIBRARY_DESC = "Executes sandboxed Python code. PREFERRED path: persist code as a .py artifact and run it with tool_execute_python_file. tool_execute_python_code is strictly reserved for short, punctual inline snippets. Returns stdout, stderr, and generated plots."
+TOOL_LIBRARY_DESC = "Executes sandboxed Python code. PREFERRED path: persist code as a .py artifact and run it with tool_execute_python_file. tool_execute_python_code is strictly reserved for short, punctual inline snippets. Long outputs are persisted to a .log file with a head/tail preview returned inline. Returns stdout, stderr, and generated plots."
 TOOL_LIBRARY_ICON = "🐍"
+
+_PREVIEW_WINDOW_CHARS = 8000
+_PREVIEW_HALF_CHARS = _PREVIEW_WINDOW_CHARS // 2
+_STRIP_MARKER = (
+    "\n... [stripped for brevity (use read file tools to inspect more)] ...\n"
+)
 
 
 def init_tools_library(config: dict = None) -> None:
@@ -68,6 +80,44 @@ def _sanitize_host_paths(text: str) -> str:
     root = str(Path.cwd().resolve())
     sanitized = text.replace(root, ".")
     return re.sub(r'[A-Za-z]:\\(?:Users|home)[\\/][^\s"\']*', '<host-path>', sanitized)
+
+
+def _window_output(text: str) -> str:
+    """
+    Builds a head/tail windowed preview of an execution output.
+
+    Short text passes through unchanged. Long text keeps the first and last
+    half-windows separated by a stripping marker, preserving both the beginning
+    and the end of the log for immediate diagnosis while bounding preview size.
+    """
+    if not isinstance(text, str) or len(text) <= _PREVIEW_WINDOW_CHARS:
+        return text if isinstance(text, str) else str(text)
+    head = text[:_PREVIEW_HALF_CHARS]
+    tail = text[-_PREVIEW_HALF_CHARS:]
+    stripped = len(text) - _PREVIEW_WINDOW_CHARS
+    marker = (
+        f"\n... [stripped for brevity — {stripped} middle characters omitted "
+        f"(use read file tools to inspect more)] ...\n"
+    )
+    return f"{head}{marker}{tail}"
+
+
+def _persist_full_output(text: str, script_label: str) -> Optional[str]:
+    """
+    Persists the full captured output to a uniquely named .log file in the
+    workspace root. Returns the file name on success, None on failure.
+    """
+    try:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_label = re.sub(r'[^A-Za-z0-9_.-]+', '_', Path(script_label).stem)[:40] or "script"
+        log_name = f"exec_output_{safe_label}_{stamp}_{uuid.uuid4().hex[:6]}.log"
+        log_path = _get_workspace_root() / log_name
+        with open(log_path, "w", encoding="utf-8", errors="ignore") as f:
+            f.write(text)
+        return log_name
+    except Exception as write_err:
+        ASCIIColors.warning(f"[execute_python] Failed to persist full output: {write_err}")
+        return None
 
 
 def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]] = None) -> Dict[str, Any]:
@@ -159,8 +209,8 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
             return {
                 "success": False,
                 "error": f"Execution Error:\n{_sanitize_host_paths(raw_traceback)}",
-                "output": _sanitize_host_paths(raw_output),
-                "stderr": _sanitize_host_paths(raw_error)
+                "output": _sanitize_host_paths(_window_output(raw_output)),
+                "stderr": _sanitize_host_paths(_window_output(raw_error))
             }
 
         fig_nums = _plt.get_fignums() if _plt is not None else []
@@ -190,8 +240,8 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
         return {
             "success": False,
             "error": f"Unexpected execution failure:\n{_sanitize_host_paths(raw_traceback)}",
-            "output": _sanitize_host_paths(raw_output),
-            "stderr": _sanitize_host_paths(raw_error)
+            "output": _sanitize_host_paths(_window_output(raw_output)),
+            "stderr": _sanitize_host_paths(_window_output(raw_error))
         }
     finally:
         sys.stdout = old_stdout
@@ -226,13 +276,30 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
         workspace_contract += (
             " To run a short, punctual inline snippet instead, use tool_execute_python_code."
         )
+
     out_str = out_str + workspace_contract
+
+    if len(out_str) > _PREVIEW_WINDOW_CHARS:
+        log_name = _persist_full_output(out_str, script_label)
+        if log_name:
+            stripped_chars = len(out_str) - _PREVIEW_WINDOW_CHARS
+            out_str = (
+                f"{out_str[:_PREVIEW_HALF_CHARS]}"
+                f"\n... [stripped for brevity — {stripped_chars} middle characters omitted] ...\n"
+                f"[FULL OUTPUT SAVED] The complete output was persisted to '{log_name}' in the workspace. "
+                "Use read file tools (e.g. unlock the .log file, or run a short Python snippet that reads "
+                f"and prints a slice of '{log_name}') to inspect the omitted middle.\n"
+                f"{out_str[-_PREVIEW_HALF_CHARS:]}"
+            )
+        else:
+            out_str = _window_output(out_str)
+
     out_str = "".join(ch for ch in out_str if ch.isascii() or ch in "\n\t")
 
     return {
         "success": True,
         "output": _sanitize_host_paths(out_str),
-        "stderr": _sanitize_host_paths(err_str)
+        "stderr": _sanitize_host_paths(_window_output(err_str))
     }
 
 
@@ -284,6 +351,39 @@ def _normalize_argv(script_label: str, args: Optional[List[Any]]) -> List[str]:
     return argv
 
 
+_MAX_INLINE_CODE_CHARS = 2000
+
+
+def _enforce_inline_code_limit(code_str: str) -> Optional[Dict[str, Any]]:
+    """
+    Hard gate for inline code execution. Returns a failure result when the
+    snippet exceeds the inline size limit, or None when it is within bounds.
+    """
+    if len(code_str.strip()) <= _MAX_INLINE_CODE_CHARS:
+        return None
+    ASCIIColors.error(
+        f"[execute_python] Inline code rejected: {len(code_str.strip())} chars "
+        f"exceeds the {_MAX_INLINE_CODE_CHARS}-char limit."
+    )
+    return {
+        "success": False,
+        "error": (
+            f"BLOCKED: inline code execution is restricted to SHORT, punctual snippets "
+            f"(max {_MAX_INLINE_CODE_CHARS} characters). Your snippet was "
+            f"{len(code_str.strip())} characters. Do NOT shrink the code by removing "
+            f"whitespace or shortening names. Instead you MUST:\n"
+            f"1. Emit an <artifact type=\"code\" name=\"your_script.py\"> tag containing "
+            f"the COMPLETE program.\n"
+            f"2. Wait for the artifact to be persisted to the workspace.\n"
+            f"3. Call 'tool_execute_python_file' with file_name=\"your_script.py\".\n"
+            f"This workflow makes the program inspectable, patchable via SEARCH/REPLACE, "
+            f"and reusable. Inline execution is reserved for quick checks and one-liners."
+        ),
+        "output": "",
+        "stderr": ""
+    }
+
+
 def tool_execute_python_code(code: str = "") -> Dict[str, Any]:
     """
     Executes a SHORT, PUNCTUAL inline Python snippet and returns stdout, stderr, and generated plots.
@@ -298,6 +398,11 @@ def tool_execute_python_code(code: str = "") -> Dict[str, Any]:
     <artifact type="code"> tag to persist the .py file, then run it with
     'tool_execute_python_file'.
 
+    OUTPUT WINDOWING: when stdout exceeds the inline preview window, the FULL
+    output is saved to a .log file in the workspace and the result contains a
+    head/tail windowed preview (beginning + end) plus a pointer to the .log
+    file. Use that pointer with read file tools to inspect the omitted middle.
+
     The execution environment automatically provides common aliases:
     - pd (pandas), np (numpy), plt (matplotlib.pyplot)
     - sns (seaborn), sklearn (scikit-learn), scipy
@@ -311,6 +416,9 @@ def tool_execute_python_code(code: str = "") -> Dict[str, Any]:
         code = code.get("code") or next((v for v in code.values() if isinstance(v, str)), "")
 
     code_str = code if isinstance(code, str) else ("" if code is None else str(code))
+    gate_result = _enforce_inline_code_limit(code_str)
+    if gate_result is not None:
+        return gate_result
     if not code_str.strip():
         return {
             "success": False,
@@ -339,9 +447,14 @@ def tool_execute_python_file(
     saves, creates, or overwrites files.
 
     WORKFLOW (mandatory for substantial code): FIRST emit an <artifact type="code">
-    tag to create the .py file, THEN call this tool with its file name. Persisting
+    tool to create the .py file, THEN call this tool with its file name. Persisting
     scripts makes them inspectable, patchable via SEARCH/REPLACE, and reusable.
     'tool_execute_python_code' is strictly reserved for short, punctual snippets.
+
+    OUTPUT WINDOWING: when stdout exceeds the inline preview window, the FULL
+    output is saved to a .log file in the workspace and the result contains a
+    head/tail windowed preview (beginning + end) plus a pointer to the .log
+    file. Use that pointer with read file tools to inspect the omitted middle.
 
     Args:
         file_name (str): Name of an existing .py file in the workspace to execute. Required. Path traversal is blocked.

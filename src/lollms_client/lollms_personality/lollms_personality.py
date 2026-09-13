@@ -111,7 +111,14 @@ class _HistoryContextAdapter:
         return []
 
     def _apply_three_view_protocol(self, msg, raw_content: str, distance_from_end: int = 0) -> str:
-        return raw_content
+        from lollms_client.lollms_discussion._context_sanitizer import (
+            scrub_processing_and_status_blocks,
+        )
+
+        if getattr(msg, "sender_type", "") != "assistant":
+            return raw_content
+
+        return scrub_processing_and_status_blocks(raw_content)
 
     def _build_memory_context_block(self, memory_manager, token_counter=None) -> str:
         if not memory_manager:
@@ -4835,6 +4842,7 @@ JSON:"""
         enable_python_exec: bool = False,
         enable_web_tools: bool = False,
         auto_load_document_editor: bool = True,
+        enforce_end_tag: bool = False,
         **kwargs
     ) -> Dict[str, Any]:
         resolved_max_rounds = max_nb_rounds if max_nb_rounds is not None else max_reasoning_steps
@@ -5281,7 +5289,13 @@ JSON:"""
             has_truncated_artifact = False
             truncated_artifact_title = None
 
-            if round_count == 1 and not ss.completed_actions and not tool_calls_this_turn and not workspace_changes:
+            if (
+                round_count == 1
+                and not enforce_end_tag
+                and not ss.completed_actions
+                and not tool_calls_this_turn
+                and not workspace_changes
+            ):
                 round1_text = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
                 if round1_text:
                     final_response = round1_text
@@ -5291,26 +5305,6 @@ JSON:"""
 
             if ss.was_done_detected():
                 final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
-
-                if not ss.completed_actions and not tool_calls_this_turn and not workspace_changes and round_count == 1:
-                    sanitized_final_response_check = re.sub(r'<[^>]+>', '', final_response).strip()
-                    if sanitized_final_response_check:
-                        ASCIIColors.warning(f"[{self.name}] Round 1 preamble stall with <done/> (text produced, no actions). Injecting continuation mandate.")
-                        virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text()))
-                        virtual_history.append(SimpleNamespace(
-                            sender_type="user",
-                            content=(
-                                "[SYSTEM: CRITICAL. You emitted <done/> after writing a conversational preamble, "
-                                "but you did NOT execute any actions. Stating intent DOES NOT execute it.\n\n"
-                                "MANDATORY ACTION: You MUST NOW emit the functional tag to perform the action you just described.\n"
-                                "- If you said you would unlock files, emit: <unlock_file>filename.pdf</unlock_file>\n"
-                                "- If you said you would read a document, emit the appropriate <tool> tag.\n"
-                                "- If your task is truly complete, output your final answer and end with <done/>.\n\n"
-                                "Do NOT write another preamble. Emit the functional tag NOW.]"
-                            )
-                        ))
-                        ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
-                        continue
 
                 if ss.completed_actions:
                     virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text()))
@@ -6253,11 +6247,20 @@ JSON:"""
 
             raw_round_text = ss.get_clean_text()
 
-            # ── 🛡️ ROUND 1 CONVERSATIONAL SHORT-CIRCUIT (MANDATORY TERMINATION) ──
-            # Round 1 with pure conversational text and ZERO actions is ALWAYS terminal,
-            # whether or not the model emitted <done/>. A greeting, a clarifying question,
-            # or a complete prose answer must never be force-continued into an agentic loop.
-            if round_count == 1 and not ss.completed_actions and not tool_calls_this_turn and not workspace_changes:
+            # ── 🛡️ ROUND 1 CONVERSATIONAL SHORT-CIRCUIT ──
+            # Round 1 with pure conversational text and ZERO actions is terminal by
+            # default, whether or not the model emitted <done/>. A greeting, a
+            # clarifying question, or a complete prose answer must never be
+            # force-continued into an agentic loop.
+            # When enforce_end_tag=True, the loop refuses to terminate without the
+            # explicit <done/> tag: a continuation mandate is injected instead.
+            if (
+                round_count == 1
+                and not enforce_end_tag
+                and not ss.completed_actions
+                and not tool_calls_this_turn
+                and not workspace_changes
+            ):
                 if raw_round_text.strip():
                     final_response = re.sub(r'(?i)<done\s*/?>', '', raw_round_text).strip()
                     if not ss.was_done_detected():

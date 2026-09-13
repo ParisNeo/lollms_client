@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-13 00:26]
+
+- feat: update LollmsCode app and core discussion mixins
+
 ## [2026-09-10 14:03]
 
 - feat(artefact): add export functionality and enhance artefact documentation

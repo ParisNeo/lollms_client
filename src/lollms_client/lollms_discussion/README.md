@@ -2,16 +2,17 @@
 
 This module implements the **Sovereign Discussion Session**, a stateful, thread-safe conversational engine that bridges the gap between transient LLM tokens and permanent, versioned knowledge storage.
 
-It is composed of nine orthogonal mixins:
+It is composed of ten orthogonal mixins:
 1.  **`CoreMixin`**: Lifecycle, ORM proxy, message CRUD, and thread-safe DB commits.
-2.  **`ChatMixin`**: The agentic reasoning loop, tool execution orchestration, stream parsing, and the scientific debug-dump instrumentation layer.
-3.  **`UtilsMixin`**: Branch management, export normalization, and context token auditing.
-4.  **`PromptMixin`**: System prompt construction and XML tag post-processing.
-5.  **`MemoryMixin`**: Integration with `LollmsMemoryManager` for tiered persistent memory, episodic memory saving, and graph relationship traversal.
-6.  **`FileImportMixin`**: Multi-modal ingestion (PDF, DOCX, Data) and Dual-Stream storage.
-7.  **`InternetImportMixin`**: Web content extraction and quality scoring for internet-based RAG.
-8.  **`ExportMixin`**: Standalone Artefact Archive (`.laa`) and Linked Artefact Bundle (`.lab`) export/import protocols.
-9.  **`BranchMixin`**: Directed Acyclic Graph (DAG) branch discovery, navigation, forking, and merging.
+2.  **`ChatMixin`**: The persona-aware agentic reasoning loop (Orchestrator/Worker modes), tool execution orchestration, stream parsing, and the scientific debug-dump instrumentation layer.
+3.  **`DelegationMixin`**: Orchestrator→Worker delegation — `<task>`/`<context_files>` parsing, sandboxed context-file resolution, bounded Worker spawning, and the `[WORKER REPORT]` envelope protocol.
+4.  **`UtilsMixin`**: Branch management, export normalization, and context token auditing.
+5.  **`PromptMixin`**: Single source of truth for all prompt doctrine — worker-tier builders (artifact/note/skill/form/image/widget), plus the Orchestrator-tier delegation protocol and the Worker task wrapper.
+6.  **`MemoryMixin`**: Integration with `LollmsMemoryManager` for tiered persistent memory, episodic memory saving, and graph relationship traversal.
+7.  **`FileImportMixin`**: Multi-modal ingestion (PDF, DOCX, Data) and Dual-Stream storage.
+8.  **`InternetImportMixin`**: Web content extraction and quality scoring for internet-based RAG.
+9.  **`ExportMixin`**: Standalone Artefact Archive (`.laa`) and Linked Artefact Bundle (`.lab`) export/import protocols.
+10. **`BranchMixin`**: Directed Acyclic Graph (DAG) branch discovery, navigation, forking, and merging.
 
 ---
 
@@ -368,6 +369,82 @@ data_workspace/
 
 ---
 
+## 🧠 2.0 Orchestrator–Worker Delegation Protocol
+
+`chat()` is **dual-persona**. The `orchestrator_mode` parameter selects which persona a given invocation runs:
+
+| | **Orchestrator persona** (`orchestrator_mode=True`) | **Worker persona** (default) |
+| :--- | :--- | :--- |
+| **System prompt** | Reflection + delegation protocol ONLY | Full tool/artifact XML doctrine |
+| **Tool grammar** | **None** — `tools_prompt` is empty; tool syntax never enters its context | Complete `<tool>`/`<artifact>`/`<skill>`/... grammar |
+| **Mimicry risk** | **Structurally impossible** — it cannot imitate tool calls it has never seen | Guarded by the standard interception gates |
+| **Allowed moves per round** | ANSWER (→ `<done/>`) or DELEGATE (never both) | Any tool/artifact action, or finish |
+| **Guards active** | Minimal: one-action-per-turn, empty-response, round budget | Full set: phantom-tool, malformed-JSON, epoch loop gates, duplicate-artifact |
+| **Context size** | The real conversation + artifact tree + loaded files (persistent) | Fresh and small: task + named files only (disposable) |
+
+### Delegation Grammar
+
+When the Orchestrator decides the user's request requires building, editing, querying, computing, or verifying workspace state, it emits:
+
+```xml
+<delegate>
+<task>
+Precise, self-contained instructions for the specialist.
+The task must be executable by someone who sees ONLY the named files.
+</task>
+<context_files>
+data.csv
+analysis.py
+</context_files>
+</delegate>
+```
+
+The stream parser intercepts the block (`_StreamState` routes it through the secondary-tag accumulator), and `ChatMixin._process_delegation` validates it:
+- **Malformed block** (missing/empty `<task>`) → a correction round is injected.
+- **Depth limit reached** (`max_delegation_depth`, default 1) → the delegation is converted into a directive to answer the user directly.
+- **Valid block** → a Worker is spawned via `DelegationMixin._run_worker`.
+
+### Worker Lifecycle
+
+1. **Context assembly**: The task doctrine (`PromptMixin._build_worker_doctrine`) + the contents of the named `context_files` (resolved through the artifact registry, then the sandboxed workspace with `relative_to(ws_root)` path-traversal confinement — `..` and absolute escapes raise `PermissionError` and the file is reported missing) are built into ONE user message. The Worker sees nothing else — no conversation history, no prior tool results.
+2. **Bounded loop**: The Worker runs its own `chat()` with `orchestrator_mode=False`, a round budget derived from the parent's remaining rounds, and all execution guards active. Failure isolation is total: a Worker crash becomes a structured failure report, never an exception into the Orchestrator turn.
+3. **Report capture**: The Worker's final output is extracted from `<report>...</report>` (falling back to the scrubbed full text), size-capped by the dynamic tool-result limit (25% of context window, clamped), and sanitized of host paths.
+4. **Single-message feedback**: The report is wrapped into ONE compact plain-data envelope and appended to the Orchestrator's `virtual_history` as a user-role message:
+
+```
+[WORKER REPORT 1 — SUCCESS]
+Files created/modified: `report.md`
+---
+<the worker's report text>
+---
+Choose your next move: ANSWER the user (then `<done/>`), or DELEGATE a follow-up task if this report is insufficient.
+```
+
+The envelope deliberately contains **no executable grammar** — the Orchestrator can never learn tool syntax from a report, closing the report-injection mimicry vector.
+
+### Worker Spawn Events
+
+The Worker lifecycle is visible to host apps through a **dedicated event pair** (not `MSG_TYPE_TOOL_START/END` — a Worker is a sub-agent lifecycle, not a tool call):
+
+*   **`MSG_TYPE_WORKER_SPAWN_START`** — fired immediately before the Worker's loop begins.
+    *   Meta: `{"round_id": int, "worker_index": int, "task": str, "context_files": list[str], "max_rounds": int}`
+    *   `task` is capped at 500 chars; no file contents, no host paths.
+*   **`MSG_TYPE_WORKER_SPAWN_END`** — fired exactly once when the Worker completes, including on crash (failure is data, not an exception).
+    *   Meta: `{"round_id": int, "worker_index": int, "success": bool, "report_digest": str, "files": list[str], "error": str|None}`
+    *   `report_digest` is capped at 2000 chars.
+
+Both events are callback-only (never written to `ai_msg.content` or `virtual_history`) and suppressed in `EventMode.SILENT_MODE`, letting UIs render a dedicated "specialist agent" panel.
+
+### Enabling Orchestrator Mode
+
+```python
+response = discussion.chat(
+    user_message="Analyze data.csv and build the quarterly report",
+    orchestrator_mode=True,   # the conversation runs as pure coordination
+    enable_code_execution=True,  # the tools are inherited by spawned workers
+)
+```
+
 ## 🧬 2. The Chat Loop & Tool Orchestration (`ChatMixin`)
 
 The `chat()` method is not a simple API call; it is an **Agentic State Machine**. It handles pre-hydration, multi-step reasoning, tool execution, and self-healing file restoration.
@@ -382,67 +459,168 @@ The core architectural concept is the separation of **Old History** from **Virtu
 
 ```mermaid
 flowchart TD
-    Start([Start Chat]) --> Init[Init ai_msg, virtual_history = stripped old_branch + new user_msg]
-    Init --> Loop{Round < Max?}
-    
-    Loop -- Yes --> Gen[LLM Generates via _StreamState]
-    Gen --> StripDone[Strip &lt;done/&gt; from content]
-    StripDone --> DoneDetected{&lt;done/&gt; detected?}
-    
-    DoneDetected -- Yes --> End([End Chat])
-    
-    DoneDetected -- No --> HasTool{ss.tool_trigger?}
-    
-    HasTool -- Yes --> ExecTool[Execute Tool, Inject Result + Mandate]
-    ExecTool --> Loop
-    
-    HasTool -- No --> HasAction{ss.was_action_dispatched?}
-    
-    HasAction -- Yes --> InjectAction[Inject Action Success + Mandate]
-    InjectAction --> Loop
-    
-    HasAction -- No --> IsRound1{Round == 1?}
-    IsRound1 -- Yes --> End
-    IsRound1 -- No --> InjectRemind[Inject 'Continue or &lt;done/&gt;' Mandate]
-    InjectRemind --> Loop
-    
-    Loop -- No --> ForceFinal[Force final answer]
-    ForceFinal --> End
+    Start([chat&#40;&#41; called]) --> Persona{orchestrator_mode?}
+    Persona -- Yes --> OrchPrompt[ORCHESTRATOR persona:<br/>delegation protocol only,<br/>tools_prompt = &#40;&#41;]
+    Persona -- No --> WorkerPrompt[WORKER persona:<br/>full tool/artifact doctrine]
+    OrchPrompt --> VHInit[virtual_history = &#91;&#93;<br/>&#40;user prompt stays in the real branch&#41;]
+    WorkerPrompt --> VHInit
+    VHInit --> Loop{round_count &lt; max_rounds?}
+    Loop -- No --> ForceFinal[Round budget exhausted<br/>status: max_rounds]
+    Loop -- Yes --> ExportCtx[export&#40;&#41; each round:<br/>system prompt + sanitised branch<br/>+ virtual_history spliced in]
+    ExportCtx --> Gen[LLM streams via _StreamState<br/>&#40;one-action-per-turn halting&#41;]
+    Gen --> FlushBuf[flush_remaining_buffer:<br/>synthesise unclosed tags,<br/>sweep missed &lt;done/&gt;]
+    FlushBuf --> DoneGate{&lt;done/&gt; detected?}
+    DoneGate -- Yes --> PersistVH{Turn had tool calls /<br/>raw tags in VH?}
+    PersistVH -- Yes --> StoreMeta[Store VH into<br/>ai_msg.metadata&#91;'virtual_history'&#93;]
+    PersistVH -- No --> StoreMsg[Standard save: ai_msg.content only]
+    StoreMeta --> Final([Commit, episodic save, auto-dream, reset cancel])
+    StoreMsg --> Final
+
+    DoneGate -- No --> Delegation{delegation_payload captured<br/>AND orchestrator_mode?}
+    Delegation -- Yes --> SpawnWorker[DelegationMixin._run_worker:<br/>fresh small context,<br/>bounded rounds, full doctrine]
+    SpawnWorker --> ReportEnv[Feed ONE &#91;WORKER REPORT&#93; envelope<br/>into virtual_history,<br/>bump environment epoch]
+    ReportEnv --> Loop
+    Delegation -- No --> PendingSearch{Pending &lt;mem_search&gt;?}
+    PendingSearch -- Yes --> ExecSearch[Run query vs memory tiers,<br/>dedupe identical queries,<br/>inject results + decision point]
+    ExecSearch --> Loop
+    PendingSearch -- No --> DupCheck{Action dispatched,<br/>no tool, no affected artefacts?}
+    DupCheck -- Yes --> FailedPatch{Dispatch marked failed?}
+    FailedPatch -- Yes --> PatchCorrection[Inject correction:<br/>retry with exact SEARCH match]
+    PatchCorrection --> Loop
+    FailedPatch -- No --> TrueDup[Set force-final flag,<br/>inject CRITICAL anti-loop directive]
+    TrueDup --> BreakDup([status: loop_break → Final])
+    DupCheck -- No --> ActionNoTool{Action dispatched,<br/>not a tool?}
+    ActionNoTool -- Yes --> HydrateVH[Append verbatim tag to VH,<br/>bump environment epoch,<br/>inject action_result SUCCESS envelope]
+    HydrateVH --> Loop
+    ActionNoTool -- No --> ToolTrigger{tool_trigger set?}
+    ToolTrigger -- No --> TextAnswer[PLAIN TEXT = THE ANSWER<br/>status: conversational → Final]
+    ToolTrigger -- Yes --> GateCascade[Interception gates:<br/>malformed JSON → memory-tag misuse →<br/>phantom tool → failure/success loop guards]
+    GateCascade --> ExecTool[Execute tool &#40;CWD switch, before/after<br/>file snapshots, auto-register new files&#41;]
+    ExecTool --> Offload{Result &gt; 1500 tokens?}
+    Offload -- structured --> StructMarker&#91;Replace with SYSTEM marker:<br/>'use aggregation tools next'&#93;
+    Offload -- unstructured --> LogOffload&#91;Save to .log artifact &#91;U&#93;,<br/>replace with pointer marker&#93;
+    Offload -- No --> Sanitize[_sanitize_tool_result:<br/>strip base64 blobs, truncate]
+    StructMarker --> VHAppend[Append assistant text + &lt;tool&gt; to VH<br/>&#40;skip append if empty prose,<br/>never fabricate placeholders&#41;,]
+    LogOffload --> VHAppend
+    Sanitize --> VHAppend
+    VHAppend --> Compress[Action-window recollection:<br/>drop expired action rounds,<br/>digest to system zone,<br/>no placeholders]
+    Compress --> Loop
 ```
 
 ### The `<done/>` Termination Protocol
 
-The agentic loop no longer relies on fragile heuristics (like intent detection) to decide when to terminate. Instead, the LLM is given explicit control via the `<done/>` tag.
+The agentic loop gives the LLM explicit, sovereign control over termination via the `<done/>` tag. Termination is never second-guessed by runtime guards:
 
-1.  **Round 1 Short-Circuit**: If the LLM generates pure conversational text without any functional tags (`<tool>`, `<artifact>`) on the first round, the loop breaks immediately. This is a standard conversational response.
-2.  **Action Continuation**: If the LLM emits a functional tag, the action is executed. The result is injected into `virtual_history` along with a mandate: "When you think you finished your task, issue a final conversational text and end it with a `<done/>` tag."
-3.  **Explicit Termination**: The loop only breaks if the LLM emits `<done/>` on a new line, or if `max_reasoning_steps` is reached. The `<done/>` tag is stripped from `ai_msg.content` before saving so it never appears in the UI.
-4.  **Continuation Mandate**: If the LLM stops generating without `<done/>` and without dispatching an action (and it's not round 1), a system message is injected reminding it to either continue working or emit `<done/>`.
+1.  **Sovereign Termination**: Any round ending in `<done/>` (or `<end/>`) terminates the loop immediately with `status: "done"`. The tag is stripped from `ai_msg.content` before saving so it never appears in the UI. There is **no analysis gate** and **no phantom-`<done/>` rejection**: the Orchestrator tier never executes tools, and the Worker tier's self-verification is enforced by its task doctrine, not by rejecting its termination signal.
+2.  **Action Continuation**: If the LLM emits a functional tag, the action is executed and the result is injected into `virtual_history` with a completion mandate. The loop continues.
+3.  **Plain Text = The Answer**: A text-only round without `<done/>` is the model's final conversational answer. The loop ends with `status: "conversational"`. There is **no stall-counter and no forced-continuation directive** — announcing intent in prose and stopping is treated as the model choosing to answer, and re-prompting it was removed as a pathology (the old 3-strike `text_stall` path no longer exists).
+4.  **Empty Response Guard**: A round producing zero tokens breaks immediately (a hard infrastructural failure, not an answer).
+5.  **Context Unlock Continuation**: A `<unlock_file>` dispatch is a state change, not an answer — the model receives exactly one continuation round to actually use the newly loaded content.
 
-### 📉 The Context Diet Protocol (Three-View Protocol)
+### 📉 The History & Context Compression Pipeline
 
-To prevent context window exhaustion during long agentic sessions, the `UtilsMixin.export()` method applies a **Three-View Protocol** to historical messages. This ensures the LLM sees its recent actions with perfect clarity while older actions are compressed into lightweight placeholders.
+Long agentic sessions cannot naively replay their full transcript: execution logs, repeated tool payloads, and repeated artifact bodies would exhaust the context window within a handful of rounds. The discussion manages this through a **placeholder-free recollection architecture** built on one doctrine:
 
-The logic is implemented in `UtilsMixin.export()` (which calculates the dynamic functional quota) and delegates the actual sanitization to `UtilsMixin._apply_three_view_protocol()` and the pure-functional `lollms_discussion._context_sanitizer` module.
+> **The LLM sees either the exact raw execution path, or a plain-language system-zone narrative of what happened — never a synthetic stub token.** Any invented token visible in history (a `status="superseded"` anchor, a `status="saved"` stub, a `[🔒...]` marker) is a template the model can learn to mimic. Placeholder generation is therefore forbidden everywhere.
 
-1.  **Recent View (Original - Last 2 Functional Actions)**:
-    *   **Trigger**: `UtilsMixin.export()` maintains a `functional_skip_count` (quota = 2). As it iterates through the branch in reverse, if an assistant message contains functional tags (`<tool>`, `<artifact>`), it increments the count. If the count is ≤ 2, the message is marked as recent (`distance_from_end = 0`).
-    *   **Behavior**: The raw content is preserved **verbatim**, including all functional XML tags and execution logs (`<processing>`).
-    *   **Purpose**: Preserves exact KV-cache alignment for multi-turn agentic chains. The LLM needs to see exactly what it just did to chain tool calls or apply patches accurately. Critically, empty conversational preambles do not consume this quota, ensuring the last two *actual operations* are always visible.
+The pipeline is composed of four cooperating mechanisms:
 
-2.  **Reduced View (Older Turns)**:
-    *   **Trigger**: Any assistant message older than the last two functional actions (passed `distance_from_end = 99`).
-    *   **Behavior**: Functional XML tags are replaced with opaque, system-generated placeholders. Execution logs (`<processing>` blocks) are scrubbed completely.
-        *   `<artifact name="main.py">...</artifact>` → `[🔒SYSTEM_ARTIFACT_ANCHOR:main.py]`
-        *   `<tool>{"name": "tool_sql"}</tool>` → `[🔒SYSTEM_TOOL_EXECUTED:tool_sql]`
-    *   **Purpose**: Prevents context bloat. The LLM is informed that an action occurred and what it was, but the token-heavy payload (code blocks, JSON parameters) is stripped.
+| # | Mechanism | Implementation | Compression primitive |
+| :-- | :-- | :-- | :-- |
+| 1 | Dual-Stream separation | `ChatMixin.chat()` | `ai_msg.content` (UI/DB) vs `virtual_history` (LLM) |
+| 2 | Age-independent log scrubbing | `HistoryManager._sanitize_for_context()` + `_context_sanitizer.py` | `<processing>` blocks & status comments removed from *every* assistant message — no stubs ever generated |
+| 3 | Dual-Copy persistence & splicing | `ChatMixin.chat()` post-loop + next-turn `export()` | `ai_msg.metadata["virtual_history"]` rehydrated for one turn |
+| 4 | Action-Window Recollection | `ChatMixin` action-window closures + `discussion.history_compression_window` | Expired action rounds dropped from VH; narrative digest injected in the system zone |
+| 5 | Tool-output offloading | Tool-result path in `ChatMixin.chat()` | `[SYSTEM: ...]` pointers / `.log` artefacts (content-bearing, re-accessable) |
 
-3.  **User View (Always Verbatim)**:
-    *   **Trigger**: `msg.sender_type == 'user'`.
-    *   **Behavior**: User messages are **never** sanitized. They are always passed to the LLM exactly as written.
-    *   **Purpose**: The LLM must always have perfect recall of user instructions and queries.
+#### Mechanism 1 — Dual-Stream Separation (per message)
 
-This protocol works in tandem with the **Anti-Mimicry Defense**. Because older messages contain placeholders like `[🔒SYSTEM_ARTIFACT_ANCHOR:...]`, the LLM might be tempted to output these markers itself. The system prompt explicitly forbids this, and the `ChatMixin` actively intercepts and halts generation if it detects the LLM mimicking infrastructure markers.
+*   **UI/DB stream (`ai_msg.content`)**: conversational text plus system-generated `<processing type="...">` execution blocks and `<!-- status:... -->` outcome metadata. Rendered to the user, persisted verbatim.
+*   **LLM stream (`virtual_history`)**: the raw alternation of assistant text — **including the verbatim `<tool>`/`<artifact>` tags it emitted** — and user-side `<tool_result>` envelopes. This is the only representation that preserves exact KV-cache alignment.
+
+#### Mechanism 2 — Age-Independent Log Scrubbing (at export)
+
+`HistoryManager._sanitize_for_context()` applies one scrub to assistant messages of **every age**: it removes system telemetry (`<processing>` blocks — preserving any `<tool_result>` payload embedded inside — status comments, `<lollms_artifact/>`/`<artefact_image/>` rendering anchors) and keeps all functional tags and conversational text verbatim. The former Three-View Protocol's "reduced view" (which replaced old tags with stub tokens) is **deleted by doctrine**: it taught the model to emit stubs. User messages are never sanitized.
+
+#### Mechanism 3 — Dual-Copy Persistence (cross-turn amnesia prevention)
+
+A turn that involved tool calls or raw tag emission stores its full `virtual_history` into `ai_msg.metadata["virtual_history"]`. On the **next** turn, `export()` splices this stored raw alternation back into the context (in place of the sanitized `ai_msg.content`), but **only while no fresh virtual history is being built** — the LLM sees the exact previous execution path exactly once, then the copy is allowed to age into the normal sanitized branch.
+
+```mermaid
+flowchart TD
+    subgraph TurnN ["Turn N (agentic)"]
+        A1[LLM emits raw &lt;tool&gt; tags + text] --> A2[virtual_history accumulates:<br/>assistant raw text / user tool_result envelopes]
+        A2 --> A3[Tool runs; result sanitised,<br/>offloaded if &gt; 1500 tokens]
+        A3 --> A4[End of turn]
+        A4 --> A5{VH contains tool calls<br/>or raw tags?}
+        A5 -- No --> A6[Save ai_msg.content only<br/>&#40;direct mode&#41;]
+        A5 -- Yes --> A7[DUAL-COPY SAVE:<br/>metadata&#91;'virtual_history'&#93; = raw VH]
+    end
+
+    A6 --> B1[Turn N+1 export]
+    A7 --> B1
+    B1 --> B2{Previous assistant msg<br/>has stored virtual_history<br/>AND no fresh VH building?}
+    B2 -- Yes --> B3[Splice raw VH into context<br/>in place of sanitised ai_msg.content<br/>→ exact KV-cache alignment,<br/>no multi-turn amnesia]
+    B2 -- No --> B4[Export sanitised ai_msg.content<br/>&#40;Three-View Protocol&#41;]
+    B3 --> B5[Turn N+1 builds its own fresh VH;<br/>the Turn-N copy now ages into<br/>the normal sanitised branch]
+    B4 --> B5
+```
+
+#### Mechanism 4 — Action-Window Recollection Protocol (intra-turn, placeholder-free)
+
+Because a single agentic turn can run 20 rounds, `virtual_history` is bounded by an **action window** instead of being stubbed. The window size is `discussion.history_compression_window` (**default 4**), and it counts **completed actions** — tool calls (successful or instructive failures) and artifact dispatches — not raw message counts. Text-only stalls, corrections, and re-requests do not consume the window.
+
+The protocol is a deterministic cycle, driven after every completed action:
+
+1.  **Register**: each completed action is recorded with its round number, kind, parameters/recipe, and verdict.
+2.  **Overflow & digest**: when a new action arrives and the window already holds `N` actions, the oldest action's **round is removed from `virtual_history` entirely** — the assistant wrapper, the raw tag body, and the result envelope all go. In its place, a one-line **narrative digest entry** is appended to the turn's digest log. A tool digest carries the re-execution recipe (`Executed tool 'X' with parameters {...} — the call succeeded`); an artifact digest points at the live workspace (`Updated artifact 'report.md' (now v3); its current content is loaded in the Active Artifacts zone`).
+3.  **System-zone recall**: the digest log is injected into the **per-round system prompt** under `[COMPLETED ACTIONS DIGEST]` — never into `virtual_history`, never into `ai_msg.content`. Because it lives in the system zone, the model is never shown it as history and cannot learn to reproduce it as conversational output.
+4.  **Re-arm**: after digesting, the window simply waits again until 4 more actions accumulate. The cycle is purely mechanical — no LLM calls, no token cost beyond the digest lines themselves.
+5.  **No-loss guarantee**: artifact content is never lost — the workspace (and the `=== ACTIVE ARTIFACTS ===` zone) always holds the current file state. A digested tool call is fully re-derivable from its recorded recipe. What is released is only the *transcript*, never the *state*.
+
+The Turn Progress Tracker (`[TURN PROGRESS TRACKER]`) continues to list all actions of the turn (in-window and digested) for anti-repetition awareness.
+
+```mermaid
+flowchart TD
+    Start([Action completes:<br/>tool result received / artifact dispatched]) --> Register[Register action in window:<br/>kind, round, params recipe, verdict]
+    Register --> Full{Window holds &lt; N actions?<br/>N = history_compression_window, default 4}
+    Full -- Yes --> Keep[Keep the action round<br/>VERBATIM in virtual_history<br/>raw tags + result envelope intact]
+    Full -- No --> Overflow[Action window overflow]
+    Overflow --> Remove[REMOVE the oldest action round from VH:<br/>assistant text + raw tag body + result envelope]
+    Remove --> Digest[Append deterministic digest line to<br/>turn_digest_log system zone:<br/>tool → name + params + verdict recipe<br/>artifact → title + version + pointer to Active Artifacts zone]
+    Digest --> ReArm[Window re-arms: waits for<br/>N more actions. Cycle repeats]
+    Keep --> NextSysPrompt
+    ReArm --> NextSysPrompt[Next round system prompt build]
+    NextSysPrompt --> Inject[Inject into SYSTEM zone only:<br/>[TURN PROGRESS TRACKER] — all actions this turn<br/>[COMPLETED ACTIONS DIGEST] — narrative of expired rounds]
+    Inject --> Export[export&#40;&#41;:<br/>system prompt + sanitized branch +<br/>VH with only in-window rounds verbatim]
+    Export --> Guarantee[NO-LOSS GUARANTEE:<br/>artifact state → Active Artifacts zone<br/>tool results → re-executable from digest recipe<br/>UI/DB ai_msg.content → untouched, placeholder-free]
+```
+
+#### Mechanism 5 — Tool-Output Offloading (content-bearing pointers)
+
+Tool results are the single largest source of context bloat. Three defenses apply before a result ever enters `virtual_history`:
+
+*   **`_sanitize_tool_result()`**: strips base64 blobs (`[base64 blob stripped: 24.3KB]`), truncates oversized strings, and unwraps nested `output`/`content` payloads. The character cap is dynamic — 25% of the model context size, clamped between 8,000 and 50,000 chars.
+*   **Structured data (>1500 tokens)**: the payload is dropped and replaced with a compact pointer — `[SYSTEM: Tool returned X tokens of structured data… DO NOT attempt to read the raw rows. Use aggregation/plotting tools next.]` — steering the model toward aggregation rather than raw-row re-reads. This is **not** a placeholder: it names real workspace state and carries a concrete re-access strategy.
+*   **Unstructured text (>1500 tokens)**: the payload is persisted as a `TREE_UNLOCKABLE` `.log` artefact in the workspace and replaced with a pointer — `[SYSTEM: Tool returned X tokens of text. It has been saved to 'tool_output_x.log'. Unlock it to read a portion…]` — a pointer to a real file the model can unlock and read.
+
+Under the placeholder-free doctrine, these `[SYSTEM: ...]` markers are permitted because they are **content-bearing pointers to real, re-accessable state** (unlike stub tokens that merely claim an action happened). The anti-mimicry contract forbids the model from emitting them itself.
+
+Additionally, tool results are wrapped in an explicit envelope (`<tool_result name="..." status="SUCCESS">`) with an anti-loop header warning that the JSON is a **RESULT, not a new tool call**, plus per-tool next-step guidance.
+
+#### Cross-Session Compression: Pruning Synopsis
+
+`summarize_and_prune()` is the persistent-memory tier of the pipeline. When the branch exceeds a token budget, it generates a dense **Project State Synopsis** (technical decisions, current goal, constraints — explicitly excluding conversational filler), stores it in `self.pruning_summary`, and sets `self.pruning_point_id`. On every subsequent export, only messages **from the pruning point onward** are rendered; everything earlier is represented by the synopsis block injected into the system prompt. The synopsis is fingerprint-hashed, so it is only regenerated when the branch content actually changes.
+
+#### The Anti-Mimicry Contract
+
+Because the pipeline injects system text (`[SYSTEM: ...]` pointers, `<action_result>` envelopes, `[COMPLETED ACTIONS DIGEST]` narratives), the model could be tempted to reproduce them. Four defenses enforce the contract:
+
+1.  The system prompt's *Action Integrity Protocol* explicitly forbids emitting system markers, stub tags, and digest narratives.
+2.  `_StreamState` halts generation the moment the model emits a `<processing` tag itself (system-generated only).
+3.  `ChatMixin` performs a final display scrub of mimicked `[🔒...]` markers from `ai_msg.content` before persistence (pure UI hygiene; no runtime gate).
+4.  **Structural immunity**: digests live only in the system zone — they are never presented as history, so there is no in-context example of a digest the model could copy as an assistant turn.
+5.  **Persona isolation**: the Orchestrator tier's prompt contains zero tool syntax, and Worker report envelopes contain no executable grammar — neither tier ever sees an example of a tool call it could mimic outside its own verbatim history.
 
 ### Detailed Phase Breakdown
 
@@ -541,7 +719,6 @@ def chat(
     max_reasoning_steps:          Optional[int] = None,
     nudge_threshold:              int = 3,
     enable_in_message_status:     bool = False,
-    enable_sub_agents:            bool = False,
     forward_artefact_chunks:      bool = False,
     fast_artefact_replicas:       Optional[List[str]] = None,
     tolerance_level:              Optional[str] = "strict",
@@ -549,6 +726,7 @@ def chat(
     enable_data_tools:            bool = True,
     enable_code_execution:        bool = False,
     suppress_images:              bool = False,  # 🛡️ Set to True for non-vision LLMs to prevent passing image data
+    orchestrator_mode:            bool = False,  # 🧠 Run as pure Orchestrator (delegation-only; workers inherit the tools)
     debug_export:                 bool = False,
     debug:                        bool = False,
     enable_vlm_query:             bool = False,
@@ -587,7 +765,8 @@ The tool registry follows a **Strict Sovereign Opt-In Doctrine**. The system wil
 2.  **Explicit `tools` parameter**: The `tools` argument to `chat()` accepts two types of values:
     *   **Dictionary of Callables**: A mapping of tool names to their specification dictionaries (containing `name`, `description`, `parameters`, `callable`). This is used for injecting custom, session-specific functions.
     *   **List of Default Tool Names**: A list of strings matching the names of tools available in the `LCPBinding`'s discovered registry (e.g., `["tool_execute_python_code", "tool_query_database_sql"]`). The orchestrator will resolve these names to their specs and register them. If a requested name is not found in the LCP registry, it is ignored.
-3.  **Auto-Mounted Data Tools**: If `enable_data_tools=True` (Default: `True`) AND data files (`.csv`, `.db`, `.xlsx`) exist in the discussion workspace, the system will automatically mount and register the `semantic_data_engineer` LCP library. This is the ONLY automatic tool mounting behavior.
+3.  **Auto-Mounted Data Tools**: If `enable_data_tools=True` (Default: `True`) AND data files (`.csv`, `.db`, `.xlsx`) exist in the discussion workspace, the system will automatically mount and register the `semantic_data_engineer` LCP library.
+4.  **Spinoff Sub-Agents (Worker-Tier Only)**: The in-process spinoff sub-agents (`tool_spinoff_code_specialist`, `tool_spinoff_presentation_designer`) are registered ONLY in the Worker persona's tool registry (`orchestrator_mode=False`). The Orchestrator persona NEVER receives them — it never sees tool syntax at all. When the Orchestrator delegates a task, the spawned Worker inherits the spinoff tools through the tools registry resolved once at turn start. This closes the contradictory double-mandate where the Orchestrator was told "you do not execute" while being handed executable tools.
 
 *   `tools` (`Union[Dict[str, Dict[str, Any]], List[str], None]`): A dictionary of external tool specifications OR a list of default LCP tool names to activate.
     
@@ -620,6 +799,7 @@ The tool registry follows a **Strict Sovereign Opt-In Doctrine**. The system wil
 *   `enable_data_tools` (`bool`): If `True` (Default), allows the system to auto-mount the `semantic_data_engineer` library if data files are detected in the workspace.
 *   `allow_dynamic_tools` (`bool`): **Security Gate**. If `True`, allows the LLM to write and execute its own Python tools on the fly via `type="tool"` artifacts. Defaults to `False`.
 *   `enable_code_execution` (`bool`): **Security Gate**. If `True`, registers the `tool_execute_python_code` LCP tool, allowing the LLM to execute arbitrary Python code strings. Defaults to `False`.
+*   `orchestrator_mode` (`bool`): If `True`, this `chat()` invocation runs as the **Orchestrator persona**: its system prompt contains only reflection + delegation grammar (no tool syntax, `tools_prompt` empty), and intercepted `<delegate>` blocks spawn bounded Worker sub-agents whose reports return as single `[WORKER REPORT]` envelopes. The tools enabled for the turn are inherited by the spawned Workers. Defaults to `False` (the full worker-tier doctrine with all execution guards).
 *   `max_nb_rounds` (`Optional[int]`): The maximum number agentic reasoning rounds before the loop forces a final answer. Prevents infinite cycles. Defaults to `20` if `None`.
 *   `max_reasoning_steps` (`Optional[int]`): **Deprecated**. Backward-compatible alias for `max_nb_rounds`. If `max_nb_rounds` is provided, this parameter is ignored.
 *   `nudge_threshold` (`int`): Round-budget early warning. When the number of remaining reasoning rounds falls to this value or below, a `[ROUND BUDGET NOTICE]` block is injected into that round's system prompt, telling the LLM exactly how many rounds remain and directing it to prioritize and wrap up (finish remaining work and emit `<done/>`) instead of being hard-stopped by round-budget exhaustion. The notice is recomputed every round and appears only in the per-round system prompt (it never mutates the base system prompt or `tools_prompt`, so KV-cache alignment across turns is preserved). On the final round the notice is an approximate advance warning, since the loop may still terminate by exhaustion immediately after. Suppressed only by setting `0` (or any value `<= 0`); not affected by `EventMode.SILENT_MODE`. Defaults to `3`.
@@ -743,11 +923,10 @@ When `EventMode.FULL_CALLBACK_MODE` (or `MIXED_MODE`, which emits them alongside
     *   The `status` string is a closed set:
         *   `"done"` — the LLM emitted the `<done/>` termination tag.
         *   `"cancelled"` — user cancellation was observed.
-        *   `"action"` — the round dispatched an action (tool, artefact, note, skill); the loop continues.
-        *   `"text_stall"` — the text-only stall limit was reached; the loop terminated.
+        *   `"action"` — the round dispatched an action (tool, artefact, note, skill, worker delegation); the loop continues.
         *   `"loop_break"` — a duplicate/phantom/malformed-call guard broke the loop.
         *   `"max_rounds"` — the round budget was exhausted.
-        *   `"conversational"` — round 1 pure conversational answer completed the turn.
+        *   `"conversational"` — a plain-text round completed the turn (the answer IS the answer).
 
 These events are **callback-only**: they are never written into `ai_msg.content` or `virtual_history`, and they are suppressed entirely in `EventMode.SILENT_MODE`. Exactly one `MSG_TYPE_ROUND_END` fires per `MSG_TYPE_ROUND_START` under all exit paths — including cancellation, loop guards, and natural exhaustion of the round budget.
 
@@ -1068,6 +1247,133 @@ discussion._debug_mode = False  # disable when done (zero overhead when off)
 *   **Full prompt exposure**: `full_prompt_round_*.log` contains the complete system prompt, RAG context, memories, and workspace file contents. Never enable debug dumps in production or when handling sensitive user data.
 *   **Retention**: Dumps are never auto-deleted. Purge `_debug_dumps/` manually after a debugging session, or exclude it from backups.
 *   **No network egress**: All dumps are strictly local writes inside the discussion workspace — nothing leaves the machine.
+
+---
+
+## 🌊 5. The Complete `chat()` Agentic Loop Workflow
+
+The following diagram describes the **entire control flow** of the `chat()` method, including every exit path, interception gate, and continuation branch. It is the authoritative map of the agentic state machine implemented in `ChatMixin`.
+
+```mermaid
+flowchart TD
+    Start([chat() called]) --> PreInit[Pre-turn setup:<br/>resolve max_rounds, capture<br/>pre-turn cancellation signal]
+    PreInit --> MemOp{Memory enabled?}
+    MemOp -- Yes --> MemTasks[Apply decay, pull deep memories,<br/>enforce token budget]
+    MemOp -- No --> UserMsg[Add or resolve user message<br/>from branch tip]
+    MemTasks --> UserMsg
+
+    UserMsg --> SysPrompt[Build system prompt:<br/>persona + core rules + features +<br/>RAG + artifacts + memories + data zones]
+    SysPrompt --> ToolReg[Resolve active tool registry:<br/>personality handbag, explicit tools,<br/>auto-mounted LCP libraries]
+    ToolReg --> InitAIm[Initialize DB ai_msg,<br/>reset FailureMemory,<br/>virtual_history = empty]
+
+    InitAIm --> RoundStart{Round loop:<br/>round_count &lt; max_rounds?}
+    RoundStart -- No --> MaxRounds[Force final answer<br/>status: max_rounds]
+    RoundStart -- Yes --> CancelChk{Cancelled?}
+    CancelChk -- Yes --> CancelledExit[Mark was_cancelled,<br/>status: cancelled]
+    CancelChk -- No --> ExportCtx[export context,<br/>inject turn progress tracker]
+    ExportCtx --> GenCall[Stream LLM generation<br/>via _StreamState parser]
+
+    GenCall --> GenFail{Generation<br/>exception?}
+    GenFail -- Yes --> CancelChk2{Cancelled?}
+    CancelChk2 -- Yes --> CancelledExit
+    GenFail -- Yes --> CancelChk2
+    CancelChk2 -- No --> RaiseError[Raise exception<br/>error dump if debug]
+    GenFail -- No --> FlushBuf[flush_remaining_buffer:<br/>force-dispatch unclosed tags]
+    FlushBuf --> DoneTag{&lt;done/&gt;<br/>detected?}
+    DoneTag -- Yes --> DoneExit[Terminate loop<br/>status: done]
+
+    DoneTag -- No --> MemSearch{Pending<br/>&lt;mem_search&gt;?}
+    MemSearch -- Yes --> ExecSearch[Execute search against memory tiers,<br/>deduplicate identical queries,<br/>inject results + decision point]
+    ExecSearch --> RoundStart
+    MemSearch -- No --> ArtifactLoop{Force-final flag set<br/>AND artifact re-dispatch?}
+    ArtifactLoop -- Yes --> LoopBreak1[Break loop<br/>status: loop_break]
+    ArtifactLoop -- No --> DupCheck{Action dispatched,<br/>no tool, no affected artefacts?}
+    DupCheck -- Yes --> FailedPatch{Dispatch<br/>marked failed?}
+    FailedPatch -- Yes --> PatchCorrection[Inject correction:<br/>retry SEARCH/REPLACE with<br/>exact match, status: action]
+    PatchCorrection --> RoundStart
+    FailedPatch -- No --> TrueDup[Force final answer flag,<br/>inject CRITICAL anti-loop directive]
+    TrueDup --> LoopBreak2[Break loop<br/>status: loop_break]
+
+    DupCheck -- No --> ActionNoTool{Action dispatched,<br/>not a tool?}
+    ActionNoTool -- Yes --> HydrateVH[Hydrate virtual_history with verbatim tag,<br/>bump environment epoch,<br/>inject action_result SUCCESS envelope]
+    HydrateVH --> RoundStart
+    ActionNoTool -- No --> ToolTrigger{tool_trigger<br/>set?}
+    ToolTrigger -- No --> NoTool[Text-only round<br/>path]
+    ToolTrigger -- Yes --> ParseCall[Parse tool call JSON]
+    ParseCall --> Malformed{Malformed JSON<br/>or missing name?}
+    Malformed -- Yes --> MalCount{Same malformed<br/>signature 2+ times?}
+    MalCount -- Yes --> LoopBreak3[Break loop<br/>status: loop_break]
+    MalCount -- No --> MalCorrect[Inject format-error correction,<br/>record in FailureMemory]
+    MalCorrect --> RoundStart
+    Malformed -- No --> MemTagCheck{Tool name is a<br/>forbidden memory tag?}
+    MemTagCheck -- Yes --> MemCorrect[Block, emit failure UI block,<br/>inject correct &lt;mem_*&gt; syntax correction]
+    MemCorrect --> RoundStart
+    MemTagCheck -- No --> PhantomChk{Tool NOT in<br/>active registry?}
+    PhantomChk -- Yes --> PhantomCount{Same phantom signature<br/>2+ times?}
+    PhantomCount -- Yes --> LoopBreak4[Break loop<br/>status: loop_break]
+    PhantomCount -- No --> PhantomCorrect[Inject INVALID TOOL CALL correction,<br/>list available tools,<br/>record in FailureMemory]
+    PhantomCorrect --> RoundStart
+    PhantomChk -- No --> LoopDet{Failure signature match<br/>AND same environment epoch?}
+    LoopDet -- Yes --> FailBlock[Inject loop-blocked result,<br/>mandate final explanation<br/>status: action]
+    FailBlock --> RoundStart
+    LoopDet -- No --> SuccessLoop{Success signature match<br/>AND unchanged workspace hashes?}
+    SuccessLoop -- Yes --> SuccessBlock[Inject duplicate-success block,<br/>mandate final answer<br/>status: action]
+    SuccessBlock --> RoundStart
+    SuccessLoop -- No --> Execute[Execute tool via callable or LCP:<br/>CWD switch to workspace,<br/>sync artifacts before/after,<br/>diff workspace files]
+    Execute --> ToolResult{Result is<br/>failure?}
+    ToolResult -- Failure --> FailPath[Record failure signature + epoch,<br/>inject SELF-CORRECTION MANDATE:<br/>diagnose → fix → retry → iterate]
+    FailPath --> RoundStart
+    ToolResult -- Success --> SuccessPath[Record success signature,<br/>inject TOOL RESULT envelope<br/>+ mandatory next steps]
+    SuccessPath --> RoundStart
+
+    NoTool --> EmptyGen{Empty response<br/>0 tokens?}
+    EmptyGen -- Yes --> EmptyBreak[Break immediately<br/>&#40;no placeholder appended&#41;]
+    EmptyGen -- No --> UnlockReq{Context unlock<br/>requested?}
+    UnlockReq -- Yes --> UnlockCont[Inject action_result SUCCESS:<br/>files now loaded,<br/>status: action]
+    UnlockCont --> RoundStart
+    UnlockReq -- No --> ConvExit[Plain text = the answer<br/>status: conversational]
+
+    MaxRounds --> Final
+    CancelledExit --> Final
+    DoneExit --> Final
+    LoopBreak1 --> Final
+    LoopBreak2 --> Final
+    LoopBreak3 --> Final
+    LoopBreak4 --> Final
+    FailBlock --> Final
+    SuccessBlock --> Final
+    FailPath --> Final
+    SuccessPath --> Final
+    MalCorrect --> Final
+    EmptyBreak --> Final
+    UnlockCont --> Final
+    ConvExit --> Final
+    PatchCorrection --> Final
+    ExecSearch --> Final
+    MemCorrect --> Final
+    PhantomCorrect --> Final
+
+    Final([Post-loop: dual-copy virtual_history persistence,<br/>hallucinated filename auto-correction,<br/>memory tag processing, episodic save,<br/>auto-dream, commit, reset cancel state])
+```
+
+**Exit Path Summary Table**
+
+| Exit Status | Trigger | Guarantee |
+| :--- | :--- | :--- |
+| `done` | LLM emitted `<done/>` — sovereign, never rejected | Task explicitly terminated by the model |
+| `conversational` | A plain-text round without `<done/>` (any round) | The answer IS the answer; no forced continuation |
+| `cancelled` | `cancel_generation()` observed at any safe point | `ai_msg` saved with cancellation marker |
+| `action` | Tool ran / artifact built / correction / worker report injected | Loop continues with hydrated `virtual_history` |
+| `loop_break` | Duplicate artifact, repeated phantom/malformed call | Hard-stops token waste on pathological loops |
+| `max_rounds` | Round budget exhausted | Safety net; forces loop end |
+
+**Key Invariants**
+
+1. **Round-Event Pairing**: Exactly one `MSG_TYPE_ROUND_END` fires per `MSG_TYPE_ROUND_START` under every exit path.
+2. **Environment Epoch Gating**: A failing tool may be retried identically only if the workspace changed in between (artifact built, different tool ran, files mutated). Otherwise the second identical failure is hard-blocked.
+3. **One-Action-Per-Turn Halting**: Once `_StreamState` dispatches a functional tag, generation halts instantly; the executor takes the next round.
+4. **Duplicate Dispatch Immunity**: `persistent_processed_tags` (a per-turn set) prevents the same `<artifact>` byte-block from being registered twice.
+5. **Pre-Turn Cancellation Preservation**: A `cancel_generation()` call *before* `chat()` is captured, the flag reset, then re-set — ensuring the first round observes it without a stale flag bleeding into turn N+1.
 
 ---
 
