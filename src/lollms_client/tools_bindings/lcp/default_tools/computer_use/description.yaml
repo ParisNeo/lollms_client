@@ -1,0 +1,15 @@
+name: computer_use
+description: >
+  Desktop automation toolset (Computer Use). Take screenshots, move the mouse,
+  click at coordinates or visually-grounded elements, type text, press keys,
+  and scroll. Visual grounding of natural-language element descriptions is
+  performed by the active vision-capable LLM — requires a vision model.
+icon: "🖥️"
+tools:
+  - tool_computer_desktop_info
+  - tool_computer_screenshot
+  - tool_computer_click
+  - tool_computer_move_cursor
+  - tool_computer_type
+  - tool_computer_key
+  - tool_computer_scroll

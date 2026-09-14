@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-14 21:32]
+
+- feat(personality): add personality tools support to chat mixin and update documentation
+
 ## [2026-09-14 09:11]
 
 - build(pyproject): update build config and dependency list
