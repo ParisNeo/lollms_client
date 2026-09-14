@@ -102,7 +102,6 @@ def _mk_discussion(tmp_path: Path, ctx_size: int = 8192):
         record_failure_by_signature=lambda *a, **k: None,
     )
     mixin.__dict__["_mimicry_attempt_counts"] = [0]
-    mixin.__dict__["_consecutive_text_only_stalls"] = 0
     mixin.__dict__["turn_actions_log"] = []
     mixin.__dict__["_debug_mode"] = 2 if False else False
     mixin.__dict__["_active_personality"] = None
@@ -173,8 +172,7 @@ class TestRoundEventPairing:
     def test_round_end_status_closed_set(self):
         """MSG_TYPE_ROUND_END statuses must belong to the documented closed set."""
         allowed = {
-            "done", "cancelled", "action", "text_stall", "loop_break",
-            "max_rounds", "conversational",
+            "done", "cancelled", "action", "max_rounds",
         }
         captured: List[str] = []
         orig_init = _StreamState.__init__
@@ -321,6 +319,29 @@ class TestHostPathLeakPrevention:
 
         disc.lollmsClient.generate_from_messages = MagicMock(side_effect=lambda **kw: scripted_llm(**kw))
         disc.lollmsClient.llm = SimpleNamespace(model_name="mock", binding_name="mock", reset_cancel=lambda: None)
+
+        disc_lollms_props = {
+            "count_tokens": lambda t: max(1, len(t) // 4),
+            "get_ctx_size": lambda: 8192,
+            "remove_thinking_blocks": lambda s: s,
+            "has_vision_capability": lambda: True,
+            "ai_name": "Assistant",
+            "tools": None,
+            "llm": SimpleNamespace(model_name="mock", binding_name="mock", reset_cancel=lambda: None),
+            "generate_from_messages": MagicMock(side_effect=lambda **kw: scripted_llm(**kw)),
+        }
+        for prop_name, prop_value in disc_lollms_props.items():
+            setattr(disc.lollmsClient, prop_name, prop_value)
+
+        disc.export = MagicMock(return_value=[{"role": "user", "content": "trigger crash"}])
+        disc.get_branch = MagicMock(return_value=[])
+        disc._is_db_backed = False
+        disc.autosave = False
+        disc.workspace_data_path = str(tmp_path / "workspace_data")
+        disc.workspace_path = str(tmp_path)
+        disc._workspace_write_revision = 0
+        disc._get_memory_manager = MagicMock(return_value=None)
+        disc.export = MagicMock(return_value=[{"role": "user", "content": "trigger crash"}])
 
         def cb(chunk, msg_type, meta):
             return True

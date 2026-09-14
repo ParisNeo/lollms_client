@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-14 01:54]
+
+- refactor(artefact): consolidate artefact module and remove duplicate root file
+
 ## [2026-09-13 15:58]
 
 - Remove outdated chat discussion mixin and refactor agentic documentation.

@@ -226,6 +226,7 @@ class MSG_TYPE(Enum):
 
     MSG_TYPE_WORKER_SPAWN_START        = 59 # a delegated worker agent has been spawned
     MSG_TYPE_WORKER_SPAWN_END          = 60 # a delegated worker agent has completed (or crashed)
+    MSG_TYPE_AGENT_SPAWN               = 61 # an <agent> tag was intercepted and a sub-agent spawned
 
 
 class EventMode(Enum):

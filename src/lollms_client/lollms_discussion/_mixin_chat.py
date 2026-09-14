@@ -108,6 +108,7 @@ _FORBIDDEN_TOOL_NAMES = {
 
 _SECONDARY_TAG_MAP = {
     "<delegate":      ("delegation_start",    MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</delegate>"),
+    "<agent":         ("agent_spawn",         MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</agent>"),
     "<artifact":      ("artifact_update",     MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK, MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,    "</artifact>"),
     "<artefact":      ("artifact_update",     MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK, MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,    "</artefact>"),
     "<note":          ("note_start",          MSG_TYPE.MSG_TYPE_NOTE_CHUNK,     MSG_TYPE.MSG_TYPE_NOTE_DONE,         "</note>"),
@@ -238,6 +239,42 @@ def _scrub_for_llm_context(text: str) -> str:
     cleaned = re.sub(r'<lollms_artifact[^/]*/>', '', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'<artefact_image[^/]*/>', '', cleaned, flags=re.IGNORECASE)
     return cleaned.strip()
+
+
+_INTENT_ANNOUNCEMENT_RE = re.compile(
+    r'(?im)^\s*(?:'
+    r'i\s+will\b'
+    r'|i\s+am\s+going\s+to\b'
+    r'|i\'?m\s+going\s+to\b'
+    r'|i\'?ll\b'
+    r'|let\s+me\b'
+    r'|let\'?s\b'
+    r'|allow\s+me\b'
+    r'|first[,.]?\s+(?:i\s+will|let\s+me|allow\s+me)\b'
+    r'|now\s+(?:i\s+will|let\s+me|allow\s+me)\b'
+    r'|next[,.]?\s+(?:i\s+will|let\s+me|allow\s+me)\b'
+    r'|je\s+vais\b'
+    r'|permettez[- ]moi\b'
+    r'|laissez[- ]moi\b'
+    r'|laisse[- ]moi\b'
+    r'|je\s+commence\b'
+    r')'
+)
+
+
+def _detect_intent_only_round(round_text: str) -> bool:
+    """
+    Deterministic detector for the announced-intent-without-action pathology.
+
+    Returns True when a TEXT-ONLY round announces an upcoming action (using
+    the exact finite intent-verb vocabulary taught by the system prompt
+    doctrine) but the round performed no action at all. This is NOT an open
+    NLP heuristic: it matches the closed set of first-person intent openers
+    the SAME-RESPONSE EXECUTION MANDATE forbids ending a round on.
+    """
+    if not round_text:
+        return False
+    return bool(_INTENT_ANNOUNCEMENT_RE.search(round_text))
 
 # Structural symbol and metadata extraction delegated to lollms_chat_core
 
@@ -537,6 +574,7 @@ class _StreamState:
         # Distinguishes a failed SEARCH/REPLACE patch (which should allow a correction round)
         # from a true duplicate artifact (which should hard-break the loop).
         self._last_dispatch_failed = False
+        self._last_failure_kind: Optional[str] = None
 
         # ── DONE TAG DETECTION ──
         # Set to True when the LLM emits <done/> to signal explicit task termination.
@@ -548,6 +586,9 @@ class _StreamState:
         # delegation-correction envelope instead of executing anything.
         self._tool_refusal_detected = False
 
+        # Orchestrator→SubAgent <agent> tag payload captured this round.
+        self.sub_agent_payload: Optional[Dict[str, Any]] = None
+
         # ── Generic Secondary Tag Interceptor State ──
         # Handles <skill>, <note>, <lollms_inline>, <lollms_form>, <generate_image>, <edit_image>, etc.
         # These tags don't need the specialized dual-stream artifact tracker, but DO need
@@ -557,7 +598,14 @@ class _StreamState:
         self._secondary_tag_name = ""      # e.g., "skill", "note"
         self._secondary_closing_tag = ""   # e.g., "</skill>"
         self._secondary_open_tag = ""      # e.g., '<skill title="...">'
+        self._secondary_attrs = {}
 
+        # ── PROCESSING BLOCK PARITY LATCH ──
+        # True while a <processing> block is open in ai_message.content.
+        # Guarantees every </processing> close has exactly one matching open:
+        # the entry block sets it, and exactly one owner (dispatcher for
+        # context tags, accumulator otherwise) clears it.
+        self._processing_block_open = False
         # Heartbeat control for empty/slow artifacts
         self._artefact_heartbeat_thread: Optional[threading.Thread] = None
         self._artefact_heartbeat_stop = threading.Event()
@@ -1399,7 +1447,7 @@ class _StreamState:
                 open_match = re.search(pattern, lower_buffer)
                 if open_match:
                     open_idx = open_match.start()
-                    tag_start_idx = lower_buffer.find(tag_prefix, open_idx)
+                    tag_start_idx = lower_buffer.find(tag_tag_prefix, open_idx)
                     if tag_start_idx == -1:
                         tag_start_idx = open_idx
                     if self._opening_tag_is_malformed(self._pending_buffer, tag_start_idx):
@@ -1462,9 +1510,11 @@ class _StreamState:
                         full_match_text
                     )
 
-                proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
-                self.ai_message.content += proc_close_tag
-                _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                if self._secondary_tag_name not in ("unlock_file", "lock_file", "hide_file", "agent"):
+                    proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
+                    self.ai_message.content += proc_close_tag
+                    _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    self._processing_block_open = False
 
                 remaining_text = self._secondary_buffer[close_idx + close_len:]
 
@@ -1487,7 +1537,7 @@ class _StreamState:
         if not is_inside_thoughts and not self._is_accumulating_secondary:
             lower_buffer = self._pending_buffer.lower()
             secondary_entered = False
-            for tag_prefix in ("<delegate", "<skill", "<note", "<scratchpad", "<lollms_form", "<generate_image", "<edit_image", "<unlock_file", "<lock_file", "<hide_file"):
+            for tag_prefix in ("<agent", "<delegate", "<skill", "<note", "<scratchpad", "<lollms_form", "<generate_image", "<edit_image"):
                 pattern = r'(?m)^\s*(?!`)(?!.*\|)' + re.escape(tag_prefix)
                 open_match = re.search(pattern, lower_buffer)
                 if open_match:
@@ -1521,27 +1571,29 @@ class _StreamState:
                             self._secondary_buffer = opening_tag
                             self._pending_buffer = ""
 
-                            proc_type = self._secondary_tag_name
-                            title_val = attrs.get("title") or attrs.get("name") or self._secondary_tag_name.capitalize()
-                            proc_open = f'\n<processing type="{proc_type}" title="{title_val}">\n'
-                            self.ai_message.content += proc_open
-                            _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                            tag_name = self._secondary_tag_name
+                            if tag_name != "agent":
+                                proc_type = self._secondary_tag_name
+                                title_val = attrs.get("title") or attrs.get("name") or self._secondary_tag_name.capitalize()
+                                proc_open = f'\n<processing type="{proc_type}" title="{title_val}">\n'
+                                self.ai_message.content += proc_open
+                                self._processing_block_open = True
+                                _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
-                            status_msg = _ARTEFACT_TYPE_MESSAGES.get(self._secondary_tag_name, f"✨ Processing {self._secondary_tag_name}...")
-                            status_line = f'{status_msg}\n'
-                            self.ai_message.content += status_line
-                            _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                status_msg = _ARTEFACT_TYPE_MESSAGES.get(self._secondary_tag_name, f"✨ Processing {self._secondary_tag_name}...")
+                                status_line = f'{status_msg}\n'
+                                self.ai_message.content += status_line
+                                _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
-                            # Emit open event announcement
-                            tag_info = _SECONDARY_TAG_MAP.get(f"<{self._secondary_tag_name}")
-                            if tag_info:
-                                open_evt = tag_info[0]
-                                _cb(self.callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
-                                    "type": open_evt,
-                                    "title": title_val,
-                                    "category": attrs.get("category", ""),
-                                    "description": attrs.get("description", "")
-                                })
+                                tag_info = _SECONDARY_TAG_MAP.get(f"<{self._secondary_tag_name}")
+                                if tag_info:
+                                    open_evt = tag_info[0]
+                                    _cb(self.callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
+                                        "type": open_evt,
+                                        "title": title_val,
+                                        "category": attrs.get("category", ""),
+                                        "description": attrs.get("description", "")
+                                    })
 
                             secondary_entered = True
                             break
@@ -1597,10 +1649,11 @@ class _StreamState:
                         full_match_text
                     )
 
-                # Close the processing block with status metadata
-                proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
-                self.ai_message.content += proc_close_tag
-                _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                if self._secondary_tag_name != "agent":
+                    proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
+                    self.ai_message.content += proc_close_tag
+                    _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    self._processing_block_open = False
 
                 remaining_text = self._secondary_buffer[close_idx + close_len:]
 
@@ -2352,11 +2405,18 @@ class _StreamState:
             details_block = f"Context Update:\n{'; '.join(status_parts)}\n"
             status_meta = "failure" if (not_found and not processed_files) or blocked_files else "success"
 
-            # The generic secondary tag interceptor already emitted the <processing> opening block.
-            # We just need to append the status content and close the block.
+            # The entry interceptor opened the <processing> block; this dispatcher
+            # is its single owner for context tags. Close it exactly once.
             proc_close = f'{status_line}{details_block}<!-- status:{status_meta} -->\n</processing>\n\n'
-            self.ai_message.content += proc_close
-            _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            if self._processing_block_open:
+                self.ai_message.content += proc_close
+                _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                self._processing_block_open = False
+            else:
+                proc_close_tag = f'\n<processing type="context_update" title="{action_verb} context files">\n'
+                self.ai_message.content += proc_close_tag
+                self.ai_message.content += proc_close
+                _cb(self.callback, proc_close_tag + proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
             # ── INJECT CONTEXT BUDGET GUIDANCE INTO VIRTUAL HISTORY ──
             # If files were blocked, inject a system message so the LLM knows
@@ -2370,7 +2430,7 @@ class _StreamState:
                     object.__setattr__(self, '_blocked_files_guidance', [])
                 self._blocked_files_guidance.append(
                     f"The following files are too large to load into context directly: {blocked_names}. "
-                    f"You MUST use a tool (e.g., SQL query, grep, or execute_python_code) to extract "
+                    f"you MUST use a tool (SQL query, grep, or execute_python_code) to extract "
                     f"specific data from these files. Do NOT attempt to <unlock_file> them again."
                 )
 
@@ -2381,7 +2441,56 @@ class _StreamState:
             self._action_dispatched = True
             return True
 
-        # 7. Orchestrator→Worker Delegation
+        # 7. Sub-Agent Spawning via <agent> tag (functional tag, NOT a tool call)
+        elif tag_name == "agent":
+            from lollms_client.lollms_agentic.sub_agent_spawner import (
+                parse_agent_tag as _parse_agent_tag,
+                repair_agent_tag_body as _repair_agent_tag_body,
+            )
+
+            full_opening_tag = attrs_str if attrs_str.startswith("<") else f"<{attrs_str}>"
+            agent_config = _parse_agent_tag(full_opening_tag, body)
+            if agent_config is None:
+                repaired_task, repair_notes = _repair_agent_tag_body(full_opening_tag, body)
+                if repaired_task:
+                    agent_config = _parse_agent_tag(full_opening_tag, repaired_task)
+                    if agent_config is not None and repair_notes:
+                        ASCIIColors.info(
+                            "[StreamState] Agent tag auto-repaired ("
+                            + "; ".join(repair_notes)
+                            + "); proceeding with delegated spawn."
+                        )
+
+            if agent_config is None:
+                self._last_dispatch_failed = True
+                self._last_failure_kind = "agent_tag"
+                failure_block = (
+                    '\n<processing type="agent_spawn" title="Invalid agent tag">\n'
+                    "* ❌ The `<agent>` block was malformed: no `<task>` XML body found.\n"
+                    "* Expected syntax (must contain a `<task>...</task>` XML block):\n"
+                    "<agent name=\"worker\" system_prompt=\"...\" max_rounds=\"8\">\n"
+                    "<task>\n"
+                    "Self-contained instructions for the specialist.\n"
+                    "</task>\n"
+                    "<context_files>\n"
+                    "filename.ext\n"
+                    "</context_files>\n"
+                    "</agent>\n"
+                    "* Plain-text `=== TASK ===` wrappers are NOT valid inside `<agent>`; "
+                    "the task MUST be wrapped in `<task>` XML tags.\n"
+                    '<!-- status:failure -->\n</processing>\n'
+                )
+                self.ai_message.content += failure_block
+                _cb(self.callback, failure_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                return True
+
+            self.sub_agent_payload = {
+                "config": agent_config,
+                "worker_index": int(getattr(self.discussion, "_worker_counter", 0)) + 1,
+            }
+            return True
+
+        # 7b. Orchestrator→Worker Delegation (legacy <delegate>)
         elif tag_name in ("delegate", "task_block"):
             self.delegation_payload = {
                 "opening_tag": attrs_str,
@@ -2484,10 +2593,11 @@ class _StreamState:
 
             # Context visibility tags close their own <processing> block with a
             # status meta inside the dispatcher; do not emit a duplicate close.
-            if self._secondary_tag_name not in ("unlock_file", "lock_file", "hide_file"):
+            if self._secondary_tag_name not in ("unlock_file", "lock_file", "hide_file", "agent"):
                 proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
                 self.ai_message.content += proc_close_tag
                 _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                self._processing_block_open = False
 
             self._secondary_tag_name = ""
             self._secondary_closing_tag = ""
@@ -3326,20 +3436,6 @@ class ChatMixin:
                         }
                         ASCIIColors.success(f"[ChatMixin] Registered {t_name} via direct discovered_tools fallback.")
 
-        from ..lollms_agentic.spinoff_tools import build_spinoff_agent_tools
-        active_tools.update(
-            build_spinoff_agent_tools(
-                self,
-                images or [],
-                orchestrator_mode=orchestrator_mode,
-                streaming_callback=kwargs.get("streaming_callback") or kwargs.get("callback"),
-                **{
-                    k: v for k, v in kwargs.items()
-                    if k not in ("temperature", "stream")
-                },
-            )
-        )
-
         if active_tools:
             ASCIIColors.info(
                 f"[ChatMixin] Final active tool registry ({len(active_tools)} tool(s)): "
@@ -3819,7 +3915,7 @@ class ChatMixin:
 
         if (enable_artefacts or active_tools or enable_memory) and not orchestrator_persona:
             feature_rules += (
-                "\n=== ACTION EXECUTION & SAME-RESPONSE MANDATE (CRITICAL) ===\n"
+                "\n=== ACTION EXECUTION & TERMINATION PROTOCOL (CRITICAL) ===\n"
                 "1. **INTENT ≠ EXECUTION (SAME-RESPONSE EXECUTION MANDATE)**: Stating 'I will search...', 'Let me analyze...', 'I am now writing...', or any equivalent declaration in ANY language (English, Arabic, Chinese, French, Spanish, etc.) DOES NOT execute the action. Conversational text is completely inert.\n"
                 "   - You MUST emit the corresponding functional XML tag (`<tool>`, `<artifact>`, `<skill>`, `<note>`, `<unlock_file>`, `<generate_image>`, etc.) IN THE EXACT SAME RESPONSE immediately following your brief statement of intent.\n"
                 "   - **NEVER SPLIT INTENT AND TAGS**: Never announce what you are going to do and then stop without emitting the tag. If you state intent without outputting the XML tag in the same response, the turn will end with nothing done.\n"
@@ -3827,7 +3923,7 @@ class ChatMixin:
                 "     • If an action is risky, destructive, or irreversible (e.g. deleting files, force-pushing git branches, dropping database tables), explicitly ask the user for confirmation and wait for their reply before emitting destructive tags.\n"
                 "     • For ALL normal, constructive tasks (creating/editing files, querying data, reading files, searching memories), output the functional tag IMMEDIATELY in the same turn without asking or waiting.\n"
                 "2. **MANDATORY TAG EMISSION**: If your response states that you are writing code, searching, or loading files, the functional tag MUST appear in that same response.\n"
-                "3. **EXPLICIT TERMINATION WITH <done/>**: You control the agentic loop. When you have finished all actions, verified all outputs, and formulated your final conversational response, terminate with `<done/>` on a new line.\n"
+                "3. **THE ONLY WAY TO FINISH IS `<done/>`**: The loop never ends on prose alone. Every response you produce must contain EITHER at least one functional action tag OR, when your work is complete, your final answer followed by the `<done/>` tag on a new line. A response containing neither a tag nor `<done/>` is invalid and will be rejected.\n"
                 "   **EXAMPLE**:\n"
                 "   ```\n"
                 "   Here is my complete answer and solution.\n"
@@ -3835,7 +3931,6 @@ class ChatMixin:
                 "   <done/>\n"
                 "   ```\n"
                 "4. **SAME-SESSION CONTINUATION**: In multi-step workflows, emit the next action tag immediately in your next response upon receiving previous tool/action results.\n"
-                "5. **ROUND 1 CONVERSATIONAL SHORT-CIRCUIT**: When the user's request is purely conversational (greeting, simple conceptual explanation) requiring NO tools, files, or actions, respond conversationally without action tags.\n"
             )
 
         # System Notification Handling (only if context unlocking is possible)
@@ -3862,6 +3957,28 @@ class ChatMixin:
                 "again with the same parameters to regenerate it. Instead, reference the produced "
                 "file URL in your final answer (e.g. <img src=\"/api/workspace_files/filename.png\" /> "
                 "for images) and STOP generating.\n"
+            )
+
+        # Sub-Agent Delegation Grammar (single canonical teacher)
+        if enable_artefacts and not orchestrator_persona:
+            feature_rules += (
+                "\n=== SUB-AGENT DELEGATION (OPTIONAL) ===\n"
+                "To delegate a self-contained task to a specialist agent, emit this EXACT structure "
+                "(starting on a new line, never inside code fences):\n"
+                "<agent name=\"worker\" system_prompt=\"You are an expert in X\" max_rounds=\"8\">\n"
+                "<task>\n"
+                "Self-contained instructions for the specialist.\n"
+                "</task>\n"
+                "</agent>\n"
+                "MANDATORY RULES:\n"
+                "1. The instructions MUST be wrapped in literal <task> and </task> XML tags — "
+                "nothing else is accepted.\n"
+                "2. NEVER use plain-text markers like '=== TASK ===' — they are not parsed.\n"
+                "3. Optionally add <context_files>filename.ext</context_files> INSIDE the agent tag "
+                "to give the specialist workspace files.\n"
+                "4. After the delegation, STOP generating. The agent's report arrives in your next turn; "
+                "then answer the user or delegate again.\n"
+                "=== END SUB-AGENT DELEGATION ===\n"
             )
 
         # Thinking & Reasoning Constraint (only if agentic features are enabled)
@@ -3920,13 +4037,12 @@ class ChatMixin:
                 "=== END TOOL CALLING DISCIPLINE ===\n"
             )
             tools_prompt += (
-                "\n=== 🏁 TASK COMPLETION PROTOCOL (CRITICAL PSYCHOLOGY) ===\n"
+                "\n=== 🏁 TASK COMPLETION PROTOCOL (CRITICAL) ===\n"
                 "Your goal is to SOLVE the user's problem, not to infinitely call tools.\n"
                 "1. **TOOL CALLS ARE TEMPORARY**: You call a `<tool>` only to gather data you don't have.\n"
                 "2. **ANSWERING IS THE GOAL**: Once you have the data, writing a comprehensive, helpful response to the user IS the successful completion of your task.\n"
-                "3. **HOW TO FINISH**: When you have written your final answer and the task is complete, simply STOP generating. You do not need to output any special tags or call any more tools.\n"
-                "4. **DO NOT FEAR ENDING**: Stopping generation after writing the answer is the CORRECT and REWARDING behavior. It means you succeeded.\n"
-                "5. **NEVER LOOP**: If you have already written your final answer to the user, you are DONE. Do NOT emit another `<tool>` tag. Emitting a tool call after your answer is a CRITICAL ERROR that ruins the completed task.\n"
+                "3. **HOW TO FINISH**: When your work is complete, write your final answer to the user and then emit `<done/>` on a new line. This is the ONLY way the turn ends.\n"
+                "4. **NEVER LOOP**: If you have already written your final answer, do NOT emit another `<tool>` tag. Emitting a tool call after your answer is a CRITICAL ERROR that ruins the completed task. Terminate with `<done/>`.\n"
                 "=== END TASK COMPLETION PROTOCOL ===\n"
             )
             tools_prompt += "\nExact syntax (copy this pattern exactly):\n<tool>{\"name\": \"tool_name\", \"parameters\": {\"param1\": \"value1\"}}</tool>\n\n"
@@ -4002,7 +4118,6 @@ class ChatMixin:
         total_actions_this_turn = 0
 
         tool_calls_this_turn = []
-        tool_refusals = 0
         round_count = 0
         conversational_gist = ""  # Accumulates only the conversational text for the final DB message
         worker_turn = not (orchestrator_mode or orchestrator_persona)
@@ -4483,13 +4598,9 @@ class ChatMixin:
             # ── 🛑 TOOL-LESS PERSONA REFUSAL HANDLING ──
             # A tool-less tier (orchestrator persona) attempted a <tool> call.
             # The dispatcher already refused execution; convert the refusal into
-            # a delegation-correction envelope. Two identical strikes break the loop.
+            # a delegation-correction envelope. The loop keeps running: the
+            # sovereign <done/> tag is the only termination signal.
             if ss.was_tool_refusal_detected():
-                tool_refusals += 1
-                if tool_refusals >= 2:
-                    ASCIIColors.warning("[ChatMixin] Repeated tool attempts from tool-less persona. Breaking loop.")
-                    _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="loop_break")
-                    break
                 refusal_text = _scrub_for_llm_context(
                     ss.get_clean_text_so_far()[current_content_length:]
                 ).strip()
@@ -4746,13 +4857,88 @@ class ChatMixin:
                 # Force a continuation round so the LLM can see the search results
                 continue
 
-            # ── 🛑 ARTIFACT LOOP ENFORCEMENT ──
-            # If we previously flagged a force-final-answer due to an artifact loop,
-            # and the LLM attempts to dispatch another artifact, we instantly break the loop.
-            if getattr(self, "_force_final_answer", False) and ss.was_action_dispatched() and not ss.tool_trigger:
-                ASCIIColors.warning("[ChatMixin] LLM attempted artifact dispatch after force-final-answer. Breaking loop.")
-                _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="loop_break")
-                break
+            # ── 🤖 SUB-AGENT TAG ROUTING (MUST PRECEDE ALL ARTIFACT/LOOP GATES) ──
+            # The <agent> tag is a delegation, not an artifact dispatch: routing it
+            # through the duplicate-artifact gate below would misread the empty
+            # affected_artefacts list as a true duplicate and break the loop with
+            # the worker never spawned. Execution happens HERE, after the stream
+            # has closed — never inside the provider's streaming callback.
+            if getattr(ss, "sub_agent_payload", None) is not None:
+                payload = ss.sub_agent_payload
+                ss.sub_agent_payload = None
+
+                from lollms_client.lollms_agentic.sub_agent_spawner import (
+                    run_sub_agent as _run_sub_agent,
+                )
+
+                sealed_run = None
+                spawn_error = None
+                try:
+                    sealed_run = _run_sub_agent(
+                        discussion=self,
+                        config=payload["config"],
+                        callback=callback,
+                        worker_index=payload["worker_index"],
+                        event_mode=event_mode,
+                        parent_personality=getattr(self, "_active_personality", None),
+                    )
+                except Exception as spawn_ex:
+                    trace_exception(spawn_ex)
+                    spawn_error = _sanitize_host_paths(str(spawn_ex))
+
+                object.__setattr__(self, "_worker_counter", payload["worker_index"])
+                _bump_environment_epoch()
+
+                if sealed_run is not None:
+                    runs = getattr(ai_msg, "metadata", None)
+                    if runs is None or not isinstance(runs, dict):
+                        try:
+                            runs = dict(ai_msg.metadata or {})
+                        except Exception:
+                            runs = {}
+                    run_list = runs.get("sub_agent_runs")
+                    if not isinstance(run_list, list):
+                        run_list = []
+                    run_list.append(sealed_run)
+                    runs["sub_agent_runs"] = run_list
+                    ai_msg.metadata = runs
+                    report_envelope = sealed_run["report_envelope"]
+                else:
+                    report_envelope = (
+                        f"[AGENT {payload['worker_index']} — FAILURE]\n"
+                        f"The specialist agent crashed before producing a report."
+                        f"{(' Error: ' + spawn_error) if spawn_error else ''}\n"
+                    )
+
+                gist = _scrub_for_llm_context(
+                    ss.get_clean_text_so_far()[current_content_length:]
+                ).strip()
+                if gist:
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="assistant",
+                        content=gist,
+                    ))
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content=report_envelope + (
+                        "Choose your next move: ANSWER the user (then `<done/>`), "
+                        "or spawn another agent with `<agent>` if this report is insufficient."
+                    ),
+                ))
+
+                _register_completed_action({
+                    "kind": "tool",
+                    "name": f"agent_{payload['worker_index']}",
+                    "params": {},
+                    "success": sealed_run is not None,
+                    "round": round_count,
+                })
+                _compress_virtual_history_if_needed()
+                _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
+                continue
+
+            # (Artifact loop enforcement removed per the single-signal termination
+            # contract: <done/> is the only way the model ends the turn.)
 
             # ── 🛑 CRITICAL FIX: DISTINGUISH FAILED PATCH FROM TRUE DUPLICATE ──
             # If the LLM emits an artifact tag that was ALREADY processed in a previous round,
@@ -4761,9 +4947,29 @@ class ChatMixin:
             # We must only force-final-answer for TRUE duplicates, not failed patches.
             if ss.was_action_dispatched() and not ss.tool_trigger and not ss.affected_artefacts:
                 if ss.was_last_dispatch_failed():
-                    # ── PATCH CORRECTION PATH ──
-                    # The SEARCH/REPLACE block failed. Inject the error and let the LLM correct it.
-                    ASCIIColors.warning("[ChatMixin] Artifact patch failed. Injecting correction context.")
+                    correction_body = ""
+                    if getattr(ss, "_last_failure_kind", None) == "agent_tag":
+                        ASCIIColors.warning("[ChatMixin] <agent> tag malformed. Injecting agent-syntax correction.")
+                        correction_body = (
+                            "[SYSTEM: Your last <agent> block was REJECTED — no <task> body was found.\n"
+                            "Re-emit the delegation using this EXACT structure:\n"
+                            "<agent name=\"worker\" system_prompt=\"You are an expert ...\" max_rounds=\"8\">\n"
+                            "<task>\n"
+                            "Self-contained instructions for the specialist.\n"
+                            "</task>\n"
+                            "</agent>\n"
+                            "MANDATORY: the instructions MUST be wrapped in literal <task> and </task> tags. "
+                            "Plain-text markers like '=== TASK ===' are NOT parsed. "
+                            "Do not wrap the delegation in code fences or any other tags.]"
+                        )
+                    else:
+                        ASCIIColors.warning("[ChatMixin] Artifact patch failed. Injecting correction context.")
+                        correction_body = (
+                            "[SYSTEM: Your last <artifact> SEARCH/REPLACE patch FAILED. The SEARCH block text was not found in the existing file content. "
+                            "You MUST retry the patch with a corrected SEARCH block that exactly matches the current file content. "
+                            "Look at the 'Fully Loaded File Contents [C]' section in your context to find the exact text to match. "
+                            "Do NOT emit <done/> until the patch succeeds or you decide to do a full rewrite instead.]"
+                        )
                     full_round_text = ss.get_clean_text_so_far()
                     raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
                     clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
@@ -4778,18 +4984,16 @@ class ChatMixin:
                     ))
                     virtual_history.append(SimpleNamespace(
                         sender_type="user",
-                        content=(
-                            "[SYSTEM: Your last <artifact> SEARCH/REPLACE patch FAILED. The SEARCH block text was not found in the existing file content. "
-                            "You MUST retry the patch with a corrected SEARCH block that exactly matches the current file content. "
-                            "Look at the 'Fully Loaded File Contents [C]' section in your context to find the exact text to match. "
-                            "Do NOT emit <done/> until the patch succeeds or you decide to do a full rewrite instead.]"
-                        )
+                        content=correction_body
                     ))
                     continue
                 else:
                     # ── TRUE DUPLICATE PATH ──
-                    ASCIIColors.warning("[ChatMixin] LLM emitted a duplicate artifact tag. Forcing final answer.")
-                    object.__setattr__(self, "_force_final_answer", True)
+                    # Same tag, same environment. No workspace mutation occurred,
+                    # so re-prompting teaches nothing new: append the round and a
+                    # corrective envelope, then let the next round decide. The
+                    # sovereign <done/> tag is the only termination signal.
+                    ASCIIColors.warning("[ChatMixin] LLM emitted a duplicate artifact tag. Injecting duplicate warning.")
                     duplicate_history_text = _scrub_for_llm_context(
                         ss.get_clean_text_so_far()[current_content_length:]
                     ).strip()
@@ -4802,8 +5006,43 @@ class ChatMixin:
                         sender_type="user",
                         content="[SYSTEM: CRITICAL. You just attempted to recreate an artifact that already exists with the exact same content. This is a loop. You MUST NOT create or update this artifact again. You MUST now provide your final conversational answer to the user, explaining what you have done, and end with <done/>.]"
                     ))
-                    _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="loop_break")
-                    break
+                    _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
+                    continue
+
+            # ── 🤖 SUB-AGENT TAG ROUTING ──
+            # The orchestrator emitted an <agent> tag; the spawner already ran
+            # the worker (user saw everything live). Feed ONLY the compact
+            # report envelope back so the orchestrator can answer or continue.
+            if getattr(ss, "sub_agent_payload", None) is not None:
+                payload = ss.sub_agent_payload
+                ss.sub_agent_payload = None
+
+                gist = _scrub_for_llm_context(
+                    ss.get_clean_text_so_far()[current_content_length:]
+                ).strip()
+                if gist:
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="assistant",
+                        content=gist,
+                    ))
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content=payload["report_envelope"] + (
+                        "Choose your next move: ANSWER the user (then `<done/>`), "
+                        "or spawn another agent with `<agent>` if this report is insufficient."
+                    ),
+                ))
+
+                _register_completed_action({
+                    "kind": "tool",
+                    "name": f"agent_{payload['worker_index']}",
+                    "params": {},
+                    "success": True,
+                    "round": round_count,
+                })
+                _compress_virtual_history_if_needed()
+                _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
+                continue
 
             # ── 🧠 DELEGATION ROUTING (PERSONA-AWARE) ──
             # Worker persona: <delegate> is never taught; neutralize drift.
@@ -5670,20 +5909,23 @@ class ChatMixin:
                             else:
                                 raw_output = tool_res.get("output", tool_res)
 
-                                # Handle nested output dictionaries (common in MCP/external tools)
+                                if isinstance(raw_output, dict) and isinstance(raw_output.get("output"), (str, int, float, bool)):
+                                    raw_output = raw_output["output"]
+                                elif isinstance(raw_output, dict):
+                                    nested = raw_output.get("output")
+                                    if isinstance(nested, dict):
+                                        raw_output = nested
+
                                 if isinstance(raw_output, dict):
-                                    # If output is a dict, try to extract the most relevant field
-                                    # Expanded key list to catch Wikipedia/external tool patterns
                                     extracted = None
-                                    for key in ("content", "text", "result", "data", "page_content", "summary", "extract", "html", "body", "query", "pages"):
+                                    for key in ("output", "content", "text", "result", "data", "page_content", "summary", "extract", "html", "body", "query", "pages"):
                                         if key in raw_output:
                                             extracted = raw_output[key]
                                             break
-                                    
+
                                     if extracted is not None:
                                         raw_output = extracted
                                     else:
-                                        # Fall back to JSON dump of the whole dict
                                         raw_output = json.dumps(raw_output, indent=2, default=str, ensure_ascii=False)
                                 elif isinstance(raw_output, list):
                                     raw_output = json.dumps(raw_output, indent=2, default=str, ensure_ascii=False)
@@ -5758,7 +6000,9 @@ class ChatMixin:
                                         ui_log = f"Applied SEARCH/REPLACE modifications to '{target_name}'."
                                     else:
                                         ui_log = f"Created/updated '{target_name}' in workspace."
-                                    details_block = f"Output Logs:\n{ui_log}\n"
+                                    _cb(callback, ui_log, MSG_TYPE.MSG_TYPE_INFO, {"type": "artifact_status", "target": target_name})
+                                    safe_dump = _build_windowed_output_preview(full_dump)
+                                    details_block = f"Output Logs:\n{safe_dump}\n"
                                 else:
                                     safe_output = _build_windowed_output_preview(full_dump)
                                     details_block = f"Output Logs:\n{safe_output}\n"
@@ -6017,11 +6261,6 @@ class ChatMixin:
                 full_round_text = ss.get_clean_text_so_far()
                 raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
 
-                # ── 🛡️ EMPTY RESPONSE GUARD (0 Tokens Generated) ──
-                if not raw_round_text.strip():
-                    ASCIIColors.warning("[ChatMixin] Empty response generated (0 tokens). Breaking immediately.")
-                    break
-
                 # ── CONTEXT UNLOCK CONTINUATION ──
                 # Unlocking a file is a state change, not an answer: the model
                 # must get a continuation round to actually use the content.
@@ -6045,22 +6284,39 @@ class ChatMixin:
                     _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
                     continue
 
-                # ── PLAIN TEXT ROUND = THE ANSWER ──
-                # A text-only round without <done/> is the model's final
-                # conversational answer. The stall-counter / forced-continuation
-                # protocol is removed by the Orchestrator/Worker split: the
-                # answer is the answer, and the loop ends here.
-                ASCIIColors.info("[ChatMixin] Conversational answer completed. Ending loop.")
-                _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="conversational")
-                break
+                # ── 🛑 SOVEREIGN <done/> TERMINATION CONTRACT ──
+                # A text-only round is NOT a terminal state. Per the single-
+                # signal doctrine, the loop runs until the model explicitly
+                # emits <done/> (or <end/>). Persist the round and prompt the
+                # model to either take a real action or terminate.
+                ASCIIColors.info("[ChatMixin] Text-only round without <done/>. Continuing loop until explicit termination.")
+                clean_history_text = scrub_processing_and_status_blocks(raw_round_text)
+                if clean_history_text.strip():
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="assistant",
+                        content=clean_history_text.strip()
+                    ))
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content=(
+                        "[SYSTEM: TERMINATION PROTOCOL]\n"
+                        "Your last message contained no action and no `<done/>` tag.\n"
+                        "You have exactly two valid moves:\n"
+                        "1. EMIT a functional tag now (`<tool>{...}</tool>`, "
+                        "`<artifact name=\"...\">...</artifact>`, `<agent>...</agent>`, "
+                        "`<unlock_file>...</unlock_file>`, etc.) to perform the work.\n"
+                        "2. FINISH by writing your final answer to the user and "
+                        "emitting `<done/>` on a new line.\n"
+                        "Announcing an action in prose performs nothing. Choose now."
+                    )
+                ))
+                _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
+                continue
 
         # ── 11. Final Post-Processing & Database Commit ──
 
-        if ss is not None and round_event_state["last_status"] is None and round_count >= resolved_max_rounds:
-            _emit_round_end_post_loop = MSG_TYPE.MSG_TYPE_ROUND_END
-            if event_mode != EventMode.SILENT_MODE:
-                _cb(callback, "", _emit_round_end_post_loop, {"round_id": round_count, "status": "max_rounds"})
-            round_event_state["last_status"] = "max_rounds"
+        if ss is not None and round_event_state["last_status"] is None:
+            _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="max_rounds")
 
         # Handle cancellation cleanup
         if was_cancelled:
@@ -6249,12 +6505,15 @@ class ChatMixin:
         # Update metadata for alternating exports
         # CRITICAL: Preserve virtual_history if it was set in the cancellation/non-cancellation block above.
         # We only update the mode and counts here to avoid overwriting the persisted virtual history.
+        existing_sub_agent_runs = ai_msg.metadata.get("sub_agent_runs")
         existing_virtual_history = ai_msg.metadata.get("virtual_history")
         ai_msg.metadata = {
             "mode": "agentic" if tool_calls_this_turn else "direct",
             "tool_calls": tool_calls_this_turn,
             "artefacts_modified": [a.get("title") for a in (ss.affected_artefacts if ss else [])]
         }
+        if existing_sub_agent_runs:
+            ai_msg.metadata["sub_agent_runs"] = existing_sub_agent_runs
         if existing_virtual_history:
             ai_msg.metadata["virtual_history"] = existing_virtual_history
         if failed_tools_pending_fix and round_count >= resolved_max_rounds:

@@ -86,9 +86,11 @@ def sanitize_artifact_filename(title: str) -> str:
     The DB title is preserved as-is for LLM context; only the physical
     filename produced from this function is safe for disk operations.
     """
+    import unicodedata
     if not title:
         return "untitled"
     import re as _re
+    title = unicodedata.normalize("NFC", title)
     clean = _re.sub(r'^[a-zA-Z]+://', '', title)
     clean = _re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', clean)
     clean = _re.sub(r'_{3,}', '__', clean)
@@ -335,9 +337,10 @@ class ArtefactManager:
 
     @staticmethod
     def _sanitize_path_segments(path_str: str) -> str:
+        import unicodedata
         if not path_str:
             return "untitled"
-        path_str = path_str.replace("\\", "/")
+        path_str = unicodedata.normalize("NFC", path_str).replace("\\", "/")
         parts = path_str.split("/")
         clean_parts = [sanitize_artifact_filename(p) for p in parts if p.strip()]
         if not clean_parts:
@@ -935,7 +938,18 @@ class ArtefactManager:
         version:           Optional[int] = None,
         **extra_data
     ) -> Optional[Dict[str, Any]]:
+        resolved_title = title
         latest = self.get(title)
+        if latest is None:
+            all_titles = [a.get("title", "") for a in self._get_all_raw()]
+            matched = _find_best_title_match(title, all_titles)
+            if matched is not None:
+                ASCIIColors.warning(
+                    f"[ArtefactManager] Title '{title}' did not match exactly; "
+                    f"resolving to existing artefact '{matched}'."
+                )
+                resolved_title = matched
+                latest = self.get(matched)
         if latest is None:
             raise ValueError(f"Cannot update non-existent artefact '{title}'.")
 
@@ -951,7 +965,7 @@ class ArtefactManager:
         if active is not None:
             resolved_visibility = ArtefactVisibility.FULL if active else ArtefactVisibility.HIDDEN
 
-        target_title = self._sanitize_path_segments(new_title) if new_title else title
+        target_title = self._sanitize_path_segments(new_title) if new_title else resolved_title
         target_physical_path = extra_data.pop("physical_path", None) or target_title
 
         internal_keys = {
@@ -963,10 +977,10 @@ class ArtefactManager:
         merged_extra = {k: v for k, v in latest.items() if k not in internal_keys}
         merged_extra.update(extra_data)
 
-        if new_title and new_title != title:
+        if new_title and new_title != resolved_title:
             artefacts = self._get_all_raw()
             for a in artefacts:
-                if a.get('title') == title:
+                if a.get('title') == resolved_title:
                     a['active'] = False
             self._save_all(artefacts)
             try:
@@ -978,8 +992,9 @@ class ArtefactManager:
                 trace_exception(e)
 
         use_content = new_content if new_content is not None else latest.get('content', '')
-        if new_title and new_title != title:
-            use_content = use_content.replace(f'id="{title}{_IMAGE_ID_SEP}', f'id="{new_title}{_IMAGE_ID_SEP}').replace(f"id='{title}{_IMAGE_ID_SEP}", f"id='{new_title}{_IMAGE_ID_SEP}")
+        if new_title and new_title != resolved_title:
+            use_content = use_content.replace(f'id="{resolved_title}{_IMAGE_ID_SEP}', f'id="{new_title}{_IMAGE_ID_SEP}').replace(f"id='{resolved_title}{_IMAGE_ID_SEP}", f"id='{new_title}{_IMAGE_ID_SEP}'")
+            
 
         use_images = new_images if new_images is not None else latest.get('images', [])
         use_mtypes = new_image_media_types if new_image_media_types is not None else latest.get('image_media_types', [])
