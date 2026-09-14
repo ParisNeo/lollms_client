@@ -3499,6 +3499,7 @@ class ChatMixin:
         debug_export:                 bool = False,
         debug:                        bool = False,
         enable_vlm_query:             bool = False,
+        enable_computer_use:          bool = False,
         event_mode:                   EventMode = EventMode.PROCESSING_TAG_MODE,
         **kwargs
     ) -> Dict[str, Any]:
@@ -3550,6 +3551,10 @@ class ChatMixin:
                 Persistent per-discussion debug dumps can also be enabled by setting
                 discussion._debug_mode = True externally (mirrors personality.debug_mode).
             enable_vlm_query (bool): Enable VLM query tool for vision fallback. Default False.
+            enable_computer_use (bool): Mount the computer use desktop automation toolset
+                (screenshots, click, type, key, scroll). Requires the active model to
+                support vision; silently skipped when no vision capability is detected.
+                Default False.
             event_mode (EventMode): Event reporting mode. Default PROCESSING_TAG_MODE.
             **kwargs: Additional generation parameters passed to the LLM binding.
 
@@ -3906,6 +3911,56 @@ class ChatMixin:
                                 active_tools[t_name] = t_spec
                     except Exception as ex:
                         trace_exception(ex)
+
+        # ── 6. Mount Computer Use Toolset (Vision-Gated) ──
+        # Desktop automation (screenshot → act → verify) is only coherent when
+        # the ACTIVE model can see the screenshots it takes: the visual
+        # grounding loop depends on a vision-capable binding. The user flag is
+        # an explicit opt-in; the vision check is a hard structural gate.
+        _computer_use_tool_names = (
+            "tool_computer_desktop_info",
+            "tool_computer_screenshot",
+            "tool_computer_click",
+            "tool_computer_move_cursor",
+            "tool_computer_type",
+            "tool_computer_key",
+            "tool_computer_scroll",
+        )
+        if enable_computer_use:
+            _computer_use_vision_ready = False
+            if self.lollmsClient and hasattr(self.lollmsClient, "has_vision_capability"):
+                try:
+                    _computer_use_vision_ready = bool(self.lollmsClient.has_vision_capability())
+                except Exception:
+                    _computer_use_vision_ready = False
+            if not _computer_use_vision_ready and self.lollmsClient:
+                active_llm = getattr(self.lollmsClient, "llm", None)
+                _computer_use_vision_ready = bool(getattr(active_llm, "vision_enabled", False))
+                if not _computer_use_vision_ready and active_llm and hasattr(active_llm, "child_bindings"):
+                    _computer_use_vision_ready = any(
+                        getattr(child, "vision_enabled", False)
+                        for child in active_llm.child_bindings.values()
+                    )
+
+            if _computer_use_vision_ready and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
+                lcp_binding.mount_tool_library("computer_use")
+                try:
+                    lcp_tools = lcp_binding.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
+                    for t_name, t_spec in lcp_tools.items():
+                        if t_name in _computer_use_tool_names:
+                            active_tools[t_name] = t_spec
+                    ASCIIColors.success(
+                        f"[ChatMixin] Mounted 'computer_use' toolset "
+                        f"({len([n for n in _computer_use_tool_names if n in active_tools])} tools, vision model active)."
+                    )
+                except Exception as ex:
+                    trace_exception(ex)
+            else:
+                ASCIIColors.warning(
+                    "[ChatMixin] enable_computer_use=True but no vision-capable "
+                    "model is active or no LCP binding is available — computer use "
+                    "toolset NOT mounted."
+                )
 
 
         # ── 🎯 WORKER-TIER EXECUTION DOCTRINE ──

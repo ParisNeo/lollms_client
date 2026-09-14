@@ -149,6 +149,68 @@ Adds highlights or comments to a PDF or DOCX document.
 - **DOCX**: Uses `python-docx`. Highlighting applies native Word highlighting. Comments are currently inserted as inline `[COMMENT: ...]` runs for stability.
 - **PPTX**: Uses `python-pptx`. Edits are applied at the run level to preserve slide formatting.
 
+## 🖥️ Computer Use: Vision-Gated Desktop Automation
+
+The `document_editor` toolset gives the personality control over workspace documents. The `computer_use` toolset extends this to the **entire desktop**: screenshots, mouse, keyboard, and scrolling — the "Computer Use" agent pattern.
+
+### Activation (Strict Opt-In × Vision Gate)
+
+Pass `enable_computer_use=True` to `LollmsPersonality.chat()`:
+
+```python
+response = personality.chat(
+    prompt="Open the browser and search for the LoLLMS project on GitHub.",
+    lollms_client=client,
+    enable_computer_use=True   # requires a vision-capable active model
+)
+```
+
+The toolset mounts only when **both** conditions hold:
+
+1. **User opt-in**: `enable_computer_use=True` (default `False`). Like `enable_code_execution`, this is a security gate — desktop control is never granted implicitly.
+2. **Vision capability**: the active model must support vision. The check walks `lollms_client.has_vision_capability()` → `llm.vision_enabled` → SmartRouter `child_bindings`, and the library is skipped (with a warning) when no vision-capable binding is found. A blind model cannot close the observe→act→verify loop, so the tools would only produce blind-click loops.
+
+Once mounted, only the seven known `tool_computer_*` names are merged into the turn's active tool registry — a stray tool file in the library folder can never leak into the personality's toolset.
+
+### Toolset Inventory
+
+| Tool | Purpose |
+| :--- | :--- |
+| `tool_computer_desktop_info` | Returns primary screen geometry (width × height). Call this first to learn the coordinate space. |
+| `tool_computer_screenshot` | Captures the screen, returns a base64 image for visual inspection, and persists a PNG to the workspace. |
+| `tool_computer_click` | Clicks at (x, y) — or visually grounds a natural-language `description` ("the search box") to coordinates via the active vision model. |
+| `tool_computer_move_cursor` | Moves the mouse to (x, y) without clicking (supports description-based grounding). |
+| `tool_computer_type` | Types text at the current cursor position (click into a field first). |
+| `tool_computer_key` | Presses a key or hotkey combination (`enter`, `ctrl+c`, `alt+f4`), bounded to 3 presses. |
+| `tool_computer_scroll` | Scrolls the mouse wheel up/down at the cursor or given coordinates. |
+
+### Visual Grounding (Zero-OCR)
+
+When acting by `description` instead of explicit coordinates, the toolset asks the active vision binding to locate the element on a fresh screenshot and return `{"x": int, "y": int}` pixel coordinates. There is no OCR dependency; grounding works with any vision-capable model. Hallucinated out-of-bounds coordinates are clamped to the visible screen area.
+
+### Computer Use Operating Doctrine
+
+When any `tool_computer_*` tool is active, `_build_system_prompt` injects a mandatory workflow block:
+
+1. **OBSERVE**: `tool_computer_screenshot` to see the current screen state. Never act blind.
+2. **LOCATE**: click with explicit coordinates read from the screenshot, or a natural-language `description` (grounded automatically).
+3. **ACT**: click, then `tool_computer_type` / `tool_computer_key` / `tool_computer_scroll`. Click into a text field **before** typing.
+4. **VERIFY**: after every action, take another screenshot to confirm the effect before proceeding.
+5. **TERMINATE**: when the goal is achieved, describe the result and emit `<done/>`. Never loop screenshots indefinitely.
+
+The doctrine block is only rendered when the tools are actually mounted, so non-computer-use turns carry zero prompt overhead.
+
+### Security Guarantees
+
+*   **Coordinate clamping**: all (x, y) inputs clamped to the visible screen.
+*   **Hotkey whitelist**: `tool_computer_key` accepts only `[a-z0-9+]` tokens; shell metacharacters are rejected.
+*   **Bounded parameters**: `clicks` (1–3), `presses` (1–3), scroll amount (1–2000), typing interval (0–1s).
+*   **Host-path sanitization**: error strings are stripped of absolute host paths.
+*   **Backend dependency**: requires `pyautogui` (lazy import with an actionable install message if missing).
+*   **Local-only**: screenshots are captured and persisted inside the workspace; nothing leaves the machine.
+
+---
+
 ## 🛠️ 3. Architecture & Deep Specification
 
 ### Null-Safety Doctrine
@@ -339,6 +401,7 @@ Factory to construct a personality from a Handbag folder.
 * **`max_nb_rounds`**: (`Optional[int]`): The maximum number of agentic reasoning rounds before the loop forces a final answer. Prevents infinite cycles. Defaults to `20` if `None`.
 * **`max_reasoning_steps` (`Optional[int]`)**:: **Deprecated**. Backward-compatible alias for `max_nb_rounds`. If `max_nb_rounds` is provided, this parameter is ignored.
 * **`nudge_threshold` (`int`)**:: Round-budget early warning. When the number of remaining reasoning rounds falls to this value or below, a `[ROUND BUDGET NOTICE]` block is injected into that round's system prompt, telling the LLM exactly how many rounds remain and directing it to prioritize and wrap up (finish remaining work and emit `<done/>`) instead of being hard-stopped by round-budget exhaustion. The notice is recomputed every round and appears only in the per-round system prompt (it never mutates the base system prompt or `tools_prompt`, so KV-cache alignment across turns is preserved). On the final round the notice is an approximate advance warning, since the loop may still terminate by exhaustion immediately after. Suppressed only by setting `0` (or any value `<= 0`); not affected by `EventMode.SILENT_MODE`. Defaults to `3`.
+* **`enable_computer_use` (`bool`)**: If `True`, mounts the `computer_use` LCP toolset (screenshots, click, type, key, scroll) for desktop automation — **only if the active model supports vision** (resolved via `has_vision_capability()` → `llm.vision_enabled` → SmartRouter `child_bindings`). When the tools are mounted, a mandatory Computer Use Operating Doctrine is injected into the system prompt (observe → locate → act → verify → terminate). Default `False`.
 
 - **`temperature`**: Generation temperature.
 - **`n_predict`**: Maximum tokens to generate.

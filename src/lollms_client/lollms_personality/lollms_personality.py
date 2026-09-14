@@ -3457,6 +3457,7 @@ JSON:"""
         enable_python_exec: bool = False,
         enable_web_tools: bool = False,
         auto_load_document_editor: bool = True,
+        enable_computer_use: bool = False,
         *args, **kwargs
     ) -> Dict[str, Dict[str, Any]]:
         active_tools = {}
@@ -3493,6 +3494,24 @@ JSON:"""
 
             _libraries_to_mount.append("git_manager")
 
+            _computer_use_vision_ready = False
+            if enable_computer_use and self.lollms_client:
+                if hasattr(self.lollms_client, "has_vision_capability"):
+                    try:
+                        _computer_use_vision_ready = bool(self.lollms_client.has_vision_capability())
+                    except Exception:
+                        _computer_use_vision_ready = False
+                if not _computer_use_vision_ready:
+                    active_llm = getattr(self.lollms_client, "llm", None)
+                    _computer_use_vision_ready = bool(getattr(active_llm, "vision_enabled", False))
+                    if not _computer_use_vision_ready and active_llm and hasattr(active_llm, "child_bindings"):
+                        _computer_use_vision_ready = any(
+                            getattr(child, "vision_enabled", False)
+                            for child in active_llm.child_bindings.values()
+                        )
+            if enable_computer_use and _computer_use_vision_ready:
+                _libraries_to_mount.append("computer_use")
+
             for lib_name in _libraries_to_mount:
                 try:
                     if hasattr(lcp_binding, 'mount_tool_library_if_absent'):
@@ -3519,6 +3538,11 @@ JSON:"""
                         "tool_git_create_branch", "tool_git_checkout", "tool_git_log",
                         "tool_git_config_get", "tool_git_config_set"
                     }
+                    _COMPUTER_USE_TOOL_NAMES = {
+                        "tool_computer_desktop_info", "tool_computer_screenshot",
+                        "tool_computer_click", "tool_computer_move_cursor",
+                        "tool_computer_type", "tool_computer_key", "tool_computer_scroll"
+                    }
 
                     allowed_tool_names = set()
                     if enable_workspace_tools and self.capabilities and self.capabilities.enable_workspace_tools and self._resolved_workspace:
@@ -3529,6 +3553,9 @@ JSON:"""
                         allowed_tool_names.update(_PY_EXEC_TOOL_NAMES)
 
                     allowed_tool_names.update(_GIT_TOOL_NAMES)
+
+                    if enable_computer_use and _computer_use_vision_ready:
+                        allowed_tool_names.update(_COMPUTER_USE_TOOL_NAMES)
 
                     for t_name, t_spec in all_lcp_tools.items():
                         if t_name in allowed_tool_names:
@@ -4150,6 +4177,21 @@ JSON:"""
                 param_desc = ", ".join([f"{p['name']}: {p['type']}" for p in params_list])
                 tool_desc += f"- {t_name}({param_desc}): {desc}\n"
 
+        computer_use_workflow = ""
+        _has_computer_use_tools = any(t_name.startswith("tool_computer_") for t_name in active_tools)
+        if _has_computer_use_tools:
+            computer_use_workflow = (
+                "\n=== COMPUTER USE OPERATING DOCTRINE (MANDATORY) ===\n"
+                "Desktop automation is enabled. Follow this loop STRICTLY:\n"
+                "1. **OBSERVE**: Call `tool_computer_screenshot` to SEE the current screen state. NEVER act blind.\n"
+                "2. **LOCATE**: Use `tool_computer_click` with either explicit x/y coordinates read from the screenshot, OR a natural-language `description` (visually grounded automatically).\n"
+                "3. **ACT**: Click, then `tool_computer_type` / `tool_computer_key` / `tool_computer_scroll` as needed. Click into a text field BEFORE typing.\n"
+                "4. **VERIFY**: After EVERY action, take another screenshot to confirm the effect before proceeding.\n"
+                "5. **TERMINATE**: When the goal is achieved, describe the result and emit `<done/>`. Do NOT loop screenshots indefinitely.\n"
+                "Start every computer use task with `tool_computer_desktop_info` to learn the screen geometry.\n"
+                "=== END COMPUTER USE OPERATING DOCTRINE ===\n"
+            )
+
         document_annotation_workflow = ""
         has_annotation_tools = "tool_annotate_document" in active_tools or "tool_edit_document_text" in active_tools
         has_reading_tools = "tool_read_document_content" in active_tools or "tool_inspect_document" in active_tools
@@ -4168,7 +4210,7 @@ JSON:"""
                 "=== END DOCUMENT ANNOTATION WORKFLOW ===\n"
             )
 
-        return sys_prompt + "\n" + rules + skills_ctx + memory_instructions + tool_desc + document_annotation_workflow
+        return sys_prompt + "\n" + rules + skills_ctx + memory_instructions + tool_desc + computer_use_workflow + document_annotation_workflow
     
     
     def change_file_visibility(self, targets: List[str], action: str) -> Dict[str, Any]:
@@ -4268,6 +4310,7 @@ JSON:"""
         enable_python_exec: bool = False,
         enable_web_tools: bool = False,
         auto_load_document_editor: bool = True,
+        enable_computer_use: bool = False,
         enforce_end_tag: bool = False,
         orchestrator_mode: bool = False,
         event_mode: EventMode = EventMode.PROCESSING_TAG_MODE,
@@ -4290,6 +4333,7 @@ JSON:"""
                 enable_python_exec=enable_python_exec,
                 enable_web_tools=enable_web_tools,
                 auto_load_document_editor=auto_load_doc_editor_flag,
+                enable_computer_use=enable_computer_use,
             )
             runner = AgenticRunner(
                 context=self,
@@ -4361,7 +4405,8 @@ JSON:"""
             enable_shell=enable_shell,
             enable_python_exec=enable_python_exec,
             enable_web_tools=enable_web_tools,
-            auto_load_document_editor=auto_load_doc_editor_flag
+            auto_load_document_editor=auto_load_doc_editor_flag,
+            enable_computer_use=enable_computer_use
         )
 
         if active_tools:

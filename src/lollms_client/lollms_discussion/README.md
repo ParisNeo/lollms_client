@@ -730,6 +730,7 @@ def chat(
     debug_export:                 bool = False,
     debug:                        bool = False,
     enable_vlm_query:             bool = False,
+    enable_computer_use:          bool = False,
     event_mode:                   EventMode = EventMode.PROCESSING_TAG_MODE,
     **kwargs
 ) -> Dict[str, Any]:
@@ -881,6 +882,7 @@ discussion.chat(user_message="Search for apples", tools=explicit_tools)
 *   `debug_export` (`bool`): Activates the **Scientific Debug-Dump Protocol** for this single turn (see [🔬 Scientific Debugging & Context Dump Protocol](#-scientific-debugging--context-dump-protocol)). Writes per-round prompt dumps, raw LLM stream dumps, and the final turn context dump to the discussion's `_debug_dumps` directory.
 *   `enable_episodic_memory` (`bool`): If `True` (default), saves substantial conversation turns as episodic memories. Set to `False` for privacy-sensitive sessions or manual memory control.
 *   `enable_vlm_query` (`bool`): If `True` and the active LLM lacks vision, auto-mounts the `tool_vlm_query` tool that routes image questions to a vision-capable fallback binding.
+*   `enable_computer_use` (`bool`): If `True`, mounts the `computer_use` LCP toolset (screenshots, click, type, key, scroll) for desktop automation — **only if the active model supports vision**. A blind model cannot close the observe→act→verify loop, so the toolset is silently skipped (with a console warning) when no vision capability is detected on the active binding or its SmartRouter children. Default `False`.
 *   `enable_in_message_status` (`bool`): If `True`, emits detailed status comments inside `<processing>` blocks for UI rendering.
 *   `remove_thinking_blocks` (`bool`): If `True`, strips `_EDEFAULT` or `INSTRUCTION` blocks from the final saved message content.
 *   `event_mode` (`EventMode`): Controls how execution telemetry (tool calls, artifact builds, context updates) is reported to the `streaming_callback`. Defaults to `EventMode.PROCESSING_TAG_MODE`.
@@ -1998,6 +2000,56 @@ This ensures the LLM gets exactly one chance to retry a failed tool with modifie
 2.  **No Blind Edits**: The Aider patch engine requires verbatim `SEARCH` blocks. It uses 6-pass fuzzy matching (Exact → Whitespace → Indent → Comments → Blanks → Core Delta) to ensure safe edits.
 3.  **Binary Stripping**: Tool results containing base64 blobs (>500 chars) are automatically stripped and replaced with `[base64 blob stripped: 24.3KB]` to prevent context explosion and tool loops.
 4.  **Prompt Injection**: Tools can return a `prompt_injection` key. This overrides the standard JSON dump and tells the LLM exactly what to say next (e.g., "Here is your plot: ![img](url)").
+
+---
+
+## 🖥️ Computer Use: Vision-Gated Desktop Automation
+
+`chat()` can grant the LLM direct desktop control (screenshots, mouse, keyboard, scrolling) through the `computer_use` LCP toolset. Because the agent must **see** the screenshots it takes to decide where to act, this capability is structurally gated on vision:
+
+| Condition | Behavior |
+| :--- | :--- |
+| `enable_computer_use=True` **and** vision-capable model active | `computer_use` library is mounted; the 7 tools are registered for the turn. |
+| `enable_computer_use=True` **but** no vision capability detected | Toolset is **not mounted**; a warning is logged (`[ChatMixin] enable_computer_use=True but no vision-capable model...`). |
+| `enable_computer_use=False` (default) | Toolset never mounted, regardless of model capabilities. |
+
+Vision capability is resolved through the same triple cascade used elsewhere in the framework: `lollmsClient.has_vision_capability()` → `llm.vision_enabled` → SmartRouter `child_bindings` scan. Mounting is idempotent (`mount_tool_library` short-circuits on repeated calls).
+
+### Toolset Inventory
+
+| Tool | Purpose |
+| :--- | :--- |
+| `tool_computer_desktop_info` | Returns primary screen geometry (width × height). Call this first to learn the coordinate space. |
+| `tool_computer_screenshot` | Captures the screen, returns a base64 image for visual inspection, and persists a PNG to the workspace. |
+| `tool_computer_click` | Clicks at (x, y) — or visually grounds a natural-language `description` ("the Chrome address bar") to coordinates via the active vision model. |
+| `tool_computer_move_cursor` | Moves the mouse to (x, y) without clicking (supports description-based grounding). |
+| `tool_computer_type` | Types text at the current cursor position (click into a field first). |
+| `tool_computer_key` | Presses a key or hotkey combination (`enter`, `ctrl+c`, `alt+f4`), bounded to 3 presses. |
+| `tool_computer_scroll` | Scrolls the mouse wheel up/down at the cursor or given coordinates. |
+
+### Visual Grounding (Zero-OCR)
+
+When the model clicks by `description` instead of explicit coordinates, the toolset internally asks the **active vision binding** to locate the element on a fresh screenshot and return pixel coordinates as `{"x": int, "y": int}` — no OCR dependency. Hallucinated out-of-bounds coordinates are clamped to the visible screen area, keeping the feedback loop honest.
+
+### Security Guarantees
+
+*   **Coordinate clamping**: all (x, y) inputs are clamped to the visible screen — no off-screen clicks from vision-model hallucinations.
+*   **Hotkey whitelist**: `tool_computer_key` accepts only `[a-z0-9+]` tokens (`ctrl+c` valid; shell metacharacters rejected).
+*   **Bounded parameters**: `clicks` (1–3), `presses` (1–3), scroll amount (1–2000), typing interval (0–1s).
+*   **Host-path sanitization**: all error strings are stripped of absolute host paths before returning to the LLM.
+*   **Local-only**: screenshots are captured and persisted entirely inside the discussion workspace; nothing leaves the machine.
+*   **Backend dependency**: requires `pyautogui` (lazy import with actionable error message if missing).
+
+### Example
+
+```python
+response = discussion.chat(
+    user_message="Open the browser and search for the LoLLMS project on GitHub.",
+    enable_computer_use=True   # requires a vision-capable active model
+)
+```
+
+The model receives a **Computer Use Operating Doctrine** in its system prompt enforcing the loop: `desktop_info` → `screenshot` → act (`click`/`type`/`key`/`scroll`) → re-`screenshot` to verify → `<done/>` when the goal is achieved. Never act blind; never loop screenshots indefinitely.
 
 ---
 

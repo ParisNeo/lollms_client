@@ -43,9 +43,9 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
-## [2026-09-14 12:07]
+## [2026-09-14 21:32]
 
-- docs: update pyproject.toml – include Python 3.13 support, remove deprecated backend-path reference
+- feat(personality): add personality tools support to chat mixin and update documentation
 
 ## [2026-09-14 09:11]
 

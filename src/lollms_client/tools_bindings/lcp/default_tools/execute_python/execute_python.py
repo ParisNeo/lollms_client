@@ -167,27 +167,28 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
         "_ensure_import": _ensure_import,
         "__builtins__": __builtins__,
         "__file__": script_label,
+        "__name__": "__main__",
     }
 
     old_stdout = sys.stdout
     old_stderr = sys.stderr
     old_argv = sys.argv[:]
+    old_dunder_stdout = getattr(sys, "__stdout__", None)
+    old_dunder_stderr = getattr(sys, "__stderr__", None)
     redirected_output = _NoReconfigureStringIO()
     redirected_error = _NoReconfigureStringIO()
+    exec_stdout_hijacked = False
+    exec_stderr_hijacked = False
 
     sys.stdout = redirected_output
     sys.stderr = redirected_error
+    sys.__stdout__ = redirected_output
+    sys.__stderr__ = redirected_error
     if argv is not None:
         sys.argv = argv
 
     try:
         ASCIIColors.info(f"⚡ Executing arbitrary Python code (label: {script_label})")
-        sibling_note = (
-            "[sandbox] CWD = workspace root. "
-            "Artifact .py files are importable as siblings: use 'from <module> import ...' directly; "
-            "do NOT prepend 'workspace/' or manipulate sys.path."
-        )
-        print(sibling_note)
         if _plt is not None:
             _plt.clf()
             _plt.close('all')
@@ -212,6 +213,23 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
                 "output": _sanitize_host_paths(_window_output(raw_output)),
                 "stderr": _sanitize_host_paths(_window_output(raw_error))
             }
+
+        exec_stdout_hijacked = sys.stdout is not redirected_output
+        exec_stderr_hijacked = sys.stderr is not redirected_error
+        if exec_stdout_hijacked and hasattr(sys.stdout, "getvalue"):
+            try:
+                swapped_stdout = sys.stdout.getvalue()
+                if isinstance(swapped_stdout, str) and swapped_stdout.strip():
+                    redirected_output.write(swapped_stdout)
+            except Exception:
+                pass
+        if exec_stderr_hijacked and hasattr(sys.stderr, "getvalue"):
+            try:
+                swapped_stderr = sys.stderr.getvalue()
+                if isinstance(swapped_stderr, str) and swapped_stderr.strip():
+                    redirected_error.write(swapped_stderr)
+            except Exception:
+                pass
 
         fig_nums = _plt.get_fignums() if _plt is not None else []
         if fig_nums:
@@ -246,38 +264,26 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
     finally:
         sys.stdout = old_stdout
         sys.stderr = old_stderr
+        sys.__stdout__ = old_dunder_stdout
+        sys.__stderr__ = old_dunder_stderr
         sys.argv = old_argv
 
     out_str = redirected_output.getvalue()
     err_str = redirected_error.getvalue()
 
     if not out_str.strip():
-        out_str = "Code executed successfully (no stdout prints)."
-
-    workspace_contract = (
-        "\n\n[WORKSPACE NOTE] The sandbox CWD is the workspace root. "
-        "Files created via <artifact> tags are siblings of your code: import them directly "
-        "(e.g. 'from rlc_filter import RLCFilter') without path prefixes or sys.path manipulation."
-    )
-    if script_label == "python_code":
-        code_len = len(source.strip())
-        doctrine_note = (
-            " [TOOL SELECTION DOCTRINE] This tool is STRICTLY for short, punctual snippets. "
-            "For substantial or reusable code, emit an <artifact type=\"code\"> tag to persist "
-            "the .py file, then run it with tool_execute_python_file."
-        )
-        if code_len > 800:
-            doctrine_note += (
-                f" NOTE: your inline snippet was {code_len} chars, which is substantial code. "
-                "Persist it as a .py artifact and use tool_execute_python_file next time."
+        if exec_stdout_hijacked:
+            out_str = (
+                "Code executed successfully, but NO stdout was captured: the script "
+                "reassigned sys.stdout to a stream the sandbox cannot read (e.g. a file "
+                "or an os-level descriptor), so its print output bypassed capture. In "
+                "sandboxed scripts, use plain print() and NEVER reassign sys.stdout."
             )
-        workspace_contract += doctrine_note
-    else:
-        workspace_contract += (
-            " To run a short, punctual inline snippet instead, use tool_execute_python_code."
-        )
+        else:
+            out_str = "Code executed successfully (no stdout prints)."
 
-    out_str = out_str + workspace_contract
+    out_str = out_str.replace("\r\n", "\n").replace("\r", "\n")
+    err_str = err_str.replace("\r\n", "\n").replace("\r", "\n")
 
     if len(out_str) > _PREVIEW_WINDOW_CHARS:
         log_name = _persist_full_output(out_str, script_label)
