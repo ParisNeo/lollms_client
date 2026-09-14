@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-14 09:11]
+
+- build(pyproject): update build config and dependency list
+
 ## [2026-09-14 01:54]
 
 - refactor(artefact): consolidate artefact module and remove duplicate root file
