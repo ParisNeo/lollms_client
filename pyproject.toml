@@ -1,6 +1,8 @@
 [build-system]
 requires = ["setuptools>=80.9", "wheel"]
 build-backend = "setuptools.build_meta"
+# REMOVE THE LINE BELOW:
+# backend-path = ["."]
 
 [project]
 name = "lollms_client"
@@ -8,29 +10,23 @@ dynamic = ["version"]
 authors = [
     {name = "ParisNeo", email = "parisneoai@gmail.com"},
 ]
-sescription = "A client library for LoLLMs generate endpoint"
+description = "A client library for LoLLMs generate endpoint"
 readme = "README.md"
 requires-python = ">=3.7"
 license = { file = "LICENSE" }
-keywords = [
-    "ai", "llm", "llm-client", "git", "lollms", "coding-assistant", "stateful-agents",
-    "agent-personality", "sub-agents", "caching", "file-browser", "onboard-generation",
-    "onboard-recognition", "auto-scanning", "text-to-image", "text-to-speech", "gpt-duck"
-]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
-    "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
-    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
-    "Topic :: Software Development :: Libraries :: Application Frameworks"
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
 ]
-
 dependencies = [
     "httpx",
     "requests",
@@ -52,14 +48,14 @@ gui = [
     "pywebview>=4.4",
     "pygments>=2.15.0"
 ]
+
 [project.urls]
 Homepage = "https://github.com/ParisNeo/lollms_client"
 
-
+# Exclude script launcher from the core library package
 [project.scripts]
 lollms-code = "lollms_client.apps.lollms_code.cli:main"
 lollms-code-gui = "lollms_client.apps.lollms_code.gui.main:main"
-
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -67,7 +63,6 @@ exclude = ["lollms_client.egg-info*", "lollms_client.llm_bindings.llama_cpp_serv
 
 [tool.setuptools.dynamic]
 version = {attr = "lollms_client.__version__"}
-
 [tool.setuptools.package-data]
 lollms_client = ["assets/*.json", "**/description.yaml", "apps/lollms_discussions/static/*", "apps/lollms_code/*"]
 

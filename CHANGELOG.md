@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-14 12:07]
+
+- docs: update pyproject.toml – include Python 3.13 support, remove deprecated backend-path reference
+
 ## [2026-09-14 09:11]
 
 - build(pyproject): update build config and dependency list
