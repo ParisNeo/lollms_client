@@ -45,6 +45,10 @@ All notable changes to this project will be documented in this file.
 
 ## [2026-09-15 22:36]
 
+- delete(helloworld): remove unused Hello World script
+
+## [2026-09-15 22:36]
+
 - feat(agentic): add spinoff tools and sub-agent spawner enhancements
 
 ## [2026-09-14 21:32]
