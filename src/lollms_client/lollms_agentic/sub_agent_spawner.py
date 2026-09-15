@@ -294,12 +294,20 @@ def _escape_attr(value: str) -> str:
 def _cb(callback: Optional[Callable], text: str, msg_type: MSG_TYPE, meta: Optional[Dict[str, Any]] = None) -> bool:
     if callback is None:
         return True
+    if msg_type == MSG_TYPE.MSG_TYPE_CHUNK and not (meta or {}).get("was_processed"):
+        if isinstance(text, str) and text.strip():
+            return callback(text, msg_type, meta or {})
+        return True
     try:
         result = callback(text, msg_type, meta or {})
         return result is not False
     except Exception as ex:
         trace_exception(ex)
     return True
+
+
+def _tag_mode_active(event_mode: Any) -> bool:
+    return event_mode in (None, EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE)
 
 
 def extract_worker_report(raw_output: str) -> str:
@@ -480,8 +488,9 @@ def run_sub_agent(
         f"{' — files: ' + ', '.join(spawned_files) if spawned_files else ''}.\n"
         f"<!-- status:{'success' if success else 'failure'} -->\n</processing>\n\n"
     )
-    _cb(callback, spawn_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-    _cb(callback, closing_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+    if _tag_mode_active(event_mode):
+        _cb(callback, spawn_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+        _cb(callback, closing_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
     _cb(callback, "", MSG_TYPE.MSG_TYPE_WORKER_SPAWN_END, {
         **spawn_meta,
         "success": success,

@@ -1139,6 +1139,12 @@ class _StreamState:
                                     **event_meta,
                                     "stream_complete": False
                                 })
+                            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                                detail = event_meta.get("detail")
+                                if detail and not detail.startswith("Line "):
+                                    status_tag = f'{event_meta["status"]}\n'
+                                    self.ai_message.content += status_tag
+                                    _cb(self.callback, status_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
                             if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
                                 # ── 🎯 MEANINGFUL STATUS UPDATES ONLY ──
@@ -1510,11 +1516,12 @@ class _StreamState:
                         full_match_text
                     )
 
-                if self._secondary_tag_name not in ("unlock_file", "lock_file", "hide_file", "agent"):
-                    proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
-                    self.ai_message.content += proc_close_tag
-                    _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                    self._processing_block_open = False
+                if self._secondary_tag_name not in ("unlock_file", "lock_file", "hide_file", "agent", "generate_image", "edit_image"):
+                        if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                            proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
+                            self.ai_message.content += proc_close_tag
+                            _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        self._processing_block_open = False
 
                 remaining_text = self._secondary_buffer[close_idx + close_len:]
 
@@ -1575,20 +1582,22 @@ class _StreamState:
                             if tag_name != "agent":
                                 proc_type = self._secondary_tag_name
                                 title_val = attrs.get("title") or attrs.get("name") or self._secondary_tag_name.capitalize()
-                                proc_open = f'\n<processing type="{proc_type}" title="{title_val}">\n'
-                                self.ai_message.content += proc_open
-                                self._processing_block_open = True
-                                _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
-                                status_msg = _ARTEFACT_TYPE_MESSAGES.get(self._secondary_tag_name, f"✨ Processing {self._secondary_tag_name}...")
-                                status_line = f'{status_msg}\n'
-                                self.ai_message.content += status_line
-                                _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                                    proc_open = f'\n<processing type="{proc_type}" title="{title_val}">\n'
+                                    self.ai_message.content += proc_open
+                                    self._processing_block_open = True
+                                    _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                                    status_msg = _ARTEFACT_TYPE_MESSAGES.get(self._secondary_tag_name, f"✨ Processing {self._secondary_tag_name}...")
+                                    status_line = f'{status_msg}\n'
+                                    self.ai_message.content += status_line
+                                    _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
                                 tag_info = _SECONDARY_TAG_MAP.get(f"<{self._secondary_tag_name}")
                                 if tag_info:
                                     open_evt = tag_info[0]
-                                    _cb(self.callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
+                                    _cb(self.callback, "", MSG_TYPE.MSG_TYPE_INFO, {
                                         "type": open_evt,
                                         "title": title_val,
                                         "category": attrs.get("category", ""),
@@ -1649,7 +1658,7 @@ class _StreamState:
                         full_match_text
                     )
 
-                if self._secondary_tag_name != "agent":
+                if self._secondary_tag_name not in ("agent", "generate_image", "edit_image"):
                     proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
                     self.ai_message.content += proc_close_tag
                     _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
@@ -1941,14 +1950,22 @@ class _StreamState:
                     "no execution capability. Only workers may execute tools."
                 )
                 self._tool_refusal_detected = True
-                refused_block = (
-                    '\n<processing type="tool" title="Tool Execution Refused">\n'
-                    "* 🚫 Tool calls are not available to you. You coordinate; "
-                    "workers execute. Delegate the work instead.\n"
-                    '<!-- status:failure -->\n</processing>\n'
-                )
-                self.ai_message.content += refused_block
-                _cb(self.callback, refused_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                    refused_block = (
+                        '\n<processing type="tool" title="Tool Execution Refused">\n'
+                        "* 🚫 Tool calls are not available to you. You coordinate; "
+                        "workers execute. Delegate the work instead.\n"
+                        '<!-- status:failure -->\n</processing>\n'
+                    )
+                    self.ai_message.content += refused_block
+                    _cb(self.callback, refused_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                if self.event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                    _cb(self.callback, "", MSG_TYPE.MSG_TYPE_TOOL_END, {
+                        "tool_name": "tool_refused",
+                        "success": False,
+                        "output": "",
+                        "error": "Tool calls are not available to this agent tier. Delegate the work instead.",
+                    })
                 return True
             self.tool_trigger = True
 
@@ -2017,14 +2034,21 @@ class _StreamState:
                 ui_tool_name = tool_name or "unknown"
                 ui_params = {}
 
-            escaped_params = html.escape(json.dumps(ui_params, default=str))
-            tool_open_tag = f'\n<processing type="tool" title="Tool Execution: {ui_tool_name}" params="{escaped_params}">\n'
-            self.ai_message.content += tool_open_tag
-            _cb(self.callback, tool_open_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                escaped_params = html.escape(json.dumps(ui_params, default=str))
+                tool_open_tag = f'\n<processing type="tool" title="Tool Execution: {ui_tool_name}" params="{escaped_params}">\n'
+                self.ai_message.content += tool_open_tag
+                _cb(self.callback, tool_open_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
-            status_line = f"* Calling local tool system for '{ui_tool_name}'...\n"
-            self.ai_message.content += status_line
-            _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                status_line = f"* Calling local tool system for '{ui_tool_name}'...\n"
+                self.ai_message.content += status_line
+                _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+            if self.event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                _cb(self.callback, "", MSG_TYPE.MSG_TYPE_TOOL_START, {
+                    "tool_name": ui_tool_name,
+                    "parameters": ui_params,
+                })
 
             # Halt generation instantly so the executor can take over the loop
             return False
@@ -2407,16 +2431,25 @@ class _StreamState:
 
             # The entry interceptor opened the <processing> block; this dispatcher
             # is its single owner for context tags. Close it exactly once.
-            proc_close = f'{status_line}{details_block}<!-- status:{status_meta} -->\n</processing>\n\n'
-            if self._processing_block_open:
-                self.ai_message.content += proc_close
-                _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                self._processing_block_open = False
-            else:
-                proc_close_tag = f'\n<processing type="context_update" title="{action_verb} context files">\n'
-                self.ai_message.content += proc_close_tag
-                self.ai_message.content += proc_close
-                _cb(self.callback, proc_close_tag + proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                proc_close = f'{status_line}{details_block}<!-- status:{status_meta} -->\n</processing>\n\n'
+                if self._processing_block_open:
+                    self.ai_message.content += proc_close
+                    _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    self._processing_block_open = False
+                else:
+                    proc_close_tag = f'\n<processing type="context_update" title="{action_verb} context files">\n'
+                    self.ai_message.content += proc_close_tag
+                    self.ai_message.content += proc_close
+                    _cb(self.callback, proc_close_tag + proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+            if self.event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                _cb(self.callback, "", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {
+                    "action": tag_name.replace("_file", ""),
+                    "files": targets,
+                    "status": status_meta,
+                    "error": None,
+                })
 
             # ── INJECT CONTEXT BUDGET GUIDANCE INTO VIRTUAL HISTORY ──
             # If files were blocked, inject a system message so the LLM knows
@@ -2438,6 +2471,123 @@ class _StreamState:
 
         # 6. Image Generation / Editing (Intercepted during streaming)
         elif tag_name in ("generate_image", "edit_image"):
+            if not self.enable_artefacts:
+                return True
+            title = attrs.get("name") or attrs.get("title") or f"generated_image_{uuid.uuid4().hex[:6]}"
+            prompt = (body or "").strip()
+            tti = getattr(self.discussion.lollmsClient, "tti", None)
+            if tti is None and not bool(getattr(self.discussion.lollmsClient, "tti_model_profiles_registry", None)):
+                ASCIIColors.warning(
+                    "[StreamState] <" + tag_name + "> tag received but no TTI binding is available."
+                )
+                if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                    failure_block = (
+                        f"\n* ⚠️ Image generation requested ('{title}'), but no image engine is "
+                        f"available in this session. Nothing was generated.\n"
+                        f"<!-- status:failure -->\n</processing>\n"
+                    )
+                    self.ai_message.content += failure_block
+                    _cb(self.callback, failure_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                return True
+
+            width = 1024
+            height = 1024
+            try:
+                width = max(64, min(int(attrs.get("width", 1024)), 4096))
+            except (TypeError, ValueError):
+                width = 1024
+            try:
+                height = max(64, min(int(attrs.get("height", 1024)), 4096))
+            except (TypeError, ValueError):
+                height = 1024
+
+            if tag_name == "edit_image" and not prompt:
+                failure_block = (
+                    f"\n* ⚠️ Image edit requested ('{title}'), but no editing instructions were "
+                    f"provided inside the tag. Nothing was modified.\n"
+                    f"<!-- status:failure -->\n</processing>\n"
+                )
+                self.ai_message.content += failure_block
+                _cb(self.callback, failure_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                return True
+            if tag_name == "generate_image" and not prompt:
+                prompt = title
+
+            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                status_line = (
+                    f"* 🎨 Generating image '{title}' ({width}×{height}) via the image engine...\n"
+                    if tag_name == "generate_image"
+                    else f"* 🎨 Editing image '{title}' with the image engine...\n"
+                )
+                self.ai_message.content += status_line
+                _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+            img_b64 = None
+            generation_error = None
+            try:
+                if tag_name == "generate_image":
+                    img_bytes = tti.generate_image(prompt=prompt, width=width, height=height)
+                else:
+                    source_b64 = None
+                    source_art = self.discussion.artefacts.get(title)
+                    if source_art and source_art.get("images"):
+                        source_b64 = source_art["images"][-1]
+                    if source_b64 is None:
+                        source_b64 = self.ai_message.get_active_images()[-1] if self.ai_message.get_active_images() else None
+                    if source_b64 is None:
+                        raise ValueError(f"No source image available to edit for '{title}'.")
+                    img_bytes = tti.edit_image(image=source_b64, prompt=prompt)
+                if img_bytes:
+                    img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+            except Exception as gen_ex:
+                trace_exception(gen_ex)
+                generation_error = _sanitize_host_paths(str(gen_ex))
+
+            if img_b64:
+                art = self.discussion.artefacts.add(
+                    title=title,
+                    artefact_type="image",
+                    content=f"### Image: '{prompt[:200]}'\n\n<artefact_image id=\"{title}::0\" />",
+                    images=[img_b64],
+                    image_media_types=["image/png"],
+                    active=self.auto_activate
+                )
+                if art:
+                    self.affected_artefacts.append(art)
+                    self.discussion._turn_actions_log.append({
+                        "action": "artifact_created",
+                        "title": title,
+                        "type": "image",
+                        "round": getattr(self.discussion, "_current_round", 0)
+                    })
+
+                if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                    result_block = (
+                        f"* ✅ Image '{title}' generated and saved to the workspace.\n"
+                        f"<!-- status:success -->\n</processing>\n"
+                    )
+                    self.ai_message.content += result_block
+                    _cb(self.callback, result_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                anchor = f'<artefact_image id="{title}::0" />'
+                self.ai_message.content += f"\n\n{anchor}\n"
+                _cb(self.callback, f"\n\n{anchor}\n", MSG_TYPE.MSG_TYPE_CHUNK)
+
+                _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+                    "type": "artifact_created",
+                    "title": title,
+                    "art_type": "image"
+                })
+            else:
+                if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                    reason = generation_error or "The image engine returned no data."
+                    failure_block = (
+                        f"\n* ❌ Image '{title}' could not be generated. Reason: {reason}\n"
+                        f"<!-- status:failure -->\n</processing>\n"
+                    )
+                    self.ai_message.content += failure_block
+                    _cb(self.callback, failure_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
             self._action_dispatched = True
             return True
 
@@ -2591,12 +2741,14 @@ class _StreamState:
                     full_match_text
                 )
 
-            # Context visibility tags close their own <processing> block with a
-            # status meta inside the dispatcher; do not emit a duplicate close.
-            if self._secondary_tag_name not in ("unlock_file", "lock_file", "hide_file", "agent"):
-                proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
-                self.ai_message.content += proc_close_tag
-                _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            # Context visibility tags and image tags close their own
+            # <processing> block with a status meta inside the dispatcher;
+            # do not emit a duplicate close.
+            if self._secondary_tag_name not in ("unlock_file", "lock_file", "hide_file", "agent", "generate_image", "edit_image"):
+                if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                    proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
+                    self.ai_message.content += proc_close_tag
+                    _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                 self._processing_block_open = False
 
             self._secondary_tag_name = ""
@@ -3467,6 +3619,7 @@ class ChatMixin:
         tools=None,
         add_user_message: bool = True,
         images=None,
+        streaming_callback: Callable[[Any,MSG_TYPE,dict],bool] = None,
         remove_thinking_blocks: bool = True,
         enable_image_generation: bool = True,
         enable_image_editing:    bool = True,
@@ -3513,6 +3666,7 @@ class ChatMixin:
             tools: Optional dict of additional tools or list of tool names to enable.
             add_user_message (bool): If True, adds the user message to the discussion. Default True.
             images: Optional list of image paths/base64 for multimodal input.
+            streaming_callback: Optional callable to receive events like streamed chunks.
             remove_thinking_blocks (bool): If True, strips <think>...</think> blocks from output. Default True.
             enable_image_generation (bool): Enable image generation capabilities. Default True.
             enable_image_editing (bool): Enable image editing capabilities. Default True.
@@ -3572,7 +3726,7 @@ class ChatMixin:
         if resolved_max_rounds is None:
             resolved_max_rounds = 20
 
-        callback = kwargs.get("streaming_callback")
+        callback = streaming_callback
 
         if orchestrator_mode:
             from ..lollms_agentic.runner import AgenticRunner
@@ -3625,7 +3779,6 @@ class ChatMixin:
             object.__setattr__(self, '_cancel_flag', True)
 
         self.scratchpad = ""
-        callback = kwargs.get("streaming_callback")
         temperature = kwargs.get("temperature")
 
         # ── 1. Safe SQLite Memory Ingestion (CONDITIONAL) ──
@@ -5382,9 +5535,17 @@ class ChatMixin:
                             f"Memory tags are processed silently by the memory system and must NEVER be wrapped in <tool> blocks.\n"
                             f"Use the XML tag directly instead.\n"
                         )
-                        tool_close_tag = f"{status_err_line}{details_block}<!-- status:failure -->\n</processing>\n\n"
-                        ai_msg.content += tool_close_tag
-                        _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        if event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                            tool_close_tag = f"{status_err_line}{details_block}<!-- status:failure -->\n</processing>\n\n"
+                            ai_msg.content += tool_close_tag
+                            _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                            _cb(callback, "", MSG_TYPE.MSG_TYPE_TOOL_END, {
+                                "tool_name": tool_name,
+                                "success": False,
+                                "output": "",
+                                "error": f"'{tool_name}' is a memory system tag, not a tool. Use the XML tag directly.",
+                            })
 
                         # Inject a targeted correction into virtual history
                         correction_msg = (
@@ -5499,9 +5660,17 @@ class ChatMixin:
                         # Emit a failure processing block to the UI
                         status_err_line = f"* Tool call blocked.\n"
                         details_block = f"Error Logs:\nTool '{tool_name}' is not available in this session.\n"
-                        tool_close_tag = f"{status_err_line}{details_block}<!-- status:failure -->\n</processing>\n\n"
-                        ai_msg.content += tool_close_tag
-                        _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        if event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                            tool_close_tag = f"{status_err_line}{details_block}<!-- status:failure -->\n</processing>\n\n"
+                            ai_msg.content += tool_close_tag
+                            _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                            _cb(callback, "", MSG_TYPE.MSG_TYPE_TOOL_END, {
+                                "tool_name": tool_name,
+                                "success": False,
+                                "output": "",
+                                "error": f"Tool '{tool_name}' is not available in this session.",
+                            })
 
                         # Inject a targeted correction into virtual history
                         available_tools_str = ", ".join(f"`{t}`" for t in active_tools.keys()) if active_tools else "No tools are available."
@@ -5620,9 +5789,17 @@ class ChatMixin:
                             
                         status_err_line = f"* Tool call blocked to prevent loop.\n"
                         details_block = f"Loop Intercepted:\n{result_str}\n"
-                        tool_close_tag = f"{status_err_line}{details_block}<!-- status:failure -->\n</processing>\n\n"
-                        ai_msg.content += tool_close_tag
-                        _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        if event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                            tool_close_tag = f"{status_err_line}{details_block}<!-- status:failure -->\n</processing>\n\n"
+                            ai_msg.content += tool_close_tag
+                            _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                            _cb(callback, "", MSG_TYPE.MSG_TYPE_TOOL_END, {
+                                "tool_name": tool_name,
+                                "success": False,
+                                "output": "",
+                                "error": result_str,
+                            })
 
                         virtual_history.append(SimpleNamespace(
                             sender_type="user",
@@ -5647,8 +5824,16 @@ class ChatMixin:
                         )
                         status_err_line = f"* Tool call blocked to prevent success loop.\n"
                         details_block = f"Loop Intercepted:\nRepetitive successful tool call blocked (workspace state unchanged)\n<!-- status:failure -->\n</processing>\n\n"
-                        ai_msg.content += status_err_line + details_block
-                        _cb(callback, status_err_line + details_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        if event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                            ai_msg.content += status_err_line + details_block
+                            _cb(callback, status_err_line + details_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                            _cb(callback, "", MSG_TYPE.MSG_TYPE_TOOL_END, {
+                                "tool_name": tool_name,
+                                "success": False,
+                                "output": "",
+                                "error": "Repetitive successful tool call blocked (workspace state unchanged).",
+                            })
 
                         virtual_history.append(SimpleNamespace(
                             sender_type="user",
@@ -6121,9 +6306,19 @@ class ChatMixin:
                         if res_success_flag is True:
                             is_failure = bool(tool_res.get("error")) and not tool_res.get("success", True)
                     status_meta = "failure" if is_failure else "success"
-                    tool_close_tag = f"{status_done_line}{details_block}<!-- status:{status_meta} -->\n</processing>\n\n"
-                    ai_msg.content += tool_close_tag
-                    _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    if event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                        tool_close_tag = f"{status_done_line}{details_block}<!-- status:{status_meta} -->\n</processing>\n\n"
+                        ai_msg.content += tool_close_tag
+                        _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                    if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                        cb_error = (tool_res.get("error") if isinstance(tool_res, dict) else None) if is_failure else None
+                        _cb(callback, "", MSG_TYPE.MSG_TYPE_TOOL_END, {
+                            "tool_name": tool_name,
+                            "success": not is_failure,
+                            "output": details_block,
+                            "error": cb_error,
+                        })
 
                     tool_success = not is_failure
                     if not tool_success:

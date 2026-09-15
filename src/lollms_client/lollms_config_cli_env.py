@@ -291,10 +291,33 @@ _PROFILE_KNOWN_KEYS = (
 )
 
 
+def _auto_promote_default(profiles: Dict[str, Dict[str, Any]], registry_order: List[str]) -> None:
+    """
+    READ-TIME AUTO-PROMOTION (SINGLE-DEFAULT INVARIANT, read side).
+    If a modality has profiles but none flagged as default, the FIRST profile
+    (insertion order from the env map) is promoted in-memory. If several are
+    flagged, the first flagged one wins and the others are demoted. This never
+    writes to disk — persistence only happens when the user saves.
+    """
+    if not profiles:
+        return
+    flagged = [
+        alias for alias, p_data in profiles.items()
+        if isinstance(p_data, dict) and p_data.get("is_default")
+    ]
+    if len(flagged) == 1:
+        return
+    owner = flagged[0] if flagged else registry_order[0]
+    for alias, p_data in profiles.items():
+        if isinstance(p_data, dict):
+            p_data["is_default"] = (alias == owner)
+
+
 def _extract_profiles_from_env(prefix: str, bindings: Dict[str, Dict[str, Any]], env_data: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
     clean_prefix = prefix.rstrip("_").upper()
     profiles = {}
     profile_prefix = f"{clean_prefix}_PROFILES_"
+    default_flag_counter = 0
 
     for k, v in env_data.items():
         k_upper = k.upper()
@@ -333,6 +356,8 @@ def _extract_profiles_from_env(prefix: str, bindings: Dict[str, Dict[str, Any]],
             profiles[p_alias]["instance_name"] = v
         elif key == "IS_DEFAULT":
             profiles[p_alias]["is_default"] = _convert_to_bool(v)
+            profiles[p_alias]["_default_flag_order"] = default_flag_counter
+            default_flag_counter += 1
         elif key == "VISION_ENABLED":
             profiles[p_alias]["vision_enabled"] = _convert_to_bool(v)
         elif key == "FORCED_CONTEXT_SIZE":
@@ -347,6 +372,8 @@ def _extract_profiles_from_env(prefix: str, bindings: Dict[str, Dict[str, Any]],
             profiles[p_alias].setdefault("binding_config", {})["verify_ssl_certificate"] = _convert_to_bool(v)
 
     resolved_profiles = {}
+    if profiles:
+        _auto_promote_default(profiles, registry_order=list(profiles.keys()))
     for p_alias, p_data in profiles.items():
         b_alias = _sanitize_alias(p_data.get("binding_alias") or "") or None
         b_info = bindings.get(b_alias, {}) if b_alias else {}
@@ -748,9 +775,18 @@ def _delete_entry(b_type: str, category: str, alias: str, config_map: Dict[str, 
         return
 
     if _safe_confirm(f"Are you sure you want to delete {category.lower()[:-1]} '{alias}' and all its {len(keys_to_delete)} keys?", default=False):
+        was_default = (
+            category == "PROFILES"
+            and config_map.get(prefix + "IS_DEFAULT", "").lower() in ("true", "1", "yes", "y", "on")
+        )
         for k in keys_to_delete:
             del config_map[k]
         ASCIIColors.green(f"\n  🗑️ Deleted {category.lower()[:-1]}: {alias}")
+
+        if category == "PROFILES":
+            _enforce_single_default_profile(b_type, config_map)
+            if was_default and b_type.upper() == "CONNECTION":
+                ASCIIColors.info("  ℹ️ Default instance profile deleted; first remaining profile promoted.")
 
 def _extract_model_name(m: Any) -> Optional[str]:
     """Robustly extracts model name string from raw items (string or dict)."""
@@ -875,6 +911,9 @@ def _configure_profile_instance(b_type: str, alias: str, config_map: Dict[str, s
 
     if _safe_confirm(f"Make '{alias}' the default profile?", default=(alias == "master")):
         config_map[profile_prefix + "IS_DEFAULT"] = "true"
+        _enforce_single_default_profile(b_type, config_map)
+    else:
+        config_map[profile_prefix + "IS_DEFAULT"] = "false"
 
     if b_type == "llm":
         if _safe_confirm(f"Does profile '{alias}' support vision?", default=False):
@@ -894,6 +933,45 @@ def _configure_profile_instance(b_type: str, alias: str, config_map: Dict[str, s
 
     ASCIIColors.green(f"\n  ✓ Saved profile: {alias}")
 
+def _enforce_single_default_profile(b_type: str, config_map: Dict[str, str]) -> None:
+    """
+    Enforces the SINGLE-DEFAULT INVARIANT across all profiles of a modality:
+    exactly one profile may carry IS_DEFAULT=true; all others are cleared.
+    If several (or none) are flagged, the FIRST profile in insertion order is
+    promoted. Mutates config_map in place.
+    """
+    profile_prefix = f"{b_type.upper()}_PROFILES_"
+    default_flags: List[Tuple[str, str]] = []
+    zero_list = []
+    flagged: List[str] = zero_list
+    flagged = []
+    for key in config_map:
+        if key.startswith(profile_prefix) and key.endswith("_IS_DEFAULT"):
+            remainder = key[len(profile_prefix): -len("_IS_DEFAULT")]
+            alias = remainder.split("_", 1)[0]
+            if config_map.get(key, "").lower() in ("true", "1", "yes", "y", "on"):
+                flagged.append(alias)
+            default_flags.append((alias, key))
+            flagged = zero_list + [alias] if config_map.get(key, "").lower() in ("true", "1", "yes", "y", "on") else flagged
+
+    if not default_flags:
+        return
+
+    owner_alias = None
+    if len(flagged) == 1:
+        owner_alias = flagged[0]
+    else:
+        first_key = min(
+            (full_key for full_key in config_map if full_key.startswith(profile_prefix)),
+            key=lambda full_key: list(config_map.keys()).index(full_key),
+        )
+        owner_alias = first_key[len(profile_prefix):].split("_", 1)[0]
+
+    for alias, key in default_flags:
+        if alias == owner_alias:
+            config_map[key] = "true"
+        else:
+            config_map[key] = "false"
 def _add_profile_flow(b_type: str, config_map: Dict[str, str]):
     alias = _sanitize_alias(_safe_input("Enter alias for the profile", "master"))
     if alias: _configure_profile_instance(b_type, alias, config_map)
@@ -1052,6 +1130,10 @@ def _configure_connection_profile_instance(binding_alias: str, instance_alias: s
 
     if _safe_confirm(f"Make '{instance_alias}' the default instance profile?", default=(instance_alias == "general")):
         config_map[prefix + "IS_DEFAULT"] = "true"
+        _enforce_single_default_profile("connection", config_map)
+    else:
+        config_map[prefix + "IS_DEFAULT"] = "false"
+        _enforce_single_default_profile("connection", config_map)
 
     ASCIIColors.green(f"\n  ✓ Saved connection instance profile: {instance_alias} (→ {binding_alias}:{instance_name})")
 

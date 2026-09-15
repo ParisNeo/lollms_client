@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import shutil
@@ -1367,6 +1368,8 @@ class StreamRenderer:
         import re
         import json as _json
 
+        block_content = re.sub(r'</?processing[^>]*>', '', block_content)
+
         type_match = re.search(r'type="([^"]+)"', block_content)
         title_match = re.search(r'title="([^"]+)"', block_content)
         params_match = re.search(r'params="([^"]+)"', block_content)
@@ -1399,11 +1402,15 @@ class StreamRenderer:
                 panel_lines.append(f"[cyan]Execution Log:[/cyan]\n{body_text}")
             panel_content = "\n".join(panel_lines)
 
+            title_action = title.split(' ')[0].lower()
+            dedup_title = title if not title.lower().startswith(title_action) else title[len(title_action):].strip()
+            display_title = dedup_title or title
+
             border = "red" if block_status == "failure" else "blue"
             print("")
             ASCIIColors.panel(
                 panel_content,
-                title=f"[bold {'red' if block_status == 'failure' else 'blue'}]🛠️ Tool Execution: {title}[/bold {'red' if block_status == 'failure' else 'blue'}]",
+                title=f"[bold {'red' if block_status == 'failure' else 'blue'}]🛠️ Tool Execution: {display_title}[/bold {'red' if block_status == 'failure' else 'blue'}]",
                 border_style=border
             )
         else:
@@ -1705,9 +1712,13 @@ class StreamRenderer:
             if preview:
                 panel_content += f"\n[cyan]Preview:[/cyan] [dim]{preview}...[/dim]"
 
+            action_words = action.replace('_', ' ').title().split()
+            deduped_action = ' '.join(
+                w for i, w in enumerate(action_words) if w not in action_words[:i]
+            ) or action
             ASCIIColors.panel(
                 panel_content,
-                title=f"[bold yellow]📝 Scratchpad {action.replace('_', ' ').title()}[/bold yellow]",
+                title=f"[bold yellow]📝 {deduped_action}[/bold yellow]",
                 border_style="yellow"
             )
             return
@@ -1799,6 +1810,9 @@ class StreamRenderer:
                 return True
             else:
                 if "<done" in chunk and "/>" in chunk:
+                    return True
+
+                if re.match(r'^[ \t]*</?processing[^>]*>[ \t]*$', chunk, re.IGNORECASE):
                     return True
 
                 if self._in_processing:

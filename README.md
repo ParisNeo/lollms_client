@@ -17,6 +17,85 @@
 
 Whether you're connecting to a remote LoLLMs server, an Ollama instance, the OpenAI API, or running models locally using GGUF (via `llama-cpp-python` or a managed `llama.cpp` server), Hugging Face Transformers, or vLLM, `lollms-client` offers a consistent and developer-friendly experience.
 
+> ### ⚡ TL;DR — Zero-Config Client in One Line
+>
+> Configure your machine **once** with the built-in wizard (`python -m lollms_client.lollms_config_cli_env`), then any app on that machine gets a **fully-armed client — text, images, audio, everything** — with a single line:
+>
+> ```python
+> from lollms_client.lollms_config_cli_env import get_client_from_env
+>
+> client = get_client_from_env(create_tti=True, create_tts=True, create_stt=True)
+> ```
+>
+> One centralized config file (`~/.lollms_client/config.yaml`) is shared by **every** `lollms_client` application on that machine. **[→ Full story below](#-one-line-setup-the-centralized-configuration-system)**
+>
+> 🖥️ **Building your own UI?** The whole configuration engine is exposed as a **headless API** — drive it from PyQt, NiceGUI, Vue/React, or your own database. **[→ Embeddable Configuration Engine](#-embeddable-configuration-engine-build-your-own-configuration-ui)**
+
+## 🧩 Embeddable Configuration Engine (Build Your Own Configuration UI)
+
+The wizard is just one frontend. The entire configuration engine — binding discovery, parameter schemas, the flat config map, and client reconstruction — is available as a **headless, UI-agnostic API** (`lollms_config_api`). Any application can embed it: build a settings page in PyQt/PySide, render auto-generated forms in NiceGUI, or expose it over REST to a Vue/React frontend.
+
+### Why This Rocks
+
+| Benefit | Description |
+| :--- | :--- |
+| **Auto-generated forms** | `get_binding_schema()` returns the parameter schema (name, type, mandatory, default) for every binding — render dynamic settings forms without hand-coding fields. |
+| **Database-friendly** | The flat config map converts to/from a structured JSON dict (`config_map_to_dict` / `load_config_map`), so you can persist user settings in a DB column or user record as a sub-config. |
+| **UI-agnostic** | No terminal, no `input()` calls — pure functions returning plain dicts. PyQt, NiceGUI, Vue, React, Electron… all first-class citizens. |
+| **Zero duplication** | Your UI writes the exact same config format the wizard writes. Users configure once in your app; every other `lollms_client` app on the machine reads the same setup. |
+| **Per-app overrides** | Save to your app's own config file or DB, and `load_config_map()` layers it on top of the machine-wide global config. |
+
+### Python UI (NiceGUI / PyQt) — 20 lines
+
+```python
+from lollms_client.lollms_config_api import discover_bindings, get_binding_schema, load_config_map, save_config_map
+
+# 1. Populate a dropdown
+bindings = [b["name"] for b in discover_bindings("llm")]
+
+# 2. Auto-generate the settings form from the schema
+schema = get_binding_schema("ollama", "llm")
+# -> [{"name": "host_address", "type": "str", "mandatory": False, "default": "http://localhost:11434", ...}]
+
+# 3. Load the user's existing settings (global config + your app's overrides)
+user_map = load_config_map(conf_file="my_app_settings.yaml")
+
+# 4. On "Save" — persist to your app's file (or DB via config_map_to_dict)
+save_config_map(user_map, "my_app_settings.yaml")
+```
+
+### Node / Web (Vue / React) — REST Backend Pattern
+
+The config map is a flat `Dict[str, str]` and the schemas are plain JSON — perfect for HTTP round-trips:
+
+```
+GET  /api/config/bindings?modality=llm          -> [{"name": "ollama"}, ...]
+GET  /api/config/schema?binding=ollama&modality=llm  -> [parameter schema]
+GET  /api/config/map                             -> {"LLM_BINDINGS_LOCAL_HOST_ADDRESS": "..."}
+POST /api/config/map      body: {config_map}    -> persists (file or DB)
+```
+
+Persist the posted map as JSON in your user record (`config_map_to_dict`), then rebuild the client server-side with `build_client_config(config_map)` → `LollmsClient(**kwargs)`.
+
+### Storing the Sub-Config in Your Own Database
+
+```python
+import json
+from my_app.database import get_user, save_user_field
+
+from lollms_client.lollms_config_api import load_config_map, config_map_to_dict
+
+# Read: merge machine-wide config + this user's DB sub-config (DB wins)
+user = get_user(user_id)
+config_map = load_config_map(conf_dict=json.loads(user.lollms_config or "{}"))
+
+# Write: serialize back to a structured dict and store in a JSON column
+structured = config_map_to_dict(config_map)
+save_user_field(user_id, "lollms_config", json.dumps(structured))
+```
+
+> 💡 **One engine, many frontends.** The CLI wizard, your PyQt settings dialog, and your Vue admin panel all read and write the same format — so a user who configures their machine once (via the wizard) gets instant defaults in your app, and edits made in your app never break other tools.
+
 ## ⚡ Why LoLLMs Client? Key Competitive Advantages
 
 `lollms_client` is not just another API wrapper. It is a highly optimized, production-grade coordination engine built to grant Large Language Models true local and hybrid autonomy.
@@ -59,6 +138,49 @@ pip install lollms-client
 ```
 
 This will install the core library. Some bindings may require additional dependencies (e.g., `llama-cpp-python`, `torch`, `transformers`, `ollama`, `vllm`, `Pillow` for image utilities, `docling` for document parsing). The library attempts to manage these using `pipmaster`, but for complex dependencies (especially those requiring compilation like `llama-cpp-python` with GPU support), manual installation might be preferred.
+
+## 🚀 One-Line Setup: The Centralized Configuration System
+
+Forget about writing binding configs, model names, and API keys in every script. `lollms_client` ships with a **PC-wide centralized configuration system**: you configure your machine *once*, and every application using `lollms_client` — on your PC, Mac, server, or even a Raspberry Pi — instantly reuses the exact same setup.
+
+### Step 1: Configure Your Machine Once (Interactive Wizard)
+
+Run the built-in wizard from any terminal. It walks you through selecting bindings, entering credentials, and picking models — then saves everything to a single shared file (`~/.lollms_client/config.yaml`):
+
+```bash
+python -m lollms_client.lollms_config_cli_env
+```
+
+That's the only setup you will ever do. The wizard covers every modality — LLM, text-to-image (TTI), text-to-speech (TTS), speech-to-text (STT), music (TTM), video (TTV), and external connections (webhooks/Discord/Slack) — so one run fully equips your machine for text, images, audio, and more.
+
+### Step 2: Get a Fully-Armed Client in One Line
+
+Any application on that machine can now spin up a complete client — text generation, image generation, and every other configured modality — with a single call:
+
+```python
+from lollms_client.lollms_config_cli_env import get_client_from_env
+
+client = get_client_from_env(create_tti=True, create_tts=True, create_stt=True)
+```
+
+That's it. No dictionaries, no binding names, no API keys in your source code. The resolver automatically discovers your saved configuration, instantiates the default profiles for each requested modality, and lazily loads the rest on demand:
+
+```python
+response = client.generate_text("Explain quantum computing in one sentence.")
+image_bytes = client.generate_image("A cyberpunk city at sunset")
+```
+
+### Why This Rocks
+
+| Benefit | Description |
+| :--- | :--- |
+| **One config, infinite apps** | Every `lollms_client` app on the machine reads the same `~/.lollms_client/config.yaml`. Update your API key once — all apps pick it up. |
+| **Zero secrets in code** | Credentials live in a local config file (or environment variables), never hardcoded in your scripts. |
+| **Multi-tier profiles** | The wizard saves bindings (connections) and profiles (models) separately, so N models can share one server config. Switching models later is a one-liner: `client.switch_model("deep_coder")`. |
+| **Works everywhere** | The same pattern runs identically on Windows, macOS, Linux servers, and Raspberry Pi. |
+| **Overridable** | Need something app-specific? Pass `conf_file="my_app.yaml"` or a `conf_dict` to `get_client_from_env()` to layer local overrides on top of the shared config — without ever editing the global file. |
+
+> 💡 **Behind the scenes:** `get_client_from_env()` merges your global config (`~/.lollms_client/`), local `.env` files, environment variables, and any explicit overrides into one resolution, then hands them to `LollmsClient` via the Two-Tier Profile System described later in this document. If you want the full details on profiles, lazy loading, and multi-model routing, jump to [Universal Lazy Profiles & Multi-Model Routing](#-universal-lazy-profiles--multi-model-routing).
 
 ## Core Generation Methods
 
