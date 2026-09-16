@@ -901,11 +901,15 @@ class LollmsClient():
         if not self.llm:
             raise RuntimeError("LLM binding not initialized. Cannot use generate_text.")
 
-        # Default think to False if not explicitly provided as True
-        if "think" not in kwargs:
-            kwargs["think"] = False
+        reasoning_effort = LollmsLLMBinding.normalize_reasoning_effort(
+            kwargs.get("think"), kwargs.get("reasoning_effort")
+        )
+        kwargs.pop("think", None)
+        kwargs.pop("reasoning_summary", None)
+        if reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
         else:
-            kwargs["think"] = kwargs["think"] is True
+            kwargs["reasoning_effort"] = None
 
         # Non-vision model image stripping and VLM substitution
         prompt = kwargs.get("prompt", args[0] if len(args) > 0 else "")
@@ -929,11 +933,15 @@ class LollmsClient():
         if not self.llm:
             raise RuntimeError("LLM binding not initialized. Cannot use generate_from_messages.")
 
-        # Default think to False if not explicitly provided as True
-        if "think" not in kwargs:
-            kwargs["think"] = False
+        reasoning_effort = LollmsLLMBinding.normalize_reasoning_effort(
+            kwargs.get("think"), kwargs.get("reasoning_effort")
+        )
+        kwargs.pop("think", None)
+        kwargs.pop("reasoning_summary", None)
+        if reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
         else:
-            kwargs["think"] = kwargs["think"] is True
+            kwargs["reasoning_effort"] = None
 
         # Non-vision model message sanitization and VLM substitution
         messages = kwargs.get("messages", args[0] if len(args) > 0 else [])

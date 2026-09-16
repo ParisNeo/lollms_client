@@ -218,6 +218,8 @@ class OpenAIBinding(LollmsLLMBinding):
         count = 0
         output = ""
 
+        effort = self.normalize_reasoning_effort(think, reasoning_effort)
+
         # ── Build message list ────────────────────────────────────────────────
         messages = [
             {
@@ -288,8 +290,8 @@ class OpenAIBinding(LollmsLLMBinding):
                     seed=seed
                 )
 
-                # ── Inject think / reasoning params ───────────────────────────
-                if think:
+                # ── Inject reasoning params ────────────────────────────────
+                if effort is not None:
                     if self.is_vllm:
                         # vLLM: enable thinking via chat_template_kwargs
                         params.setdefault("extra_body", {}).setdefault(
@@ -299,18 +301,14 @@ class OpenAIBinding(LollmsLLMBinding):
                         # OpenAI extended-thinking models (o3, o4-mini, gpt-5 …)
                         # Chat Completions uses flat reasoning_effort, not the
                         # nested `reasoning` dict (that is Responses API only).
-                        params["reasoning_effort"] = reasoning_effort or "low"
-                        # Some providers extend the API with a summary field;
-                        # pass it via extra_body so the SDK doesn't reject it.
+                        # OpenAI accepts minimal/low/medium/high — clamp "max".
+                        params["reasoning_effort"] = effort if effort != "max" else "high"
                         if reasoning_summary and reasoning_summary != "auto":
                             params.setdefault("extra_body", {})["reasoning_summary"] = reasoning_summary
-                        # These models reject temperature / top_p
                         params.pop("temperature", None)
                         params.pop("top_p", None)
                 else:
                     if self.is_vllm:
-                        # Explicitly disable thinking so vLLM doesn't carry it
-                        # over from a cached template state
                         params.setdefault("extra_body", {}).setdefault(
                             "chat_template_kwargs", {}
                         )["enable_thinking"] = False
@@ -330,7 +328,7 @@ class OpenAIBinding(LollmsLLMBinding):
                     params.pop("frequency_penalty", None)
                     params.pop("reasoning_effort", None)
 
-                    if not think:
+                    if effort is None:
                         params["temperature"] = 1
 
                     # Strip vLLM-specific extras so the retry is clean
@@ -604,31 +602,28 @@ class OpenAIBinding(LollmsLLMBinding):
         # Drop None values
         params = {k: v for k, v in params.items() if v is not None}
 
-        # ── Inject think / reasoning params ───────────────────────────────────
-        if think:
+        # ── Inject reasoning params ────────────────────────────────────────
+        effort = self.normalize_reasoning_effort(think, reasoning_effort)
+        if effort is not None:
             if self.is_vllm:
                 params.setdefault("extra_body", {}).setdefault(
                     "chat_template_kwargs", {}
                 )["enable_thinking"] = True
             else:
-                # OpenAI extended-thinking models (o3, o4-mini, gpt-5 …)
-                # Chat Completions uses flat reasoning_effort, not the
-                # nested `reasoning` dict (that is Responses API only).
-                params["reasoning_effort"] = reasoning_effort or "low"
-                # Some providers extend the API with a summary field;
-                # pass it via extra_body so the SDK doesn't reject it.
+                # OpenAI Chat Completions uses flat reasoning_effort.
+                # OpenAI accepts minimal/low/medium/high — clamp "max".
+                params["reasoning_effort"] = effort if effort != "max" else "high"
                 if reasoning_summary and reasoning_summary != "auto":
                     params.setdefault("extra_body", {})["reasoning_summary"] = reasoning_summary
-                # These models reject temperature / top_p
                 params.pop("temperature", None)
                 params.pop("top_p", None)
         else:
             if self.is_vllm:
-                # Explicitly disable so vLLM doesn't carry over a cached state
                 params.setdefault("extra_body", {}).setdefault(
                     "chat_template_kwargs", {}
                 )["enable_thinking"] = False
 
+        effort = self.normalize_reasoning_effort(think, reasoning_effort)
         output = ""
 
         try:
@@ -658,7 +653,7 @@ class OpenAIBinding(LollmsLLMBinding):
                     params.pop("presence_penalty", None)
                     params.pop("reasoning_effort", None)
 
-                    if not think:
+                    if effort is None:
                         params["temperature"] = 1
 
                     # Strip vLLM-specific extras so the retry is clean

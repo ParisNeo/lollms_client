@@ -275,9 +275,10 @@ class OllamaBinding(LollmsLLMBinding):
             options['num_thread']= self.n_threads
             
         options = {k: v for k, v in options.items() if v is not None}
-        
+
         full_response_text = ""
-        think = think if "gpt-oss" not in self.model_name else reasoning_effort
+        think = self.normalize_reasoning_effort(think, reasoning_effort)
+        think = False if think is None else (think != "low")
 
         try:
             with self._client() as client:
@@ -484,7 +485,7 @@ class OllamaBinding(LollmsLLMBinding):
                         seed: Optional[int] = None,
                         streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
                         think: Optional[bool] = False,
-                        reasoning_effort: Optional[bool] = "low", # low, medium, high
+                        reasoning_effort: Optional[str] = "low", # low, medium, high, max
                         **kwargs
                         ) -> Union[str, dict]:
         options = {}
@@ -506,6 +507,8 @@ class OllamaBinding(LollmsLLMBinding):
         alternated_messages = self.clean_and_alternate_messages(messages)
         ollama_messages = self.clean_message_images(alternated_messages)
         full_response_text = ""
+        think = self.normalize_reasoning_effort(think, reasoning_effort)
+        think = False if think is None else (think != "low")
 
         try:
             with self._client() as client:

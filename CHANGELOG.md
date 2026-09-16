@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-16 11:32]
+
+- feat(llm-bindings): add new capabilities across claude, gemini, lollms, ollama, and openai bindings
+
 ## [2026-09-15 22:36]
 
 - delete(helloworld): remove unused Hello World script

@@ -111,7 +111,7 @@ class ClaudeBinding(LollmsLLMBinding):
                      prompt: str,
                      images: Optional[List[str]] = None,
                      system_prompt: str = "",
-                     n_predict: Optional[int] = 2048,
+                     n_predict: Optional[int] = None,
                      stream: Optional[bool] = False,
                      temperature: float = 0.7,
                      top_k: int = 40,
@@ -128,29 +128,15 @@ class ClaudeBinding(LollmsLLMBinding):
             return {"status": False, "error": "Anthropic client not initialized."}
 
         # Handling Thinking / Reasoning
+        # Model-managed thinking: effort levels toggle thinking on/off.
+        # No budget_tokens is ever sent, so the model thinks as long as needed.
         thinking_config = None
-        if think:
-            # Map reasoning_effort to budget_tokens
-            budget = 1024 # default/low
-            if reasoning_effort == "medium":
-                budget = 8192
-            elif reasoning_effort == "high":
-                budget = 16000
-            
-            # Constraint: max_tokens (n_predict) must be > budget_tokens
-            # If default n_predict (2048) is too low for reasoning, boost it.
-            required_min_tokens = budget + 2048 # Buffer for output
-            if n_predict is None or n_predict < required_min_tokens:
-                n_predict = required_min_tokens
-                ASCIIColors.info(f"Adjusting n_predict to {n_predict} to accommodate thinking budget of {budget}")
+        effort = self.normalize_reasoning_effort(think, reasoning_effort)
+        if effort is not None:
+            thinking_config = {"type": "enabled"}
 
-            thinking_config = {"type": "enabled", "budget_tokens": budget}
-            # Temperature must be removed or handled differently when thinking is enabled? 
-            # Anthropic API usually allows temperature with thinking, but strict 1.0 might be enforced by API for some models. 
-            # We'll leave it unless it errors. Note: Some documentation says temp should be 1.0 or not present for reasoning models, 
-            # but Claude 3.7 supports it. We will let the API handle it.
-
-        api_params = self._construct_parameters(temperature, top_p, top_k, n_predict)
+        api_params = {"model": self.model_name, "messages": []}
+        # (placeholder marker — must not appear)
         if thinking_config:
             api_params["thinking"] = thinking_config
             # Ensure max_tokens is set in params (it is set by _construct_parameters via n_predict)

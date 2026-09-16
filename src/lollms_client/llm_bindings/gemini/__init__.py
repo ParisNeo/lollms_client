@@ -62,17 +62,35 @@ class GeminiBinding(LollmsLLMBinding):
             self.client = None
             raise ConnectionError(f"Could not configure Gemini client: {e}") from e
 
+    _EFFORT_TO_GEMINI_BUDGET = {
+        "low": 128,
+        "medium": 8192,
+        "high": 24576,
+        "max": -1,
+    }
+
     def get_generation_config(self, 
                               temperature: float, 
                               top_p: float, 
                               top_k: int, 
-                              n_predict: int) -> types.GenerateContentConfig:
+                              n_predict: int,
+                              reasoning_effort: Optional[str] = None) -> types.GenerateContentConfig:
         """Builds a GenerateContentConfig object from parameters."""
         config = {}
         if temperature is not None: config['temperature'] = float(temperature)
         if top_p is not None: config['top_p'] = top_p
         if top_k is not None: config['top_k'] = top_k
         if n_predict is not None: config['max_output_tokens'] = n_predict
+        effort = self.normalize_reasoning_effort(False, reasoning_effort)
+        if effort is not None:
+            budget = self._EFFORT_TO_GEMINI_BUDGET.get(effort, 128)
+            try:
+                config['thinking_config'] = types.ThinkingConfig(
+                    thinking_budget=budget,
+                    include_thoughts=True,
+                )
+            except Exception as e:
+                ASCIIColors.warning(f"Could not build Gemini thinking config: {e}")
         return types.GenerateContentConfig(**config)
 
     def generate_text(self,
@@ -89,6 +107,8 @@ class GeminiBinding(LollmsLLMBinding):
                      user_keyword: Optional[str] = "!@>user:",
                      ai_keyword: Optional[str] = "!@>assistant:",
                      think: Optional[bool] = False,
+                    reasoning_effort: Optional[str] = "low",
+                    reasoning_summary: Optional[str] = "auto",
                      **kwargs
                      ) -> Union[str, dict]:
         """
@@ -97,10 +117,13 @@ class GeminiBinding(LollmsLLMBinding):
         if not self.client:
             return {"status": False, "error": "Gemini client not initialized."}
 
-        if think and "thinking" not in str(self.model_name).lower():
+        effort = self.normalize_reasoning_effort(think, reasoning_effort)
+        if effort is not None and "thinking" not in str(self.model_name).lower():
              ASCIIColors.info(f"Thinking requested but model '{self.model_name}' may not be a thinking model. Proceeding.")
 
-        generation_config = self.get_generation_config(temperature, top_p, top_k, n_predict)
+        generation_config = self.get_generation_config(
+            temperature, top_p, top_k, n_predict, reasoning_effort=effort
+        )
 
         # Prepare content for the API call
         content_parts = []
@@ -177,6 +200,8 @@ class GeminiBinding(LollmsLLMBinding):
                         seed: Optional[int] = None,
                         streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
                         think: Optional[bool] = False,
+                        reasoning_effort: Optional[str] = "low",
+                        reasoning_summary: Optional[str] = "auto",
                         **kwargs
                         ) -> Union[str, dict]:
         """
@@ -185,7 +210,10 @@ class GeminiBinding(LollmsLLMBinding):
         if not self.client:
             return {"status": False, "error": "Gemini client not initialized."}
 
-        gen_config = self.get_generation_config(temperature, top_p, top_k, n_predict)
+        effort = self.normalize_reasoning_effort(think, reasoning_effort)
+        gen_config = self.get_generation_config(
+            temperature, top_p, top_k, n_predict, reasoning_effort=effort
+        )
 
         system_instruction = None
         gemini_contents = []

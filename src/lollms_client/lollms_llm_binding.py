@@ -114,6 +114,41 @@ class LollmsLLMBinding(LollmsBaseBinding):
         # build text processor
         self.tp = LollmsTextProcessor(self)
 
+    @staticmethod
+    def normalize_reasoning_effort(
+        think: Optional[bool],
+        reasoning_effort: Optional[str],
+    ) -> Optional[str]:
+        """
+        Resolve the effective reasoning effort from the modern ``reasoning_effort``
+        string and the legacy boolean ``think`` flag.
+
+        Precedence:
+          1. An explicit ``reasoning_effort`` string wins (validated against the
+             canonical set ``low | medium | high | max``).
+          2. A ``reasoning_effort`` that arrives as a boolean (legacy misuse) is
+             mapped: ``True`` -> ``"high"``, ``False`` -> ``None``.
+          3. Otherwise the legacy ``think`` flag decides:
+             ``True`` -> ``"high"``, ``False`` -> ``None``.
+
+        Returns the normalized effort string, or ``None`` when reasoning is
+        fully disabled (no thinking output requested).
+        """
+        valid = {"low", "medium", "high", "max"}
+        if reasoning_effort is not None:
+            if isinstance(reasoning_effort, bool):
+                return "high" if reasoning_effort else None
+            effort = str(reasoning_effort).strip().lower()
+            if effort in valid:
+                return effort
+            ASCIIColors.warning(
+                f"Unknown reasoning_effort '{reasoning_effort}'. Falling back to 'low'."
+            )
+            return "low"
+        if think is True:
+            return "high"
+        return None
+
     # ── Cancellation API ─────────────────────────────────────────────────────
 
     def cancel(self) -> None:
@@ -186,8 +221,8 @@ class LollmsLLMBinding(LollmsBaseBinding):
                     user_keyword:Optional[str]="!@>user:",
                     ai_keyword:Optional[str]="!@>assistant:",
                     think: Optional[bool] = False,
-                    reasoning_effort: Optional[bool] = "low", # low, medium, high
-                    reasoning_summary: Optional[bool] = "auto", # auto
+                    reasoning_effort: Optional[str] = "low", # low, medium, high, max
+                    reasoning_summary: Optional[str] = "auto",
                     **kwargs
                     ) -> Union[str, dict]:
         """
@@ -207,8 +242,8 @@ class LollmsLLMBinding(LollmsBaseBinding):
                     seed: Optional[int] = None,
                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
                     think: Optional[bool] = False,
-                    reasoning_effort: Optional[bool] = "low", # low, medium, high
-                    reasoning_summary: Optional[bool] = "auto", # auto
+                    reasoning_effort: Optional[str] = "low", # low, medium, high, max
+                    reasoning_summary: Optional[str] = "auto",
                     **kwargs
                     ) -> Union[str, dict]:
         """

@@ -1,4 +1,6 @@
 # llm_bindings/lollms/__init__.py
+from __future__ import annotations
+
 import requests
 import json
 from lollms_client.lollms_llm_binding import LollmsLLMBinding
@@ -501,6 +503,7 @@ class LollmsBinding(LollmsLLMBinding):
         think = kwargs.pop("think", False)
         reasoning_effort = kwargs.pop("reasoning_effort", "low")
         reasoning_summary = kwargs.pop("reasoning_summary", "auto")
+        effort = self.normalize_reasoning_effort(think, reasoning_effort)
 
         if not model:
             raise ValueError(
@@ -521,8 +524,8 @@ class LollmsBinding(LollmsLLMBinding):
             elif v is not None and kwargs.get("debug", False):
                 ASCIIColors.warning(f"Removed unsupported OpenAI param '{k}'")
 
-        if think:
-            params["reasoning_effort"] = reasoning_effort or "low"
+        if effort is not None:
+            params["reasoning_effort"] = effort if effort != "max" else "high"
             if reasoning_summary and reasoning_summary != "auto":
                 params.setdefault("extra_body", {})["reasoning_summary"] = reasoning_summary
             params.pop("temperature", None)
@@ -595,7 +598,7 @@ class LollmsBinding(LollmsLLMBinding):
                     repeat_penalty=repeat_penalty,
                     seed=seed,
                     think=think,
-                    reasoning_effort=reasoning_effort,
+                    reasoning_effort=effort,
                     reasoning_summary=reasoning_summary,
                 )
                 try:
@@ -821,8 +824,9 @@ class LollmsBinding(LollmsLLMBinding):
         if not params.get("messages"):
             raise ValueError("[LollmsBinding] No messages to send.")
 
-        if think:
-            params["reasoning_effort"] = reasoning_effort or "low"
+        effort = self.normalize_reasoning_effort(think, reasoning_effort)
+        if effort is not None:
+            params["reasoning_effort"] = effort if effort != "max" else "high"
             if reasoning_summary and reasoning_summary != "auto":
                 params.setdefault("extra_body", {})["reasoning_summary"] = reasoning_summary
             params.pop("temperature", None)
@@ -854,7 +858,7 @@ class LollmsBinding(LollmsLLMBinding):
                     params.pop("frequency_penalty", None)
                     params.pop("presence_penalty", None)
                     params.pop("reasoning_effort", None)
-                    if not think:
+                    if effort is None:
                         params["temperature"] = 1
                     if "extra_body" in params:
                         params["extra_body"].pop("chat_template_kwargs", None)
@@ -956,36 +960,72 @@ class LollmsBinding(LollmsLLMBinding):
             "babbage": 2049, "ada": 2049,
         }
         generation_prefixes = ("gpt-", "text-davinci", "davinci", "curie", "babbage", "ada")
-        models_info = []
         prompt_buffer = 500
 
+        raw_entries = None
+        ssl_or_network_failure = False
+
         try:
-            models = self.client.models.list()
-            for model in models.data:
-                model_id = model.id
-                if model_id.startswith(generation_prefixes):
-                    context_length = known_context_lengths.get(model_id, "unknown")
-                    max_generation = (
-                        context_length - prompt_buffer if isinstance(context_length, int) else "unknown"
-                    )
-                    models_info.append({
-                        "model_name": model_id,
-                        "owned_by": getattr(model, "owned_by", "N/A"),
-                        "created": getattr(model, "created", "N/A"),
-                        "context_length": context_length,
-                        "max_generation": max_generation,
-                    })
-                else:
-                    models_info.append({
-                        "model_name": model_id,
-                        "owned_by": getattr(model, "owned_by", "N/A"),
-                        "created": getattr(model, "created", "N/A"),
-                        "context_length": None,
-                        "max_generation": None,
-                    })
+            raw_entries = self.client.models.list().data
         except Exception as e:
-            trace_exception(e)
-            print(f"Failed to list models: {e}")
+            ssl_or_network_failure = True
+            ASCIIColors.warning(
+                f"[LollmsBinding] OpenAI-compat model listing failed: {e}. "
+                "Falling back to the native /lollms/v1/models endpoint."
+            )
+
+        if raw_entries is None:
+            try:
+                native = self._lollms_get("/models", timeout=15)
+                data = native.get("data") if isinstance(native, dict) else None
+                raw_entries = data if isinstance(data, list) else []
+            except Exception as e:
+                trace_exception(e)
+                ASCIIColors.error(f"Failed to list models from Lollms server: {e}")
+                return []
+
+        models_info = []
+        for model in raw_entries:
+            if isinstance(model, dict):
+                model_id = model.get("id") or model.get("model_name") or ""
+                if not model_id:
+                    continue
+                owned_by = model.get("owned_by", "N/A")
+                created = model.get("created", "N/A")
+            else:
+                model_id = getattr(model, "id", "") or ""
+                if not model_id:
+                    continue
+                owned_by = getattr(model, "owned_by", "N/A")
+                created = getattr(model, "created", "N/A")
+
+            if model_id.startswith(generation_prefixes):
+                context_length = known_context_lengths.get(model_id, "unknown")
+                max_generation = (
+                    context_length - prompt_buffer if isinstance(context_length, int) else "unknown"
+                )
+                models_info.append({
+                    "model_name": model_id,
+                    "owned_by": owned_by,
+                    "created": created,
+                    "context_length": context_length,
+                    "max_generation": max_generation,
+                })
+            else:
+                models_info.append({
+                    "model_name": model_id,
+                    "owned_by": owned_by,
+                    "created": created,
+                    "context_length": None,
+                    "max_generation": None,
+                })
+
+        if ssl_or_network_failure and not models_info:
+            ASCIIColors.warning(
+                "[LollmsBinding] No models listed. If the server uses a self-signed "
+                "certificate, set verify_ssl_certificate=false or provide "
+                "certificate_file_path in the binding config."
+            )
 
         return models_info
 
