@@ -449,7 +449,16 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         dialog.open()
 
     def _strip_processing_tags(text: str) -> str:
-        return re.sub(r"<processing.*?</processing>", "", text, flags=re.DOTALL)
+        if not text:
+            return ""
+        # 1. Strip complete processing blocks
+        cleaned = re.sub(r"<processing.*?</processing>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        # 2. Strip any trailing or unclosed processing tag block
+        cleaned = re.sub(r"<processing[^>]*>.*$", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+        # 3. Strip any stray closing tags or status comments
+        cleaned = re.sub(r"</?processing[^>]*>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<!--\s*status:[^>]*-->", "", cleaned, flags=re.IGNORECASE)
+        return cleaned.strip()
 
     current_agent_md: Optional[ui.markdown] = None
     agent_text_buffer = ""
@@ -466,10 +475,15 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
             drained_any = True
 
             if ev.kind == "chunk":
+                if ev.data.get("was_processed"):
+                    continue
+                chunk_text = ev.data.get("text", "")
+                if "<processing" in chunk_text or "</processing>" in chunk_text:
+                    continue
                 if current_agent_md is None:
                     current_agent_md = add_agent_message_container()
                     agent_text_buffer = ""
-                agent_text_buffer += ev.data.get("text", "")
+                agent_text_buffer += chunk_text
                 current_agent_md.set_content(_strip_processing_tags(agent_text_buffer))
 
             elif ev.kind == "thought":

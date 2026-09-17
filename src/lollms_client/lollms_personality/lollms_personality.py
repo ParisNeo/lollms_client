@@ -65,7 +65,7 @@ if _compile is None or not callable(_compile) or _compile.__module__ != 'builtin
     _compile = None
 
 
-from lollms_client.lollms_types import MSG_TYPE, EventMode
+from lollms_client.lollms_types import MSG_TYPE, EventMode, normalize_event_mode
 
 from lollms_client.lollms_memory import FailureMemory
 from lollms_client.lollms_artefact import ArtefactVisibility, ArtefactManager
@@ -3111,13 +3111,6 @@ JSON:"""
 
         self._sync_base_context_artifacts(base_conversation, virtual_history)
 
-        if streaming_callback:
-            compaction_msg = '\n<processing type="context_compaction" title="Autonomous Context Compaction">\n* 🧹 Context window approaching limit. Summarizing history to free up space...\n</processing>\n'
-            try:
-                streaming_callback(compaction_msg, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-            except Exception:
-                pass
-
         history_text = "\n\n".join([f"[{vh.sender_type}]: {vh.content}" for vh in virtual_history])
 
         summary_prompt = (
@@ -3140,13 +3133,6 @@ JSON:"""
                 sender_type="user",
                 content=f"[SYSTEM: AUTONOMOUS CONTEXT COMPACTION]\nThe previous history has been summarized to save space. Use this summary as your working context:\n\n{summary.strip()}"
             )]
-
-            if streaming_callback:
-                success_msg = f'\n<processing type="context_compaction" title="Autonomous Context Compaction">\n* ✅ History compacted successfully. Context freed.\n</processing>\n'
-                try:
-                    streaming_callback(success_msg, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                except Exception:
-                    pass
 
             return compacted_history
 
@@ -3184,13 +3170,6 @@ JSON:"""
         if not base_conversation or not self.lollms_client:
             return base_conversation
 
-        if streaming_callback:
-            compaction_msg = '\n<processing type="history_refactoring" title="Autonomous History Refactoring">\n* 🧹 Refactoring conversation history to free up context space...\n</processing>\n'
-            try:
-                streaming_callback(compaction_msg, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-            except Exception:
-                pass
-
         history_text = "\n\n".join([f"[{msg.get('role', 'user').upper()}]: {msg.get('content', '')}" for msg in base_conversation])
 
         summary_prompt = (
@@ -3215,75 +3194,10 @@ JSON:"""
                 "content": f"[SYSTEM: AUTONOMOUS HISTORY REFACTORING]\nThe previous conversation has been summarized to save context. Use this summary as your working history:\n\n{summary.strip()}"
             }]
 
-            if streaming_callback:
-                success_msg = f'\n<processing type="history_refactoring" title="Autonomous History Refactoring">\n* ✅ History refactored successfully. Context freed.\n</processing>\n'
-                try:
-                    streaming_callback(success_msg, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                except Exception:
-                    pass
-
             return compacted_history
         except Exception as e:
             ASCIIColors.warning(f"[{self.name}] History refactoring failed: {e}")
             return base_conversation
-
-    def _compact_virtual_history(self, virtual_history: List, base_conversation: List[Dict[str, str]], streaming_callback: Optional[Callable]) -> List:
-        """
-        Autonomously summarizes the virtual history to free up context space.
-        Replaces verbose tool outputs and intermediate reasoning with a dense summary.
-        Syncs the base context to preserve artifact state before history is discarded.
-        """
-        if not virtual_history or not self.lollms_client:
-            return virtual_history
-
-        self._sync_base_context_artifacts(base_conversation, virtual_history)
-
-        # Notify the UI of the autonomous compaction
-        if streaming_callback:
-            compaction_msg = '\n<processing type="context_compaction" title="Autonomous Context Compaction">\n* 🧹 Context window approaching limit. Summarizing history to free up space...\n</processing>\n'
-            try:
-                streaming_callback(compaction_msg, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-            except Exception:
-                pass
-
-        # Build a summarization prompt from the virtual history
-        history_text = "\n\n".join([f"[{vh.sender_type}]: {vh.content}" for vh in virtual_history])
-
-        summary_prompt = (
-            "You are a context compaction engine. Summarize the following conversation history into a dense, factual summary.\n"
-            "Focus on retaining: user goals, key data retrieved from tools, file names created/modified, and final conclusions.\n"
-            "Discard: conversational pleasantries, intermediate reasoning steps, and verbose tool outputs.\n\n"
-            f"=== HISTORY TO COMPACT ===\n{history_text}\n=== END HISTORY ==="
-        )
-
-        try:
-            # Use a low temperature for deterministic, factual summarization
-            summary = self.lollms_client.generate_text(
-                prompt=summary_prompt,
-                temperature=0.1,
-                n_predict=1024
-            )
-            if not isinstance(summary, str) or not summary.strip():
-                return virtual_history
-
-            # Replace the verbose history with a single dense system message
-            compacted_history = [SimpleNamespace(
-                sender_type="user",
-                content=f"[SYSTEM: AUTONOMOUS CONTEXT COMPACTION]\nThe previous history has been summarized to save space. Use this summary as your working context:\n\n{summary.strip()}"
-            )]
-
-            if streaming_callback:
-                success_msg = f'\n<processing type="context_compaction" title="Autonomous Context Compaction">\n* ✅ History compacted successfully. Context freed.\n</processing>\n'
-                try:
-                    streaming_callback(success_msg, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                except Exception:
-                    pass
-
-            return compacted_history
-
-        except Exception as e:
-            ASCIIColors.warning(f"[{self.name}] Context compaction failed: {e}")
-            return virtual_history
 
     def _init_artefact_system(self):
         try:
@@ -4319,6 +4233,8 @@ JSON:"""
         resolved_max_rounds = max_nb_rounds if max_nb_rounds is not None else max_reasoning_steps
         if resolved_max_rounds is None:
             resolved_max_rounds = 20
+
+        event_mode = normalize_event_mode(kwargs.pop("event_mode", event_mode))
 
         if orchestrator_mode:
             from lollms_client.lollms_agentic.runner import AgenticRunner
@@ -6252,7 +6168,6 @@ JSON:"""
                                 action_reports.append(git_block)
                                 continue
 
-                        event_mode = kwargs.get("event_mode", EventMode.PROCESSING_TAG_MODE)
                         if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
                             try:
                                 if streaming_callback:

@@ -1067,9 +1067,10 @@ class _StreamState:
 
                     # Close the processing block cleanly with status metadata INSIDE the block.
                     if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
-                        proc_close_tag = '\n<!-- status:finished -->\n</processing>\n'
-                        self.ai_message.content += proc_close_tag
-                        _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                            proc_close_tag = '\n<!-- status:finished -->\n</processing>\n'
+                    self.ai_message.content += proc_close_tag
+                    _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
                     # Keep any text that came after the closing tag
                     self._pending_buffer = self._artefact_buffer[close_idx+len(closing_tag):]
@@ -1659,9 +1660,10 @@ class _StreamState:
                     )
 
                 if self._secondary_tag_name not in ("agent", "generate_image", "edit_image"):
-                    proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
-                    self.ai_message.content += proc_close_tag
-                    _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                        proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
+                        self.ai_message.content += proc_close_tag
+                        _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                     self._processing_block_open = False
 
                 remaining_text = self._secondary_buffer[close_idx + close_len:]
@@ -1818,15 +1820,18 @@ class _StreamState:
                 except Exception as patch_err:
                     ASCIIColors.error(f"[StreamState] Artifact patch failed: {patch_err}")
                     self._last_dispatch_failed = True
-                    proc_open = f'\n<processing type="artefact" title="{title}" language="{lang or ""}">\n'
-                    proc_body = f'* ❌ Failed to apply patch to artifact: {patch_err}\n'
-                    proc_close = f'<!-- status:failure -->\n</processing>\n'
-                    proc_block = proc_open + proc_body + proc_close
+                    if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                        proc_open = f'\n<processing type="artefact" title="{title}" language="{lang or ""}">\n'
+                        proc_body = f'* ❌ Failed to apply patch to artifact: {patch_err}\n'
+                        proc_close = f'<!-- status:failure -->\n</processing>\n'
+                        proc_block = proc_open + proc_body + proc_close
 
-                    self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
-                    _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                    _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                    _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
+                        _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    else:
+                        self.ai_message.content = self.ai_message.content.replace(full_match_text, "")
                     return True
 
                 if art:
@@ -2093,15 +2098,18 @@ class _StreamState:
             if art:
                 self.affected_artefacts.append(art)
 
-            proc_open = f'\n<processing type="note" title="{title}">\n'
-            proc_body = f'* 🗒️ Note captured and saved to workspace.\n'
-            proc_close = f'<!-- status:finished -->\n</processing>\n'
-            proc_block = proc_open + proc_body + proc_close
+            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                proc_open = f'\n<processing type="note" title="{title}">\n'
+                proc_body = f'* 🗒️ Note captured and saved to workspace.\n'
+                proc_close = f'<!-- status:finished -->\n</processing>\n'
+                proc_block = proc_open + proc_body + proc_close
 
-            self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
-            _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-            _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-            _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
+                _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            else:
+                self.ai_message.content = self.ai_message.content.replace(full_match_text, "")
 
             _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
                 "type": "artifact_created",
@@ -2150,15 +2158,18 @@ class _StreamState:
             if art:
                 self.affected_artefacts.append(art)
 
-            proc_open = f'\n<processing type="scratchpad" title="{title}">\n'
-            proc_body = f'* 📝 Scratchpad updated and saved to workspace.\n'
-            proc_close = f'<!-- status:finished -->\n</processing>\n'
-            proc_block = proc_open + proc_body + proc_close
+            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                proc_open = f'\n<processing type="scratchpad" title="{title}">\n'
+                proc_body = f'* 📝 Scratchpad updated and saved to workspace.\n'
+                proc_close = f'<!-- status:finished -->\n</processing>\n'
+                proc_block = proc_open + proc_body + proc_close
 
-            self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
-            _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-            _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-            _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
+                _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            else:
+                self.ai_message.content = self.ai_message.content.replace(full_match_text, "")
 
             _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
                 "type": "artifact_created",
@@ -2253,19 +2264,23 @@ class _StreamState:
                 }
                 self.affected_artefacts.append(skill_entry)
 
-                proc_open = f'\n<processing type="skill" title="{title}">\n'
-                proc_body = f'* 🧠 Skill \'{title}\' created/updated in handbag \'{personality.handbag_path.name}\'.\n'
-                proc_close = f'<!-- status:finished -->\n</processing>\n'
-                proc_block = proc_open + proc_body + proc_close
+                if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                    proc_open = f'\n<processing type="skill" title="{title}">\n'
+                    proc_body = f'* 🧠 Skill \'{title}\' created/updated in handbag \'{personality.handbag_path.name}\'.\n'
+                    proc_close = f'<!-- status:finished -->\n</processing>\n'
+                    proc_block = proc_open + proc_body + proc_close
 
-                if full_match_text in self.ai_message.content:
-                    self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
+                    if full_match_text in self.ai_message.content:
+                        self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
+                    else:
+                        self.ai_message.content += proc_block
+
+                    _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                 else:
-                    self.ai_message.content += proc_block
-
-                _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    if full_match_text in self.ai_message.content:
+                        self.ai_message.content = self.ai_message.content.replace(full_match_text, "")
 
                 _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
                     "type": "artifact_created",
@@ -2322,19 +2337,23 @@ class _StreamState:
                 if art:
                     self.affected_artefacts.append(art)
 
-                proc_open = f'\n<processing type="skill" title="{title}">\n'
-                proc_body = f'* 🧠 Skill \'{title}\' captured and saved as discussion artefact.\n'
-                proc_close = f'<!-- status:finished -->\n</processing>\n'
-                proc_block = proc_open + proc_body + proc_close
+                if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                    proc_open = f'\n<processing type="skill" title="{title}">\n'
+                    proc_body = f'* 🧠 Skill \'{title}\' captured and saved as discussion artefact.\n'
+                    proc_close = f'<!-- status:finished -->\n</processing>\n'
+                    proc_block = proc_open + proc_body + proc_close
 
-                if full_match_text in self.ai_message.content:
-                    self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
+                    if full_match_text in self.ai_message.content:
+                        self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
+                    else:
+                        self.ai_message.content += proc_block
+
+                    _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                 else:
-                    self.ai_message.content += proc_block
-
-                _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    if full_match_text in self.ai_message.content:
+                        self.ai_message.content = self.ai_message.content.replace(full_match_text, "")
 
                 _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
                     "type": "artifact_created",

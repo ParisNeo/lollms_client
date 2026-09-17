@@ -388,7 +388,11 @@ class QueueStreamingCallback:
             self.q.put(AgentEvent(mapping[msg_type], **(meta or {})))
             return True
         if msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
-            self.q.put(AgentEvent("chunk", text=chunk, was_processed=bool(meta and meta.get("was_processed"))))
+            was_processed = bool(meta and meta.get("was_processed"))
+            # In FULL_CALLBACK_MODE, suppress any processing tags or internal logs from the text stream
+            if was_processed or (chunk and ("<processing" in chunk or "</processing>" in chunk or "<!-- status:" in chunk)):
+                return True
+            self.q.put(AgentEvent("chunk", text=chunk, was_processed=False))
         elif msg_type == MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK:
             self.q.put(AgentEvent("thought", text=chunk))
         elif msg_type == MSG_TYPE.MSG_TYPE_INFO:

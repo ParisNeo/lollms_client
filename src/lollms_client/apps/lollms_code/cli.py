@@ -1777,18 +1777,8 @@ class StreamRenderer:
 
         if msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
             if meta and meta.get("was_processed"):
-                self._processing_buffer += chunk
-
-                if "<processing" in chunk:
-                    self._in_processing = True
-
-                if "</processing>" in chunk or (self._in_processing and "<!-- status:" in chunk):
-                    self._in_processing = False
-                    try:
-                        self._render_processing_block(self._processing_buffer)
-                    except Exception as e:
-                        ASCIIColors.rich_print(self._processing_buffer, end="")
-                    self._processing_buffer = ""
+                # In callback mode, structured events handle UI panels; discard raw processing chunks
+                return True
             elif meta and meta.get("live_tool_chunk"):
                 return True
             elif meta and meta.get("live_artifact_chunk"):
@@ -1812,18 +1802,19 @@ class StreamRenderer:
                 if "<done" in chunk and "/>" in chunk:
                     return True
 
-                if re.match(r'^[ \t]*</?processing[^>]*>[ \t]*$', chunk, re.IGNORECASE):
+                # Strip any stray processing tags or comments from the conversational stream
+                clean_chunk = re.sub(r'</?processing[^>]*>', '', chunk, flags=re.IGNORECASE)
+                clean_chunk = re.sub(r'<!--\s*status:[^>]*-->', '', clean_chunk, flags=re.IGNORECASE)
+
+                if not clean_chunk:
                     return True
 
-                if self._in_processing:
-                    self._processing_buffer += chunk
-                else:
-                    if not self._live_artifact_panel and not self._in_processing:
-                        if not getattr(self, '_first_token_printed', False):
-                            ASCIIColors.rich_print("\n[dim]🤖 Thinking...[/dim]", end="")
-                            ASCIIColors.rich_print("\r\033[K", end="")
-                            self._first_token_printed = True
-                    ASCIIColors.rich_print(chunk, end="")
+                if not self._live_artifact_panel and not self._in_processing:
+                    if not getattr(self, '_first_token_printed', False):
+                        ASCIIColors.rich_print("\n[dim]🤖 Thinking...[/dim]", end="")
+                        ASCIIColors.rich_print("\r\033[K", end="")
+                        self._first_token_printed = True
+                ASCIIColors.rich_print(clean_chunk, end="")
         elif msg_type == MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK:
             ASCIIColors.rich_print(f"[dim]{chunk}[/dim]", end="")
         elif msg_type == MSG_TYPE.MSG_TYPE_INFO:

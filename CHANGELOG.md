@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-17 12:31]
+
+- fix(cli): remove deprecated chat_core import from __init__.py & update lollms_discussion
+
 ## [2026-09-17 10:15]
 
 - feat(bindings): enhance llm bindings and personality skills handling

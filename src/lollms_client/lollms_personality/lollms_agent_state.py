@@ -672,9 +672,15 @@ class _ToolsManager:
 
 
 class _AgentStreamState:
-    def __init__(self, callback: Optional[Callable] = None, event_mode: int = 0):
+    def __init__(self, callback: Optional[Callable] = None, event_mode: Any = None):
+        try:
+            from lollms_client.lollms_types import normalize_event_mode, EventMode
+            self.event_mode = normalize_event_mode(event_mode) if event_mode is not None else EventMode.PROCESSING_TAG_MODE
+        except Exception:
+            self.event_mode = event_mode or 0
+        self._event_mode = self.event_mode
         self.callback = callback
-        self._event_mode = event_mode
+
         self.content = ""
         self.completed_actions: List[Dict[str, Any]] = []
 
@@ -704,6 +710,20 @@ class _AgentStreamState:
         self.live_artifact_meta: Optional[Dict[str, Any]] = None
         self._done_intercepted: bool = False
         self._seen_symbol_keys: set = set()
+
+    @property
+    def is_tag_mode(self) -> bool:
+        if hasattr(self.event_mode, "has_tags"):
+            return self.event_mode.has_tags
+        val = getattr(self.event_mode, "value", self.event_mode)
+        return val in (0, 2)
+
+    @property
+    def is_callback_mode(self) -> bool:
+        if hasattr(self.event_mode, "has_callbacks"):
+            return self.event_mode.has_callbacks
+        val = getattr(self.event_mode, "value", self.event_mode)
+        return val in (1, 2)
 
     def _cb(self, text: str, msg_type=None, meta: Optional[Dict] = None):
         if self.callback is None:
@@ -814,10 +834,10 @@ class _AgentStreamState:
                 self._tool_buffer = self._pending_buffer[tag_start_idx:]
                 self._pending_buffer = ""
 
-                if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                if self.is_callback_mode:
                     self._cb("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "streaming"})
 
-                if self._event_mode == EventMode.PROCESSING_TAG_MODE:
+                if self.is_tag_mode:
                     self._cb(f'\n<processing type="context" title="{tag_name}">\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
                 self._try_complete_context_tag()
@@ -1026,10 +1046,10 @@ class _AgentStreamState:
                 self._tool_buffer = self._pending_buffer[tag_start_idx:]
                 self._pending_buffer = ""
 
-                if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
-                    self._cb("<tool>", MSG_TYPE.MSG_TYPE_TOOL_START, {"tool_name": "pending", "parameters": {}})
+                if self.is_callback_mode:
+                    self._cb("", MSG_TYPE.MSG_TYPE_TOOL_START, {"tool_name": "pending", "parameters": {}})
 
-                if self._event_mode == EventMode.PROCESSING_TAG_MODE:
+                if self.is_tag_mode:
                     self._cb('\n<processing type="tool" title="pending">\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
                 self._try_complete_tool()
@@ -1132,10 +1152,10 @@ class _AgentStreamState:
                 self._tool_buffer = self._pending_buffer[tag_start_idx:]
                 self._pending_buffer = ""
 
-                if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                if self.is_callback_mode:
                     self._cb("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": "refactor_history", "files": [], "status": "streaming"})
 
-                if self._event_mode == EventMode.PROCESSING_TAG_MODE:
+                if self.is_tag_mode:
                     self._cb(f'\n<processing type="context" title="refactor_history">\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
                 self._try_complete_context_tag()
@@ -1360,7 +1380,7 @@ class _AgentStreamState:
                         resolved_params = {}
                         ASCIIColors.warning(f"[AgentStreamState] Failed to parse tool call JSON even after repair: {sanitized_json_body[:200]}")
 
-        if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+        if self.is_callback_mode:
             try:
                 self._cb("", MSG_TYPE.MSG_TYPE_TOOL_END, {
                     "tool_name": resolved_tool_name,
@@ -1370,7 +1390,7 @@ class _AgentStreamState:
             except Exception:
                 pass
 
-        if self._event_mode == EventMode.PROCESSING_TAG_MODE:
+        if self.is_tag_mode:
             self._cb('\n</processing>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
         raw_data = {"name": resolved_tool_name, "parameters": resolved_params}
@@ -1461,7 +1481,7 @@ class _AgentStreamState:
             except Exception:
                 pass
 
-        if self._event_mode == EventMode.PROCESSING_TAG_MODE:
+        if self.is_tag_mode:
             self._cb('\n</processing>\n', MSG_TYPE.MSG_TYPE_CHUNK, {
                 "was_processed": True,
                 "event_type": "artifact_complete",
@@ -1498,13 +1518,13 @@ class _AgentStreamState:
             if remaining:
                 self._pending_buffer = remaining
 
-            if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+            if self.is_callback_mode:
                 try:
                     self._cb("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": self._context_tag_name, "files": [], "status": "stream_complete"})
                 except Exception:
                     pass
 
-            if self._event_mode == EventMode.PROCESSING_TAG_MODE:
+            if self.is_tag_mode:
                 self._cb('\n</processing>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
             self.completed_actions.append({"type": "context", "tag_name": self._context_tag_name, "xml": full_tag_call})
@@ -1525,13 +1545,13 @@ class _AgentStreamState:
             if remaining:
                 self._pending_buffer = remaining
 
-            if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+            if self.is_callback_mode:
                 try:
                     self._cb("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": self._context_tag_name, "files": [], "status": "stream_complete"})
                 except Exception:
                     pass
 
-            if self._event_mode == EventMode.PROCESSING_TAG_MODE:
+            if self.is_tag_mode:
                 self._cb('\n</processing>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
             self.completed_actions.append({"type": "context", "tag_name": self._context_tag_name, "xml": full_tag_call})

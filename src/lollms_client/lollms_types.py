@@ -238,6 +238,43 @@ class EventMode(Enum):
     MIXED_MODE          = 2  # Emits both <processing> tags AND specific MSG_TYPE_* events.
     SILENT_MODE         = 3  # Suppresses all event reporting. Only final conversational text is streamed.
 
+    @property
+    def has_tags(self) -> bool:
+        """True if this mode should emit or inject <processing> text tags."""
+        return self in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE)
+
+    @property
+    def has_callbacks(self) -> bool:
+        """True if this mode should emit granular MSG_TYPE_* events."""
+        return self in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE)
+
+    @property
+    def is_silent(self) -> bool:
+        """True if telemetry should be completely suppressed."""
+        return self == EventMode.SILENT_MODE
+
+
+def normalize_event_mode(mode: Any) -> EventMode:
+    """Normalizes an EventMode enum, integer value, or string to a canonical EventMode."""
+    if isinstance(mode, EventMode):
+        return mode
+    if isinstance(mode, str):
+        clean = mode.strip().upper()
+        if hasattr(EventMode, clean):
+            return EventMode[clean]
+        if "FULL" in clean or "CALLBACK" in clean:
+            return EventMode.FULL_CALLBACK_MODE
+        if "MIXED" in clean:
+            return EventMode.MIXED_MODE
+        if "SILENT" in clean:
+            return EventMode.SILENT_MODE
+        return EventMode.PROCESSING_TAG_MODE
+    if isinstance(mode, int):
+        for em in EventMode:
+            if em.value == mode:
+                return em
+    return EventMode.PROCESSING_TAG_MODE
+
 
 class LCPResult:
     """
