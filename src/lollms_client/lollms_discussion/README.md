@@ -1664,6 +1664,21 @@ Skill creation follows strict personality-aware destination routing:
 
 ---
 
+### 🧰 Skill Tool Mounting & Registry Merge
+
+When the active personality carries a `skills_manager`, `chat()` merges its conditionally-built skill tools into the turn's active tool registry alongside handbag tools, explicit `tools=` callables, and auto-mounted LCP libraries. The skill tools follow the same activation matrix as the standalone personality runtime:
+
+| Tool | Mounted When |
+| :--- | :--- |
+| `tool_list_skills` | The personality's skill library is non-empty. |
+| `tool_load_skill` | ≥1 loadable skill exists (or visible skills overflowed the visibility budget). |
+| `tool_search_skills` | ≥1 searchable skill exists. |
+| `tool_create_skill` / `tool_update_skill` / `tool_append_to_skill` / `tool_remove_skill` | The manager was constructed with `allow_llm_skill_writing=True`. |
+
+The system prompt receives the matching context block from `skills_manager.build_context()` (visible skill bodies, loadable name+description list, and the hidden-skills hint), so the LLM always knows which skill tools exist and why. Skills created mid-turn via the `<skill>` tag are immediately visible to subsequent rounds after the manager reloads. See the [LollmsPersonality README](../lollms_personality/README.md) for the full hosting-app API (`Handbag.register_skills_dir()`, `SkillsManager.add_skill()`, `set_skill_visibility()`).
+
+---
+
 ### 📡 Live Secondary Stream Events
 
 During streaming generation, skills, notes, and interactive widgets do NOT pollute the main conversational chat stream (`MSG_TYPE_CHUNK`). Instead, they stream on dedicated secondary channels:

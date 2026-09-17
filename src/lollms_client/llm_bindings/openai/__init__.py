@@ -106,6 +106,7 @@ class OpenAIBinding(LollmsLLMBinding):
         self.certificate_file_path=kwargs.get("certificate_file_path", None)
         self.default_completion_format=kwargs.get("default_completion_format", ELF_COMPLETION_FORMAT.Chat)
         self.is_vllm = kwargs.get("is_vllm", False)
+        self.send_thinking_parameter = kwargs.get("send_thinking_parameter", True)
 
         self.base_address = self.host_address
         if self.base_address:
@@ -191,7 +192,16 @@ class OpenAIBinding(LollmsLLMBinding):
 
         return params
 
-   
+    def _apply_vllm_thinking_kwargs(self, params: dict, effort: Optional[str]) -> dict:
+        if not self.is_vllm:
+            return params
+        if not self.send_thinking_parameter:
+            return params
+        params.setdefault("extra_body", {}).setdefault(
+            "chat_template_kwargs", {}
+        )["enable_thinking"] = effort is not None
+        return params
+
     def generate_text(
         self,
         prompt: str,
@@ -293,10 +303,7 @@ class OpenAIBinding(LollmsLLMBinding):
                 # ── Inject reasoning params ────────────────────────────────
                 if effort is not None:
                     if self.is_vllm:
-                        # vLLM: enable thinking via chat_template_kwargs
-                        params.setdefault("extra_body", {}).setdefault(
-                            "chat_template_kwargs", {}
-                        )["enable_thinking"] = True
+                        self._apply_vllm_thinking_kwargs(params, effort)
                     else:
                         # OpenAI extended-thinking models (o3, o4-mini, gpt-5 …)
                         # Chat Completions uses flat reasoning_effort, not the
@@ -309,9 +316,7 @@ class OpenAIBinding(LollmsLLMBinding):
                         params.pop("top_p", None)
                 else:
                     if self.is_vllm:
-                        params.setdefault("extra_body", {}).setdefault(
-                            "chat_template_kwargs", {}
-                        )["enable_thinking"] = False
+                        self._apply_vllm_thinking_kwargs(params, None)
 
                 # ── First attempt ─────────────────────────────────────────────
                 try:
@@ -606,9 +611,7 @@ class OpenAIBinding(LollmsLLMBinding):
         effort = self.normalize_reasoning_effort(think, reasoning_effort)
         if effort is not None:
             if self.is_vllm:
-                params.setdefault("extra_body", {}).setdefault(
-                    "chat_template_kwargs", {}
-                )["enable_thinking"] = True
+                self._apply_vllm_thinking_kwargs(params, effort)
             else:
                 # OpenAI Chat Completions uses flat reasoning_effort.
                 # OpenAI accepts minimal/low/medium/high — clamp "max".
@@ -619,9 +622,7 @@ class OpenAIBinding(LollmsLLMBinding):
                 params.pop("top_p", None)
         else:
             if self.is_vllm:
-                params.setdefault("extra_body", {}).setdefault(
-                    "chat_template_kwargs", {}
-                )["enable_thinking"] = False
+                self._apply_vllm_thinking_kwargs(params, None)
 
         effort = self.normalize_reasoning_effort(think, reasoning_effort)
         output = ""

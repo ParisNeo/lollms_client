@@ -42,6 +42,24 @@ class Handbag:
         """Returns the canonical skills directory for this handbag."""
         return self._skills_dir
 
+    def register_skills_dir(self, skills_dir: Union[str, Path]) -> Path:
+        """
+        Registers an additional directory of application-grade skills.
+
+        Hosting apps call this to inject their own SKILL.md libraries
+        (app-shipped, per-user, or per-discussion) alongside the handbag's
+        native skills. The directory is created if missing and appended to
+        `skills_dirs` (idempotent — re-registering the same path is a no-op).
+
+        Returns:
+            The resolved directory path.
+        """
+        resolved = Path(skills_dir).resolve()
+        resolved.mkdir(parents=True, exist_ok=True)
+        if resolved not in self.skills_dirs:
+            self.skills_dirs.append(resolved)
+        return resolved
+
     def _load_manifest(self) -> Dict[str, Any]:
         manifest_path = self.path / "handbag.yaml"
         if not manifest_path.exists():

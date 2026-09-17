@@ -130,13 +130,10 @@ class ClaudeBinding(LollmsLLMBinding):
         # Handling Thinking / Reasoning
         # Model-managed thinking: effort levels toggle thinking on/off.
         # No budget_tokens is ever sent, so the model thinks as long as needed.
-        thinking_config = None
         effort = self.normalize_reasoning_effort(think, reasoning_effort)
-        if effort is not None:
-            thinking_config = {"type": "enabled"}
+        thinking_config = {"type": "enabled"} if effort is not None else None
 
-        api_params = {"model": self.model_name, "messages": []}
-        # (placeholder marker — must not appear)
+        api_params = self._construct_parameters(temperature, top_p, top_k, n_predict)
         if thinking_config:
             api_params["thinking"] = thinking_config
             # Ensure max_tokens is set in params (it is set by _construct_parameters via n_predict)

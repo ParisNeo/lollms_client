@@ -28,6 +28,11 @@ global_input_parameters:
     description: "If true, the server is a vLLM instance. Enables vLLM-specific chat_template_kwargs (e.g. enable_thinking) so reasoning/thinking models like Qwen3 are handled correctly."
     mandatory: false
     default: false
+  - name: send_thinking_parameter
+    type: bool
+    description: "Only relevant when is_vllm=true. When true (default), the binding injects chat_template_kwargs.enable_thinking into every request. Set to false to never send enable_thinking to vLLM — required for models whose chat templates do not support this kwarg (e.g. GLM 5.3), where sending it causes hallucinated or garbled output."
+    mandatory: false
+    default: true
   - name: verify_ssl_certificate
     type: bool
     description: "Whether to verify SSL certificates on HTTPS connections. Set to false for self-hosted servers with self-signed certificates."
@@ -120,4 +125,5 @@ advisory:
   - "When targeting LoLLMS WebUI or a LoLLMS LCP server, prefer the dedicated `lollms` or `lollms_webui` binding to access native artefacts, discussions, and personality features not exposed via the OpenAI subset."
   - "When targeting Ollama, llama.cpp server, vLLM, or Groq, dedicated bindings exist that may expose backend-specific features. Use this binding only when you need a single uniform interface across providers."
   - "Set is_vllm=true when connecting to a vLLM server so reasoning/thinking models (e.g. Qwen3) are handled correctly via chat_template_kwargs."
+  - "If a vLLM-served model (e.g. GLM 5.3) hallucinates or produces garbled output, its chat template likely does not support enable_thinking. Set send_thinking_parameter=false to stop sending it entirely."
   - "Self-hosted servers with self-signed certificates require verify_ssl_certificate=false or a custom certificate_file_path."

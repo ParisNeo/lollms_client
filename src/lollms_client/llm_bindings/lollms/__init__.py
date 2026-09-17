@@ -598,7 +598,7 @@ class LollmsBinding(LollmsLLMBinding):
                     repeat_penalty=repeat_penalty,
                     seed=seed,
                     think=think,
-                    reasoning_effort=effort,
+                    reasoning_effort=reasoning_effort,
                     reasoning_summary=reasoning_summary,
                 )
                 try:

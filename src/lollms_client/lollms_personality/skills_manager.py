@@ -10,19 +10,29 @@ from .skill import Skill, parse_skill_md
 class SkillsManager:
     """
     Manages SKILL.md files from external directories.
-    Tiers: "visible" (in sys prompt), "loadable" (listed, tool_load_skill), "searchable" (hidden, tool_search_skills).
+
+    Visibility tiers:
+        - "visible":    full content injected into the system prompt.
+        - "loadable":   name + description listed in the prompt; full content
+                        retrieved on demand via `tool_load_skill`.
+        - "searchable": hidden from the prompt; discovered via
+                        `tool_search_skills` then loaded via `tool_load_skill`.
     """
+
+    VALID_VISIBILITIES = ("visible", "loadable", "searchable")
 
     def __init__(
         self,
         skills_dirs: Optional[List[Union[str, Path]]] = None,
         mode: str = "mixed",
         max_visible_skills: int = 10,
-        max_visible_tokens: int = 4000
+        max_visible_tokens: int = 4000,
+        allow_llm_skill_writing: bool = True,
     ):
         self.mode = mode
         self.max_visible_skills = max_visible_skills
         self.max_visible_tokens = max_visible_tokens
+        self.allow_llm_skill_writing = allow_llm_skill_writing
         self._skills_dirs: List[Path] = []
         if skills_dirs:
             for d in skills_dirs:
@@ -37,6 +47,8 @@ class SkillsManager:
         self.skills: Dict[str, Skill] = {}
         self.reload()
 
+    # ─────────────────────────────────────────────────────────── tier helpers
+
     def _resolve_visibility(self, skill: Skill) -> str:
         if not skill.has_metadata:
             return "visible" if self.mode != "searchable" else "searchable"
@@ -50,6 +62,24 @@ class SkillsManager:
         if self.mode == "searchable":
             return "searchable"
         return "loadable"
+
+    def get_skills_by_visibility(self, tier: str) -> List[Skill]:
+        if tier not in self.VALID_VISIBILITIES:
+            raise ValueError(
+                f"Invalid visibility tier '{tier}'. Must be one of {self.VALID_VISIBILITIES}."
+            )
+        return [s for s in self.skills.values() if s.visibility == tier]
+
+    def has_loadable_skills(self) -> bool:
+        return any(s.visibility == "loadable" for s in self.skills.values())
+
+    def has_searchable_skills(self) -> bool:
+        return any(s.visibility == "searchable" for s in self.skills.values())
+
+    def has_visible_skills(self) -> bool:
+        return any(s.visibility == "visible" for s in self.skills.values())
+
+    # ─────────────────────────────────────────────────────────── persistence
 
     def reload(self):
         self.skills.clear()
@@ -103,6 +133,24 @@ class SkillsManager:
             cleaned = re.sub(pattern, '', cleaned, flags=re.DOTALL | re.IGNORECASE)
         return cleaned.strip()
 
+    def _validate_visibility(self, visibility: str) -> str:
+        normalized = (visibility or "").strip().lower()
+        if normalized not in self.VALID_VISIBILITIES:
+            raise ValueError(
+                f"Invalid visibility '{visibility}'. Must be one of {self.VALID_VISIBILITIES}."
+            )
+        return normalized
+
+    def _ensure_writable_dir(self) -> Path:
+        if not self._skills_dirs:
+            default_p = Path("./skills").resolve()
+            default_p.mkdir(parents=True, exist_ok=True)
+            self._skills_dirs.append(default_p)
+        target_dir = self._skills_dirs[0]
+        target_dir.mkdir(parents=True, exist_ok=True)
+        self._skills_dirs[0] = target_dir.resolve()
+        return self._skills_dirs[0]
+
     def create_skill(
         self,
         title: str,
@@ -112,21 +160,15 @@ class SkillsManager:
         tags: Optional[List[str]] = None,
         visibility: str = "loadable"
     ) -> Optional[Skill]:
-        if not self._skills_dirs:
-            default_p = Path("./skills").resolve()
-            default_p.mkdir(parents=True, exist_ok=True)
-            self._skills_dirs.append(default_p)
-
-        target_dir = self._skills_dirs[0]
-        target_dir.mkdir(parents=True, exist_ok=True)
+        target_dir = self._ensure_writable_dir()
         safe_title = self._sanitize_title(title)
-        
+
         skill_dir = target_dir / safe_title
         skill_dir.mkdir(parents=True, exist_ok=True)
         skill_path = skill_dir / "SKILL.md"
 
         tags_str = ", ".join(tags) if tags else ""
-        
+
         frontmatter = "---\n"
         frontmatter += f"title: \"{title}\"\n"
         if description:
@@ -144,6 +186,97 @@ class SkillsManager:
         self.reload()
         return self.skills.get(title.lower())
 
+    def add_skill(
+        self,
+        title: str,
+        content: str,
+        description: str = "",
+        category: str = "",
+        tags: Optional[List[str]] = None,
+        visibility: str = "loadable",
+        overwrite: bool = False,
+    ) -> Skill:
+        """
+        Application-grade entry point for hosting apps to register a custom skill.
+
+        Validates the visibility tier, sanitizes the title and content, persists
+        the skill as a SKILL.md file inside the manager's primary skills
+        directory, and reloads the registry.
+
+        Args:
+            title: Human-readable skill name (sanitized for the filesystem).
+            content: Markdown body of the skill.
+            description: One-line summary shown in loadable lists.
+            category: Optional grouping label.
+            tags: Optional list of search keywords.
+            visibility: One of "visible", "loadable", "searchable".
+            overwrite: When False, raises if a skill with the same title exists.
+
+        Returns:
+            The persisted Skill object.
+
+        Raises:
+            ValueError: On invalid visibility or duplicate title (overwrite=False).
+        """
+        normalized_visibility = self._validate_visibility(visibility)
+
+        if not title or not title.strip():
+            raise ValueError("Skill title must not be empty.")
+        title = title.strip()
+
+        existing = self.skills.get(title.lower())
+        if existing and not overwrite:
+            raise ValueError(
+                f"A skill titled '{title}' already exists. Pass overwrite=True to replace it."
+            )
+
+        return self.create_skill(
+            title=title,
+            content=content,
+            description=description,
+            category=category,
+            tags=tags,
+            visibility=normalized_visibility,
+        )
+
+    def get_skill(self, title: str) -> Optional[Skill]:
+        """Retrieves a skill by exact (case-insensitive) title."""
+        return self.skills.get((title or "").strip().lower())
+
+    def set_skill_visibility(self, title: str, visibility: str) -> Skill:
+        """
+        Re-writes a skill's frontmatter with a new visibility tier and reloads.
+
+        Raises:
+            ValueError: If the skill is unknown, read-only, or the tier is invalid.
+        """
+        normalized_visibility = self._validate_visibility(visibility)
+        skill = self.get_skill(title)
+        if skill is None:
+            raise ValueError(f"Skill '{title}' not found.")
+        if not skill.modifiable:
+            raise ValueError(f"Skill '{title}' is marked read-only and cannot be modified.")
+        if skill.file_path is None:
+            raise ValueError(f"Skill '{title}' has no backing file.")
+
+        raw = skill.file_path.read_text(encoding="utf-8", errors="ignore")
+        updated_raw, substitution_count = re.subn(
+            r'(?m)^visibility:\s*\w+\s*$',
+            f'visibility: {normalized_visibility}',
+            raw,
+        )
+        if substitution_count == 0:
+            raise ValueError(
+                f"Skill '{title}' has no visibility field in its frontmatter to update."
+            )
+
+        skill.file_path.write_text(updated_raw, encoding="utf-8")
+        self.reload()
+        refreshed = self.get_skill(skill.title)
+        if refreshed is None:
+            raise ValueError(f"Skill '{title}' disappeared after visibility update.")
+        return refreshed
+
     def update_skill(
         self,
         title: str,
@@ -157,7 +290,7 @@ class SkillsManager:
             matches = self.search_skills(title)
             if matches:
                 skill = matches[0]
-        
+
         if not skill or not skill.file_path:
             return None
 
@@ -166,10 +299,10 @@ class SkillsManager:
 
         target_dir = skill.file_path.parent
         target_dir.mkdir(parents=True, exist_ok=True)
-        skill_path = target_dir / "SKILL.md"
+        skill_path = skill.file_path
 
         tags_str = ", ".join(tags) if tags else (", ".join(skill.tags) if skill.tags else "")
-        
+
         frontmatter = "---\n"
         frontmatter += f"title: \"{skill.title}\"\n"
         final_desc = description if description is not None else skill.description
@@ -200,7 +333,7 @@ class SkillsManager:
             matches = self.search_skills(title)
             if matches:
                 skill = matches[0]
-        
+
         if not skill or not skill.file_path:
             return None
 
@@ -223,7 +356,7 @@ class SkillsManager:
             matches = self.search_skills(title)
             if matches:
                 skill = matches[0]
-        
+
         if not skill or not skill.file_path:
             return False
 
@@ -235,7 +368,7 @@ class SkillsManager:
 
         try:
             skill_path.unlink()
-            
+
             if parent_dir != self._skills_dirs[0] and not any(parent_dir.iterdir()):
                 parent_dir.rmdir()
         except Exception:
@@ -243,6 +376,8 @@ class SkillsManager:
 
         self.reload()
         return True
+
+    # ─────────────────────────────────────────────────────────── prompt builders
 
     def build_context(self) -> str:
         parts = []
@@ -301,6 +436,50 @@ class SkillsManager:
 
         return "\n\n".join(parts)
 
+    def build_loadable_skills_prompt(self) -> str:
+        """
+        Compact prompt block listing immediately loadable skills (names only).
+
+        Returns an empty string when there are no loadable skills, so callers
+        can append it unconditionally.
+        """
+        loadable = [s for s in self.skills.values() if s.visibility == "loadable"]
+        if not loadable:
+            return ""
+
+        lines = ["=== IMMEDIATELY LOADABLE SKILLS ==="]
+        lines.append(
+            "The following skills are available and can be loaded on demand with the "
+            "`tool_load_skill` tool (pass the exact skill title):"
+        )
+        lines.append("")
+        for skill in loadable:
+            lines.append(f"- {skill.title}")
+        lines.append("=== END IMMEDIATELY LOADABLE SKILLS ===")
+        return "\n".join(lines)
+
+    def build_searchable_skills_prompt(self) -> str:
+        """
+        Compact prompt block announcing the existence of hidden, searchable skills.
+
+        Returns an empty string when there are no searchable skills, so callers
+        can append it unconditionally.
+        """
+        if not self.has_searchable_skills():
+            return ""
+
+        lines = ["=== HIDDEN SKILLS (SEARCHABLE) ==="]
+        lines.append(
+            f"There are {self._searchable_count()} hidden skills in the library. "
+            "Use the `tool_search_skills` tool with a keyword to discover them, "
+            "then `tool_load_skill` to load the full content."
+        )
+        lines.append("=== END HIDDEN SKILLS ===")
+        return "\n".join(lines)
+
+    def _searchable_count(self) -> int:
+        return sum(1 for s in self.skills.values() if s.visibility == "searchable")
+
     def search_skills(self, query: str) -> List[Skill]:
         query_lower = query.lower()
         results = []
@@ -338,12 +517,17 @@ class SkillsManager:
     def list_skills(self) -> List[Dict[str, Any]]:
         return [s.to_dict() for s in self.skills.values()]
 
-    def has_searchable_skills(self) -> bool:
-        return any(s.visibility == "searchable" for s in self.skills.values())
+    # ─────────────────────────────────────────────────────────── tool building
 
     def build_skill_tools(self) -> Dict[str, Dict[str, Any]]:
         """
         Conditionally builds tool specifications for skill management based on visibility tiers.
+
+        Tool activation matrix:
+            - `tool_list_skills`   → offered when the library is non-empty.
+            - `tool_load_skill`    → offered when ≥1 loadable skill exists.
+            - `tool_search_skills` → offered when ≥1 searchable skill exists.
+            - CRUD tools           → offered when `allow_llm_skill_writing` is True.
         """
         tools: Dict[str, Dict[str, Any]] = {}
 
@@ -361,7 +545,7 @@ class SkillsManager:
                 visible = [s.to_dict() for s in self.skills.values() if s.visibility == "visible"]
                 loadable = [s.to_dict() for s in self.skills.values() if s.visibility == "loadable"]
                 searchable = [s.to_dict() for s in self.skills.values() if s.visibility == "searchable"]
-                
+
                 report = {
                     "visible_skills": visible,
                     "loadable_skills": loadable,
@@ -426,6 +610,9 @@ class SkillsManager:
                 "callable": tool_search_skills,
             }
 
+        if not self.allow_llm_skill_writing:
+            return tools
+
         def tool_create_skill(
             title: str,
             content: str,
@@ -447,17 +634,19 @@ class SkillsManager:
                 visibility (str, optional): "visible", "loadable", or "searchable". Defaults to "loadable".
             """
             tags_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
-            skill = self.create_skill(
-                title=title,
-                content=content,
-                description=description,
-                category=category,
-                tags=tags_list,
-                visibility=visibility
-            )
-            if skill:
-                return {"success": True, "output": f"Skill '{title}' created successfully."}
-            return {"success": False, "error": "Failed to create skill."}
+            try:
+                skill = self.add_skill(
+                    title=title,
+                    content=content,
+                    description=description,
+                    category=category,
+                    tags=tags_list,
+                    visibility=visibility,
+                    overwrite=True,
+                )
+                return {"success": True, "output": f"Skill '{skill.title}' created successfully with visibility '{skill.visibility}'."}
+            except ValueError as ex:
+                return {"success": False, "error": str(ex)}
 
         tools["tool_create_skill"] = {
             "name": "tool_create_skill",
@@ -491,19 +680,19 @@ class SkillsManager:
                 tags (str, optional): New comma-separated tags. If empty, keeps existing.
             """
             tags_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
-            
+
             skill = self.skills.get(title.lower())
             if not skill:
                 matches = self.search_skills(title)
                 if matches:
                     skill = matches[0]
-            
+
             if not skill:
                 return {"success": False, "error": f"Skill '{title}' not found."}
-                
+
             if not skill.modifiable:
                 return {"success": False, "error": f"Skill '{title}' is marked as READ-ONLY (unmodifiable) and cannot be updated."}
-                
+
             updated_skill = self.update_skill(
                 title=title,
                 content=content,
@@ -541,13 +730,13 @@ class SkillsManager:
                 matches = self.search_skills(title)
                 if matches:
                     skill = matches[0]
-            
+
             if not skill:
                 return {"success": False, "error": f"Skill '{title}' not found."}
-                
+
             if not skill.modifiable:
                 return {"success": False, "error": f"Skill '{title}' is marked as READ-ONLY (unmodifiable) and cannot be appended to."}
-                
+
             updated_skill = self.append_to_skill(title=title, content=content)
             if updated_skill:
                 return {"success": True, "output": f"Content appended to skill '{title}' successfully."}
@@ -575,13 +764,13 @@ class SkillsManager:
                 matches = self.search_skills(title)
                 if matches:
                     skill = matches[0]
-            
+
             if not skill:
                 return {"success": False, "error": f"Skill '{title}' not found."}
-                
+
             if not skill.modifiable:
                 return {"success": False, "error": f"Skill '{title}' is marked as READ-ONLY (unmodifiable) and cannot be removed."}
-                
+
             success = self.remove_skill(title=title)
             if success:
                 return {"success": True, "output": f"Skill '{title}' removed successfully."}

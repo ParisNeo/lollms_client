@@ -965,7 +965,7 @@ class LollmsClient():
         tools: List[Union[str, Path, Dict[str, Any]]],
         system_prompt: str = "",
         temperature: float = 0.7,
-        n_predict: int = 4096,
+        n_predict: Optional[int] = None,
         max_tool_rounds: int = 10,
         streaming_callback: Optional[Callable] = None,
         auto_execute: bool = True,

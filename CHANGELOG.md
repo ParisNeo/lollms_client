@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-17 10:15]
+
+- feat(bindings): enhance llm bindings and personality skills handling
+
 ## [2026-09-16 11:32]
 
 - feat(llm-bindings): add new capabilities across claude, gemini, lollms, ollama, and openai bindings

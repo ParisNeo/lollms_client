@@ -318,6 +318,70 @@ Skills are `SKILL.md` files managed by the `SkillsManager`. They use a tiered vi
 
 The `SkillsManager.build_skill_tools()` method dynamically registers `tool_load_skill` and `tool_search_skills` based on the presence of `loadable` and `searchable` skills.
 
+#### Visible-Skills Budget (Overflow Demotion)
+
+The `visible` tier is budget-capped by two constructor parameters on `SkillsManager`:
+*   `max_visible_skills` (default `10`): maximum number of visible skills injected verbatim.
+*   `max_visible_tokens` (default `4000`): approximate character ceiling (`tokens × 4`) for the combined visible block.
+
+When a visible skill would exceed either budget, it is **demoted to the loadable list for that prompt build** (its `SKILL.md` frontmatter is untouched). The first visible skill is always kept, even if oversized, so a library is never rendered fully blind.
+
+#### Hosting-App API (App-Grade Skill Registration)
+
+Host applications can register skills programmatically without going through the LLM. Two entry points exist:
+
+**1. `Handbag.register_skills_dir(directory)`** — injects an app-shipped skills directory into a handbag's skill search path. It is idempotent (skips directories already registered) and creates the directory if missing. This is the recommended way to ship a curated skill library with your application:
+
+```python
+from lollms_client.lollms_personality import LollmsPersonality
+
+personality = LollmsPersonality.from_handbag("./my_handbag")
+personality.handbag.register_skills_dir("./app_assets/skills")  # app-shipped skills
+```
+
+> **Security note**: only pass directories your application controls. `SkillsManager` will create and scan every registered directory, and any `SKILL.md` found there becomes part of the persona's prompt surface.
+
+**2. `SkillsManager.add_skill(...)`** — the validated, application-grade entry point for registering a single skill. Unlike the LLM-facing `tool_create_skill` (which always overwrites), `add_skill` enforces an explicit contract:
+
+```python
+personality.skills_manager.add_skill(
+    title="Quarterly Report Format",
+    content="Always structure quarterly reports as: Executive Summary, KPIs, ...",
+    description="Corporate quarterly report layout rules",
+    category="writing",
+    tags=["report", "format"],
+    visibility="loadable",   # "visible" | "loadable" | "searchable"
+    overwrite=False,         # raises ValueError if the title already exists
+)
+```
+
+*   Raises `ValueError` on an invalid visibility tier, an empty title, or a duplicate title (unless `overwrite=True`).
+*   Sanitizes the title for the filesystem and strips LLM functional tags from the content before persisting.
+*   Writes into the manager's **primary** skills directory (the first registered one) and reloads the registry.
+
+**3. `SkillsManager.set_skill_visibility(title, visibility)`** — rewrites a skill's frontmatter to move it between tiers at runtime. Raises `ValueError` if the skill is unknown, marked read-only (`modifiable: false`), or has no `visibility` field in its frontmatter.
+
+#### Prompt Builders
+
+| Builder | Purpose |
+| :--- | :--- |
+| `build_context()` | Full prompt block: verbatim visible skills, loadable name+description list, searchable count hint. Returns a "0 skills" notice when the library is empty. |
+| `build_loadable_skills_prompt()` | Compact names-only list of loadable skills (empty string when none). |
+| `build_searchable_skills_prompt()` | One-line hint announcing hidden skills and the `tool_search_skills` discovery path (empty string when none). |
+
+#### Tool Activation Matrix
+
+`build_skill_tools()` registers tools conditionally — the LLM only ever sees tools that can succeed:
+
+| Tool | Registered When |
+| :--- | :--- |
+| `tool_list_skills` | The library is non-empty. |
+| `tool_load_skill` | ≥1 loadable skill exists (or visible skills overflowed the budget). |
+| `tool_search_skills` | ≥1 searchable skill exists. |
+| `tool_create_skill` / `tool_update_skill` / `tool_append_to_skill` / `tool_remove_skill` | `allow_llm_skill_writing=True` (constructor flag, default `True`). |
+
+Read-only skills (`modifiable: false` in frontmatter) are rejected by every mutation tool and announced as unmodifiable in both the prompt block and `tool_load_skill` output.
+
 #### Dynamic Skill Creation & Destination Routing
 When an agent or discussion emits `<skill title="..." description="..." category="...">content</skill>`:
 1. **Handbag Destination**: If the personality was loaded from a Handbag (`personality.handbag_path` is present), `SkillsManager.create_skill()` writes a new `SKILL.md` with YAML frontmatter into `handbag_path / "skills" / <sanitized_title> / "SKILL.md"`. The manager reloads immediately, making the skill a permanent capability of that persona across all discussions.
