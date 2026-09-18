@@ -33,6 +33,11 @@ global_input_parameters:
     description: "Only relevant when is_vllm=true. When true (default), the binding injects chat_template_kwargs.enable_thinking into every request. Set to false to never send enable_thinking to vLLM — required for models whose chat templates do not support this kwarg (e.g. GLM 5.3), where sending it causes hallucinated or garbled output."
     mandatory: false
     default: true
+  - name: thinking_effort_keyword
+    type: str
+    description: "Only relevant when is_vllm=true. When can be enable_thinking or reasoning_effort."
+    mandatory: false
+    default: enable_thinking
   - name: verify_ssl_certificate
     type: bool
     description: "Whether to verify SSL certificates on HTTPS connections. Set to false for self-hosted servers with self-signed certificates."

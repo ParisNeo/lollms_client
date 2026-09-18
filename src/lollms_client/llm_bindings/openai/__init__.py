@@ -107,6 +107,7 @@ class OpenAIBinding(LollmsLLMBinding):
         self.default_completion_format=kwargs.get("default_completion_format", ELF_COMPLETION_FORMAT.Chat)
         self.is_vllm = kwargs.get("is_vllm", False)
         self.send_thinking_parameter = kwargs.get("send_thinking_parameter", True)
+        self.thinking_effort_keyword = kwargs.get("thinking_effort_keyword", "enable_thinking")
 
         self.base_address = self.host_address
         if self.base_address:
@@ -199,7 +200,7 @@ class OpenAIBinding(LollmsLLMBinding):
             return params
         params.setdefault("extra_body", {}).setdefault(
             "chat_template_kwargs", {}
-        )["enable_thinking"] = effort is not None
+        )[self.thinking_effort_keyword] = effort is not None
         return params
 
     def generate_text(
