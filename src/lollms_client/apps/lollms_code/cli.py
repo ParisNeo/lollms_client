@@ -20,33 +20,31 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import re
-import sys
-import time
 import shutil
 import signal
-import threading
-import platform
+import subprocess
+import sys
+import time
 from pathlib import Path
-from typing import Optional, Dict, Any, List
-from ascii_colors import trace_exception
+from typing import Any
+
+from ascii_colors import ASCIIColors, trace_exception
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
 SRC_DIR = PROJECT_ROOT / "src"
 if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from ascii_colors import ASCIIColors
 from ascii_colors import questionary
-
-from lollms_client.lollms_config_cli_env import get_client_from_env
-from lollms_client import LollmsClient
-from lollms_client.lollms_personality import LollmsPersonality, PersonalityBundle
-from lollms_client.lollms_personality.skills_manager import SkillsManager
-from lollms_client.lollms_personality.lollms_personality import CapabilityFlags
-from lollms_client.lollms_types import MSG_TYPE, EventMode
-
 from ascii_colors.rich.console import Console
 from ascii_colors.rich.table import Table
+from lollms_client import LollmsClient
+from lollms_client.lollms_personality import LollmsPersonality
+from lollms_client.lollms_personality.lollms_personality import CapabilityFlags
+from lollms_client.lollms_personality.skills_manager import SkillsManager
+from lollms_client.lollms_types import EventMode, MSG_TYPE
 
 
 APP_NAME = "lollms_code"
@@ -402,7 +400,7 @@ class PersistentHistory:
     def __init__(self, history_file: Path, max_entries: int = 100):
         self.history_file = history_file
         self.max_entries = max_entries
-        self.entries: List[str] = []
+        self.entries: list[str] = []
         self._load()
 
     def _load(self):
@@ -411,7 +409,8 @@ class PersistentHistory:
                 data = json.loads(self.history_file.read_text(encoding="utf-8"))
                 if isinstance(data, list):
                     self.entries = [str(x) for x in data if isinstance(x, (str, int, float))]
-            except Exception:
+            except (OSError, json.JSONDecodeError) as e:
+                ASCIIColors.warning(f"Failed to load history: {e}")
                 self.entries = []
 
     def _save(self):
@@ -421,7 +420,7 @@ class PersistentHistory:
                 json.dumps(self.entries, indent=2, ensure_ascii=False), 
                 encoding="utf-8"
             )
-        except Exception as e:
+        except OSError as e:
             ASCIIColors.warning(f"Failed to save history: {e}")
 
     def add(self, prompt: str):
@@ -444,20 +443,20 @@ class CodeAgentConfig:
     """
     def __init__(self):
         # Two-Tier Profile Registries (Universal Modalities)
-        self.llm_binding_profiles: Dict[str, Dict[str, Any]] = {}
-        self.llm_model_profiles: Dict[str, Dict[str, Any]] = {}
-        self.tti_binding_profiles: Dict[str, Dict[str, Any]] = {}
-        self.tti_model_profiles: Dict[str, Dict[str, Any]] = {}
-        self.tts_binding_profiles: Dict[str, Dict[str, Any]] = {}
-        self.tts_model_profiles: Dict[str, Dict[str, Any]] = {}
-        self.stt_binding_profiles: Dict[str, Dict[str, Any]] = {}
-        self.stt_model_profiles: Dict[str, Dict[str, Any]] = {}
-        self.ttv_binding_profiles: Dict[str, Dict[str, Any]] = {}
-        self.ttv_model_profiles: Dict[str, Dict[str, Any]] = {}
-        self.ttm_binding_profiles: Dict[str, Dict[str, Any]] = {}
-        self.ttm_model_profiles: Dict[str, Dict[str, Any]] = {}
+        self.llm_binding_profiles: dict[str, dict[str, Any]] = {}
+        self.llm_model_profiles: dict[str, dict[str, Any]] = {}
+        self.tti_binding_profiles: dict[str, dict[str, Any]] = {}
+        self.tti_model_profiles: dict[str, dict[str, Any]] = {}
+        self.tts_binding_profiles: dict[str, dict[str, Any]] = {}
+        self.tts_model_profiles: dict[str, dict[str, Any]] = {}
+        self.stt_binding_profiles: dict[str, dict[str, Any]] = {}
+        self.stt_model_profiles: dict[str, dict[str, Any]] = {}
+        self.ttv_binding_profiles: dict[str, dict[str, Any]] = {}
+        self.ttv_model_profiles: dict[str, dict[str, Any]] = {}
+        self.ttm_binding_profiles: dict[str, dict[str, Any]] = {}
+        self.ttm_model_profiles: dict[str, dict[str, Any]] = {}
 
-        self.active_profile: Optional[str] = None
+        self.active_profile: str | None = None
         self.wizard_completed: bool = False
         self.max_reasoning_steps: int = 100
         self.temperature: float = 0.3
@@ -537,7 +536,7 @@ class CodeAgentConfig:
                         continue
                     if hasattr(config, key):
                         setattr(config, key, val)
-            except Exception as e:
+            except (OSError, json.JSONDecodeError) as e:
                 ASCIIColors.warning(f"Failed to read config file: {e}")
 
         # 2. Extract profiles from environment & config files
@@ -552,7 +551,7 @@ class CodeAgentConfig:
         resolved_env = dict(os.environ)
 
         explicit_config = getattr(cli_args, "config_path", None)
-        config_sources: List[Path] = []
+        config_sources: list[Path] = []
 
         if explicit_config:
             p = Path(explicit_config).expanduser()
@@ -578,12 +577,12 @@ class CodeAgentConfig:
                 if source.suffix == ".env":
                     resolved_env.update(load_env_file(source))
                 elif source.suffix == ".json":
-                    from lollms_client.lollms_config_cli_env import load_json_file, _descend_into_entry
+                    from lollms_client.lollms_config_cli_env import _descend_into_entry, load_json_file
                     data = _descend_into_entry(load_json_file(source), None)
                     resolved_env.update(_flatten_dict_to_env(data))
                 elif source.suffix in (".yaml", ".yml"):
                     resolved_env.update(_flatten_dict_to_env(load_yaml_file(source)))
-            except Exception as e:
+            except (OSError, ValueError) as e:
                 ASCIIColors.warning(f"Failed to parse configuration source {source}: {e}")
 
         # Extract profiles across all modalities
@@ -601,9 +600,6 @@ class CodeAgentConfig:
             setattr(config, f"{modality}_model_profiles", profiles)
 
         # 3. Handle CLI argument overrides
-        active_b_alias = "default"
-        active_m_alias = "default"
-
         if getattr(cli_args, "profile", None):
             config.active_profile = cli_args.profile.strip()
             # Flag selected profile as default
@@ -734,11 +730,11 @@ class CodeAgentConfig:
         }
         try:
             APP_CONFIG_FILE.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
-        except Exception as e:
+        except OSError as e:
             ASCIIColors.warning(f"Failed to save config: {e}")
-    
-    
-    def _resolve_env_map(self, config_path: Optional[str] = None) -> Dict[str, str]:
+
+
+    def _resolve_env_map(self, config_path: str | None = None) -> dict[str, str]:
         """Reads ALL universal configuration sources into one flattened env map.
 
         Merge order (later sources override earlier ones):
@@ -752,7 +748,7 @@ class CodeAgentConfig:
             _flatten_dict_to_env,
         )
 
-        env_data: Dict[str, str] = {}
+        env_data: dict[str, str] = {}
         if config_path:
             sources = [Path(config_path).expanduser()]
         else:
@@ -771,11 +767,11 @@ class CodeAgentConfig:
                     env_data.update(_flatten_dict_to_env(load_yaml_file(source)))
                 else:
                     env_data.update(load_env_file(source))
-            except Exception as e:
+            except (OSError, ValueError) as e:
                 ASCIIColors.warning(f"Failed to read configuration source {source}: {e}")
         return env_data
 
-    def _has_modality_configured(self, env_data: Dict[str, str], modality: str) -> bool:
+    def _has_modality_configured(self, env_data: dict[str, str], modality: str) -> bool:
         """Checks if at least one binding and one profile exist for the given modality (e.g., 'llm', 'tti')."""
         mod_upper = modality.upper()
         has_binding = any(k.upper().startswith(f"{mod_upper}_BINDINGS_") and k.upper().endswith("_BINDING_NAME") and v for k, v in env_data.items())
@@ -802,7 +798,7 @@ class CodeAgentConfig:
         return True
     
 
-def _resolve_modality_from_env(modality: str) -> Optional[Dict[str, Any]]:
+def _resolve_modality_from_env(modality: str) -> dict[str, Any] | None:
     """
     Resolves a modality (tti, tts, stt, etc.) binding+profile from:
     1. ~/.lollms-client/.env
@@ -813,7 +809,7 @@ def _resolve_modality_from_env(modality: str) -> Optional[Dict[str, Any]]:
     prefix = modality.upper()
 
     config_obj = CodeAgentConfig()
-    env_map: Dict[str, str] = config_obj._resolve_env_map()
+    env_map: dict[str, str] = config_obj._resolve_env_map()
 
     default_alias = None
     for k, v in env_map.items():
@@ -858,7 +854,7 @@ def _resolve_modality_from_env(modality: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _resolve_modality_from_config(config: CodeAgentConfig, modality: str) -> Optional[Dict[str, Any]]:
+def _resolve_modality_from_config(config: CodeAgentConfig, modality: str) -> dict[str, Any] | None:
     """
     Resolves a modality (tti, tts, stt, etc.) binding+profile from the already-loaded
     CodeAgentConfig two-tier profile registries.
@@ -924,7 +920,7 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
 
     binding_alias = active_model_profile.get("binding_profile_name") or active_model_profile.get("binding_alias")
     if not binding_alias or binding_alias not in config.llm_binding_profiles:
-        for alias, prof in config.llm_model_profiles.items():
+        for prof in config.llm_model_profiles.values():
             if prof.get("is_default"):
                 binding_alias = prof.get("binding_profile_name") or prof.get("binding_alias")
                 break
@@ -939,7 +935,7 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
     active_model_name = active_model_profile.get("model_name") or config.active_model_name
     active_binding_name = binding_profile.get("binding_name") or config.active_binding_name
 
-    llm_config: Dict[str, Any] = {
+    llm_config: dict[str, Any] = {
         "model_name": active_model_name,
         "host_address": binding_config.get("host_address", "http://localhost:11434"),
         "verify_ssl_certificate": binding_config.get("verify_ssl_certificate", False),
@@ -992,7 +988,7 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
                 resolved = _resolve_modality_from_env(modality)
 
             if resolved:
-                modality_config: Dict[str, Any] = {
+                modality_config: dict[str, Any] = {
                     "host_address": resolved["host_address"],
                     "model_name": resolved["model_name"],
                     "verify_ssl_certificate": resolved["verify_ssl"],
@@ -1005,7 +1001,7 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
                 ASCIIColors.success(f"[CLI] ✅ {modality.upper()} Binding '{resolved['binding_name']}' mounted for {modality_label}.")
             elif modality == "tti":
                 ASCIIColors.info("[CLI] No TTI binding configured. Image generation tools will not be available.")
-        except Exception as e:
+        except (KeyError, ValueError, OSError) as e:
             ASCIIColors.warning(f"[CLI] Failed to configure {modality.upper()} binding: {e}")
 
     client = LollmsClient(**client_kwargs)
@@ -1025,7 +1021,7 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
             else:
                 client.tools.mount_tool_library('system_shell')
             ASCIIColors.success("[CLI] ✅ System Shell library mounted.")
-        except Exception as e:
+        except (AttributeError, OSError, RuntimeError) as e:
             ASCIIColors.warning(f"Failed to pre-mount system_shell library: {e}")
 
     if client.tools:
@@ -1035,7 +1031,7 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
             else:
                 client.tools.mount_tool_library('git_manager')
             ASCIIColors.success("[CLI] ✅ Git Manager library mounted.")
-        except Exception as e:
+        except (AttributeError, OSError, RuntimeError) as e:
             ASCIIColors.warning(f"Failed to pre-mount git_manager library: {e}")
 
     return client
@@ -1092,8 +1088,8 @@ def ensure_sandbox_structure(config: CodeAgentConfig):
             if f.is_file():
                 try:
                     f.unlink()
-                except Exception:
-                    pass
+                except OSError as e:
+                    ASCIIColors.warning(f"Failed to remove transient script {f.name}: {e}")
     scripts_dir.mkdir(exist_ok=True)
 
     if not scratchpad.exists():
@@ -1107,8 +1103,6 @@ def build_environment_context(config: CodeAgentConfig) -> str:
     python_version = platform.python_version()
 
     workspace_root = Path(config.workspace_path).resolve()
-    sandbox_dir = workspace_root / ".lollms_code"
-    scripts_dir = sandbox_dir / "scripts"
 
     shell_cmd = "cmd / powershell" if is_windows else "bash/sh"
     path_sep = "\\" if is_windows else "/"
@@ -1117,18 +1111,16 @@ def build_environment_context(config: CodeAgentConfig) -> str:
     git_dir = workspace_root / ".git"
     if git_dir.exists():
         try:
-            import subprocess
             result = subprocess.run(
                 ["git", "branch", "--show-current"],
                 cwd=str(workspace_root),
-                capture_output=True, text=True, encoding="utf-8", errors="ignore"
+                capture_output=True, text=True, encoding="utf-8", errors="ignore",
+                check=False
             )
-            if result.returncode == 0:
-                branch_name = result.stdout.strip()
-                if branch_name:
-                    git_branch_info = f"\n- Git Branch: {branch_name}"
-        except Exception:
-            pass
+            if result.returncode == 0 and result.stdout.strip():
+                git_branch_info = f"\n- Git Branch: {result.stdout.strip()}"
+        except (OSError, subprocess.SubprocessError) as e:
+            ASCIIColors.warning(f"Failed to detect git branch: {e}")
 
     return f"""
 === ENVIRONMENT CONTEXT (CRITICAL) ===
@@ -1208,8 +1200,8 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
                 config=MemoryConfig(working_token_budget=2000)
             )
             ASCIIColors.rich_print(f" [green]✓[/green] [dim]({project_memory_db.name})[/dim]")
-        except Exception as e:
-            ASCIIColors.rich_print(f" [red]✗[/red]")
+        except (ImportError, OSError, RuntimeError, ValueError) as e:
+            ASCIIColors.rich_print(" [red]✗[/red]")
             ASCIIColors.warning(f"[CLI] Failed to initialize project memory: {e}. Falling back to handbag memory.")
 
     # ── 💾 PROJECT-LOCAL HISTORY ISOLATION ──
@@ -1255,8 +1247,8 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
         if hasattr(personality, "_init_scratchpad"):
             personality._init_scratchpad()
         ASCIIColors.rich_print(" [green]✓[/green]")
-    except Exception as e:
-        ASCIIColors.rich_print(f" [red]✗[/red]")
+    except (OSError, RuntimeError, ValueError) as e:
+        ASCIIColors.rich_print(" [red]✗[/red]")
         ASCIIColors.warning(f"Failed to initialize scratchpad: {e}")
 
     ASCIIColors.rich_print("  [dim]🔍 Building artefact system...[/dim]", end="")
@@ -1264,8 +1256,8 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
         if hasattr(personality, "_init_artefact_system"):
             personality._init_artefact_system()
         ASCIIColors.rich_print(" [green]✓[/green]")
-    except Exception as e:
-        ASCIIColors.rich_print(f" [red]✗[/red]")
+    except (OSError, RuntimeError, ValueError) as e:
+        ASCIIColors.rich_print(" [red]✗[/red]")
         ASCIIColors.warning(f"Failed to pre-initialize artefact system for stats: {e}")
 
     ASCIIColors.rich_print("[bold green]  ✅ Agent initialized and ready.[/bold green]\n")
@@ -1278,7 +1270,7 @@ def _index_workspace_with_progress(personality: LollmsPersonality, client: Lollm
         ws_path = personality._resolved_workspace
         if not ws_path or not ws_path.exists():
             return
-    except Exception as e:
+    except AttributeError as e:
         ASCIIColors.warning(f"Workspace validation failed: {e}")
 
 
@@ -1289,7 +1281,7 @@ def _format_bytes(size: int) -> str:
         size /= 1024.0
     return f"{size:.1f} PB"
 
-def _render_files_table(files_data: List[Dict[str, Any]], title: str):
+def _render_files_table(files_data: list[dict[str, Any]], title: str):
     console = Console()
     sorted_files = sorted(
         files_data, 
@@ -1303,7 +1295,7 @@ def _render_files_table(files_data: List[Dict[str, Any]], title: str):
         files_table.add_row(_format_bytes(f["size"]), f["path"])
     console.print(files_table)
 
-def get_workspace_stats(personality: LollmsPersonality) -> Dict[str, Any]:
+def get_workspace_stats(personality: LollmsPersonality) -> dict[str, Any]:
     """
     Calculates statistics about the indexed workspace files.
     Returns total files, loaded files count, and a list of relative paths of loaded files.
@@ -1337,7 +1329,7 @@ def get_workspace_stats(personality: LollmsPersonality) -> Dict[str, Any]:
                             abs_path = personality._resolved_workspace / rel_path
                             if abs_path.exists() and abs_path.is_file():
                                 file_size = abs_path.stat().st_size
-                        except Exception:
+                        except OSError:
                             file_size = 0
 
                     stats["loaded_files"].append({
@@ -1346,9 +1338,9 @@ def get_workspace_stats(personality: LollmsPersonality) -> Dict[str, Any]:
                     })
 
         stats["total_loaded"] = len(stats["loaded_files"])
-    except Exception as e:
+    except (AttributeError, KeyError, OSError) as e:
         ASCIIColors.warning(f"Failed to calculate workspace stats: {e}")
-        
+
     return stats
 
 
@@ -1365,7 +1357,6 @@ class StreamRenderer:
 
     def _render_processing_block(self, block_content: str):
         """Parses and renders a <processing> block as a rich panel."""
-        import re
         import json as _json
 
         block_content = re.sub(r'</?processing[^>]*>', '', block_content)
@@ -1385,7 +1376,7 @@ class StreamRenderer:
             try:
                 params_dict = _json.loads(params_str)
                 params_str_formatted = _json.dumps(params_dict, indent=2, ensure_ascii=False)
-            except Exception:
+            except _json.JSONDecodeError:
                 params_str_formatted = params_str
 
             body_match = re.search(r'>(.*)', block_content, re.DOTALL)
@@ -1469,7 +1460,6 @@ class StreamRenderer:
         spinner = spinners[self._progress_frame]
 
         detected_section = ""
-        import re
         header_match = re.search(r'^#+\s+(.+)|^#{1,3}\s+(.+)|^class\s+(\w+)|^def\s+(\w+)|^function\s+(\w+)', self._live_artifact_buffer, re.MULTILINE)
         if header_match:
             detected_section = header_match.group(1) or header_match.group(2) or header_match.group(3) or header_match.group(4) or header_match.group(5)
@@ -1500,8 +1490,8 @@ class StreamRenderer:
         if self._live_artifact_panel:
             try:
                 self._live_artifact_panel.stop()
-            except Exception:
-                pass
+            except RuntimeError as e:
+                ASCIIColors.warning(f"Failed to stop live artifact panel: {e}")
             self._live_artifact_panel = None
             self._live_artifact_buffer = ""
             self._live_artifact_title = ""
@@ -1511,7 +1501,7 @@ class StreamRenderer:
             self._live_artifact_started = False
             self._last_stream_artifact_title = None
 
-    def _render_callback_event(self, msg_type: Any, meta: Optional[Dict]):
+    def _render_callback_event(self, msg_type: Any, meta: dict | None):
         """Renders structured MSG_TYPE events as Rich panels for FULL_CALLBACK_MODE."""
         if not meta:
             return
@@ -1562,7 +1552,7 @@ class StreamRenderer:
                     if val:
                         try:
                             output = json.dumps(val, indent=2, ensure_ascii=False, default=str) if not isinstance(val, str) else val
-                        except Exception:
+                        except (TypeError, ValueError):
                             output = str(val)
                         break
 
@@ -1603,7 +1593,7 @@ class StreamRenderer:
             if cmd_params:
                 try:
                     params_str = json.dumps(cmd_params, indent=2, ensure_ascii=False, default=str)
-                except Exception:
+                except (TypeError, ValueError):
                     params_str = str(cmd_params)
                 panel_lines.append(f"[cyan]Parameters:[/cyan]\n[dim]{params_str}[/dim]")
 
@@ -1632,7 +1622,6 @@ class StreamRenderer:
 
         elif msg_type == MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START:
             title = meta.get("title", "artifact")
-            art_type = meta.get("art_type", "code")
             lang = meta.get("language", "")
             is_patch = meta.get("is_patch", False)
             is_execution = meta.get("execution_phase", False)
@@ -1733,7 +1722,7 @@ class StreamRenderer:
             self._processing_buffer = ""
             self._in_processing = False
 
-    def __call__(self, chunk: str, msg_type: Any = None, meta: Optional[Dict] = None) -> bool:
+    def __call__(self, chunk: str, msg_type: Any = None, meta: dict | None = None) -> bool:
         if msg_type == MSG_TYPE.MSG_TYPE_NEW_MESSAGE:
             ASCIIColors.rich_print("\n[bold green]🤖 Generating...[/bold green]")
             return True
@@ -1851,7 +1840,7 @@ def _display_context_status(personality: LollmsPersonality, client: LollmsClient
         ASCIIColors.yellow("  Context status unavailable.")
 
 
-def display_result(result: Dict[str, Any], config: CodeAgentConfig, elapsed: float):
+def display_result(result: dict[str, Any], config: CodeAgentConfig, elapsed: float):
     ASCIIColors.rule("[bold cyan]📊 SESSION REPORT[/bold cyan]")
 
     summary_rows = [
@@ -1973,7 +1962,8 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
             client.cancel()
         ASCIIColors.yellow("\n\n⚠️  Generation cancelled by user.")
         return 130
-    except Exception as e:
+    except (RuntimeError, ValueError, OSError, ConnectionError) as e:
+        trace_exception(e)
         ASCIIColors.red(f"\n\n💥 Fatal error: {e}")
         return 1
 
@@ -1992,7 +1982,7 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
     return 0 if not result.get("was_cancelled") else 130
 
 
-def get_context_fill_status(personality: LollmsPersonality, client: LollmsClient) -> Optional[Dict[str, Any]]:
+def get_context_fill_status(personality: LollmsPersonality, client: LollmsClient) -> dict[str, Any] | None:
     """Safely calculates the full context fill status, including memories and loaded files."""
     try:
         max_ctx = client.get_ctx_size() or 0
@@ -2035,8 +2025,8 @@ def get_context_fill_status(personality: LollmsPersonality, client: LollmsClient
                 mem_zone = personality.memory_manager.build_working_zone()
                 if mem_zone:
                     breakdown["active_memories"] = client.count_tokens(mem_zone) or 0
-            except Exception:
-                pass
+            except (AttributeError, RuntimeError, ValueError) as e:
+                ASCIIColors.warning(f"Failed to compute memory token count: {e}")
 
         used_tokens = sum(breakdown.values())
         fill_pct = round((used_tokens / max_ctx) * 100, 1)
@@ -2047,7 +2037,8 @@ def get_context_fill_status(personality: LollmsPersonality, client: LollmsClient
             "fill_percentage": fill_pct,
             "breakdown": breakdown
         }
-    except Exception:
+    except (AttributeError, RuntimeError, ValueError, OSError) as e:
+        ASCIIColors.warning(f"Failed to compute context fill status: {e}")
         return None
     
 def dump_startup_context(personality: LollmsPersonality, client: LollmsClient):
@@ -2067,18 +2058,17 @@ def dump_startup_context(personality: LollmsPersonality, client: LollmsClient):
         debug_dir = ws_path / ".lollms_code" / "_debug_dumps"
         debug_dir.mkdir(parents=True, exist_ok=True)
 
-        import shutil
         for item in debug_dir.iterdir():
             if item.is_file():
                 try:
                     item.unlink()
-                except Exception:
-                    pass
+                except OSError as e:
+                    ASCIIColors.warning(f"Failed to remove debug file {item.name}: {e}")
             elif item.is_dir():
                 try:
                     shutil.rmtree(str(item))
-                except Exception:
-                    pass
+                except OSError as e:
+                    ASCIIColors.warning(f"Failed to remove debug directory {item.name}: {e}")
 
         debug_log_path = debug_dir / "startup_context.log"
 
@@ -2098,9 +2088,11 @@ def dump_startup_context(personality: LollmsPersonality, client: LollmsClient):
             f.write("=" * 80 + "\n\n")
 
             f.write("--- ACTIVE TOOLS ---\n")
-            for t_name, t_spec in active_tools.items():
-                f.write(f"- {t_name}: {t_spec.get('description', '')[:100]}\n")
-            f.write("\n")
+            f.write("\n".join(
+                f"- {t_name}: {t_spec.get('description', '')[:100]}"
+                for t_name, t_spec in active_tools.items()
+            ))
+            f.write("\n\n")
 
             f.write("--- FULL SYSTEM PROMPT (STABLE PREFIX) ---\n")
             f.write(full_system_prompt + "\n\n")
@@ -2125,10 +2117,10 @@ def dump_startup_context(personality: LollmsPersonality, client: LollmsClient):
                 f.write("Context stats unavailable.\n")
 
         ASCIIColors.info(f"[CLI] 🐛 Startup context dumped to: {debug_log_path}")
-    except Exception as e:
+    except (AttributeError, OSError, RuntimeError, ValueError) as e:
         ASCIIColors.warning(f"[CLI] Failed to dump startup context: {e}")
 
-def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optional[str]:
+def _advanced_prompt(history: PersistentHistory, commands: list[str]) -> str | None:
     """
     Cross-platform raw key-capture prompt with Ghost-Text Autocomplete and Multi-line support.
     - Submit: Press Enter to submit the prompt.
@@ -2168,7 +2160,7 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
             sys.stdout.write(f"\033[{target_col}G")
         sys.stdout.flush()
 
-    def _native_prompt_unix() -> Optional[str]:
+    def _native_prompt_unix() -> str | None:
         import termios
         import tty
 
@@ -2295,11 +2287,10 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
-    def _native_prompt_windows() -> Optional[str]:
+    def _native_prompt_windows() -> str | None:
         import msvcrt
         import ctypes
 
-        VK_SHIFT = 0x10
         VK_LSHIFT = 0xA0
         VK_RSHIFT = 0xA1
 
@@ -2310,7 +2301,7 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
                     ctypes.windll.user32.GetAsyncKeyState(VK_LSHIFT) & 0x8000
                     or ctypes.windll.user32.GetAsyncKeyState(VK_RSHIFT) & 0x8000
                 )
-            except Exception:
+            except (AttributeError, OSError):
                 return False
 
         buffer = ""
@@ -2443,7 +2434,7 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
             return _native_prompt_windows()
         else:
             return _native_prompt_unix()
-    except Exception:
+    except (OSError, ImportError, RuntimeError):
         try:
             return input(PROMPT_TEXT)
         except (EOFError, KeyboardInterrupt):
@@ -2451,7 +2442,7 @@ def _advanced_prompt(history: PersistentHistory, commands: List[str]) -> Optiona
             return None  
             
         
-def _switch_workspace_interactive(config: CodeAgentConfig, client: LollmsClient) -> Optional[LollmsPersonality]:
+def _switch_workspace_interactive(config: CodeAgentConfig, client: LollmsClient) -> LollmsPersonality | None:
     """Handles the interactive workspace switching process."""
     try:
         ASCIIColors.rule("[bold cyan]📂 Switch Workspace[/bold cyan]")
@@ -2466,7 +2457,7 @@ def _switch_workspace_interactive(config: CodeAgentConfig, client: LollmsClient)
                 default=str(default_path),
                 only_directories=True
             ).ask()
-        except Exception:
+        except (ImportError, RuntimeError, OSError):
             selected_path = input("Enter new workspace path manually: ").strip()
             
         if not selected_path:
@@ -2502,7 +2493,7 @@ def _switch_workspace_interactive(config: CodeAgentConfig, client: LollmsClient)
     except KeyboardInterrupt:
         ASCIIColors.yellow("\nWorkspace switch cancelled.")
         return None
-    except Exception as e:
+    except (OSError, RuntimeError, ValueError) as e:
         ASCIIColors.red(f"Failed to switch workspace: {e}")
         return None
 
@@ -2628,15 +2619,15 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
             if conv_file.exists():
                 try:
                     conv_file.unlink()
-                except Exception:
-                    pass
+                except OSError as e:
+                    ASCIIColors.warning(f"Failed to remove conversation file: {e}")
             # Clear the project-local prompt history as well
             prompt_file = get_workspace_prompt_history_file(config.workspace_path)
             if prompt_file.exists():
                 try:
                     prompt_file.unlink()
-                except Exception:
-                    pass
+                except OSError as e:
+                    ASCIIColors.warning(f"Failed to remove prompt history file: {e}")
             history.entries = []
             history._save()
             ASCIIColors.green("  Workspace conversation and prompt history cleared.")
@@ -2687,7 +2678,7 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                     _render_files_table(ws_stats["loaded_files"], "Remaining Loaded Context Files [C]")
                 else:
                     ASCIIColors.yellow("\n  📂 No files are currently loaded in context.")
-            except Exception as e:
+            except (AttributeError, KeyError, OSError, RuntimeError, ValueError) as e:
                 ASCIIColors.red(f"\n  ❌ Error unloading files: {e}")
             continue
 
@@ -2704,7 +2695,12 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                 exit_behavior="ask",
                 include_save_exit=True,
             )
-            wizard_menu.run()
+            while True:
+                selection = wizard_menu.run()
+                if callable(selection):
+                    selection()
+                if selection is None or wizard_state["saved"]:
+                    break
             if wizard_state["saved"]:
                 ASCIIColors.green("  Configuration updated. Restart lollms-code for changes to take effect.")
             continue
@@ -2885,7 +2881,7 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                     ASCIIColors.yellow("\n  📂 No files are currently loaded in context.")
                 
                 _display_context_status(personality, client)
-            except Exception as e:
+            except (AttributeError, KeyError, OSError, RuntimeError, ValueError) as e:
                 ASCIIColors.red(f"\n  ❌ Error unloading files: {e}")
             continue
 
@@ -2948,7 +2944,7 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                 client.cancel()
             ASCIIColors.yellow("\n\n⚠️  Cancelled.")
             continue
-        except Exception as e:
+        except (RuntimeError, ValueError, OSError, ConnectionError) as e:
             trace_exception(e)
             ASCIIColors.red(f"\n💥 Error: {e}")
             continue
@@ -2963,9 +2959,9 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
         if hasattr(client, 'llm') and hasattr(client.llm, 'flush_stream'):
             try:
                 client.llm.flush_stream()
-            except Exception:
-                pass
-            
+            except (RuntimeError, OSError) as e:
+                ASCIIColors.warning(f"Failed to flush LLM stream: {e}")
+
         elapsed = time.time() - start_time
         ctx_h = result.get("context_health", {})
         ctx_str = ""
@@ -3035,7 +3031,7 @@ Examples:
     parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
     parser.add_argument("--version", action="version", version=f"lollms_code v{APP_VERSION}")
     subparsers = parser.add_subparsers(dest="command", help="Additional commands")
-    gui_parser = subparsers.add_parser("gui", help="Launch the lollms_code GUI (NiceGUI native window).")    
+    subparsers.add_parser("gui", help="Launch the lollms_code GUI (NiceGUI native window).")    
     return parser
 
 
@@ -3052,7 +3048,8 @@ def main():
             ASCIIColors.red(f"Failed to import GUI dependencies: {e}")
             ASCIIColors.yellow("Please install the GUI requirements: pip install nicegui pywebview")
             return 1
-        except Exception as e:
+        except (RuntimeError, ValueError, OSError) as e:
+            trace_exception(e)
             ASCIIColors.red(f"GUI crashed: {e}")
             return 1
 
@@ -3079,14 +3076,14 @@ def main():
             try:
                 conv_file.unlink()
                 cleared_any = True
-            except Exception:
-                pass
+            except OSError as e:
+                ASCIIColors.warning(f"Failed to remove conversation file: {e}")
         if prompt_file.exists():
             try:
                 prompt_file.unlink()
                 cleared_any = True
-            except Exception:
-                pass
+            except OSError as e:
+                ASCIIColors.warning(f"Failed to remove prompt history file: {e}")
         if cleared_any:
             ASCIIColors.green(f"Conversation and prompt history cleared for workspace: {config.workspace_path}")
         else:
@@ -3102,7 +3099,8 @@ def main():
 
     try:
         client = create_client(config)
-    except Exception as e:
+    except (ImportError, RuntimeError, ValueError, OSError, ConnectionError) as e:
+        trace_exception(e)
         ASCIIColors.red(f"Failed to create LollmsClient: {e}")
         return 1
 

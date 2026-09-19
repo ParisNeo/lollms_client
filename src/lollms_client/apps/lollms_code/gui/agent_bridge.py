@@ -378,12 +378,14 @@ class QueueStreamingCallback:
             MSG_TYPE.MSG_TYPE_TOOL_END: "tool_end",
             MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START: "artefact_start",
             MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END: "artefact_end",
-            getattr(MSG_TYPE, "MSG_TYPE_ARTEFACT_SYMBOL_DETECTED", None): "artefact_symbol",
-            getattr(MSG_TYPE, "MSG_TYPE_ROUND_INFO", None): "round_info",
+            MSG_TYPE.MSG_TYPE_ARTEFACT_SYMBOL_DETECTED: "artefact_symbol",
+            MSG_TYPE.MSG_TYPE_ROUND_START: "round_start",
+            MSG_TYPE.MSG_TYPE_ROUND_END: "round_end",
             MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE: "context_update",
-            getattr(MSG_TYPE, "MSG_TYPE_SCRATCHPAD_UPDATE", None): "scratchpad_update",
+            MSG_TYPE.MSG_TYPE_SCRATCHPAD_UPDATE: "scratchpad_update",
+            MSG_TYPE.MSG_TYPE_WORKER_SPAWN_START: "worker_spawn_start",
+            MSG_TYPE.MSG_TYPE_WORKER_SPAWN_END: "worker_spawn_end",
         }
-        mapping.pop(None, None)
         if msg_type in mapping:
             self.q.put(AgentEvent(mapping[msg_type], **(meta or {})))
             return True

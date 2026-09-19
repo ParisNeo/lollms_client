@@ -639,20 +639,34 @@ def _safe_input(prompt: str, default: str = "") -> str:
         return val if val else default
     except EOFError: return default
 
-def _safe_select(prompt: str, choices: List[str]) -> Optional[str]:
-    choices_with_cancel = list(choices) + ["🚫 Cancel"]
+def _safe_input_or_back(prompt: str, default: str = "") -> Optional[str]:
+    """Text input where entering 'b' or 'back' (case-insensitive) returns None to go back."""
+    try:
+        val = input(f"{prompt} [{default}] (b=back): ").strip()
+        if val.lower() in ("b", "back"):
+            return None
+        return val if val else default
+    except EOFError: return default
+
+def _safe_select(prompt: str, choices: List[str], allow_back: bool = True) -> Optional[str]:
+    """Interactive selection with an explicit Back/Cancel escape entry.
+
+    Returns the selected choice string, or None when the user goes back.
+    """
+    escape_label = "↩ Back" if allow_back else "🚫 Cancel"
+    choices_with_escape = list(choices) + [escape_label]
     try:
         menu = Menu(prompt, mode=Menu.MODE_RETURN)
         menu.set_intro("Use arrow keys to navigate. Select an option and press Enter.")
-        for c in choices_with_cancel: menu.add_choice(c, value=c)
+        for c in choices_with_escape: menu.add_choice(c, value=c)
         selection = menu.run()
-        if selection == "🚫 Cancel":
+        if selection == escape_label:
             return None
         return selection
     except:
         ASCIIColors.yellow(f"\n(Fallback) {prompt}")
-        for i, c in enumerate(choices_with_cancel): ASCIIColors.cyan(f"  {i+1}. {c}")
-        raw = _safe_input("Enter number", str(len(choices_with_cancel)))
+        for i, c in enumerate(choices_with_escape): ASCIIColors.cyan(f"  {i+1}. {c}")
+        raw = _safe_input("Enter number", str(len(choices_with_escape)))
         try:
             val = int(raw)
             if 1 <= val <= len(choices):
@@ -661,16 +675,13 @@ def _safe_select(prompt: str, choices: List[str]) -> Optional[str]:
         except: return None
 
 def _safe_confirm(prompt: str, default: bool = False) -> bool:
-    try:
-        menu = Menu(prompt, mode=Menu.MODE_RETURN)
-        menu.set_intro("Select Yes or No.")
-        menu.add_choice("Yes", value=True)
-        menu.add_choice("No", value=False)
-        res = menu.run()
-        return res if res is not None else default
-    except:
-        raw = _safe_input(f"{prompt} (y/n)", "y" if default else "n")
-        return raw.lower().startswith("y")
+    """Plain-text confirmation. Deliberately avoids the interactive Menu so it
+    can be safely invoked from inside another menu's callback (nested menus
+    corrupt the terminal state and silently return defaults)."""
+    raw = _safe_input(f"{prompt} (y/n)", "y" if default else "n")
+    return raw.lower().startswith("y")
+
+_BACK_SENTINEL = "__WIZARD_BACK__"
 
 def _prompt_param(name: str, desc: str, ptype: str, mandatory: bool, default: Any) -> Any:
     ASCIIColors.rich_print(f"\n[bold cyan]── {name} ──[/bold cyan]")
@@ -679,7 +690,9 @@ def _prompt_param(name: str, desc: str, ptype: str, mandatory: bool, default: An
     if ptype == "bool":
         return _safe_confirm("Enter yes/no:", default if isinstance(default, bool) else False)
     else:
-        ans = _safe_input("Enter value", str(default) if default is not None else "")
+        ans = _safe_input_or_back("Enter value", str(default) if default is not None else "")
+        if ans is None:
+            return _BACK_SENTINEL
         if not ans.strip() and mandatory:
             ASCIIColors.red("  ⚠ Required. Please enter a value.")
             return _prompt_param(name, desc, ptype, mandatory, default)
@@ -697,19 +710,50 @@ def _configure_binding_instance(b_type: str, b_name: str, alias: str, config_map
             pname = p.get("name", "")
             if not pname or pname == "model_name": continue
             val = _prompt_param(pname, p.get("description", ""), p.get("type", "str"), p.get("mandatory", False), p.get("default"))
+            if val is _BACK_SENTINEL:
+                ASCIIColors.yellow("\n  ⚠️ Binding configuration cancelled. Rolling back partial keys.")
+                for k in [k for k in config_map if k.startswith(prefix)]:
+                    del config_map[k]
+                return
             config_map[prefix + pname.upper()] = _format_env_value(val)
     else:
         ASCIIColors.yellow("\n  No description.yaml found. Using standard server configuration.\n")
         default_host = "http://localhost:9642" if b_type in ("tti", "tts", "stt") else "http://localhost:8000"
         host_val = _prompt_param("host_address", f"The host address of the {b_type.upper()} server", "str", False, default_host)
+        if host_val is _BACK_SENTINEL:
+            ASCIIColors.yellow("\n  ⚠️ Binding configuration cancelled. Rolling back partial keys.")
+            for k in [k for k in config_map if k.startswith(prefix)]:
+                del config_map[k]
+            return
         config_map[prefix + "HOST_ADDRESS"] = _format_env_value(host_val)
 
         key_val = _prompt_param("service_key", f"API / Service Key for the {b_type.upper()} server (leave blank if none)", "str", False, "")
+        if key_val is _BACK_SENTINEL:
+            ASCIIColors.yellow("\n  ⚠️ Binding configuration cancelled. Rolling back partial keys.")
+            for k in [k for k in config_map if k.startswith(prefix)]:
+                del config_map[k]
+            return
         if key_val:
             config_map[prefix + "SERVICE_KEY"] = _format_env_value(key_val)
 
         ssl_val = _prompt_param("verify_ssl_certificate", "Verify SSL certificate", "bool", False, False)
         config_map[prefix + "VERIFY_SSL_CERTIFICATE"] = _format_env_value(ssl_val)
+
+def _generate_unique_alias(base: str, existing_aliases: List[str]) -> str:
+    """Generates a unique alias by auto-incrementing if the base name already exists.
+
+    If 'master' exists, returns 'master_2', 'master_3', etc.
+    The sanitized base is used for collision detection.
+    """
+    sanitized_base = _sanitize_alias(base)
+    if sanitized_base not in existing_aliases:
+        return sanitized_base
+
+    counter = 2
+    while f"{sanitized_base}_{counter}" in existing_aliases:
+        counter += 1
+    return f"{sanitized_base}_{counter}"
+
 
 def _add_binding_flow(b_type: str, config_map: Dict[str, str]):
     bindings = _list_bindings_by_type(b_type)
@@ -718,14 +762,25 @@ def _add_binding_flow(b_type: str, config_map: Dict[str, str]):
     if not selected:
         ASCIIColors.yellow("\n  ⚠️ Binding selection cancelled.")
         return
-    alias = _sanitize_alias(_safe_input("Enter an alias for this binding", "master"))
+    existing = _get_configured_aliases(b_type, config_map, "BINDINGS")
+    raw_alias = _safe_input_or_back("Enter an alias for this binding", "master")
+    if raw_alias is None:
+        ASCIIColors.yellow("\n  ⚠️ Binding creation cancelled.")
+        return
+    if not raw_alias.strip():
+        alias = _generate_unique_alias("master", existing)
+        ASCIIColors.info(f"  ℹ️ Auto-named binding: {alias}")
+    else:
+        alias = _generate_unique_alias(raw_alias, existing)
+        if alias != _sanitize_alias(raw_alias):
+            ASCIIColors.info(f"  ℹ️ Name collision resolved: {alias}")
     if alias: _configure_binding_instance(b_type, selected, alias, config_map)
 
 def _bindings_menu(b_type: str, config_map: Dict[str, str]):
     while True:
-        menu = Menu(f"{b_type.upper()} Bindings", mode=Menu.MODE_EXECUTE, exit_text="↩ Back")
+        menu = Menu(f"{b_type.upper()} Bindings", mode=Menu.MODE_RETURN, exit_text="↩ Back")
         menu.set_intro("Add a new binding, edit, or delete an existing one.")
-        menu.add_action("Add new binding", lambda: _add_binding_flow(b_type, config_map))
+        menu.add_choice("Add new binding", value=lambda: _add_binding_flow(b_type, config_map))
 
         prefix = f"{b_type.upper()}_BINDINGS_"
         existing_aliases = []
@@ -733,10 +788,14 @@ def _bindings_menu(b_type: str, config_map: Dict[str, str]):
             if k.startswith(prefix) and k.endswith("_BINDING_NAME"):
                 alias = k[len(prefix):-len("_BINDING_NAME")]
                 existing_aliases.append(alias)
-                menu.add_action(f"Edit binding: {alias}", lambda a=alias: _edit_keys_menu(b_type, "BINDINGS", a, config_map))
-                menu.add_action(f"🗑️ Delete binding: {alias}", lambda a=alias: _delete_entry(b_type, "BINDINGS", a, config_map))
+                menu.add_choice(f"Edit binding: {alias}", value=lambda a=alias: _edit_keys_menu(b_type, "BINDINGS", a, config_map))
+                menu.add_choice(f"🗑️ Delete binding: {alias}", value=lambda a=alias: _delete_entry(b_type, "BINDINGS", a, config_map))
 
-        if menu.run() is None: break
+        selection = menu.run()
+        if selection is None:
+            break
+        if callable(selection):
+            selection()
 
 def _edit_keys_menu(b_type: str, category: str, alias: str, config_map: Dict[str, str]):
     while True:
@@ -744,12 +803,16 @@ def _edit_keys_menu(b_type: str, category: str, alias: str, config_map: Dict[str
         keys = {k[len(prefix):]: v for k, v in config_map.items() if k.startswith(prefix)}
         if not keys: return
 
-        menu = Menu(f"Edit {b_type.upper()} {category}: {alias}", mode=Menu.MODE_EXECUTE, exit_text="↩ Back")
+        menu = Menu(f"Edit {b_type.upper()} {category}: {alias}", mode=Menu.MODE_RETURN, exit_text="↩ Back")
         menu.set_intro("Select a key to edit or go back.")
         for k, v in keys.items():
-            menu.add_action(f"Edit {k}: {v[:40]}", lambda k=k: _edit_single_key(b_type, category, alias, k, config_map))
-        menu.add_action("➕ Add custom key", lambda: _add_custom_key(b_type, category, alias, config_map))
-        if menu.run() is None: break
+            menu.add_choice(f"Edit {k}: {v[:40]}", value=lambda k=k: _edit_single_key(b_type, category, alias, k, config_map))
+        menu.add_choice("➕ Add custom key", value=lambda: _add_custom_key(b_type, category, alias, config_map))
+        selection = menu.run()
+        if selection is None:
+            break
+        if callable(selection):
+            selection()
 
 def _edit_single_key(b_type: str, category: str, alias: str, key: str, config_map: Dict[str, str]):
     full_key = f"{b_type.upper()}_{category}_{alias}_{key}"
@@ -768,25 +831,26 @@ def _add_custom_key(b_type: str, category: str, alias: str, config_map: Dict[str
 
 def _delete_entry(b_type: str, category: str, alias: str, config_map: Dict[str, str]):
     prefix = f"{b_type.upper()}_{category}_{alias}_"
-    keys_to_delete = [k for k in config_map.keys() if k.startswith(prefix)]
+    keys_to_delete = [k for k in list(config_map.keys()) if k.startswith(prefix)]
 
     if not keys_to_delete:
         ASCIIColors.yellow(f"\n  ⚠️ No {category.lower()[:-1]} found with alias '{alias}'.")
         return
 
-    if _safe_confirm(f"Are you sure you want to delete {category.lower()[:-1]} '{alias}' and all its {len(keys_to_delete)} keys?", default=False):
+    label = "binding" if category == "BINDINGS" else "profile"
+    if _safe_confirm(f"Are you sure you want to delete {label} '{alias}' and all its {len(keys_to_delete)} keys?", default=False):
         was_default = (
             category == "PROFILES"
             and config_map.get(prefix + "IS_DEFAULT", "").lower() in ("true", "1", "yes", "y", "on")
         )
         for k in keys_to_delete:
             del config_map[k]
-        ASCIIColors.green(f"\n  🗑️ Deleted {category.lower()[:-1]}: {alias}")
+        ASCIIColors.green(f"\n  🗑️ Deleted {label}: {alias}")
 
         if category == "PROFILES":
             _enforce_single_default_profile(b_type, config_map)
-            if was_default and b_type.upper() == "CONNECTION":
-                ASCIIColors.info("  ℹ️ Default instance profile deleted; first remaining profile promoted.")
+            if was_default:
+                ASCIIColors.info("  ℹ️ Default profile deleted; first remaining profile promoted.")
 
 def _extract_model_name(m: Any) -> Optional[str]:
     """Robustly extracts model name string from raw items (string or dict)."""
@@ -942,9 +1006,7 @@ def _enforce_single_default_profile(b_type: str, config_map: Dict[str, str]) -> 
     """
     profile_prefix = f"{b_type.upper()}_PROFILES_"
     default_flags: List[Tuple[str, str]] = []
-    zero_list = []
-    flagged: List[str] = zero_list
-    flagged = []
+    flagged: List[str] = []
     for key in config_map:
         if key.startswith(profile_prefix) and key.endswith("_IS_DEFAULT"):
             remainder = key[len(profile_prefix): -len("_IS_DEFAULT")]
@@ -952,7 +1014,6 @@ def _enforce_single_default_profile(b_type: str, config_map: Dict[str, str]) -> 
             if config_map.get(key, "").lower() in ("true", "1", "yes", "y", "on"):
                 flagged.append(alias)
             default_flags.append((alias, key))
-            flagged = zero_list + [alias] if config_map.get(key, "").lower() in ("true", "1", "yes", "y", "on") else flagged
 
     if not default_flags:
         return
@@ -973,14 +1034,25 @@ def _enforce_single_default_profile(b_type: str, config_map: Dict[str, str]) -> 
         else:
             config_map[key] = "false"
 def _add_profile_flow(b_type: str, config_map: Dict[str, str]):
-    alias = _sanitize_alias(_safe_input("Enter alias for the profile", "master"))
+    existing = _get_configured_aliases(b_type, config_map, "PROFILES")
+    raw_alias = _safe_input_or_back("Enter alias for the profile", "master")
+    if raw_alias is None:
+        ASCIIColors.yellow("\n  ⚠️ Profile creation cancelled.")
+        return
+    if not raw_alias.strip():
+        alias = _generate_unique_alias("master", existing)
+        ASCIIColors.info(f"  ℹ️ Auto-named profile: {alias}")
+    else:
+        alias = _generate_unique_alias(raw_alias, existing)
+        if alias != _sanitize_alias(raw_alias):
+            ASCIIColors.info(f"  ℹ️ Name collision resolved: {alias}")
     if alias: _configure_profile_instance(b_type, alias, config_map)
 
 def _profiles_menu(b_type: str, config_map: Dict[str, str]):
     while True:
-        menu = Menu(f"{b_type.upper()} Profiles", mode=Menu.MODE_EXECUTE, exit_text="↩ Back")
+        menu = Menu(f"{b_type.upper()} Profiles", mode=Menu.MODE_RETURN, exit_text="↩ Back")
         menu.set_intro("Add a new profile, edit, or delete an existing one.")
-        menu.add_action("Add new profile", lambda: _add_profile_flow(b_type, config_map))
+        menu.add_choice("Add new profile", value=lambda: _add_profile_flow(b_type, config_map))
 
         prefix = f"{b_type.upper()}_PROFILES_"
         existing_aliases = []
@@ -988,10 +1060,14 @@ def _profiles_menu(b_type: str, config_map: Dict[str, str]):
             if k.startswith(prefix) and k.endswith("_BINDING_ALIAS"):
                 alias = k[len(prefix):-len("_BINDING_ALIAS")]
                 existing_aliases.append(alias)
-                menu.add_action(f"Edit profile: {alias}", lambda a=alias: _edit_keys_menu(b_type, "PROFILES", a, config_map))
-                menu.add_action(f"🗑️ Delete profile: {alias}", lambda a=alias: _delete_entry(b_type, "PROFILES", a, config_map))
+                menu.add_choice(f"Edit profile: {alias}", value=lambda a=alias: _edit_keys_menu(b_type, "PROFILES", a, config_map))
+                menu.add_choice(f"🗑️ Delete profile: {alias}", value=lambda a=alias: _delete_entry(b_type, "PROFILES", a, config_map))
 
-        if menu.run() is None: break
+        selection = menu.run()
+        if selection is None:
+            break
+        if callable(selection):
+            selection()
 
 def _modality_menu(b_type: str, config_map: Dict[str, str]):
     if b_type == "connection":
@@ -999,25 +1075,29 @@ def _modality_menu(b_type: str, config_map: Dict[str, str]):
         return
 
     while True:
-        menu = Menu(f"{b_type.upper()} Configuration", mode=Menu.MODE_EXECUTE, exit_text="↩ Back")
+        menu = Menu(f"{b_type.upper()} Configuration", mode=Menu.MODE_RETURN, exit_text="↩ Back")
         menu.set_intro(f"Configure {b_type.upper()} Bindings and Profiles.")
-        menu.add_action(f"Configure {b_type.upper()} Bindings", lambda: _bindings_menu(b_type, config_map))
-        menu.add_action(f"Configure {b_type.upper()} Profiles", lambda: _profiles_menu(b_type, config_map))
-        if menu.run() is None: break
+        menu.add_choice(f"Configure {b_type.upper()} Bindings", value=lambda: _bindings_menu(b_type, config_map))
+        menu.add_choice(f"Configure {b_type.upper()} Profiles", value=lambda: _profiles_menu(b_type, config_map))
+        selection = menu.run()
+        if selection is None:
+            break
+        if callable(selection):
+            selection()
 
 
 def _connection_modality_menu(config_map: Dict[str, str]):
     """Specialized modality menu for CONNECTION bindings (uses instance_name, not model_name)."""
     while True:
-        menu = Menu("CONNECTION Configuration", mode=Menu.MODE_EXECUTE, exit_text="↩ Back")
+        menu = Menu("CONNECTION Configuration", mode=Menu.MODE_RETURN, exit_text="↩ Back")
         menu.set_intro(
             "Configure Connection Bindings (Discord, Telegram, Slack, Webhook, etc.) "
             "and Instance Profiles (which channel to send to)."
         )
-        menu.add_action("🔗 Add Connection Binding", lambda: _add_connection_binding_flow(config_map))
-        menu.add_action("📱 Add Instance Profile (Channel)", lambda: _add_connection_profile_flow(config_map))
-        menu.add_action("✏️ Edit Existing", lambda: _connection_edit_menu(config_map))
-        menu.add_action("🗑️ Delete", lambda: _connection_delete_menu(config_map))
+        menu.add_choice("🔗 Add Connection Binding", value=lambda: _add_connection_binding_flow(config_map))
+        menu.add_choice("📱 Add Instance Profile (Channel)", value=lambda: _add_connection_profile_flow(config_map))
+        menu.add_choice("✏️ Edit Existing", value=lambda: _connection_edit_menu(config_map))
+        menu.add_choice("🗑️ Delete", value=lambda: _connection_delete_menu(config_map))
 
         existing = _get_configured_aliases("connection", config_map, "BINDINGS")
         existing_profiles = _get_configured_aliases("connection", config_map, "PROFILES")
@@ -1026,7 +1106,11 @@ def _connection_modality_menu(config_map: Dict[str, str]):
         if existing_profiles:
             ASCIIColors.info(f"  Configured profiles: {', '.join(existing_profiles)}")
 
-        if menu.run() is None: break
+        selection = menu.run()
+        if selection is None:
+            break
+        if callable(selection):
+            selection()
 
 
 def _add_connection_binding_flow(config_map: Dict[str, str]):
@@ -1040,7 +1124,18 @@ def _add_connection_binding_flow(config_map: Dict[str, str]):
     if not selected:
         return
 
-    alias = _sanitize_alias(_safe_input("Enter an alias for this connection (e.g., 'slack-main', 'discord-ops')", "main"))
+    existing = _get_configured_aliases("connection", config_map, "BINDINGS")
+    raw_alias = _safe_input_or_back("Enter an alias for this connection (e.g., 'slack-main', 'discord-ops')", "main")
+    if raw_alias is None:
+        ASCIIColors.yellow("\n  ⚠️ Connection binding creation cancelled.")
+        return
+    if not raw_alias.strip():
+        alias = _generate_unique_alias("main", existing)
+        ASCIIColors.info(f"  ℹ️ Auto-named binding: {alias}")
+    else:
+        alias = _generate_unique_alias(raw_alias, existing)
+        if alias != _sanitize_alias(raw_alias):
+            ASCIIColors.info(f"  ℹ️ Name collision resolved: {alias}")
     if not alias:
         return
 
@@ -1062,14 +1157,29 @@ def _configure_connection_binding_instance(b_name: str, alias: str, config_map: 
             if not pname:
                 continue
             val = _prompt_param(pname, p.get("description", ""), p.get("type", "str"), p.get("mandatory", False), p.get("default"))
+            if val is _BACK_SENTINEL:
+                ASCIIColors.yellow("\n  ⚠️ Connection binding configuration cancelled. Rolling back partial keys.")
+                for k in [k for k in config_map if k.startswith(prefix)]:
+                    del config_map[k]
+                return
             config_map[prefix + pname.upper()] = _format_env_value(val)
     else:
         # Fallback: prompt for standard connection params
         ASCIIColors.yellow("\n  No description.yaml found. Using standard connection parameters.\n")
         host_val = _prompt_param("host_address", "Platform API base URL or webhook endpoint", "str", False, "")
+        if host_val is _BACK_SENTINEL:
+            ASCIIColors.yellow("\n  ⚠️ Connection binding configuration cancelled. Rolling back partial keys.")
+            for k in [k for k in config_map if k.startswith(prefix)]:
+                del config_map[k]
+            return
         if host_val:
             config_map[prefix + "HOST_ADDRESS"] = _format_env_value(host_val)
         key_val = _prompt_param("service_key", "API key, bot token, or webhook URL (includes credentials)", "str", False, "")
+        if key_val is _BACK_SENTINEL:
+            ASCIIColors.yellow("\n  ⚠️ Connection binding configuration cancelled. Rolling back partial keys.")
+            for k in [k for k in config_map if k.startswith(prefix)]:
+                del config_map[k]
+            return
         if key_val:
             config_map[prefix + "SERVICE_KEY"] = _format_env_value(key_val)
         timeout_val = _prompt_param("timeout", "HTTP timeout in seconds", "int", False, 30)
@@ -1102,10 +1212,21 @@ def _add_connection_profile_flow(config_map: Dict[str, str]):
     if not selected_binding:
         return
 
-    alias = _sanitize_alias(_safe_input(
+    existing = _get_configured_aliases("connection", config_map, "PROFILES")
+    raw_alias = _safe_input_or_back(
         "Enter alias for this instance/channel (e.g., 'general', 'alerts', 'support')",
         "general"
-    ))
+    )
+    if raw_alias is None:
+        ASCIIColors.yellow("\n  ⚠️ Connection profile creation cancelled.")
+        return
+    if not raw_alias.strip():
+        alias = _generate_unique_alias("general", existing)
+        ASCIIColors.info(f"  ℹ️ Auto-named profile: {alias}")
+    else:
+        alias = _generate_unique_alias(raw_alias, existing)
+        if alias != _sanitize_alias(raw_alias):
+            ASCIIColors.info(f"  ℹ️ Name collision resolved: {alias}")
     if not alias:
         return
 
@@ -1470,17 +1591,17 @@ def build_wizard_menu(
             source = Path(cli_env_path).expanduser() if cli_env_path else Path.home() / ".lollms_client" / "config.yaml"
             ASCIIColors.green(f"✅ Loaded existing configuration from: {source}")
 
-    menu = Menu(title, mode=Menu.MODE_EXECUTE, exit_text=exit_text)
+    menu = Menu(title, mode=Menu.MODE_RETURN, exit_text=exit_text)
     menu.set_intro("Select a modality to configure, or save your changes.")
 
-    menu.add_action("🧠 Configure LLM", lambda: _modality_menu("llm", config_map))
-    menu.add_action("🎨 Configure TTI", lambda: _modality_menu("tti", config_map))
-    menu.add_action("🗣️ Configure TTS", lambda: _modality_menu("tts", config_map))
-    menu.add_action("👂 Configure STT", lambda: _modality_menu("stt", config_map))
-    menu.add_action("🎵 Configure TTM", lambda: _modality_menu("ttm", config_map))
-    menu.add_action("🎬 Configure TTV", lambda: _modality_menu("ttv", config_map))
-    menu.add_action("🔗 Configure CONNECTION", lambda: _modality_menu("connection", config_map))
-    menu.add_action("💾 Save", lambda: _save_and_validate(config_map, cli_env_path=cli_env_path))
+    menu.add_choice("🧠 Configure LLM", value=lambda: _modality_menu("llm", config_map))
+    menu.add_choice("🎨 Configure TTI", value=lambda: _modality_menu("tti", config_map))
+    menu.add_choice("🗣️ Configure TTS", value=lambda: _modality_menu("tts", config_map))
+    menu.add_choice("👂 Configure STT", value=lambda: _modality_menu("stt", config_map))
+    menu.add_choice("🎵 Configure TTM", value=lambda: _modality_menu("ttm", config_map))
+    menu.add_choice("🎬 Configure TTV", value=lambda: _modality_menu("ttv", config_map))
+    menu.add_choice("🔗 Configure CONNECTION", value=lambda: _modality_menu("connection", config_map))
+    menu.add_choice("💾 Save", value=lambda: _save_and_validate(config_map, cli_env_path=cli_env_path))
 
     # CONNECTION modality hint for couples counseling
     if "CONNECTION_BINDINGS_" in str(config_map.keys()):
@@ -1497,17 +1618,17 @@ def build_wizard_menu(
             def _save_and_exit_action():
                 _save_and_validate(state["config_map"], cli_env_path=cli_env_path)
                 state["saved"] = True
-            menu.add_action("💾 Save & Exit", _save_and_exit_action)
+            menu.add_choice("💾 Save & Exit", value=_save_and_exit_action)
         elif exit_behavior == "ask":
             def _save_and_exit_action():
                 if _safe_confirm("Save configuration before exiting?", default=True):
                     _save_and_validate(state["config_map"], cli_env_path=cli_env_path)
                     state["saved"] = True
-            menu.add_action("💾 Save & Exit", _save_and_exit_action)
+            menu.add_choice("💾 Save & Exit", value=_save_and_exit_action)
         else:
-            menu.add_action(
+            menu.add_choice(
                 "🔍 Save & Validate Connection",
-                lambda: _save_and_validate(state["config_map"], test_connection=True, cli_env_path=cli_env_path),
+                value=lambda: _save_and_validate(state["config_map"], test_connection=True, cli_env_path=cli_env_path),
             )
 
     return menu, state
@@ -1538,9 +1659,12 @@ def run_wizard_and_save(cli_env_path: Optional[Union[str, Path]] = None):
 
         def _validate_action():
             _save_and_validate(state["config_map"], test_connection=True, cli_env_path=cli_env_path)
-        menu.add_action("🔍 Save & Validate Connection", _validate_action)
+        menu.add_choice("🔍 Save & Validate Connection", value=_validate_action)
 
-        if menu.run() is None or state["saved"]:
+        selection = menu.run()
+        if callable(selection):
+            selection()
+        if selection is None or state["saved"]:
             break
 
 

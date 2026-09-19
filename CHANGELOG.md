@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-19 17:13]
+
+- feat(llm-bindings): add model listing support for Ollama and OpenAI bindings
+
 ## [2026-09-17 12:31]
 
 - fix(cli): remove deprecated chat_core import from __init__.py & update lollms_discussion

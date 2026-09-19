@@ -2958,8 +2958,6 @@ JSON:"""
             if not isinstance(cleanup_response, str) or not cleanup_response.strip():
                 return user_prompt
 
-            # Execute any <lock_file> tags found in the response
-            import re
             lock_tags = re.findall(r'<lock_file>(.*?)</lock_file>', cleanup_response, re.DOTALL | re.IGNORECASE)
 
             if lock_tags:
@@ -2967,7 +2965,6 @@ JSON:"""
                 for body in lock_tags:
                     files_to_lock = [f.strip().replace("\\", "/") for f in re.split(r'[\n,;]+', body) if f.strip()]
                     for f_name in files_to_lock:
-                        # Use the same visibility execution logic as the main chat loop
                         result = self._execute_context_visibility("lock_file", f_name)
                         if "✅ Locking" in result:
                             locked_count += 1
@@ -3541,9 +3538,7 @@ JSON:"""
 
         if enable_data_tools and lcp_binding is None and (tool_files or self._resolved_workspace):
             try:
-                import lollms_client as _lollms_client_pkg
                 from lollms_client.tools_bindings.lcp import LCPBinding
-                pkg_root = Path(_lollms_client_pkg.__file__).resolve().parent
                 lcp_binding = LCPBinding(tools_folders=[])
             except Exception:
                 lcp_binding = None
@@ -4293,14 +4288,6 @@ JSON:"""
 
         import builtins as _builtins_mod_check
         _current_compile = getattr(_builtins_mod_check, 'compile', None)
-        if _current_compile is None or _current_compile.__module__ != 'builtins':
-            ASCIIColors.error(f"[{self.name}] CRITICAL SHADOW DETECTED in chat(): builtins.compile is not native (module: {_current_compile.__module__ if _current_compile else 'None'}). Restoring it.")
-            import importlib as _importlib_check
-            _real_builtins = _importlib_check.import_module('builtins')
-            _builtins_mod_check.compile = _real_builtins.compile
-
-        import builtins as _builtins_mod_check
-        _current_compile = getattr(_builtins_mod_check, 'compile', None)
         if _current_compile is None or getattr(_current_compile, '__module__', '') != 'builtins':
             ASCIIColors.error(f"[{self.name}] CRITICAL SHADOW DETECTED in chat(): builtins.compile is not native (module: {getattr(_current_compile, '__module__', 'None')}). Restoring it.")
             import importlib as _importlib_check
@@ -4431,6 +4418,14 @@ JSON:"""
         while round_count < resolved_max_rounds:
             if self.is_generation_cancelled():
                 was_cancelled = True
+                if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                    try:
+                        streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                            "round_id": round_count,
+                            "status": "cancelled"
+                        })
+                    except Exception:
+                        pass
                 break
 
             round_count += 1
@@ -4438,10 +4433,10 @@ JSON:"""
             if getattr(self, 'debug_mode', False):
                 ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count}/{self._max_rounds} START ===")
 
-            if streaming_callback:
+            if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
                 try:
-                    streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_INFO, {
-                        "round": round_count,
+                    streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_START, {
+                        "round_id": round_count,
                         "max_rounds": self._max_rounds
                     })
                 except Exception:
@@ -4676,10 +4671,26 @@ JSON:"""
                 break
 
             if not _generation_succeeded and not final_response:
+                if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                    try:
+                        streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                            "round_id": round_count,
+                            "status": "generation_error"
+                        })
+                    except Exception:
+                        pass
                 break
 
             if self.is_generation_cancelled():
                 was_cancelled = True
+                if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                    try:
+                        streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                            "round_id": round_count,
+                            "status": "cancelled"
+                        })
+                    except Exception:
+                        pass
                 break
 
             if getattr(self, 'debug_mode', False) and raw_llm_output_buffer:
@@ -4714,6 +4725,14 @@ JSON:"""
                     final_response = round1_text
                     if not ss.was_done_detected():
                         ASCIIColors.info(f"[{self.name}] Round 1 conversational answer. Terminating (authoritative short-circuit).")
+                    if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                        try:
+                            streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                                "round_id": round_count,
+                                "status": "conversational"
+                            })
+                        except Exception:
+                            pass
                     break
 
             if ss.was_done_detected():
@@ -4854,7 +4873,7 @@ JSON:"""
                                 body_match = re.search(r'<art(?:ifact|efact)[^>]*>(.*)</art(?:ifact|efact)>', raw_artifact_xml, re.DOTALL | re.IGNORECASE)
 
                                 if not body_match:
-                                    action_reports.append(f"❌ TRUNCATED ARTIFACT REJECTED. Missing closing tag for '{title}'. Retry generation.")
+                                    action_reports.append("❌ TRUNCATED ARTIFACT REJECTED. Missing closing tag. Retry generation.")
                                     continue
 
                                 body_content = body_match.group(1).strip()
@@ -4862,6 +4881,7 @@ JSON:"""
                                 title = "artifact"
                                 lang = "python"
                                 operation_type = "full_rewrite"
+                                resolved_art_type = "code"
                                 for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
                                     if m.group(1).lower() in ("name", "title"):
                                         title = m.group(2)
@@ -4869,6 +4889,8 @@ JSON:"""
                                         lang = m.group(2)
                                     elif m.group(1).lower() == "operation":
                                         operation_type = m.group(2).lower()
+                                    elif m.group(1).lower() == "type":
+                                        resolved_art_type = m.group(2).lower()
 
                                 is_patch = "<<<<<<< SEARCH" in body_content
                                 is_append = operation_type == "append"
@@ -4922,6 +4944,8 @@ JSON:"""
                                             "You MUST provide a valid SEARCH/REPLACE block inside the <artifact> tag. "
                                             "Do not output an empty artifact. Retry immediately with the correct format."
                                         )
+                                        has_truncated_artifact = True
+                                        truncated_artifact_title = title
                                         continue
 
                                     original_content = file_path.read_text(encoding="utf-8", errors="ignore")
@@ -4940,6 +4964,8 @@ JSON:"""
                                                 extra_data={"title": title, "original_length": len(original_content), "patch_body": body_content[:500]}
                                             )
                                         action_reports.append(f"❌ SEARCH/REPLACE FAILED for {title}. Error: {patch_err}")
+                                        has_truncated_artifact = True
+                                        truncated_artifact_title = title
                                 elif is_append:
                                     if not file_path.exists():
                                         action_reports.append(f"[SYSTEM ERROR] File '{title}' not found. Cannot append. Create it first without operation='append'.")
@@ -4972,7 +4998,7 @@ JSON:"""
                                         continue
 
                                     if self._artefact_manager:
-                                        self._artefact_manager.add(title=title, artefact_type="code", content=body_content, language=lang, active=True)
+                                        self._artefact_manager.add(title=title, artefact_type=resolved_art_type, content=body_content, language=lang, active=True)
                                     file_path = self._resolved_workspace / title
                                     file_path.parent.mkdir(parents=True, exist_ok=True)
                                     file_path.write_text(body_content, encoding="utf-8")
@@ -5104,37 +5130,47 @@ JSON:"""
 
                     ss.completed_actions = []
                     final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
+                    if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                        try:
+                            streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                                "round_id": round_count,
+                                "status": "done"
+                            })
+                        except Exception:
+                            pass
                     break
 
                 if has_truncated_artifact:
+                    consecutive_artifact_failures = getattr(self, '_consecutive_artifact_failures', 0) + 1
+                    object.__setattr__(self, '_consecutive_artifact_failures', consecutive_artifact_failures)
+
+                    if consecutive_artifact_failures >= 3:
+                        ASCIIColors.error(f"[{self.name}] Breaking after {consecutive_artifact_failures} consecutive artifact failures (truncation/empty patch).")
+                        final_response = f"[Task terminated: The agent repeatedly failed to generate a valid artifact for '{truncated_artifact_title}'. Check token limits or patch syntax.]"
+                        if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                            try:
+                                streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                                    "round_id": round_count,
+                                    "status": "loop_break"
+                                })
+                            except Exception:
+                                pass
+                        break
+
                     virtual_history.append(SimpleNamespace(
                         sender_type="user",
                         content=(
-                            f"[SYSTEM: CRITICAL ERROR. Your previous generation of '{truncated_artifact_title}' was TRUNCATED because you hit the token limit. "
+                            f"[SYSTEM: CRITICAL ERROR. Your previous generation of '{truncated_artifact_title}' was TRUNCATED or FAILED. "
                             "The file was NOT saved. You MUST rewrite the COMPLETE file from scratch using a standard <artifact> tag (NOT a SEARCH/REPLACE patch). "
                             "Reproduce the existing content exactly and append the missing ending. Do NOT emit `<done/>` until the file is complete.]"
                         )
                     ))
                     ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
                     continue
+                object.__setattr__(self, '_consecutive_artifact_failures', 0)
 
                 if not ss.completed_actions and not tool_calls_this_turn and not workspace_changes and not ss.was_done_detected() and round_count == 1:
-                    if False:
-                        ASCIIColors.warning(f"[{self.name}] Round 1 preamble stall (text produced, no actions, no <done/>). Injecting continuation mandate.")
-                        virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text()))
-                        virtual_history.append(SimpleNamespace(
-                            sender_type="user",
-                            content=(
-                                "[SYSTEM: CRITICAL. You wrote a conversational preamble but you STOPPED without executing "
-                                "the actual action. Stating intent DOES NOT execute it.\n\n"
-                                "MANDATORY ACTION: You MUST NOW emit the functional tag to perform the action you just described.\n"
-                                "- If you said you would unlock files, emit: <unlock_file>filename.pdf</unlock_file>\n"
-                                "- If your task is truly complete, output your final answer and end with <done/>.\n\n"
-                                "Do NOT write another preamble. Emit the functional tag NOW.]"
-                            )
-                        ))
-                        ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
-                        continue
+                    pass
 
                 if not final_response.strip():
                     if getattr(self, 'debug_mode', False):
@@ -5152,6 +5188,14 @@ JSON:"""
                         )
                     ASCIIColors.warning(f"[{self.name}] Empty response after <done/> with no prior actions. Terminating.")
                     final_response = "[Task terminated: The agent produced no actionable output.]"
+                    if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                        try:
+                            streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                                "round_id": round_count,
+                                "status": "text_stall"
+                            })
+                        except Exception:
+                            pass
                     break
 
                 sanitized_final_response = re.sub(r'<[^>]+>', '', final_response).strip()
@@ -5173,6 +5217,14 @@ JSON:"""
                     continue
                 if getattr(self, 'debug_mode', False):
                     ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: <done/> detected ===")
+                if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                    try:
+                        streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                            "round_id": round_count,
+                            "status": "done"
+                        })
+                    except Exception:
+                        pass
                 break
 
             if ss.completed_actions:
@@ -5322,7 +5374,7 @@ JSON:"""
                             body_match = re.search(r'<art(?:ifact|efact)[^>]*>(.*)</art(?:ifact|efact)>', raw_artifact_xml, re.DOTALL | re.IGNORECASE)
 
                             if not body_match:
-                                action_reports.append(f"❌ TRUNCATED ARTIFACT REJECTED. Missing closing tag for '{title}'. Retry generation.")
+                                action_reports.append("❌ TRUNCATED ARTIFACT REJECTED. Missing closing tag. Retry generation.")
                                 continue
 
                             body_content = body_match.group(1).strip()
@@ -5649,6 +5701,14 @@ JSON:"""
 
                 ss.completed_actions = []
                 ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
+                if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                    try:
+                        streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                            "round_id": round_count,
+                            "status": "action"
+                        })
+                    except Exception:
+                        pass
                 if getattr(self, 'debug_mode', False):
                     ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Actions dispatched, continuing ===")
                 continue
@@ -5656,6 +5716,14 @@ JSON:"""
             if ss.was_done_detected() and not ss.completed_actions:
                 if getattr(self, 'debug_mode', False):
                     ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: <done/> detected (no actions) ===")
+                if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                    try:
+                        streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                            "round_id": round_count,
+                            "status": "done"
+                        })
+                    except Exception:
+                        pass
                 break
 
             raw_round_text = ss.get_clean_text()
@@ -5678,6 +5746,14 @@ JSON:"""
                     final_response = re.sub(r'(?i)<done\s*/?>', '', raw_round_text).strip()
                     if not ss.was_done_detected():
                         ASCIIColors.info(f"[{self.name}] Round 1 conversational answer without <done/>. Terminating (conversational short-circuit).")
+                    if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                        try:
+                            streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                                "round_id": round_count,
+                                "status": "conversational"
+                            })
+                        except Exception:
+                            pass
                     break
 
             # ── 🧹 DYNAMIC HISTORY SANITIZATION (Strict Non-Placeholder Strategy) ──
@@ -5696,6 +5772,14 @@ JSON:"""
                 final_response = done_pattern.sub('', raw_round_text).strip()
                 if getattr(self, 'debug_mode', False):
                     ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: <done/> detected (fallback) ===")
+                if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                    try:
+                        streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                            "round_id": round_count,
+                            "status": "done"
+                        })
+                    except Exception:
+                        pass
                 break
 
             # ── 🛡️ SAFETY NET: Detect phantom artifact processing ──
@@ -5827,6 +5911,14 @@ JSON:"""
                     final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
                     if not final_response:
                         final_response = "[Task terminated: The agent produced repetitive text due to a tool failure or sandbox restriction. The last tool call may have been blocked.]"
+                    if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                        try:
+                            streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                                "round_id": round_count,
+                                "status": "loop_break"
+                            })
+                        except Exception:
+                            pass
                     break
 
                 ASCIIColors.warning(f"[{self.name}] Repetitive text preamble detected (Round {round_count}, streak: {consecutive_stall_count}/3). Injecting correction — NOT terminating.")
@@ -5868,6 +5960,14 @@ JSON:"""
                     final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
                     if not final_response:
                         final_response = "[Task terminated: The agent stalled repeatedly without producing actionable output. This may indicate the context window is full or the task is too complex for the current model.]"
+                    if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                        try:
+                            streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                                "round_id": round_count,
+                                "status": "text_stall"
+                            })
+                        except Exception:
+                            pass
                     break
 
                 ASCIIColors.warning(f"[{self.name}] Mid-task stall detected (Round {round_count}, consecutive: {consecutive_stall_count}). LLM stopped without <done/> or new actions. Forcing continuation.")
@@ -5915,6 +6015,14 @@ JSON:"""
                     if empty_response_count >= 2:
                         ASCIIColors.warning(f"[{self.name}] Consecutive empty LLM responses detected ({empty_response_count}). Terminating loop to prevent spin.")
                         final_response = "[Terminated: LLM stopped generating without completing the task.]"
+                        if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                            try:
+                                streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                                    "round_id": round_count,
+                                    "status": "text_stall"
+                                })
+                            except Exception:
+                                pass
                         break
 
                     ASCIIColors.warning(f"[{self.name}] Empty LLM response detected after action (attempt {empty_response_count}). Injecting continuation mandate.")
@@ -6009,6 +6117,14 @@ JSON:"""
                     final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
                     if not final_response:
                         final_response = "[Task terminated: The agent repeatedly produced text preambles without executing any actions.]"
+                    if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                        try:
+                            streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                                "round_id": round_count,
+                                "status": "text_stall"
+                            })
+                        except Exception:
+                            pass
                     break
 
                 ASCIIColors.warning(f"[{self.name}] LLM stopped without <done/> after tools were executed (stall #{consecutive_stall_count}). Injecting continuation mandate.")
@@ -6047,6 +6163,14 @@ JSON:"""
                         "(input exceeds the model's maximum context length). Try unloading files with /clear-files, "
                         "clearing history with /clear-history, or switching to a model with a larger context window.]"
                     )
+                    if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                        try:
+                            streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                                "round_id": round_count,
+                                "status": "text_stall"
+                            })
+                        except Exception:
+                            pass
                     break
 
                 ASCIIColors.warning(f"[{self.name}] Empty LLM response on round 1 (no actions, no <done/>). Possible context exhaustion. Injecting continuation mandate (attempt {empty_response_count}).")
@@ -6078,6 +6202,14 @@ JSON:"""
                         ASCIIColors.warning(f"[{self.name}] Terminating after {consecutive_stall_count} consecutive text-only stalls. LLM is stuck in preamble mode.")
                     if not final_response:
                         final_response = "[Task terminated: The agent repeatedly produced text preambles without executing any actions.]"
+                    if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                        try:
+                            streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                                "round_id": round_count,
+                                "status": "text_stall"
+                            })
+                        except Exception:
+                            pass
                     break
 
                 if getattr(self, 'debug_mode', False):
@@ -6100,28 +6232,15 @@ JSON:"""
 
             if getattr(self, 'debug_mode', False):
                 ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Clean exit ===")
+            if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                try:
+                    streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                        "round_id": round_count,
+                        "status": "done"
+                    })
+                except Exception:
+                    pass
             break
-
-        context_health = {"used_tokens": 0, "max_tokens": 0, "fill_percentage": 0.0}
-        try:
-            if self.lollms_client and hasattr(self.lollms_client, 'get_ctx_size'):
-                max_ctx = self.lollms_client.get_ctx_size() or 0
-                if max_ctx > 0:
-                    total_used = 0
-                    if hasattr(self.lollms_client, 'count_tokens'):
-                        total_used = self.lollms_client.count_tokens(stable_system_prompt)
-                        for msg in base_conversation:
-                            total_used += self.lollms_client.count_tokens(msg.get("content", ""))
-                        for vh in virtual_history:
-                            total_used += self.lollms_client.count_tokens(vh.content)
-                        total_used += self.lollms_client.count_tokens(final_response)
-                    context_health = {
-                        "used_tokens": total_used,
-                        "max_tokens": max_ctx,
-                        "fill_percentage": round((total_used / max_ctx) * 100, 1)
-                    }
-        except Exception:
-            pass
 
         if not final_response and ss:
             final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
@@ -6141,7 +6260,7 @@ JSON:"""
                         body_match = re.search(r'<art(?:ifact|efact)[^>]*>(.*)</art(?:ifact|efact)>', raw_artifact_xml, re.DOTALL | re.IGNORECASE)
 
                         if not body_match:
-                            action_reports.append(f"❌ TRUNCATED ARTIFACT REJECTED. Missing closing tag for '{title}'. Retry generation.")
+                            action_reports.append("❌ TRUNCATED ARTIFACT REJECTED. Missing closing tag. Retry generation.")
                             continue
 
                         body_content = body_match.group(1).strip()

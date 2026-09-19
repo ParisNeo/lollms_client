@@ -1,47 +1,52 @@
 # bindings/OpenAI/binding.py
-import requests
-import json
-from lollms_client.lollms_llm_binding import LollmsLLMBinding
-from lollms_client.lollms_types import MSG_TYPE
-from lollms_client.lollms_utilities import encode_image
-from lollms_client.lollms_types import ELF_COMPLETION_FORMAT
-from lollms_client.lollms_discussion import LollmsDiscussion
-from typing import Optional, Callable, List, Union
-from ascii_colors import ASCIIColors, trace_exception
-from typing import List, Dict
-import math
-import httpx
-import pipmaster as pm
-import mimetypes
-pm.ensure_packages(["openai","tiktoken"])
-from pathlib import Path
-import ssl
+from __future__ import annotations
 
-import openai
-import tiktoken
-import os
 import base64
+import math
+import mimetypes
+import os
+import ssl
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Union
+
+import httpx
+import openai
+import pipmaster as pm
+import tiktoken
+from ascii_colors import ASCIIColors, trace_exception
+
+from lollms_client.lollms_llm_binding import LollmsLLMBinding
+from lollms_client.lollms_types import ELF_COMPLETION_FORMAT, MSG_TYPE
+
+pm.ensure_packages(["openai", "tiktoken"])
+
 BindingName = "OpenAIBinding"
+
+_NIM_FUNCTION_NAME_PLACEHOLDER = "23d4f03a-b8a6-4adb-a183-7daa083a09cc"
 
 
 def _read_file_as_base64(path):
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
 
+
 def _extract_markdown_path(s):
     s = s.strip()
     if s.startswith("[") and s.endswith(")"):
         lb, rb = s.find("["), s.find("]")
         if lb != -1 and rb != -1 and rb > lb:
-            return s[lb+1:rb].strip()
+            return s[lb + 1 : rb].strip()
     return s
+
 
 def _guess_mime_from_name(name, default="image/jpeg"):
     mime, _ = mimetypes.guess_type(name)
     return mime or default
 
+
 def _to_data_url(b64_str, mime):
     return f"data:{mime};base64,{b64_str}"
+
 
 def normalize_image_input(img, default_mime="image/jpeg"):
     """
@@ -69,24 +74,24 @@ def normalize_image_input(img, default_mime="image/jpeg"):
 
     if isinstance(img, str):
         s = _extract_markdown_path(img)
-        # Accept already-correct data URLs as-is
         if s.startswith("data:"):
             return {"type": "input_image", "image_url": s}
-        # Local path heuristics: exists on disk or looks like a path
-        if os.path.exists(s) or (":" in s and "\\" in s) or s.startswith("/") or s.startswith("."):
+        if os.path.exists(s) or (":" in s and "\\" in s) or s.startswith(("/", ".")):
             b64 = _read_file_as_base64(s)
             mime = _guess_mime_from_name(s, default_mime)
             return {"type": "input_image", "image_url": _to_data_url(b64, mime)}
-        # Otherwise, treat as raw base64 payload
         return {"type": "input_image", "image_url": _to_data_url(s, default_mime)}
 
     raise ValueError("Unsupported image input type")
+
+
 class OpenAIBinding(LollmsLLMBinding):
     """OpenAI-specific binding implementation"""
-    
-    
-    def __init__(self,
-                 **kwargs):
+
+    def __init__(
+        self,
+        **kwargs,
+    ):
         """
         Initialize the OpenAI binding.
 
@@ -98,26 +103,31 @@ class OpenAIBinding(LollmsLLMBinding):
             personality (Optional[int]): Ignored parameter for compatibility with LollmsLLMBinding.
         """
         super().__init__(BindingName, **kwargs)
-        
-        self.host_address=kwargs.get("host_address")
-        self.model_name=kwargs.get("model_name")
-        self.service_key=kwargs.get("service_key")
-        self.verify_ssl_certificate=kwargs.get("verify_ssl_certificate", True)
-        self.certificate_file_path=kwargs.get("certificate_file_path", None)
-        self.default_completion_format=kwargs.get("default_completion_format", ELF_COMPLETION_FORMAT.Chat)
+
+        self.host_address = kwargs.get("host_address")
+        self.model_name = kwargs.get("model_name")
+        self.service_key = kwargs.get("service_key")
+        self.verify_ssl_certificate = kwargs.get("verify_ssl_certificate", True)
+        self.certificate_file_path = kwargs.get("certificate_file_path", None)
+        self.default_completion_format = kwargs.get(
+            "default_completion_format", ELF_COMPLETION_FORMAT.Chat
+        )
         self.is_vllm = kwargs.get("is_vllm", False)
         self.send_thinking_parameter = kwargs.get("send_thinking_parameter", True)
         self.thinking_effort_keyword = kwargs.get("thinking_effort_keyword", "enable_thinking")
 
         self.base_address = self.host_address
         if self.base_address:
-            self.open_ai_host_address = f"{self.base_address}" if self.base_address.endswith("/v1") else f"{self.base_address}/v1"
+            self.open_ai_host_address = (
+                f"{self.base_address}"
+                if self.base_address.endswith("/v1")
+                else f"{self.base_address}/v1"
+            )
         else:
             self.open_ai_host_address = None
 
         if not self.service_key:
             self.service_key = os.getenv("OPENAI_API_KEY", self.service_key)
-
 
         self.verify = True
         verify = True
@@ -130,13 +140,9 @@ class OpenAIBinding(LollmsLLMBinding):
             cert_path = Path(self.certificate_file_path)
 
             if not cert_path.exists():
-                raise FileNotFoundError(
-                    f"Certificate file not found: {cert_path}"
-                )
+                raise FileNotFoundError(f"Certificate file not found: {cert_path}")
 
-            ssl_context = ssl.create_default_context(
-                cafile=str(cert_path)
-            )
+            ssl_context = ssl.create_default_context(cafile=str(cert_path))
             self.verify = cert_path
             verify = ssl_context
 
@@ -145,8 +151,8 @@ class OpenAIBinding(LollmsLLMBinding):
             base_url=self.open_ai_host_address,
             http_client=httpx.Client(
                 verify=verify,
-                timeout=300.0
-            )
+                timeout=300.0,
+            ),
         )
         self.completion_format = ELF_COMPLETION_FORMAT.Chat
 
@@ -160,14 +166,24 @@ class OpenAIBinding(LollmsLLMBinding):
             "gpt-4o",
             "o1",
             "o3",
-            "o4"
+            "o4",
         ]
 
         allowed_params = {
-            "model", "messages", "temperature", "top_p", "n",
-            "stop", "max_tokens", "presence_penalty", "frequency_penalty",
-            "logit_bias", "stream", "user", "max_completion_tokens",
-            "reasoning_effort"
+            "model",
+            "messages",
+            "temperature",
+            "top_p",
+            "n",
+            "stop",
+            "max_tokens",
+            "presence_penalty",
+            "frequency_penalty",
+            "logit_bias",
+            "stream",
+            "user",
+            "max_completion_tokens",
+            "reasoning_effort",
         }
 
         params = {
@@ -179,13 +195,15 @@ class OpenAIBinding(LollmsLLMBinding):
             if k in allowed_params and v is not None:
                 params[k] = v
             else:
-                if v is not None and kwargs.get("debug",False):
+                if v is not None and kwargs.get("debug", False):
                     ASCIIColors.warning(f"Removed unsupported OpenAI param '{k}'")
 
         model_lower = model.lower()
         if any(fam in model_lower for fam in restricted_families):
             if "temperature" in params and params["temperature"] != 1:
-                ASCIIColors.warning(f"{model} does not support temperature != 1. Overriding to 1.")
+                ASCIIColors.warning(
+                    f"{model} does not support temperature != 1. Overriding to 1."
+                )
                 params["temperature"] = 1
             if "top_p" in params:
                 ASCIIColors.warning(f"{model} does not support top_p. Removing it.")
@@ -223,9 +241,8 @@ class OpenAIBinding(LollmsLLMBinding):
         think: Optional[bool] = False,
         reasoning_effort: Optional[str] = "low",
         reasoning_summary: Optional[str] = "auto",
-        **kwargs
+        **kwargs,
     ) -> Union[str, dict]:
-
         count = 0
         output = ""
 
@@ -235,7 +252,7 @@ class OpenAIBinding(LollmsLLMBinding):
         messages = [
             {
                 "role": "system",
-                "content": system_prompt or "You are a helpful assistant."
+                "content": system_prompt or "You are a helpful assistant.",
             }
         ]
 
@@ -244,21 +261,18 @@ class OpenAIBinding(LollmsLLMBinding):
                 messages += self.split_discussion(
                     prompt,
                     user_keyword=user_keyword,
-                    ai_keyword=ai_keyword
+                    ai_keyword=ai_keyword,
                 )
                 last = messages[-1]
-                last["content"] = (
-                    [{"type": "text", "text": last["content"]}]
-                    + [normalize_image_input(img) for img in images]
-                )
+                last["content"] = [{"type": "text", "text": last["content"]}] + [
+                    normalize_image_input(img) for img in images
+                ]
             else:
                 messages.append(
                     {
                         "role": "user",
-                        "content": (
-                            [{"type": "text", "text": prompt}]
-                            + [normalize_image_input(img) for img in images]
-                        )
+                        "content": [{"type": "text", "text": prompt}]
+                        + [normalize_image_input(img) for img in images],
                     }
                 )
         else:
@@ -266,14 +280,11 @@ class OpenAIBinding(LollmsLLMBinding):
                 messages += self.split_discussion(
                     prompt,
                     user_keyword=user_keyword,
-                    ai_keyword=ai_keyword
+                    ai_keyword=ai_keyword,
                 )
             else:
                 messages.append(
-                    {
-                        "role": "user",
-                        "content": [{"type": "text", "text": prompt}]
-                    }
+                    {"role": "user", "content": [{"type": "text", "text": prompt}]}
                 )
 
         # ── Helper: extract reasoning from any delta / message object ─────────
@@ -285,12 +296,10 @@ class OpenAIBinding(LollmsLLMBinding):
             return None
 
         try:
-
             # ══════════════════════════════════════════════════════════════════
             # Chat-completion path
             # ══════════════════════════════════════════════════════════════════
             if self.completion_format == ELF_COMPLETION_FORMAT.Chat:
-
                 params = self._build_openai_params(
                     messages=messages,
                     n_predict=n_predict,
@@ -298,7 +307,7 @@ class OpenAIBinding(LollmsLLMBinding):
                     temperature=temperature,
                     top_p=top_p,
                     repeat_penalty=repeat_penalty,
-                    seed=seed
+                    seed=seed,
                 )
 
                 # ── Inject reasoning params ────────────────────────────────
@@ -310,9 +319,13 @@ class OpenAIBinding(LollmsLLMBinding):
                         # Chat Completions uses flat reasoning_effort, not the
                         # nested `reasoning` dict (that is Responses API only).
                         # OpenAI accepts minimal/low/medium/high — clamp "max".
-                        params["reasoning_effort"] = effort if effort != "max" else "high"
+                        params["reasoning_effort"] = (
+                            effort if effort != "max" else "high"
+                        )
                         if reasoning_summary and reasoning_summary != "auto":
-                            params.setdefault("extra_body", {})["reasoning_summary"] = reasoning_summary
+                            params.setdefault("extra_body", {})[
+                                "reasoning_summary"
+                            ] = reasoning_summary
                         params.pop("temperature", None)
                         params.pop("top_p", None)
                 else:
@@ -361,32 +374,40 @@ class OpenAIBinding(LollmsLLMBinding):
                         if reasoning:
                             if not in_reasoning:
                                 in_reasoning = True
-                                chunk = "<think>\n"
+                                chunk = "🧠\n"
                                 output += chunk
                                 if streaming_callback:
-                                    streaming_callback(chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                                    streaming_callback(
+                                        chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK
+                                    )
                             output += reasoning
                             if streaming_callback:
-                                streaming_callback(reasoning, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                                streaming_callback(
+                                    reasoning, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK
+                                )
                             count += 1
                             continue
 
                         if content:
                             if in_reasoning:
                                 in_reasoning = False
-                                closing = "\n</think>\n"
+                                closing = "\n\n✈️\n\n"
                                 output += closing
                                 if streaming_callback:
-                                    streaming_callback(closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                                    streaming_callback(
+                                        closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK
+                                    )
                             output += content
                             if streaming_callback:
-                                if not streaming_callback(content, MSG_TYPE.MSG_TYPE_CHUNK):
+                                if not streaming_callback(
+                                    content, MSG_TYPE.MSG_TYPE_CHUNK
+                                ):
                                     break
                             count += 1
 
-                    # Close any dangling <think> block
+                    # Close any dangling 🧠 block
                     if in_reasoning:
-                        closing = "\n</think>\n"
+                        closing = "\n\n✈️\n\n"
                         output += closing
                         if streaming_callback:
                             streaming_callback(closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
@@ -399,9 +420,9 @@ class OpenAIBinding(LollmsLLMBinding):
 
                     if reasoning:
                         # Server returned reasoning separately — wrap it
-                        output = f"<think>\n{reasoning}\n</think>\n{content}"
+                        output = f"🧠\n{reasoning}\n\n✈️\n\n{content}"
                     else:
-                        # vLLM (and some others) embed <think>…</think> directly
+                        # vLLM (and some others) embed 🧠…✈️ directly
                         # in content, or thinking was disabled — pass through as-is
                         output = content
 
@@ -416,7 +437,7 @@ class OpenAIBinding(LollmsLLMBinding):
                     temperature=temperature,
                     top_p=top_p,
                     repeat_penalty=repeat_penalty,
-                    seed=seed
+                    seed=seed,
                 )
 
                 try:
@@ -460,7 +481,6 @@ class OpenAIBinding(LollmsLLMBinding):
 
         return output
 
-    
     def generate_from_messages(
         self,
         messages: List[Dict],
@@ -472,11 +492,10 @@ class OpenAIBinding(LollmsLLMBinding):
         seed: Optional[int] = None,
         streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
         think: Optional[bool] = False,
-        reasoning_effort: Optional[str] = "low",   # low, medium, high
+        reasoning_effort: Optional[str] = "low",  # low, medium, high
         reasoning_summary: Optional[str] = "auto",  # auto
-        **kwargs
+        **kwargs,
     ) -> Union[str, dict]:
-
         # ── Normalize messages to the OpenAI wire format ──────────────────────
         # OpenAI Chat Completions only accepts these roles:
         #   system, developer, user, assistant, tool, function
@@ -541,11 +560,9 @@ class OpenAIBinding(LollmsLLMBinding):
                 openai_content.append({"type": "text", "text": text_content})
             for img in images:
                 img_url = img
-                if not img.startswith("http") and not img.startswith("data:"):
+                if not img.startswith(("http", "data:")):
                     img_url = f"data:image/jpeg;base64,{img}"
-                openai_content.append(
-                    {"type": "image_url", "image_url": {"url": img_url}}
-                )
+                openai_content.append({"type": "image_url", "image_url": {"url": img_url}})
             return {"role": role, "content": openai_content}
 
         # ── Helper: extract reasoning from any delta / message object ─────────
@@ -558,7 +575,7 @@ class OpenAIBinding(LollmsLLMBinding):
 
         openai_messages = [normalize_message(m) for m in messages]
 
-        # ── 🛡️ NVIDIA NIM / STRICT ENDPOINT TOOL SANITIZATION ──
+        # ── NVIDIA NIM / STRICT ENDPOINT TOOL SANITIZATION ──
         # The NVIDIA OpenAI-compatible endpoint strictly validates function IDs.
         # It throws 404 NotFoundError if an unregistered UUID is passed inside the `tools` array.
         # Ollama and vLLM ignore this, but we must sanitize the payload for strict routers.
@@ -582,7 +599,9 @@ class OpenAIBinding(LollmsLLMBinding):
                     func_def["strict"] = False
                     # Remove any UUID hidden inside function name or description
                     if "name" in func_def and isinstance(func_def["name"], str):
-                        func_def["name"] = func_def["name"].replace("23d4f03a-b8a6-4adb-a183-7daa083a09cc", "lcp_tool")
+                        func_def["name"] = func_def["name"].replace(
+                            _NIM_FUNCTION_NAME_PLACEHOLDER, "lcp_tool"
+                        )
                 sanitized_tools.append(tool)
 
         # ── Build base params ─────────────────────────────────────────────────
@@ -618,14 +637,15 @@ class OpenAIBinding(LollmsLLMBinding):
                 # OpenAI accepts minimal/low/medium/high — clamp "max".
                 params["reasoning_effort"] = effort if effort != "max" else "high"
                 if reasoning_summary and reasoning_summary != "auto":
-                    params.setdefault("extra_body", {})["reasoning_summary"] = reasoning_summary
+                    params.setdefault("extra_body", {})[
+                        "reasoning_summary"
+                    ] = reasoning_summary
                 params.pop("temperature", None)
                 params.pop("top_p", None)
         else:
             if self.is_vllm:
                 self._apply_vllm_thinking_kwargs(params, None)
 
-        effort = self.normalize_reasoning_effort(think, reasoning_effort)
         output = ""
 
         try:
@@ -636,12 +656,18 @@ class OpenAIBinding(LollmsLLMBinding):
             except Exception as ex:
                 trace_exception(ex)
 
-                # 🛡️ CRITICAL FIX: NVIDIA NIM 404 Function Not Found Interceptor
+                # NVIDIA NIM 404 Function Not Found Interceptor
                 # If NVIDIA's strict endpoint still rejects the sanitized tools payload,
                 # we intercept the 404 NotFoundError specifically related to function IDs
                 # and retry WITHOUT the tools array entirely to save the generation.
-                if isinstance(ex, openai.NotFoundError) and "Function" in str(ex) and "Not found for account" in str(ex):
-                    ASCIIColors.warning("[NIM Strict Validation] Intercepted 404 Function Not Found. Retrying without tools array.")
+                if (
+                    isinstance(ex, openai.NotFoundError)
+                    and "Function" in str(ex)
+                    and "Not found for account" in str(ex)
+                ):
+                    ASCIIColors.warning(
+                        "[NIM Strict Validation] Intercepted 404 Function Not Found. Retrying without tools array."
+                    )
                     params.pop("tools", None)
                     params.pop("tool_choice", None)
                     completion = self.client.chat.completions.create(**params)
@@ -678,10 +704,12 @@ class OpenAIBinding(LollmsLLMBinding):
                     if reasoning:
                         if not in_reasoning:
                             in_reasoning = True
-                            opening = "<think>\n"
+                            opening = "🧠\n"
                             output += opening
                             if streaming_callback:
-                                streaming_callback(opening, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                                streaming_callback(
+                                    opening, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK
+                                )
                         output += reasoning
                         if streaming_callback:
                             streaming_callback(reasoning, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
@@ -690,18 +718,20 @@ class OpenAIBinding(LollmsLLMBinding):
                     if content:
                         if in_reasoning:
                             in_reasoning = False
-                            closing = "\n</think>\n"
+                            closing = "\n\n✈️\n\n"
                             output += closing
                             if streaming_callback:
-                                streaming_callback(closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                                streaming_callback(
+                                    closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK
+                                )
                         output += content
                         if streaming_callback:
                             if not streaming_callback(content, MSG_TYPE.MSG_TYPE_CHUNK):
                                 break
 
-                # Close any dangling <think> block
+                # Close any dangling 🧠 block
                 if in_reasoning:
-                    closing = "\n</think>\n"
+                    closing = "\n\n✈️\n\n"
                     output += closing
                     if streaming_callback:
                         streaming_callback(closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
@@ -714,9 +744,9 @@ class OpenAIBinding(LollmsLLMBinding):
 
                 if reasoning:
                     # Server returned reasoning separately — wrap it
-                    output = f"<think>\n{reasoning}\n</think>\n{content}"
+                    output = f"🧠\n{reasoning}\n\n✈️\n\n{content}"
                 else:
-                    # vLLM (and some others) embed <think>…</think> in content,
+                    # vLLM (and some others) embed 🧠…✈️ in content,
                     # or thinking was disabled — pass through as-is
                     output = content
 
@@ -728,7 +758,6 @@ class OpenAIBinding(LollmsLLMBinding):
             return {"status": "error", "message": err_msg}
 
         return output
-        
 
     def _get_encoding(self, model_name: str | None = None):
         """
@@ -819,7 +848,7 @@ class OpenAIBinding(LollmsLLMBinding):
             if model_name.lower().startswith(key):
                 return price
         return 0.0
-    
+
     def count_tokens(self, text: str) -> int:
         """
         Count tokens from a text.
@@ -829,10 +858,8 @@ class OpenAIBinding(LollmsLLMBinding):
 
         Returns:
             int: Number of tokens in text.
-        """        
+        """
         return len(self.tokenize(text))
-
-        
 
     def embed(self, text: str | list[str], normalize: bool = False, **kwargs) -> list:
         """
@@ -841,7 +868,7 @@ class OpenAIBinding(LollmsLLMBinding):
         Args:
             text (str | list[str]): Input text or list of texts to embed.
             normalize (bool): Whether to normalize the resulting vector(s) to unit length.
-            **kwargs: Additional arguments. The 'model' argument can be used 
+            **kwargs: Additional arguments. The 'model' argument can be used
                     to specify the embedding model (e.g., "text-embedding-3-small").
                     Defaults to "text-embedding-3-small".
 
@@ -863,23 +890,24 @@ class OpenAIBinding(LollmsLLMBinding):
         max_tokens_map = {
             "text-embedding-3-small": 8191,
             "text-embedding-3-large": 8191,
-            "text-embedding-ada-002": 8191
+            "text-embedding-ada-002": 8191,
         }
         max_tokens = max_tokens_map.get(embedding_model, None)
         if max_tokens is not None:
             input_texts = [
-                self.detokenize(self.tokenize(t)[:max_tokens])
-                for t in input_texts
+                self.detokenize(self.tokenize(t)[:max_tokens]) for t in input_texts
             ]
 
         try:
             response = self.client.embeddings.create(
                 model=embedding_model,
-                input=input_texts
+                input=input_texts,
             )
 
             if not response.data:
-                ASCIIColors.warning(f"OpenAI API returned no data for the embedding request (model: {embedding_model}).")
+                ASCIIColors.warning(
+                    f"OpenAI API returned no data for the embedding request (model: {embedding_model})."
+                )
                 return []
 
             embeddings = [item.embedding for item in response.data]
@@ -887,17 +915,18 @@ class OpenAIBinding(LollmsLLMBinding):
             # Normalize if requested
             if normalize:
                 embeddings = [
-                    [v / math.sqrt(sum(x*x for x in emb)) for v in emb]
+                    [v / math.sqrt(sum(x * x for x in emb)) for v in emb]
                     for emb in embeddings
                 ]
 
             return embeddings[0] if is_single_input else embeddings
 
         except Exception as e:
-            ASCIIColors.error(f"Failed to generate embeddings using model '{embedding_model}': {e}")
+            ASCIIColors.error(
+                f"Failed to generate embeddings using model '{embedding_model}': {e}"
+            )
             trace_exception(e)
             return []
-
 
     def _get_ctx_size(self, model_name: str | None = None) -> int:
         """
@@ -941,7 +970,6 @@ class OpenAIBinding(LollmsLLMBinding):
         # Fallback: default safe value
         return None
 
-
     def get_model_info(self) -> dict:
         """
         Return information about the current OpenAI model.
@@ -953,7 +981,7 @@ class OpenAIBinding(LollmsLLMBinding):
             "name": "OpenAI",
             "version": "2.0",
             "host_address": self.host_address,
-            "model_name": self.model_name
+            "model_name": self.model_name,
         }
 
     def list_models(self) -> List[Dict]:
@@ -983,7 +1011,7 @@ class OpenAIBinding(LollmsLLMBinding):
             "davinci",
             "curie",
             "babbage",
-            "ada"
+            "ada",
         )
 
         models_info = []
@@ -1000,27 +1028,30 @@ class OpenAIBinding(LollmsLLMBinding):
                         if isinstance(context_length, int)
                         else "unknown"
                     )
-                    models_info.append({
-                        "model_name": model_id,
-                        "owned_by": getattr(model, "owned_by", "N/A"),
-                        "created": getattr(model, "created", "N/A"),
-                        "context_length": context_length,
-                        "max_generation": max_generation,
-                    })
+                    models_info.append(
+                        {
+                            "model_name": model_id,
+                            "owned_by": getattr(model, "owned_by", "N/A"),
+                            "created": getattr(model, "created", "N/A"),
+                            "context_length": context_length,
+                            "max_generation": max_generation,
+                        }
+                    )
                 else:
-                    models_info.append({
-                        "model_name": model_id,
-                        "owned_by": getattr(model, "owned_by", "N/A"),
-                        "created": getattr(model, "created", "N/A"),
-                        "context_length": None,
-                        "max_generation": None,
-                    })
-                    
+                    models_info.append(
+                        {
+                            "model_name": model_id,
+                            "owned_by": getattr(model, "owned_by", "N/A"),
+                            "created": getattr(model, "created", "N/A"),
+                            "context_length": None,
+                            "max_generation": None,
+                        }
+                    )
+
         except Exception as e:
             print(f"Failed to list models: {e}")
 
         return models_info
-
 
     def load_model(self, model_name: str) -> bool:
         """

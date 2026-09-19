@@ -196,7 +196,11 @@ class CoreMixin:
         if db_manager:
            with db_manager.get_session() as session:
                valid_keys = db_manager.DiscussionModel.__table__.columns.keys()
-               db_creation_args = {k: v for k, v in kwargs.items() if k in valid_keys}
+               history_bearing_keys = {"messages", "active_branch_id", "pruning_summary", "pruning_point_id"}
+               db_creation_args = {
+                   k: v for k, v in kwargs.items()
+                   if k in valid_keys and k not in history_bearing_keys
+               }
                if 'id' not in db_creation_args:
                    db_creation_args['id'] = str(uuid.uuid4())
                db_discussion_orm = db_manager.DiscussionModel(**db_creation_args)

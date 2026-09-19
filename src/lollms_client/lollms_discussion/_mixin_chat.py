@@ -1062,15 +1062,16 @@ class _StreamState:
                         )
                     else:
                         ASCIIColors.warning("[StreamState] Duplicate artifact tag detected. Skipping dispatch.")
+                        if "<<<<<<< SEARCH" in self._artefact_buffer:
+                            self._last_dispatch_failed = True
                         self._action_dispatched = True
                         return False
 
                     # Close the processing block cleanly with status metadata INSIDE the block.
                     if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
-                        if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
-                            proc_close_tag = '\n<!-- status:finished -->\n</processing>\n'
-                    self.ai_message.content += proc_close_tag
-                    _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        proc_close_tag = '\n<!-- status:finished -->\n</processing>\n'
+                        self.ai_message.content += proc_close_tag
+                        _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
                     # Keep any text that came after the closing tag
                     self._pending_buffer = self._artefact_buffer[close_idx+len(closing_tag):]
@@ -1273,6 +1274,8 @@ class _StreamState:
                                 )
                             else:
                                 ASCIIColors.warning("[StreamState] Duplicate artifact tag detected (inline). Skipping dispatch.")
+                                if "<<<<<<< SEARCH" in body_content:
+                                    self._last_dispatch_failed = True
                                 self._action_dispatched = True
                                 return False
 

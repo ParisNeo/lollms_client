@@ -578,6 +578,8 @@ class UtilsMixin:
 
     def clone_without_messages(self):
         from . import LollmsDiscussion
+        clean_metadata = dict(self.metadata or {})
+        clean_metadata.pop("_token_cache", None)
         return LollmsDiscussion.create_new(
             lollms_client=self.lollmsClient, db_manager=self.db_manager,
             system_prompt=self.system_prompt,
@@ -585,7 +587,7 @@ class UtilsMixin:
             discussion_data_zone=self.discussion_data_zone,
             personality_data_zone=self.personality_data_zone,
             memory=self.memory, participants=self.participants,
-            discussion_metadata=self.metadata,
+            discussion_metadata=clean_metadata,
             images=[i.copy() for i in self.get_discussion_images()],
         )
 

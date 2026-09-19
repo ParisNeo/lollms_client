@@ -38,6 +38,9 @@ global_input_parameters:
     description: "Only relevant when is_vllm=true. When can be enable_thinking or reasoning_effort."
     mandatory: false
     default: enable_thinking
+    options:
+      - enable_thinking
+      - reasoning_effort
   - name: verify_ssl_certificate
     type: bool
     description: "Whether to verify SSL certificates on HTTPS connections. Set to false for self-hosted servers with self-signed certificates."
