@@ -186,6 +186,7 @@ def create_client(env: EnvStore, prefs: GuiPrefs):
             "tools_folders": tools_folders,
             "host_tool_configs": host_tool_configs,
         },
+        "debug": prefs.debug,
     }
 
     # ── Other Modalities (TTI, TTS, STT, TTV, TTM) using unified profiles ──
@@ -266,6 +267,40 @@ def create_personality(prefs: GuiPrefs, client):
 
     personality.capabilities = caps
     personality.max_tokens_per_turn = prefs.max_tokens_per_turn
+    personality.debug_mode = prefs.debug
+
+    # ── Universal Skills Discovery (Bundled + Global + Handbag) ──
+    collected_skill_dirs = []
+
+    # 1. Project / Repository bundled skills
+    repo_skills = Path(__file__).resolve().parent.parent.parent.parent.parent / "skills"
+    if repo_skills.exists() and repo_skills.is_dir():
+        collected_skill_dirs.append(repo_skills.resolve())
+
+    # 2. Package skills
+    import lollms_client
+    pkg_skills = Path(lollms_client.__file__).resolve().parent / "skills"
+    if pkg_skills.exists() and pkg_skills.is_dir():
+        collected_skill_dirs.append(pkg_skills.resolve())
+
+    # 3. User global skills directory
+    if prefs.skills_dir and Path(prefs.skills_dir).exists():
+        collected_skill_dirs.append(Path(prefs.skills_dir).resolve())
+
+    # 4. Workspace-local skills directory
+    ws_skills = Path(prefs.workspace_path) / ".lollms_code" / "skills"
+    if ws_skills.exists():
+        collected_skill_dirs.append(ws_skills.resolve())
+
+    if personality.skills_manager:
+        for s_dir in collected_skill_dirs:
+            if s_dir not in [d.resolve() for d in personality.skills_manager._skills_dirs]:
+                personality.skills_manager._skills_dirs.append(s_dir)
+        personality.skills_manager.reload()
+    elif collected_skill_dirs:
+        from lollms_client.lollms_personality.skills_manager import SkillsManager
+        personality.skills_manager = SkillsManager(skills_dirs=collected_skill_dirs, mode=prefs.skills_mode)
+
     return personality
 
 
@@ -395,9 +430,15 @@ class QueueStreamingCallback:
             self.q.put(AgentEvent(mapping[msg_type], **(meta or {})))
             return True
         if msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
-            was_processed = bool(meta and meta.get("was_processed"))
-            # In FULL_CALLBACK_MODE, suppress any processing tags or internal logs from the text stream
-            if was_processed or (chunk and ("<processing" in chunk or "</processing>" in chunk or "<!-- status:" in chunk)):
+            is_internal_chunk = bool(
+                meta and (
+                    meta.get("was_processed")
+                    or meta.get("live_tool_chunk")
+                    or meta.get("live_artifact_chunk")
+                )
+            )
+            # In FULL_CALLBACK_MODE, suppress internal streaming chunks, raw tool tags, and processing tags
+            if is_internal_chunk or (chunk and ("<processing" in chunk or "</processing>" in chunk or "<!-- status:" in chunk or "<tool>" in chunk or "</tool>" in chunk)):
                 return True
             self.q.put(AgentEvent("chunk", text=chunk, was_processed=False))
         elif msg_type == MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK:
@@ -428,6 +469,8 @@ def run_agent_turn_in_thread(
                 enable_artefacts=True,
                 use_internal_history=use_history,
                 event_mode=EventMode.FULL_CALLBACK_MODE,
+                debug=prefs.debug,
+                debug_export=prefs.debug,
             )
             event_queue.put(AgentEvent("done", result=result))
         except Exception as e:

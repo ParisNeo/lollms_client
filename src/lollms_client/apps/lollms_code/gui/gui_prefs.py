@@ -43,6 +43,7 @@ class GuiPrefs:
     enable_skill_loading: bool = True
     enable_memory: bool = True
     skills_mode: str = "mixed"
+    debug: bool = False
 
     # --- Paths ---
     workspace_path: str = str(Path.cwd())

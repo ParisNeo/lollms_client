@@ -19,7 +19,8 @@ from pathlib import Path
 # Guarantee this file's own folder is importable regardless of the working
 # directory main.py was launched from (double-click, IDE run config, etc.).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-
+import pipmaster as pm
+pm.ensure_packages(["nicegui", "pywebview"])
 from nicegui import ui, app as nicegui_app
 
 from gui_prefs import GuiPrefs
@@ -72,7 +73,7 @@ def main_page():
     # so a child "calc(100vh - HEADER)" div ends up sized by its content instead
     # of the viewport, pushing the input row below the fold. Strip that here
     # so the header + chat area exactly fill the native window.
-    ui.query(".nicegui-content").classes("h-screen p-0 gap-0")
+    ui.query(".nicegui-content").classes("h-full max-h-full p-0 gap-0 flex flex-col overflow-hidden")
 
     # Fast access to Settings: Ctrl+, (also has header + in-chat "Settings"
     # buttons — three ways in, since it's a click users reach for often).
@@ -85,30 +86,29 @@ def main_page():
     HEADER_H = 40
     resolved = env.resolve_default_connection("llm")
 
-    with ui.header().classes(
-        "items-center justify-between px-3 flex-nowrap"
-    ).style(f"min-height: {HEADER_H}px; height: {HEADER_H}px;"):
-        with ui.row().classes("items-center gap-2 flex-nowrap overflow-hidden"):
-            ui.icon("terminal", size="18px")
-            ui.label("lollms_code").classes("text-sm font-bold shrink-0")
-            ui.label("·").classes("text-xs opacity-40 shrink-0")
-            ui.label(prefs.workspace_path).classes("text-xs opacity-70 truncate").style("max-width: 320px;")
-            ui.label("·").classes("text-xs opacity-40 shrink-0")
-            profile_label = f"{resolved.get('binding_name') or '?'} / {resolved.get('model_name') or '?'}"
-            ui.label(profile_label).classes(
-                "text-xs opacity-70 shrink-0"
-            )
-        with ui.row().classes("items-center gap-1 shrink-0"):
-            ui.button("Settings", icon="settings", on_click=lambda: ui.navigate.to("/settings")).props(
-                "flat dense size=sm no-caps"
-            )
-            ui.button(
-                icon="dark_mode" if not prefs.dark_mode else "light_mode",
-                on_click=lambda: toggle_dark(prefs),
-            ).props("flat round dense size=sm")
+    with ui.column().classes("w-full h-screen max-h-screen p-0 m-0 gap-0 flex flex-col overflow-hidden bg-slate-950 text-slate-100"):
+        with ui.row().classes(
+            "w-full items-center justify-between px-3 flex-nowrap bg-primary text-white shrink-0 shadow-sm"
+        ).style(f"min-height: {HEADER_H}px; height: {HEADER_H}px;"):
+            with ui.row().classes("items-center gap-2 flex-nowrap overflow-hidden"):
+                ui.icon("terminal", size="18px")
+                ui.label("lollms_code").classes("text-sm font-bold shrink-0")
+                ui.label("·").classes("text-xs opacity-40 shrink-0")
+                ui.label(prefs.workspace_path).classes("text-xs opacity-80 truncate").style("max-width: 320px;")
+                ui.label("·").classes("text-xs opacity-40 shrink-0")
+                profile_label = f"{resolved.get('binding_name') or '?'} / {resolved.get('model_name') or '?'}"
+                ui.label(profile_label).classes("text-xs opacity-80 shrink-0")
+            with ui.row().classes("items-center gap-1 shrink-0"):
+                ui.button("Settings", icon="settings", on_click=lambda: ui.navigate.to("/settings")).props(
+                    "flat dense size=sm no-caps"
+                )
+                ui.button(
+                    icon="dark_mode" if not prefs.dark_mode else "light_mode",
+                    on_click=lambda: toggle_dark(prefs),
+                ).props("flat round dense size=sm")
 
-    with ui.element("div").classes("w-full").style(f"height: calc(100vh - {HEADER_H}px); overflow: hidden;"):
-        build_chat_page(env, prefs)
+        with ui.element("div").classes("w-full flex-1 min-h-0 flex flex-col overflow-hidden"):
+            build_chat_page(env, prefs)
 
 
 def toggle_dark(prefs: GuiPrefs):

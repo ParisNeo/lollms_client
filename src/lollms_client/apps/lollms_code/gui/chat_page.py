@@ -11,7 +11,7 @@ from nicegui import ui
 from gui_prefs import GuiPrefs
 from env_config import EnvStore
 import agent_bridge
-
+from pathlib import Path
 
 HELP_TEXT = """\
 **Commands**
@@ -86,18 +86,26 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         _msg_counter += 1
         return _msg_counter
 
-    with ui.column().classes("w-full h-full flex-nowrap gap-0"):
+    show_tree_sidebar = True
+
+    with ui.column().classes("w-full h-full flex-1 min-h-0 flex-nowrap gap-0 overflow-hidden flex flex-col"):
         # ---- Slim status strip (replaces the old sidebar cards) ----
         with ui.row().classes(
-            "w-full items-center justify-between px-3 py-1 shrink-0 "
-            "bg-gray-50 dark:bg-gray-900 border-b border-gray-200 dark:border-gray-800"
+            "w-full items-center justify-between px-3 py-1.5 shrink-0 "
+            "bg-slate-900 border-b border-slate-800"
         ):
-            status_label = ui.label("Idle").classes("text-xs text-gray-500")
+            with ui.row().classes("items-center gap-2"):
+                tree_toggle_btn = ui.button(
+                    "Tree", icon="folder",
+                    on_click=lambda: toggle_tree_visibility(),
+                ).props("flat dense size=sm no-caps").tooltip("Toggle Workspace Tree")
+                status_label = ui.label("Idle").classes("text-xs text-slate-400 font-mono")
+
             with ui.row().classes("items-center gap-3"):
-                rounds_label = ui.label("").classes("text-xs text-gray-500")
-                ctx_label = ui.label("").classes("text-xs text-gray-500")
+                rounds_label = ui.label("").classes("text-xs text-slate-400 font-mono")
+                ctx_label = ui.label("").classes("text-xs text-slate-400 font-mono")
                 if tools_toggle is None:
-                    tools_toggle = ui.switch("Tool panels", value=prefs.show_tool_calls).props("dense")
+                    tools_toggle = ui.switch("Tool panels", value=prefs.show_tool_calls).props("dense dark")
                 ui.button(
                     "Scratchpad", icon="edit_note",
                     on_click=lambda: open_scratchpad_dialog(),
@@ -114,33 +122,50 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     "flat dense size=sm no-caps"
                 )
 
-        # ---- Live telemetry sidebar (toggleable via Settings → Appearance) ----
-        with ui.row().classes("w-full flex-1 min-h-0"):
+        # ---- Center Workspace Area (Tree View + Chat Transcript + Telemetry) ----
+        with ui.row().classes("w-full flex-1 min-h-0 items-stretch overflow-hidden flex-nowrap gap-0"):
+
+            # ---- Left-hand Lazy Workspace Tree Panel ----
+            tree_panel = ui.column().classes(
+                "w-72 h-full shrink-0 border-r border-slate-800 bg-slate-900/80 overflow-hidden flex flex-col p-0 gap-0"
+            )
+            with tree_panel:
+                with ui.row().classes("w-full items-center justify-between px-3 py-2 border-b border-slate-800 shrink-0"):
+                    ui.label("📁 Workspace").classes("text-xs font-bold text-slate-300")
+                    with ui.row().classes("gap-1"):
+                        ui.button(icon="refresh", on_click=lambda: refresh_workspace_tree()).props(
+                            "flat round dense size=xs"
+                        ).tooltip("Refresh tree")
+
+                tree_scroll = ui.scroll_area().classes("w-full flex-1 p-2")
+                with tree_scroll:
+                    tree_container = ui.column().classes("w-full gap-0 p-0")
+
             # ---- Transcript ----
-            scroll_area = ui.scroll_area().classes("flex-1 min-w-0")
+            scroll_area = ui.scroll_area().classes("flex-1 h-full min-w-0 bg-slate-950")
             with scroll_area:
-                transcript = ui.column().classes("w-full gap-2 p-3")
+                transcript = ui.column().classes("w-full gap-3 p-4")
 
             # ---- Right-hand live panels ----
             live_sidebar = ui.column().classes(
-                "w-64 shrink-0 border-l border-gray-200 dark:border-gray-800 "
-                "bg-gray-50 dark:bg-gray-900 overflow-y-auto p-2 gap-2"
+                "w-64 h-full shrink-0 border-l border-slate-800 "
+                "bg-slate-900/80 overflow-y-auto p-2 gap-2"
             ).bind_visibility_from(prefs, "show_live_sidebar")
             with live_sidebar:
-                with ui.card().classes("w-full no-shadow border"):
-                    ui.label("⏱️ Round Timeline").classes("text-xs font-bold text-gray-600 dark:text-gray-300")
+                with ui.card().classes("w-full no-shadow border border-slate-800 bg-slate-900"):
+                    ui.label("⏱️ Round Timeline").classes("text-xs font-bold text-slate-300")
                     timeline_container = ui.column().classes("w-full gap-0.5 mt-1")
                 timeline_slots: Dict[int, Any] = {}
 
-                with ui.card().classes("w-full no-shadow border"):
-                    ui.label("📊 Context Health").classes("text-xs font-bold text-gray-600 dark:text-gray-300")
-                    health_label = ui.label("no data yet").classes("text-xs text-gray-500")
+                with ui.card().classes("w-full no-shadow border border-slate-800 bg-slate-900"):
+                    ui.label("📊 Context Health").classes("text-xs font-bold text-slate-300")
+                    health_label = ui.label("no data yet").classes("text-xs text-slate-400 font-mono")
                     health_bar = ui.linear_progress(value=0.0, show_value=False).props("instant-feedback")
 
-                with ui.card().classes("w-full no-shadow border"):
-                    ui.label("🎓 Skills (live)").classes("text-xs font-bold text-gray-600 dark:text-gray-300")
-                    skills_label = ui.label("—").classes("text-xs text-gray-500")
-                    ui.separator().classes("my-1")
+                with ui.card().classes("w-full no-shadow border border-slate-800 bg-slate-900"):
+                    ui.label("🎓 Skills (live)").classes("text-xs font-bold text-slate-300")
+                    skills_label = ui.label("—").classes("text-xs text-slate-400")
+                    ui.separator().classes("my-1 border-slate-800")
                     peek_button = ui.button(
                         "🔍 Peek Scratchpad", icon="visibility",
                         on_click=lambda: open_scratchpad_dialog(),
@@ -151,14 +176,19 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     )
 
         # ---- Slash-command suggestions (shown above the input, hidden by default) ----
-        suggestions_row = ui.row().classes("w-full gap-1 px-3 flex-wrap")
+        suggestions_row = ui.row().classes("w-full gap-1 px-3 py-1.5 shrink-0 flex-wrap bg-slate-900 border-t border-slate-800")
         suggestions_row.visible = False
 
-        # ---- Input ----
-        with ui.row().classes("w-full items-end gap-2 px-3 py-2 shrink-0"):
-            prompt_input = ui.textarea(placeholder="Describe the task, or type / for commands…").classes(
-                "flex-1"
-            ).props("outlined autogrow dense rows=1 input-debounce=0")
+        # ---- Input Box (Pinned to Bottom) ----
+        with ui.row().classes(
+            "w-full items-end gap-2 px-3 py-2 shrink-0 bg-slate-900 "
+            "border-t border-slate-800"
+        ):
+            prompt_input = ui.textarea(
+                placeholder="Describe task, or type / for commands… (Enter to send, Shift+Enter for new line)"
+            ).classes(
+                "flex-1 bg-slate-800/80 text-slate-100 rounded"
+            ).props("outlined autogrow dense rows=1 input-debounce=0 dark")
             send_button = ui.button(icon="send").props("round color=primary")
 
     def add_user_bubble(text: str) -> str:
@@ -195,7 +225,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         with transcript:
             with ui.row().classes("w-full justify-start items-start gap-1"):
                 md = ui.markdown("").classes(
-                    "bg-gray-100 dark:bg-gray-800 rounded-lg px-3 py-1.5 max-w-[85%] whitespace-pre-wrap"
+                    "bg-gray-100 dark:bg-gray-800 rounded-lg px-4 py-2.5 max-w-[85%] text-sm break-words leading-relaxed"
                 )
                 copy_btn = ui.button(icon="content_copy", on_click=lambda: copy_agent_message(entry)).props(
                     "flat round dense size=xs"
@@ -255,11 +285,11 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 copy_btn.tooltip("Copy this notice" + (" (error)" if is_error else ""))
         scroll_area.scroll_to(percent=1.0)
 
-    def add_event_panel(title: str, subtitle: str, body: str, color: str, icon: str):
+    def add_event_panel(title: str, subtitle: str, body: str, color: str, icon: str) -> ui.expansion:
         entry = {"type": "event", "title": title, "subtitle": subtitle, "body": body}
         debug_log.append(entry)
         with transcript:
-            panel = ui.expansion(title, icon=icon).classes(f"w-full border-l-4 border-{color}")
+            panel = ui.expansion(title, icon=icon).classes(f"w-full max-w-[90%] border-l-4 border-{color} bg-gray-50/50 dark:bg-gray-900/50 rounded-r-md text-xs")
             panel.bind_visibility_from(tools_toggle, "value")
             with panel:
                 with ui.row().classes("w-full items-center justify-between"):
@@ -271,6 +301,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     ).props("flat round dense size=xs")
                     copy_btn.tooltip("Copy panel content")
                 ui.code(body or "(no output)").classes("w-full text-xs")
+        return panel
 
     def copy_event_body(entry: Dict[str, Any]):
         try:
@@ -462,6 +493,24 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
 
     current_agent_md: Optional[ui.markdown] = None
     agent_text_buffer = ""
+    active_tool_panels: Dict[str, Dict[str, Any]] = {}
+    active_artefact_panels: Dict[str, Dict[str, Any]] = {}
+
+    def seal_current_text_block():
+        """Seals the current conversational agent bubble so that the next action
+        or response text is inserted chronologically below the preceding event."""
+        nonlocal current_agent_md, agent_text_buffer
+        if current_agent_md is not None:
+            clean_text = _strip_processing_tags(agent_text_buffer)
+            if clean_text:
+                current_agent_md.set_content(clean_text)
+            else:
+                try:
+                    current_agent_md.delete()
+                except Exception:
+                    pass
+            current_agent_md = None
+            agent_text_buffer = ""
 
     def drain_queue():
         nonlocal current_agent_md, agent_text_buffer
@@ -478,15 +527,22 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 if ev.data.get("was_processed"):
                     continue
                 chunk_text = ev.data.get("text", "")
-                if "<processing" in chunk_text or "</processing>" in chunk_text:
+                if not chunk_text or "<processing" in chunk_text or "</processing>" in chunk_text or "<!-- status:" in chunk_text:
                     continue
+
+                # Strip out raw tool JSON that might have bypassed low-level filters
+                if chunk_text.strip().startswith('{"') and chunk_text.strip().endswith('}'):
+                    continue
+
                 if current_agent_md is None:
                     current_agent_md = add_agent_message_container()
                     agent_text_buffer = ""
+
                 agent_text_buffer += chunk_text
                 current_agent_md.set_content(_strip_processing_tags(agent_text_buffer))
 
             elif ev.kind == "thought":
+                seal_current_text_block()
                 add_event_panel("💭 Thinking", "", ev.data.get("text", ""), "gray-400", "psychology")
 
             elif ev.kind == "info":
@@ -494,18 +550,40 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
 
             elif ev.kind == "tool_start":
                 name = ev.data.get("tool_name", "tool")
+                if name == "pending":
+                    continue
+                seal_current_text_block()
                 params = ev.data.get("parameters", {})
-                add_event_panel(f"🛠️ Running: {name}", "executing…", str(params), "blue-500", "build")
+                params_str = json.dumps(params, indent=2, ensure_ascii=False) if isinstance(params, dict) else str(params)
+
+                panel = add_event_panel(f"🛠️ Running: {name}", "executing…", params_str, "blue-500", "build")
+                active_tool_panels[name] = {"panel": panel, "params": params}
                 status_label.set_text(f"Running {name}…")
                 _paint_round(timeline_slots, session.current_round, "bg-blue-500 animate-pulse")
 
             elif ev.kind == "tool_end":
                 name = ev.data.get("tool_name", "tool")
+                if name == "pending" and not ev.data.get("output") and not ev.data.get("error"):
+                    continue
+                seal_current_text_block()
                 success = ev.data.get("success", False)
                 output = ev.data.get("output") or ev.data.get("error") or ""
                 color = "green-500" if success else "red-500"
+
+                # Update existing running panel if present to prevent duplicate disjoint panels
+                if name in active_tool_panels:
+                    active_item = active_tool_panels.pop(name)
+                    try:
+                        active_item["panel"].delete()
+                    except Exception:
+                        pass
+
                 add_event_panel(
-                    f"{'✅' if success else '❌'} Finished: {name}", "", output, color, "build_circle"
+                    f"{'✅' if success else '❌'} Finished: {name}",
+                    "success" if success else "failed",
+                    output,
+                    color,
+                    "build_circle"
                 )
                 _paint_round(
                     timeline_slots, session.current_round,
@@ -513,6 +591,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 )
 
             elif ev.kind == "context_update":
+                seal_current_text_block()
                 _paint_round(timeline_slots, session.current_round, "bg-amber-500")
                 add_event_panel(
                     "📂 Context update",
@@ -522,6 +601,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 )
 
             elif ev.kind == "scratchpad_update":
+                seal_current_text_block()
                 action = ev.data.get("action", "update")
                 message = ev.data.get("message", "Scratchpad updated.")
                 ui.notify(f"📝 {message}", type="info")
@@ -535,7 +615,9 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 subtitle = f"{op} · {lang}" if lang else op
                 if sec:
                     subtitle += f" · {sec}"
-                add_event_panel(f"📝 Writing: {title}", subtitle, "", "purple-500", "description")
+                seal_current_text_block()
+                panel = add_event_panel(f"📝 Writing: {title}", subtitle, "", "purple-500", "description")
+                active_artefact_panels[title] = {"panel": panel}
                 _paint_round(timeline_slots, session.current_round, "bg-purple-500 animate-pulse")
 
             elif ev.kind == "artefact_symbol":
@@ -552,13 +634,21 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 chars = ev.data.get("size_chars", 0)
                 is_patch = ev.data.get("is_patch", False)
 
+                seal_current_text_block()
+
+                if title in active_artefact_panels:
+                    active_art_item = active_artefact_panels.pop(title)
+                    try:
+                        active_art_item["panel"].delete()
+                    except Exception:
+                        pass
+
                 meta_details = []
                 if version: meta_details.append(f"v{version}")
                 if lines: meta_details.append(f"{lines} lines")
                 if chars: meta_details.append(f"{chars:,} chars")
                 subtitle = " · ".join(meta_details) if success else str(ev.data.get("error", "failed"))
 
-                # Build summary of symbols/sections without printing full content
                 body_lines = []
                 sections = ev.data.get("sections", [])
                 if sections:
@@ -580,9 +670,10 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     "task_alt",
                 )
 
-            elif ev.kind == "round_info":
-                r = ev.data.get("round", "?")
-                m = ev.data.get("max_rounds", "?")
+            elif ev.kind == "round_start":
+                seal_current_text_block()
+                r = ev.data.get("round_id", 1)
+                m = ev.data.get("max_rounds", prefs.max_reasoning_steps)
                 status_label.set_text(f"Round {r}/{m}")
                 try:
                     r_int = int(r)
@@ -595,9 +686,14 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                         dot = ui.element("div").classes("h-2.5 w-2.5 rounded-full bg-gray-300")
                 timeline_slots[r_int] = dot
 
+            elif ev.kind == "round_info":
+                r = ev.data.get("round", "?")
+                m = ev.data.get("max_rounds", "?")
+                status_label.set_text(f"Round {r}/{m}")
+
             elif ev.kind == "done":
+                seal_current_text_block()
                 result = ev.data.get("result", {}) or {}
-                current_agent_md = None
                 session.busy = False
                 send_button.props(remove="loading")
                 status_label.set_text("Idle")
@@ -622,13 +718,13 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
 
                 skills_created = result.get("skills_created") or []
                 skills_updated = result.get("skills_updated") or []
-                if skills_created or skills_updated and prefs.show_skills_activity:
+                if (skills_created or skills_updated) and prefs.show_skills_activity:
                     body = "\n".join([f"created: {s}" for s in skills_created] +
                                       [f"updated: {s}" for s in skills_updated])
                     add_event_panel("🎓 Skills activity", "", body, "yellow-600", "school")
 
             elif ev.kind == "error":
-                current_agent_md = None
+                seal_current_text_block()
                 session.busy = False
                 send_button.props(remove="loading")
                 status_label.set_text("Error")
@@ -929,7 +1025,135 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         )
 
     send_button.on("click", send_prompt)
-    prompt_input.on("keydown.enter.prevent", send_prompt)
+    prompt_input.on("keydown.enter.exact.prevent", send_prompt)
+
+    # ---------------- Tree View Lazy Loading ----------------
+
+    tree_holder = {"tree": None}
+    tree_nodes_cache: list[dict[str, Any]] = []
+
+    def toggle_tree_visibility():
+        nonlocal show_tree_sidebar
+        show_tree_sidebar = not show_tree_sidebar
+        tree_panel.set_visibility(show_tree_sidebar)
+
+    def _get_loaded_files_set() -> set:
+        try:
+            session.ensure_ready()
+            stats = agent_bridge.get_workspace_stats(session.personality)
+            return {f["path"].replace("\\", "/") for f in stats.get("loaded_files", [])}
+        except Exception:
+            return set()
+
+    def _scan_folder_lazy(folder: Path, root: Path, loaded_set: set) -> list[dict[str, Any]]:
+        nodes = []
+        ignored_names = {"__pycache__", ".git", ".venv", "venv", "node_modules", ".lollms_code"}
+        try:
+            items = sorted(folder.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+            for item in items:
+                if item.name.startswith(".") or item.name in ignored_names:
+                    continue
+                rel_path = str(item.relative_to(root)).replace("\\", "/")
+                if item.is_dir():
+                    nodes.append({
+                        "id": rel_path,
+                        "label": item.name,
+                        "path": str(item.resolve()),
+                        "is_dir": True,
+                        "icon": "folder",
+                        "lazy": True,
+                        "children": [],
+                    })
+                else:
+                    is_loaded = rel_path in loaded_set or item.name in loaded_set
+                    nodes.append({
+                        "id": rel_path,
+                        "label": f"{item.name}{' [C]' if is_loaded else ''}",
+                        "path": str(item.resolve()),
+                        "is_dir": False,
+                        "icon": "task_alt" if is_loaded else "description",
+                    })
+        except Exception as e:
+            nodes.append({"id": f"err_{folder.name}", "label": f"(error: {e})", "is_dir": False, "icon": "error"})
+        return nodes
+
+    def _find_node_and_populate(node_list: list[dict[str, Any]], target_id: str, root: Path, loaded_set: set) -> bool:
+        for node in node_list:
+            if node.get("id") == target_id:
+                if node.get("is_dir") and not node.get("children"):
+                    node_path = Path(node["path"])
+                    node["children"] = _scan_folder_lazy(node_path, root, loaded_set)
+                return True
+            if node.get("children"):
+                if _find_node_and_populate(node["children"], target_id, root, loaded_set):
+                    return True
+        return False
+
+    def handle_tree_expand(e):
+        val = getattr(e, "value", None)
+        if val is None and hasattr(e, "args"):
+            val = e.args
+        if val is None:
+            return
+
+        expanded_ids = val if isinstance(val, list) else [val]
+        ws_root = Path(prefs.workspace_path).resolve()
+        loaded_set = _get_loaded_files_set()
+        updated = False
+
+        for raw_id in expanded_ids:
+            target_id = raw_id.get("id") if isinstance(raw_id, dict) else str(raw_id)
+            if target_id and _find_node_and_populate(tree_nodes_cache, target_id, ws_root, loaded_set):
+                updated = True
+
+        if updated and tree_holder["tree"] is not None:
+            tree_holder["tree"].update()
+
+    def handle_tree_select(e):
+        val = getattr(e, "value", None)
+        if val is None and hasattr(e, "args"):
+            val = e.args
+        if val is None:
+            return
+
+        if isinstance(val, dict):
+            target_id = val.get("id")
+        elif isinstance(val, list):
+            target_id = val[0] if val else None
+        else:
+            target_id = str(val)
+
+        if not target_id:
+            return
+
+        ws_root = Path(prefs.workspace_path).resolve()
+        file_path = ws_root / target_id
+        if file_path.is_file():
+            current_val = prompt_input.value or ""
+            if current_val:
+                prompt_input.value = f"{current_val.rstrip()} {target_id} "
+            else:
+                prompt_input.value = f"/load {target_id}"
+            prompt_input.run_method("focus")
+            ui.notify(f"Selected: {target_id}", type="info")
+
+    def refresh_workspace_tree():
+        nonlocal tree_nodes_cache
+        ws_root = Path(prefs.workspace_path).resolve()
+        loaded_set = _get_loaded_files_set()
+        tree_nodes_cache = _scan_folder_lazy(ws_root, ws_root, loaded_set)
+        tree_container.clear()
+        with tree_container:
+            tree_holder["tree"] = ui.tree(
+                tree_nodes_cache,
+                label_key="label",
+                node_key="id",
+                on_expand=handle_tree_expand,
+                on_select=handle_tree_select,
+            ).props("dense dark no-nodes-label='(Workspace empty)'").classes("w-full text-xs")
+
+    # Initial tree population
+    refresh_workspace_tree()
 
     # ---------------- Command Palette (Ctrl+K) ----------------
 

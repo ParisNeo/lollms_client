@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-20 20:46]
+
+- git commit -m "Fix(lllms_client): Improve CLI and GUI error handling"
+
 ## [2026-09-20 15:11]
 
 - fix(lollms-binding): update minor imports and syntax fixes in lollms/__init__.py

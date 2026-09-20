@@ -449,6 +449,8 @@ def _build_agent_panel(prefs: GuiPrefs):
         skill_create_switch = ui.switch("Enable skill creation", value=prefs.enable_skill_creation)
         skill_load_switch = ui.switch("Enable skill loading", value=prefs.enable_skill_loading)
         skills_mode_select = ui.select(SKILLS_MODES, value=prefs.skills_mode, label="Skills mode").classes("w-full")
+        ui.separator()
+        debug_switch = ui.switch("Enable debug mode", value=prefs.debug)
 
     def apply(p: GuiPrefs):
         p.temperature = float(temperature_slider.value)
@@ -464,6 +466,7 @@ def _build_agent_panel(prefs: GuiPrefs):
         p.enable_skill_creation = skill_create_switch.value
         p.enable_skill_loading = skill_load_switch.value
         p.skills_mode = skills_mode_select.value
+        p.debug = debug_switch.value
 
     return apply
 

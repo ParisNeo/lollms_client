@@ -56,7 +56,7 @@ APP_USER_PROFILE_FILE = Path.home() / ".lollms_client" / "user_profile.md"
 APP_DEFAULT_WORKSPACE = Path.cwd()
 APP_DEFAULT_SKILLS_DIR = APP_CONFIG_DIR / "skills"
 APP_DEFAULT_MEMORY_DB = APP_CONFIG_DIR / "memory.db"
-APP_DEFAULT_HANDSAG_DIR = APP_CONFIG_DIR / "handbags"
+APP_DEFAULT_HANDBAG_DIR = APP_CONFIG_DIR / "handbags"
 
 def get_workspace_sandbox_dir(workspace_path: str | Path) -> Path:
     return Path(workspace_path).resolve() / ".lollms_code"
@@ -449,10 +449,11 @@ def show_interactive_help():
 
 class PersistentHistory:
     """Manages a persistent JSON-backed history of prompts for the REPL."""
-    
-    def __init__(self, history_file: Path, max_entries: int = 100):
+
+    def __init__(self, history_file: Path, max_entries: int = 100, debug: bool = False):
         self.history_file = history_file
         self.max_entries = max_entries
+        self.debug = debug
         self.entries: list[str] = []
         self._load()
 
@@ -463,7 +464,8 @@ class PersistentHistory:
                 if isinstance(data, list):
                     self.entries = [str(x) for x in data if isinstance(x, (str, int, float))]
             except (OSError, json.JSONDecodeError) as e:
-                ASCIIColors.warning(f"Failed to load history: {e}")
+                if self.debug:
+                    ASCIIColors.warning(f"Failed to load history: {e}")
                 self.entries = []
 
     def _save(self):
@@ -474,7 +476,8 @@ class PersistentHistory:
                 encoding="utf-8"
             )
         except OSError as e:
-            ASCIIColors.warning(f"Failed to save history: {e}")
+            if self.debug:
+                ASCIIColors.warning(f"Failed to save history: {e}")
 
     def add(self, prompt: str):
         prompt = prompt.strip()
@@ -527,7 +530,7 @@ class CodeAgentConfig:
         self.workspace_path: str = str(Path.cwd().resolve())
         self.skills_dir: str = str(APP_DEFAULT_SKILLS_DIR)
         self.memory_db: str = f"sqlite:///{APP_DEFAULT_MEMORY_DB}"
-        self.handbag_path: str = str(APP_DEFAULT_HANDSAG_DIR / "default_coder")
+        self.handbag_path: str = str(APP_DEFAULT_HANDBAG_DIR / "default_coder")
         self.show_tool_calls: bool = True
         self.show_workspace_changes: bool = True
         self.show_skills: bool = True
@@ -579,7 +582,7 @@ class CodeAgentConfig:
             try:
                 file_config = json.loads(APP_CONFIG_FILE.read_text(encoding="utf-8"))
                 stale_profile_keys = [k for k in file_config if k in PROFILE_KEYS and k != "active_profile"]
-                if stale_profile_keys:
+                if stale_profile_keys and config.debug:
                     ASCIIColors.warning(
                         "[CLI] Ignoring stale binding/model profiles found in config.json. "
                         "Profiles are resolved from ~/.lollms_client/config.yaml (or --config path)."
@@ -590,7 +593,8 @@ class CodeAgentConfig:
                     if hasattr(config, key):
                         setattr(config, key, val)
             except (OSError, json.JSONDecodeError) as e:
-                ASCIIColors.warning(f"Failed to read config file: {e}")
+                if config.debug:
+                    ASCIIColors.warning(f"Failed to read config file: {e}")
 
         # 2. Extract profiles from environment & config files
         from lollms_client.lollms_config_cli_env import (
@@ -636,7 +640,8 @@ class CodeAgentConfig:
                 elif source.suffix in (".yaml", ".yml"):
                     resolved_env.update(_flatten_dict_to_env(load_yaml_file(source)))
             except (OSError, ValueError) as e:
-                ASCIIColors.warning(f"Failed to parse configuration source {source}: {e}")
+                if config.debug:
+                    ASCIIColors.warning(f"Failed to parse configuration source {source}: {e}")
 
         # Extract profiles across all modalities
         _ssl_debug = os.getenv("LOLLMS_DEBUG_SSL", "").lower() in ("1", "true", "yes")
@@ -711,20 +716,22 @@ class CodeAgentConfig:
                 )
 
         if not config.llm_binding_profiles:
-            ASCIIColors.warning(
-                "[Config.load] No LLM bindings resolved from configuration files. "
-                "Scaffolding fallback 'ollama' binding — check ~/.lollms_client/config.yaml."
-            )
+            if config.debug:
+                ASCIIColors.warning(
+                    "[Config.load] No LLM bindings resolved from configuration files. "
+                    "Scaffolding fallback 'ollama' binding — check ~/.lollms_client/config.yaml."
+                )
             config.llm_binding_profiles["default"] = {
                 "binding_name": "ollama",
                 "binding_config": {"host_address": "http://localhost:11434"},
                 "is_default": True
             }
         if not config.llm_model_profiles:
-            ASCIIColors.warning(
-                "[Config.load] No LLM model profiles resolved from configuration files. "
-                "Scaffolding fallback profile — check ~/.lollms_client/config.yaml."
-            )
+            if config.debug:
+                ASCIIColors.warning(
+                    "[Config.load] No LLM model profiles resolved from configuration files. "
+                    "Scaffolding fallback profile — check ~/.lollms_client/config.yaml."
+                )
             fallback_binding_alias = next(iter(config.llm_binding_profiles))
             config.llm_model_profiles["default"] = {
                 "binding_profile_name": fallback_binding_alias,
@@ -1025,6 +1032,7 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
             "tools_folders": tools_folders,
             "host_tool_configs": host_tool_configs
         },
+        "debug": config.debug,
     }
 
     if config.llm_binding_profiles and config.llm_model_profiles:
@@ -1073,9 +1081,11 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
                 client.tools.mount_tool_library_if_absent('system_shell')
             else:
                 client.tools.mount_tool_library('system_shell')
-            ASCIIColors.success("[CLI] ✅ System Shell library mounted.")
+            if config.debug:
+                ASCIIColors.success("[CLI] ✅ System Shell library mounted.")
         except (AttributeError, OSError, RuntimeError) as e:
-            ASCIIColors.warning(f"Failed to pre-mount system_shell library: {e}")
+            if config.debug:
+                ASCIIColors.warning(f"Failed to pre-mount system_shell library: {e}")
 
     if client.tools:
         try:
@@ -1083,9 +1093,11 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
                 client.tools.mount_tool_library_if_absent('execute_python')
             else:
                 client.tools.mount_tool_library('execute_python')
-            ASCIIColors.success("[CLI] ✅ Execute Python library mounted.")
+            if config.debug:
+                ASCIIColors.success("[CLI] ✅ Execute Python library mounted.")
         except (AttributeError, OSError, RuntimeError) as e:
-            ASCIIColors.warning(f"Failed to pre-mount execute_python library: {e}")
+            if config.debug:
+                ASCIIColors.warning(f"Failed to pre-mount execute_python library: {e}")
 
     if client.tools:
         try:
@@ -1093,9 +1105,11 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
                 client.tools.mount_tool_library_if_absent('git_manager')
             else:
                 client.tools.mount_tool_library('git_manager')
-            ASCIIColors.success("[CLI] ✅ Git Manager library mounted.")
+            if config.debug:
+                ASCIIColors.success("[CLI] ✅ Git Manager library mounted.")
         except (AttributeError, OSError, RuntimeError) as e:
-            ASCIIColors.warning(f"Failed to pre-mount git_manager library: {e}")
+            if config.debug:
+                ASCIIColors.warning(f"Failed to pre-mount git_manager library: {e}")
 
     return client
 
@@ -1324,6 +1338,38 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
     personality.capabilities = caps
     personality.max_tokens_per_turn = config.max_tokens_per_turn
     personality.debug_mode = config.debug
+
+    # ── Universal Skills Discovery (Bundled + Global + Handbag) ──
+    collected_skill_dirs = []
+
+    # 1. Project / Repository bundled skills
+    repo_skills = Path(__file__).resolve().parent.parent.parent.parent.parent / "skills"
+    if repo_skills.exists() and repo_skills.is_dir():
+        collected_skill_dirs.append(repo_skills.resolve())
+
+    # 2. Package skills
+    import lollms_client
+    pkg_skills = Path(lollms_client.__file__).resolve().parent / "skills"
+    if pkg_skills.exists() and pkg_skills.is_dir():
+        collected_skill_dirs.append(pkg_skills.resolve())
+
+    # 3. User global skills directory
+    if config.skills_dir and Path(config.skills_dir).exists():
+        collected_skill_dirs.append(Path(config.skills_dir).resolve())
+
+    # 4. Workspace-local skills directory
+    ws_skills = Path(config.workspace_path) / ".lollms_code" / "skills"
+    if ws_skills.exists():
+        collected_skill_dirs.append(ws_skills.resolve())
+
+    if personality.skills_manager:
+        for s_dir in collected_skill_dirs:
+            if s_dir not in [d.resolve() for d in personality.skills_manager._skills_dirs]:
+                personality.skills_manager._skills_dirs.append(s_dir)
+        personality.skills_manager.reload()
+    elif collected_skill_dirs:
+        from lollms_client.lollms_personality.skills_manager import SkillsManager
+        personality.skills_manager = SkillsManager(skills_dirs=collected_skill_dirs, mode=config.skills_mode)
 
     ASCIIColors.rich_print("  [dim]👤 Loading user profile...[/dim]", end="")
     personality._init_user_profile(APP_USER_PROFILE_FILE)
@@ -2038,7 +2084,7 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
 
     # Use project-local prompt history for REPL tracking
     prompt_history_file = get_workspace_prompt_history_file(config.workspace_path)
-    history = PersistentHistory(prompt_history_file)
+    history = PersistentHistory(prompt_history_file, debug=config.debug)
     history.add(prompt)
 
     renderer = StreamRenderer(config)
@@ -2097,7 +2143,9 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
             enable_python_exec=True,
             enable_workspace_tools=True,
             event_mode=EventMode.FULL_CALLBACK_MODE,
-            enforce_end_tag=True
+            enforce_end_tag=True,
+            debug=config.debug,
+            debug_export=config.debug,
         )
     except KeyboardInterrupt:
         if hasattr(client, 'cancel'):
@@ -2105,7 +2153,8 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
         ASCIIColors.yellow("\n\n⚠️  Generation cancelled by user.")
         return 130
     except (RuntimeError, ValueError, OSError, ConnectionError) as e:
-        trace_exception(e)
+        if config.debug:
+            trace_exception(e)
         ASCIIColors.red(f"\n\n💥 Fatal error: {e}")
         return 1
 
@@ -2652,7 +2701,7 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
 
     # Use project-local prompt history for autocomplete (up-arrow) and persist it
     prompt_history_file = get_workspace_prompt_history_file(config.workspace_path)
-    history = PersistentHistory(prompt_history_file)
+    history = PersistentHistory(prompt_history_file, debug=config.debug)
 
     slash_commands = ["/exit", "/quit", "/help", "/config", "/shell", "/forget", "/skills", "/clear-history", "/clear-files", "/clear-scratchpad", "/models", "/files", "/workspace", "/load", "/unload", "/lock", "/hide", "/unhide"]
     
@@ -2743,10 +2792,10 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
 
         if user_input.lower() in ("/handbag", "/persona"):
             ASCIIColors.rule("[bold cyan]👜 Active Handbag & Persona[/bold cyan]")
-            ASCIIColors.info(f"Handbag Path: [yellow]{config.handbag_path}[/yellow]")
-            ASCIIColors.info(f"Persona Name: [green]{personality.name}[/green]")
-            ASCIIColors.info(f"Category:     {personality.category}")
-            ASCIIColors.info(f"Description:  {personality.description or '(none)'}")
+            ASCIIColors.rich_print(f"Handbag Path: [yellow]{config.handbag_path}[/yellow]")
+            ASCIIColors.rich_print(f"Persona Name: [green]{personality.name}[/green]")
+            ASCIIColors.rich_print(f"Category:     {personality.category}")
+            ASCIIColors.rich_print(f"Description:  {personality.description or '(none)'}")
             continue
 
         if user_input.lower() == "/skills":
@@ -3096,7 +3145,9 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                 enable_python_exec=True,
                 enable_workspace_tools=True,
                 event_mode=EventMode.FULL_CALLBACK_MODE,
-                enforce_end_tag=True
+                enforce_end_tag=True,
+                debug=config.debug,
+                debug_export=config.debug,
             )
         except KeyboardInterrupt:
             if hasattr(client, 'cancel'):
@@ -3104,7 +3155,8 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
             ASCIIColors.yellow("\n\n⚠️  Cancelled.")
             continue
         except (RuntimeError, ValueError, OSError, ConnectionError) as e:
-            trace_exception(e)
+            if config.debug:
+                trace_exception(e)
             ASCIIColors.red(f"\n💥 Error: {e}")
             continue
 
