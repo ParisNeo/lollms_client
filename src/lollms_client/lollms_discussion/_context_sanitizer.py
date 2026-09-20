@@ -51,11 +51,13 @@ def _extract_attrs(attr_str: str) -> Dict[str, str]:
 
 def scrub_processing_and_status_blocks(text: str) -> str:
     """
-    Removes system-generated execution logs (<processing> blocks, status comments)
+    Removes system-generated execution logs (<processing> blocks, status comments, thoughts)
     without touching the LLM's conversational text or functional action tags.
     """
     if not text:
         return ""
+    text = re.sub(r'<think\b[^>]*>.*?(?:</think>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<thought\b[^>]*>.*?(?:</thought>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
     text = _PROCESSING_PATTERN.sub('', text)
     text = _ORPHAN_PROCESSING_PATTERN.sub('', text)
     text = re.sub(r'<!--\s*status:[^>]*-->', '', text, flags=re.IGNORECASE)

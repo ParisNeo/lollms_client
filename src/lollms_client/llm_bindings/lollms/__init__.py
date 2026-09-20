@@ -154,7 +154,6 @@ class LollmsBinding(LollmsLLMBinding):
         try:
             if self._http_client and not self._http_client.is_closed:
                 self._http_client.close()
-                ASCIIColors.yellow("[LollmsBinding] HTTP client closed for cancellation.")
         except Exception as e:
             ASCIIColors.warning(f"[LollmsBinding] Error closing HTTP client during cancel: {e}")
         super().cancel()

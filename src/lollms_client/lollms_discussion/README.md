@@ -732,6 +732,9 @@ def chat(
     enable_vlm_query:             bool = False,
     enable_computer_use:          bool = False,
     event_mode:                   EventMode = EventMode.PROCESSING_TAG_MODE,
+    think:                        Optional[bool] = None,
+    reasoning_effort:             Optional[str] = None,
+    reasoning_summary:            Optional[str] = None,
     **kwargs
 ) -> Dict[str, Any]:
 ```
@@ -886,6 +889,9 @@ discussion.chat(user_message="Search for apples", tools=explicit_tools)
 *   `enable_in_message_status` (`bool`): If `True`, emits detailed status comments inside `<processing>` blocks for UI rendering.
 *   `remove_thinking_blocks` (`bool`): If `True`, strips `_EDEFAULT` or `INSTRUCTION` blocks from the final saved message content.
 *   `event_mode` (`EventMode`): Controls how execution telemetry (tool calls, artifact builds, context updates) is reported to the `streaming_callback`. Defaults to `EventMode.PROCESSING_TAG_MODE`.
+*   `think` (`Optional[bool]`): Legacy flag controlling reasoning/thinking output. If True, maps to `reasoning_effort="high"`. If False, disables thinking output.
+*   `reasoning_effort` (`Optional[str]`): Sets the level of reasoning effort for reasoning/thinking models (e.g., OpenAI o-series, DeepSeek-R1, QwQ, etc.). Canonical values: `'low'`, `'medium'`, `'high'`, `'max'`. Overrides `think` when provided. Defaults to `None`.
+*   `reasoning_summary` (`Optional[str]`): Optional reasoning summary preference ('auto', 'concise', 'detailed'). Defaults to `None`.
 *   `**kwargs`: Additional keyword arguments passed directly to the LLM binding's `generate_from_messages` call (e.g., `temperature`, `streaming_callback`).
 
 ### 📡 Event Modes & Streaming Protocol

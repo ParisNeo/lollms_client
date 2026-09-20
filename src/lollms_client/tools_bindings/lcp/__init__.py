@@ -435,12 +435,103 @@ class LCPBinding(LollmsToolBinding):
             if py_file and py_file.exists() and py_file.suffix == ".py":
                 self._load_tool_file(py_file)
 
+    def _get_or_load_tool_module(self, python_file_path: Path) -> Optional[types.ModuleType]:
+        module_name = f"lollms_client.tools_bindings.lcp.persistent_{python_file_path.stem}"
+        if module_name in sys.modules:
+            return sys.modules[module_name]
+
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, str(python_file_path.resolve()))
+            if not spec or not spec.loader:
+                return None
+
+            tool_module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = tool_module
+            spec.loader.exec_module(tool_module)
+
+            # ── 🛡️ HOST CONFIGURATION INJECTION ──
+            if hasattr(tool_module, "init_tools_library") and callable(tool_module.init_tools_library):
+                library_name = python_file_path.stem
+                host_config = self.host_tool_configs.get(library_name, {})
+
+                import inspect as _lcp_inspect
+                _init_sig = _lcp_inspect.signature(tool_module.init_tools_library)
+                _init_params = _init_sig.parameters
+
+                _accepts_positional = any(
+                    p.kind in (_lcp_inspect.Parameter.POSITIONAL_ONLY, _lcp_inspect.Parameter.POSITIONAL_OR_KEYWORD)
+                    for p in _init_params.values()
+                )
+                _accepts_var_positional = any(
+                    p.kind == _lcp_inspect.Parameter.VAR_POSITIONAL
+                    for p in _init_params.values()
+                )
+
+                if _accepts_positional or _accepts_var_positional:
+                    tool_module.init_tools_library(host_config)
+                else:
+                    tool_module.init_tools_library()
+
+                if getattr(ASCIIColors, '_force_debug', False):
+                    ASCIIColors.success(f"[LCP Lazy Init] ✅ Initialized library for '{library_name}' with host configs.")
+                else:
+                    ASCIIColors.debug(f"[LCP Lazy Init] ✅ Initialized library for '{library_name}' with host configs.")
+            return tool_module
+        except Exception as init_ex:
+            ASCIIColors.error(f"[LCP] ❌ Toolset '{python_file_path.stem}' FAILED lazy init: {init_ex}")
+            if module_name in sys.modules:
+                del sys.modules[module_name]
+            return None
+
+    def get_dynamic_tool_description(self, tool_def: Dict[str, Any]) -> Optional[str]:
+        """
+        Executes the dynamic prompt function if defined for this tool,
+        returning the dynamic description string.
+        """
+        if not tool_def.get("_has_dynamic_prompt"):
+            return None
+        fn_name = tool_def.get("_dynamic_prompt_fn_name")
+        if not fn_name:
+            return None
+
+        python_file_path = Path(tool_def["_python_file_path"]) if tool_def.get("_python_file_path") else None
+        if python_file_path and python_file_path.exists():
+            tool_module = self._get_or_load_tool_module(python_file_path)
+        else:
+            tool_module = tool_def.get("_dynamic_module")
+
+        if tool_module and hasattr(tool_module, fn_name):
+            try:
+                fn = getattr(tool_module, fn_name)
+                if callable(fn):
+                    return str(fn())
+            except Exception as e:
+                ASCIIColors.warning(f"[LCP] Failed to execute dynamic prompt function '{fn_name}': {e}")
+        return None
+
+    def to_chat_tool_specs(self, **discover_kwargs) -> Dict[str, Dict[str, Any]]:
+        specs = super().to_chat_tool_specs(**discover_kwargs)
+        for tool_name, spec in specs.items():
+            tool_def = next((t for t in self.discovered_tools if t.get("name") == tool_name), None)
+            if tool_def and tool_def.get("_has_dynamic_prompt"):
+                dynamic_desc = self.get_dynamic_tool_description(tool_def)
+                if dynamic_desc:
+                    spec["description"] = dynamic_desc
+                    tool_def["description"] = dynamic_desc
+        return specs
+
     def discover_tools(self, specific_tool_names: Optional[List[str]] = None, **kwargs) -> List[Dict[str, Any]]:
         if kwargs.get("force_refresh", False) or not self.discovered_tools:
              self._discover_local_tools()
+        tools = self.discovered_tools
         if specific_tool_names:
-            return [t for t in self.discovered_tools if t.get("name") in specific_tool_names]
-        return self.discovered_tools
+            tools = [t for t in tools if t.get("name") in specific_tool_names]
+        for t in tools:
+            if t.get("_has_dynamic_prompt"):
+                dyn_desc = self.get_dynamic_tool_description(t)
+                if dyn_desc:
+                    t["description"] = dyn_desc
+        return tools
 
     def list_tools(self, **kwargs) -> List[Dict[str, Any]]:
         return self.discover_tools(**kwargs)
@@ -497,54 +588,9 @@ class LCPBinding(LollmsToolBinding):
 
         try:
             if python_file_path:
-                module_name = f"lollms_client.tools_bindings.lcp.persistent_{python_file_path.stem}"
-
-                if module_name not in sys.modules:
-                    try:
-                        spec = importlib.util.spec_from_file_location(module_name, str(python_file_path.resolve()))
-                        if not spec or not spec.loader:
-                            return {"error": f"Failed to create module spec for '{python_file_path.stem}'.", "status_code": 500}
-
-                        tool_module = importlib.util.module_from_spec(spec)
-                        sys.modules[module_name] = tool_module
-                        spec.loader.exec_module(tool_module)
-
-                        # ── 🛡️ HOST CONFIGURATION INJECTION ──
-                        if hasattr(tool_module, "init_tools_library") and callable(tool_module.init_tools_library):
-                            library_name = python_file_path.stem
-                            host_config = self.host_tool_configs.get(library_name, {})
-
-                            import inspect as _lcp_inspect
-                            _init_sig = _lcp_inspect.signature(tool_module.init_tools_library)
-                            _init_params = _init_sig.parameters
-
-                            _accepts_positional = any(
-                                p.kind in (_lcp_inspect.Parameter.POSITIONAL_ONLY, _lcp_inspect.Parameter.POSITIONAL_OR_KEYWORD)
-                                for p in _init_params.values()
-                            )
-                            _accepts_var_positional = any(
-                                p.kind == _lcp_inspect.Parameter.VAR_POSITIONAL
-                                for p in _init_params.values()
-                            )
-
-                            if _accepts_positional or _accepts_var_positional:
-                                tool_module.init_tools_library(host_config)
-                            else:
-                                tool_module.init_tools_library()
-
-                            if getattr(ASCIIColors, '_force_debug', False):
-                                ASCIIColors.success(f"[LCP Lazy Init] ✅ Initialized library for '{library_name}' with host configs.")
-                            else:
-                                ASCIIColors.debug(f"[LCP Lazy Init] ✅ Initialized library for '{library_name}' with host configs.")
-                    except Exception as init_ex:
-                        ASCIIColors.error(f"[LCP execute_tool] ❌ Toolset '{python_file_path.stem}' FAILED lazy init: {init_ex}")
-                        import traceback as _lcp_tb
-                        tb_str = _lcp_tb.format_exc()
-                        if module_name in sys.modules:
-                            del sys.modules[module_name]
-                        return {"error": f"Tool initialization failed: {init_ex}", "status_code": 500, "traceback": tb_str}
-                else:
-                    tool_module = sys.modules[module_name]
+                tool_module = self._get_or_load_tool_module(python_file_path)
+                if not tool_module:
+                    return {"error": f"Tool initialization failed for '{python_file_path.stem}'.", "status_code": 500}
             else:
                 tool_module = tool_def.get("_dynamic_module")
                 if not tool_module:

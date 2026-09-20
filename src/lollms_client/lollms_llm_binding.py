@@ -172,7 +172,6 @@ class LollmsLLMBinding(LollmsBaseBinding):
                     self._http_client.close()   # aborts in-flight request
                 super().cancel()
         """
-        ASCIIColors.warning(f"[{self.binding_name}] cancel() called — setting cancel event.")
         self._cancel_event.set()
 
     def reset_cancel(self) -> None:

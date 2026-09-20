@@ -266,7 +266,7 @@ def get_binding_params(config_map: Dict[str, str], modality: str, alias: str) ->
     modality = _validate_modality(modality)
     alias = _sanitize_alias(alias)
     prefix = f"{modality.upper()}_BINDINGS_{alias.upper()}_"
-    return {k[len(prefix):]: v for k, v in config_map.items() if k.startswith(prefix)}
+    return {k[len(prefix):]: v for k, v in config_map.items() if k.upper().startswith(prefix)}
 
 
 def get_profile_params(config_map: Dict[str, str], modality: str, alias: str) -> Dict[str, str]:
@@ -277,7 +277,7 @@ def get_profile_params(config_map: Dict[str, str], modality: str, alias: str) ->
     modality = _validate_modality(modality)
     alias = _sanitize_alias(alias)
     prefix = f"{modality.upper()}_PROFILES_{alias.upper()}_"
-    return {k[len(prefix):]: v for k, v in config_map.items() if k.startswith(prefix)}
+    return {k[len(prefix):]: v for k, v in config_map.items() if k.upper().startswith(prefix)}
 
 
 def set_binding_params(
@@ -367,15 +367,15 @@ def set_default_profile(config_map: Dict[str, str], modality: str, alias: str) -
     profile_prefix = f"{modality.upper()}_PROFILES_"
     target_key = f"{profile_prefix}{alias.upper()}_IS_DEFAULT"
 
-    if not any(k.startswith(f"{profile_prefix}{alias.upper()}_") for k in config_map):
+    if not any(k.upper().startswith(f"{profile_prefix}{alias.upper()}_") for k in config_map):
         raise KeyError(
             f"Profile '{alias}' not found in {modality} config map. "
             f"Create it first with set_profile_params()."
         )
 
     for key in list(config_map.keys()):
-        if key.startswith(profile_prefix) and key.endswith("_IS_DEFAULT"):
-            config_map[key] = "true" if key == target_key else "false"
+        if key.upper().startswith(profile_prefix) and key.upper().endswith("_IS_DEFAULT"):
+            config_map[key] = "true" if key.upper() == target_key else "false"
     config_map[target_key] = "true"
 
     return config_map
@@ -389,7 +389,7 @@ def delete_binding(config_map: Dict[str, str], modality: str, alias: str) -> Dic
     modality = _validate_modality(modality)
     alias = _sanitize_alias(alias)
     prefix = f"{modality.upper()}_BINDINGS_{alias.upper()}_"
-    for key in [k for k in config_map if k.startswith(prefix)]:
+    for key in [k for k in list(config_map.keys()) if k.upper().startswith(prefix)]:
         del config_map[key]
     return config_map
 
@@ -403,17 +403,15 @@ def delete_profile(config_map: Dict[str, str], modality: str, alias: str) -> Dic
     alias = _sanitize_alias(alias)
     prefix = f"{modality.upper()}_PROFILES_{alias.upper()}_"
 
-    was_default = config_map.get(prefix + "IS_DEFAULT", "").lower() in ("true", "1", "yes", "y", "on")
-    for key in [k for k in config_map if k.startswith(prefix)]:
+    was_default = any(
+        k.upper() == f"{prefix}IS_DEFAULT" and config_map[k].lower() in ("true", "1", "yes", "y", "on")
+        for k in config_map
+    )
+    for key in [k for k in list(config_map.keys()) if k.upper().startswith(prefix)]:
         del config_map[key]
 
     if was_default:
-        remaining_prefix = f"{modality.upper()}_PROFILES_"
-        remaining = [
-            k[len(remaining_prefix):].split("_", 1)[0]
-            for k in config_map
-            if k.startswith(remaining_prefix) and k.endswith("_BINDING_ALIAS")
-        ]
+        remaining = get_configured_profiles(config_map, modality)
         if remaining:
             set_default_profile(config_map, modality, remaining[0])
 

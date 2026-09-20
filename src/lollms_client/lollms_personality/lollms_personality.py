@@ -1876,6 +1876,7 @@ class LollmsPersonality:
 
         self._conversation: List[Dict[str, str]] = []
         self._failure_memory = FailureMemory() if FailureMemory else SimpleNamespace(failures=[], _signatures=set())
+        self._pinned_lessons: str = ""
 
         # Initialize workspace
         if self.workspace_path:
@@ -3443,7 +3444,7 @@ JSON:"""
                         "tool_find_files", "tool_grep_files"
                     }
                     _SHELL_TOOL_NAMES = {"tool_execute_shell_command"}
-                    _PY_EXEC_TOOL_NAMES = {"tool_execute_python_code"}
+                    _PY_EXEC_TOOL_NAMES = {"tool_execute_python_code", "tool_execute_python_file"}
                     _GIT_TOOL_NAMES = {
                         "tool_git_status", "tool_git_diff", "tool_git_commit",
                         "tool_git_create_branch", "tool_git_checkout", "tool_git_log",
@@ -3678,6 +3679,161 @@ JSON:"""
             return f"=== SCRATCHPAD CONTENT ===\n{content}\n=== END SCRATCHPAD ==="
         except Exception:
             return ""
+
+    def _build_current_plan_context(self) -> str:
+        """Reads the CURRENT.md plan for injection into the dynamic suffix."""
+        if not self._resolved_workspace:
+            return ""
+        current_path = self._resolved_workspace / ".lollms_code" / "CURRENT.md"
+        if not current_path.exists():
+            return ""
+        try:
+            content = current_path.read_text(encoding="utf-8", errors="ignore")
+            clean_content = content.strip()
+            if not clean_content or clean_content.startswith("# Current Task\n\nNo active task plan"):
+                return ""
+            return f"=== CURRENT TASK PLAN (CURRENT.md) ===\n{clean_content}\n=== END CURRENT TASK PLAN ==="
+        except Exception:
+            return ""
+
+    def _should_compress_context(self, new_prompt: str) -> bool:
+        """
+        Determines whether the incoming prompt represents a major shift in objective
+        or a new task, warranting compression of the previous context into pinned lessons.
+        """
+        if not self._conversation or len(self._conversation) < 2:
+            return False
+
+        new_prompt_lower = new_prompt.strip().lower()
+
+        # 1. Explicit new-task indicators
+        new_task_patterns = [
+            r'^(?:new\s+task|next\s+task|different\s+task|another\s+task)\b',
+            r'^(?:now\s+)?(?:let\'?s\s+)?(?:switch\s+to|start\s+(?:a\s+)?new|move\s+on\s+to)\b',
+            r'^(?:forget\s+(?:about\s+)?(?:that|the\s+previous|earlier)|instead\s+of\s+that)\b',
+            r'^(?:nouvelle\s+t\u00e2che|passons\s+\u00e0|autre\s+chose)\b',
+        ]
+        for pat in new_task_patterns:
+            if re.search(pat, new_prompt_lower):
+                return True
+
+        # 2. Strong continuation indicators (DO NOT compress)
+        continuation_patterns = [
+            r'^(?:continue|proceed|go\s+on|keep\s+going|more|next\s+step)\b',
+            r'^(?:fix|debug|repair|correct|modify|change|update|delete|run|test|execute)\s+(?:it|this|that|the\s+file|the\s+script|the\s+bug|the\s+code)\b',
+            r'^(?:why|what\s+happened|explain|how\s+come)\b',
+            r'^(?:yes|no|y|n|ok|okay|sure|do\s+it)\b',
+        ]
+        for pat in continuation_patterns:
+            if re.search(pat, new_prompt_lower):
+                return False
+
+        # 3. Lexical overlap analysis against previous task keywords
+        words = set(re.findall(r'\b[a-zA-Z]{3,}\b', new_prompt_lower))
+        meaningful_words = {w for w in words if w not in _STOP_WORDS}
+        if not meaningful_words:
+            return False
+
+        prev_words: set[str] = set()
+        for msg in self._conversation:
+            if msg.get("role") == "user":
+                content = str(msg.get("content", "")).lower()
+                for w in re.findall(r'\b[a-zA-Z]{3,}\b', content):
+                    if w not in _STOP_WORDS:
+                        prev_words.add(w)
+
+        if not prev_words:
+            return False
+
+        overlap = len(meaningful_words & prev_words)
+        overlap_ratio = overlap / len(meaningful_words)
+
+        # If keyword overlap is very low (< 15%), it represents a distinct new task
+        if overlap_ratio < 0.15:
+            return True
+
+        return False
+
+    def _compress_previous_task_context(self, new_prompt: str) -> None:
+        """
+        Compresses previous conversation context into persistent lessons learned,
+        pins them to the system prompt, and resets working history so the agent starts
+        the new task with clean context while preserving all acquired knowledge.
+        """
+        if not self._conversation:
+            return
+
+        ASCIIColors.info(f"[{self.name}] 🧠 Objective shift detected. Compressing previous context into pinned lessons...")
+
+        history_lines = []
+        for msg in self._conversation:
+            role = msg.get("role", "user")
+            content = str(msg.get("content", ""))
+            content = re.sub(r'<think\b[^>]*>.*?(?:</think>|$)', '', content, flags=re.DOTALL | re.IGNORECASE)
+            content = re.sub(r'<thought\b[^>]*>.*?(?:</thought>|$)', '', content, flags=re.DOTALL | re.IGNORECASE)
+            content = re.sub(r'<processing\b[^>]*>.*?(?:</processing>|$)', '', content, flags=re.DOTALL | re.IGNORECASE)
+            content = content.strip()
+            if content:
+                history_lines.append(f"{role.upper()}: {content}")
+
+        history_text = "\n\n".join(history_lines)
+        if not history_text.strip():
+            self._conversation.clear()
+            return
+
+        extracted_lessons = ""
+
+        if self.lollms_client:
+            try:
+                extraction_prompt = (
+                    "You are a Senior Software Architect. The user is starting a new task.\n"
+                    "Analyze the previous session history below and extract a concise list of KEY LESSONS LEARNED, "
+                    "CODE/ENVIRONMENT RULES, and ARCHITECTURAL CONSTRAINTS established during that session.\n"
+                    "Requirements:\n"
+                    "1. Focus ONLY on actionable facts, technical constraints, bugs resolved, and tool findings.\n"
+                    "2. Exclude conversational filler, pleasantries, apologies, and intermediate step-by-step logs.\n"
+                    "3. Format as clean bullet points.\n"
+                    "4. Maximum 5 bullet points.\n\n"
+                    f"=== PREVIOUS SESSION ===\n{history_text[:4000]}\n=== END PREVIOUS SESSION ===\n\n"
+                    "KEY LESSONS & CONSTRAINTS:"
+                )
+                raw_extracted = self.lollms_client.generate_text(
+                    prompt=extraction_prompt,
+                    temperature=0.1,
+                    n_predict=512
+                )
+                if isinstance(raw_extracted, str) and raw_extracted.strip():
+                    extracted_lessons = re.sub(r'<think\b[^>]*>.*?(?:</think>|$)', '', raw_extracted, flags=re.DOTALL | re.IGNORECASE).strip()
+            except Exception as ex:
+                ASCIIColors.warning(f"[{self.name}] LLM lesson extraction failed: {ex}")
+
+        if not extracted_lessons:
+            summary_bullets = []
+            for msg in self._conversation:
+                if msg.get("role") == "user":
+                    summary_bullets.append(f"- Previous task: {str(msg.get('content', ''))[:120]}...")
+            extracted_lessons = "\n".join(summary_bullets[:4])
+
+        if extracted_lessons:
+            timestamp = time.strftime("%Y-%m-%d %H:%M")
+            lesson_entry = f"### Session ({timestamp}):\n{extracted_lessons}"
+            if getattr(self, "_pinned_lessons", ""):
+                combined = f"{self._pinned_lessons}\n\n{lesson_entry}"
+                if len(combined) > 3000:
+                    combined = combined[-3000:]
+                self._pinned_lessons = combined
+            else:
+                self._pinned_lessons = lesson_entry
+
+            ASCIIColors.success(f"[{self.name}] 📌 Pinned lessons from previous task to system prompt.")
+
+        # Clear working conversation history; pinned lessons are preserved in system prompt
+        self._conversation.clear()
+        if hasattr(self, "_project_history_file") and self._project_history_file:
+            try:
+                self.save_history_to_disk(self._project_history_file)
+            except Exception:
+                pass
 
     def _build_user_profile_context(self) -> str:
         """Injects the global user profile into the system prompt."""
@@ -4223,6 +4379,9 @@ JSON:"""
         enforce_end_tag: bool = False,
         orchestrator_mode: bool = False,
         event_mode: EventMode = EventMode.PROCESSING_TAG_MODE,
+        think: Optional[bool] = None,
+        reasoning_effort: Optional[str] = None,
+        reasoning_summary: Optional[str] = None,
         **kwargs
     ) -> Dict[str, Any]:
         resolved_max_rounds = max_nb_rounds if max_nb_rounds is not None else max_reasoning_steps
@@ -4362,6 +4521,26 @@ JSON:"""
                         dynamic_suffix_parts.append("=== ACTIVE MEMORIES (PERSISTENT ACROSS SESSIONS) ===\n" + mem_zone + "\n=== END MEMORIES ===")
             except Exception as mem_ex:
                 ASCIIColors.warning(f"[{self.name}] Failed to hydrate memories: {mem_ex}")
+
+        # Task Plan Context (CURRENT.md)
+        current_plan_ctx = self._build_current_plan_context()
+        if current_plan_ctx:
+            dynamic_suffix_parts.append(current_plan_ctx.strip())
+
+        # Check for objective shift / new task and compress context into pinned lessons if needed
+        if use_internal_history and self._conversation:
+            if self._should_compress_context(cleaned_prompt):
+                self._compress_previous_task_context(cleaned_prompt)
+
+        # Pin acquired lessons to the system prompt
+        if getattr(self, "_pinned_lessons", ""):
+            pinned_block = (
+                "\n=== PINNED LESSONS & CONSTRAINTS FROM PREVIOUS SESSIONS ===\n"
+                f"{self._pinned_lessons}\n"
+                "=== END PINNED LESSONS ===\n"
+            )
+            stable_system_prompt += pinned_block
+
         if use_internal_history:
             base_conversation = list(self._conversation)
         else:
@@ -4411,6 +4590,8 @@ JSON:"""
         round_count = 0
         was_cancelled = False
         successful_tool_signatures: set = set()
+        failed_tool_signatures: Dict[str, int] = {}
+        object.__setattr__(self, "_failed_tool_signatures", failed_tool_signatures)
         seen_context_signatures: set = set()
         final_response = ""
         workspace_changes: List[Dict[str, Any]] = []
@@ -4580,7 +4761,6 @@ JSON:"""
                     messages[last_user_idx]["content"] = content_blocks
                 object.__setattr__(self, '_pending_vlm_images', [])
 
-            event_mode = kwargs.get("event_mode", EventMode.PROCESSING_TAG_MODE)
             ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
 
             raw_llm_output_buffer = ""
@@ -4599,11 +4779,17 @@ JSON:"""
                     return ss.feed(chunk)
                 return True
 
-            gen_kwargs = {k: v for k, v in kwargs.items() if k not in ("streaming_callback", "temperature", "n_predict", "stream")}
+            gen_kwargs = {k: v for k, v in kwargs.items() if k not in ("streaming_callback", "temperature", "n_predict", "stream", "think", "reasoning_effort", "reasoning_summary")}
 
             gen_kwargs["n_predict"] = None
 
             gen_kwargs["temperature"] = temperature
+            if think is not None:
+                gen_kwargs["think"] = think
+            if reasoning_effort is not None:
+                gen_kwargs["reasoning_effort"] = reasoning_effort
+            if reasoning_summary is not None:
+                gen_kwargs["reasoning_summary"] = reasoning_summary
 
             _max_retries = 3
             _retry_delay = 2.0
@@ -4794,6 +4980,34 @@ JSON:"""
                                         )
                                         continue
 
+                                # ── 🛑 FAILURE LOOP GUARD (PRE-EXECUTION) ──
+                                fail_count = failed_tool_signatures.get(context_aware_sig, 0)
+                                if fail_count >= 2:
+                                    rep_msg = (
+                                        f"🛑 BLOCKED: Tool '{tool_name}' with identical parameters has already failed {fail_count} times in this turn. "
+                                        f"Execution was blocked to prevent an infinite loop. "
+                                        f"Do NOT call this tool again with the same parameters. Adapt your approach or inform the user."
+                                    )
+                                    action_reports.append(rep_msg)
+                                    if (event_mode.has_callbacks or event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE)) and streaming_callback:
+                                        try:
+                                            streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_END, {
+                                                "tool_name": tool_name,
+                                                "parameters": tool_params,
+                                                "success": False,
+                                                "output": None,
+                                                "error": rep_msg
+                                            })
+                                        except Exception:
+                                            pass
+                                    continue
+
+                                if (event_mode.has_callbacks or event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE)) and streaming_callback:
+                                    try:
+                                        streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_START, {"tool_name": tool_name, "parameters": tool_params})
+                                    except Exception as ex:
+                                        ASCIIColors.warning(f"Failed to emit tool start: {ex}")
+
                                 tool_res = self._execute_tool(tool_name, tool_params, active_tools)
 
                                 vlm_images = self._inject_tool_images_for_vlm(tool_res)
@@ -4814,6 +5028,21 @@ JSON:"""
                                 )
                                 tool_success = not is_failure
 
+                                if tool_success:
+                                    successful_tool_signatures.add(context_aware_sig)
+                                    if context_aware_sig in failed_tool_signatures:
+                                        del failed_tool_signatures[context_aware_sig]
+                                else:
+                                    failed_tool_signatures[context_aware_sig] = failed_tool_signatures.get(context_aware_sig, 0) + 1
+                                    if self._failure_memory:
+                                        try:
+                                            if hasattr(self._failure_memory, "record_failure_by_signature"):
+                                                self._failure_memory.record_failure_by_signature(context_aware_sig, str(tool_res.get("error", "")))
+                                            elif hasattr(self._failure_memory, "_signatures"):
+                                                self._failure_memory._signatures.add(context_aware_sig)
+                                        except Exception:
+                                            pass
+
                                 if tool_success and tool_name in ("tool_create_skill", "tool_update_skill"):
                                     if isinstance(tool_res, dict):
                                         output_vis = tool_params.get("output_visibility", "context").lower()
@@ -4830,13 +5059,6 @@ JSON:"""
                                 tool_results_this_turn.append({"round": round_count, "name": tool_name, "result": tool_res, "success": tool_success})
                                 clean_result_str = _sanitize_tool_result(tool_res, client=self.lollms_client)
 
-                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
-                                    try:
-                                        if streaming_callback:
-                                            streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_START, {"tool_name": tool_name, "parameters": tool_params})
-                                    except Exception:
-                                        pass
-
                                 if tool_success:
                                     report_part = f"=== ✅ TOOL RESULT: {tool_name} ===\n<tool_result name=\"{tool_name}\" status=\"SUCCESS\">\n{clean_result_str}\n</tool_result>"
                                 else:
@@ -4844,16 +5066,17 @@ JSON:"""
 
                                 action_reports.append(report_part)
 
-                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
                                     try:
-                                        if streaming_callback:
-                                            streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_END, {
-                                                "tool_name": tool_name, "success": tool_success,
-                                                "output": clean_result_str if tool_success else None,
-                                                "error": None if tool_success else clean_result_str
-                                            })
-                                    except Exception:
-                                        pass
+                                        streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_END, {
+                                            "tool_name": tool_name,
+                                            "parameters": tool_params,
+                                            "success": tool_success,
+                                            "output": clean_result_str if tool_success else None,
+                                            "error": None if tool_success else clean_result_str
+                                        })
+                                    except Exception as ex:
+                                        ASCIIColors.warning(f"Failed to emit tool end: {ex}")
                             except Exception as e:
                                 if getattr(self, 'debug_mode', False):
                                     self._dump_error(
@@ -4997,6 +5220,20 @@ JSON:"""
                                         action_reports.append(f"❌ FILE WRITE BLOCKED for {title}. Empty artifact body.")
                                         continue
 
+                                    if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                        try:
+                                            streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {
+                                                "title": title,
+                                                "art_type": resolved_art_type,
+                                                "language": lang,
+                                                "is_patch": False,
+                                                "operation": "create",
+                                                "content": body_content,
+                                                "execution_phase": True
+                                            })
+                                        except Exception:
+                                            pass
+
                                     if self._artefact_manager:
                                         self._artefact_manager.add(title=title, artefact_type=resolved_art_type, content=body_content, language=lang, active=True)
                                     file_path = self._resolved_workspace / title
@@ -5005,10 +5242,21 @@ JSON:"""
                                     action_reports.append(f"✅ File {title} created/updated successfully.")
                                     actions_executed_count += 1
 
-                                    try:
-                                        self._execute_context_visibility("lock_file", title)
-                                    except Exception:
-                                        pass
+                                    if (event_mode.has_callbacks or event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE)) and streaming_callback:
+                                        try:
+                                            streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {
+                                                "title": title,
+                                                "art_type": resolved_art_type,
+                                                "language": lang,
+                                                "version": 1,
+                                                "is_patch": False,
+                                                "operation": "create",
+                                                "content": body_content,
+                                                "success": True,
+                                                "error": None
+                                            })
+                                        except Exception:
+                                            pass
                             except Exception as e:
                                 if getattr(self, 'debug_mode', False):
                                     self._dump_error(
@@ -5171,6 +5419,15 @@ JSON:"""
 
                 if not ss.completed_actions and not tool_calls_this_turn and not workspace_changes and not ss.was_done_detected() and round_count == 1:
                     pass
+
+                if not final_response.strip():
+                    for vh in reversed(virtual_history):
+                        if getattr(vh, "sender_type", "") == "assistant" and getattr(vh, "content", "").strip():
+                            recovered = re.sub(r'<[^>]+>', '', vh.content).strip()
+                            if recovered and not _is_synthetic_agent_response(recovered):
+                                final_response = recovered
+                                ASCIIColors.info(f"[{self.name}] Recovered conversational response from previous round assistant text.")
+                                break
 
                 if not final_response.strip():
                     if getattr(self, 'debug_mode', False):
@@ -5336,15 +5593,37 @@ JSON:"""
 
                             tool_calls_this_turn.append({"round": round_count, "name": tool_name, "parameters": tool_params})
                             tool_results_this_turn.append({"round": round_count, "name": tool_name, "result": tool_res, "success": tool_success})
+                            if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                try:
+                                    streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_START, {"tool_name": tool_name, "parameters": tool_params})
+                                except Exception:
+                                    pass
+
+                            tool_res = self._execute_tool(tool_name, tool_params, active_tools)
+
+                            vlm_images = self._inject_tool_images_for_vlm(tool_res)
+                            if vlm_images:
+                                if not hasattr(self, '_pending_vlm_images'):
+                                    object.__setattr__(self, '_pending_vlm_images', [])
+                                self._pending_vlm_images.extend(vlm_images)
+
                             clean_result_str = _sanitize_tool_result(tool_res, client=self.lollms_client)
                             actions_executed_count += 1
 
-                            if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
-                                try:
-                                    if streaming_callback:
-                                        streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_START, {"tool_name": tool_name, "parameters": tool_params})
-                                except Exception:
-                                    pass
+                            if tool_success:
+                                successful_tool_signatures.add(context_aware_sig)
+                                if context_aware_sig in failed_tool_signatures:
+                                    del failed_tool_signatures[context_aware_sig]
+                            else:
+                                failed_tool_signatures[context_aware_sig] = failed_tool_signatures.get(context_aware_sig, 0) + 1
+                                if self._failure_memory:
+                                    try:
+                                        if hasattr(self._failure_memory, "record_failure_by_signature"):
+                                            self._failure_memory.record_failure_by_signature(context_aware_sig, str(tool_res.get("error", "")))
+                                        elif hasattr(self._failure_memory, "_signatures"):
+                                            self._failure_memory._signatures.add(context_aware_sig)
+                                    except Exception:
+                                        pass
 
                             if tool_success:
                                 report_part = f"=== ✅ TOOL RESULT: {tool_name} ===\n<tool_result name=\"{tool_name}\" status=\"SUCCESS\">\n{clean_result_str}\n</tool_result>"
@@ -5353,14 +5632,15 @@ JSON:"""
 
                             action_reports.append(report_part)
 
-                            if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                            if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
                                 try:
-                                    if streaming_callback:
-                                        streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_END, {
-                                            "tool_name": tool_name, "success": tool_success,
-                                            "output": clean_result_str if tool_success else None,
-                                            "error": None if tool_success else clean_result_str
-                                        })
+                                    streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_END, {
+                                        "tool_name": tool_name,
+                                        "parameters": tool_params,
+                                        "success": tool_success,
+                                        "output": clean_result_str if tool_success else None,
+                                        "error": None if tool_success else clean_result_str
+                                    })
                                 except Exception:
                                     pass
                         except Exception as e:
@@ -5436,6 +5716,21 @@ JSON:"""
                                     action_reports.append(f"✅ SEARCH/REPLACE applied successfully to {title}.")
                                     if self._artefact_manager:
                                         self._artefact_manager.update(title=title, new_content=patched_content, language=lang, bump_version=True, active=True)
+                                    if (event_mode.has_callbacks or event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE)) and streaming_callback:
+                                        try:
+                                            streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {
+                                                "title": title,
+                                                "art_type": resolved_art_type,
+                                                "language": lang,
+                                                "version": 1,
+                                                "is_patch": True,
+                                                "operation": "patch",
+                                                "content": patched_content,
+                                                "success": True,
+                                                "error": None
+                                            })
+                                        except Exception:
+                                            pass
                                 except Exception as patch_err:
                                     if getattr(self, 'debug_mode', False):
                                         self._dump_error(
@@ -5445,6 +5740,21 @@ JSON:"""
                                             extra_data={"title": title, "original_length": len(original_content), "patch_body": body_content[:500]}
                                         )
                                     action_reports.append(f"❌ SEARCH/REPLACE FAILED for {title}. Error: {patch_err}")
+                                    if (event_mode.has_callbacks or event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE)) and streaming_callback:
+                                        try:
+                                            streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {
+                                                "title": title,
+                                                "art_type": resolved_art_type,
+                                                "language": lang,
+                                                "version": 1,
+                                                "is_patch": True,
+                                                "operation": "patch",
+                                                "content": body_content,
+                                                "success": False,
+                                                "error": str(patch_err)
+                                            })
+                                        except Exception:
+                                            pass
                             elif is_append:
                                 if not file_path.exists():
                                     action_reports.append(f"[SYSTEM ERROR] File '{title}' not found. Cannot append. Create it first without operation='append'.")
@@ -5475,6 +5785,20 @@ JSON:"""
                                     action_reports.append(f"❌ FILE WRITE BLOCKED for {title}. Empty artifact body.")
                                     continue
 
+                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                    try:
+                                        streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {
+                                            "title": title,
+                                            "art_type": resolved_art_type if 'resolved_art_type' in locals() else "code",
+                                            "language": lang,
+                                            "is_patch": False,
+                                            "operation": "create",
+                                            "content": body_content,
+                                            "execution_phase": True
+                                        })
+                                    except Exception:
+                                        pass
+
                                 if self._artefact_manager:
                                     self._artefact_manager.add(title=title, artefact_type="code", content=body_content, language=lang, active=True)
                                 file_path = self._resolved_workspace / title
@@ -5482,6 +5806,38 @@ JSON:"""
                                 file_path.write_text(body_content, encoding="utf-8")
                                 action_reports.append(f"✅ File {title} created/updated successfully.")
                                 actions_executed_count += 1
+
+                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                    try:
+                                        streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {
+                                            "title": title,
+                                            "art_type": "code",
+                                            "language": lang,
+                                            "version": 1,
+                                            "is_patch": False,
+                                            "operation": "create",
+                                            "content": body_content,
+                                            "success": True,
+                                            "error": None
+                                        })
+                                    except Exception:
+                                        pass
+
+                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                    try:
+                                        streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {
+                                            "title": title,
+                                            "art_type": resolved_art_type if 'resolved_art_type' in locals() else "code",
+                                            "language": lang,
+                                            "version": 1,
+                                            "is_patch": False,
+                                            "operation": "create",
+                                            "content": body_content,
+                                            "success": True,
+                                            "error": None
+                                        })
+                                    except Exception:
+                                        pass
 
                                 try:
                                     self._execute_context_visibility("lock_file", title)
@@ -5951,15 +6307,21 @@ JSON:"""
                 ))
                 continue
 
-            if round_count > 1 and tool_calls_this_turn and not was_cancelled and not has_new_actions_this_round:
+            had_prior_actions = bool(tool_calls_this_turn or workspace_changes or len(virtual_history) > 0)
+
+            # ── 🛡️ MID-TASK STALL INTERCEPTOR ──
+            # If the model had prior actions (e.g. created a file in round 1), but in this round
+            # outputted prose intent (e.g. "Now I'll execute it...") without emitting an action tag
+            # or <done/>, it must NOT exit. Intercept and mandate action tag execution.
+            if round_count > 1 and had_prior_actions and not was_cancelled and not has_new_actions_this_round and not ss.was_done_detected():
                 consecutive_stall_count = getattr(self, '_consecutive_stall_count', 0) + 1
                 object.__setattr__(self, '_consecutive_stall_count', consecutive_stall_count)
 
                 if consecutive_stall_count >= 3:
-                    ASCIIColors.error(f"[{self.name}] Terminating after {consecutive_stall_count} consecutive stalls. The LLM appears unable to proceed.")
+                    ASCIIColors.warning(f"[{self.name}] Terminating after {consecutive_stall_count} consecutive stalls. The LLM is stuck in preamble mode.")
                     final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
                     if not final_response:
-                        final_response = "[Task terminated: The agent stalled repeatedly without producing actionable output. This may indicate the context window is full or the task is too complex for the current model.]"
+                        final_response = "[Task terminated: The agent stalled repeatedly without producing actionable output.]"
                     if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
                         try:
                             streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
@@ -5971,17 +6333,20 @@ JSON:"""
                     break
 
                 ASCIIColors.warning(f"[{self.name}] Mid-task stall detected (Round {round_count}, consecutive: {consecutive_stall_count}). LLM stopped without <done/> or new actions. Forcing continuation.")
-                virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text()))
+                virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text().strip()))
                 recent_tool_names = [tc.get("name", "") for tc in tool_calls_this_turn[-3:]]
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
                     content=self._build_progressive_continuation_prompt(consecutive_stall_count, recent_tool_names)
                 ))
+                ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
                 continue
+
             elif has_new_actions_this_round and not text_is_repetitive:
                 object.__setattr__(self, '_consecutive_stall_count', 0)
                 if raw_round_text.strip():
                     virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text()))
+
             if not text_is_repetitive and stripped_round_text:
                 object.__setattr__(self, '_consecutive_stall_count', 0)
 
@@ -6048,9 +6413,6 @@ JSON:"""
                 virtual_history = self._apply_rolling_artifact_compaction(virtual_history, base_conversation)
 
             # ── 🛡️ ROUND 1 PREAMBLE STALL INTERCEPTOR ──
-            # If the model emitted conversational prose (e.g., "I'll generate an image...")
-            # but stopped without emitting <done/> and without calling any tools/actions,
-            # we MUST inject a continuation prompt to execute the required action tag.
             if (
                 round_count == 1
                 and not ss.was_done_detected()
@@ -6108,127 +6470,39 @@ JSON:"""
                     ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Malformed tag detected, injecting format correction ===")
                 continue
 
-            if len(tool_calls_this_turn) > 0 and not was_cancelled:
+            # ── 🛑 ENFORCE END TAG MANDATE ──
+            # When enforce_end_tag=True, the turn MUST NOT terminate without an explicit <done/> tag.
+            if enforce_end_tag and not ss.was_done_detected() and not was_cancelled:
                 consecutive_stall_count = getattr(self, '_consecutive_stall_count', 0) + 1
                 object.__setattr__(self, '_consecutive_stall_count', consecutive_stall_count)
-
-                if consecutive_stall_count >= 3:
-                    ASCIIColors.warning(f"[{self.name}] Terminating after {consecutive_stall_count} consecutive text-only stalls after tools. LLM is stuck in preamble mode.")
+                if consecutive_stall_count >= 4:
+                    ASCIIColors.warning(f"[{self.name}] Terminating after {consecutive_stall_count} consecutive stalls without <done/>.")
                     final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
-                    if not final_response:
-                        final_response = "[Task terminated: The agent repeatedly produced text preambles without executing any actions.]"
-                    if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
-                        try:
-                            streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
-                                "round_id": round_count,
-                                "status": "text_stall"
-                            })
-                        except Exception:
-                            pass
                     break
 
-                ASCIIColors.warning(f"[{self.name}] LLM stopped without <done/> after tools were executed (stall #{consecutive_stall_count}). Injecting continuation mandate.")
-                virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text()))
+                ASCIIColors.warning(f"[{self.name}] No <done/> detected (Round {round_count}, streak {consecutive_stall_count}/4). Enforcing continuation.")
+                virtual_history.append(SimpleNamespace(
+                    sender_type="assistant",
+                    content=ss.get_clean_text().strip()
+                ))
                 recent_tool_names = [tc.get("name", "") for tc in tool_calls_this_turn[-3:]]
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
-                    content=self._build_progressive_continuation_prompt(consecutive_stall_count, recent_tool_names)
+                    content=(
+                        "[SYSTEM DIRECTIVE: You wrote conversational text without executing an action tag or emitting `<done/>`.\n"
+                        "Your task is NOT finished yet. Continue and perform the remaining steps requested by the user:\n"
+                        "- To execute Python code: `<tool>{\"name\": \"tool_execute_python_code\", \"parameters\": {\"code\": \"...\"}}</tool>`\n"
+                        "- To run shell/system commands: `<tool>{\"name\": \"tool_execute_shell_command\", \"parameters\": {\"command\": \"...\"}}</tool>`\n"
+                        "- To delete files: run a command via `tool_execute_shell_command` or Python code via `tool_execute_python_code`.\n"
+                        "- ONLY when ALL steps are genuinely completed and verified, write your final answer and emit `<done/>` on a new line.\n"
+                        "Do NOT write conversational preambles. Output the action tag NOW.]"
+                    )
                 ))
-                if getattr(self, 'debug_mode', False):
-                    ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Text-only after tools, injecting continuation mandate ===")
+                ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
                 continue
 
             if not final_response:
                 final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
-
-            stripped_final_check = re.sub(r'<[^>]+>', '', final_response).strip()
-
-            if (
-                not was_cancelled
-                and not tool_calls_this_turn
-                and not workspace_changes
-                and not getattr(self, '_consecutive_stall_count', 0) >= 3
-                and not stripped_final_check
-                and round_count == 1
-                and not ss.was_done_detected()
-                and not ss.was_action_dispatched()
-            ):
-                empty_response_count = getattr(self, '_consecutive_empty_responses', 0) + 1
-                object.__setattr__(self, '_consecutive_empty_responses', empty_response_count)
-
-                if empty_response_count >= 2:
-                    ASCIIColors.warning(f"[{self.name}] Consecutive empty responses with no actions or <done/> ({empty_response_count}). Likely context exhaustion or model failure. Terminating.")
-                    final_response = (
-                        "[Empty response: The LLM produced 0 tokens. This typically indicates the context window is exhausted "
-                        "(input exceeds the model's maximum context length). Try unloading files with /clear-files, "
-                        "clearing history with /clear-history, or switching to a model with a larger context window.]"
-                    )
-                    if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
-                        try:
-                            streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
-                                "round_id": round_count,
-                                "status": "text_stall"
-                            })
-                        except Exception:
-                            pass
-                    break
-
-                ASCIIColors.warning(f"[{self.name}] Empty LLM response on round 1 (no actions, no <done/>). Possible context exhaustion. Injecting continuation mandate (attempt {empty_response_count}).")
-                virtual_history.append(SimpleNamespace(
-                    sender_type="user",
-                    content=(
-                        "[SYSTEM: Your previous response was completely empty (0 tokens generated). "
-                        "This usually means the context window is full. "
-                        "If you can see this message, respond with a brief status and emit <done/>. "
-                        "If you cannot generate any text, the user needs to reduce the context load.]"
-                    )
-                ))
-                ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
-                continue
-
-            if (
-                not was_cancelled
-                and not tool_calls_this_turn
-                and not workspace_changes
-                and not getattr(self, '_consecutive_stall_count', 0) >= 3
-                and stripped_final_check
-                and len(stripped_final_check) > 10
-            ):
-                consecutive_stall_count = getattr(self, '_consecutive_stall_count', 0) + 1
-                object.__setattr__(self, '_consecutive_stall_count', consecutive_stall_count)
-
-                if consecutive_stall_count >= 3:
-                    if getattr(self, 'debug_mode', False):
-                        ASCIIColors.warning(f"[{self.name}] Terminating after {consecutive_stall_count} consecutive text-only stalls. LLM is stuck in preamble mode.")
-                    if not final_response:
-                        final_response = "[Task terminated: The agent repeatedly produced text preambles without executing any actions.]"
-                    if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
-                        try:
-                            streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
-                                "round_id": round_count,
-                                "status": "text_stall"
-                            })
-                        except Exception:
-                            pass
-                    break
-
-                if getattr(self, 'debug_mode', False):
-                    ASCIIColors.warning(f"[{self.name}] Text-only stall detected (Round {round_count}, consecutive: {consecutive_stall_count}). No actions, no <done/>. Injecting continuation mandate.")
-
-                virtual_history.append(SimpleNamespace(
-                    sender_type="assistant",
-                    content=ss.get_clean_text()
-                ))
-
-                recent_tool_names = [tc.get("name", "") for tc in tool_calls_this_turn[-3:]]
-                virtual_history.append(SimpleNamespace(
-                    sender_type="user",
-                    content=self._build_progressive_continuation_prompt(consecutive_stall_count, recent_tool_names)
-                ))
-                ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
-                if getattr(self, 'debug_mode', False):
-                    ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Text-only stall intercepted, enforcing continuation ===")
-                continue
 
             if getattr(self, 'debug_mode', False):
                 ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Clean exit ===")
@@ -6367,11 +6641,14 @@ JSON:"""
             ss.completed_actions = []
 
         if use_internal_history and not was_cancelled:
-            if _is_synthetic_agent_response(final_response):
+            # Strip thoughts completely before persisting in conversation history
+            clean_persisted = re.sub(r'<think\b[^>]*>.*?(?:</think>|$)', '', final_response, flags=re.DOTALL | re.IGNORECASE).strip()
+            clean_persisted = re.sub(r'<thought\b[^>]*>.*?(?:</thought>|$)', '', clean_persisted, flags=re.DOTALL | re.IGNORECASE).strip()
+            if _is_synthetic_agent_response(clean_persisted):
                 ASCIIColors.info(f"[{self.name}] Synthetic failure response suppressed from conversation history.")
             else:
                 self._conversation.append({"role": "user", "content": prompt})
-                self._conversation.append({"role": "assistant", "content": final_response})
+                self._conversation.append({"role": "assistant", "content": clean_persisted})
 
         object.__setattr__(self, '_compaction_triggered_this_turn', False)
 

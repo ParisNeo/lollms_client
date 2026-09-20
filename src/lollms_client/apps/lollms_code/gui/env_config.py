@@ -73,13 +73,25 @@ except ImportError as e:
         return raw
 
     def get_configured_aliases(binding_type, config_map, category="BINDINGS") -> List[str]:
-        prefix = f"{binding_type.upper()}_{category}_"
+        prefix = f"{binding_type.upper()}_{category.upper()}_"
         aliases = set()
         for k in config_map:
-            if k.startswith(prefix):
-                parts = k[len(prefix):].split("_", 1)
-                if len(parts) == 2:
-                    aliases.add(parts[0])
+            k_upper = k.upper()
+            if not k_upper.startswith(prefix):
+                continue
+            remainder = k_upper[len(prefix):]
+            if category.upper() == "BINDINGS" and remainder.endswith("_BINDING_NAME"):
+                alias = remainder[:-len("_BINDING_NAME")]
+                if alias:
+                    aliases.add(alias)
+            elif category.upper() == "PROFILES" and remainder.endswith("_BINDING_ALIAS"):
+                alias = remainder[:-len("_BINDING_ALIAS")]
+                if alias:
+                    aliases.add(alias)
+            else:
+                idx = remainder.rfind("_")
+                if idx > 0:
+                    aliases.add(remainder[:idx])
         return sorted(aliases)
 
     def get_binding_keys_raw(binding_type, alias, config_map) -> Dict[str, str]:

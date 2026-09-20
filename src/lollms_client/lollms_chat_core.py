@@ -1279,11 +1279,13 @@ def format_orchestrator_history(messages: List[Dict[str, Any]]) -> List[Dict[str
 def format_user_view(text: str, event_mode: Any = None) -> str:
     """
     Renders the clean user-facing view from raw model output.
-    Strips internal orchestration tags and processing blocks while preserving natural conversational prose.
+    Strips internal orchestration tags, processing blocks, and thoughts while preserving natural conversational prose.
     """
     if not text:
         return ""
-    cleaned = re.sub(r'<(?:plan|delegate|verify)\b[^>]*>.*?</(?:plan|delegate|verify)>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r'<think\b[^>]*>.*?(?:</think>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r'<thought\b[^>]*>.*?(?:</thought>|$)', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r'<(?:plan|delegate|verify)\b[^>]*>.*?</(?:plan|delegate|verify)>', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
     cleaned = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
     cleaned = re.sub(r'</?processing[^>]*>', '', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'<!--\s*status:[^>]*-->', '', cleaned, flags=re.IGNORECASE)

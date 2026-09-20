@@ -32,6 +32,10 @@ lollms-code -i
 # Target a specific project
 lollms-code --workspace ./myproject "add unit tests for all modules"
 
+# Point to a custom Handbag (specialized persona, custom tools, skills, memory)
+lollms-code --handbag ./my_handbags/security_auditor "audit the authentication flow"
+lollms-code -hb ./my_handbags/data_scientist -i
+
 # Use a specific model
 lollms-code --model qwen3:32b "refactor the database layer"
 ```

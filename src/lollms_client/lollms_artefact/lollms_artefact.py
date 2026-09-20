@@ -297,6 +297,12 @@ _KNOWN_EXTENSIONS = {
     ".asc", ".cir", ".net", ".op", ".sp", ".spi", ".sch",
 }
 
+_KNOWN_EXTENSIONLESS_FILES = {
+    "makefile", "dockerfile", "license", "procfile", "gemfile",
+    "rakefile", "vagrantfile", "authors", "changelog", "contributing",
+    "copying", "install", "news", "readme",
+}
+
 # Directories and extensions to strictly ignore during artifact discovery, indexing, and context injection
 _IGNORED_ARTEFACT_DIRS = {
     "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
@@ -451,19 +457,33 @@ class ArtefactManager:
         return migrated
 
     def _get_filename_with_ext(self, title: str, atype: str, language: Optional[str] = None, file_ext: Optional[str] = None) -> str:
-        # CRITICAL FIX: If file_ext is explicitly an empty string, honor it immediately.
-        # This prevents scratchpads/skills/notes from receiving default extensions like .txt or .md.
+        # If file_ext is explicitly an empty string, honor it immediately.
         if file_ext == "":
             return title
-            
+
+        p_name = Path(title).name
+        # Dotfiles (e.g. .gitignore, .env, .dockerignore) are complete filenames and must never have extensions appended
+        if p_name.startswith("."):
+            return title
+
+        # Known extensionless files (e.g. Makefile, Dockerfile, LICENSE) are complete filenames
+        if p_name.lower() in _KNOWN_EXTENSIONLESS_FILES:
+            return title
+
+        # If title already has an extension (suffix), never append another extension
+        if Path(title).suffix:
+            return title
+
         title_lower = title.lower()
         for known_ext in _KNOWN_EXTENSIONS:
             if title_lower.endswith(known_ext):
                 return title
-        
-        if file_ext is not None:
+
+        if file_ext is not None and file_ext != "":
+            if title_lower.endswith(file_ext.lower()):
+                return title
             return f"{title}{file_ext}"
-            
+
         ext = ""
         if language:
             lang_map = {
@@ -479,7 +499,17 @@ class ArtefactManager:
                     "tool": ".py"
                 }
                 ext = type_map.get(atype, ".txt")
-        return f"{title}{ext}"
+        elif atype:
+            type_map = {
+                "code": ".py", "document": ".md", "note": ".txt",
+                "skill": ".md", "data": ".csv", "presentation": ".html",
+                "tool": ".py"
+            }
+            ext = type_map.get(atype, "")
+
+        if ext and not title_lower.endswith(ext.lower()):
+            return f"{title}{ext}"
+        return title
 
     def _sync_to_disk_workspace(self, title: str, content: str, version: int, atype: str, language: Optional[str] = None, file_ext: Optional[str] = None, physical_data: Optional[bytes] = None, logical_content: Optional[str] = None, physical_path: Optional[str] = None):
         """
@@ -508,6 +538,18 @@ class ArtefactManager:
 
             # The active file in the workspace root (source of truth for tools)
             active_file_path = self._resolve_confined_path(filename, ensure_parent=True)
+
+            # Clean up any spurious duplicate file created by legacy extension appending
+            # (e.g. '.gitignore.md' when the true file is '.gitignore')
+            if filename != f"{clean_path}.md":
+                try:
+                    spurious_md = self._resolve_confined_path(f"{clean_path}.md")
+                    if spurious_md != active_file_path and spurious_md.is_file():
+                        if not any(a.get("title") == f"{clean_path}.md" for a in self._get_all_raw()):
+                            spurious_md.unlink()
+                            ASCIIColors.info(f"[ArtefactManager] Auto-purged spurious duplicate file: '{spurious_md.name}'")
+                except Exception:
+                    pass
 
             # ── MODE SPLIT: VERSION SNAPSHOTS & .LAM ARE DISCUSSION-MODE ONLY ──
             # In agentic mode (disable_artefact_versioning=True), thousands of files
@@ -684,8 +726,15 @@ class ArtefactManager:
         else:
             physical_path = title
 
+        p_name = Path(physical_path).name
+        is_dotfile = p_name.startswith(".")
+        is_known_extensionless = p_name.lower() in _KNOWN_EXTENSIONLESS_FILES
+        has_suffix = bool(Path(physical_path).suffix)
+
         raw_suffix = Path(physical_path).suffix.lower()
-        if raw_suffix and raw_suffix in _KNOWN_EXTENSIONS:
+        if is_dotfile or is_known_extensionless or has_suffix:
+            file_ext = ""
+        elif raw_suffix and raw_suffix in _KNOWN_EXTENSIONS:
             file_ext = extra_data.get("file_ext") or raw_suffix
         else:
             file_ext = extra_data.get("file_ext") or None
@@ -695,11 +744,12 @@ class ArtefactManager:
                 file_ext = ""
             elif artefact_type in (ArtefactType.SKILL, ArtefactType.NOTE):
                 file_ext = ".md"
-            elif artefact_type == ArtefactType.DOCUMENT and not raw_suffix:
+            elif artefact_type == ArtefactType.DOCUMENT and not has_suffix and not is_dotfile and not is_known_extensionless:
                 file_ext = ".md"
+            else:
+                file_ext = ""
 
-            if file_ext is not None:
-                extra_data["file_ext"] = file_ext
+        extra_data["file_ext"] = file_ext
 
         file_ext_clean = (file_ext or "").lower()
         if file_ext_clean == ".sql" or title.lower().endswith(".sql"):

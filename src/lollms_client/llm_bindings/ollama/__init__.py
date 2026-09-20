@@ -26,8 +26,9 @@ from lollms_client.lollms_utilities import ImageTokenizer
 
 BindingName = "OllamaBinding"
 
-_THINK_OPEN = "\n\n"
+_THINK_OPEN = "<think>"
 
+_THINK_CLOSE = "</think>\n"
 
 class _ThinkingStreamTracker:
     """

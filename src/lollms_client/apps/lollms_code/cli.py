@@ -40,6 +40,7 @@ if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
 from ascii_colors import questionary
 from ascii_colors.rich.console import Console
 from ascii_colors.rich.table import Table
+
 from lollms_client import LollmsClient
 from lollms_client.lollms_personality import LollmsPersonality
 from lollms_client.lollms_personality.lollms_personality import CapabilityFlags
@@ -65,6 +66,40 @@ def get_workspace_conversation_file(workspace_path: str | Path) -> Path:
 
 def get_workspace_prompt_history_file(workspace_path: str | Path) -> Path:
     return get_workspace_sandbox_dir(workspace_path) / "prompt_history.json"
+
+CODING_EXECUTION_HARNESS = """
+=== AUTONOMOUS EXECUTION & SHELL CAPABILITIES ===
+You have full access to execute code, run shell commands, and manage workspace files.
+
+## MACRO STEPS PLANNING (CURRENT.md MANDATE)
+For every non-trivial task, you MUST maintain a macro-level plan in `.lollms_code/CURRENT.md`.
+1. **DEFINE AT TASK START**: Initialize your macro steps plan in `.lollms_code/CURRENT.md` using checkbox markdown:
+   ```markdown
+   # Current Task: <Task Title>
+
+   ## Macro Steps Plan
+   - [ ] Step 1: <First milestone>
+   - [ ] Step 2: <Second milestone>
+   - [ ] Step 3: <Verification and testing>
+
+   ## Notes & Findings
+   - ...
+   ```
+2. **UPDATE ON MILESTONE COMPLETION**: Every time a macro step is finished (for example, you coded a function, executed it, debugged it, and tested it), update `.lollms_code/CURRENT.md` immediately, marking that step complete (`- [x]`) and recording any findings.
+3. **GROUND TRUTH ROADMAP**: `.lollms_code/CURRENT.md` is automatically loaded into your context. Use it so you never lose context or repeat completed work across rounds.
+
+## WORKFLOW & EXECUTION MANDATE
+1. **FILE CREATION & EDITING**: Use `<artifact>` tags with complete code or SEARCH/REPLACE blocks.
+2. **EXECUTION MANDATE**: When asked to create and execute code:
+   - Emit the `<artifact>` tag to create the file.
+   - Then execute it using `tool_execute_python_file` or `tool_execute_shell_command`.
+   - Never finish with `<done/>` before executing and inspecting the output!
+3. **SYSTEM SHELL EXECUTION**: Use `tool_execute_shell_command` to run tests, scripts, or OS commands.
+   - On Windows, the shell is `cmd.exe`. Use `del` to delete files (NOT `rm`), `rmdir /s /q` to delete directories (NOT `rm -rf`), `dir` to list, and `type` to view. Never use `rm` on Windows.
+   - To check file deletion, use `python -c "import os; print(not os.path.exists('file'))"` or `if not exist file.py (echo DELETED)`. Do not use `dir <deleted_file>` which returns exit code 1.
+4. **TERMINATION**: When all objectives are met and verified, summarize your work and end with `<done/>` on a new line.
+=== END AUTONOMOUS EXECUTION & SHELL CAPABILITIES ===
+"""
 
 TTI_CAPABILITY_PROMPT = """
 === IMAGE GENERATION CAPABILITY (ACTIVE) ===
@@ -96,10 +131,22 @@ For every task, follow this structured pipeline:
   - Example: "The database layer uses SQLAlchemy with a repository pattern." -> `<mem_new content="Project uses SQLAlchemy repository pattern for DB access" tags="architecture,database" />`
   - Do NOT save trivial code snippets. Save rules, patterns, and structural facts.
 
-### Phase 2: PLANNING & DIRECT ACTION
-- For complex multi-file coding tasks: Briefly state your plan in 2-3 bullet points AND emit the first action tag (`<unlock_file>`, `<artifact>`, or `<tool>`) in the SAME response.
-- For direct commands (e.g., generating images, running a command, querying data): Do NOT write multi-step plans. Emit the `<tool>` or `<generate_image>` tag immediately.
-- Never write a plan and stop without outputting the action tag.
+### Phase 2: MACRO STEPS PLANNING (CURRENT.md MANDATE)
+- For every non-trivial task, you MUST maintain a macro-level plan in `.lollms_code/CURRENT.md`.
+- **CREATE AT TASK START**: Define your macro steps using markdown checkboxes:
+  ```markdown
+  # Current Task: <Task Title>
+
+  ## Macro Steps Plan
+  - [ ] Step 1: <Description of first milestone, e.g. Implement function X>
+  - [ ] Step 2: <Description of second milestone, e.g. Execute and debug>
+  - [ ] Step 3: <Verification and testing>
+
+  ## Notes & Findings
+  - ...
+  ```
+- **UPDATE ON MILESTONE COMPLETION**: Every time a macro step is finished (e.g., you coded a function, executed it, debugged it, and tested it), you MUST update `.lollms_code/CURRENT.md` immediately, marking that step complete (`- [x]`) and recording any findings.
+- **GROUND TRUTH ROADMAP**: `.lollms_code/CURRENT.md` is automatically loaded into your context. Use it so you never lose context or repeat completed work across rounds.
 
 ### Phase 3: IMPLEMENTATION
 - Use `<artifact>` tags to create or overwrite files.
@@ -107,11 +154,16 @@ For every task, follow this structured pipeline:
 - Write clean, production-quality code with proper error handling.
 - Include docstrings and type hints where appropriate.
 
-### Phase 4: TESTING & VERIFICATION
+### Phase 4: TESTING & VERIFICATION (EXECUTION MANDATE)
+- When the user asks you to create a file AND execute it (e.g. 'create X and run/execute it'):
+  1. Emit the `<artifact>` tag to create the file.
+  2. You MUST EXECUTE it in the next action using `tool_execute_python_code`, `tool_execute_python_file`, or `tool_execute_shell_command`.
+  3. You are STRICTLY FORBIDDEN from finishing with `<done/>` before executing the file and inspecting the output!
 - Use `tool_execute_shell_command` to run tests (e.g., `python -m pytest`).
 - Read the test output carefully. If tests fail, FIX THE ROOT CAUSE.
 - Do NOT mask errors with try/except — fix the actual bug.
 - Re-run tests after each fix until ALL pass.
+- After verification, update `.lollms_code/CURRENT.md` marking the step complete (`- [x]`).
 
 ### Phase 5: SKILL GENESIS (CRITICAL FOR LEARNING)
 - After completing a non-trivial task, you MUST evaluate if your solution contains a reusable methodology.
@@ -216,6 +268,7 @@ You have access to the `tool_execute_shell_command` tool. This is used for runni
 2. **CODE EXECUTION**: To execute Python code, use `python scripts/script.py` or `python -c "import math; print(math.pi)"`.
 3. **PACKAGE MANAGEMENT**: If a package is missing, use `pip install package_name`.
 4. **TESTING**: Run tests using `python -m pytest` or `python -m unittest`.
+5. **WINDOWS COMMAND PROMPT (cmd.exe)**: When running on Windows, the shell is `cmd.exe`. Use `del` to delete files (NOT `rm`), `rmdir /s /q` to delete directories (NOT `rm -rf`), `dir` to list files, and `type` to view files. Never use `rm` on Windows. To check if a file is deleted without tripping exit-code errors, use `python -c "import os; print(not os.path.exists('file'))"` or `if not exist file.py (echo DELETED)` (do not use `dir <deleted_file>` which returns exit code 1).
 
 ### GIT OPERATIONS (HIGH-EFFICIENCY PROTOCOL)
 When asked to "commit", "push", or perform any git operation, you MUST follow this 2-round protocol:
@@ -1027,6 +1080,16 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
     if client.tools:
         try:
             if hasattr(client.tools, 'mount_tool_library_if_absent'):
+                client.tools.mount_tool_library_if_absent('execute_python')
+            else:
+                client.tools.mount_tool_library('execute_python')
+            ASCIIColors.success("[CLI] ✅ Execute Python library mounted.")
+        except (AttributeError, OSError, RuntimeError) as e:
+            ASCIIColors.warning(f"Failed to pre-mount execute_python library: {e}")
+
+    if client.tools:
+        try:
+            if hasattr(client.tools, 'mount_tool_library_if_absent'):
                 client.tools.mount_tool_library_if_absent('git_manager')
             else:
                 client.tools.mount_tool_library('git_manager')
@@ -1038,39 +1101,50 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
 
 
 def ensure_handbag_structure(config: CodeAgentConfig):
-    """Ensures that the handbag directory and SOUL.md exist and are up-to-date."""
-    handbag_path = Path(config.handbag_path)
+    """Ensures that the handbag directory exists. Only writes default coder SOUL.md if using default handbag."""
+    handbag_path = Path(config.handbag_path).resolve()
+    default_handbag_path = (APP_DEFAULT_HANDBAG_DIR / "default_coder").resolve()
+    is_default = (handbag_path == default_handbag_path)
+
     handbag_path.mkdir(parents=True, exist_ok=True)
-
     soul_path = handbag_path / "SOUL.md"
-    metadata = {
-        "name": "lollms_code",
-        "author": "ParisNeo",
-        "category": "software_engineering",
-        "description": "An elite autonomous software engineering agent that writes, tests, and fixes code iteratively.",
-        "temperature": str(config.temperature)
-    }
-    yaml_lines = [f"{k}: {v}" for k, v in metadata.items()]
-    soul_content = f"---\n{chr(10).join(yaml_lines)}\n---\n\n{CODING_SYSTEM_PROMPT}"
 
-    if not soul_path.exists() or soul_path.read_text(encoding="utf-8") != soul_content:
-        soul_path.write_text(soul_content, encoding="utf-8")
-        ASCIIColors.info("[CLI] SOUL.md updated to latest system prompt standard.")
-        
-    coworkers_dir = handbag_path / "coworkers"
-    coworkers_dir.mkdir(exist_ok=True)
-    
-    tools_dir = handbag_path / "tools"
-    tools_dir.mkdir(exist_ok=True)
-    
-    skills_dir = handbag_path / "skills"
-    skills_dir.mkdir(exist_ok=True)
-    
-    memory_dir = handbag_path / "memory"
-    memory_dir.mkdir(exist_ok=True)
-    
-    workspace_dir = handbag_path / "workspace"
-    workspace_dir.mkdir(exist_ok=True)
+    if is_default:
+        metadata = {
+            "name": "lollms_code",
+            "author": "ParisNeo",
+            "category": "software_engineering",
+            "description": "An elite autonomous software engineering agent that writes, tests, and fixes code iteratively.",
+            "temperature": str(config.temperature)
+        }
+        yaml_lines = [f"{k}: {v}" for k, v in metadata.items()]
+        soul_content = f"---\n{chr(10).join(yaml_lines)}\n---\n\n{CODING_SYSTEM_PROMPT}"
+
+        if not soul_path.exists() or soul_path.read_text(encoding="utf-8") != soul_content:
+            soul_path.write_text(soul_content, encoding="utf-8")
+            ASCIIColors.info("[CLI] Default SOUL.md updated to latest system prompt standard.")
+    else:
+        if not soul_path.exists():
+            ASCIIColors.warning(f"[CLI] Custom handbag at {handbag_path} does not contain SOUL.md. Creating a baseline SOUL.md.")
+            name = handbag_path.name.replace("_", " ").title()
+            template_content = f"""---
+name: "{name}"
+author: "User"
+category: "custom"
+description: "Custom personality for {name}."
+---
+
+You are {name}, a specialized engineering agent.
+"""
+            soul_path.write_text(template_content, encoding="utf-8")
+        else:
+            ASCIIColors.info(f"[CLI] Using custom handbag personality from: {soul_path}")
+
+    (handbag_path / "coworkers").mkdir(exist_ok=True)
+    (handbag_path / "tools").mkdir(exist_ok=True)
+    (handbag_path / "skills").mkdir(exist_ok=True)
+    (handbag_path / "memory").mkdir(exist_ok=True)
+    (handbag_path / "workspace").mkdir(exist_ok=True)
 
 
 def ensure_sandbox_structure(config: CodeAgentConfig):
@@ -1078,6 +1152,7 @@ def ensure_sandbox_structure(config: CodeAgentConfig):
     sandbox_dir = Path(config.workspace_path) / ".lollms_code"
     scripts_dir = sandbox_dir / "scripts"
     scratchpad = sandbox_dir / "scratchpad.md"
+    current_plan = sandbox_dir / "CURRENT.md"
     memory_dir = sandbox_dir / "memory"
 
     sandbox_dir.mkdir(parents=True, exist_ok=True)
@@ -1094,6 +1169,9 @@ def ensure_sandbox_structure(config: CodeAgentConfig):
 
     if not scratchpad.exists():
         scratchpad.write_text("# Agent Scratchpad\n\nUse this space to store long-term notes, code snippets, and task context.\n", encoding="utf-8")
+
+    if not current_plan.exists():
+        current_plan.write_text("# Current Task\n\nNo active task plan defined yet. Initialize your macro steps plan here at the start of a task.\n", encoding="utf-8")
 
 def build_environment_context(config: CodeAgentConfig) -> str:
     """Builds a dynamic system prompt block describing the execution environment."""
@@ -1184,7 +1262,16 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
     personality = LollmsPersonality.from_handbag(config.handbag_path)
     personality.lollms_client = client
     personality.workspace_path = Path(config.workspace_path)
-    ASCIIColors.rich_print(" [green]✓[/green]")
+
+    # ── 🛡️ ALWAYS ENFORCE SHELL, PYTHON EXECUTION, & PLANNING FOR THE PERSONALITY ──
+    env_context = build_environment_context(config)
+    if "=== ENVIRONMENT CONTEXT" not in personality.system_prompt:
+        personality.system_prompt += "\n\n" + env_context
+
+    if "## MACRO STEPS PLANNING (CURRENT.md)" not in personality.system_prompt:
+        personality.system_prompt += "\n\n" + CODING_EXECUTION_HARNESS
+
+    ASCIIColors.rich_print(f" [green]✓[/green] [dim]({personality.name})[/dim]")
 
     # ── 🧠 PROJECT-LOCAL MEMORY ISOLATION ──
     if config.enable_memory:
@@ -1204,19 +1291,19 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
             ASCIIColors.rich_print(" [red]✗[/red]")
             ASCIIColors.warning(f"[CLI] Failed to initialize project memory: {e}. Falling back to handbag memory.")
 
-    # ── 💾 PROJECT-LOCAL HISTORY ISOLATION ──
-    ASCIIColors.rich_print("  [dim]📜 Loading conversation history...[/dim]", end="")
+    # ── 💾 FRESH SESSION INITIATION (LONG-TERM FACTS IN MEMORY DB) ──
     project_history_file = get_workspace_conversation_file(config.workspace_path)
-    personality.load_history_from_disk(project_history_file)
+    if not getattr(config, "continue_session", False):
+        if project_history_file.exists():
+            try:
+                project_history_file.unlink()
+            except OSError:
+                pass
+        personality._conversation = []
+    else:
+        personality.load_history_from_disk(project_history_file)
     personality._project_history_file = project_history_file
-    ASCIIColors.rich_print(" [green]✓[/green]")
-
-    ASCIIColors.rich_print("  [dim]📝 Assembling system prompt & environment context...[/dim]", end="")
-    env_context = build_environment_context(config)
-    personality.system_prompt = personality.system_prompt + "\n" + env_context
-    if has_tti:
-        personality.system_prompt += "\n" + TTI_CAPABILITY_PROMPT
-    ASCIIColors.rich_print(" [green]✓[/green]")
+    ASCIIColors.rich_print("  [green]✓[/green] [dim]Started fresh discussion session (long-term facts preserved in memory)[/dim]")
 
     if has_tts:
         personality.system_prompt += (
@@ -1241,6 +1328,9 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
     ASCIIColors.rich_print("  [dim]👤 Loading user profile...[/dim]", end="")
     personality._init_user_profile(APP_USER_PROFILE_FILE)
     ASCIIColors.rich_print(" [green]✓[/green]")
+
+    # Grant autonomous workspace authority for CLI tasks (exempt from interactive git prompt blocks)
+    object.__setattr__(personality, "_git_autonomy_granted", True)
 
     ASCIIColors.rich_print("  [dim]📝 Initializing scratchpad...[/dim]", end="")
     try:
@@ -1280,6 +1370,40 @@ def _format_bytes(size: int) -> str:
             return f"{size:.1f} {unit}"
         size /= 1024.0
     return f"{size:.1f} PB"
+
+def _clean_str(val: Any) -> str:
+    if val is None:
+        return ""
+    try:
+        from ascii_colors.rich.markup import escape
+        return escape(str(val))
+    except Exception:
+        return str(val).replace("[", "\\[")
+
+
+def _render_box(content_lines: list[str], title: str = "", border_style: str = "blue"):
+    """Draws a Rich panel to stdout using ASCIIColors.panel with forced immediate flush."""
+    try:
+        content_text = "\n".join(content_lines)
+        ASCIIColors.panel(
+            content_text,
+            title=f"[bold {border_style}]{title}[/bold {border_style}]",
+            border_style=border_style,
+        )
+        sys.stdout.flush()
+    except Exception:
+        try:
+            content_text = "\n".join(content_lines)
+            ASCIIColors.panel(content_text, title=title, border_style=border_style)
+            sys.stdout.flush()
+        except Exception as e:
+            print(f"\n--- {title} ---")
+            for line in content_lines:
+                clean_line = re.sub(r'\[/?[a-zA-Z0-9_ =]+\]', '', str(line))
+                print(clean_line)
+            print(f"--- end {title} ---\n")
+            sys.stdout.flush()
+
 
 def _render_files_table(files_data: list[dict[str, Any]], title: str):
     console = Console()
@@ -1354,6 +1478,12 @@ class StreamRenderer:
         self._live_artifact_lang = ""
         self._live_artifact_buffer = ""
         self._last_stream_artifact_title = None
+        self._rendered_artefact_ends = set()
+        self._rendered_artefact_starts = set()
+        self._first_token_printed = False
+        self._rendered_artefact_ends = set()
+        self._rendered_artefact_starts = set()
+        self._first_token_printed = False
 
     def _render_processing_block(self, block_content: str):
         """Parses and renders a <processing> block as a rich panel."""
@@ -1420,298 +1550,292 @@ class StreamRenderer:
             )
 
     def _start_live_artifact_panel(self, title: str, lang: str = ""):
-        """Initializes state for streaming artifact content with a simple one-line print."""
-        if getattr(self, '_live_artifact_started', False) and self._live_artifact_title == title:
-            return
-
         self._live_artifact_title = title
         self._live_artifact_lang = lang
         self._live_artifact_buffer = ""
-        self._live_artifact_line_count = 0
-        self._progress_frame = 0
-        self._live_artifact_panel = None
         self._live_artifact_started = True
-        self._last_stream_artifact_title = title
-
-        if not hasattr(self, '_rich_console'):
-            self._rich_console = Console()
-
-        ASCIIColors.rich_print(
-            f"\n[bold magenta]📝 Writing:[/bold magenta] [yellow]{title}[/yellow]"
-            + (f" [dim]({lang})[/dim]" if lang else "")
-            + "\n[dim]Preparing to stream content...[/dim]"
-        )
 
     def _update_live_artifact_panel(self, chunk: str, fallback_title: str = "artifact", fallback_lang: str = ""):
-        """Updates the live artifact panel with a simple, rotating progress message."""
-        if not self._live_artifact_panel:
-            self._start_live_artifact_panel(fallback_title, fallback_lang)
-
-        from rich.panel import Panel
-
         self._live_artifact_buffer += chunk
-        self._live_artifact_line_count += 1
-
-        if not hasattr(self, '_progress_frame'):
-            self._progress_frame = 0
-        self._progress_frame = (self._progress_frame + 1) % 4
-
-        spinners = ["⠋", "⠙", "⠹", "⠸"]
-        spinner = spinners[self._progress_frame]
-
-        detected_section = ""
-        header_match = re.search(r'^#+\s+(.+)|^#{1,3}\s+(.+)|^class\s+(\w+)|^def\s+(\w+)|^function\s+(\w+)', self._live_artifact_buffer, re.MULTILINE)
-        if header_match:
-            detected_section = header_match.group(1) or header_match.group(2) or header_match.group(3) or header_match.group(4) or header_match.group(5)
-
-        lines = []
-        lines.append(f"[bold magenta]{spinner} Generating content...[/bold magenta]")
-        lines.append(f"[dim]Lines written: {self._live_artifact_line_count}[/dim]")
-        if detected_section:
-            lines.append(f"[cyan]📝 Section: {detected_section.strip()[:60]}[/cyan]")
-        else:
-            lines.append("[dim]Composing narrative...[/dim]")
-
-        panel = Panel(
-            "\n".join(lines),
-            title=f"[bold magenta]📝 Writing: {self._live_artifact_title}[/bold magenta]" + (f" [dim]({self._live_artifact_lang})[/dim]" if self._live_artifact_lang else ""),
-            border_style="magenta"
-        )
-
-        if self._live_artifact_panel is None:
-            from rich.live import Live
-            self._live_artifact_panel = Live(panel, console=self._rich_console, refresh_per_second=10, vertical_overflow="visible")
-            self._live_artifact_panel.start()
-        else:
-            self._live_artifact_panel.update(panel)
 
     def _stop_live_artifact_panel(self):
-        """Stops the live artifact panel."""
-        if self._live_artifact_panel:
-            try:
-                self._live_artifact_panel.stop()
-            except RuntimeError as e:
-                ASCIIColors.warning(f"Failed to stop live artifact panel: {e}")
-            self._live_artifact_panel = None
-            self._live_artifact_buffer = ""
-            self._live_artifact_title = ""
-            self._live_artifact_lang = ""
-            self._live_artifact_line_count = 0
-            self._progress_frame = 0
-            self._live_artifact_started = False
-            self._last_stream_artifact_title = None
+        self._live_artifact_buffer = ""
+        self._live_artifact_started = False
 
     def _render_callback_event(self, msg_type: Any, meta: dict | None):
-        """Renders structured MSG_TYPE events as Rich panels for FULL_CALLBACK_MODE."""
+        """Renders structured MSG_TYPE events using ASCIIColors panels and tables."""
         if not meta:
             return
 
-        if msg_type == MSG_TYPE.MSG_TYPE_TOOL_START:
-            ASCIIColors.rich_print("")
-            tool_name = meta.get("tool_name", "unknown")
-            params = meta.get("parameters", {})
-
-            # 🛑 FIX: Suppress the structured TOOL_START event if it's a shell command.
-            # The _StreamState interceptor already emitted a <processing> block for it,
-            # so rendering this panel would cause a duplicate UI block.
-            if tool_name == "tool_execute_shell_command":
+        def _is_type(target):
+            if msg_type == target:
                 return True
+            if hasattr(msg_type, "value") and hasattr(target, "value"):
+                return msg_type.value == target.value
+            if isinstance(msg_type, int) and hasattr(target, "value"):
+                return msg_type == target.value
+            if isinstance(msg_type, str) and hasattr(target, "name"):
+                return msg_type == target.name
+            return False
 
-            command_str = params.get("command", "")
-            autonomy = params.get("autonomy_level", "safe")
+        try:
+            if _is_type(MSG_TYPE.MSG_TYPE_TOOL_START):
+                tool_name = meta.get("tool_name", "unknown")
+                if tool_name == "pending":
+                    return
 
-            if tool_name == "tool_execute_shell_command" and command_str:
-                panel_content = (
-                    f"\n[cyan]Command:[/cyan] [yellow]{command_str}[/yellow]\n"
-                    f"[cyan]Autonomy:[/cyan] [dim]{autonomy}[/dim]\n"
-                    f"\n[cyan]Status:[/cyan] [yellow]⏳ Executing...[/yellow]"
-                )
-            else:
-                params_str = json.dumps(params, indent=2, ensure_ascii=False) if params else "{}"
-                panel_content = (
-                    f"\n[cyan]Parameters:[/cyan]\n[dim]{params_str}[/dim]\n"
-                    f"\n[cyan]Status:[/cyan] [yellow]⏳ Executing...[/yellow]"
-                )
+                params = meta.get("parameters", {})
+                content_parts = []
 
-            ASCIIColors.panel(
-                panel_content,
-                title=f"[bold blue]🛠️ Executing: {tool_name}[/bold blue]",
-                border_style="blue"
-            )
-
-        elif msg_type == MSG_TYPE.MSG_TYPE_TOOL_END:
-            ASCIIColors.rich_print("")
-            tool_name = meta.get("tool_name", "unknown")
-            success = meta.get("success", False)
-            output = meta.get("output", "")
-            error = meta.get("error")
-
-            if not output and not error:
-                for key in ("matches", "files", "content", "result", "data"):
-                    val = meta.get(key)
-                    if val:
-                        try:
-                            output = json.dumps(val, indent=2, ensure_ascii=False, default=str) if not isinstance(val, str) else val
-                        except (TypeError, ValueError):
-                            output = str(val)
-                        break
-
-            if success and error == "[No output returned by tool]":
-                error = None
-
-            if not success and not error and output:
-                error = output
-                output = ""
-
-            if not success and not error:
-                error = "Tool returned success=False but no error or output content was provided."
-
-            status_str = "[green]✅ Success[/green]" if success else "[red]❌ Failed[/red]"
-
-            cmd_params = meta.get("parameters", {})
-
-            if not cmd_params and tool_name != "tool_execute_shell_command":
-                ASCIIColors.rich_print("")
-                log_source = output or error or ""
-                if log_source:
-                    log_lines = log_source.splitlines()
-                    max_log_lines = 30
-                    if len(log_lines) > max_log_lines:
-                        log_content = "\n".join(log_lines[:max_log_lines]) + f"\n[dim]... ({len(log_lines) - max_log_lines} more lines truncated)[/dim]"
-                    else:
-                        log_content = log_source
+                code_val = params.get("code") or params.get("script") if isinstance(params, dict) else None
+                if code_val and isinstance(code_val, str) and code_val.strip():
+                    content_parts.append("[bold cyan]Code to Execute:[/bold cyan]")
+                    for c_line in code_val.strip().splitlines():
+                        content_parts.append(f"  [yellow]{_clean_str(c_line)}[/yellow]")
+                    other_params = {k: v for k, v in params.items() if k not in ("code", "script")}
+                    if other_params:
+                        content_parts.append(f"\n[dim]Arguments: {_clean_str(json.dumps(other_params, default=str))}[/dim]")
+                elif tool_name == "tool_execute_shell_command" and isinstance(params, dict) and "command" in params:
+                    content_parts.append(f"[bold cyan]Command:[/bold cyan] [bold yellow]{_clean_str(params['command'])}[/bold yellow]")
+                    if "autonomy_level" in params:
+                        content_parts.append(f"[dim]Autonomy: {_clean_str(params['autonomy_level'])}[/dim]")
+                elif isinstance(params, dict) and "file_name" in params:
+                    content_parts.append(f"[bold cyan]Target File:[/bold cyan] [bold yellow]{_clean_str(params['file_name'])}[/bold yellow]")
+                    other_params = {k: v for k, v in params.items() if k != "file_name"}
+                    if other_params:
+                        content_parts.append(f"[dim]Arguments: {_clean_str(json.dumps(other_params, default=str))}[/dim]")
+                elif isinstance(params, dict) and params:
+                    rows = [[f"[cyan]{_clean_str(k)}[/cyan]", f"[yellow]{_clean_str(str(v))}[/yellow]"] for k, v in params.items()]
+                    table = ASCIIColors.table("Parameter", "Value", rows=rows, box="round")
+                    ASCIIColors.rich_print(table)
+                    sys.stdout.flush()
+                    return
                 else:
-                    log_content = "[dim](No output or error details provided)[/dim]"
+                    content_parts.append("[dim]No parameters[/dim]")
 
-                log_label = "Output" if success else "Error"
-                ASCIIColors.rich_print(f"[bold blue]🛠️ Finished:[/bold blue] [yellow]{tool_name}[/yellow] {status_str}")
-                ASCIIColors.rich_print(f"[cyan]{log_label}:[/cyan]\n{log_content}")
-                return
+                content_parts.append("\n[yellow]⏳ Executing...[/yellow]")
+                ASCIIColors.panel(
+                    "\n".join(content_parts),
+                    title=f"[bold blue]🛠️ Tool Call: {_clean_str(tool_name)}[/bold blue]",
+                    border_style="blue"
+                )
+                sys.stdout.flush()
 
-            panel_lines = [f"\n[cyan]Status:[/cyan] {status_str}"]
+            elif _is_type(MSG_TYPE.MSG_TYPE_TOOL_END):
+                tool_name = meta.get("tool_name", "tool")
+                success = meta.get("success", False)
+                output = meta.get("output", "")
+                error = meta.get("error")
+                params = meta.get("parameters", {})
 
-            if cmd_params:
-                try:
-                    params_str = json.dumps(cmd_params, indent=2, ensure_ascii=False, default=str)
-                except (TypeError, ValueError):
-                    params_str = str(cmd_params)
-                panel_lines.append(f"[cyan]Parameters:[/cyan]\n[dim]{params_str}[/dim]")
+                status_str = "[bold green]✅ Success[/bold green]" if success else "[bold red]❌ Failed[/bold red]"
+                border = "green" if success else "red"
 
-            if tool_name == "tool_execute_shell_command":
-                command_str = cmd_params.get("command", "")
-                if command_str:
-                    panel_lines.append(f"[cyan]Command:[/cyan] [yellow]{command_str}[/yellow]")
+                content_parts = [f"[cyan]Status:[/cyan] {status_str}"]
 
-            log_source = output or error or ""
-            max_log_lines = 30
-            log_lines = log_source.splitlines() if log_source else []
-            if len(log_lines) > max_log_lines:
-                log_content = "\n".join(log_lines[:max_log_lines]) + f"\n[dim]... ({len(log_lines) - max_log_lines} more lines truncated)[/dim]"
-            else:
-                log_content = log_source if log_source else "[dim](No output or error details provided)[/dim]"
+                code_val = params.get("code") or params.get("script") if isinstance(params, dict) else None
+                if code_val and isinstance(code_val, str) and code_val.strip():
+                    code_lines = code_val.strip().splitlines()
+                    content_parts.append(f"\n[bold cyan]Executed Code ({len(code_lines)} lines):[/bold cyan]")
+                    preview_lines = code_lines[:8] if len(code_lines) <= 10 else code_lines[:5] + ["..."] + code_lines[-3:]
+                    for cl in preview_lines:
+                        content_parts.append(f"  [dim]{_clean_str(cl)}[/dim]")
+                elif isinstance(params, dict) and "command" in params:
+                    content_parts.append(f"[cyan]Command:[/cyan] [yellow]{_clean_str(params['command'])}[/yellow]")
 
-            log_label = "Execution Log" if success else "Error Details"
-            panel_lines.append(f"\n[cyan]{log_label}:[/cyan]\n{log_content}")
-            panel_content = "\n".join(panel_lines)
+                log_source = output if success else (error or output or "")
+                if not log_source:
+                    log_source = "(No output returned by tool)"
 
-            ASCIIColors.panel(
-                panel_content,
-                title=f"[bold blue]🛠️ Finished: {tool_name}[/bold blue]",
-                border_style="green" if success else "red"
-            )
+                log_lines = str(log_source).splitlines()
+                max_lines = 30
+                display_logs = log_lines[:15] + [f"\n... [{len(log_lines)-30} lines omitted for display] ...\n"] + log_lines[-15:] if len(log_lines) > max_lines else log_lines
 
-        elif msg_type == MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START:
-            title = meta.get("title", "artifact")
-            lang = meta.get("language", "")
-            is_patch = meta.get("is_patch", False)
-            is_execution = meta.get("execution_phase", False)
+                log_label = "Execution Output" if success else "Error Details"
+                content_parts.append(f"\n[bold cyan]{log_label}:[/bold cyan]")
+                for ll in display_logs:
+                    content_parts.append(f"  {_clean_str(ll)}")
 
-            if meta.get("stream_complete"):
-                return
+                ASCIIColors.panel(
+                    "\n".join(content_parts),
+                    title=f"[bold {border}]🛠️ Tool Result: {_clean_str(tool_name)}[/bold {border}]",
+                    border_style=border
+                )
+                sys.stdout.flush()
 
-            if self._live_artifact_panel and self._live_artifact_title == title:
-                return
+            elif _is_type(MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START):
+                title = meta.get("title", "artifact")
+                lang = meta.get("language", "")
+                art_type = meta.get("art_type", "code")
+                is_patch = meta.get("is_patch", False)
+                op_label = "Patching" if is_patch else "Creating"
+                op_icon = "🔧" if is_patch else "📄"
 
-            if is_execution and self._last_stream_artifact_title == title:
-                self._last_stream_artifact_title = None
-                return
+                rows = [
+                    ["File", f"[bold yellow]{_clean_str(title)}[/bold yellow]"],
+                    ["Type", f"[magenta]{_clean_str(art_type)}[/magenta]" + (f" [dim]({_clean_str(lang)})[/dim]" if lang else "")],
+                    ["Operation", f"{op_icon} {op_label}"],
+                    ["Status", "[yellow]⏳ Writing to workspace...[/yellow]"]
+                ]
+                table = ASCIIColors.table(
+                    "Field", "Details",
+                    rows=rows,
+                    title=f"[bold magenta]{op_icon} Artifact: {op_label} {_clean_str(title)}[/bold magenta]",
+                    box="round"
+                )
+                ASCIIColors.rich_print(table)
+                sys.stdout.flush()
 
-            self._stop_live_artifact_panel()
+            elif _is_type(MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END):
+                title = meta.get("title", "artifact")
+                success = meta.get("success", False)
+                version = meta.get("version", 1)
+                error = meta.get("error")
+                content = meta.get("content", "")
 
-            print("")
-            if is_patch:
-                ASCIIColors.rich_print(f"[bold yellow]🔧 PATCHING ARTIFACT:[/bold yellow] [yellow]{title}[/yellow]" + (f" [dim]({lang})[/dim]" if lang else ""))
-            else:
-                self._start_live_artifact_panel(title, lang)
-            return
+                status_str = f"[bold green]✅ Saved (v{version})[/bold green]" if success else f"[bold red]❌ Failed: {_clean_str(error)}[/bold red]"
+                border = "green" if success else "red"
 
-        elif msg_type == MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END:
-            self._stop_live_artifact_panel()
-            title = meta.get("title", "artifact")
-            success = meta.get("success", False)
-            version = meta.get("version", 1)
-            error = meta.get("error")
+                content_parts = [
+                    f"[cyan]File:[/cyan] [bold yellow]{_clean_str(title)}[/bold yellow] (v{version})",
+                    f"[cyan]Status:[/cyan] {status_str}"
+                ]
 
-            ASCIIColors.rich_print("")
-            if success:
-                status_str = f"[green]✅ Patched (v{version})[/green]" if meta.get("is_patch") else f"[green]✅ Saved (v{version})[/green]"
-            else:
-                status_str = f"[red]❌ Patch Failed: {error}[/red]" if meta.get("is_patch") else f"[red]❌ Save Failed: {error}[/red]"
-            ASCIIColors.rich_print(f"  {status_str}")
-            return
+                if content and isinstance(content, str):
+                    c_lines = content.strip().splitlines()
+                    content_parts.append(f"\n[bold cyan]Content Preview ({len(c_lines)} lines):[/bold cyan]")
+                    preview_content = c_lines[:12] if len(c_lines) <= 16 else c_lines[:8] + [f"... [{len(c_lines)-12} lines omitted] ..."] + c_lines[-4:]
+                    for cl in preview_content:
+                        content_parts.append(f"  [yellow]{_clean_str(cl)}[/yellow]")
 
-        elif msg_type == MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE:
-            action = meta.get("action", "update")
-            status = meta.get("status", "")
+                ASCIIColors.panel(
+                    "\n".join(content_parts),
+                    title=f"[bold {border}]📄 Artifact Complete: {_clean_str(title)}[/bold {border}]",
+                    border_style=border
+                )
+                sys.stdout.flush()
 
-            if status in ("streaming", "stream_complete"):
-                return
+            elif _is_type(MSG_TYPE.MSG_TYPE_ARTEFACT_SYMBOL_DETECTED):
+                sym = meta.get("symbol", {})
+                detail = sym.get("detail") or meta.get("detail", "")
+                title = meta.get("title", "artifact")
+                ASCIIColors.rich_print(f"  [bold cyan]•[/bold cyan] [dim]Writing {_clean_str(title)}:[/dim] [bold yellow]{_clean_str(detail)}[/bold yellow]")
+                sys.stdout.flush()
 
-            ASCIIColors.rich_print("")
-            files = meta.get("files", [])
-            error = meta.get("error")
+            elif _is_type(MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE):
+                action = meta.get("action", "update")
+                status = meta.get("status", "success")
+                files = meta.get("files", [])
+                error = meta.get("error")
 
-            if not files and error:
-                files_display = f"[red]{error}[/red]"
-            elif not files:
-                files_display = "[dim]No files specified[/dim]"
-            else:
-                files_display = "\n".join(f"  - {f}" for f in files)
+                status_color = "green" if status == "success" else "red"
+                content_parts = [
+                    f"[cyan]Action:[/cyan] [yellow]{_clean_str(action.replace('_', ' ').capitalize())}[/yellow]",
+                    f"[cyan]Status:[/cyan] [{status_color}]{_clean_str(status or ('Success' if not error else 'Failed'))}[/{status_color}]"
+                ]
+                if files:
+                    content_parts.append("[cyan]Files:[/cyan]")
+                    for f in files:
+                        content_parts.append(f"  • {_clean_str(str(f))}")
+                if error:
+                    content_parts.append(f"[red]Error:[/red] {_clean_str(str(error))}")
 
-            status_color = "green" if status == "success" else "red"
-            panel_content = f"\n[cyan]Files:[/cyan]\n{files_display}\n\n[cyan]Status:[/cyan] [{status_color}]{status}[/{status_color}]"
-            if error:
-                panel_content += f"\n[cyan]Error:[/cyan] [red]{error}[/red]"
+                ASCIIColors.panel(
+                    "\n".join(content_parts),
+                    title=f"[bold yellow]📂 Context: {_clean_str(action.replace('_', ' ').capitalize())}[/bold yellow]",
+                    border_style="yellow" if status != "failure" else "red"
+                )
+                sys.stdout.flush()
 
-            ASCIIColors.panel(
-                panel_content,
-                title=f"[bold yellow]📂 Context {action.replace('_', ' ').capitalize()}[/bold yellow]",
-                border_style="yellow"
-            )
+            elif _is_type(MSG_TYPE.MSG_TYPE_SCRATCHPAD_UPDATE):
+                action = meta.get("action", "update")
+                message = meta.get("message", "Scratchpad updated.")
+                preview = meta.get("preview", "")
 
-        elif msg_type == MSG_TYPE.MSG_TYPE_SCRATCHPAD_UPDATE:
-            action = meta.get("action", "update")
-            status = meta.get("status", "success")
-            message = meta.get("message", "Scratchpad updated.")
-            preview = meta.get("preview", "")
+                content_parts = [f"[cyan]Status:[/cyan] [green]{_clean_str(message)}[/green]"]
+                if preview:
+                    content_parts.append(f"[cyan]Preview:[/cyan]\n[dim]{_clean_str(preview)}[/dim]")
 
-            ASCIIColors.rich_print("")
-            status_color = "green" if status == "success" else "red"
-            panel_content = f"\n[cyan]Status:[/cyan] [{status_color}]{message}[/{status_color}]"
-            if preview:
-                panel_content += f"\n[cyan]Preview:[/cyan] [dim]{preview}...[/dim]"
+                ASCIIColors.panel(
+                    "\n".join(content_parts),
+                    title=f"[bold cyan]📝 Scratchpad: {_clean_str(action.replace('_', ' ').capitalize())}[/bold cyan]",
+                    border_style="cyan"
+                )
+                sys.stdout.flush()
 
-            action_words = action.replace('_', ' ').title().split()
-            deduped_action = ' '.join(
-                w for i, w in enumerate(action_words) if w not in action_words[:i]
-            ) or action
-            ASCIIColors.panel(
-                panel_content,
-                title=f"[bold yellow]📝 {deduped_action}[/bold yellow]",
-                border_style="yellow"
-            )
-            return
+            elif _is_type(MSG_TYPE.MSG_TYPE_SKILL_DONE):
+                title = meta.get("title", "skill")
+                category = meta.get("category", "general")
+                desc = meta.get("description", "")
+                content = meta.get("content", "")
 
+                content_parts = [
+                    f"[cyan]Skill:[/cyan] [bold yellow]{_clean_str(title)}[/bold yellow]",
+                    f"[cyan]Category:[/cyan] [magenta]{_clean_str(category)}[/magenta]",
+                ]
+                if desc:
+                    content_parts.append(f"[cyan]Description:[/cyan] {_clean_str(desc)}")
+                if content and isinstance(content, str):
+                    c_lines = content.strip().splitlines()
+                    content_parts.append(f"\n[bold cyan]Doctrine Preview ({len(c_lines)} lines):[/bold cyan]")
+                    for cl in c_lines[:8]:
+                        content_parts.append(f"  {_clean_str(cl)}")
+
+                ASCIIColors.panel(
+                    "\n".join(content_parts),
+                    title=f"[bold yellow]🧠 Learned Skill: {_clean_str(title)}[/bold yellow]",
+                    border_style="yellow"
+                )
+                sys.stdout.flush()
+
+            elif _is_type(MSG_TYPE.MSG_TYPE_WORKER_SPAWN_START):
+                worker_idx = meta.get("worker_index", 1)
+                task = meta.get("task", "")
+                files = meta.get("context_files", [])
+                content_parts = [
+                    f"[cyan]Worker:[/cyan] [bold yellow]Worker #{worker_idx}[/bold yellow]",
+                    f"[cyan]Task:[/cyan] {_clean_str(task[:300])}",
+                ]
+                if files:
+                    content_parts.append(f"[cyan]Context Files:[/cyan] {', '.join(_clean_str(f) for f in files)}")
+                content_parts.append("\n[yellow]⏳ Specialist worker running...[/yellow]")
+                ASCIIColors.panel(
+                    "\n".join(content_parts),
+                    title=f"[bold cyan]🤖 Sub-Agent Spawn: Worker #{worker_idx}[/bold cyan]",
+                    border_style="cyan"
+                )
+                sys.stdout.flush()
+
+            elif _is_type(MSG_TYPE.MSG_TYPE_WORKER_SPAWN_END):
+                worker_idx = meta.get("worker_index", 1)
+                success = meta.get("success", False)
+                digest = meta.get("report_digest", "")
+                files = meta.get("files", [])
+                status_str = "[bold green]✅ Success[/bold green]" if success else "[bold red]❌ Failed[/bold red]"
+                border = "green" if success else "red"
+                content_parts = [
+                    f"[cyan]Worker:[/cyan] [bold yellow]Worker #{worker_idx}[/bold yellow]",
+                    f"[cyan]Status:[/cyan] {status_str}",
+                ]
+                if files:
+                    content_parts.append(f"[cyan]Files Created/Modified:[/cyan] {', '.join(_clean_str(f) for f in files)}")
+                if digest:
+                    content_parts.append(f"\n[cyan]Report Digest:[/cyan]\n{_clean_str(digest[:1000])}")
+                ASCIIColors.panel(
+                    "\n".join(content_parts),
+                    title=f"[bold {border}]🤖 Sub-Agent Finished: Worker #{worker_idx}[/bold {border}]",
+                    border_style=border
+                )
+                sys.stdout.flush()
+
+        except Exception as ex:
+            ASCIIColors.warning(f"[StreamRenderer] Error rendering {msg_type}: {ex}")
+            name_val = meta.get("title") or meta.get("tool_name") or "Action"
+            ASCIIColors.cyan(f"\n▶ [{msg_type}] {name_val}")
+            for k, v in meta.items():
+                if k not in ("content", "output") and v:
+                    ASCIIColors.info(f"  • {k}: {v}")
+            sys.stdout.flush()
 
     def flush(self):
         """Flushes any pending buffers, rendering unclosed tags as raw text."""
@@ -1723,8 +1847,24 @@ class StreamRenderer:
             self._in_processing = False
 
     def __call__(self, chunk: str, msg_type: Any = None, meta: dict | None = None) -> bool:
+        if msg_type is None:
+            msg_type = MSG_TYPE.MSG_TYPE_CHUNK
+
         if msg_type == MSG_TYPE.MSG_TYPE_NEW_MESSAGE:
             ASCIIColors.rich_print("\n[bold green]🤖 Generating...[/bold green]")
+            sys.stdout.flush()
+            return True
+
+        if msg_type == MSG_TYPE.MSG_TYPE_ROUND_START:
+            round_id = meta.get("round_id", 1) if meta else 1
+            max_r = meta.get("max_rounds", self.config.max_reasoning_steps) if meta else self.config.max_reasoning_steps
+            ASCIIColors.rich_print(f"\n[dim]── Round {round_id}/{max_r} ──[/dim]")
+            sys.stdout.flush()
+            self._rendered_artefact_ends.clear()
+            self._rendered_artefact_starts.clear()
+            return True
+
+        if msg_type == MSG_TYPE.MSG_TYPE_ROUND_END:
             return True
 
         if msg_type in [
@@ -1732,32 +1872,29 @@ class StreamRenderer:
             MSG_TYPE.MSG_TYPE_TOOL_END,
             MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START,
             MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END,
+            MSG_TYPE.MSG_TYPE_ARTEFACT_SYMBOL_DETECTED,
             MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE,
-            MSG_TYPE.MSG_TYPE_SCRATCHPAD_UPDATE
+            MSG_TYPE.MSG_TYPE_SCRATCHPAD_UPDATE,
+            MSG_TYPE.MSG_TYPE_SKILL_DONE,
+            MSG_TYPE.MSG_TYPE_WORKER_SPAWN_START,
+            MSG_TYPE.MSG_TYPE_WORKER_SPAWN_END,
         ]:
-            if meta and meta.get("stream_complete"):
-                if msg_type == MSG_TYPE.MSG_TYPE_TOOL_START and meta.get("tool_name") == "pending":
-                    return True
-                if msg_type == MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START:
-                    return True
-                if msg_type == MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END:
-                    return True
-                if msg_type == MSG_TYPE.MSG_TYPE_TOOL_END:
-                    return True
-
-            if msg_type == MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START and meta and meta.get("execution_phase"):
-                self._processing_buffer = ""
-                self._in_processing = False
-                self._render_callback_event(msg_type, meta)
+            if meta and meta.get("tool_name") == "pending":
                 return True
-
-            if meta and meta.get("status") in ("streaming", "stream_complete"):
-                if meta.get("tool_name") == "pending":
-                    ASCIIColors.rich_print("\n[dim]⏳ Detected tool call, buffering stream...[/dim]")
+            if meta and meta.get("status") == "streaming" and not meta.get("files"):
                 return True
-
-            if msg_type == MSG_TYPE.MSG_TYPE_TOOL_START and meta.get("tool_name") == "pending":
+            if msg_type == MSG_TYPE.MSG_TYPE_TOOL_END and meta and meta.get("stream_complete") and "success" not in meta:
                 return True
+            if msg_type == MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START and meta:
+                start_key = (meta.get("title"), meta.get("is_patch"))
+                if start_key in self._rendered_artefact_starts:
+                    return True
+                self._rendered_artefact_starts.add(start_key)
+            if msg_type == MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END and meta:
+                end_key = (meta.get("title"), meta.get("is_patch"))
+                if end_key in self._rendered_artefact_ends:
+                    return True
+                self._rendered_artefact_ends.add(end_key)
 
             self._processing_buffer = ""
             self._in_processing = False
@@ -1798,22 +1935,23 @@ class StreamRenderer:
                 if not clean_chunk:
                     return True
 
-                if not self._live_artifact_panel and not self._in_processing:
-                    if not getattr(self, '_first_token_printed', False):
-                        ASCIIColors.rich_print("\n[dim]🤖 Thinking...[/dim]", end="")
-                        ASCIIColors.rich_print("\r\033[K", end="")
-                        self._first_token_printed = True
+                if not getattr(self, '_first_token_printed', False):
+                    self._first_token_printed = True
                 ASCIIColors.rich_print(clean_chunk, end="")
+                sys.stdout.flush()
         elif msg_type == MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK:
             ASCIIColors.rich_print(f"[dim]{chunk}[/dim]", end="")
+            sys.stdout.flush()
         elif msg_type == MSG_TYPE.MSG_TYPE_INFO:
             if meta and meta.get("done_intercepted"):
                 self._stop_live_artifact_panel()
                 print()
                 ASCIIColors.rule("[bold green]✅ Task Completed (<done/>)[/bold green]")
+                sys.stdout.flush()
                 return True
             else:
                 ASCIIColors.rich_print(f"\n[blue][INFO] {chunk}[/blue]")
+                sys.stdout.flush()
                 return True
     
 
@@ -1907,6 +2045,7 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
 
     config_panel_content = (
         f"[cyan]Workspace:[/cyan] {config.workspace_path}\n"
+        f"[cyan]Handbag:[/cyan]   {personality.name} ({Path(config.handbag_path).name})\n"
         f"[cyan]Model:[/cyan]      {config.active_model_name}\n"
         f"[cyan]Binding:[/cyan]    {config.active_binding_name}\n"
         f"[cyan]Max steps:[/cyan]  {config.max_reasoning_steps}\n"
@@ -1954,6 +2093,9 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
             n_predict=config.max_tokens_per_turn,
             enable_artefacts=True,
             use_internal_history=False,
+            enable_shell=config.enable_shell_execution,
+            enable_python_exec=True,
+            enable_workspace_tools=True,
             event_mode=EventMode.FULL_CALLBACK_MODE,
             enforce_end_tag=True
         )
@@ -2500,6 +2642,9 @@ def _switch_workspace_interactive(config: CodeAgentConfig, client: LollmsClient)
 def run_interactive(personality: LollmsPersonality, client: LollmsClient, config: CodeAgentConfig) -> int:
     _index_workspace_with_progress(personality, client)
 
+    if not getattr(config, "continue_session", False):
+        personality._conversation = []
+
     if config.debug:
         dump_startup_context(personality, client)
 
@@ -2524,10 +2669,11 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
     active_model = getattr(getattr(client, "llm", None), "model_name", None) or config.active_model_name
     header_lines = [
         f"[cyan]Workspace:[/cyan] {ws_path_display}",
+        f"[cyan]Handbag:[/cyan]   {personality.name} [dim]({Path(config.handbag_path).name})[/dim]",
         f"[cyan]Profile:[/cyan]    {active_alias}",
         f"[cyan]Model:[/cyan]      {active_model}",
         f"[cyan]Binding:[/cyan]    {config.active_binding_name}",
-        f"[dim]Commands: 'exit', 'help', 'config', 'shell', 'forget', 'skills', 'clear-history', 'clear-files', 'clear-scratchpad', 'workspace', 'files', 'load', 'unload', 'lock', 'hide'[/dim]"
+        f"[dim]Commands: 'exit', 'help', 'config', 'shell', 'forget', 'skills', 'handbag', 'clear-history', 'clear-files', 'clear-scratchpad', 'workspace', 'files', 'load', 'unload', 'lock', 'hide'[/dim]"
     ]
 
     ctx_status = get_context_fill_status(personality, client)
@@ -2593,6 +2739,14 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                     ASCIIColors.yellow("  Personality does not support memory wiping.")
             else:
                 ASCIIColors.green("  ✅ Wipe aborted. Memories are safe.")
+            continue
+
+        if user_input.lower() in ("/handbag", "/persona"):
+            ASCIIColors.rule("[bold cyan]👜 Active Handbag & Persona[/bold cyan]")
+            ASCIIColors.info(f"Handbag Path: [yellow]{config.handbag_path}[/yellow]")
+            ASCIIColors.info(f"Persona Name: [green]{personality.name}[/green]")
+            ASCIIColors.info(f"Category:     {personality.category}")
+            ASCIIColors.info(f"Description:  {personality.description or '(none)'}")
             continue
 
         if user_input.lower() == "/skills":
@@ -2687,7 +2841,7 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
             continue
 
         if user_input.lower() == "/config":
-            from lollms_client.lollms_config_cli_env import build_wizard_menu, _load_existing_env_to_map
+            from lollms_client.lollms_config_cli_env import build_wizard_menu, _load_existing_env_to_map, _is_back_choice
             wizard_menu, wizard_state = build_wizard_menu(
                 config_map=_load_existing_env_to_map(),
                 title="⚙️ Lollms Client Configuration",
@@ -2697,11 +2851,13 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
             )
             while True:
                 selection = wizard_menu.run()
+                if _is_back_choice(selection):
+                    break
                 if callable(selection):
                     selection()
-                if selection is None or wizard_state["saved"]:
+                if wizard_state.get("saved") or wizard_state.get("exited"):
                     break
-            if wizard_state["saved"]:
+            if wizard_state.get("saved"):
                 ASCIIColors.green("  Configuration updated. Restart lollms-code for changes to take effect.")
             continue
 
@@ -2936,6 +3092,9 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                 n_predict=config.max_tokens_per_turn,
                 enable_artefacts=True,
                 use_internal_history=True,
+                enable_shell=config.enable_shell_execution,
+                enable_python_exec=True,
+                enable_workspace_tools=True,
                 event_mode=EventMode.FULL_CALLBACK_MODE,
                 enforce_end_tag=True
             )
@@ -3009,7 +3168,7 @@ Examples:
     parser.add_argument("prompt", nargs="?", default=None, help="The task prompt for the autonomous agent.")
     parser.add_argument("-i", "--interactive", action="store_true", help="Start in interactive REPL mode.")
     parser.add_argument("--workspace", type=str, default=None, help="Path to the workspace directory. Defaults to current working directory.")
-    parser.add_argument("--handbag-path", type=str, default=None, help="Path to the Handbag folder containing agent resources.")
+    parser.add_argument("-hb", "--handbag", "--handbag-path", dest="handbag_path", type=str, default=None, help="Path to a custom Handbag folder containing agent resources (SOUL.md, tools, skills, memory).")
     parser.add_argument("--model", type=str, default=None, help="Model name to use.")
     parser.add_argument("--llm-binding", type=str, default=None, help="LLM binding name.")
     parser.add_argument("--host", type=str, default=None, help="Host address for remote bindings.")
@@ -3036,6 +3195,18 @@ Examples:
 
 
 def main():
+    if sys.platform == "win32":
+        if hasattr(sys.stdout, "reconfigure"):
+            try:
+                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+        if hasattr(sys.stderr, "reconfigure"):
+            try:
+                sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
     parser = build_arg_parser()
     args = parser.parse_args()
 

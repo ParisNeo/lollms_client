@@ -3610,13 +3610,14 @@ class ChatMixin:
                         }
                         ASCIIColors.success(f"[ChatMixin] Registered {t_name} via direct discovered_tools fallback.")
 
-        if active_tools:
-            ASCIIColors.info(
-                f"[ChatMixin] Final active tool registry ({len(active_tools)} tool(s)): "
-                f"{sorted(active_tools.keys())}"
-            )
-        else:
-            ASCIIColors.warning("[ChatMixin] Final active tool registry is EMPTY — no tools available to the LLM this turn.")
+        if debug:
+            if active_tools:
+                ASCIIColors.info(
+                    f"[ChatMixin] Final active tool registry ({len(active_tools)} tool(s)): "
+                    f"{sorted(active_tools.keys())}"
+                )
+            else:
+                ASCIIColors.warning("[ChatMixin] Final active tool registry is EMPTY — no tools available to the LLM this turn.")
 
         if debug and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
             lcp_binding.mount_tool_library("debug_toolset")
@@ -3676,6 +3677,9 @@ class ChatMixin:
         enable_vlm_query:             bool = False,
         enable_computer_use:          bool = False,
         event_mode:                   EventMode = EventMode.PROCESSING_TAG_MODE,
+        think:                        Optional[bool] = None,
+        reasoning_effort:             Optional[str] = None,
+        reasoning_summary:            Optional[str] = None,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -3732,6 +3736,9 @@ class ChatMixin:
                 support vision; silently skipped when no vision capability is detected.
                 Default False.
             event_mode (EventMode): Event reporting mode. Default PROCESSING_TAG_MODE.
+            think (Optional[bool]): Legacy flag to toggle reasoning/thinking output. If True, maps to reasoning_effort='high'. If False, disables reasoning. Default None.
+            reasoning_effort (Optional[str]): Level of reasoning effort for reasoning/thinking models ('low', 'medium', 'high', 'max'). Overrides `think`. Default None.
+            reasoning_summary (Optional[str]): Format of reasoning summary for thinking models ('auto', 'concise', 'detailed'). Default None.
             **kwargs: Additional generation parameters passed to the LLM binding.
 
         Returns:
@@ -4734,7 +4741,13 @@ class ChatMixin:
                 return True
 
             # Sanitize kwargs to prevent duplicate argument passing
-            gen_kwargs = {k: v for k, v in kwargs.items() if k not in ("streaming_callback", "temperature", "stream")}
+            gen_kwargs = {k: v for k, v in kwargs.items() if k not in ("streaming_callback", "temperature", "stream", "think", "reasoning_effort", "reasoning_summary")}
+            if think is not None:
+                gen_kwargs["think"] = think
+            if reasoning_effort is not None:
+                gen_kwargs["reasoning_effort"] = reasoning_effort
+            if reasoning_summary is not None:
+                gen_kwargs["reasoning_summary"] = reasoning_summary
 
             # ── 📊 CONTEXT FILL TELEMETRY ──
             try:
@@ -5319,6 +5332,9 @@ class ChatMixin:
                         "worker_index": worker_index,
                         "event_mode": event_mode,
                     },
+                    think=think,
+                    reasoning_effort=reasoning_effort,
+                    reasoning_summary=reasoning_summary,
                 )
                 object.__setattr__(self, "_worker_counter", worker_index)
                 _bump_environment_epoch()
@@ -6337,6 +6353,7 @@ class ChatMixin:
                         cb_error = (tool_res.get("error") if isinstance(tool_res, dict) else None) if is_failure else None
                         _cb(callback, "", MSG_TYPE.MSG_TYPE_TOOL_END, {
                             "tool_name": tool_name,
+                            "parameters": tool_params,
                             "success": not is_failure,
                             "output": details_block,
                             "error": cb_error,

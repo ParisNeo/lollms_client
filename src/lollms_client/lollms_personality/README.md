@@ -103,6 +103,24 @@ crew_pers = LollmsPersonality.from_handbag("./my_crew_handbag")
 response = discussion.chat(user_message="Build a Python script.", personality=crew_pers)
 ```
 
+### Using Custom Handbags in `lollms_code` CLI (`--handbag`)
+
+You can point the autonomous coding agent directly to any custom Handbag:
+
+```bash
+lollms-code --handbag ./my_specialized_handbag "Analyze this network trace and implement the parser"
+lollms-code -hb ./my_specialized_handbag -i
+```
+
+When invoked this way:
+* **Preserved Persona**: The custom `SOUL.md` (author, identity, prompt doctrine, specialized knowledge) is respected and used as the agent's core personality.
+* **Injected Execution Capabilities**: `lollms_code` automatically mounts the execution harness:
+  - System shell tools (`system_shell`: `tool_execute_shell_command`) configured with the active OS environment.
+  - Python execution tools (`execute_python`: `tool_execute_python_file`, `tool_execute_python_code`).
+  - Git manager and workspace tools.
+  - `.lollms_code/CURRENT.md` macro-steps planning and tracking.
+* **Preserved Tools & Skills**: Any tools in the handbag's `tools/` directory and skills in `skills/` are available alongside the execution tools.
+
 ### The Crew Handbag (Multi-Persona Routing)
 
 A single Handbag can contain a `coworkers/` directory with subdirectories for each crewmate. When loaded, the primary `LollmsPersonality` object acts as a router.

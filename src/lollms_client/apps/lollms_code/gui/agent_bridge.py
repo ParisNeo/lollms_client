@@ -68,7 +68,7 @@ def build_environment_context(workspace_path: str) -> str:
     python_version = platform.python_version()
     workspace_root = Path(workspace_path).resolve()
 
-    shell_cmd = "cmd / powershell" if is_windows else "bash/sh"
+    shell_cmd = "cmd.exe (Windows Command Prompt, NOT PowerShell or bash)" if is_windows else "bash/sh"
     path_sep = "\\" if is_windows else "/"
 
     git_branch_info = ""
@@ -130,6 +130,7 @@ def ensure_sandbox_structure(prefs: GuiPrefs) -> None:
     sandbox_dir = Path(prefs.workspace_path) / ".lollms_code"
     scripts_dir = sandbox_dir / "scripts"
     scratchpad = sandbox_dir / "scratchpad.md"
+    current_plan = sandbox_dir / "CURRENT.md"
     sandbox_dir.mkdir(parents=True, exist_ok=True)
     if scripts_dir.exists():
         for f in scripts_dir.glob("*"):
@@ -142,6 +143,10 @@ def ensure_sandbox_structure(prefs: GuiPrefs) -> None:
     if not scratchpad.exists():
         scratchpad.write_text(
             "# Agent Scratchpad\n\nLong-term notes and task state.\n", encoding="utf-8"
+        )
+    if not current_plan.exists():
+        current_plan.write_text(
+            "# Current Task\n\nNo active task plan defined yet.\n", encoding="utf-8"
         )
 
 

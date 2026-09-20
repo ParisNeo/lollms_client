@@ -73,9 +73,8 @@ def _serialize_config_map_to_yaml(config_map: Dict[str, str]) -> Dict[str, Any]:
       profiles:
         <alias>:
           <param_name>: <value>
-    Alias extraction anchors on known parameter suffixes (the mirror of
-    _extract_profiles_from_env) so aliases containing underscores or spaces
-    (e.g. glm_5_3, GLM 5.3) are never truncated.
+    Pre-discovers configured aliases so aliases containing underscores
+    (e.g. local_ollama, qwen_2_5) are preserved without truncation.
     """
     yaml_data: Dict[str, Any] = {}
 
@@ -89,6 +88,13 @@ def _serialize_config_map_to_yaml(config_map: Dict[str, str]) -> Dict[str, Any]:
                 return float(v)
             except ValueError:
                 return v
+
+    known_aliases_by_modality: Dict[str, Dict[str, List[str]]] = {}
+    for mod in ("llm", "tti", "tts", "stt", "ttm", "ttv", "connection"):
+        known_aliases_by_modality[mod] = {
+            "bindings": _get_configured_aliases(mod, config_map, "BINDINGS"),
+            "profiles": _get_configured_aliases(mod, config_map, "PROFILES"),
+        }
 
     for k, v in config_map.items():
         if not v:
@@ -105,29 +111,43 @@ def _serialize_config_map_to_yaml(config_map: Dict[str, str]) -> Dict[str, Any]:
             continue
         remainder = parts[2]
 
-        if category == "profiles":
-            alias = None
-            param_name = None
-            for suffix in _SERIALIZATION_PROFILE_SUFFIXES:
-                if remainder.endswith(suffix):
-                    alias = remainder[: -len(suffix)]
-                    param_name = suffix.lstrip("_").lower()
-                    break
-            if param_name is None and "_ROUTING_" in remainder:
-                idx = remainder.find("_ROUTING_")
-                alias = remainder[:idx]
-                param_name = remainder[idx + 1:].lower()
-            if not alias:
-                continue
-            alias = _sanitize_alias(alias)
-            yaml_data.setdefault(modality, {}).setdefault("profiles", {}).setdefault(alias, {})[param_name] = _convert_scalar(v)
-        else:
-            idx = remainder.find("_")
-            if idx <= 0:
-                continue
-            alias = _sanitize_alias(remainder[:idx])
-            param_name = remainder[idx + 1:].lower()
-            yaml_data.setdefault(modality, {}).setdefault("bindings", {}).setdefault(alias, {})[param_name] = _convert_scalar(v)
+        known_aliases = known_aliases_by_modality.get(modality, {}).get(category, [])
+        alias = None
+        param_name = None
+
+        for known_alias in sorted(known_aliases, key=len, reverse=True):
+            marker = f"{known_alias.upper()}_"
+            if remainder.startswith(marker):
+                alias = known_alias
+                param_name = remainder[len(marker):].lower()
+                break
+
+        if not alias:
+            if category == "profiles":
+                for suffix in _SERIALIZATION_PROFILE_SUFFIXES:
+                    if remainder.endswith(suffix):
+                        alias = remainder[: -len(suffix)]
+                        param_name = suffix.lstrip("_").lower()
+                        break
+                if param_name is None and "_ROUTING_" in remainder:
+                    idx = remainder.find("_ROUTING_")
+                    alias = remainder[:idx]
+                    param_name = remainder[idx + 1:].lower()
+            else:
+                if remainder.endswith("_BINDING_NAME"):
+                    alias = remainder[:-len("_BINDING_NAME")]
+                    param_name = "binding_name"
+                else:
+                    idx = _find_first_upper_param_boundary(remainder)
+                    if idx > 0:
+                        alias = remainder[:idx]
+                        param_name = remainder[idx + 1:].lower()
+
+        if not alias or not param_name:
+            continue
+
+        alias = _sanitize_alias(alias)
+        yaml_data.setdefault(modality, {}).setdefault(category, {}).setdefault(alias, {})[param_name] = _convert_scalar(v)
 
     return yaml_data
 
@@ -406,22 +426,51 @@ def _extract_profiles_from_env(prefix: str, bindings: Dict[str, Dict[str, Any]],
     return resolved_profiles
 
 def _get_configured_aliases(binding_type: str, config_map: Dict[str, str], category: str = "BINDINGS") -> List[str]:
-    prefix = f"{binding_type.rstrip('_').upper()}_{category}_"
+    cat = category.upper()
+    prefix = f"{binding_type.rstrip('_').upper()}_{cat}_"
     aliases = set()
     for k in config_map:
-        if k.startswith(prefix):
-            parts = k[len(prefix):].split("_", 1)
-            if len(parts) == 2:
+        k_upper = k.upper()
+        if not k_upper.startswith(prefix):
+            continue
+        remainder = k_upper[len(prefix):]
+        if cat == "BINDINGS":
+            if remainder.endswith("_BINDING_NAME"):
+                alias = remainder[:-len("_BINDING_NAME")]
+                if alias:
+                    aliases.add(alias)
+            else:
+                idx = _find_first_upper_param_boundary(remainder)
+                if idx > 0:
+                    alias = remainder[:idx]
+                    if alias:
+                        aliases.add(alias)
+        elif cat == "PROFILES":
+            alias = None
+            for known_key in _PROFILE_KNOWN_KEYS:
+                marker = f"_{known_key}"
+                if remainder.endswith(marker):
+                    alias = remainder[:-len(marker)]
+                    break
+            if alias is None and "_ROUTING_" in remainder:
+                idx = remainder.find("_ROUTING_")
+                if idx > 0:
+                    alias = remainder[:idx]
+            if alias:
+                aliases.add(alias)
+        else:
+            parts = remainder.split("_", 1)
+            if len(parts) == 2 and parts[0]:
                 aliases.add(parts[0])
     return sorted(aliases)
 
 def _get_binding_keys(binding_type: str, alias: str, config_map: Dict[str, str]) -> Dict[str, str]:
     prefix = f"{binding_type.rstrip('_').upper()}_BINDINGS_{alias.upper()}_"
-    return {k[len(prefix):]: v for k, v in config_map.items() if k.startswith(prefix)}
+    return {k[len(prefix):]: v for k, v in config_map.items() if k.upper().startswith(prefix)}
 
 def _get_profile_keys(binding_type: str, alias: str, config_map: Dict[str, str]) -> Dict[str, str]:
     prefix = f"{binding_type.rstrip('_').upper()}_PROFILES_{alias.upper()}_"
-    return {k[len(prefix):]: v for k, v in config_map.items() if k.startswith(prefix)}
+    return {k[len(prefix):]: v for k, v in config_map.items() if k.upper().startswith(prefix)}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Unified Client Resolver
@@ -682,6 +731,27 @@ def _safe_confirm(prompt: str, default: bool = False) -> bool:
     return raw.lower().startswith("y")
 
 _BACK_SENTINEL = "__WIZARD_BACK__"
+_BACK_VALUE = "__BACK__"
+
+
+def _is_back_choice(selection: Any) -> bool:
+    """Checks whether the user's menu selection represents a Back or Exit action."""
+    if selection is None or selection is False or selection == _BACK_VALUE:
+        return True
+    if isinstance(selection, str):
+        clean = selection.strip()
+        if clean in (
+            _BACK_VALUE, "↩ Back", "Back", "back", "b", "↩",
+            "🚪 Exit without Saving", "↩ Back to Chat", "↩ Back to Main Menu"
+        ):
+            return True
+        if clean.endswith("Back") or clean.startswith("↩"):
+            return True
+    if isinstance(selection, dict):
+        val = selection.get("value") or selection.get("name") or selection.get("title")
+        return _is_back_choice(val)
+    return False
+
 
 def _prompt_param(name: str, desc: str, ptype: str, mandatory: bool, default: Any) -> Any:
     ASCIIColors.rich_print(f"\n[bold cyan]── {name} ──[/bold cyan]")
@@ -699,8 +769,8 @@ def _prompt_param(name: str, desc: str, ptype: str, mandatory: bool, default: An
         return _convert_value(ans, ptype)
 
 def _configure_binding_instance(b_type: str, b_name: str, alias: str, config_map: Dict[str, str]):
-    prefix = f"{b_type.upper()}_BINDINGS_{alias}_"
-    config_map[prefix + "BINDING_NAME"] = b_name
+    prefix = f"{b_type.upper()}_BINDINGS_{alias.upper()}_"
+    temp_params: Dict[str, str] = {"BINDING_NAME": b_name}
     ASCIIColors.green(f"\n  ✓ Selected {b_type.upper()} binding: {b_name} (Alias: {alias})")
 
     desc = _get_binding_description(b_name, b_type)
@@ -711,33 +781,34 @@ def _configure_binding_instance(b_type: str, b_name: str, alias: str, config_map
             if not pname or pname == "model_name": continue
             val = _prompt_param(pname, p.get("description", ""), p.get("type", "str"), p.get("mandatory", False), p.get("default"))
             if val is _BACK_SENTINEL:
-                ASCIIColors.yellow("\n  ⚠️ Binding configuration cancelled. Rolling back partial keys.")
-                for k in [k for k in config_map if k.startswith(prefix)]:
-                    del config_map[k]
+                ASCIIColors.yellow("\n  ⚠️ Binding configuration cancelled.")
                 return
-            config_map[prefix + pname.upper()] = _format_env_value(val)
+            temp_params[pname.upper()] = _format_env_value(val)
     else:
         ASCIIColors.yellow("\n  No description.yaml found. Using standard server configuration.\n")
         default_host = "http://localhost:9642" if b_type in ("tti", "tts", "stt") else "http://localhost:8000"
         host_val = _prompt_param("host_address", f"The host address of the {b_type.upper()} server", "str", False, default_host)
         if host_val is _BACK_SENTINEL:
-            ASCIIColors.yellow("\n  ⚠️ Binding configuration cancelled. Rolling back partial keys.")
-            for k in [k for k in config_map if k.startswith(prefix)]:
-                del config_map[k]
+            ASCIIColors.yellow("\n  ⚠️ Binding configuration cancelled.")
             return
-        config_map[prefix + "HOST_ADDRESS"] = _format_env_value(host_val)
+        temp_params["HOST_ADDRESS"] = _format_env_value(host_val)
 
         key_val = _prompt_param("service_key", f"API / Service Key for the {b_type.upper()} server (leave blank if none)", "str", False, "")
         if key_val is _BACK_SENTINEL:
-            ASCIIColors.yellow("\n  ⚠️ Binding configuration cancelled. Rolling back partial keys.")
-            for k in [k for k in config_map if k.startswith(prefix)]:
-                del config_map[k]
+            ASCIIColors.yellow("\n  ⚠️ Binding configuration cancelled.")
             return
         if key_val:
-            config_map[prefix + "SERVICE_KEY"] = _format_env_value(key_val)
+            temp_params["SERVICE_KEY"] = _format_env_value(key_val)
 
         ssl_val = _prompt_param("verify_ssl_certificate", "Verify SSL certificate", "bool", False, False)
-        config_map[prefix + "VERIFY_SSL_CERTIFICATE"] = _format_env_value(ssl_val)
+        if ssl_val is _BACK_SENTINEL:
+            ASCIIColors.yellow("\n  ⚠️ Binding configuration cancelled.")
+            return
+        temp_params["VERIFY_SSL_CERTIFICATE"] = _format_env_value(ssl_val)
+
+    for k, v in temp_params.items():
+        config_map[prefix + k] = v
+    ASCIIColors.green(f"\n  ✓ Successfully configured {b_type.upper()} binding '{alias}'.")
 
 def _generate_unique_alias(base: str, existing_aliases: List[str]) -> str:
     """Generates a unique alias by auto-incrementing if the base name already exists.
@@ -780,77 +851,105 @@ def _bindings_menu(b_type: str, config_map: Dict[str, str]):
     while True:
         menu = Menu(f"{b_type.upper()} Bindings", mode=Menu.MODE_RETURN, exit_text="↩ Back")
         menu.set_intro("Add a new binding, edit, or delete an existing one.")
-        menu.add_choice("Add new binding", value=lambda: _add_binding_flow(b_type, config_map))
+        menu.add_choice("➕ Add new binding", value=lambda: _add_binding_flow(b_type, config_map))
 
-        prefix = f"{b_type.upper()}_BINDINGS_"
-        existing_aliases = []
-        for k in list(config_map.keys()):
-            if k.startswith(prefix) and k.endswith("_BINDING_NAME"):
-                alias = k[len(prefix):-len("_BINDING_NAME")]
-                existing_aliases.append(alias)
-                menu.add_choice(f"Edit binding: {alias}", value=lambda a=alias: _edit_keys_menu(b_type, "BINDINGS", a, config_map))
-                menu.add_choice(f"🗑️ Delete binding: {alias}", value=lambda a=alias: _delete_entry(b_type, "BINDINGS", a, config_map))
+        existing_aliases = _get_configured_aliases(b_type, config_map, "BINDINGS")
+        for alias in existing_aliases:
+            menu.add_choice(f"✏️ Edit binding: {alias}", value=lambda a=alias: _edit_keys_menu(b_type, "BINDINGS", a, config_map))
+            menu.add_choice(f"🗑️ Delete binding: {alias}", value=lambda a=alias: _delete_entry(b_type, "BINDINGS", a, config_map))
+
+        menu.add_choice("↩ Back", value=_BACK_VALUE)
 
         selection = menu.run()
-        if selection is None:
+        if _is_back_choice(selection):
             break
         if callable(selection):
             selection()
 
 def _edit_keys_menu(b_type: str, category: str, alias: str, config_map: Dict[str, str]):
     while True:
-        prefix = f"{b_type.upper()}_{category}_{alias}_"
-        keys = {k[len(prefix):]: v for k, v in config_map.items() if k.startswith(prefix)}
-        if not keys: return
+        prefix_upper = f"{b_type.upper()}_{category.upper()}_{alias.upper()}_"
+        keys = {}
+        for k, v in config_map.items():
+            if k.upper().startswith(prefix_upper):
+                raw_k = k[len(prefix_upper):]
+                keys[raw_k] = v
 
-        menu = Menu(f"Edit {b_type.upper()} {category}: {alias}", mode=Menu.MODE_RETURN, exit_text="↩ Back")
-        menu.set_intro("Select a key to edit or go back.")
+        if not keys:
+            ASCIIColors.yellow(f"\n  ⚠️ No keys found for {alias}.")
+            return
+
+        menu = Menu(f"Edit {b_type.upper()} {category.capitalize()}: {alias}", mode=Menu.MODE_RETURN, exit_text="↩ Back")
+        menu.set_intro("Select a key to edit, add a custom key, or go back.")
         for k, v in keys.items():
-            menu.add_choice(f"Edit {k}: {v[:40]}", value=lambda k=k: _edit_single_key(b_type, category, alias, k, config_map))
+            menu.add_choice(f"✏️ Edit {k}: {str(v)[:40]}", value=lambda k=k: _edit_single_key(b_type, category, alias, k, config_map))
         menu.add_choice("➕ Add custom key", value=lambda: _add_custom_key(b_type, category, alias, config_map))
+        menu.add_choice("↩ Back", value=_BACK_VALUE)
+
         selection = menu.run()
-        if selection is None:
+        if _is_back_choice(selection):
             break
         if callable(selection):
             selection()
 
 def _edit_single_key(b_type: str, category: str, alias: str, key: str, config_map: Dict[str, str]):
-    full_key = f"{b_type.upper()}_{category}_{alias}_{key}"
-    new_val = _safe_input(f"Enter new value for {key}", config_map.get(full_key, ""))
+    prefix_upper = f"{b_type.upper()}_{category.upper()}_{alias.upper()}_"
+    target_key = f"{prefix_upper}{key.upper()}"
+    found_key = None
+    for k in config_map:
+        if k.upper() == target_key:
+            found_key = k
+            break
+    curr_val = config_map.get(found_key or target_key, "")
+    new_val = _safe_input_or_back(f"Enter new value for {key}", curr_val)
     if new_val is not None:
-        config_map[full_key] = new_val
+        if found_key:
+            config_map[found_key] = new_val
+        else:
+            config_map[target_key] = new_val
         ASCIIColors.green(f"  ✓ Updated {key}")
 
 def _add_custom_key(b_type: str, category: str, alias: str, config_map: Dict[str, str]):
-    new_key = _safe_input("Enter the name of the new key (e.g., SERVICE_KEY)", "").strip().upper()
-    if new_key:
-        new_val = _safe_input(f"Enter value for {new_key}", "")
+    new_key = _safe_input_or_back("Enter the name of the new key (e.g., SERVICE_KEY)", "")
+    if new_key is not None and new_key.strip():
+        new_key_clean = new_key.strip().upper()
+        new_val = _safe_input_or_back(f"Enter value for {new_key_clean}", "")
         if new_val is not None:
-            config_map[f"{b_type.upper()}_{category}_{alias}_{new_key}"] = new_val
-            ASCIIColors.green(f"  ✓ Added {new_key}")
+            config_map[f"{b_type.upper()}_{category.upper()}_{alias.upper()}_{new_key_clean}"] = new_val
+            ASCIIColors.green(f"  ✓ Added {new_key_clean}")
 
 def _delete_entry(b_type: str, category: str, alias: str, config_map: Dict[str, str]):
-    prefix = f"{b_type.upper()}_{category}_{alias}_"
-    keys_to_delete = [k for k in list(config_map.keys()) if k.startswith(prefix)]
+    cat_upper = category.upper()
+    prefix = f"{b_type.upper()}_{cat_upper}_{alias}_".upper()
+    keys_to_delete = [k for k in list(config_map.keys()) if k.upper().startswith(prefix)]
 
     if not keys_to_delete:
         ASCIIColors.yellow(f"\n  ⚠️ No {category.lower()[:-1]} found with alias '{alias}'.")
         return
 
-    label = "binding" if category == "BINDINGS" else "profile"
+    label = "binding" if cat_upper == "BINDINGS" else "profile"
     if _safe_confirm(f"Are you sure you want to delete {label} '{alias}' and all its {len(keys_to_delete)} keys?", default=False):
-        was_default = (
-            category == "PROFILES"
-            and config_map.get(prefix + "IS_DEFAULT", "").lower() in ("true", "1", "yes", "y", "on")
-        )
+        was_default = False
         for k in keys_to_delete:
+            if k.upper().endswith("_IS_DEFAULT") and str(config_map[k]).lower() in ("true", "1", "yes", "y", "on"):
+                was_default = True
             del config_map[k]
         ASCIIColors.green(f"\n  🗑️ Deleted {label}: {alias}")
 
-        if category == "PROFILES":
+        if cat_upper == "PROFILES":
             _enforce_single_default_profile(b_type, config_map)
             if was_default:
                 ASCIIColors.info("  ℹ️ Default profile deleted; first remaining profile promoted.")
+        elif cat_upper == "BINDINGS":
+            profile_prefix = f"{b_type.upper()}_PROFILES_"
+            orphaned = []
+            for k, v in config_map.items():
+                if k.upper().startswith(profile_prefix) and k.upper().endswith("_BINDING_ALIAS"):
+                    if v.upper() == alias.upper():
+                        p_alias = k[len(profile_prefix):-len("_BINDING_ALIAS")].rstrip("_")
+                        orphaned.append(p_alias)
+            if orphaned:
+                ASCIIColors.warning(f"  ⚠️ Note: The following profile(s) still point to deleted binding '{alias}': {', '.join(orphaned)}.")
 
 def _extract_model_name(m: Any) -> Optional[str]:
     """Robustly extracts model name string from raw items (string or dict)."""
@@ -942,9 +1041,9 @@ def _fetch_available_models(b_type: str, b_name: str, config_map: Dict[str, str]
         return []
 
 def _configure_profile_instance(b_type: str, alias: str, config_map: Dict[str, str]):
-    profile_prefix = f"{b_type.upper()}_PROFILES_{alias}_"
+    profile_prefix = f"{b_type.upper()}_PROFILES_{alias.upper()}_"
 
-    configured_bindings = [k[len(f"{b_type.upper()}_BINDINGS_"):-len("_BINDING_NAME")] for k in config_map if k.startswith(f"{b_type.upper()}_BINDINGS_") and k.endswith("_BINDING_NAME")]
+    configured_bindings = _get_configured_aliases(b_type, config_map, "BINDINGS")
     if not configured_bindings:
         ASCIIColors.yellow(f"\n  ⚠️ No {b_type.upper()} bindings configured. Please add a binding first.")
         return
@@ -953,9 +1052,10 @@ def _configure_profile_instance(b_type: str, alias: str, config_map: Dict[str, s
     if not selected_b_alias:
         ASCIIColors.yellow(f"\n  ⚠️ Binding selection cancelled for profile '{alias}'.")
         return
-    config_map[profile_prefix + "BINDING_ALIAS"] = selected_b_alias
 
-    b_name = config_map.get(f"{b_type.upper()}_BINDINGS_{selected_b_alias}_BINDING_NAME")
+    temp_profile: Dict[str, str] = {"BINDING_ALIAS": selected_b_alias}
+
+    b_name = config_map.get(f"{b_type.upper()}_BINDINGS_{selected_b_alias.upper()}_BINDING_NAME")
     if b_name:
         available_models = _fetch_available_models(b_type, b_name, config_map, selected_b_alias)
         if available_models:
@@ -965,74 +1065,112 @@ def _configure_profile_instance(b_type: str, alias: str, config_map: Dict[str, s
                 ASCIIColors.yellow(f"\n  ⚠️ Model selection cancelled for profile '{alias}'.")
                 return
             if selected_model == "✍️ Enter model name manually":
-                m_name = _safe_input("Enter model name manually", "")
-                if m_name: config_map[profile_prefix + "MODEL_NAME"] = m_name
+                m_name = _safe_input_or_back("Enter model name manually", "")
+                if m_name is None:
+                    return
+                if m_name:
+                    temp_profile["MODEL_NAME"] = m_name
             else:
-                config_map[profile_prefix + "MODEL_NAME"] = selected_model
+                temp_profile["MODEL_NAME"] = selected_model
         else:
-            m_name = _safe_input("Enter model name manually", "")
-            if m_name: config_map[profile_prefix + "MODEL_NAME"] = m_name
+            m_name = _safe_input_or_back("Enter model name manually", "")
+            if m_name is None:
+                return
+            if m_name:
+                temp_profile["MODEL_NAME"] = m_name
 
-    if _safe_confirm(f"Make '{alias}' the default profile?", default=(alias == "master")):
-        config_map[profile_prefix + "IS_DEFAULT"] = "true"
-        _enforce_single_default_profile(b_type, config_map)
+    existing_profiles = _get_configured_aliases(b_type, config_map, "PROFILES")
+    is_first = len(existing_profiles) == 0 or (len(existing_profiles) == 1 and existing_profiles[0].upper() == alias.upper())
+    if _safe_confirm(f"Make '{alias}' the default profile?", default=(alias.lower() == "master" or is_first)):
+        temp_profile["IS_DEFAULT"] = "true"
     else:
-        config_map[profile_prefix + "IS_DEFAULT"] = "false"
+        temp_profile["IS_DEFAULT"] = "false"
 
     if b_type == "llm":
         if _safe_confirm(f"Does profile '{alias}' support vision?", default=False):
-            config_map[profile_prefix + "VISION_ENABLED"] = "true"
-        ctx = _safe_input("Force context size? (leave blank for auto)", "")
-        if ctx.strip(): config_map[profile_prefix + "FORCED_CONTEXT_SIZE"] = ctx.strip()
+            temp_profile["VISION_ENABLED"] = "true"
+        ctx = _safe_input_or_back("Force context size? (leave blank for auto)", "")
+        if ctx is not None and ctx.strip():
+            temp_profile["FORCED_CONTEXT_SIZE"] = ctx.strip()
 
-        ASCIIColors.rich_print("\n[bold magenta]── Smart Router Metadata ──[/bold magenta]")
-        r_desc = _safe_input("Routing description (keywords)", "")
-        if r_desc: config_map[profile_prefix + "ROUTING_DESCRIPTION"] = r_desc
-        r_cost = _safe_input("Cost per 1k tokens (0.0 for local)", "0.0")
-        if r_cost: config_map[profile_prefix + "ROUTING_COST"] = r_cost
-        r_lat = _safe_input("Average latency (ms)", "100")
-        if r_lat: config_map[profile_prefix + "ROUTING_LATENCY"] = r_lat
-        r_comp = _safe_select("Complexity tier (1=simple, 3=complex)", ["1", "2", "3"])
-        if r_comp: config_map[profile_prefix + "ROUTING_COMPLEXITY"] = r_comp
+        if _safe_confirm("Configure Smart Router metadata (optional)?", default=False):
+            ASCIIColors.rich_print("\n[bold magenta]── Smart Router Metadata ──[/bold magenta]")
+            r_desc = _safe_input_or_back("Routing description (keywords)", "")
+            if r_desc: temp_profile["ROUTING_DESCRIPTION"] = r_desc
+            r_cost = _safe_input_or_back("Cost per 1k tokens (0.0 for local)", "0.0")
+            if r_cost: temp_profile["ROUTING_COST"] = r_cost
+            r_lat = _safe_input_or_back("Average latency (ms)", "100")
+            if r_lat: temp_profile["ROUTING_LATENCY"] = r_lat
+            r_comp = _safe_select("Complexity tier (1=simple, 3=complex)", ["1", "2", "3"])
+            if r_comp: temp_profile["ROUTING_COMPLEXITY"] = r_comp
 
+    for k, v in temp_profile.items():
+        config_map[profile_prefix + k] = v
+
+    _enforce_single_default_profile(b_type, config_map)
     ASCIIColors.green(f"\n  ✓ Saved profile: {alias}")
 
 def _enforce_single_default_profile(b_type: str, config_map: Dict[str, str]) -> None:
     """
     Enforces the SINGLE-DEFAULT INVARIANT across all profiles of a modality:
     exactly one profile may carry IS_DEFAULT=true; all others are cleared.
-    If several (or none) are flagged, the FIRST profile in insertion order is
-    promoted. Mutates config_map in place.
+    If several (or none) are flagged, the FIRST profile is promoted.
+    Mutates config_map in place.
     """
-    profile_prefix = f"{b_type.upper()}_PROFILES_"
-    default_flags: List[Tuple[str, str]] = []
-    flagged: List[str] = []
-    for key in config_map:
-        if key.startswith(profile_prefix) and key.endswith("_IS_DEFAULT"):
-            remainder = key[len(profile_prefix): -len("_IS_DEFAULT")]
-            alias = remainder.split("_", 1)[0]
-            if config_map.get(key, "").lower() in ("true", "1", "yes", "y", "on"):
-                flagged.append(alias)
-            default_flags.append((alias, key))
-
-    if not default_flags:
+    configured_profiles = _get_configured_aliases(b_type, config_map, "PROFILES")
+    if not configured_profiles:
         return
 
-    owner_alias = None
+    profile_prefix = f"{b_type.upper()}_PROFILES_"
+
+    flagged = []
+    for alias in configured_profiles:
+        target_key = f"{profile_prefix}{alias.upper()}_IS_DEFAULT"
+        for k, v in config_map.items():
+            if k.upper() == target_key:
+                if str(v).lower() in ("true", "1", "yes", "y", "on"):
+                    flagged.append(alias)
+                break
+
     if len(flagged) == 1:
         owner_alias = flagged[0]
+    elif len(flagged) > 1:
+        owner_alias = flagged[0]
     else:
-        first_key = min(
-            (full_key for full_key in config_map if full_key.startswith(profile_prefix)),
-            key=lambda full_key: list(config_map.keys()).index(full_key),
-        )
-        owner_alias = first_key[len(profile_prefix):].split("_", 1)[0]
+        owner_alias = configured_profiles[0]
 
-    for alias, key in default_flags:
-        if alias == owner_alias:
-            config_map[key] = "true"
+    for alias in configured_profiles:
+        target_key = f"{profile_prefix}{alias.upper()}_IS_DEFAULT"
+        found_key = None
+        for k in list(config_map.keys()):
+            if k.upper() == target_key:
+                found_key = k
+                break
+
+        val = "true" if alias == owner_alias else "false"
+        if found_key:
+            config_map[found_key] = val
         else:
-            config_map[key] = "false"
+            config_map[target_key] = val
+
+
+def _set_default_profile_action(b_type: str, alias: str, config_map: Dict[str, str]):
+    profile_prefix = f"{b_type.upper()}_PROFILES_"
+    for a in _get_configured_aliases(b_type, config_map, "PROFILES"):
+        target_key = f"{profile_prefix}{a.upper()}_IS_DEFAULT"
+        found_key = None
+        for k in list(config_map.keys()):
+            if k.upper() == target_key:
+                found_key = k
+                break
+        val = "true" if a.upper() == alias.upper() else "false"
+        if found_key:
+            config_map[found_key] = val
+        else:
+            config_map[target_key] = val
+    ASCIIColors.green(f"\n  ✓ Profile '{alias}' set as default for {b_type.upper()}.")
+
+
 def _add_profile_flow(b_type: str, config_map: Dict[str, str]):
     existing = _get_configured_aliases(b_type, config_map, "PROFILES")
     raw_alias = _safe_input_or_back("Enter alias for the profile", "master")
@@ -1048,26 +1186,30 @@ def _add_profile_flow(b_type: str, config_map: Dict[str, str]):
             ASCIIColors.info(f"  ℹ️ Name collision resolved: {alias}")
     if alias: _configure_profile_instance(b_type, alias, config_map)
 
+
 def _profiles_menu(b_type: str, config_map: Dict[str, str]):
     while True:
         menu = Menu(f"{b_type.upper()} Profiles", mode=Menu.MODE_RETURN, exit_text="↩ Back")
-        menu.set_intro("Add a new profile, edit, or delete an existing one.")
-        menu.add_choice("Add new profile", value=lambda: _add_profile_flow(b_type, config_map))
+        menu.set_intro("Add a new profile, edit, set as default, or delete an existing one.")
+        menu.add_choice("➕ Add new profile", value=lambda: _add_profile_flow(b_type, config_map))
 
-        prefix = f"{b_type.upper()}_PROFILES_"
-        existing_aliases = []
-        for k in list(config_map.keys()):
-            if k.startswith(prefix) and k.endswith("_BINDING_ALIAS"):
-                alias = k[len(prefix):-len("_BINDING_ALIAS")]
-                existing_aliases.append(alias)
-                menu.add_choice(f"Edit profile: {alias}", value=lambda a=alias: _edit_keys_menu(b_type, "PROFILES", a, config_map))
-                menu.add_choice(f"🗑️ Delete profile: {alias}", value=lambda a=alias: _delete_entry(b_type, "PROFILES", a, config_map))
+        existing_aliases = _get_configured_aliases(b_type, config_map, "PROFILES")
+        for alias in existing_aliases:
+            is_def = config_map.get(f"{b_type.upper()}_PROFILES_{alias.upper()}_IS_DEFAULT", "").lower() in ("true", "1", "yes", "y", "on")
+            def_badge = " ⭐ [DEFAULT]" if is_def else ""
+            menu.add_choice(f"✏️ Edit profile: {alias}{def_badge}", value=lambda a=alias: _edit_keys_menu(b_type, "PROFILES", a, config_map))
+            if not is_def:
+                menu.add_choice(f"⭐ Set as default: {alias}", value=lambda a=alias: _set_default_profile_action(b_type, a, config_map))
+            menu.add_choice(f"🗑️ Delete profile: {alias}", value=lambda a=alias: _delete_entry(b_type, "PROFILES", a, config_map))
+
+        menu.add_choice("↩ Back", value=_BACK_VALUE)
 
         selection = menu.run()
-        if selection is None:
+        if _is_back_choice(selection):
             break
         if callable(selection):
             selection()
+
 
 def _modality_menu(b_type: str, config_map: Dict[str, str]):
     if b_type == "connection":
@@ -1077,10 +1219,11 @@ def _modality_menu(b_type: str, config_map: Dict[str, str]):
     while True:
         menu = Menu(f"{b_type.upper()} Configuration", mode=Menu.MODE_RETURN, exit_text="↩ Back")
         menu.set_intro(f"Configure {b_type.upper()} Bindings and Profiles.")
-        menu.add_choice(f"Configure {b_type.upper()} Bindings", value=lambda: _bindings_menu(b_type, config_map))
-        menu.add_choice(f"Configure {b_type.upper()} Profiles", value=lambda: _profiles_menu(b_type, config_map))
+        menu.add_choice(f"🔌 Configure {b_type.upper()} Bindings", value=lambda: _bindings_menu(b_type, config_map))
+        menu.add_choice(f"📋 Configure {b_type.upper()} Profiles", value=lambda: _profiles_menu(b_type, config_map))
+        menu.add_choice("↩ Back", value=_BACK_VALUE)
         selection = menu.run()
-        if selection is None:
+        if _is_back_choice(selection):
             break
         if callable(selection):
             selection()
@@ -1098,6 +1241,7 @@ def _connection_modality_menu(config_map: Dict[str, str]):
         menu.add_choice("📱 Add Instance Profile (Channel)", value=lambda: _add_connection_profile_flow(config_map))
         menu.add_choice("✏️ Edit Existing", value=lambda: _connection_edit_menu(config_map))
         menu.add_choice("🗑️ Delete", value=lambda: _connection_delete_menu(config_map))
+        menu.add_choice("↩ Back", value=_BACK_VALUE)
 
         existing = _get_configured_aliases("connection", config_map, "BINDINGS")
         existing_profiles = _get_configured_aliases("connection", config_map, "PROFILES")
@@ -1107,7 +1251,7 @@ def _connection_modality_menu(config_map: Dict[str, str]):
             ASCIIColors.info(f"  Configured profiles: {', '.join(existing_profiles)}")
 
         selection = menu.run()
-        if selection is None:
+        if _is_back_choice(selection):
             break
         if callable(selection):
             selection()
@@ -1313,14 +1457,6 @@ def _connection_delete_menu(config_map: Dict[str, str]):
         _delete_entry("connection", "PROFILES", alias, config_map)
 
 
-def _list_bindings_by_type(b_type: str) -> List[str]:
-    """List bindings by modality type, falling back to manual discovery for 'connection'."""
-    if b_type == "connection":
-        return _list_connection_bindings()
-    try:
-        from lollms_client.lollms_bindings_utils import list_bindings
-        return [b if isinstance(b, str) else b.get("name") for b in list_bindings(b_type) if b]
-    except: return []
 
 
 def _show_tool_registry(persona) -> None:
@@ -1444,16 +1580,16 @@ def _load_existing_env_to_map(cli_env_path: Optional[Union[str, Path]] = None) -
         return config_map
 
     home_dir = Path.home() / ".lollms_client"
+    home_env = home_dir / ".env"
+    if home_env.exists():
+        config_map.update(load_env_file(home_env))
+
     home_yaml = home_dir / "config.yaml"
     if home_yaml.exists():
         try:
             config_map.update(_flatten_dict_to_env(load_yaml_file(home_yaml)))
         except Exception as e:
             ASCIIColors.warning(f"Failed to load existing config.yaml: {e}")
-
-    home_env = home_dir / ".env"
-    if home_env.exists():
-        config_map.update(load_env_file(home_env))
 
     for local_env in (Path.cwd() / ".lollms_code" / ".env", Path.cwd() / ".lollms_code" / "config.yaml"):
         if local_env.exists():
@@ -1506,6 +1642,15 @@ def _save_and_validate(
             yaml_data = _serialize_config_map_to_yaml(config_map)
             with open(target_yaml_file, "w", encoding="utf-8") as f:
                 yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False)
+
+            target_env_file = target_dir / ".env"
+            if target_env_file.exists():
+                with open(target_env_file, "w", encoding="utf-8") as f:
+                    f.write("# Lollms Client Configuration\n# Synchronized with config.yaml\n\n")
+                    for k, v in sorted(config_map.items()):
+                        if v:
+                            f.write(f"{k}={v}\n")
+
             ASCIIColors.panel(
                 f"Configuration saved to: [bold green]{target_yaml_file}[/bold green]",
                 title="[bold]✅ Success[/bold]",
@@ -1631,6 +1776,19 @@ def build_wizard_menu(
                 value=lambda: _save_and_validate(state["config_map"], test_connection=True, cli_env_path=cli_env_path),
             )
 
+    def _exit_choice_action():
+        if exit_behavior == "save":
+            _save_and_validate(state["config_map"], cli_env_path=cli_env_path)
+            state["saved"] = True
+        elif exit_behavior == "ask":
+            if _safe_confirm("Save configuration before exiting?", default=True):
+                _save_and_validate(state["config_map"], cli_env_path=cli_env_path)
+                state["saved"] = True
+        state["exited"] = True
+        return _BACK_VALUE
+
+    menu.add_choice(exit_text, value=_exit_choice_action)
+
     return menu, state
 
 
@@ -1647,12 +1805,13 @@ def run_wizard_and_save(cli_env_path: Optional[Union[str, Path]] = None):
         border_style="magenta"
     )
 
+    config_map = _load_existing_env_to_map(cli_env_path)
     while True:
-        config_map = _load_existing_env_to_map(cli_env_path)
         menu, state = build_wizard_menu(
             config_map=config_map,
             title="Lollms Client Main Menu",
             exit_text="🚪 Exit without Saving",
+            exit_behavior="discard",
             include_save_exit=True,
             cli_env_path=cli_env_path,
         )
@@ -1662,9 +1821,11 @@ def run_wizard_and_save(cli_env_path: Optional[Union[str, Path]] = None):
         menu.add_choice("🔍 Save & Validate Connection", value=_validate_action)
 
         selection = menu.run()
+        if _is_back_choice(selection):
+            break
         if callable(selection):
             selection()
-        if selection is None or state["saved"]:
+        if state.get("saved") or state.get("exited"):
             break
 
 

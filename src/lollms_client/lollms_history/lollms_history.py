@@ -72,21 +72,15 @@ class HistoryManager:
         Applies a single, age-independent scrub to assistant messages:
         removes system-generated execution telemetry only — <processing>
         blocks (preserving any <tool_result> payload embedded inside them),
-        status comments, and rendering anchors — while keeping every
-        functional tag and all conversational text verbatim at any age.
-
-        Placeholder tokens (self-closing stubs, [🔒...] anchors,
-        status="saved" markers) are FORBIDDEN by doctrine: any synthetic
-        token shown in history is a template the model can learn to mimic.
-        Long-horizon compression is handled upstream by the action-window
-        recollection protocol (turn digest in the system zone) and the
-        cross-session pruning synopsis — never by stubbing history here.
-
-        `distance_from_end` is retained for API compatibility but no longer
-        selects a compression tier.
+        status comments, rendering anchors, and reasoning/thinking blocks —
+        while keeping every functional tag and all conversational text verbatim.
         """
         if not text:
             return ""
+
+        # Strip reasoning traces so thoughts are never embedded in context
+        text = re.sub(r'<think\b[^>]*>.*?(?:</think>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<thought\b[^>]*>.*?(?:</thought>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
 
         text = re.sub(r'<!--\s*status:[^>]*-->', '', text, flags=re.IGNORECASE)
         text = re.sub(r'<lollms_artifact[^/]*/>', '', text, flags=re.IGNORECASE)

@@ -165,6 +165,9 @@ class DelegationMixin:
         max_worker_rounds: int,
         callback: Optional[Callable],
         event_meta: Dict[str, Any],
+        think: Optional[bool] = None,
+        reasoning_effort: Optional[str] = None,
+        reasoning_summary: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Runs one Worker to completion and returns its report envelope.
@@ -222,6 +225,9 @@ class DelegationMixin:
                 orchestrator_mode=False,
                 event_mode=event_meta.get("event_mode"),
                 streaming_callback=worker_stream_relay,
+                think=think,
+                reasoning_effort=reasoning_effort,
+                reasoning_summary=reasoning_summary,
             )
             ai_message = (result or {}).get("ai_message")
             full_text = getattr(ai_message, "content", "") or ""

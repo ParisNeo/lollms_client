@@ -1,17 +1,49 @@
 title: Novita AI
-author: ParisNeo
+author: ParisNeo & Lollms
+version: 2.0.0
+binding_name: novita_ai
 creation_date: 2025-09-05
-last_update_date: 2025-09-05
-description: A binding for the Novita AI API, which provides access to a variety of open-source language models through an OpenAI-compatible interface. This allows for easy integration with models like Llama 3, Mixtral, and Gemma.
+last_update_date: 2026-09-20
+description: >
+  A binding for Novita AI, providing fast and cost-effective access to popular open-source
+  language and reasoning models (DeepSeek R1/V3, Llama 3.3, Qwen 2.5, Mistral) through an
+  OpenAI-compatible interface.
 global_input_parameters:
   - name: service_key
     type: str
-    description: "The API key for the Novita AI service. Can also be set via the NOVITA_API_KEY environment variable."
+    description: "The API key for Novita AI. Can also be set via the NOVITA_API_KEY environment variable."
     mandatory: true
     default: ""
+    is_secret: true
+  - name: host_address
+    type: str
+    description: "The base URL for Novita AI OpenAI-compatible endpoint. Defaults to 'https://api.novita.ai/v3/openai'."
+    mandatory: false
+    default: "https://api.novita.ai/v3/openai"
+  - name: verify_ssl_certificate
+    type: bool
+    description: "Whether to verify SSL certificates."
+    mandatory: false
+    default: true
 model_input_parameters:
   - name: model_name
     type: str
-    description: "The name of the Novita AI model to use (e.g., 'meta-llama/Llama-3-8B-Instruct')."
+    description: "The name of the Novita AI model to use."
     mandatory: true
-    default: "meta-llama/Llama-3-8B-Instruct"
+    default: "meta-llama/llama-3.3-70b-instruct"
+    options:
+      - "meta-llama/llama-3.3-70b-instruct"
+      - "deepseek/deepseek-r1"
+      - "deepseek/deepseek-v3"
+      - "qwen/qwen-2.5-coder-32b-instruct"
+      - "qwen/qwen-2.5-72b-instruct"
+      - "mistralai/mistral-large-instruct-2407"
+      - "meta-llama/llama-3.1-8b-instruct"
+      - "meta-llama/llama-3.2-11b-vision-instruct"
+commands:
+  - name: get_user_balance
+    title: Get User Balance
+    description: "Queries the user account balance from Novita AI."
+  - name: validate_key
+    title: Validate API Key
+    description: "Tests the API key against Novita AI models endpoint."
