@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-20 21:02]
+
+- fix(spinoff): add `trace_exception` import to handle unhandled exceptions in async operations
+
 ## [2026-09-20 20:46]
 
 - git commit -m "Fix(lllms_client): Improve CLI and GUI error handling"

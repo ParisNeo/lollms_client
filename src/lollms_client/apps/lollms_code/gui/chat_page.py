@@ -12,6 +12,8 @@ from gui_prefs import GuiPrefs
 from env_config import EnvStore
 import agent_bridge
 from pathlib import Path
+import json
+
 
 HELP_TEXT = """\
 **Commands**

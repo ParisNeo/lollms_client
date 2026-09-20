@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from ascii_colors import ASCIIColors
+from ascii_colors import ASCIIColors, trace_exception
 
 _MAX_TASK_CHARS = 8000
 _MAX_PERSONA_CHARS = 4000
