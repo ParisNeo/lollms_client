@@ -1469,7 +1469,12 @@ class LollmsClient():
         if self.llm:
             return self.llm.tp.generate_with_tags(prompt, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
-            
+
+    def cancel(self) -> None:
+        """Signal the active LLM binding to abort generation immediately."""
+        if self.llm and hasattr(self.llm, "cancel"):
+            self.llm.cancel()
+
 
 def chunk_text(text, tokenizer, detokenizer, chunk_size, overlap, use_separators=True):
     tokens = tokenizer(text)

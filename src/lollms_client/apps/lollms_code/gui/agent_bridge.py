@@ -42,13 +42,15 @@ except ImportError:
 # Point this at wherever CODING_SYSTEM_PROMPT actually lives in your project.
 # Simplest fix: `from lollms_code.cli import CODING_SYSTEM_PROMPT`
 try:
-    from lollms_code_cli import CODING_SYSTEM_PROMPT  # type: ignore
+    from lollms_client.apps.lollms_code.cli import CODING_SYSTEM_PROMPT, CODING_EXECUTION_HARNESS
 except ImportError:
-    CODING_SYSTEM_PROMPT = (
-        "You are lollms_code, an elite autonomous software engineering agent.\n"
-        "(!) CODING_SYSTEM_PROMPT import failed — replace the import in "
-        "app/agent_bridge.py with the real path to your CLI module."
-    )
+    try:
+        from lollms_code_cli import CODING_SYSTEM_PROMPT, CODING_EXECUTION_HARNESS  # type: ignore
+    except ImportError:
+        CODING_SYSTEM_PROMPT = (
+            "You are lollms_code, an elite autonomous software engineering agent."
+        )
+        CODING_EXECUTION_HARNESS = ""
 
 
 class AgentEvent:
@@ -269,6 +271,23 @@ def create_personality(prefs: GuiPrefs, client):
     personality.max_tokens_per_turn = prefs.max_tokens_per_turn
     personality.debug_mode = prefs.debug
 
+    # ── Project-Local Memory Setup (matching CLI) ──
+    if prefs.enable_memory:
+        try:
+            from lollms_client.lollms_memory import LollmsMemoryManager, MemoryConfig
+            project_memory_db = Path(prefs.workspace_path) / ".lollms_code" / "memory" / "memory.db"
+            project_memory_db.parent.mkdir(parents=True, exist_ok=True)
+            personality.memory_manager = LollmsMemoryManager(
+                db_path=f"sqlite:///{project_memory_db}",
+                owner_id=f"project_{Path(prefs.workspace_path).name}",
+                config=MemoryConfig(working_token_budget=2000)
+            )
+        except Exception:
+            pass
+
+    if CODING_EXECUTION_HARNESS and "## MACRO STEPS PLANNING (CURRENT.md)" not in personality.system_prompt:
+        personality.system_prompt += "\n\n" + CODING_EXECUTION_HARNESS
+
     # ── Universal Skills Discovery (Bundled + Global + Handbag) ──
     collected_skill_dirs = []
 
@@ -446,6 +465,48 @@ class QueueStreamingCallback:
         elif msg_type == MSG_TYPE.MSG_TYPE_INFO:
             self.q.put(AgentEvent("info", text=chunk))
         return True
+
+
+def cancel_agent_turn(personality, client=None) -> bool:
+    """Cancels an active agent turn across personality, client, and low-level LLM bindings."""
+    cancelled = False
+    if personality is not None:
+        if hasattr(personality, "cancel_generation"):
+            personality.cancel_generation()
+            cancelled = True
+        elif hasattr(personality, "cancel"):
+            personality.cancel()
+            cancelled = True
+
+    if client is not None:
+        if hasattr(client, "cancel"):
+            try:
+                client.cancel()
+                cancelled = True
+            except Exception:
+                pass
+        if hasattr(client, "llm") and hasattr(client.llm, "cancel"):
+            try:
+                client.llm.cancel()
+                cancelled = True
+            except Exception:
+                pass
+    elif personality is not None and getattr(personality, "lollms_client", None) is not None:
+        lc = personality.lollms_client
+        if hasattr(lc, "cancel"):
+            try:
+                lc.cancel()
+                cancelled = True
+            except Exception:
+                pass
+        if hasattr(lc, "llm") and hasattr(lc.llm, "cancel"):
+            try:
+                lc.llm.cancel()
+                cancelled = True
+            except Exception:
+                pass
+
+    return cancelled
 
 
 def run_agent_turn_in_thread(

@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-21 08:10]
+
+- `fix: update core and client library imports to resolve circular dependency warnings in lollms_core and client API modules`
+
 ## [2026-09-20 21:02]
 
 - fix(spinoff): add `trace_exception` import to handle unhandled exceptions in async operations

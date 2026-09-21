@@ -679,7 +679,30 @@ class LollmsMemoryManager:
             r = self._q(s).filter(_MemoryRecord.id == memory_id).first()
             if r is None: return False
             s.delete(r)
+            if memory_id in self._cache:
+                del self._cache[memory_id]
+            self._clear_cache()
             return True
+
+    def purge_zero_importance(self) -> int:
+        """
+        Permanently deletes all memories with importance <= 0.001 (soft-deleted or completely faded).
+        Returns the count of purged records.
+        """
+        with self._session() as s:
+            q = s.query(_MemoryRecord).filter(_MemoryRecord.importance <= 0.001)
+            if self.owner_id:
+                q = q.filter(_MemoryRecord.owner_id == self.owner_id)
+            count = q.count()
+            q.delete(synchronize_session=False)
+            self._clear_cache()
+            return count
+
+    def get_all_owner_ids(self) -> List[str]:
+        """Returns a list of all unique owner IDs present in the memory database."""
+        with self._session() as s:
+            results = s.query(_MemoryRecord.owner_id).filter(_MemoryRecord.owner_id.isnot(None)).distinct().all()
+            return sorted([r[0] for r in results if r[0]])
 
     def clear_level(self, level: int) -> int:
         with self._session() as s:
@@ -728,30 +751,55 @@ class LollmsMemoryManager:
         search_query: Optional[str] = None,
         page: int = 1,
         page_size: int = 50,
+        owner_id: Optional[str] = None,
+        ignore_owner: bool = True,
+        order_by: str = "importance_desc",
     ) -> Dict[str, Any]:
         """
-        List all memories with optional level filtering, search, and pagination.
+        List all memories with optional level filtering, search, owner filtering, and pagination.
         Ideal for building user management control panels.
         """
         with self._session() as s:
-            q = self._q(s)
+            q = s.query(_MemoryRecord)
+            if not ignore_owner:
+                target_owner = owner_id if owner_id is not None else self.owner_id
+                if target_owner:
+                    q = q.filter(_MemoryRecord.owner_id == target_owner)
+
             if level is not None:
                 q = q.filter(_MemoryRecord.level == level)
             if search_query:
-                # Case-insensitive SQL substring match
                 q = q.filter(_MemoryRecord.content.ilike(f"%{search_query}%"))
-                
+
             total = q.count()
-            recs = q.order_by(_MemoryRecord.importance.desc())\
-                    .offset((page - 1) * page_size)\
-                    .limit(page_size)\
-                    .all()
-            
+
+            if order_by == "importance_desc":
+                q = q.order_by(_MemoryRecord.importance.desc())
+            elif order_by == "importance_asc":
+                q = q.order_by(_MemoryRecord.importance.asc())
+            elif order_by == "date_desc":
+                q = q.order_by(_MemoryRecord.created_at.desc())
+            elif order_by == "date_asc":
+                q = q.order_by(_MemoryRecord.created_at.asc())
+            elif order_by == "centrality_desc":
+                q = q.order_by(_MemoryRecord.centrality.desc())
+            elif order_by == "use_count_desc":
+                q = q.order_by(_MemoryRecord.use_count.desc())
+            else:
+                q = q.order_by(_MemoryRecord.importance.desc())
+
+            if page_size > 0:
+                recs = q.offset((page - 1) * page_size).limit(page_size).all()
+                pages = max(1, (total + page_size - 1) // page_size)
+            else:
+                recs = q.all()
+                pages = 1
+
             return {
                 "total": total,
                 "page": page,
                 "page_size": page_size,
-                "pages": (total + page_size - 1) // page_size,
+                "pages": pages,
                 "memories": [self._to_dict(r) for r in recs]
             }
 
@@ -1164,7 +1212,7 @@ class LollmsMemoryManager:
 
         # 1. Hard purge of all zero-importance marked nodes (Soft Deletes)
         with self._session() as s:
-            forgotten_count = s.query(_MemoryRecord).filter(_MemoryRecord.importance < -0.001).delete(synchronize_session=False)
+            forgotten_count = s.query(_MemoryRecord).filter(_MemoryRecord.importance <= 0.001).delete(synchronize_session=False)
             report["forgotten"] += forgotten_count
             s.flush()
 

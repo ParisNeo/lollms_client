@@ -2689,20 +2689,22 @@ class LollmsPersonality:
         return _core_sync_workspace_diff(files_before, files_after)
 
     def cancel_generation(self) -> bool:
-        if hasattr(self, '_cancel_flag'):
-            object.__setattr__(self, '_cancel_flag', True)
+        object.__setattr__(self, '_cancel_flag', True)
         if hasattr(self, 'lollms_client') and self.lollms_client:
             if hasattr(self.lollms_client, 'cancel'):
                 try:
                     self.lollms_client.cancel()
                 except Exception:
                     pass
-            elif hasattr(self.lollms_client, 'llm') and hasattr(self.lollms_client.llm, 'cancel'):
+            if hasattr(self.lollms_client, 'llm') and hasattr(self.lollms_client.llm, 'cancel'):
                 try:
                     self.lollms_client.llm.cancel()
                 except Exception:
                     pass
         return True
+
+    def cancel(self) -> bool:
+        return self.cancel_generation()
 
     def is_generation_cancelled(self) -> bool:
         return getattr(self, '_cancel_flag', False)

@@ -86,7 +86,7 @@ def main_page():
     HEADER_H = 40
     resolved = env.resolve_default_connection("llm")
 
-    with ui.column().classes("w-full h-screen max-h-screen p-0 m-0 gap-0 flex flex-col overflow-hidden bg-slate-950 text-slate-100"):
+    with ui.column().classes("w-full h-screen max-h-screen p-0 m-0 gap-0 flex flex-col overflow-hidden bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100"):
         with ui.row().classes(
             "w-full items-center justify-between px-3 flex-nowrap bg-primary text-white shrink-0 shadow-sm"
         ).style(f"min-height: {HEADER_H}px; height: {HEADER_H}px;"):
@@ -123,18 +123,14 @@ def settings_page_route():
     prefs = state["prefs"]
     apply_theme(prefs)
 
-    with ui.row().classes("items-center gap-2 mb-4"):
-        ui.button(icon="arrow_back", on_click=lambda: ui.navigate.to("/")).props("flat round")
-        ui.label("Back to chat").classes("text-sm text-gray-500")
-
     def on_saved(e: EnvStore, p: GuiPrefs):
-        # Persist bindings/profiles to ~/.lollms-client/.env, same as the wizard.
         e.save()
         apply_theme(p)
         ui.notify("Applied. Returning to chat…", type="positive")
         ui.navigate.to("/")
 
-    build_settings_page(env, prefs, on_saved=on_saved)
+    with ui.column().classes("w-full h-screen max-h-screen p-0 m-0 gap-0 flex flex-col overflow-hidden bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100"):
+        build_settings_page(env, prefs, on_saved=on_saved, on_back=lambda: ui.navigate.to("/"))
 
 
 if __name__ in {"__main__", "__mp_main__"}:
