@@ -6,6 +6,7 @@ import platform
 import shlex
 from typing import Any, Dict
 from pathlib import Path
+from typing import Optional
 from ascii_colors import ASCIIColors
 
 TOOL_LIBRARY_NAME = "System Shell"
@@ -13,37 +14,39 @@ TOOL_LIBRARY_DESC = "Executes shell commands (bash, cmd, powershell) with adjust
 TOOL_LIBRARY_ICON = "⚙️"
 
 AUTONOMY_LEVEL: str = "safe"
+_CONFIRM_HANDLER: Optional[Any] = None
 
-def init_tools_library(config: dict = None) -> None:
-    global AUTONOMY_LEVEL
+
+def set_confirm_handler(handler: Optional[Any]) -> None:
+    """Sets a custom confirmation handler across both current and persistent LCP module instances."""
+    global _CONFIRM_HANDLER
+    _CONFIRM_HANDLER = handler
+    for mod_name in (
+        "lollms_client.tools_bindings.lcp.persistent_system_shell",
+        "lollms_client.tools_bindings.lcp.default_tools.system_shell.system_shell"
+    ):
+        if mod_name in sys.modules and sys.modules[mod_name] is not sys.modules.get(__name__):
+            try:
+                sys.modules[mod_name]._CONFIRM_HANDLER = handler
+            except Exception:
+                pass
+
+
+def init_tools_library(config: dict|None = None) -> None:
+    global AUTONOMY_LEVEL, _CONFIRM_HANDLER
     if config and isinstance(config, dict):
-        autonomy = config.get("autonomy_level", "safe").lower()
-        if autonomy in ("safe", "full_access"):
+        autonomy = config.get("autonomy_level", "safe").lower().strip()
+        if autonomy in ("strict", "safe", "full_access"):
             AUTONOMY_LEVEL = autonomy
             ASCIIColors.info(f"[System Shell] Host configured autonomy level: {AUTONOMY_LEVEL}")
         else:
             ASCIIColors.warning(f"[System Shell] Invalid autonomy level '{autonomy}' received. Defaulting to 'safe'.")
             AUTONOMY_LEVEL = "safe"
+        if "confirm_handler" in config:
+            set_confirm_handler(config.get("confirm_handler"))
     else:
         AUTONOMY_LEVEL = "safe"
 
-def _get_safe_commands() -> set:
-    is_windows = platform.system() == "Windows"
-    cmds = {
-        "dir", "echo", "type", "cd", "pip", "python", "py", "git",
-        "ls", "pwd", "cat", "head", "tail", "mkdir", "rmdir", "del",
-        "powershell", "pwsh", "cmd", "node", "npm", "npx",
-        "where", "which", "set", "env"
-    }
-    if is_windows:
-        cmds.update({
-            "copy", "move", "ren", "rename", "md", "rd", "cls", "erase", "if",
-            "chdir", "pushd", "popd", "tree", "find", "findstr",
-            "sort", "more", "help", "ver", "vol", "label", "time", "date"
-        })
-    else:
-        cmds.update({"rm", "cp", "mv", "touch", "grep", "clear", "export", "find", "sort"})
-    return cmds
 
 def _get_safe_commands() -> set:
     is_windows = platform.system() == "Windows"
@@ -181,12 +184,15 @@ POSIX SHELL SYNTAX RULES:
         autonomy_desc = (
             "AUTONOMY: FULL ACCESS mode is active. You can run all shell commands, tests, and environment tools."
         )
+    elif AUTONOMY_LEVEL == "strict":
+        autonomy_desc = (
+            "AUTONOMY: STRICT MODE is active. All shell commands require human operator approval."
+        )
     else:
         autonomy_desc = (
-            f"AUTONOMY: SAFE MODE is active. Only whitelisted safe commands are permitted:\n"
+            f"AUTONOMY: SAFE MODE is active. Whitelisted commands run automatically:\n"
             f"Allowed safe commands: {safe_cmds_str}\n"
-            "Any command outside this list is blocked by the sandbox. "
-            "If you need elevated privileges, ask the user to enable full_access mode."
+            "Commands outside this whitelist will prompt the user for authorization before execution."
         )
 
     return f"""Executes a shell command in the current workspace directory.
@@ -239,31 +245,48 @@ def tool_execute_shell_command(
                     if len(parts) > 1:
                         command = " & ".join(f'{cmd_name} {cmd_flags} "{d}"' for d in parts)
 
-            if not _is_safe_command(command):
-                allowed_list = ", ".join(sorted(_get_safe_commands()))
-                hint = ""
-                stripped_cmd = command.strip().lower()
-                if is_windows:
-                    if stripped_cmd.startswith("rm ") or stripped_cmd == "rm":
-                        hint = "\n\n💡 HINT: You are on Windows (cmd.exe). Use 'del <file>' to delete files or 'rmdir /s /q <dir>' to delete directories. 'rm' does not exist."
-                    elif stripped_cmd.startswith("cat ") or stripped_cmd == "cat":
-                        hint = "\n\n💡 HINT: You are on Windows (cmd.exe). Use 'type <file>' to view files. 'cat' does not exist."
-                    elif stripped_cmd.startswith("ls ") or stripped_cmd == "ls":
-                        hint = "\n\n💡 HINT: You are on Windows (cmd.exe). Use 'dir' or 'dir /b' to list files. 'ls' does not exist."
-                    elif stripped_cmd.startswith("touch "):
-                        hint = "\n\n💡 HINT: You are on Windows (cmd.exe). Use 'type nul > <file>' or create it using an <artifact> tag. 'touch' does not exist."
+            if not _is_safe_command(command) or autonomy_level == "strict":
+                handler = _CONFIRM_HANDLER
+                if not handler:
+                    persistent_name = "lollms_client.tools_bindings.lcp.persistent_system_shell"
+                    if persistent_name in sys.modules:
+                        handler = getattr(sys.modules[persistent_name], "_CONFIRM_HANDLER", None)
 
-                return {
-                    "success": False,
-                    "output": (
-                        f"🛑 BLOCKED BY SANDBOX: The command '{command}' is not in the safe whitelist.\n\n"
-                        f"The system shell is currently in 'safe' mode on {platform.system()} ({'cmd.exe' if is_windows else 'sh/bash'}).\n"
-                        f"Allowed safe commands include: {allowed_list}.{hint}\n\n"
-                        f"⚠️ **ACTION REQUIRED FROM THE USER**: If this task requires elevated privileges (e.g., system configuration, complex shell scripts), "
-                        f"please ask the user to enable 'full_access' mode by typing `/shell` in the CLI, or by pressing `Ctrl+C` and restarting with the `--shell-autonomy full_access` flag."
-                    ),
-                    "error": f"Blocked by sandbox (safe mode). The command '{command}' is not whitelisted.{hint}"
-                }
+                user_authorized = False
+                if handler is not None and callable(handler):
+                    try:
+                        res = handler(command, f"shell: {command}")
+                        decision = res[0] if isinstance(res, tuple) else (res if isinstance(res, str) else ("allow" if res else "reject"))
+                        if str(decision).lower().strip() in ("allow", "always"):
+                            user_authorized = True
+                    except Exception as handler_err:
+                        ASCIIColors.warning(f"[system_shell] Confirm handler failed: {handler_err}")
+
+                if not user_authorized:
+                    allowed_list = ", ".join(sorted(_get_safe_commands()))
+                    hint = ""
+                    stripped_cmd = command.strip().lower()
+                    if is_windows:
+                        if stripped_cmd.startswith("rm ") or stripped_cmd == "rm":
+                            hint = "\n\n💡 HINT: You are on Windows (cmd.exe). Use 'del <file>' to delete files or 'rmdir /s /q <dir>' to delete directories. 'rm' does not exist."
+                        elif stripped_cmd.startswith("cat ") or stripped_cmd == "cat":
+                            hint = "\n\n💡 HINT: You are on Windows (cmd.exe). Use 'type <file>' to view files. 'cat' does not exist."
+                        elif stripped_cmd.startswith("ls ") or stripped_cmd == "ls":
+                            hint = "\n\n💡 HINT: You are on Windows (cmd.exe). Use 'dir' or 'dir /b' to list files. 'ls' does not exist."
+                        elif stripped_cmd.startswith("touch "):
+                            hint = "\n\n💡 HINT: You are on Windows (cmd.exe). Use 'type nul > <file>' or create it using an <artifact> tag. 'touch' does not exist."
+
+                    return {
+                        "success": False,
+                        "output": (
+                            f"🛑 BLOCKED BY SANDBOX: The command '{command}' is not in the safe whitelist.\n\n"
+                            f"The system shell is currently in '{autonomy_level}' mode on {platform.system()} ({'cmd.exe' if is_windows else 'sh/bash'}).\n"
+                            f"Allowed safe commands include: {allowed_list}.{hint}\n\n"
+                            f"⚠️ **ACTION REQUIRED FROM THE USER**: If this task requires elevated privileges, "
+                            f"please ask the user to enable 'full_access' mode by typing `/shell` in the CLI or settings."
+                        ),
+                        "error": f"Blocked by sandbox ({autonomy_level} mode). The command '{command}' is not whitelisted.{hint}"
+                    }
             result = subprocess.run(
                 command,
                 shell=True,
@@ -286,9 +309,14 @@ def tool_execute_shell_command(
                 else:
                     error_msg = f"Command failed with exit code {result.returncode}"
 
+        cmd_banner = f"$ {command}\n"
+        raw_stdout = result.stdout or ("(Command executed successfully with no stdout output)" if result.returncode == 0 else "")
+        formatted_output = f"{cmd_banner}{raw_stdout}"
+
         return {
             "success": result.returncode == 0,
-            "output": result.stdout or ("Command executed successfully (no stdout)." if result.returncode == 0 else ""),
+            "command": command,
+            "output": formatted_output,
             "stderr": result.stderr,
             "error": error_msg,
             "return_code": result.returncode

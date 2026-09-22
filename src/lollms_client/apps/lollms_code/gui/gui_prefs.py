@@ -16,7 +16,7 @@ APP_DEFAULT_SKILLS_DIR = APP_CONFIG_DIR / "skills"
 APP_DEFAULT_MEMORY_DB = APP_CONFIG_DIR / "memory.db"
 APP_DEFAULT_HANDBAG_DIR = APP_CONFIG_DIR / "handbags"
 
-SHELL_AUTONOMY_LEVELS = ["safe", "full_access"]
+SHELL_AUTONOMY_LEVELS = ["strict", "safe", "full_access"]
 SKILLS_MODES = ["mixed", "loadable", "always_on", "off"]
 ACCENT_PRESETS = {
     "LoLLMS Blue": "#2563eb",

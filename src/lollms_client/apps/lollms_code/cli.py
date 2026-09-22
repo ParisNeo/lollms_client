@@ -28,7 +28,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ascii_colors import ASCIIColors, trace_exception
 
@@ -975,6 +975,95 @@ def _resolve_modality_from_config(config: CodeAgentConfig, modality: str) -> dic
     }
 
 
+def make_cli_confirm_handler(config: CodeAgentConfig) -> Callable:
+    """Creates a terminal confirmation callback for LCP tool execution in safe mode."""
+    def _handler(*args, **kwargs) -> tuple[str, str]:
+        if getattr(config, "auto_approve_python", False):
+            return "allow", ""
+
+        source = ""
+        script_label = "script.py"
+        argv = None
+
+        if len(args) == 1 and isinstance(args[0], dict):
+            req = args[0]
+            source = req.get("source") or req.get("content") or ""
+            script_label = req.get("script_label") or req.get("label") or "script.py"
+            argv = req.get("argv") or req.get("metadata", {}).get("argv")
+        elif len(args) >= 2:
+            source = str(args[0])
+            script_label = str(args[1])
+            if len(args) > 2:
+                argv = args[2]
+        elif kwargs:
+            source = kwargs.get("source") or kwargs.get("content") or ""
+            script_label = kwargs.get("script_label") or kwargs.get("label") or "script.py"
+            argv = kwargs.get("argv")
+
+        if not sys.stdin or not sys.stdin.isatty():
+            return "allow", ""
+
+        source_lines = source.splitlines()
+        total_lines = len(source_lines)
+        max_preview = 25
+
+        preview_lines = []
+        for i, line in enumerate(source_lines[:max_preview], 1):
+            preview_lines.append(f"[dim]{i:3d} |[/dim] {line}")
+        if total_lines > max_preview:
+            preview_lines.append(f"[dim]    ... [{total_lines - max_preview} more lines — enter 'v' to view all][/dim]")
+
+        panel_parts = [
+            f"[bold cyan]Script / Target:[/bold cyan] [yellow]{script_label}[/yellow]",
+            f"[bold cyan]Autonomy Mode:[/bold cyan] [green]SAFE[/green] (Protected Sandbox)",
+        ]
+        if argv and len(argv) > 1:
+            panel_parts.append(f"[bold cyan]Arguments:[/bold cyan] {argv[1:]}")
+
+        panel_parts.append(f"\n[bold cyan]Code Preview ({total_lines} lines):[/bold cyan]")
+        panel_parts.extend(preview_lines)
+        panel_parts.append(
+            "\n[bold yellow]⚠️  The LLM agent wants to execute this code in your workspace.[/bold yellow]"
+        )
+
+        ASCIIColors.panel(
+            "\n".join(panel_parts),
+            title="[bold yellow]🛡️ Execution Authorization (Safe Mode)[/bold yellow]",
+            border_style="yellow"
+        )
+
+        while True:
+            try:
+                choice = input("  Authorize execution? [y]es / [n]o / [a]lways for session / [v]iew full code (default: y): ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return "reject", "Execution cancelled by user."
+
+            if choice in ("", "y", "yes"):
+                return "allow", ""
+            elif choice in ("a", "always"):
+                config.auto_approve_python = True
+                ASCIIColors.success("[CLI] 🔓 Auto-approval enabled for this session.")
+                return "always", ""
+            elif choice in ("n", "no"):
+                try:
+                    reason = input("  Reason / feedback for the LLM (optional, press Enter to skip): ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    reason = ""
+                return "reject", reason or "User declined execution."
+            elif choice in ("v", "view"):
+                print("\n" + "=" * 80)
+                print(f"📄 FULL SOURCE CODE: {script_label} ({total_lines} lines)")
+                print("=" * 80)
+                for i, line in enumerate(source_lines, 1):
+                    print(f"{i:4d} | {line}")
+                print("=" * 80 + "\n")
+            else:
+                ASCIIColors.yellow("  Invalid choice. Please enter 'y', 'n', 'a', or 'v'.")
+
+    return _handler
+
+
 def create_client(config: CodeAgentConfig) -> LollmsClient:
     """Creates a LollmsClient instance from the CodeAgentConfig using the Two-Tier Profile System."""
 
@@ -1023,20 +1112,25 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
 
     tools_folders = [str(default_tools_path)] if default_tools_path.exists() else []
 
+    cli_confirm_handler = make_cli_confirm_handler(config)
+
     host_tool_configs = {
         "system_shell": {
-            "autonomy_level": config.shell_autonomy_level
+            "autonomy_level": config.shell_autonomy_level,
+            "confirm_handler": cli_confirm_handler
         },
         "execute_python": {
             "autonomy_level": config.shell_autonomy_level,
-            "auto_approve": getattr(config, "auto_approve_python", False)
+            "auto_approve": getattr(config, "auto_approve_python", False),
+            "confirm_handler": cli_confirm_handler
         }
     }
     client_kwargs = {
         "tools_binding_name": "lcp",
         "tools_binding_config": {
             "tools_folders": tools_folders,
-            "host_tool_configs": host_tool_configs
+            "host_tool_configs": host_tool_configs,
+            "confirm_handler": cli_confirm_handler
         },
         "debug": config.debug,
     }
@@ -1095,6 +1189,8 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
 
     if client.tools:
         try:
+            if hasattr(client.tools, 'set_confirm_handler'):
+                client.tools.set_confirm_handler(cli_confirm_handler)
             if hasattr(client.tools, 'mount_tool_library_if_absent'):
                 client.tools.mount_tool_library_if_absent('execute_python')
             else:
@@ -1555,6 +1651,7 @@ class StreamRenderer:
 
         if proc_type == "tool":
             params_str = params_match.group(1) if params_match else "{}"
+            params_dict = {}
             try:
                 params_dict = _json.loads(params_str)
                 params_str_formatted = _json.dumps(params_dict, indent=2, ensure_ascii=False)
@@ -1568,7 +1665,12 @@ class StreamRenderer:
             if not body_text:
                 body_text = "[dim](No execution log output was provided by the tool)[/dim]"
 
-            panel_lines = [f"[cyan]Parameters:[/cyan]\n[dim]{params_str_formatted}[/dim]\n"]
+            panel_lines = []
+            if isinstance(params_dict, dict) and "command" in params_dict:
+                panel_lines.append(f"[bold cyan]Command:[/bold cyan] [bold yellow]$ {params_dict['command']}[/bold yellow]\n")
+            else:
+                panel_lines.append(f"[cyan]Parameters:[/cyan]\n[dim]{params_str_formatted}[/dim]\n")
+
             if block_status == "failure":
                 panel_lines.append(f"[cyan]Error Details:[/cyan]\n[red]{body_text}[/red]")
             else:
@@ -1639,31 +1741,32 @@ class StreamRenderer:
                 params = meta.get("parameters", {})
                 content_parts = []
 
-                code_val = params.get("code") or params.get("script") if isinstance(params, dict) else None
-                if code_val and isinstance(code_val, str) and code_val.strip():
-                    content_parts.append("[bold cyan]Code to Execute:[/bold cyan]")
-                    for c_line in code_val.strip().splitlines():
-                        content_parts.append(f"  [yellow]{_clean_str(c_line)}[/yellow]")
-                    other_params = {k: v for k, v in params.items() if k not in ("code", "script")}
-                    if other_params:
-                        content_parts.append(f"\n[dim]Arguments: {_clean_str(json.dumps(other_params, default=str))}[/dim]")
-                elif tool_name == "tool_execute_shell_command" and isinstance(params, dict) and "command" in params:
-                    content_parts.append(f"[bold cyan]Command:[/bold cyan] [bold yellow]{_clean_str(params['command'])}[/bold yellow]")
+                if tool_name == "tool_execute_shell_command" and isinstance(params, dict) and "command" in params:
+                    content_parts.append(f"[bold cyan]Command:[/bold cyan] [bold yellow]$ {_clean_str(params['command'])}[/bold yellow]")
                     if "autonomy_level" in params:
                         content_parts.append(f"[dim]Autonomy: {_clean_str(params['autonomy_level'])}[/dim]")
-                elif isinstance(params, dict) and "file_name" in params:
-                    content_parts.append(f"[bold cyan]Target File:[/bold cyan] [bold yellow]{_clean_str(params['file_name'])}[/bold yellow]")
-                    other_params = {k: v for k, v in params.items() if k != "file_name"}
-                    if other_params:
-                        content_parts.append(f"[dim]Arguments: {_clean_str(json.dumps(other_params, default=str))}[/dim]")
-                elif isinstance(params, dict) and params:
-                    rows = [[f"[cyan]{_clean_str(k)}[/cyan]", f"[yellow]{_clean_str(str(v))}[/yellow]"] for k, v in params.items()]
-                    table = ASCIIColors.table("Parameter", "Value", rows=rows, box="round")
-                    ASCIIColors.rich_print(table)
-                    sys.stdout.flush()
-                    return
                 else:
-                    content_parts.append("[dim]No parameters[/dim]")
+                    code_val = params.get("code") or params.get("script") if isinstance(params, dict) else None
+                    if code_val and isinstance(code_val, str) and code_val.strip():
+                        content_parts.append("[bold cyan]Code to Execute:[/bold cyan]")
+                        for c_line in code_val.strip().splitlines():
+                            content_parts.append(f"  [yellow]{_clean_str(c_line)}[/yellow]")
+                        other_params = {k: v for k, v in params.items() if k not in ("code", "script")}
+                        if other_params:
+                            content_parts.append(f"\n[dim]Arguments: {_clean_str(json.dumps(other_params, default=str))}[/dim]")
+                    elif isinstance(params, dict) and "file_name" in params:
+                        content_parts.append(f"[bold cyan]Target File:[/bold cyan] [bold yellow]{_clean_str(params['file_name'])}[/bold yellow]")
+                        other_params = {k: v for k, v in params.items() if k != "file_name"}
+                        if other_params:
+                            content_parts.append(f"[dim]Arguments: {_clean_str(json.dumps(other_params, default=str))}[/dim]")
+                    elif isinstance(params, dict) and params:
+                        rows = [[f"[cyan]{_clean_str(k)}[/cyan]", f"[yellow]{_clean_str(str(v))}[/yellow]"] for k, v in params.items()]
+                        table = ASCIIColors.table("Parameter", "Value", rows=rows, box="round")
+                        ASCIIColors.rich_print(table)
+                        sys.stdout.flush()
+                        return
+                    else:
+                        content_parts.append("[dim]No parameters[/dim]")
 
                 content_parts.append("\n[yellow]⏳ Executing...[/yellow]")
                 ASCIIColors.panel(
@@ -1690,15 +1793,18 @@ class StreamRenderer:
 
                 content_parts = [f"[cyan]Status:[/cyan] {status_str}"]
 
-                code_val = params.get("code") or params.get("script") if isinstance(params, dict) else None
-                if code_val and isinstance(code_val, str) and code_val.strip():
-                    code_lines = code_val.strip().splitlines()
-                    content_parts.append(f"\n[bold cyan]Executed Code ({len(code_lines)} lines):[/bold cyan]")
-                    preview_lines = code_lines[:8] if len(code_lines) <= 10 else code_lines[:5] + ["..."] + code_lines[-3:]
-                    for cl in preview_lines:
-                        content_parts.append(f"  [dim]{_clean_str(cl)}[/dim]")
+                if tool_name == "tool_execute_shell_command" and isinstance(params, dict) and "command" in params:
+                    content_parts.append(f"[bold cyan]Command Executed:[/bold cyan] [bold yellow]$ {_clean_str(params['command'])}[/bold yellow]")
                 elif isinstance(params, dict) and "command" in params:
-                    content_parts.append(f"[cyan]Command:[/cyan] [yellow]{_clean_str(params['command'])}[/yellow]")
+                    content_parts.append(f"[cyan]Command:[/cyan] [yellow]$ {_clean_str(params['command'])}[/yellow]")
+                else:
+                    code_val = params.get("code") or params.get("script") if isinstance(params, dict) else None
+                    if code_val and isinstance(code_val, str) and code_val.strip():
+                        code_lines = code_val.strip().splitlines()
+                        content_parts.append(f"\n[bold cyan]Executed Code ({len(code_lines)} lines):[/bold cyan]")
+                        preview_lines = code_lines[:8] if len(code_lines) <= 10 else code_lines[:5] + ["..."] + code_lines[-3:]
+                        for cl in preview_lines:
+                            content_parts.append(f"  [dim]{_clean_str(cl)}[/dim]")
 
                 log_source = output if success else (error or output or "")
                 if not log_source:
@@ -2143,6 +2249,7 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
 
     signal.signal(signal.SIGINT, _signal_handler)
 
+    cli_confirm_handler = make_cli_confirm_handler(config)
     try:
         result = personality.chat(
             prompt=prompt,
@@ -2158,6 +2265,10 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
             enable_workspace_tools=True,
             event_mode=EventMode.FULL_CALLBACK_MODE,
             enforce_end_tag=True,
+            shell_autonomy_level=config.shell_autonomy_level,
+            python_autonomy_level=config.shell_autonomy_level,
+            auto_approve_python=getattr(config, "auto_approve_python", False),
+            confirm_handler=cli_confirm_handler,
             debug=config.debug,
             debug_export=config.debug,
         )
@@ -2717,7 +2828,7 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
     prompt_history_file = get_workspace_prompt_history_file(config.workspace_path)
     history = PersistentHistory(prompt_history_file, debug=config.debug)
 
-    slash_commands = ["/exit", "/quit", "/help", "/config", "/shell", "/forget", "/skills", "/clear-history", "/clear-files", "/clear-scratchpad", "/models", "/files", "/workspace", "/load", "/unload", "/lock", "/hide", "/unhide"]
+    slash_commands = ["/exit", "/quit", "/help", "/plan", "/current", "/scratchpad", "/config", "/shell", "/forget", "/skills", "/clear-history", "/clear-files", "/clear-scratchpad", "/models", "/files", "/workspace", "/load", "/unload", "/lock", "/hide", "/unhide"]
     
     # Display a safe, truncated workspace path to the user
     ws_path_display = Path(config.workspace_path).resolve()
@@ -2802,6 +2913,32 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                     ASCIIColors.yellow("  Personality does not support memory wiping.")
             else:
                 ASCIIColors.green("  ✅ Wipe aborted. Memories are safe.")
+            continue
+
+        if user_input.lower() in ("/plan", "/current"):
+            plan_file = Path(config.workspace_path) / ".lollms_code" / "CURRENT.md"
+            if plan_file.exists():
+                content = plan_file.read_text(encoding="utf-8", errors="ignore")
+                ASCIIColors.panel(
+                    content.strip() or "(CURRENT.md is empty)",
+                    title="[bold blue]📋 Current Task Plan (.lollms_code/CURRENT.md)[/bold blue]",
+                    border_style="blue"
+                )
+            else:
+                ASCIIColors.yellow("  No CURRENT.md plan file found in this workspace (.lollms_code/CURRENT.md).")
+            continue
+
+        if user_input.lower() in ("/scratchpad", "/scratch"):
+            scratch_file = Path(config.workspace_path) / ".lollms_code" / "scratchpad.md"
+            if scratch_file.exists():
+                content = scratch_file.read_text(encoding="utf-8", errors="ignore")
+                ASCIIColors.panel(
+                    content.strip() or "(Scratchpad is empty)",
+                    title="[bold cyan]📝 Agent Scratchpad (.lollms_code/scratchpad.md)[/bold cyan]",
+                    border_style="cyan"
+                )
+            else:
+                ASCIIColors.yellow("  No scratchpad.md file found in this workspace (.lollms_code/scratchpad.md).")
             continue
 
         if user_input.lower() in ("/handbag", "/persona"):
@@ -2983,58 +3120,38 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
         if user_input.lower() == "/shell":
             ASCIIColors.rule("[bold cyan]⚙️ Shell & Execution Autonomy Configuration[/bold cyan]")
             current_mode = config.shell_autonomy_level
-            mode_color = "red" if current_mode == "full_access" else "green"
-            ASCIIColors.info(f"Current execution autonomy level: [{mode_color}]{current_mode}[/{mode_color}]")
+            mode_color = "red" if current_mode == "full_access" else ("yellow" if current_mode == "strict" else "green")
+            ASCIIColors.info(f"Current execution autonomy level: [{mode_color}]{current_mode.upper()}[/{mode_color}]")
 
-            if current_mode == "safe":
-                ASCIIColors.red("\n  ⚠️  WARNING: Switching to 'full_access' mode grants the agent UNRESTRICTED access to your system shell and Python process execution.")
-                ASCIIColors.red("  This means it can execute arbitrary commands (e.g., `rm -rf`, network commands, scripts), modify system files, or install software without asking.")
-                ASCIIColors.yellow("  Only enable this if you trust the agent and the task requires elevated privileges.")
+            print("\n  Available Autonomy Levels:")
+            print("    [1] STRICT      — Ask for permission on EVERY code run and shell command.")
+            print("    [2] SAFE        — Auto-run benign code, plots, docx/pdf/pptx; prompt ONLY on process spawning & shell escapes.")
+            print("    [3] FULL ACCESS — Unrestricted shell & code execution without prompts.")
 
-                try:
-                    confirm = input("\n  ❓ Type 'ENABLE FULL ACCESS' to proceed, or anything else to abort: ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    ASCIIColors.yellow("\n  ❌ Aborted. Execution remains in 'safe' mode.")
-                    continue
+            try:
+                choice = input("\n  Select level [1/2/3] (press Enter to keep current): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                ASCIIColors.yellow("\n  Aborted.")
+                continue
 
-                if confirm == "ENABLE FULL ACCESS":
-                    config.shell_autonomy_level = "full_access"
-                    config.save()
+            level_map = {"1": "strict", "2": "safe", "3": "full_access"}
+            new_level = level_map.get(choice)
+            if new_level and new_level != config.shell_autonomy_level:
+                config.shell_autonomy_level = new_level
+                config.save()
 
-                    if hasattr(client, 'tools') and hasattr(client.tools, 'mounted_libraries'):
-                        for tool_lib in ("system_shell", "execute_python"):
-                            if tool_lib in client.tools.mounted_libraries:
-                                lib = client.tools.mounted_libraries[tool_lib]
-                                if hasattr(lib, 'init_tools_library'):
-                                    lib.init_tools_library({"autonomy_level": "full_access", "auto_approve": True})
-                        ASCIIColors.red("\n  🔓 Execution autonomy set to 'full_access'. The agent now has unrestricted shell and Python process access.")
-                    else:
-                        ASCIIColors.yellow("\n  ⚠️ Config saved, but client tool binding is unavailable for hot-reload. Please restart lollms-code.")
-                else:
-                    ASCIIColors.green("\n  ✅ Aborted. Execution remains in 'safe' mode.")
+                if hasattr(client, 'tools') and hasattr(client.tools, 'mounted_libraries'):
+                    for tool_lib in ("system_shell", "execute_python"):
+                        if tool_lib in client.tools.mounted_libraries:
+                            lib = client.tools.mounted_libraries[tool_lib]
+                            if hasattr(lib, 'init_tools_library'):
+                                lib.init_tools_library({
+                                    "autonomy_level": new_level,
+                                    "auto_approve": config.auto_approve_python if new_level != "full_access" else True
+                                })
+                ASCIIColors.green(f"  ✓ Execution autonomy updated to '{new_level.upper()}'.")
             else:
-                ASCIIColors.green("\n  Execution is currently in 'full_access' mode.")
-                try:
-                    confirm = input("\n  ❓ Switch back to 'safe' mode? (y/n): ").strip().lower()
-                except (EOFError, KeyboardInterrupt):
-                    ASCIIColors.yellow("\n  ❌ Aborted.")
-                    continue
-
-                if confirm in ("y", "yes"):
-                    config.shell_autonomy_level = "safe"
-                    config.save()
-
-                    if hasattr(client, 'tools') and hasattr(client.tools, 'mounted_libraries'):
-                        for tool_lib in ("system_shell", "execute_python"):
-                            if tool_lib in client.tools.mounted_libraries:
-                                lib = client.tools.mounted_libraries[tool_lib]
-                                if hasattr(lib, 'init_tools_library'):
-                                    lib.init_tools_library({"autonomy_level": "safe", "auto_approve": False})
-                        ASCIIColors.green("\n  🛡️ Execution autonomy set back to 'safe'. Interactive Python code authorization re-engaged.")
-                    else:
-                        ASCIIColors.yellow("\n  ⚠️ Config saved, but client tool binding is unavailable for hot-reload. Please restart lollms-code.")
-                else:
-                    ASCIIColors.yellow("\n  ❌ Aborted. Execution remains in 'full_access' mode.")
+                ASCIIColors.info(f"  Autonomy level remains '{config.shell_autonomy_level.upper()}'.")
 
             ASCIIColors.rule()
             continue
@@ -3121,6 +3238,7 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
         renderer._first_token_printed = False
 
         start_time = time.time()
+        cli_confirm_handler = make_cli_confirm_handler(config)
         try:
             result = personality.chat(
                 prompt=user_input,
@@ -3136,6 +3254,10 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                 enable_workspace_tools=True,
                 event_mode=EventMode.FULL_CALLBACK_MODE,
                 enforce_end_tag=True,
+                shell_autonomy_level=config.shell_autonomy_level,
+                python_autonomy_level=config.shell_autonomy_level,
+                auto_approve_python=getattr(config, "auto_approve_python", False),
+                confirm_handler=cli_confirm_handler,
                 debug=config.debug,
                 debug_export=config.debug,
             )
@@ -3202,17 +3324,22 @@ def _launch_lollms_client_wizard_submenu(cli_env_path: Optional[str] = None):
 def _configure_shell_autonomy_menu(config: CodeAgentConfig, client=None):
     """Sub-menu for configuring system shell and Python code execution policies."""
     from ascii_colors import Menu
-    from lollms_client.lollms_config_cli_env import _is_back_choice, _BACK_VALUE
+    from lollms_client.lollms_config_cli_env import _is_back_choice, _safe_select, _BACK_VALUE
 
     while True:
-        mode_label = "SAFE (Whitelisted & Code Prompting)" if config.shell_autonomy_level == "safe" else "FULL ACCESS (Unrestricted)"
-        approve_label = "YES (Skip confirmation)" if config.auto_approve_python else "NO (Prompt user with preview)"
+        mode_labels = {
+            "strict": "STRICT (Prompt for all code/shell actions)",
+            "safe": "SAFE (Auto-run benign code, plots, pptx/pdf/docx; prompt on process spawning)",
+            "full_access": "FULL ACCESS (Unrestricted execution)"
+        }
+        mode_label = mode_labels.get(config.shell_autonomy_level, config.shell_autonomy_level.upper())
+        approve_label = "YES (Skip confirmation entirely)" if config.auto_approve_python else "NO (Prompt when required)"
         shell_exec_label = "ENABLED" if config.enable_shell_execution else "DISABLED"
 
         menu = Menu("🛡️ Shell & Code Execution Policies", mode=Menu.MODE_RETURN, exit_text="↩ Back")
         menu.set_intro("Configure execution privileges and human-in-the-loop security boundaries.")
-        menu.add_choice(f"🔒 Autonomy Level: [{mode_label}]", value="toggle_autonomy")
-        menu.add_choice(f"⚡ Safe Mode Python Auto-Approve: [{approve_label}]", value="toggle_auto_approve")
+        menu.add_choice(f"🔒 Autonomy Level: [{config.shell_autonomy_level.upper()}]", value="select_autonomy")
+        menu.add_choice(f"⚡ Global Python Auto-Approve: [{approve_label}]", value="toggle_auto_approve")
         menu.add_choice(f"💻 Shell Tool Execution: [{shell_exec_label}]", value="toggle_shell")
         menu.add_choice("↩ Back", value=_BACK_VALUE)
 
@@ -3220,17 +3347,14 @@ def _configure_shell_autonomy_menu(config: CodeAgentConfig, client=None):
         if _is_back_choice(selection):
             break
 
-        if selection == "toggle_autonomy":
-            if config.shell_autonomy_level == "safe":
-                config.shell_autonomy_level = "full_access"
-                ASCIIColors.red("  🔓 Autonomy switched to 'full_access' (Unrestricted).")
-            else:
-                config.shell_autonomy_level = "safe"
-                config.auto_approve_python = False
-                ASCIIColors.green("  🛡️ Autonomy switched to 'safe' (Whitelisted commands & Python approval).")
+        if selection == "select_autonomy":
+            chosen = _safe_select("Select autonomy tier:", ["safe", "strict", "full_access"])
+            if chosen:
+                config.shell_autonomy_level = chosen
+                ASCIIColors.green(f"  ✓ Autonomy set to '{chosen.upper()}'.")
         elif selection == "toggle_auto_approve":
             config.auto_approve_python = not config.auto_approve_python
-            status = "enabled (runs will not prompt)" if config.auto_approve_python else "disabled (runs will prompt with code preview)"
+            status = "enabled (runs will not prompt)" if config.auto_approve_python else "disabled (runs will prompt based on autonomy level)"
             ASCIIColors.cyan(f"  ℹ️ Python auto-approval {status}.")
         elif selection == "toggle_shell":
             config.enable_shell_execution = not config.enable_shell_execution
@@ -3541,7 +3665,7 @@ Examples:
     parser.add_argument("--skills-dir", type=str, default=None, help="Directory for SKILL.md files.")
     parser.add_argument("--enable-model-switching", action="store_true", help="Allow the agent to switch models.")
     parser.add_argument("--no-shell-execution", action="store_true", help="Disable autonomous shell command execution.")
-    parser.add_argument("--shell-autonomy", type=str, default="safe", choices=["safe", "full_access"], help="Autonomy level for shell execution.")
+    parser.add_argument("--shell-autonomy", type=str, default="safe", choices=["strict", "safe", "full_access"], help="Autonomy level for shell and Python execution (strict, safe, full_access).")
     parser.add_argument("--auto-approve-python", action="store_true", help="Auto-approve Python execution in safe mode without confirmation prompts.")
     parser.add_argument("--no-sub-agents", action="store_true", help="Disable sub-agent delegation.")
     parser.add_argument("--no-memory", action="store_true", help="Disable persistent memory.")

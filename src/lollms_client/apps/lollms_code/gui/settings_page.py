@@ -449,26 +449,40 @@ def _render_agent_section(prefs: GuiPrefs) -> None:
         steps_in.on_value_change(lambda e: setattr(prefs, "max_reasoning_steps", int(e.value)))
         temp_slider.on_value_change(lambda e: setattr(prefs, "temperature", float(e.value)))
 
-    # Card 2: Shell Autonomy & Execution
+    # Card 2: Shell Autonomy & Python Execution Security Policies
     with ui.card().classes(f"w-full p-5 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-3"):
-        ui.label("System Shell Execution").classes("text-sm font-bold text-slate-800 dark:text-slate-200")
+        with ui.row().classes("items-center justify-between"):
+            ui.label("Shell & Python Execution Security Policies").classes("text-sm font-bold text-slate-800 dark:text-slate-200")
+            badge_map = {"strict": ("STRICT", "amber"), "safe": ("SAFE", "emerald"), "full_access": ("FULL ACCESS", "red")}
+            badge_label, badge_color = badge_map.get(prefs.shell_autonomy_level, ("SAFE", "emerald"))
+            ui.badge(badge_label, color=badge_color).props("rounded dense")
 
-        shell_switch = ui.switch("Enable Shell Execution", value=prefs.enable_shell_execution)
+        shell_switch = ui.switch("Enable System Shell Tool", value=prefs.enable_shell_execution)
         shell_switch.on_value_change(lambda e: setattr(prefs, "enable_shell_execution", e.value))
 
-        with ui.column().classes("w-full gap-2").bind_visibility_from(shell_switch, "value"):
+        with ui.column().classes("w-full gap-2.5 pt-1").bind_visibility_from(shell_switch, "value"):
             autonomy_select = ui.select(
-                {"safe": "Safe Mode (Whitelisted Commands & Code Authorization)", "full_access": "Full Access (Unrestricted Shell & Python)"},
+                {
+                    "strict": "Strict Mode (Prompt operator on EVERY Python execution and shell command)",
+                    "safe": "Safe Mode (Auto-run benign algorithms, plots, docx/pdf/pptx; prompt on process spawning & shell escapes)",
+                    "full_access": "Full Access (Unrestricted shell & Python execution without confirmation prompts)"
+                },
                 value=prefs.shell_autonomy_level,
-                label="Shell & Code Autonomy Level"
+                label="Execution Autonomy & Security Boundary"
             ).classes("w-full").props("outlined dense")
             autonomy_select.on_value_change(lambda e: setattr(prefs, "shell_autonomy_level", e.value))
 
             auto_py_switch = ui.switch(
-                "Auto-Approve Python Execution in Safe Mode (Skip authorization dialog)",
+                "Auto-Approve All Python Executions (Skip confirmation dialogs completely)",
                 value=getattr(prefs, "auto_approve_python", False)
             ).props("dense")
             auto_py_switch.on_value_change(lambda e: setattr(prefs, "auto_approve_python", e.value))
+
+            ui.label(
+                "In Safe Mode, standard scripts, calculations, data science (pandas/numpy), document creation (pptx/pdf/docx), "
+                "and plotting (matplotlib/seaborn) run autonomously. The system prompts you ONLY when risky operations "
+                "(spawning processes via subprocess, os.system, shell scripting escapes) are detected."
+            ).classes("text-[11px] text-slate-500 dark:text-slate-400 pl-1")
 
     # Card 3: Sub-Agents & Model Switching
     with ui.card().classes(f"w-full p-5 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-3"):

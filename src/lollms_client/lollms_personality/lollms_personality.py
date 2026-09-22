@@ -3362,6 +3362,179 @@ JSON:"""
 
         return surviving_history
 
+    def list_skills_structured(self, include_content: bool = False) -> List[Dict[str, Any]]:
+        """
+        Returns a structured list of all skills registered with this personality,
+        annotating each skill with its source provenance (handbag, workspace, global, bundled)
+        and indicating whether it originated from the active handbag.
+        """
+        if not self.skills_manager:
+            return []
+
+        handbag_dir = Path(self.handbag_path).resolve() if self.handbag_path else None
+        ws_dir = Path(self.workspace_path).resolve() if self.workspace_path else None
+
+        skills_list = []
+        for s in self.skills_manager.skills.values():
+            fp = s.file_path.resolve() if s.file_path else None
+            source = "custom"
+            is_handbag = False
+
+            if fp and handbag_dir:
+                try:
+                    fp.relative_to(handbag_dir)
+                    source = "handbag"
+                    is_handbag = True
+                except ValueError:
+                    pass
+
+            if not is_handbag and fp and ws_dir:
+                try:
+                    fp.relative_to(ws_dir)
+                    source = "workspace"
+                except ValueError:
+                    pass
+
+            if not is_handbag and source == "custom" and fp:
+                fp_str = str(fp).lower()
+                if ".lollms_client" in fp_str or ".lollms_hub" in fp_str or ".lollms_code" in fp_str:
+                    source = "global"
+                elif "skills" in fp_str:
+                    source = "bundled"
+
+            entry = {
+                "title": s.title,
+                "description": s.description,
+                "category": s.category,
+                "tags": s.tags,
+                "visibility": s.visibility,
+                "modifiable": s.modifiable,
+                "source": source,
+                "is_handbag": is_handbag,
+                "handbag_name": handbag_dir.name if is_handbag and handbag_dir else None,
+                "file_path": str(s.file_path) if s.file_path else None,
+                "content_preview": (s.content[:200] + "...") if len(s.content) > 200 else s.content,
+            }
+            if include_content:
+                entry["content"] = s.content
+            skills_list.append(entry)
+
+        skills_list.sort(key=lambda s: (not s["is_handbag"], s["source"], s["title"].lower()))
+        return skills_list
+
+    def list_skills(self, include_content: bool = False) -> List[Dict[str, Any]]:
+        """Alias for list_skills_structured()."""
+        return self.list_skills_structured(include_content=include_content)
+
+    def get_skills_structured(self, include_content: bool = False) -> List[Dict[str, Any]]:
+        """Alias for list_skills_structured()."""
+        return self.list_skills_structured(include_content=include_content)
+
+    def list_tools_structured(self) -> List[Dict[str, Any]]:
+        """
+        Returns a structured, categorized list of all tools available to this personality,
+        indicating tool provenance (handbag, lcp_default, multimodal binding, rag, sub_agent, etc.),
+        descriptions, parameter schemas, and whether the tool originates from the active handbag.
+        """
+        active_tools = self._discover_tools(
+            enable_data_tools=True,
+            enable_workspace_tools=True,
+            enable_shell=True,
+            enable_python_exec=True,
+            enable_web_tools=True,
+            auto_load_document_editor=True,
+            enable_computer_use=True,
+        )
+
+        handbag_tool_names = set()
+        if self._tool_binding and hasattr(self._tool_binding, "discovered_tools"):
+            for t in self._tool_binding.discovered_tools:
+                handbag_tool_names.add(t.get("name"))
+
+        structured_tools = []
+        for name, spec in active_tools.items():
+            desc = spec.get("description", "")
+            params = spec.get("parameters", [])
+            source_file = spec.get("_source_file") or spec.get("_python_file_path")
+
+            if name in handbag_tool_names or (self.handbag_path and source_file and str(self.handbag_path) in str(source_file)):
+                source = "handbag"
+                category = "handbag_tools"
+                is_handbag = True
+            elif name.startswith("tool_computer_"):
+                source = "computer_use"
+                category = "desktop_automation"
+                is_handbag = False
+            elif name in ("tool_execute_python_code", "tool_execute_python_file"):
+                source = "execute_python"
+                category = "execution"
+                is_handbag = False
+            elif name == "tool_execute_shell_command":
+                source = "system_shell"
+                category = "system"
+                is_handbag = False
+            elif name in ("tool_generate_image", "tool_edit_image", "tool_text_to_speech", "tool_speech_to_text", "tool_generate_music", "tool_generate_video", "tool_send_connection"):
+                source = "multimodal_binding"
+                category = "multimodal"
+                is_handbag = False
+            elif name.startswith("tool_git_"):
+                source = "git_manager"
+                category = "version_control"
+                is_handbag = False
+            elif name in ("tool_write_file", "tool_read_file", "tool_list_files", "tool_find_files", "tool_grep_files"):
+                source = "workspace_tools"
+                category = "workspace"
+                is_handbag = False
+            elif name in ("tool_load_skill", "tool_search_skills", "tool_list_skills", "tool_create_skill", "tool_update_skill", "tool_append_to_skill", "tool_remove_skill"):
+                source = "skills_manager"
+                category = "skills"
+                is_handbag = False
+            elif name in ("tool_spawn_sub_agent", "tool_spinoff_code_specialist", "tool_spinoff_presentation_designer"):
+                source = "sub_agent"
+                category = "delegation"
+                is_handbag = False
+            elif name in ("tool_switch_model", "tool_list_models"):
+                source = "model_switcher"
+                category = "model_management"
+                is_handbag = False
+            elif name == "tool_query_rag":
+                source = "rag"
+                category = "knowledge_retrieval"
+                is_handbag = False
+            elif name.startswith(("tool_inspect_document", "tool_read_document_content", "tool_grep_document", "tool_modify_docx", "tool_modify_excel", "tool_edit_document_text", "tool_annotate_document")):
+                source = "document_editor"
+                category = "documents"
+                is_handbag = False
+            elif name == "tool_execute_python_data_query":
+                source = "semantic_data_engineer"
+                category = "data_engineering"
+                is_handbag = False
+            else:
+                source = "custom"
+                category = "custom_tools"
+                is_handbag = False
+
+            structured_tools.append({
+                "name": name,
+                "description": desc,
+                "parameters": params,
+                "source": source,
+                "category": category,
+                "is_handbag": is_handbag,
+                "source_file": str(source_file) if source_file else None,
+            })
+
+        structured_tools.sort(key=lambda t: (not t["is_handbag"], t["category"], t["name"]))
+        return structured_tools
+
+    def list_tools(self) -> List[Dict[str, Any]]:
+        """Alias for list_tools_structured()."""
+        return self.list_tools_structured()
+
+    def get_tools_structured(self) -> List[Dict[str, Any]]:
+        """Alias for list_tools_structured()."""
+        return self.list_tools_structured()
+
     def _discover_tools(
         self,
         explicit_tools: Optional[Dict] = None,
@@ -3373,8 +3546,14 @@ JSON:"""
         enable_web_tools: bool = False,
         auto_load_document_editor: bool = True,
         enable_computer_use: bool = False,
+        shell_autonomy_level: Optional[str] = "safe",
+        python_autonomy_level: Optional[str] = "safe",
+        auto_approve_python: bool = False,
+        confirm_handler: Optional[Callable] = None,
         *args, **kwargs
     ) -> Dict[str, Dict[str, Any]]:
+        if confirm_handler is None and "confirm_handler" in kwargs:
+            confirm_handler = kwargs.get("confirm_handler")
         active_tools = {}
 
         try:
@@ -3398,6 +3577,25 @@ JSON:"""
                 lcp_binding = None
 
         if lcp_binding and hasattr(lcp_binding, 'mount_tool_library'):
+            # Update host configs dynamically
+            if not hasattr(lcp_binding, "host_tool_configs") or lcp_binding.host_tool_configs is None:
+                lcp_binding.host_tool_configs = {}
+
+            if confirm_handler:
+                if hasattr(lcp_binding, "set_confirm_handler"):
+                    lcp_binding.set_confirm_handler(confirm_handler)
+                lcp_binding.host_tool_configs.setdefault("execute_python", {})["confirm_handler"] = confirm_handler
+                lcp_binding.host_tool_configs.setdefault("system_shell", {})["confirm_handler"] = confirm_handler
+
+            if shell_autonomy_level:
+                lcp_binding.host_tool_configs.setdefault("system_shell", {})["autonomy_level"] = shell_autonomy_level
+            if python_autonomy_level or auto_approve_python is not None:
+                py_cfg = lcp_binding.host_tool_configs.setdefault("execute_python", {})
+                if python_autonomy_level:
+                    py_cfg["autonomy_level"] = python_autonomy_level
+                if auto_approve_python is not None:
+                    py_cfg["auto_approve"] = auto_approve_python
+
             _libraries_to_mount: List[str] = []
 
             if enable_workspace_tools and self.capabilities and self.capabilities.enable_workspace_tools and self._resolved_workspace:
@@ -4385,8 +4583,14 @@ JSON:"""
         think: Optional[bool] = None,
         reasoning_effort: Optional[str] = None,
         reasoning_summary: Optional[str] = None,
+        shell_autonomy_level: Optional[str] = "safe",
+        python_autonomy_level: Optional[str] = "safe",
+        auto_approve_python: bool = False,
+        confirm_handler: Optional[Callable] = None,
         **kwargs
     ) -> Dict[str, Any]:
+        if confirm_handler is None and "confirm_handler" in kwargs:
+            confirm_handler = kwargs.get("confirm_handler")
         resolved_max_rounds = max_nb_rounds if max_nb_rounds is not None else max_reasoning_steps
         if resolved_max_rounds is None:
             resolved_max_rounds = 20
@@ -4471,7 +4675,11 @@ JSON:"""
             enable_python_exec=enable_python_exec,
             enable_web_tools=enable_web_tools,
             auto_load_document_editor=auto_load_doc_editor_flag,
-            enable_computer_use=enable_computer_use
+            enable_computer_use=enable_computer_use,
+            shell_autonomy_level=shell_autonomy_level,
+            python_autonomy_level=python_autonomy_level,
+            auto_approve_python=auto_approve_python,
+            confirm_handler=confirm_handler
         )
 
         if active_tools:
@@ -5233,20 +5441,6 @@ JSON:"""
                                         action_reports.append(f"❌ FILE WRITE BLOCKED for {title}. Empty artifact body.")
                                         continue
 
-                                    if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
-                                        try:
-                                            streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {
-                                                "title": title,
-                                                "art_type": resolved_art_type,
-                                                "language": lang,
-                                                "is_patch": False,
-                                                "operation": "create",
-                                                "content": body_content,
-                                                "execution_phase": True
-                                            })
-                                        except Exception:
-                                            pass
-
                                     if self._artefact_manager:
                                         self._artefact_manager.add(title=title, artefact_type=resolved_art_type, content=body_content, language=lang, active=True)
                                     file_path = self._resolved_workspace / title
@@ -5808,20 +6002,6 @@ JSON:"""
                                     action_reports.append(f"❌ FILE WRITE BLOCKED for {title}. Empty artifact body.")
                                     continue
 
-                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
-                                    try:
-                                        streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {
-                                            "title": title,
-                                            "art_type": resolved_art_type if 'resolved_art_type' in locals() else "code",
-                                            "language": lang,
-                                            "is_patch": False,
-                                            "operation": "create",
-                                            "content": body_content,
-                                            "execution_phase": True
-                                        })
-                                    except Exception:
-                                        pass
-
                                 if self._artefact_manager:
                                     self._artefact_manager.add(title=title, artefact_type="code", content=body_content, language=lang, active=True)
                                 file_path = self._resolved_workspace / title
@@ -5834,23 +6014,7 @@ JSON:"""
                                     try:
                                         streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {
                                             "title": title,
-                                            "art_type": "code",
-                                            "language": lang,
-                                            "version": 1,
-                                            "is_patch": False,
-                                            "operation": "create",
-                                            "content": body_content,
-                                            "success": True,
-                                            "error": None
-                                        })
-                                    except Exception:
-                                        pass
-
-                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
-                                    try:
-                                        streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {
-                                            "title": title,
-                                            "art_type": resolved_art_type if 'resolved_art_type' in locals() else "code",
+                                            "art_type": resolved_art_type,
                                             "language": lang,
                                             "version": 1,
                                             "is_patch": False,

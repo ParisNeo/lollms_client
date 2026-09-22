@@ -47,16 +47,25 @@ _STRIP_MARKER = (
 
 
 def set_confirm_handler(handler: Optional[Any]) -> None:
-    """Sets a custom confirmation handler (used by GUI or host app)."""
+    """Sets a custom confirmation handler across both current and persistent LCP module instances."""
     global _CONFIRM_HANDLER
     _CONFIRM_HANDLER = handler
+    for mod_name in (
+        "lollms_client.tools_bindings.lcp.persistent_execute_python",
+        "lollms_client.tools_bindings.lcp.default_tools.execute_python.execute_python"
+    ):
+        if mod_name in sys.modules and sys.modules[mod_name] is not sys.modules.get(__name__):
+            try:
+                sys.modules[mod_name]._CONFIRM_HANDLER = handler
+            except Exception:
+                pass
 
 
 def init_tools_library(config: dict = None) -> None:
     global AUTONOMY_LEVEL, _AUTO_APPROVE_PYTHON, _CONFIRM_HANDLER
     if config and isinstance(config, dict):
-        autonomy = config.get("autonomy_level", "safe").lower()
-        if autonomy in ("safe", "full_access"):
+        autonomy = config.get("autonomy_level", "safe").lower().strip()
+        if autonomy in ("strict", "safe", "full_access"):
             AUTONOMY_LEVEL = autonomy
             ASCIIColors.info(f"[execute_python] Configured autonomy level: {AUTONOMY_LEVEL}")
         else:
@@ -64,7 +73,7 @@ def init_tools_library(config: dict = None) -> None:
         if "auto_approve" in config:
             _AUTO_APPROVE_PYTHON = bool(config.get("auto_approve"))
         if "confirm_handler" in config:
-            _CONFIRM_HANDLER = config.get("confirm_handler")
+            set_confirm_handler(config.get("confirm_handler"))
     else:
         AUTONOMY_LEVEL = "safe"
 
@@ -91,22 +100,53 @@ def _can_prompt_interactive() -> bool:
 
 def _prompt_user_validation(source: str, script_label: str, argv: Optional[List[Any]] = None) -> Tuple[str, str]:
     """
-    Prompts the user for validation when executing Python code in safe mode.
-    Returns:
-        (decision, reason)
-        where decision is one of: "allow", "always", "reject"
+    Prompts for validation when executing Python code in safe mode.
+    Prioritizes registered confirmation handler (GUI / WebUI / custom callback),
+    falls back to interactive terminal prompt if stdin is a TTY,
+    and returns ('allow', '') safely if running in a non-interactive environment without a TTY.
     """
+    global _CONFIRM_HANDLER
+
+    handler = _CONFIRM_HANDLER
+    if not handler:
+        persistent_name = "lollms_client.tools_bindings.lcp.persistent_execute_python"
+        if persistent_name in sys.modules:
+            handler = getattr(sys.modules[persistent_name], "_CONFIRM_HANDLER", None)
+
     # 1. Check custom host/GUI confirmation handler first
-    if _CONFIRM_HANDLER is not None and callable(_CONFIRM_HANDLER):
+    if handler is not None and callable(handler):
         try:
-            decision, reason = _CONFIRM_HANDLER(source, script_label, argv)
-            return decision, reason
+            try:
+                res = handler(source, script_label, argv)
+            except TypeError:
+                res = handler({
+                    "tool_name": "execute_python",
+                    "action_type": "python_execution",
+                    "source": source,
+                    "script_label": script_label,
+                    "argv": argv,
+                    "label": script_label,
+                    "content": source,
+                    "metadata": {"argv": argv, "autonomy_level": AUTONOMY_LEVEL}
+                })
+
+            if isinstance(res, tuple):
+                decision = res[0]
+                reason = res[1] if len(res) > 1 else ""
+            elif isinstance(res, bool):
+                decision, reason = ("allow", "") if res else ("reject", "Declined by user.")
+            elif isinstance(res, str):
+                decision, reason = res, ""
+            else:
+                decision, reason = "allow", ""
+            return str(decision).lower().strip(), str(reason)
         except Exception as handler_err:
             ASCIIColors.warning(f"[execute_python] Confirm handler failed: {handler_err}")
             return "allow", ""
 
     # 2. Check interactive TTY for terminal CLI
     if not _can_prompt_interactive():
+        # In non-interactive environments without a handler, do not attempt input()
         return "allow", ""
 
     source_lines = source.splitlines()
@@ -232,75 +272,64 @@ def _persist_full_output(text: str, script_label: str) -> Optional[str]:
         return None
 
 
-def _check_python_code_safety(source: str) -> Optional[str]:
+def _detect_risky_operations(source: str) -> Optional[str]:
     """
-    Enforces sandbox integrity in safe mode by analyzing code AST before execution.
-    Rejects process execution escapes (subprocess, os.system, os.popen, pty) and
-    prevents using Python to circumvent shell command restrictions.
+    Analyzes Python code AST for potentially risky operations:
+      - Spawning external OS processes (subprocess, pty, commands, multiprocessing)
+      - Shell execution and process management (os.system, os.popen, os.spawn*, os.exec*, os.kill*)
+      - Dynamic system escapes (ctypes, winreg)
+    Normal computation, data science (numpy, pandas, scipy, sklearn), document creation
+    (python-docx, python-pptx, reportlab, openpyxl), matplotlib/seaborn plotting, and workspace I/O return None.
     """
-    if AUTONOMY_LEVEL != "safe":
-        return None
-
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return None
 
-    forbidden_modules = {"subprocess", "pty", "commands"}
-    forbidden_os_attrs = {
+    forbidden_process_modules = {"subprocess", "pty", "commands", "multiprocessing"}
+    forbidden_os_process_attrs = {
         "system", "popen", "spawnl", "spawnle", "spawnlp", "spawnlpe",
         "spawnv", "spawnve", "spawnvp", "spawnvpe", "execl", "execle",
-        "execlp", "execlpe", "execv", "execve", "execvp", "execvpe"
+        "execlp", "execlpe", "execv", "execve", "execvp", "execvpe",
+        "kill", "killpg"
     }
+    risky_system_modules = {"ctypes", "winreg"}
 
     for node in ast.walk(tree):
         # 1. Direct imports
         if isinstance(node, ast.Import):
             for alias in node.names:
                 root_mod = alias.name.split(".")[0].lower()
-                if root_mod in forbidden_modules:
-                    return (
-                        f"🛑 BLOCKED BY SANDBOX (SAFE MODE): Importing '{alias.name}' is prohibited in safe mode.\n"
-                        "Spawning system processes and executing shell commands from Python is blocked by the sandbox.\n"
-                        "You cannot bypass shell restrictions using Python. "
-                        "If this task genuinely requires elevated privileges, ask the user to enable 'full_access' mode via `/shell`."
-                    )
+                if root_mod in forbidden_process_modules:
+                    return f"Attempting to spawn external processes via '{alias.name}'"
+                if root_mod in risky_system_modules:
+                    return f"Low-level system access via '{alias.name}'"
 
         # 2. From imports
         elif isinstance(node, ast.ImportFrom):
             mod = (node.module or "").lower()
             root_mod = mod.split(".")[0]
-            if root_mod in forbidden_modules:
-                return (
-                    f"🛑 BLOCKED BY SANDBOX (SAFE MODE): Importing from '{mod}' is prohibited in safe mode.\n"
-                    "Spawning system processes and executing shell commands from Python is blocked by the sandbox.\n"
-                    "If this task genuinely requires elevated privileges, ask the user to enable 'full_access' mode via `/shell`."
-                )
+            if root_mod in forbidden_process_modules:
+                return f"Attempting to spawn external processes from '{mod}'"
+            if root_mod in risky_system_modules:
+                return f"Low-level system access from '{mod}'"
             if root_mod == "os":
                 for alias in node.names:
-                    if alias.name.lower() in forbidden_os_attrs:
-                        return (
-                            f"🛑 BLOCKED BY SANDBOX (SAFE MODE): Importing 'os.{alias.name}' is prohibited in safe mode.\n"
-                            "Executing shell commands via Python is blocked by the sandbox.\n"
-                            "If this task genuinely requires elevated privileges, ask the user to enable 'full_access' mode via `/shell`."
-                        )
+                    if alias.name.lower() in forbidden_os_process_attrs:
+                        return f"Executing system/process command via 'os.{alias.name}'"
 
-        # 3. Call expressions on os.system, os.popen, etc.
+        # 3. Direct call expressions
         elif isinstance(node, ast.Call):
             if isinstance(node.func, ast.Attribute):
                 attr_name = node.func.attr.lower()
-                if attr_name in forbidden_os_attrs:
+                if attr_name in forbidden_os_process_attrs:
                     if isinstance(node.func.value, ast.Name) and node.func.value.id.lower() == "os":
-                        return (
-                            f"🛑 BLOCKED BY SANDBOX (SAFE MODE): Calling 'os.{node.func.attr}' is prohibited in safe mode.\n"
-                            "Executing arbitrary shell commands via Python is blocked by the sandbox.\n"
-                            "If this task genuinely requires elevated privileges, ask the user to enable 'full_access' mode via `/shell`."
-                        )
+                        return f"Executing system command via 'os.{node.func.attr}'"
             elif isinstance(node.func, ast.Name) and node.func.id == "__import__":
                 if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
                     mod_name = node.args[0].value.split(".")[0].lower()
-                    if mod_name in forbidden_modules:
-                        return f"🛑 BLOCKED BY SANDBOX (SAFE MODE): Dynamic import of '{node.args[0].value}' is prohibited in safe mode."
+                    if mod_name in forbidden_process_modules or mod_name in risky_system_modules:
+                        return f"Dynamic import of '{node.args[0].value}'"
 
     return None
 
@@ -312,19 +341,27 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
     """
     global _AUTO_APPROVE_PYTHON
 
-    safety_violation = _check_python_code_safety(source)
-    if safety_violation:
-        ASCIIColors.error(f"[execute_python] {safety_violation}")
-        return {
-            "success": False,
-            "error": safety_violation,
-            "output": "",
-            "stderr": safety_violation
-        }
+    # ── AUTONOMY LEVEL DECISION MATRIX ──
+    # 1. STRICT: Prompts operator on EVERY execution turn (maximum scrutiny).
+    # 2. SAFE (Default): Auto-approves benign computational code, data analysis (numpy/pandas/scipy/sklearn),
+    #    document generation (docx/pptx/pdf/xlsx), and plotting (matplotlib/seaborn). Prompts ONLY when
+    #    risky operations (process spawning, os.system/subprocess calls, system escapes) are detected.
+    # 3. FULL ACCESS: Executes everything without confirmation prompts.
+    risky_reason = _detect_risky_operations(source)
 
-    # ── SYSTEMIC HUMAN VALIDATION IN SAFE MODE ──
-    if AUTONOMY_LEVEL == "safe" and not _AUTO_APPROVE_PYTHON:
-        decision, rejection_reason = _prompt_user_validation(source, script_label, argv)
+    requires_user_prompt = False
+    prompt_label = script_label
+
+    if not _AUTO_APPROVE_PYTHON:
+        if AUTONOMY_LEVEL == "strict":
+            requires_user_prompt = True
+            prompt_label = f"[STRICT] {script_label}"
+        elif AUTONOMY_LEVEL == "safe" and risky_reason:
+            requires_user_prompt = True
+            prompt_label = f"[RISKY: {risky_reason}] {script_label}"
+
+    if requires_user_prompt:
+        decision, rejection_reason = _prompt_user_validation(source, prompt_label, argv)
         if decision == "reject":
             reason_msg = rejection_reason or "The user reviewed the code and declined permission to execute it."
             ASCIIColors.warning(f"[execute_python] ❌ Execution rejected by user: {reason_msg}")
@@ -401,12 +438,12 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
     orig_import = safe_builtins.get("__import__", __import__)
 
     def _sandboxed_import(name, *args, **kwargs):
-        if AUTONOMY_LEVEL == "safe":
+        if AUTONOMY_LEVEL in ("safe", "strict") and not _AUTO_APPROVE_PYTHON:
             root_mod = name.split(".")[0].lower()
             if root_mod in ("subprocess", "pty", "commands"):
                 raise PermissionError(
-                    f"🛑 BLOCKED BY SANDBOX (SAFE MODE): Importing '{name}' is forbidden in safe mode. "
-                    "Process execution and shell escapes via Python are blocked. Ask user to enable 'full_access' mode if required."
+                    f"🛑 BLOCKED BY SANDBOX: Importing '{name}' to spawn external processes is restricted. "
+                    "Authorize execution or switch to 'full_access' mode if required."
                 )
         return orig_import(name, *args, **kwargs)
 
@@ -419,19 +456,23 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
     orig_os_rmdir = getattr(os, "rmdir", None)
     orig_shutil_rmtree = getattr(shutil, "rmtree", None)
 
-    if AUTONOMY_LEVEL == "safe":
+    if AUTONOMY_LEVEL in ("safe", "strict"):
         def _blocked_system(*args, **kwargs):
-            raise PermissionError("🛑 BLOCKED BY SANDBOX (SAFE MODE): 'os.system' cannot be used to run shell commands in safe mode.")
+            if not _AUTO_APPROVE_PYTHON:
+                raise PermissionError("🛑 BLOCKED BY SANDBOX: 'os.system' cannot be used without explicit authorization.")
+            return orig_os_system(*args, **kwargs) if orig_os_system else None
 
         def _blocked_popen(*args, **kwargs):
-            raise PermissionError("🛑 BLOCKED BY SANDBOX (SAFE MODE): 'os.popen' cannot be used to run shell commands in safe mode.")
+            if not _AUTO_APPROVE_PYTHON:
+                raise PermissionError("🛑 BLOCKED BY SANDBOX: 'os.popen' cannot be used without explicit authorization.")
+            return orig_os_popen(*args, **kwargs) if orig_os_popen else None
 
         def _bounded_remove(path, *args, **kwargs):
             p = Path(path).resolve()
             try:
                 p.relative_to(workspace_root)
             except ValueError:
-                raise PermissionError(f"🛑 BLOCKED BY SANDBOX (SAFE MODE): Deleting file '{path}' outside workspace is forbidden.")
+                raise PermissionError(f"🛑 BLOCKED BY SANDBOX: Deleting file '{path}' outside workspace is forbidden.")
             return orig_os_remove(path, *args, **kwargs)
 
         def _bounded_rmdir(path, *args, **kwargs):
@@ -439,7 +480,7 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
             try:
                 p.relative_to(workspace_root)
             except ValueError:
-                raise PermissionError(f"🛑 BLOCKED BY SANDBOX (SAFE MODE): Deleting folder '{path}' outside workspace is forbidden.")
+                raise PermissionError(f"🛑 BLOCKED BY SANDBOX: Deleting folder '{path}' outside workspace is forbidden.")
             return orig_os_rmdir(path, *args, **kwargs)
 
         def _bounded_rmtree(path, *args, **kwargs):
@@ -447,7 +488,7 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
             try:
                 p.relative_to(workspace_root)
             except ValueError:
-                raise PermissionError(f"🛑 BLOCKED BY SANDBOX (SAFE MODE): Deleting directory tree '{path}' outside workspace is forbidden.")
+                raise PermissionError(f"🛑 BLOCKED BY SANDBOX: Deleting directory tree '{path}' outside workspace is forbidden.")
             return orig_shutil_rmtree(path, *args, **kwargs)
 
         os.system = _blocked_system
@@ -574,7 +615,7 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
         sys.argv = old_argv
 
         # Restore system functions if modified
-        if AUTONOMY_LEVEL == "safe":
+        if AUTONOMY_LEVEL in ("safe", "strict"):
             if orig_os_system:
                 os.system = orig_os_system
             if orig_os_popen:

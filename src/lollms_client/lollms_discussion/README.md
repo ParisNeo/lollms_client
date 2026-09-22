@@ -735,6 +735,10 @@ def chat(
     think:                        Optional[bool] = None,
     reasoning_effort:             Optional[str] = None,
     reasoning_summary:            Optional[str] = None,
+    shell_autonomy_level:         Optional[str] = "safe",
+    python_autonomy_level:        Optional[str] = "safe",
+    auto_approve_python:          bool = False,
+    confirm_handler:              Optional[Callable] = None,
     **kwargs
 ) -> Dict[str, Any]:
 ```
@@ -886,6 +890,16 @@ discussion.chat(user_message="Search for apples", tools=explicit_tools)
 *   `enable_episodic_memory` (`bool`): If `True` (default), saves substantial conversation turns as episodic memories. Set to `False` for privacy-sensitive sessions or manual memory control.
 *   `enable_vlm_query` (`bool`): If `True` and the active LLM lacks vision, auto-mounts the `tool_vlm_query` tool that routes image questions to a vision-capable fallback binding.
 *   `enable_computer_use` (`bool`): If `True`, mounts the `computer_use` LCP toolset (screenshots, click, type, key, scroll) for desktop automation — **only if the active model supports vision**. A blind model cannot close the observe→act→verify loop, so the toolset is silently skipped (with a console warning) when no vision capability is detected on the active binding or its SmartRouter children. Default `False`.
+*   `shell_autonomy_level` (`Optional[str]`): Sets the security and permission boundaries for shell command execution (`"safe"` or `"full_access"`). Safe mode enforces whitelist checks. Defaults to `"safe"`.
+*   `python_autonomy_level` (`Optional[str]`): Sets the security level for sandboxed Python code/file execution (`"safe"` or `"full_access"`). Safe mode prohibits subprocess escapes. Defaults to `"safe"`.
+*   `auto_approve_python` (`bool`): If `True`, bypasses human-in-the-loop confirmation dialogs/prompts when running Python in safe mode. Defaults to `False`.
+*   `confirm_handler` (`Optional[Callable]`): Custom confirmation callback for UI/host applications to display interactive confirmation dialogs for tool executions without touching the console.
+
+- **`temperature`**: Generation temperature.
+- **`n_predict`**: Maximum tokens to generate.
+- **`enable_artefacts`**: Toggles the artifact creation system.
+- **`use_internal_history`**: If `True`, maintains a separate internal conversation history.
+
 *   `enable_in_message_status` (`bool`): If `True`, emits detailed status comments inside `<processing>` blocks for UI rendering.
 *   `remove_thinking_blocks` (`bool`): If `True`, strips `_EDEFAULT` or `INSTRUCTION` blocks from the final saved message content.
 *   `event_mode` (`EventMode`): Controls how execution telemetry (tool calls, artifact builds, context updates) is reported to the `streaming_callback`. Defaults to `EventMode.PROCESSING_TAG_MODE`.

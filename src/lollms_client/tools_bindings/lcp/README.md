@@ -44,6 +44,36 @@ The actual module import and `init_tools_library()` execution are deferred to `e
 ### 9. Persistent Module Caching
 To maximize performance and preserve state across multiple tool calls, LCP loads tool files into `sys.modules` under the `lollms_client.tools_bindings.lcp.persistent_{file_stem}` namespace upon first execution. The binding trusts that this cache exists at execution time. If a lazy initialization fails, the module is purged from the cache, ensuring broken modules are not re-used.
 
+### 10. Confirmation & Authorization Protocol (UI & Host Integration)
+When tools need to perform sensitive actions (like executing Python scripts, modifying workspace state, or running system commands in safe mode), LCP provides a decoupled, host-managed confirmation protocol:
+
+- **Host Handler Registration**: Any GUI (NiceGUI, WebUI, Desktop), headless pipeline, or CLI app can register a confirmation handler via:
+  ```python
+  lcp_binding.set_confirm_handler(my_confirm_callback)
+  # or pass during client creation:
+  tools_binding_config={"confirm_handler": my_confirm_callback, ...}
+  # or in chat():
+  discussion.chat(..., confirm_handler=my_confirm_callback)
+  ```
+- **Handler Contract**:
+  The handler receives request information and returns `("allow"|"always"|"reject", reason)` or a boolean `True`/`False`.
+  ```python
+  def my_confirm_callback(source: str, script_label: str, argv: list) -> tuple[str, str]:
+      # Prompt UI dialog (e.g. NiceGUI dialog) and return decision
+      return "allow", ""
+  ```
+- **Zero Console Hangs**: In UI/non-interactive environments without a TTY, LCP avoids blocking on `sys.stdin.read()`. If a UI confirm handler is registered, the UI handles it asynchronously; otherwise, safe computational tasks proceed without console interruptions.
+
+### 11. Safe Mode Security Boundaries
+Safe mode protects the host environment without hindering programming and data processing:
+- **What Safe Mode Restricts**:
+  - Spawning extra/uncontrolled OS processes via `subprocess`, `pty`, `commands`, `os.system`, `os.popen`, `os.spawn*`, `os.exec*`.
+  - Destructive filesystem operations escaping the workspace root.
+- **What Safe Mode Allows**:
+  - Full computational logic, algorithms, and math.
+  - Data science workflows using `numpy`, `pandas`, `scipy`, `sklearn`, `matplotlib`, `seaborn`, `sqlite3`, etc.
+  - Reading, creating, and updating workspace files within the workspace root sandbox.
+
 ---
 
 ## 📦 LCP Default Tools Injection

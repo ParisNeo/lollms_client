@@ -13,7 +13,7 @@ import platform
 import queue
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from gui_prefs import GuiPrefs
 from env_config import EnvStore
@@ -400,22 +400,57 @@ def clear_all_loaded_files(personality) -> Dict[str, Any]:
     return change_file_visibility(personality, loaded_files, "unload")
 
 
-def get_scratchpad_content(personality) -> str:
+def get_scratchpad_content(personality, workspace_path: Optional[str] = None) -> str:
     """Reads the live scratchpad file for the current workspace so the GUI
     can display the agent's persistent notes and intermediate thoughts."""
     scratchpad_path = getattr(personality, "_scratchpad_path", None)
-    if scratchpad_path is None or not Path(scratchpad_path).exists():
+    if scratchpad_path and Path(scratchpad_path).exists():
+        try:
+            return Path(scratchpad_path).read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            pass
+
+    ws = getattr(personality, "_resolved_workspace", None) or getattr(personality, "workspace_path", None) or workspace_path
+    if ws:
+        p = Path(ws) / ".lollms_code" / "scratchpad.md"
+        if p.exists():
+            try:
+                return p.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                pass
+    return ""
+
+
+def get_current_plan_content(personality=None, workspace_path: Optional[str] = None) -> str:
+    """Reads the live CURRENT.md plan file for the current workspace so the GUI
+    can display the agent's macro-steps plan."""
+    ws = None
+    if personality is not None:
+        ws = getattr(personality, "_resolved_workspace", None) or getattr(personality, "workspace_path", None)
+    if not ws and workspace_path:
+        ws = Path(workspace_path)
+
+    if not ws:
+        return ""
+
+    plan_path = Path(ws).resolve() / ".lollms_code" / "CURRENT.md"
+    if not plan_path.exists():
         return ""
     try:
-        return Path(scratchpad_path).read_text(encoding="utf-8", errors="ignore")
+        return plan_path.read_text(encoding="utf-8", errors="ignore")
     except Exception:
         return ""
 
 
 def get_live_skills(personality) -> List[Dict[str, Any]]:
-    """Returns the personality's current skills list. Safe to call while the
-    agent is generating: SkillsManager.list_skills() only reads the in-memory
-    dict (refreshed on each tool_create_skill/tool_update_skill call)."""
+    """Returns the personality's current skills list with handbag provenance."""
+    if personality is None:
+        return []
+    if hasattr(personality, "list_skills_structured"):
+        try:
+            return personality.list_skills_structured() or []
+        except Exception:
+            pass
     mgr = getattr(personality, "skills_manager", None)
     if mgr is None:
         return []
@@ -528,13 +563,32 @@ _CURRENT_RESP_QUEUE: Optional[queue.Queue] = None
 
 def make_gui_python_confirm_handler(event_queue: "queue.Queue[AgentEvent]", prefs: GuiPrefs):
     """
-    Creates a confirmation handler for execute_python that dispatches a modal dialog
+    Creates a confirmation handler for LCP execution tools that dispatches a modal dialog
     request to NiceGUI and blocks the worker thread until the user decides.
     """
-    def _handler(source: str, script_label: str, argv: Optional[List[Any]]) -> Tuple[str, str]:
+    def _handler(*args, **kwargs) -> Tuple[str, str]:
         global _CURRENT_RESP_QUEUE
         if getattr(prefs, "auto_approve_python", False):
             return "allow", ""
+
+        source = ""
+        script_label = "script.py"
+        argv = None
+
+        if len(args) == 1 and isinstance(args[0], dict):
+            req = args[0]
+            source = req.get("source") or req.get("content") or ""
+            script_label = req.get("script_label") or req.get("label") or "script.py"
+            argv = req.get("argv") or req.get("metadata", {}).get("argv")
+        elif len(args) >= 2:
+            source = str(args[0])
+            script_label = str(args[1])
+            if len(args) > 2:
+                argv = args[2]
+        elif kwargs:
+            source = kwargs.get("source") or kwargs.get("content") or ""
+            script_label = kwargs.get("script_label") or kwargs.get("label") or "script.py"
+            argv = kwargs.get("argv")
 
         resp_queue = queue.Queue(maxsize=1)
         _CURRENT_RESP_QUEUE = resp_queue
@@ -571,10 +625,19 @@ def run_agent_turn_in_thread(
     """Runs personality.chat(...) in a background thread so the NiceGUI
     event loop never blocks, and reports completion/errors via the queue."""
 
-    # Register GUI validation handler with execute_python tool library
+    gui_confirm_handler = make_gui_python_confirm_handler(event_queue, prefs)
+
+    # Register GUI validation handler with execute_python and system_shell across all tool modules
+    if client and hasattr(client, "tools") and client.tools:
+        if hasattr(client.tools, "set_confirm_handler"):
+            client.tools.set_confirm_handler(gui_confirm_handler)
+        if hasattr(client.tools, "host_tool_configs") and isinstance(client.tools.host_tool_configs, dict):
+            client.tools.host_tool_configs.setdefault("execute_python", {})["confirm_handler"] = gui_confirm_handler
+            client.tools.host_tool_configs.setdefault("system_shell", {})["confirm_handler"] = gui_confirm_handler
+
     try:
         from lollms_client.tools_bindings.lcp.default_tools.execute_python import execute_python as _ep_mod
-        _ep_mod.set_confirm_handler(make_gui_python_confirm_handler(event_queue, prefs))
+        _ep_mod.set_confirm_handler(gui_confirm_handler)
         _ep_mod._AUTO_APPROVE_PYTHON = getattr(prefs, "auto_approve_python", False)
     except Exception:
         pass
@@ -597,6 +660,10 @@ def run_agent_turn_in_thread(
                 enable_workspace_tools=True,
                 enforce_end_tag=True,
                 event_mode=EventMode.FULL_CALLBACK_MODE,
+                shell_autonomy_level=getattr(prefs, "shell_autonomy_level", "safe"),
+                python_autonomy_level=getattr(prefs, "shell_autonomy_level", "safe"),
+                auto_approve_python=getattr(prefs, "auto_approve_python", False),
+                confirm_handler=gui_confirm_handler,
                 debug=prefs.debug,
                 debug_export=prefs.debug,
             )

@@ -3490,8 +3490,14 @@ class ChatMixin:
         images: Optional[List[str]] = None,
         orchestrator_mode: bool = False,
         orchestrator_persona: bool = False,
-        **kwargs: dict,
+        shell_autonomy_level: Optional[str] = "safe",
+        python_autonomy_level: Optional[str] = "safe",
+        auto_approve_python: bool = False,
+        confirm_handler: Optional[Callable] = None,
+        **kwargs: Any,
     ) -> Dict[str, Dict[str, Any]]:
+        if confirm_handler is None and "confirm_handler" in kwargs:
+            confirm_handler = kwargs.get("confirm_handler")
         """
         Single source of truth for tool-registry resolution (Sovereign Opt-In
         Doctrine). Used by chat() and by the AgenticRunner so the orchestrator
@@ -3555,6 +3561,24 @@ class ChatMixin:
                 lcp_binding = None
 
         if lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
+            if not hasattr(lcp_binding, "host_tool_configs") or lcp_binding.host_tool_configs is None:
+                lcp_binding.host_tool_configs = {}
+
+            if confirm_handler:
+                if hasattr(lcp_binding, "set_confirm_handler"):
+                    lcp_binding.set_confirm_handler(confirm_handler)
+                lcp_binding.host_tool_configs.setdefault("execute_python", {})["confirm_handler"] = confirm_handler
+                lcp_binding.host_tool_configs.setdefault("system_shell", {})["confirm_handler"] = confirm_handler
+
+            if shell_autonomy_level:
+                lcp_binding.host_tool_configs.setdefault("system_shell", {})["autonomy_level"] = shell_autonomy_level
+            if python_autonomy_level or auto_approve_python is not None:
+                py_cfg = lcp_binding.host_tool_configs.setdefault("execute_python", {})
+                if python_autonomy_level:
+                    py_cfg["autonomy_level"] = python_autonomy_level
+                if auto_approve_python is not None:
+                    py_cfg["auto_approve"] = auto_approve_python
+
             if enable_data_tools and has_data_files:
                 lcp_binding.mount_tool_library("semantic_data_engineer")
                 ASCIIColors.info("[ChatMixin] Mounted 'semantic_data_engineer' (data files detected).")
@@ -3680,6 +3704,10 @@ class ChatMixin:
         think:                        Optional[bool] = None,
         reasoning_effort:             Optional[str] = None,
         reasoning_summary:            Optional[str] = None,
+        shell_autonomy_level:         Optional[str] = "safe",
+        python_autonomy_level:        Optional[str] = "safe",
+        auto_approve_python:          bool = False,
+        confirm_handler:              Optional[Callable] = None,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -3769,7 +3797,11 @@ class ChatMixin:
                 suppress_images=suppress_images,
                 images=images,
                 orchestrator_mode=orchestrator_mode,
-                kwargs=kwargs,
+                shell_autonomy_level=shell_autonomy_level,
+                python_autonomy_level=python_autonomy_level,
+                auto_approve_python=auto_approve_python,
+                confirm_handler=confirm_handler,
+                **kwargs,
             )
             runner = AgenticRunner(
                 discussion=self,
@@ -4013,7 +4045,11 @@ class ChatMixin:
             images=images,
             orchestrator_mode=orchestrator_mode,
             orchestrator_persona=orchestrator_persona,
-            kwargs=kwargs,
+            shell_autonomy_level=shell_autonomy_level,
+            python_autonomy_level=python_autonomy_level,
+            auto_approve_python=auto_approve_python,
+            confirm_handler=confirm_handler,
+            **kwargs,
         )
 
         if personality and hasattr(personality, "tools") and _is_tool_binding(personality.tools) and not orchestrator_persona:

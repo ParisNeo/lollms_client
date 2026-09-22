@@ -82,6 +82,10 @@ llm:
 # Use a specific profile declared in your configuration
 lollms-code --profile gpt4o "Refactor the authentication module"
 
+# Run with full shell/Python autonomy or auto-approved safe mode
+lollms-code --shell-autonomy full_access "Run system maintenance scripts"
+lollms-code --auto-approve-python "Build and run integration tests"
+
 # Quick override of model on the active profile
 lollms-code --model llama3.2:3b "Write a quick test"
 ```
@@ -149,6 +153,19 @@ lollms-code --list-skills
 | `skills` | List all learned skills |
 | `clear` | Clear conversation history |
 | `models` | List available models for switching |
+| `/shell` | Toggle shell & Python execution autonomy (`safe` vs `full_access`) |
+| `/files` | List loaded workspace context files |
+| `/clear-files` | Unload all files from active context |
+
+## Security Modes & Confirmation Architecture
+
+- **Safe Mode vs Full Access**:
+  - `safe` mode allows full data processing, math, data science, plotting, and workspace file editing while blocking potentially harmful actions (uncontrolled process spawning via `subprocess` or `os.system` escapes).
+  - `full_access` mode allows unrestricted shell and system process execution.
+- **UI vs CLI Confirmation**:
+  - **GUI Mode (`lollms-code gui`)**: Confirmation requests are handled seamlessly in the browser/native window via a NiceGUI modal authorization dialog with code preview and line counts. No console prompts are displayed.
+  - **CLI Mode (`lollms-code -i` / single prompt)**: When running in a terminal TTY, an interactive ASCIIColors prompt displays the code preview with `[y]es / [n]o / [a]lways / [v]iew` options.
+  - **`--auto-approve-python`**: Bypass confirmation prompts for headless automation runs.
 
 ## Return Value
 

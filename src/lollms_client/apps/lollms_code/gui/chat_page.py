@@ -35,6 +35,8 @@ HELP_TEXT = """\
 **Commands**
 
 - `/help` — this list
+- `/plan` (alias `/current`) — view and edit the active task plan (CURRENT.md)
+- `/scratchpad` — view and edit the agent's persistent scratchpad
 - `/history` — browse and resend prompt history (Ctrl+H)
 - `/clear-history` (alias `/clear`) — clear the conversation shown here (and the agent's in-memory history)
 - `/clear-files` (alias `/unload-all`) — unload every currently loaded file from context
@@ -60,6 +62,9 @@ Ctrl+Shift+C copy the last agent message.
 
 SLASH_COMMANDS = [
     ("/help", "Show command list"),
+    ("/plan", "View and edit active macro plan (CURRENT.md)"),
+    ("/current", "View active macro plan (CURRENT.md)"),
+    ("/scratchpad", "View and edit agent scratchpad notes"),
     ("/history", "Browse and resend prompt history"),
     ("/clear-history", "Clear the conversation"),
     ("/clear-files", "Unload all files from context"),
@@ -394,9 +399,13 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     on_click=lambda: open_memory_explorer_dialog(session, prefs) if open_memory_explorer_dialog else ui.notify("Memory Explorer not available", type="warning"),
                 ).props("flat dense size=sm no-caps text-color=purple").tooltip("Open Memory Explorer (inspect, edit, dream)")
                 ui.button(
+                    "Plan", icon="checklist",
+                    on_click=lambda: open_current_plan_dialog(),
+                ).props("flat dense size=sm no-caps text-color=primary font-semibold").tooltip("View and edit the active task roadmap (.lollms_code/CURRENT.md)")
+                ui.button(
                     "Scratchpad", icon="edit_note",
                     on_click=lambda: open_scratchpad_dialog(),
-                ).props("flat dense size=sm no-caps").tooltip("View the agent's persistent notes and thoughts")
+                ).props("flat dense size=sm no-caps").tooltip("View the agent's persistent scratchpad notes")
                 ui.button(
                     "Copy as Markdown", icon="content_copy",
                     on_click=lambda: copy_debug_markdown(),
@@ -470,13 +479,19 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     health_bar = ui.linear_progress(value=0.0, show_value=False).props("instant-feedback")
 
                 with ui.card().classes(f"w-full no-shadow border {BORDER} {SURFACE}"):
-                    ui.label("🎓 Skills (live)").classes(f"text-xs font-bold {STRONG}")
+                    ui.label("🎓 Skills & State (live)").classes(f"text-xs font-bold {STRONG}")
                     skills_label = ui.label("—").classes(f"text-xs {MUTED}")
                     ui.separator().classes(f"my-1 {BORDER}")
+                    peek_plan_button = ui.button(
+                        "📋 Peek Plan (CURRENT.md)", icon="checklist",
+                        on_click=lambda: open_current_plan_dialog(),
+                    ).props("flat dense size=xs no-caps").classes("w-full text-left justify-start")
+                    peek_plan_button.tooltip("Inspect macro steps plan in .lollms_code/CURRENT.md")
+
                     peek_button = ui.button(
-                        "🔍 Peek Scratchpad", icon="visibility",
+                        "📝 Peek Scratchpad", icon="visibility",
                         on_click=lambda: open_scratchpad_dialog(),
-                    ).props("flat dense size=xs no-caps").classes("w-full")
+                    ).props("flat dense size=xs no-caps").classes("w-full text-left justify-start")
                     peek_button.tooltip("Read the agent's scratchpad right now — safe while generating")
                     scratchpad_badge = ui.badge("0", color="blue").props("floating").bind_visibility_from(
                         session, "current_round", backward=lambda r: session.busy and r > 0
@@ -667,6 +682,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 ui.code(body or "(no output)").classes(
                     "w-full text-xs bg-slate-900 dark:bg-slate-950 text-slate-100 p-2.5 rounded border border-slate-700 dark:border-slate-800"
                 )
+        panel._debug_entry = entry
         return panel
 
     def copy_event_body(entry: Dict[str, Any]):
@@ -957,23 +973,145 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         session.current_round = 0
         add_system_notice("🆕 New session started.")
 
+    def open_current_plan_dialog():
+        dialog = ui.dialog().props("maximized")
+        with dialog, ui.card().classes(
+            f"w-full h-full flex flex-col p-4 {CANVAS} text-slate-900 dark:text-slate-100"
+        ):
+            with ui.row().classes(f"w-full items-center justify-between pb-2 border-b {BORDER}"):
+                with ui.row().classes("items-center gap-2.5"):
+                    ui.icon("checklist", size="26px").classes("text-primary")
+                    with ui.column().classes("gap-0"):
+                        ui.label("Task Plan (CURRENT.md)").classes("text-base font-bold")
+                        ui.label("Macro steps plan tracked by the agent in .lollms_code/CURRENT.md").classes(
+                            f"text-xs {MUTED_DIM}"
+                        )
+
+                with ui.row().classes("gap-2 items-center"):
+                    edit_mode = {"active": False}
+                    current_plan_text = {"content": ""}
+
+                    def _toggle_edit():
+                        edit_mode["active"] = not edit_mode["active"]
+                        plan_md_view.set_visibility(not edit_mode["active"])
+                        plan_editor.set_visibility(edit_mode["active"])
+                        save_btn.set_visibility(edit_mode["active"])
+                        edit_btn.text = "Preview" if edit_mode["active"] else "Edit"
+                        edit_btn._props["icon"] = "visibility" if edit_mode["active"] else "edit"
+                        if edit_mode["active"]:
+                            plan_editor.value = current_plan_text["content"]
+
+                    def _save_plan():
+                        try:
+                            ws = Path(prefs.workspace_path).resolve()
+                            plan_file = ws / ".lollms_code" / "CURRENT.md"
+                            plan_file.parent.mkdir(parents=True, exist_ok=True)
+                            new_text = plan_editor.value or ""
+                            plan_file.write_text(new_text, encoding="utf-8")
+                            current_plan_text["content"] = new_text
+                            plan_md_view.set_content(new_text if new_text.strip() else "# Current Task Plan\n\n_(No active task plan defined yet)_")
+                            _toggle_edit()
+                            ui.notify("Plan saved to .lollms_code/CURRENT.md", type="positive")
+                        except Exception as ex:
+                            notify_error(f"Failed to save plan: {ex}")
+
+                    def _refresh_plan():
+                        try:
+                            session.ensure_ready()
+                            content = agent_bridge.get_current_plan_content(session.personality, prefs.workspace_path)
+                            current_plan_text["content"] = content
+                            plan_md_view.set_content(
+                                content if content.strip() else "# Current Task Plan\n\n_(No active task plan in .lollms_code/CURRENT.md)_"
+                            )
+                            plan_editor.value = content
+                            ui.notify("Plan refreshed from CURRENT.md.", type="positive", timeout=1200)
+                        except Exception as e:
+                            notify_error(f"Failed to read CURRENT.md: {e}")
+
+                    edit_btn = ui.button("Edit", icon="edit", on_click=_toggle_edit).props("flat size=sm no-caps")
+                    save_btn = ui.button("Save", icon="save", on_click=_save_plan).props("unelevated size=sm color=primary no-caps")
+                    save_btn.visible = False
+                    ui.button("Refresh", icon="refresh", on_click=_refresh_plan).props("flat size=sm no-caps")
+                    ui.button("Close", icon="close", on_click=dialog.close).props("flat size=sm no-caps")
+
+            plan_md_view = ui.markdown("").classes(
+                f"flex-1 overflow-auto p-4 bg-slate-100 dark:bg-slate-900 rounded border {BORDER} text-sm leading-relaxed"
+            )
+            plan_editor = ui.textarea().classes(
+                f"flex-1 w-full bg-slate-100 dark:bg-slate-900 text-xs font-mono rounded border {BORDER} p-2"
+            ).props(':dark="Quasar.Dark.isActive" outlined autogrow')
+            plan_editor.visible = False
+
+            _refresh_plan()
+        dialog.open()
+
     def open_scratchpad_dialog():
         dialog = ui.dialog().props("maximized")
-        with dialog, ui.card().classes("w-full h-full flex flex-col"):
-            with ui.row().classes("w-full items-center justify-between mb-2"):
-                ui.label("📝 Agent Scratchpad").classes("text-lg font-bold")
-                with ui.row().classes("gap-2"):
+        with dialog, ui.card().classes(
+            f"w-full h-full flex flex-col p-4 {CANVAS} text-slate-900 dark:text-slate-100"
+        ):
+            with ui.row().classes(f"w-full items-center justify-between pb-2 border-b {BORDER}"):
+                with ui.row().classes("items-center gap-2.5"):
+                    ui.icon("edit_note", size="26px").classes("text-cyan-500")
+                    with ui.column().classes("gap-0"):
+                        ui.label("Agent Scratchpad").classes("text-lg font-bold")
+                        ui.label("Persistent intermediate notes and architectural state in .lollms_code/scratchpad.md").classes(
+                            f"text-xs {MUTED_DIM}"
+                        )
+
+                with ui.row().classes("gap-2 items-center"):
+                    edit_mode = {"active": False}
+                    current_scratch_text = {"content": ""}
+
+                    def _toggle_scratch_edit():
+                        edit_mode["active"] = not edit_mode["active"]
+                        scratchpad_md.set_visibility(not edit_mode["active"])
+                        scratch_editor.set_visibility(edit_mode["active"])
+                        save_scratch_btn.set_visibility(edit_mode["active"])
+                        edit_scratch_btn.text = "Preview" if edit_mode["active"] else "Edit"
+                        edit_scratch_btn._props["icon"] = "visibility" if edit_mode["active"] else "edit"
+                        if edit_mode["active"]:
+                            scratch_editor.value = current_scratch_text["content"]
+
+                    def _save_scratchpad():
+                        try:
+                            ws = Path(prefs.workspace_path).resolve()
+                            scratch_file = ws / ".lollms_code" / "scratchpad.md"
+                            scratch_file.parent.mkdir(parents=True, exist_ok=True)
+                            new_text = scratch_editor.value or ""
+                            scratch_file.write_text(new_text, encoding="utf-8")
+                            current_scratch_text["content"] = new_text
+                            scratchpad_md.set_content(new_text if new_text.strip() else "_(Scratchpad is empty)_")
+                            _toggle_scratch_edit()
+                            ui.notify("Scratchpad saved.", type="positive")
+                        except Exception as ex:
+                            notify_error(f"Failed to save scratchpad: {ex}")
+
                     def _refresh_scratchpad():
                         try:
                             session.ensure_ready()
-                            content = agent_bridge.get_scratchpad_content(session.personality)
-                            scratchpad_md.set_content(content if content.strip() else "_(scratchpad is empty)_")
-                            ui.notify("Scratchpad refreshed.", type="positive")
+                            content = agent_bridge.get_scratchpad_content(session.personality, prefs.workspace_path)
+                            current_scratch_text["content"] = content
+                            scratchpad_md.set_content(content if content.strip() else "# Agent Scratchpad\n\n_(Scratchpad is empty)_")
+                            scratch_editor.value = content
+                            ui.notify("Scratchpad refreshed.", type="positive", timeout=1200)
                         except Exception as e:
-                            ui.notify(f"Failed to read scratchpad: {e}", type="negative")
+                            notify_error(f"Failed to read scratchpad: {e}")
+
+                    edit_scratch_btn = ui.button("Edit", icon="edit", on_click=_toggle_scratch_edit).props("flat size=sm no-caps")
+                    save_scratch_btn = ui.button("Save", icon="save", on_click=_save_scratchpad).props("unelevated size=sm color=primary no-caps")
+                    save_scratch_btn.visible = False
                     ui.button("Refresh", icon="refresh", on_click=_refresh_scratchpad).props("flat size=sm no-caps")
                     ui.button("Close", icon="close", on_click=dialog.close).props("flat size=sm no-caps")
-            scratchpad_md = ui.markdown("").classes("flex-1 overflow-auto p-2 bg-gray-50 dark:bg-gray-900 rounded")
+
+            scratchpad_md = ui.markdown("").classes(
+                f"flex-1 overflow-auto p-4 bg-slate-100 dark:bg-slate-900 rounded border {BORDER} text-sm leading-relaxed"
+            )
+            scratch_editor = ui.textarea().classes(
+                f"flex-1 w-full bg-slate-100 dark:bg-slate-900 text-xs font-mono rounded border {BORDER} p-2"
+            ).props(':dark="Quasar.Dark.isActive" outlined autogrow')
+            scratch_editor.visible = False
+
             _refresh_scratchpad()
         dialog.open()
 
@@ -1147,7 +1285,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
             thinking_label = None
 
     def open_python_approval_dialog(source: str, script_label: str, argv: Optional[List[Any]], resp_queue: Any):
-        """Displays a modal dialog asking the user to authorize Python execution in safe mode."""
+        """Displays an in-app modal authorization dialog for LCP tool execution in safe mode."""
         dialog = ui.dialog().props("persistent")
         active_approval_dialog_holder["dialog"] = dialog
         active_approval_dialog_holder["resp_queue"] = resp_queue
@@ -1156,7 +1294,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         line_count = len(source_lines)
 
         with dialog, ui.card().classes(
-            "w-[760px] max-w-[95vw] max-h-[90vh] flex flex-col p-4 gap-3 "
+            "w-[780px] max-w-[95vw] max-h-[90vh] flex flex-col p-4 gap-3 "
             "bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 "
             "rounded-xl shadow-2xl border-2 border-amber-500/80"
         ):
@@ -1164,8 +1302,8 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 with ui.row().classes("items-center gap-2.5"):
                     ui.icon("security", size="28px").classes("text-amber-500")
                     with ui.column().classes("gap-0"):
-                        ui.label("🛡️ Python Execution Authorization (Safe Mode)").classes("text-base font-bold")
-                        ui.label("The AI agent wants to execute this Python code in your workspace sandbox.").classes(
+                        ui.label("🛡️ Execution Authorization Request (Safe Mode)").classes("text-base font-bold")
+                        ui.label("The agent requested execution of the code below in your workspace sandbox.").classes(
                             "text-xs text-slate-500 dark:text-slate-400"
                         )
 
@@ -1178,10 +1316,10 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
             with ui.scroll_area().classes(
                 "w-full max-h-[360px] border border-slate-300 dark:border-slate-800 rounded bg-slate-50 dark:bg-slate-950 p-2"
             ):
-                ui.code(source, language="python").classes("w-full text-xs")
+                ui.code(source, language="python" if script_label.endswith(".py") or "def " in source or "import " in source else "text").classes("w-full text-xs")
 
             feedback_input = ui.input(
-                placeholder="Optional feedback / instruction if rejecting (e.g. 'Use requests instead', 'Fix syntax error')..."
+                placeholder="Optional feedback / instruction if rejecting (e.g. 'Use requests instead of urllib', 'Check variable types')..."
             ).classes("w-full text-xs").props("outlined dense clearable")
 
             with ui.row().classes("w-full items-center justify-between pt-2 border-t border-slate-200 dark:border-slate-800"):
@@ -1192,7 +1330,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                         resp_queue.put(("reject", fb or "User declined execution."))
                     active_approval_dialog_holder["dialog"] = None
                     active_approval_dialog_holder["resp_queue"] = None
-                    ui.notify("Python execution rejected.", type="warning")
+                    ui.notify("Execution rejected.", type="warning")
 
                 def _do_allow():
                     dialog.close()
@@ -1207,6 +1345,10 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     if resp_queue:
                         resp_queue.put(("always", ""))
                     prefs.auto_approve_python = True
+                    try:
+                        prefs.save()
+                    except Exception:
+                        pass
                     active_approval_dialog_holder["dialog"] = None
                     active_approval_dialog_holder["resp_queue"] = None
                     ui.notify("Auto-approval enabled for this session.", type="positive")
@@ -1303,10 +1445,24 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 params = ev.data.get("parameters", {})
                 params_str = json.dumps(params, indent=2, ensure_ascii=False) if isinstance(params, dict) else str(params)
 
-                # Avoid duplicate running panels if already registered for this active tool call
-                if name not in active_tool_panels:
-                    panel = add_event_panel(f"🛠️ Running: {name}", "executing…", params_str, "blue-500", "build")
-                    active_tool_panels[name] = {"panel": panel, "params": params}
+                # Remove previous running panel and debug entry for the same tool if present
+                if name in active_tool_panels:
+                    old_item = active_tool_panels.pop(name)
+                    try:
+                        old_item["panel"].delete()
+                        if hasattr(old_item["panel"], "_debug_entry") and old_item["panel"]._debug_entry in debug_log:
+                            debug_log.remove(old_item["panel"]._debug_entry)
+                    except Exception:
+                        pass
+
+                subtitle = "executing…"
+                if name == "tool_execute_shell_command" and isinstance(params, dict) and "command" in params:
+                    subtitle = f"$ {params['command']}"
+                elif isinstance(params, dict) and "file_name" in params:
+                    subtitle = f"{params['file_name']} · executing…"
+
+                panel = add_event_panel(f"🛠️ Running: {name}", subtitle, params_str, "blue-500", "build")
+                active_tool_panels[name] = {"panel": panel, "params": params}
                 status_label.set_text(f"Running {name}…")
                 _paint_round(timeline_slots, session.current_round, "bg-blue-500 animate-pulse")
 
@@ -1323,19 +1479,40 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 success = bool(ev.data.get("success", False))
                 output = ev.data.get("output") or ev.data.get("error") or ""
                 color = "green-500" if success else "red-500"
+                params = ev.data.get("parameters", {})
 
-                # Remove the 'Running...' panel so the completed result replaces it cleanly
+                # If params wasn't in ev.data, extract from active_tool_panels
+                if not params and name in active_tool_panels:
+                    params = active_tool_panels[name].get("params", {})
+
+                # Remove the 'Running...' panel from both UI and debug_log so only the finished result is preserved
                 if name in active_tool_panels:
                     active_item = active_tool_panels.pop(name)
+                    if not params:
+                        params = active_item.get("params", {})
                     try:
                         active_item["panel"].delete()
+                        if hasattr(active_item["panel"], "_debug_entry") and active_item["panel"]._debug_entry in debug_log:
+                            debug_log.remove(active_item["panel"]._debug_entry)
                     except Exception:
                         pass
 
+                subtitle = "success" if success else "failed"
+                body_content = output
+
+                if name == "tool_execute_shell_command":
+                    cmd_str = (params.get("command") if isinstance(params, dict) else None) or ev.data.get("command")
+                    if cmd_str:
+                        subtitle = f"$ {cmd_str}"
+                        if not output.startswith("$ "):
+                            body_content = f"$ {cmd_str}\n\n{output}"
+                elif name in ("tool_execute_python_file", "tool_read_document_content", "tool_inspect_document") and isinstance(params, dict) and "file_name" in params:
+                    subtitle = f"{params['file_name']} · {'success' if success else 'failed'}"
+
                 add_event_panel(
                     f"{'✅' if success else '❌'} Finished: {name}",
-                    "success" if success else "failed",
-                    output,
+                    subtitle,
+                    body_content,
                     color,
                     "build_circle"
                 )
@@ -1385,8 +1562,19 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 if sec:
                     subtitle += f" · {sec}"
                 seal_current_text_block()
+
+                # If a writing panel for this artifact already exists, delete it and remove from debug_log
+                if title in active_artefact_panels:
+                    old_art_item = active_artefact_panels.pop(title)
+                    try:
+                        old_art_item["panel"].delete()
+                        if hasattr(old_art_item["panel"], "_debug_entry") and old_art_item["panel"]._debug_entry in debug_log:
+                            debug_log.remove(old_art_item["panel"]._debug_entry)
+                    except Exception:
+                        pass
+
                 panel = add_event_panel(f"📝 Writing: {title}", subtitle, "", "purple-500", "description")
-                active_artefact_panels[title] = {"panel": panel}
+                active_artefact_panels[title] = {"panel": panel, "op": op, "lang": lang}
                 _paint_round(timeline_slots, session.current_round, "bg-purple-500 animate-pulse")
 
             elif ev.kind == "artefact_symbol":
@@ -1408,12 +1596,22 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 chars = ev.data.get("size_chars", 0)
                 is_patch = ev.data.get("is_patch", False)
 
-                if title in active_artefact_panels:
+                # Remove the in-flight 'Writing...' panel from UI and debug_log so it's cleanly replaced
+                had_active_panel = title in active_artefact_panels
+                if had_active_panel:
                     active_art_item = active_artefact_panels.pop(title)
                     try:
                         active_art_item["panel"].delete()
+                        if hasattr(active_art_item["panel"], "_debug_entry") and active_art_item["panel"]._debug_entry in debug_log:
+                            debug_log.remove(active_art_item["panel"]._debug_entry)
                     except Exception:
                         pass
+                else:
+                    # Suppress duplicate completion panels if already processed for this artifact version in this turn
+                    end_sig = (title, version, is_patch, success, session.current_round)
+                    if getattr(session, "_last_rendered_artefact_end", None) == end_sig:
+                        continue
+                    session._last_rendered_artefact_end = end_sig
 
                 meta_details = []
                 if version: meta_details.append(f"v{version}")
@@ -1782,6 +1980,14 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
 
         if cmd == "/help":
             add_system_notice(HELP_TEXT)
+            return True
+
+        if cmd in ("/plan", "/current", "/current-plan"):
+            open_current_plan_dialog()
+            return True
+
+        if cmd in ("/scratchpad", "/scratch"):
+            open_scratchpad_dialog()
             return True
 
         if cmd == "/config":

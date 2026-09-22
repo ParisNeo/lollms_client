@@ -31,10 +31,11 @@ class LCPBinding(LollmsToolBinding):
 
     def __init__(self, host_tool_configs: Optional[Dict[str, Dict[str, Any]]] = None, **kwargs: Any):
         super().__init__(binding_name="LCP")
-        
+
         # Host-provided configurations for tools (e.g., {"system_shell": {"autonomy_level": "safe"}})
         self.host_tool_configs: Dict[str, Dict[str, Any]] = host_tool_configs or {}
-        
+        self.confirm_handler: Optional[Callable] = kwargs.get("confirm_handler")
+
         # Resolve Direct Tool Files (must resolve first: explicit tool_files implies an empty folder scan)
         self.tool_files: List[Path] = []
         files_input = kwargs.get("tool_files")
@@ -435,10 +436,35 @@ class LCPBinding(LollmsToolBinding):
             if py_file and py_file.exists() and py_file.suffix == ".py":
                 self._load_tool_file(py_file)
 
+    def set_confirm_handler(self, handler: Optional[Callable]) -> None:
+        """Registers a confirmation callback on LCPBinding and propagates it to all loaded tool modules."""
+        self.confirm_handler = handler
+        for lib_cfg in self.host_tool_configs.values():
+            if isinstance(lib_cfg, dict):
+                lib_cfg["confirm_handler"] = handler
+        for mod_name, mod in list(sys.modules.items()):
+            if mod_name.startswith("lollms_client.tools_bindings.lcp.persistent_"):
+                if hasattr(mod, "set_confirm_handler") and callable(mod.set_confirm_handler):
+                    try:
+                        mod.set_confirm_handler(handler)
+                    except Exception:
+                        pass
+                elif hasattr(mod, "_CONFIRM_HANDLER"):
+                    try:
+                        mod._CONFIRM_HANDLER = handler
+                    except Exception:
+                        pass
+
     def _get_or_load_tool_module(self, python_file_path: Path) -> Optional[types.ModuleType]:
         module_name = f"lollms_client.tools_bindings.lcp.persistent_{python_file_path.stem}"
         if module_name in sys.modules:
-            return sys.modules[module_name]
+            tool_mod = sys.modules[module_name]
+            if self.confirm_handler and hasattr(tool_mod, "set_confirm_handler") and callable(tool_mod.set_confirm_handler):
+                try:
+                    tool_mod.set_confirm_handler(self.confirm_handler)
+                except Exception:
+                    pass
+            return tool_mod
 
         try:
             spec = importlib.util.spec_from_file_location(module_name, str(python_file_path.resolve()))
@@ -449,10 +475,19 @@ class LCPBinding(LollmsToolBinding):
             sys.modules[module_name] = tool_module
             spec.loader.exec_module(tool_module)
 
-            # ── 🛡️ HOST CONFIGURATION INJECTION ──
+            # ── 🛡️ HOST CONFIGURATION & CONFIRMATION INJECTION ──
+            library_name = python_file_path.stem
+            host_config = self.host_tool_configs.get(library_name, {})
+            if self.confirm_handler and "confirm_handler" not in host_config:
+                host_config["confirm_handler"] = self.confirm_handler
+
+            if hasattr(tool_module, "set_confirm_handler") and callable(tool_module.set_confirm_handler):
+                try:
+                    tool_module.set_confirm_handler(host_config.get("confirm_handler", self.confirm_handler))
+                except Exception:
+                    pass
+
             if hasattr(tool_module, "init_tools_library") and callable(tool_module.init_tools_library):
-                library_name = python_file_path.stem
-                host_config = self.host_tool_configs.get(library_name, {})
 
                 import inspect as _lcp_inspect
                 _init_sig = _lcp_inspect.signature(tool_module.init_tools_library)

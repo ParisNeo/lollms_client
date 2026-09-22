@@ -460,6 +460,27 @@ Factory to construct a personality from a Handbag folder.
 - **`path`**: Path to the Handbag directory.
 - **Returns**: A configured `LollmsPersonality` instance with lazily instantiated stateful components.
 
+#### `list_tools_structured() -> List[Dict[str, Any]]`
+Returns a structured list of all tools registered with this personality, categorized by provenance:
+- **`name`**: Function identifier (e.g. `tool_execute_python_code`)
+- **`description`**: Tool documentation
+- **`parameters`**: Parameter schemas
+- **`is_handbag`**: Boolean (`True` if originating from the active Handbag)
+- **`source`**: Category (`"handbag"`, `"execute_python"`, `"system_shell"`, `"multimodal_binding"`, `"git_manager"`, `"workspace_tools"`, `"skills_manager"`, `"sub_agent"`, etc.)
+- **`source_file`**: Path to backing `.py` file if known.
+
+#### `list_skills_structured(include_content: bool = False) -> List[Dict[str, Any]]`
+Returns a structured list of all skills registered with this personality, distinguishing native Handbag skills from workspace and global skills:
+- **`title`**: Skill name
+- **`description`**: One-sentence summary
+- **`category`**: Domain grouping
+- **`tags`**: Keyword tags
+- **`visibility`**: Visibility tier (`"visible"`, `"loadable"`, `"searchable"`)
+- **`modifiable`**: Boolean (`False` for read-only skills)
+- **`is_handbag`**: Boolean (`True` if the skill is native to the loaded Handbag)
+- **`source`**: Provenance string (`"handbag"`, `"workspace"`, `"global"`, `"bundled"`, `"custom"`)
+- **`handbag_name`**: Name of the parent handbag folder.
+
 #### `__init__(...)`
 - **`name`**: Display name of the agent.
 - **`author`**: Creator string.
