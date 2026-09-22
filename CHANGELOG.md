@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-22 01:58]
+
+- fix(doc): update description.yaml and __init__.py for Novita AI client bindings
+
 ## [2026-09-21 19:17]
 
 - fix(editor:): restructured CLI and GUI initialization to enforce strict task macro-level requirements and minor refactoring in chat_page

@@ -26,21 +26,24 @@ FAMILY_MING = "ming"
 NOVITA_AI_MODELS = [
     {
         "model_name": "qwen-image",
-        "display_name": "Qwen-Image",
-        "description": "20B MMDiT next-gen text-to-image model. Excellent at graphic posters with native text rendering.",
+        "display_name": "Qwen-Image (Generation & Editing)",
+        "description": "20B MMDiT model bundling text-to-image generation and prompt-based image editing. The appropriate Novita API is selected automatically: generation calls use the Qwen-Image txt2img task, editing calls with input images use the Qwen-Image Edit task.",
         "family": FAMILY_QWEN,
+        "capabilities": ["generation", "editing"],
     },
     {
         "model_name": "ming-image-0.1-design",
         "display_name": "Ming Image 0.1 Design",
         "description": "Ming Image text-to-image generation using the OpenAI image generations protocol.",
         "family": FAMILY_MING,
+        "capabilities": ["generation"],
     },
     {
         "model_name": "ming-image-0.1-design-layer",
         "display_name": "Ming Image 0.1 Design (Layer Decoupling)",
         "description": "Splits an input image into decoupled layers (foreground/background) using the OpenAI image edits protocol.",
         "family": FAMILY_MING,
+        "capabilities": ["editing"],
     },
 ]
 
@@ -73,7 +76,7 @@ class NovitaAITTIBinding(LollmsTTIBinding):
         self.headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "LoLLMS-Client/3.1",
+            "User-Agent": "LoLLMS-Client/3.2",
         }
         if self.api_key:
             self.headers["Authorization"] = f"Bearer {self.api_key}"
@@ -284,6 +287,23 @@ class NovitaAITTIBinding(LollmsTTIBinding):
             raise RuntimeError(f"Novita.ai did not return a task_id for Qwen-Image. Response: {data}")
         return self._poll_task_result(task_id, timeout=kwargs.get("timeout", 300))
 
+    def _qwen_edit_endpoints(self) -> List[str]:
+        model_slug = self._clean_model_name(self.model_name)
+        candidates = [
+            "qwen-image-edit",
+            "qwen-image-edit-2509",
+            "qwen-image-edit-img2img",
+            "qwen-image-img2img",
+            "qwen-image-image-to-image",
+        ]
+        if model_slug not in candidates:
+            candidates.append(model_slug)
+        endpoints: List[str] = []
+        for candidate in candidates:
+            endpoints.append(f"{self.base_url}/async/{candidate}")
+            endpoints.append(f"{NOVITA_DEFAULT_HOST}/v3/async/{candidate}")
+        return endpoints
+
     def _edit_qwen_image(self, image_bytes: bytes, prompt: str, **kwargs) -> bytes:
         payload = {
             "prompt": prompt,
@@ -291,11 +311,7 @@ class NovitaAITTIBinding(LollmsTTIBinding):
             "seed": int(kwargs.get("seed", -1)),
             "output_format": kwargs.get("output_format", "jpeg"),
         }
-        endpoints = [
-            f"{self.base_url}/async/qwen-image-img2img",
-            f"{NOVITA_DEFAULT_HOST}/v3/async/qwen-image-img2img",
-            f"{self.base_url}/async/qwen-image-image-edit",
-        ]
+        endpoints = self._qwen_edit_endpoints()
         data = self._post_with_fallback(endpoints, payload)
         task_id = self._extract_task_id(data)
         if not task_id:
@@ -303,8 +319,18 @@ class NovitaAITTIBinding(LollmsTTIBinding):
         return self._poll_task_result(task_id, timeout=kwargs.get("timeout", 300))
 
     # ------------------------------------------------------------------
-    # Ming-Image (v1 OpenAI-compatible protocol)
+    # Ming-Image (OpenAI-compatible image protocol)
     # ------------------------------------------------------------------
+
+    def _ming_image_endpoints(self, action: str) -> List[str]:
+        api_root = self.v1_base_url[: -len("/v1")]
+        endpoints: List[str] = []
+        for root in (api_root, NOVITA_DEFAULT_HOST):
+            endpoints.append(f"{root}/v1/images/{action}")
+            endpoints.append(f"{root}/v3/openai/images/{action}")
+            endpoints.append(f"{root}/v3/images/{action}")
+            endpoints.append(f"{root}/openapi/v1/images/{action}")
+        return endpoints
 
     def _generate_ming_image(self, prompt: str, width: int, height: int, **kwargs) -> bytes:
         payload = {
@@ -315,12 +341,11 @@ class NovitaAITTIBinding(LollmsTTIBinding):
             "size": self._format_ming_size(width, height, **kwargs),
             "watermark": bool(kwargs.get("watermark", False)),
         }
-        response = requests.post(f"{self.v1_base_url}/images/generations", json=payload, headers=self.headers, timeout=180)
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"Novita.ai Ming-Image generation failed: HTTP {response.status_code}: {response.text[:300]}"
-            )
-        data = response.json()
+        data = self._post_with_fallback(
+            self._ming_image_endpoints("generations"),
+            payload,
+            request_timeout=float(kwargs.get("timeout", 300)),
+        )
         for item in data.get("data") or []:
             if not isinstance(item, dict):
                 continue
@@ -350,22 +375,12 @@ class NovitaAITTIBinding(LollmsTTIBinding):
             "size": self._format_ming_size(width, height, **kwargs),
             "watermark": "true" if kwargs.get("watermark") else "false",
         }
-        headers = {"Accept": "application/json"}
-        authorization = self.headers.get("Authorization")
-        if authorization:
-            headers["Authorization"] = authorization
-        response = requests.post(
-            f"{self.v1_base_url}/images/edits",
-            data=form_fields,
+        data = self._post_with_fallback(
+            self._ming_image_endpoints("edits"),
+            form_fields,
+            request_timeout=float(kwargs.get("timeout", 300)),
             files={"image[]": ("input.png", image_bytes, "image/png")},
-            headers=headers,
-            timeout=300,
         )
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"Novita.ai Ming layer decoupling failed: HTTP {response.status_code}: {response.text[:300]}"
-            )
-        data = response.json()
         layers: List[bytes] = []
         layer_structure: Optional[str] = None
         for item in data.get("data") or []:
@@ -454,7 +469,19 @@ class NovitaAITTIBinding(LollmsTTIBinding):
             return base64.b64decode(first_image)
         return None
 
-    def _post_with_fallback(self, path_variants: List[str], payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _post_with_fallback(
+        self,
+        path_variants: List[str],
+        payload: Dict[str, Any],
+        request_timeout: float = 60.0,
+        files: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        request_headers = self.headers
+        if files is not None:
+            request_headers = {"Accept": "application/json"}
+            authorization = self.headers.get("Authorization")
+            if authorization:
+                request_headers["Authorization"] = authorization
         unique_urls: List[str] = []
         for variant in path_variants:
             if variant.startswith("http://") or variant.startswith("https://"):
@@ -467,7 +494,10 @@ class NovitaAITTIBinding(LollmsTTIBinding):
         for url in unique_urls:
             try:
                 ASCIIColors.info(f"[{self.binding_name}] Requesting {url}...")
-                response = requests.post(url, json=payload, headers=self.headers, timeout=60)
+                if files is None:
+                    response = requests.post(url, json=payload, headers=request_headers, timeout=request_timeout)
+                else:
+                    response = requests.post(url, data=payload, files=files, headers=request_headers, timeout=request_timeout)
                 if response.status_code == 404:
                     detail = response.text[:300] if response.text else "No response body"
                     ASCIIColors.warning(f"[{self.binding_name}] 404 from {url}: {detail}")
@@ -481,11 +511,16 @@ class NovitaAITTIBinding(LollmsTTIBinding):
                 last_error = http_error
                 if http_error.response is not None and http_error.response.status_code == 404:
                     continue
-                raise
+                body_detail = http_error.response.text[:300] if http_error.response is not None else ""
+                raise RuntimeError(
+                    f"Novita.ai request failed: {http_error}. Body: {body_detail}"
+                ) from http_error
             except Exception as ex:
                 last_error = ex
                 continue
-        raise last_error or RuntimeError("All Novita.ai endpoint variants failed.")
+        raise RuntimeError(
+            f"Novita.ai endpoint not found. Tried routes: {', '.join(unique_urls)}. Last error: {last_error}"
+        ) from last_error
 
     def _poll_task_result(self, task_id: str, timeout: float = 180.0) -> bytes:
         poll_urls = [

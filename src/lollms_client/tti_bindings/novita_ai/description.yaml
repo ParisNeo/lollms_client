@@ -1,14 +1,18 @@
 title: 'Novita.ai TTI'
 author: 'ParisNeo & Lollms'
-version: 3.1.0
+version: 3.2.1
 binding_name: 'novita_ai'
 description: >
   A binding for the Novita.ai image generation and editing APIs.
-  Qwen-Image requests are routed to the asynchronous v3 task pipeline
-  and Ming-Image requests to the OpenAI-compatible v1 image protocol.
-  Novita retired the legacy checkpoint-based txt2img/img2img routes, so
-  generic Stable Diffusion checkpoint names are rejected with an
-  explicit migration error listing the supported foundation models.
+  The qwen-image model bundles text-to-image generation and image
+  editing in a single entry: calls without input images are routed to
+  the asynchronous v3 txt2img task and calls with input images are
+  routed to the Qwen-Image Edit task. Ming-Image requests are routed
+  to the OpenAI-compatible image protocol (probing the documented /v1
+  paths and the /v3/openai paths). Novita retired the legacy
+  checkpoint-based txt2img/img2img routes, so generic Stable Diffusion
+  checkpoint names are rejected with an explicit migration error
+  listing the supported foundation models.
 
 global_input_parameters:
   - name: "api_key"
@@ -26,7 +30,7 @@ model_input_parameters:
   - name: "model_name"
     type: "str"
     default: "qwen-image"
-    description: "The Novita.ai foundation model to use. Legacy Stable Diffusion checkpoints are no longer served by the Novita API."
+    description: "The Novita.ai foundation model to use. 'qwen-image' bundles generation and editing: the appropriate API is picked automatically based on whether input images are provided. Legacy Stable Diffusion checkpoints are no longer served by the Novita API."
     options:
       - "qwen-image"
       - "ming-image-0.1-design"
