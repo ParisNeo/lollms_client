@@ -133,7 +133,9 @@ def ensure_sandbox_structure(prefs: GuiPrefs) -> None:
     scripts_dir = sandbox_dir / "scripts"
     scratchpad = sandbox_dir / "scratchpad.md"
     current_plan = sandbox_dir / "CURRENT.md"
+    sub_ws_dir = sandbox_dir / "sub_workspace"
     sandbox_dir.mkdir(parents=True, exist_ok=True)
+    sub_ws_dir.mkdir(parents=True, exist_ok=True)
     if scripts_dir.exists():
         for f in scripts_dir.glob("*"):
             if f.is_file():
@@ -277,6 +279,15 @@ def create_personality(prefs: GuiPrefs, client):
     # Grant autonomous workspace authority for coding tasks (exempt from git prompt blocks)
     object.__setattr__(personality, "_git_autonomy_granted", True)
 
+    # ── Ensure Artefact System is initialized and synced with disk ──
+    try:
+        if hasattr(personality, "_init_artefact_system"):
+            personality._init_artefact_system()
+        if hasattr(personality, "_sync_artefact_index_with_disk"):
+            personality._sync_artefact_index_with_disk()
+    except Exception:
+        pass
+
     # ── Project-Local Memory Setup (matching CLI) ──
     if prefs.enable_memory:
         try:
@@ -293,6 +304,18 @@ def create_personality(prefs: GuiPrefs, client):
 
     if CODING_EXECUTION_HARNESS and "## MACRO STEPS PLANNING (CURRENT.md)" not in personality.system_prompt:
         personality.system_prompt += "\n\n" + CODING_EXECUTION_HARNESS
+
+    sub_ws_instructions = (
+        "\n\n=== SUB-WORKSPACE (REFERENCE & DOCUMENTATION) ===\n"
+        "You have access to a reference sub-workspace stored in `.lollms_code/sub_workspace/`.\n"
+        "This area holds external documentation, reference code, specifications, or datasets that do not belong to the project codebase itself.\n"
+        "- Reference files are listed in your prompt under `=== SUB-WORKSPACE (REFERENCE & DOCUMENTATION) ===`.\n"
+        "- To load a reference file into your context, use `<unlock_file>sub_workspace/filename.ext</unlock_file>`.\n"
+        "- To unload when done, use `<lock_file>sub_workspace/filename.ext</lock_file>`.\n"
+        "- You can read and reference these files, but NEVER modify them unless explicitly instructed.\n"
+    )
+    if "=== SUB-WORKSPACE (REFERENCE & DOCUMENTATION) ===" not in personality.system_prompt:
+        personality.system_prompt += sub_ws_instructions
 
     # ── Universal Skills Discovery (Bundled + Global + Handbag) ──
     collected_skill_dirs = []
@@ -344,6 +367,11 @@ def get_workspace_stats(personality) -> Dict[str, Any]:
     """Same logic as the CLI's get_workspace_stats() — indexed/loaded file
     counts and sizes, used by the /files command."""
     stats: Dict[str, Any] = {"total_indexed": 0, "total_loaded": 0, "loaded_files": []}
+    if personality is None:
+        return stats
+    if not hasattr(personality, "_artefact_manager") or not personality._artefact_manager:
+        if hasattr(personality, "_init_artefact_system") and getattr(personality, "_resolved_workspace", None):
+            personality._init_artefact_system()
     if not hasattr(personality, "_artefact_manager") or not personality._artefact_manager:
         return stats
     try:
@@ -376,7 +404,11 @@ def change_file_visibility(personality, targets: list, action: str) -> Dict[str,
     """Wraps personality.change_file_visibility(), same as the CLI's
     /load, /unload, /lock, /hide, /unhide commands. `action` is one of
     'load', 'unload', 'lock', 'hide', 'unhide'."""
-    result = personality.change_file_visibility(targets, action)
+    if personality is not None:
+        if not hasattr(personality, "_artefact_manager") or not personality._artefact_manager:
+            if hasattr(personality, "_init_artefact_system") and getattr(personality, "_resolved_workspace", None):
+                personality._init_artefact_system()
+    result = personality.change_file_visibility(targets, action) if personality else {"status_str": "Personality not ready."}
     try:
         object.__setattr__(personality, "_last_ws_sync_time", 0.0)
     except Exception:
@@ -387,6 +419,10 @@ def change_file_visibility(personality, targets: list, action: str) -> Dict[str,
 def clear_all_loaded_files(personality) -> Dict[str, Any]:
     """Same as the CLI's /clear-files: unloads every currently [C]-loaded
     file from context in one shot."""
+    if personality is not None:
+        if not hasattr(personality, "_artefact_manager") or not personality._artefact_manager:
+            if hasattr(personality, "_init_artefact_system") and getattr(personality, "_resolved_workspace", None):
+                personality._init_artefact_system()
     if not hasattr(personality, "_artefact_manager") or not personality._artefact_manager:
         return {"status_str": "Artefact system not initialized."}
     from lollms_client.lollms_artefact import ArtefactVisibility

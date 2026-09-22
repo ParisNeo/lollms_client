@@ -65,6 +65,8 @@ SLASH_COMMANDS = [
     ("/plan", "View and edit active macro plan (CURRENT.md)"),
     ("/current", "View active macro plan (CURRENT.md)"),
     ("/scratchpad", "View and edit agent scratchpad notes"),
+    ("/subws", "Open Sub-Workspace Manager (Documentation & Reference files)"),
+    ("/reference", "Open Sub-Workspace Manager (Documentation & Reference files)"),
     ("/history", "Browse and resend prompt history"),
     ("/clear-history", "Clear the conversation"),
     ("/clear-files", "Unload all files from context"),
@@ -399,6 +401,10 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     on_click=lambda: open_memory_explorer_dialog(session, prefs) if open_memory_explorer_dialog else ui.notify("Memory Explorer not available", type="warning"),
                 ).props("flat dense size=sm no-caps text-color=purple").tooltip("Open Memory Explorer (inspect, edit, dream)")
                 ui.button(
+                    "Reference", icon="auto_stories",
+                    on_click=lambda: open_sub_workspace_dialog(),
+                ).props("flat dense size=sm no-caps text-color=emerald font-semibold").tooltip("Open Sub-Workspace (Documentation & Reference files in .lollms_code/sub_workspace)")
+                ui.button(
                     "Plan", icon="checklist",
                     on_click=lambda: open_current_plan_dialog(),
                 ).props("flat dense size=sm no-caps text-color=primary font-semibold").tooltip("View and edit the active task roadmap (.lollms_code/CURRENT.md)")
@@ -439,24 +445,105 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 f"w-72 h-full shrink-0 border-r {BORDER} {SURFACE_ALT} overflow-hidden flex flex-col p-0 gap-0"
             )
             with tree_panel:
-                with ui.row().classes(f"w-full items-center justify-between px-3 py-2 border-b {BORDER} shrink-0"):
-                    ui.label("📁 Workspace").classes(f"text-xs font-bold {STRONG}")
-                    with ui.row().classes("gap-1"):
-                        ui.button(icon="upload_file", on_click=lambda: upload_dialog.open()).props(
-                            "flat round dense size=xs"
-                        ).tooltip("Upload a file into the workspace root")
-                        ui.button(icon="refresh", on_click=lambda: refresh_workspace_tree()).props(
-                            "flat round dense size=xs"
-                        ).tooltip("Refresh tree")
+                with ui.tabs().classes(f"w-full {SURFACE} border-b {BORDER} shrink-0").props('dense no-caps active-color="primary" indicator-color="primary"') as sidebar_tabs:
+                    tab_ws = ui.tab('workspace', label='Workspace', icon='folder').classes('text-xs py-1.5 flex-1')
+                    with ui.tab('subws', label='Sub-WS', icon='auto_stories').classes('text-xs py-1.5 flex-1') as tab_subws:
+                        subws_tab_badge = ui.badge("0", color="emerald").props("floating dense").classes("text-[9px]")
+                        subws_tab_badge.visible = False
 
-                with ui.row().classes("w-full px-2 pt-2 shrink-0"):
-                    tree_search_input = ui.input(placeholder="Filter files…").props(
-                        ':dark="Quasar.Dark.isActive" dense outlined clearable'
-                    ).classes("w-full bg-slate-50 dark:bg-slate-900 text-xs text-slate-900 dark:text-slate-100")
+                with ui.tab_panels(sidebar_tabs, value='workspace').classes('w-full flex-1 min-h-0 p-0 bg-transparent flex flex-col overflow-hidden'):
+                    # --- Tab 1: Project Workspace Tree ---
+                    with ui.tab_panel('workspace').classes('w-full h-full p-0 flex flex-col overflow-hidden gap-0'):
+                        with ui.row().classes(f"w-full items-center justify-between px-3 py-2 border-b {BORDER} shrink-0"):
+                            ui.label("📁 Project Root").classes(f"text-xs font-bold {STRONG}")
+                            with ui.row().classes("gap-1"):
+                                ui.button(icon="upload_file", on_click=lambda: upload_dialog.open()).props(
+                                    "flat round dense size=xs"
+                                ).tooltip("Upload a file into the workspace root")
+                                ui.button(icon="refresh", on_click=lambda: refresh_workspace_tree()).props(
+                                    "flat round dense size=xs"
+                                ).tooltip("Refresh workspace tree")
 
-                tree_scroll = ui.scroll_area().classes("w-full flex-1 p-2")
-                with tree_scroll:
-                    tree_container = ui.column().classes("w-full gap-0 p-0")
+                        with ui.row().classes("w-full px-2 pt-2 shrink-0"):
+                            tree_search_input = ui.input(placeholder="Filter files…").props(
+                                ':dark="Quasar.Dark.isActive" dense outlined clearable'
+                            ).classes("w-full bg-slate-50 dark:bg-slate-900 text-xs text-slate-900 dark:text-slate-100")
+
+                        tree_scroll = ui.scroll_area().classes("w-full flex-1 p-2")
+                        with tree_scroll:
+                            tree_container = ui.column().classes("w-full gap-0 p-0")
+
+                    # --- Tab 2: Sub-Workspace Reference Tree (.lollms_code/sub_workspace/) ---
+                    with ui.tab_panel('subws').classes('w-full h-full p-0 flex flex-col overflow-hidden gap-0'):
+                        with ui.row().classes(f"w-full items-center justify-between px-3 py-2 border-b {BORDER} shrink-0"):
+                            ui.label("📚 Sub-Workspace").classes(f"text-xs font-bold {STRONG}")
+                            with ui.row().classes("gap-0.5"):
+                                async def _import_subws_file_sidebar():
+                                    _picker = pick_folder
+                                    if _picker:
+                                        chosen = await _picker(title="Select File to Import into Sub-Workspace")
+                                        if chosen:
+                                            try:
+                                                from lollms_client.apps.lollms_code.sub_workspace import SubWorkspaceManager
+                                                sub_ws = SubWorkspaceManager(prefs.workspace_path)
+                                                dest = sub_ws.import_file(chosen)
+                                                ui.notify(f"Imported reference: {dest.name}", type="positive")
+                                                refresh_subws_tree()
+                                            except Exception as ex:
+                                                notify_error(f"Import failed: {ex}")
+
+                                async def _import_subws_folder_sidebar():
+                                    _picker = pick_folder
+                                    if _picker:
+                                        chosen = await _picker(title="Select Folder to Import into Sub-Workspace")
+                                        if chosen:
+                                            try:
+                                                from lollms_client.apps.lollms_code.sub_workspace import SubWorkspaceManager
+                                                sub_ws = SubWorkspaceManager(prefs.workspace_path)
+                                                imported = sub_ws.import_folder(chosen)
+                                                ui.notify(f"Imported {len(imported)} reference files.", type="positive")
+                                                refresh_subws_tree()
+                                            except Exception as ex:
+                                                notify_error(f"Import folder failed: {ex}")
+
+                                def _load_all_subws_sidebar():
+                                    from lollms_client.apps.lollms_code.sub_workspace import SubWorkspaceManager
+                                    sub_ws = SubWorkspaceManager(prefs.workspace_path)
+                                    cnt = sub_ws.load_all()
+                                    ui.notify(f"Loaded all {cnt} reference file(s) [C]", type="positive")
+                                    refresh_subws_tree()
+
+                                def _unload_all_subws_sidebar():
+                                    from lollms_client.apps.lollms_code.sub_workspace import SubWorkspaceManager
+                                    sub_ws = SubWorkspaceManager(prefs.workspace_path)
+                                    sub_ws.unload_all()
+                                    ui.notify("Unloaded all reference files [U]", type="info")
+                                    refresh_subws_tree()
+
+                                ui.button(icon="upload_file", on_click=_import_subws_file_sidebar).props(
+                                    "flat round dense size=xs"
+                                ).tooltip("Import reference file into .lollms_code/sub_workspace")
+                                ui.button(icon="drive_folder_upload", on_click=_import_subws_folder_sidebar).props(
+                                    "flat round dense size=xs"
+                                ).tooltip("Import external folder into sub-workspace")
+                                ui.button(icon="download", on_click=_load_all_subws_sidebar).props(
+                                    "flat round dense size=xs color=emerald"
+                                ).tooltip("Load all reference files into context [C]")
+                                ui.button(icon="clear_all", on_click=_unload_all_subws_sidebar).props(
+                                    "flat round dense size=xs color=amber"
+                                ).tooltip("Unload all reference files from context [U]")
+                                ui.button(icon="refresh", on_click=lambda: refresh_subws_tree()).props(
+                                    "flat round dense size=xs"
+                                ).tooltip("Refresh sub-workspace tree")
+
+                        with ui.row().classes("w-full px-2 pt-2 shrink-0"):
+                            subws_tree_search_input = ui.input(placeholder="Filter reference files…").props(
+                                ':dark="Quasar.Dark.isActive" dense outlined clearable'
+                            ).classes("w-full bg-slate-50 dark:bg-slate-900 text-xs text-slate-900 dark:text-slate-100")
+
+                        subws_tree_scroll = ui.scroll_area().classes("w-full flex-1 p-2")
+                        with subws_tree_scroll:
+                            subws_tree_container = ui.column().classes("w-full gap-0 p-0")
 
             # ---- Transcript ----
             scroll_area = ui.scroll_area().classes(f"flex-1 h-full min-w-0 {CANVAS}")
@@ -1984,6 +2071,10 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
             open_current_plan_dialog()
             return True
 
+        if cmd in ("/subws", "/reference", "/sub-workspace", "/ref"):
+            open_sub_workspace_dialog()
+            return True
+
         if cmd in ("/scratchpad", "/scratch"):
             open_scratchpad_dialog()
             return True
@@ -2405,23 +2496,28 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
     # ---- filesystem / OS actions ----
 
     def open_in_default_editor(abs_path: str):
-        """Hands the file to the OS default application (double-click action).
-        Local-desktop only: this runs on the machine hosting the server."""
+        """Opens the file in its native software using the OS default application."""
         import os
         import subprocess
         import sys
         try:
-            p = Path(abs_path)
+            p = Path(abs_path).resolve()
             if not p.exists():
-                ui.notify(f"No longer on disk: {p.name}", type="warning")
+                ui.notify(f"File not found on disk: {p.name}", type="warning")
                 return
             if sys.platform.startswith("win"):
-                os.startfile(str(p))  # type: ignore[attr-defined]
+                try:
+                    os.startfile(str(p))  # type: ignore[attr-defined]
+                except OSError:
+                    try:
+                        subprocess.Popen(["cmd.exe", "/c", "start", "", str(p)], shell=True)
+                    except Exception:
+                        subprocess.Popen(["notepad.exe", str(p)])
             elif sys.platform == "darwin":
                 subprocess.Popen(["open", str(p)])
             else:
                 subprocess.Popen(["xdg-open", str(p)])
-            ui.notify(f"Opening {p.name}…", type="info")
+            ui.notify(f"Opening {p.name} in native software…", type="info", timeout=2000)
         except Exception as e:
             notify_error(f"Could not open {abs_path}: {e}")
 
@@ -2495,7 +2591,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
 
     def _insert_into_prompt(rel: str):
         current_val = prompt_input.value or ""
-        prompt_input.value = f"{current_val.rstrip()} {rel} " if current_val else f"/load {rel}"
+        prompt_input.value = f"{current_val.rstrip()} {rel} " if current_val else f"{rel} "
         prompt_input.run_method("focus")
 
     def _copy_text(text: str, what: str = "Path"):
@@ -2539,26 +2635,26 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                         files = await _collect_files_under(r)
                         _visibility_action(files, "unload")
 
-                    ui.menu_item("📥 Load all files in folder", _load_folder)
-                    ui.menu_item("📤 Unload all files in folder", _unload_folder)
+                    ui.menu_item("📥 Load all files into context [C]", _load_folder)
+                    ui.menu_item("📤 Unload all files from context [U]", _unload_folder)
                     ui.separator()
                     ui.menu_item("🙈 Hide from tree", lambda r=rel: _visibility_action([r], "hide"))
                     ui.menu_item("👁️ Unhide", lambda r=rel: _visibility_action([r], "unhide"))
                     ui.separator()
-                    ui.menu_item("📂 Open folder", lambda p=abs_path: open_in_default_editor(p))
+                    ui.menu_item("📂 Open folder in native software", lambda p=abs_path: open_in_default_editor(p))
                     ui.menu_item("🗂️ Switch workspace here",
                                  lambda p=abs_path: _switch_workspace_from_tree(p))
                 else:
                     if is_loaded:
-                        ui.menu_item("📤 Remove from context",
+                        ui.menu_item("📤 Unload from context [U]",
                                      lambda r=rel: _visibility_action([r], "unload"))
                     else:
-                        ui.menu_item("📥 Add to context",
+                        ui.menu_item("📥 Load into context [C]",
                                      lambda r=rel: _visibility_action([r], "load"))
-                    ui.menu_item("🔒 Add & lock (agent can't unload)",
+                    ui.menu_item("🔒 Lock in tree [L] (agent can't unload)",
                                  lambda r=rel: _visibility_action([r], "lock"))
                     ui.separator()
-                    ui.menu_item("✏️ Open in default editor",
+                    ui.menu_item("✏️ Open in native software",
                                  lambda p=abs_path: open_in_default_editor(p))
                     ui.menu_item("📁 Reveal in file manager",
                                  lambda p=abs_path: reveal_in_file_manager(p))
@@ -2637,12 +2733,10 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         if not is_dir:
             label.tooltip(f"{rel}\n{_file_meta(node['path'])}")
 
-        # Single click: folders expand/collapse, files get mentioned in the prompt.
+        # Double click: open in native software. Single click on folder: expand/collapse.
         if is_dir:
             row.on("click", lambda r=rel: _toggle_dir(r))
         else:
-            row.on("click", lambda r=rel: _insert_into_prompt(r))
-            # Double click: hand off to the OS default application.
             row.on("dblclick", lambda p=node["path"]: open_in_default_editor(p))
 
         _attach_context_menu(row, node, is_loaded)
@@ -2751,7 +2845,6 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         if node["is_dir"]:
             row.on("click", lambda r=node["rel"]: _reveal_path_in_tree(r))
         else:
-            row.on("click", lambda r=node["rel"]: _insert_into_prompt(r))
             row.on("dblclick", lambda p=node["path"]: open_in_default_editor(p))
         _attach_context_menu(row, node, is_loaded)
 
@@ -2790,14 +2883,418 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
             _paint_tree()
 
         ui.timer(0.01, _load_root, once=True)
+        try:
+            refresh_subws_tree()
+        except Exception:
+            pass
 
     def apply_tree_filter():
         _paint_tree()
 
     tree_search_input.on_value_change(lambda e: apply_tree_filter())
 
+    # ---- Sub-Workspace Interactive Dialog ----------------
+    def open_sub_workspace_dialog():
+        from lollms_client.apps.lollms_code.sub_workspace import SubWorkspaceManager
+        sub_ws = SubWorkspaceManager(prefs.workspace_path)
+
+        dialog = ui.dialog()
+        with dialog, ui.card().classes(
+            f"w-[880px] max-w-[95vw] h-[640px] max-h-[92vh] flex flex-col p-4 gap-3 "
+            f"{CANVAS} text-slate-900 dark:text-slate-100 rounded-xl shadow-2xl border {BORDER}"
+        ):
+            with ui.row().classes(f"w-full items-center justify-between pb-2 border-b {BORDER}"):
+                with ui.row().classes("items-center gap-2.5"):
+                    ui.icon("auto_stories", size="26px").classes("text-emerald-500")
+                    with ui.column().classes("gap-0"):
+                        ui.label("Sub-Workspace Manager").classes("text-base font-bold")
+                        ui.label("Reference documentation and external files in .lollms_code/sub_workspace/").classes(f"text-xs {MUTED_DIM}")
+
+                with ui.row().classes("items-center gap-1.5"):
+                    async def do_import_file():
+                        _picker = pick_folder
+                        if _picker:
+                            chosen = await _picker(title="Select Reference File to Import")
+                            if chosen:
+                                try:
+                                    dest = sub_ws.import_file(chosen)
+                                    ui.notify(f"Imported reference: {dest.name}", type="positive")
+                                    refresh_sub_ws_items()
+                                    refresh_workspace_tree()
+                                except Exception as ex:
+                                    notify_error(f"Import file failed: {ex}")
+
+                    async def do_import_folder():
+                        _picker = pick_folder
+                        if _picker:
+                            chosen = await _picker(title="Select Folder to Import as Reference")
+                            if chosen:
+                                try:
+                                    imported = sub_ws.import_folder(chosen)
+                                    ui.notify(f"Imported {len(imported)} files into sub-workspace.", type="positive")
+                                    refresh_sub_ws_items()
+                                    refresh_workspace_tree()
+                                except Exception as ex:
+                                    notify_error(f"Import folder failed: {ex}")
+
+                    def do_load_all():
+                        cnt = sub_ws.load_all()
+                        ui.notify(f"Loaded all {cnt} reference file(s) into context.", type="positive")
+                        refresh_sub_ws_items()
+                        refresh_workspace_tree()
+
+                    def do_unload_all():
+                        sub_ws.unload_all()
+                        ui.notify("Unloaded all reference files from context.", type="info")
+                        refresh_sub_ws_items()
+                        refresh_workspace_tree()
+
+                    ui.button("Import File", icon="upload_file", on_click=do_import_file).props("unelevated dense size=xs color=primary no-caps")
+                    ui.button("Import Folder", icon="drive_folder_upload", on_click=do_import_folder).props("outline dense size=xs color=primary no-caps")
+                    ui.button("Load All [C]", icon="download", on_click=do_load_all).props("flat dense size=xs color=emerald no-caps")
+                    ui.button("Unload All", icon="clear_all", on_click=do_unload_all).props("flat dense size=xs color=amber no-caps")
+                    ui.button(icon="close", on_click=dialog.close).props("flat round dense size=xs")
+
+            sub_search_input = ui.input(placeholder="Search reference files…").props("dense outlined clearable").classes("w-full text-xs")
+
+            sub_scroll = ui.scroll_area().classes(f"w-full flex-1 border {BORDER} rounded p-2")
+            with sub_scroll:
+                sub_list_container = ui.column().classes("w-full gap-2")
+
+            def refresh_sub_ws_items():
+                sub_list_container.clear()
+                q = (sub_search_input.value or "").strip().lower()
+                files = sub_ws.list_files(q)
+                with sub_list_container:
+                    if not files:
+                        ui.label("No files in sub-workspace yet. Use 'Import File' or 'Import Folder' above.").classes(
+                            f"text-xs {MUTED_DIM} italic p-4 text-center w-full"
+                        )
+                        return
+
+                    for item in files:
+                        rel = item["rel_path"]
+                        is_loaded = item["is_loaded"]
+                        size_str = f"{item['size'] / 1024:.1f} KB"
+                        with ui.card().classes(
+                            f"w-full p-2.5 rounded-lg border {BORDER} {SURFACE} hover:border-emerald-500/50 transition-colors gap-1.5 shadow-none"
+                        ):
+                            with ui.row().classes("w-full items-center justify-between"):
+                                with ui.row().classes("items-center gap-2 flex-1 min-w-0"):
+                                    ui.icon("description", size="18px").classes("text-emerald-500 shrink-0")
+                                    ui.label(rel).classes("text-xs font-mono font-semibold truncate text-slate-900 dark:text-slate-100")
+                                    ui.label(size_str).classes(f"text-[10px] {MUTED_DIM} shrink-0")
+                                    badge_color = "emerald" if is_loaded else "grey"
+                                    ui.badge("[C] LOADED" if is_loaded else "[U] UNLOADED", color=badge_color).props("dense rounded").classes("text-[10px]")
+
+                                with ui.row().classes("items-center gap-1 shrink-0"):
+                                    def _toggle_load(r=rel, loaded=is_loaded):
+                                        if loaded:
+                                            sub_ws.unload_file(r)
+                                            ui.notify(f"Unloaded {r}", type="info")
+                                        else:
+                                            sub_ws.load_file(r)
+                                            ui.notify(f"Loaded {r} into context [C]", type="positive")
+                                        refresh_sub_ws_items()
+                                        refresh_workspace_tree()
+
+                                    def _peek(r=rel):
+                                        content = sub_ws.peek_file(r)
+                                        peek_dlg = ui.dialog()
+                                        with peek_dlg, ui.card().classes(f"w-[760px] max-w-[95vw] h-[550px] flex flex-col p-4 {CANVAS} text-slate-900 dark:text-slate-100 rounded-xl border {BORDER}"):
+                                            with ui.row().classes(f"w-full items-center justify-between pb-2 border-b {BORDER}"):
+                                                ui.label(f"👁️ Peek: sub_workspace/{r}").classes("text-sm font-bold font-mono")
+                                                ui.button(icon="close", on_click=peek_dlg.close).props("flat round dense size=xs")
+                                            with ui.scroll_area().classes(f"w-full flex-1 border {BORDER} rounded p-2 bg-slate-900 dark:bg-slate-950"):
+                                                ui.code(content, language="markdown" if r.endswith(".md") else "text").classes("w-full text-xs")
+                                        peek_dlg.open()
+
+                                    def _delete_ref(r=rel):
+                                        sub_ws.remove_path(r)
+                                        ui.notify(f"Removed {r}", type="info")
+                                        refresh_sub_ws_items()
+                                        refresh_workspace_tree()
+
+                                    ui.button("Unload" if is_loaded else "Load", icon="remove_circle_outline" if is_loaded else "check_circle_outline", on_click=_toggle_load).props(
+                                        f"flat dense size=xs no-caps color={'amber' if is_loaded else 'emerald'}"
+                                    )
+                                    ui.button("Peek", icon="visibility", on_click=_peek).props("flat dense size=xs no-caps color=primary")
+                                    ui.button(icon="delete", on_click=_delete_ref).props("flat dense round size=xs color=red")
+
+            sub_search_input.on_value_change(lambda _: refresh_sub_ws_items())
+            refresh_sub_ws_items()
+
+        dialog.open()
+
+    # ── Sub-Workspace Tree Management ──────────────────────
+    subws_children: Dict[str, list] = {}
+    subws_expanded: set = set()
+    subws_loading: set = set()
+
+    def _scan_subws_dir_sync(folder_str: str, root_str: str) -> list:
+        import os
+        root = Path(root_str)
+        nodes = []
+        if not os.path.exists(folder_str):
+            return []
+        try:
+            with os.scandir(folder_str) as it:
+                entries = sorted(it, key=lambda e: (not e.is_dir(follow_symlinks=False), e.name.lower()))
+        except Exception as e:
+            return [{"rel": "__err__", "name": f"(cannot read folder: {e})", "path": "", "is_dir": False, "error": True}]
+
+        for entry in entries:
+            try:
+                if entry.is_symlink() or _should_skip(entry.name):
+                    continue
+                is_dir = entry.is_dir(follow_symlinks=False)
+                p = Path(entry.path)
+                rel = str(p.relative_to(root)).replace("\\", "/")
+                nodes.append({"rel": rel, "name": entry.name, "path": str(p), "is_dir": is_dir})
+            except OSError:
+                continue
+        return nodes
+
+    async def _children_of_subws_async(rel: str) -> list:
+        if rel in subws_children:
+            return subws_children[rel]
+        from lollms_client.apps.lollms_code.sub_workspace import SubWorkspaceManager
+        sub_ws = SubWorkspaceManager(prefs.workspace_path)
+        folder = sub_ws.sub_ws_dir if rel == "" else (sub_ws.sub_ws_dir / rel)
+        nodes = await _nicegui_run.io_bound(_scan_subws_dir_sync, str(folder), str(sub_ws.sub_ws_dir))
+        subws_children[rel] = nodes
+        return nodes
+
+    def _children_of_subws_cached(rel: str) -> list:
+        return subws_children.get(rel, [])
+
+    def refresh_subws_tree():
+        subws_children.clear()
+        subws_expanded.clear()
+        from lollms_client.apps.lollms_code.sub_workspace import SubWorkspaceManager
+        sub_ws = SubWorkspaceManager(prefs.workspace_path)
+        files = sub_ws.list_files()
+        loaded_count = sum(1 for f in files if f["is_loaded"])
+        if files:
+            subws_tab_badge.set_text(f"{loaded_count}/{len(files)}")
+            subws_tab_badge.visible = True
+        else:
+            subws_tab_badge.visible = False
+
+        async def _load_subws_root():
+            subws_loading.add("")
+            _paint_subws_tree()
+            try:
+                await _children_of_subws_async("")
+            finally:
+                subws_loading.discard("")
+            _paint_subws_tree()
+
+        ui.timer(0.01, _load_subws_root, once=True)
+
+    def _paint_subws_tree():
+        subws_tree_container.clear()
+        with subws_tree_container:
+            q = (subws_tree_search_input.value or "").lower().strip()
+            if q:
+                _render_subws_search_results(q)
+                return
+            roots = _children_of_subws_cached("")
+            if not roots:
+                ui.label("Loading…" if "" in subws_loading else "(No reference files in .lollms_code/sub_workspace/)").classes(
+                    f"text-xs {MUTED_DIM} p-2 italic"
+                )
+                return
+            _render_subws_nodes(roots, 0)
+
+    def _render_subws_nodes(nodes: list, depth: int):
+        for node in nodes:
+            try:
+                _render_subws_one_node(node, depth)
+            except Exception as e:
+                ui.label(f"⚠ {node.get('name', '?')} ({e})").classes("text-xs text-red-400 pl-2")
+
+    def _render_subws_one_node(node: Dict[str, Any], depth: int):
+        if node.get("error"):
+            ui.label(node["name"]).classes(f"text-xs {MUTED_DIM} pl-2 italic")
+            return
+
+        from lollms_client.apps.lollms_code.sub_workspace import SubWorkspaceManager
+        sub_ws = SubWorkspaceManager(prefs.workspace_path)
+        loaded_set = sub_ws.get_loaded_files()
+
+        rel = node["rel"]
+        is_dir = node["is_dir"]
+        expanded = rel in subws_expanded
+        is_loaded = (not is_dir) and (rel in loaded_set)
+        icon, colour = _icon_for(node["name"], is_dir, expanded)
+
+        row = ui.row().classes(_row_classes(is_loaded)).style(f"padding-left: {6 + depth * 12}px")
+        with row:
+            if is_dir:
+                if rel in subws_loading:
+                    ui.spinner(size="14px").classes("shrink-0")
+                else:
+                    ui.icon("chevron_right" if not expanded else "expand_more").classes(
+                        "text-slate-500 shrink-0"
+                    ).props("size=14px")
+            else:
+                ui.element("div").classes("shrink-0").style("width: 14px")
+            ui.icon(icon).classes(f"{colour} shrink-0").props("size=16px")
+            label = ui.label(node["name"]).classes(
+                "text-xs truncate "
+                + ("font-semibold " if is_loaded else "")
+                + ("text-emerald-700 dark:text-emerald-300" if is_loaded else STRONG)
+            )
+            ui.element("div").classes("flex-1")
+            if is_loaded:
+                ui.icon("task_alt").classes("text-emerald-500 shrink-0").props("size=13px").tooltip(
+                    "Loaded into agent context [C]"
+                )
+
+        if not is_dir:
+            label.tooltip(f"sub_workspace/{rel}\n{_file_meta(node['path'])}")
+
+        if is_dir:
+            row.on("click", lambda r=rel: _toggle_subws_dir(r))
+        else:
+            row.on("dblclick", lambda p=node["path"]: open_in_default_editor(p))
+
+        _attach_subws_context_menu(row, node, is_loaded)
+
+        if is_dir and expanded:
+            _render_subws_nodes(_children_of_subws_cached(rel), depth + 1)
+
+    async def _toggle_subws_dir(rel: str):
+        if rel in subws_expanded:
+            subws_expanded.discard(rel)
+            _paint_subws_tree()
+            return
+        subws_expanded.add(rel)
+        if rel not in subws_children:
+            subws_loading.add(rel)
+            _paint_subws_tree()
+            try:
+                await _children_of_subws_async(rel)
+            finally:
+                subws_loading.discard(rel)
+        _paint_subws_tree()
+
+    def _attach_subws_context_menu(container, node: Dict[str, Any], is_loaded: bool):
+        rel = node["rel"]
+        abs_path = node["path"]
+        from lollms_client.apps.lollms_code.sub_workspace import SubWorkspaceManager
+        sub_ws = SubWorkspaceManager(prefs.workspace_path)
+        with container:
+            with ui.context_menu():
+                if node["is_dir"]:
+                    def _load_subws_folder(r=rel):
+                        target_dir = sub_ws.sub_ws_dir / r
+                        for f in target_dir.rglob("*"):
+                            if f.is_file() and not sub_ws._is_ignored(f):
+                                sub_ws.load_file(str(f.relative_to(sub_ws.sub_ws_dir)).replace("\\", "/"))
+                        ui.notify(f"Loaded folder '{r}' into context [C]", type="positive")
+                        refresh_subws_tree()
+
+                    def _unload_subws_folder(r=rel):
+                        target_dir = sub_ws.sub_ws_dir / r
+                        for f in target_dir.rglob("*"):
+                            if f.is_file() and not sub_ws._is_ignored(f):
+                                sub_ws.unload_file(str(f.relative_to(sub_ws.sub_ws_dir)).replace("\\", "/"))
+                        ui.notify(f"Unloaded folder '{r}' [U]", type="info")
+                        refresh_subws_tree()
+
+                    def _delete_subws_folder(r=rel):
+                        sub_ws.remove_path(r)
+                        ui.notify(f"Removed folder '{r}'", type="info")
+                        refresh_subws_tree()
+
+                    ui.menu_item("📥 Load all files in folder [C]", _load_subws_folder)
+                    ui.menu_item("📤 Unload all files in folder [U]", _unload_subws_folder)
+                    ui.separator()
+                    ui.menu_item("📂 Open folder in native software", lambda p=abs_path: open_in_default_editor(p))
+                    ui.menu_item("📁 Reveal in file manager", lambda p=abs_path: reveal_in_file_manager(p))
+                    ui.separator()
+                    ui.menu_item("🗑️ Delete folder from sub-workspace", _delete_subws_folder)
+                else:
+                    def _toggle_load(r=rel, loaded=is_loaded):
+                        if loaded:
+                            sub_ws.unload_file(r)
+                            ui.notify(f"Unloaded {r} [U]", type="info")
+                        else:
+                            sub_ws.load_file(r)
+                            ui.notify(f"Loaded {r} into context [C]", type="positive")
+                        refresh_subws_tree()
+
+                    def _peek_action(r=rel):
+                        content = sub_ws.peek_file(r)
+                        dlg = ui.dialog()
+                        with dlg, ui.card().classes(f"w-[760px] max-w-[95vw] h-[550px] flex flex-col p-4 {CANVAS} text-slate-900 dark:text-slate-100 rounded-xl border {BORDER}"):
+                            with ui.row().classes(f"w-full items-center justify-between pb-2 border-b {BORDER}"):
+                                ui.label(f"👁️ Peek: sub_workspace/{r}").classes("text-sm font-bold font-mono")
+                                ui.button(icon="close", on_click=dlg.close).props("flat round dense size=xs")
+                            with ui.scroll_area().classes(f"w-full flex-1 border {BORDER} rounded p-2 bg-slate-900 dark:bg-slate-950"):
+                                ui.code(content, language="markdown" if r.endswith(".md") else "python" if r.endswith(".py") else "text").classes("w-full text-xs")
+                        dlg.open()
+
+                    def _delete_action(r=rel):
+                        sub_ws.remove_path(r)
+                        ui.notify(f"Removed {r}", type="info")
+                        refresh_subws_tree()
+
+                    if is_loaded:
+                        ui.menu_item("📤 Unload from context [U]", lambda: _toggle_load())
+                    else:
+                        ui.menu_item("📥 Load into context [C]", lambda: _toggle_load())
+                    ui.menu_item("👁️ Peek content", _peek_action)
+                    ui.separator()
+                    ui.menu_item("💬 Mention in prompt", lambda r=rel: _insert_into_prompt(f"sub_workspace/{r}"))
+                    ui.menu_item("✏️ Open in native software", lambda p=abs_path: open_in_default_editor(p))
+                    ui.menu_item("📁 Reveal in file manager", lambda p=abs_path: reveal_in_file_manager(p))
+                    ui.separator()
+                    ui.menu_item("📋 Copy relative path", lambda r=rel: _copy_text(f"sub_workspace/{r}", "Relative path"))
+                    ui.menu_item("📋 Copy absolute path", lambda p=abs_path: _copy_text(p, "Absolute path"))
+                    ui.separator()
+                    ui.menu_item("🗑️ Delete from sub-workspace", _delete_action)
+
+    def _render_subws_search_results(q: str):
+        from lollms_client.apps.lollms_code.sub_workspace import SubWorkspaceManager
+        sub_ws = SubWorkspaceManager(prefs.workspace_path)
+        files = sub_ws.list_files(q)
+        if not files:
+            ui.label("(no matches)").classes(f"text-xs {MUTED_DIM} p-2")
+            return
+        ui.label(f"{len(files)} match(es)").classes(f"text-[10px] {MUTED_DIM} px-2 pb-1")
+        for f in files:
+            node = {
+                "rel": f["rel_path"],
+                "name": f["name"],
+                "path": f["full_path"],
+                "is_dir": False,
+            }
+            _render_subws_search_row(node, f["is_loaded"])
+
+    def _render_subws_search_row(node: Dict[str, Any], is_loaded: bool):
+        icon, colour = _icon_for(node["name"], False)
+        row = ui.row().classes(_row_classes(is_loaded) + " px-1.5")
+        with row:
+            ui.icon(icon).classes(f"{colour} shrink-0").props("size=16px")
+            with ui.column().classes("gap-0 min-w-0 flex-1"):
+                ui.label(node["name"]).classes(
+                    "text-xs truncate "
+                    + ("text-emerald-700 dark:text-emerald-300 font-semibold" if is_loaded else STRONG)
+                )
+                ui.label(f"sub_workspace/{node['rel']}").classes(f"text-[10px] truncate {MUTED_DIM}")
+            if is_loaded:
+                ui.icon("task_alt").classes("text-emerald-500 shrink-0").props("size=13px")
+        row.on("dblclick", lambda p=node["path"]: open_in_default_editor(p))
+        _attach_subws_context_menu(row, node, is_loaded)
+
+    subws_tree_search_input.on_value_change(lambda _: _paint_subws_tree())
+
     # Initial tree population
     refresh_workspace_tree()
+    refresh_subws_tree()
     # ---------------- Command Palette (Ctrl+K) ----------------
 
     def open_command_palette():

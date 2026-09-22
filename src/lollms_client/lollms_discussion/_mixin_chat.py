@@ -3108,7 +3108,8 @@ class ChatMixin:
 
         for rel_path in new_files:
             file_info = files_after[rel_path]
-            file_name = rel_path.name
+            rel_str = str(rel_path).replace("\\", "/")
+            file_name = rel_str
             file_ext = rel_path.suffix.lower()
             file_path = file_info["path"]
             file_size = file_path.stat().st_size
@@ -3253,7 +3254,8 @@ class ChatMixin:
         for rel_path in common_files:
             before_info = files_before[rel_path]
             after_info = files_after[rel_path]
-            file_name = rel_path.name
+            rel_str = str(rel_path).replace("\\", "/")
+            file_name = rel_str
             file_ext = rel_path.suffix.lower()
             file_path = after_info["path"]
 
@@ -4556,6 +4558,18 @@ class ChatMixin:
             binding_name=getattr(self.lollmsClient.llm, "binding_name", "unknown") if self.lollmsClient else "unknown"
         )
 
+        def _persist_round_state():
+            """Commits active message content and discussion state immediately to the database."""
+            if self._is_db_backed:
+                try:
+                    self.touch()
+                    self.commit()
+                except Exception as commit_err:
+                    ASCIIColors.warning(f"[ChatMixin] Mid-turn round commit warning: {commit_err}")
+
+        # Commit initial user message and assistant message anchor immediately so message is never lost
+        _persist_round_state()
+
         # CRITICAL: Expose the active personality to _StreamState so it can access the SkillsManager
         # for Handbag skill routing (modifiable/read-only enforcement) during <skill> tag dispatch.
         object.__setattr__(self, '_active_personality', personality)
@@ -4930,6 +4944,7 @@ class ChatMixin:
                     )
                 ))
                 _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
+                _persist_round_state()
                 continue
 
             # ── 🔍 PROCESS PENDING MEMORY SEARCHES (HIGHEST PRIORITY) ──
@@ -5164,6 +5179,8 @@ class ChatMixin:
                 # After adding the search results, check if we need to compress older rounds
                 _compress_virtual_history_if_needed()
 
+                _persist_round_state()
+
                 # Force a continuation round so the LLM can see the search results
                 continue
 
@@ -5245,6 +5262,7 @@ class ChatMixin:
                 })
                 _compress_virtual_history_if_needed()
                 _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
+                _persist_round_state()
                 continue
 
             # (Artifact loop enforcement removed per the single-signal termination
@@ -5296,13 +5314,10 @@ class ChatMixin:
                         sender_type="user",
                         content=correction_body
                     ))
+                    _persist_round_state()
                     continue
                 else:
                     # ── TRUE DUPLICATE PATH ──
-                    # Same tag, same environment. No workspace mutation occurred,
-                    # so re-prompting teaches nothing new: append the round and a
-                    # corrective envelope, then let the next round decide. The
-                    # sovereign <done/> tag is the only termination signal.
                     ASCIIColors.warning("[ChatMixin] LLM emitted a duplicate artifact tag. Injecting duplicate warning.")
                     duplicate_history_text = _scrub_for_llm_context(
                         ss.get_clean_text_so_far()[current_content_length:]
@@ -5317,6 +5332,7 @@ class ChatMixin:
                         content="[SYSTEM: CRITICAL. You just attempted to recreate an artifact that already exists with the exact same content. This is a loop. You MUST NOT create or update this artifact again. You MUST now provide your final conversational answer to the user, explaining what you have done, and end with <done/>.]"
                     ))
                     _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
+                    _persist_round_state()
                     continue
 
             # ── 🤖 SUB-AGENT TAG ROUTING ──
@@ -5429,6 +5445,7 @@ class ChatMixin:
                 })
                 _compress_virtual_history_if_needed()
                 _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
+                _persist_round_state()
                 continue
 
             # ── 🛑 ONE-ACTION-PER-TURN PROTOCOL ──
@@ -5556,6 +5573,7 @@ class ChatMixin:
                 ))
 
                 _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
+                _persist_round_state()
                 continue
 
             if ss.tool_trigger:
@@ -5622,6 +5640,7 @@ class ChatMixin:
                             break
 
                         # Force another round to let the LLM correct itself
+                        _persist_round_state()
                         continue
 
                     tool_name = call_data.get("name", "")
@@ -5726,6 +5745,7 @@ class ChatMixin:
                         ))
 
                         # Force another reasoning round to let the LLM correct itself
+                        _persist_round_state()
                         continue
 
                     full_round_text = ss.get_clean_text_so_far()
@@ -5827,6 +5847,7 @@ class ChatMixin:
                             break
 
                         # Force another reasoning round to let the LLM correct itself
+                        _persist_round_state()
                         continue
 
                     # ── CONTEXT-AWARE LOOP DETECTION (BEFORE EXECUTION) ──
@@ -6609,9 +6630,11 @@ class ChatMixin:
                             content=user_part
                         ))
                     _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
+                    _persist_round_state()
                     continue
                 else:
                     _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
+                    _persist_round_state()
                     break
             else:
                 full_round_text = ss.get_clean_text_so_far()
@@ -6638,6 +6661,7 @@ class ChatMixin:
                     ))
                     ss.context_unlock_requested = False
                     _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
+                    _persist_round_state()
                     continue
 
                 # ── 🛑 SOVEREIGN <done/> TERMINATION CONTRACT ──
@@ -6667,6 +6691,7 @@ class ChatMixin:
                     )
                 ))
                 _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
+                _persist_round_state()
                 continue
 
         # ── 11. Final Post-Processing & Database Commit ──
@@ -6686,6 +6711,7 @@ class ChatMixin:
                 "artefacts_modified": [a.get("title") for a in (ss.affected_artefacts if ss else [])],
                 "cancelled": True
             }
+            _persist_round_state()
         else:
             # ── 🧠 DUAL-COPY PERSISTENCE PROTOCOL ──
             # If this turn involved multiple agentic steps (tool calls or artifact dispatches),
@@ -6883,8 +6909,8 @@ class ChatMixin:
             except Exception as ex:
                 trace_exception(ex)
 
-        if self._is_db_backed and self.autosave:
-            self.commit()
+        # Unconditionally commit the final message and discussion state to the database
+        _persist_round_state()
 
         self.scratchpad = ""
         object.__setattr__(self, '_active_callback', None)

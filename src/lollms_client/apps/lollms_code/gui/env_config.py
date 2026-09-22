@@ -51,11 +51,31 @@ except ImportError as e:
         return {}
 
     def resolve_env_file(cli_env_path=None):
-        home_env = Path.home() / ".lollms-client" / ".env"
-        return (home_env, False) if home_env.exists() else (None, True)
+        if cli_env_path:
+            p = Path(cli_env_path).expanduser()
+            if p.exists():
+                return p, False
+        home_dir = Path.home() / ".lollms_client"
+        home_env = home_dir / ".env"
+        home_yaml = home_dir / "config.yaml"
+        if home_env.exists():
+            return home_env, False
+        if home_yaml.exists():
+            return home_yaml, False
+        return None, True
 
     def load_env_file(env_path):
-        pass
+        data = {}
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        data[k.strip()] = v.strip().strip("'\"")
+        except Exception:
+            pass
+        return data
 
     def list_bindings_by_type(binding_type: str) -> List[str]:
         return []
@@ -118,19 +138,17 @@ class EnvStore:
     # ---------- load / persist ----------
 
     def load(self) -> None:
-        path, _needs_wizard = resolve_env_file()
-        self.env_path = path
-        self.config_map = {}
-        if path and path.exists():
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith("#") and "=" in line:
-                            k, v = line.split("=", 1)
-                            self.config_map[k.strip()] = v.strip().strip("'\"")
-            except Exception:
-                pass
+        try:
+            from lollms_client.lollms_config_cli_env import _load_existing_env_to_map, resolve_env_file as _res_file
+            self.config_map = _load_existing_env_to_map(self.env_path)
+            path, _ = _res_file(self.env_path)
+            self.env_path = path
+        except Exception:
+            path, _ = resolve_env_file(self.env_path)
+            self.env_path = path
+            self.config_map = {}
+            if path and path.exists():
+                self.config_map = load_env_file(path)
 
     def is_configured(self, require_llm: bool = True, require_tti: bool = False, require_tts: bool = False, require_stt: bool = False, require_ttm: bool = False, require_ttv: bool = False) -> bool:
         """Validates configuration based on required modalities using the Two-Tier Profile System."""
@@ -167,17 +185,23 @@ class EnvStore:
         return _extract_profiles_from_env(prefix, bindings, self.config_map) or {}
 
     def save(self) -> Path:
-        target_dir = Path.home() / ".lollms-client"
+        target_dir = Path.home() / ".lollms_client"
         target_dir.mkdir(parents=True, exist_ok=True)
-        target_file = target_dir / ".env"
-        with open(target_file, "w", encoding="utf-8") as f:
-            f.write("# Lollms Client Configuration\n# Written by lollms_code GUI settings\n\n")
-            for k, v in self.config_map.items():
-                if v:
-                    f.write(f"{k}={v}\n")
-        self.env_path = target_file
-        load_env_file(target_file)  # refresh os.environ for this process too
-        return target_file
+        try:
+            from lollms_client.lollms_config_cli_env import _save_and_validate, resolve_env_file as _res_file
+            _save_and_validate(self.config_map, test_connection=False, cli_env_path=self.env_path)
+            path, _ = _res_file(self.env_path)
+            self.env_path = path or (target_dir / "config.yaml")
+        except Exception:
+            target_file = target_dir / "config.yaml"
+            target_env = target_dir / ".env"
+            with open(target_env, "w", encoding="utf-8") as f:
+                f.write("# Lollms Client Configuration\n# Written by lollms_code GUI settings\n\n")
+                for k, v in self.config_map.items():
+                    if v:
+                        f.write(f"{k}={v}\n")
+            self.env_path = target_file
+        return self.env_path
 
     def validate(self) -> Tuple[bool, str]:
         """Try to actually build a LollmsClient from the current MASTER-ish
@@ -277,9 +301,11 @@ class EnvStore:
         prefix = f"{binding_type.upper()}_PROFILES_{alias}_"
 
         if is_default:
-            # Only one default per modality — clear any existing one first.
-            for other in self.configured_profile_aliases(binding_type):
-                self.config_map.pop(f"{binding_type.upper()}_PROFILES_{other}_IS_DEFAULT", None)
+            # Clear is_default across all aliases for this modality
+            prefix_prof = f"{binding_type.upper()}_PROFILES_"
+            for k in list(self.config_map.keys()):
+                if k.upper().startswith(prefix_prof) and k.upper().endswith("_IS_DEFAULT"):
+                    self.config_map[k] = "false"
 
         self.config_map[prefix + "BINDING_ALIAS"] = binding_alias.strip().upper()
         if model_name:
@@ -287,7 +313,7 @@ class EnvStore:
         if is_default:
             self.config_map[prefix + "IS_DEFAULT"] = "true"
         else:
-            self.config_map.pop(prefix + "IS_DEFAULT", None)
+            self.config_map[prefix + "IS_DEFAULT"] = "false"
 
         if binding_type == "llm":
             if vision_enabled:
@@ -321,13 +347,26 @@ class EnvStore:
         prefix = binding_type.upper()
         default_alias = None
         for k, v in self.config_map.items():
-            if k.startswith(f"{prefix}_PROFILES_") and k.endswith("_IS_DEFAULT") and v.lower() in ("true", "1", "yes"):
-                default_alias = k[len(f"{prefix}_PROFILES_"):-len("_IS_DEFAULT")]
+            if k.upper().startswith(f"{prefix}_PROFILES_") and k.upper().endswith("_IS_DEFAULT") and str(v).lower() in ("true", "1", "yes"):
+                default_alias = k.upper()[len(f"{prefix}_PROFILES_"):-len("_IS_DEFAULT")].rstrip("_")
                 break
 
         if default_alias:
-            binding_alias = self.config_map.get(f"{prefix}_PROFILES_{default_alias}_BINDING_ALIAS", default_alias)
-            model_name = self.config_map.get(f"{prefix}_PROFILES_{default_alias}_MODEL_NAME")
+            target_b_key = f"{prefix}_PROFILES_{default_alias}_BINDING_ALIAS"
+            binding_alias = None
+            for k, v in self.config_map.items():
+                if k.upper() == target_b_key:
+                    binding_alias = v
+                    break
+            if not binding_alias:
+                binding_alias = default_alias
+
+            model_name = None
+            target_m_key = f"{prefix}_PROFILES_{default_alias}_MODEL_NAME"
+            for k, v in self.config_map.items():
+                if k.upper() == target_m_key:
+                    model_name = v
+                    break
         else:
             aliases = self.configured_binding_aliases(binding_type)
             if not aliases:
@@ -335,14 +374,38 @@ class EnvStore:
             binding_alias = aliases[0]
             model_name = None
             for p_alias in self.configured_profile_aliases(binding_type):
-                if self.config_map.get(f"{prefix}_PROFILES_{p_alias}_BINDING_ALIAS") == binding_alias:
-                    model_name = self.config_map.get(f"{prefix}_PROFILES_{p_alias}_MODEL_NAME")
+                b_match = False
+                for k, v in self.config_map.items():
+                    if k.upper() == f"{prefix}_PROFILES_{p_alias.upper()}_BINDING_ALIAS" and v.upper() == binding_alias.upper():
+                        b_match = True
+                        break
+                if b_match:
+                    for k, v in self.config_map.items():
+                        if k.upper() == f"{prefix}_PROFILES_{p_alias.upper()}_MODEL_NAME":
+                            model_name = v
+                            break
                     break
 
+        b_name = None
+        host_addr = ""
+        service_key = ""
+        verify_ssl = "false"
+
+        b_prefix = f"{prefix}_BINDINGS_{binding_alias.upper()}_"
+        for k, v in self.config_map.items():
+            if k.upper() == f"{b_prefix}BINDING_NAME":
+                b_name = v
+            elif k.upper() == f"{b_prefix}HOST_ADDRESS":
+                host_addr = v
+            elif k.upper() in (f"{b_prefix}SERVICE_KEY", f"{b_prefix}API_KEY"):
+                service_key = v
+            elif k.upper() == f"{b_prefix}VERIFY_SSL_CERTIFICATE":
+                verify_ssl = v
+
         return dict(
-            binding_name=self.config_map.get(f"{prefix}_BINDINGS_{binding_alias}_BINDING_NAME"),
-            model_name=model_name,
-            host_address=self.config_map.get(f"{prefix}_BINDINGS_{binding_alias}_HOST_ADDRESS", ""),
-            api_key=self.config_map.get(f"{prefix}_BINDINGS_{binding_alias}_SERVICE_KEY", ""),
-            verify_ssl=self.config_map.get(f"{prefix}_BINDINGS_{binding_alias}_VERIFY_SSL_CERTIFICATE", "false"),
+            binding_name=b_name or "",
+            model_name=model_name or "",
+            host_address=host_addr,
+            api_key=service_key,
+            verify_ssl=verify_ssl,
         )

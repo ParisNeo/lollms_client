@@ -313,22 +313,21 @@ def main():
 def deck_page_route():
     try:
         env = state["env"]
+        env.load()
         prefs = state["prefs"]
         apply_theme(prefs)
 
         if not env.is_configured():
-            with ui.column().classes("w-full h-screen items-center justify-center p-8 bg-slate-900 text-white"):
-                ui.icon("rocket_launch", size="48px").classes("text-primary")
-                ui.label("Welcome to lollms_code").classes("text-2xl font-bold mt-2")
-                ui.label("Configure your LLM model connection before launching your workspaces.").classes(
-                    "text-sm text-slate-400 mb-4"
+            def on_first_save(e: EnvStore, pr: GuiPrefs):
+                e.save()
+                state["env"].load()
+                apply_theme(pr)
+                ui.navigate.to("/")
+            with ui.column().classes("w-full h-screen max-h-screen p-0 m-0 gap-0 flex flex-col overflow-hidden bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100"):
+                build_settings_page(
+                    env, prefs,
+                    on_saved=on_first_save,
                 )
-                with ui.card().classes("w-full max-w-3xl"):
-                    def on_first_save(e: EnvStore, pr: GuiPrefs):
-                        e.save()
-                        apply_theme(pr)
-                        ui.navigate.to("/")
-                    build_settings_page(env, prefs, on_saved=on_first_save)
             return
 
         ui.query(".nicegui-content").classes("h-full max-h-full p-0 gap-0 flex flex-col overflow-hidden")
@@ -364,6 +363,7 @@ def deck_page_route():
 def chat_page_route():
     try:
         env = state["env"]
+        env.load()
         prefs = state["prefs"]
         apply_theme(prefs)
 
@@ -440,11 +440,13 @@ def chat_page_route():
 @ui.page("/settings")
 def settings_page_route():
     env = state["env"]
+    env.load()
     prefs = state["prefs"]
     apply_theme(prefs)
 
     def on_saved(e: EnvStore, p: GuiPrefs):
         e.save()
+        state["env"].load()
         apply_theme(p)
         ui.notify("Settings saved.", type="positive")
         ui.navigate.to("/chat")

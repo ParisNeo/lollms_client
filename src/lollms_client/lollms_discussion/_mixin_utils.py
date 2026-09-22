@@ -694,18 +694,25 @@ class UtilsMixin:
         if artefact is None:
             return None
 
-        base_ws = Path(self.workspace_path) if hasattr(self, 'workspace_path') and self.workspace_path else Path("./data_workspace")
-        ws_dir = base_ws / str(self.id) / "workspace_data"
-
-        filename = artefact.get('title', '')
-
-        if '/' in filename or '\\' in filename:
-            file_path = ws_dir / filename
+        ws_data_path = getattr(self, "workspace_data_path", None)
+        if ws_data_path:
+            ws_dir = Path(ws_data_path)
         else:
-            file_path = ws_dir / filename
+            base_ws = Path(self.workspace_path) if hasattr(self, 'workspace_path') and self.workspace_path else Path("./data_workspace")
+            ws_dir = base_ws / str(self.id) / "workspace_data"
+
+        filename = artefact.get('physical_path') or artefact.get('title', '')
+        clean_rel = filename.replace("\\", "/").lstrip("/")
+        file_path = ws_dir / clean_rel
 
         try:
             if file_path.exists():
+                from lollms_client.lollms_artefact.lollms_artefact import is_binary_file
+                if is_binary_file(file_path):
+                    lam = self.artefacts._get_lam_content(artefact)
+                    if lam:
+                        return lam
+                    return f"[Non-textual file: {clean_rel} ({file_path.stat().st_size:,} bytes). Raw binary content is withheld to protect the context window.]"
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                     return f.read()
 

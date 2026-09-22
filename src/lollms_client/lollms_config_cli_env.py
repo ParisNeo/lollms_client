@@ -1676,54 +1676,42 @@ def build_wizard_menu(
     exit_text: str = "↩ Back",
     exit_behavior: str = "discard",
     include_save_exit: bool = False,
+    include_save: Optional[bool] = None,
     cli_env_path: Optional[Union[str, Path]] = None,
+    standalone: bool = False,
 ) -> tuple:
     """Builds a configuration wizard menu that can run standalone or be
+    embedded as a submenu inside a calling application menu.
 
-    embedded as a submenu inside a bigger menu.
+    In Standalone Mode (standalone=True):
+      - Directly offers '💾 Save', '💾 Save & Exit', and '🔍 Save & Validate Connection'.
+      - Owns the complete persistence and exit lifecycle.
 
-    Args:
-        config_map: Mutable configuration map to edit. If None, a fresh map is
-            created and pre-loaded from existing config files when available.
-        title: Title displayed at the top of the menu.
-        exit_text: Label of the menu's exit entry.
-        exit_behavior: Governs what happens when the user selects the exit
-            entry:
-                "save"     -> persist config_map before returning.
-                "ask"      -> prompt Yes/No, then persist if confirmed.
-                "discard"  -> return without persisting (embedder owns saving).
-        include_save_exit: When True, append a "Save & Exit" action that
-            persists config_map and marks state["saved"] = True. When False,
-            the embedder owns persistence.
-
-    Returns:
-        tuple: (menu, state) where menu is a configured Menu instance and
-        state is {"config_map": dict, "saved": bool}. The caller is
-        responsible for invoking menu.run() (standalone) or wiring the menu
-        as a submenu action inside a parent menu.
-    """
-    """Builds a configuration wizard menu that can run standalone or be
-    embedded as a submenu inside a bigger menu.
+    In Embedded / Non-Standalone Mode (standalone=False):
+      - Designed for host applications (e.g. lollms_code CLI, WebUI, GUI).
+      - The calling application owns the saving lifecycle.
+      - Edits directly mutate `config_map` in memory without premature disk writes.
+      - Save options are omitted from the submenu by default; selecting `exit_text`
+        returns control to the host app with `state["config_map"]` ready for
+        the host app to persist when appropriate.
 
     Args:
         config_map: Mutable configuration map to edit. If None, a fresh map is
             created and pre-loaded from existing config files when available.
         title: Title displayed at the top of the menu.
         exit_text: Label of the menu's exit entry.
-        exit_behavior: Governs what happens when the user selects the exit
-            entry:
-                "save"     -> persist config_map before returning.
-                "ask"      -> prompt Yes/No, then persist if confirmed.
-                "discard"  -> return without persisting (embedder owns saving).
-        include_save_exit: When True, append a "Save & Exit" action that
-            persists config_map and marks state["saved"] = True. When False,
-            the embedder owns persistence.
+        exit_behavior: Governs what happens when the user selects the exit entry:
+            "save"     -> persist config_map before returning.
+            "ask"      -> prompt Yes/No, then persist if confirmed.
+            "discard"  -> return without persisting (calling app owns saving).
+        include_save_exit: When True, append 'Save & Exit' action. Defaults to True in standalone mode.
+        include_save: When True, append 'Save' action. Defaults to True in standalone mode.
+        cli_env_path: Target path for explicit .env/.yaml saving.
+        standalone: When True, enables standalone saving choices. When False, lets calling app save.
 
     Returns:
         tuple: (menu, state) where menu is a configured Menu instance and
-        state is {"config_map": dict, "saved": bool}. The caller is
-        responsible for invoking menu.run() (standalone) or wiring the menu
-        as a submenu action inside a parent menu.
+        state is {"config_map": dict, "saved": bool, "exited": bool}.
     """
     if exit_behavior not in ("save", "ask", "discard"):
         raise ValueError(
@@ -1737,7 +1725,12 @@ def build_wizard_menu(
             ASCIIColors.green(f"✅ Loaded existing configuration from: {source}")
 
     menu = Menu(title, mode=Menu.MODE_RETURN, exit_text=exit_text)
-    menu.set_intro("Select a modality to configure, or save your changes.")
+    intro_desc = (
+        "Select a modality to configure, or save your changes."
+        if standalone
+        else "Select a modality to configure in-memory. Return to the application to save."
+    )
+    menu.set_intro(intro_desc)
 
     menu.add_choice("🧠 Configure LLM", value=lambda: _modality_menu("llm", config_map))
     menu.add_choice("🎨 Configure TTI", value=lambda: _modality_menu("tti", config_map))
@@ -1746,43 +1739,36 @@ def build_wizard_menu(
     menu.add_choice("🎵 Configure TTM", value=lambda: _modality_menu("ttm", config_map))
     menu.add_choice("🎬 Configure TTV", value=lambda: _modality_menu("ttv", config_map))
     menu.add_choice("🔗 Configure CONNECTION", value=lambda: _modality_menu("connection", config_map))
-    menu.add_choice("💾 Save", value=lambda: _save_and_validate(config_map, cli_env_path=cli_env_path))
 
-    # CONNECTION modality hint for couples counseling
-    if "CONNECTION_BINDINGS_" in str(config_map.keys()):
-        ASCIIColors.info(
-            "\n⭐ Tip: For multi-user apps (e.g., couples counseling), use "
-            "separate CONNECTION profiles per partner. Each partner's channel is "
-            "their own private vault. See examples_perso/proactive_partner/channel_router.py"
+    # In standalone mode, include direct saving options. In non-standalone mode, the calling app owns saving.
+    should_include_save = include_save if include_save is not None else standalone
+    should_include_save_exit = include_save_exit if include_save_exit else standalone
+
+    if should_include_save:
+        menu.add_choice("💾 Save", value=lambda: _save_and_validate(config_map, cli_env_path=cli_env_path))
+
+    state = {"config_map": config_map, "saved": False, "exited": False}
+
+    if should_include_save_exit:
+        def _save_and_exit_action():
+            _save_and_validate(state["config_map"], test_connection=False, cli_env_path=cli_env_path)
+            state["saved"] = True
+            state["exited"] = True
+            return _BACK_VALUE
+
+        menu.add_choice("💾 Save & Exit", value=_save_and_exit_action)
+        menu.add_choice(
+            "🔍 Save & Validate Connection",
+            value=lambda: _save_and_validate(state["config_map"], test_connection=True, cli_env_path=cli_env_path),
         )
-
-    state = {"config_map": config_map, "saved": False}
-
-    if include_save_exit:
-        if exit_behavior == "save":
-            def _save_and_exit_action():
-                _save_and_validate(state["config_map"], cli_env_path=cli_env_path)
-                state["saved"] = True
-            menu.add_choice("💾 Save & Exit", value=_save_and_exit_action)
-        elif exit_behavior == "ask":
-            def _save_and_exit_action():
-                if _safe_confirm("Save configuration before exiting?", default=True):
-                    _save_and_validate(state["config_map"], cli_env_path=cli_env_path)
-                    state["saved"] = True
-            menu.add_choice("💾 Save & Exit", value=_save_and_exit_action)
-        else:
-            menu.add_choice(
-                "🔍 Save & Validate Connection",
-                value=lambda: _save_and_validate(state["config_map"], test_connection=True, cli_env_path=cli_env_path),
-            )
 
     def _exit_choice_action():
         if exit_behavior == "save":
-            _save_and_validate(state["config_map"], cli_env_path=cli_env_path)
+            _save_and_validate(state["config_map"], test_connection=False, cli_env_path=cli_env_path)
             state["saved"] = True
         elif exit_behavior == "ask":
             if _safe_confirm("Save configuration before exiting?", default=True):
-                _save_and_validate(state["config_map"], cli_env_path=cli_env_path)
+                _save_and_validate(state["config_map"], test_connection=False, cli_env_path=cli_env_path)
                 state["saved"] = True
         state["exited"] = True
         return _BACK_VALUE
@@ -1809,22 +1795,20 @@ def run_wizard_and_save(cli_env_path: Optional[Union[str, Path]] = None):
     while True:
         menu, state = build_wizard_menu(
             config_map=config_map,
-            title="Lollms Client Main Menu",
+            title="Lollms Client Main Menu (Standalone Wizard)",
             exit_text="🚪 Exit without Saving",
             exit_behavior="discard",
-            include_save_exit=True,
             cli_env_path=cli_env_path,
+            standalone=True,
         )
-
-        def _validate_action():
-            _save_and_validate(state["config_map"], test_connection=True, cli_env_path=cli_env_path)
-        menu.add_choice("🔍 Save & Validate Connection", value=_validate_action)
 
         selection = menu.run()
         if _is_back_choice(selection):
             break
         if callable(selection):
-            selection()
+            res = selection()
+            if _is_back_choice(res):
+                break
         if state.get("saved") or state.get("exited"):
             break
 

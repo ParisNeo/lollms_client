@@ -47,6 +47,13 @@ lollms-code --model qwen3:32b "refactor the database layer"
 1. **Connection Layer (`*_BINDINGS_*`)**: Defines server engines (Ollama, OpenAI, vLLM, etc.)
 2. **Execution Layer (`*_PROFILES_*`)**: Defines models, vision flags, and routing profiles referencing a binding
 
+### Embedded Configuration Wizard Architecture (Calling App Ownership)
+
+When the provider wizard is invoked inside `lollms_code` (`lollms-code --config`):
+- It runs in **Embedded Mode (`standalone=False`)**.
+- The low-level wizard does not save prematurely to disk; it mutates configuration mappings in-memory and returns cleanly with `↩ Back to Agent Config`.
+- The parent application (`lollms_code`) owns the saving lifecycle: when you select `💾 Save & Apply All Settings`, both the provider profiles (`config.yaml`) and the agent settings (`config.json`) are committed to disk atomically.
+
 Configuration is automatically resolved from:
 1. CLI arguments (`--profile`, `--model`, `--binding`, `--host`, `--api-key`)
 2. `~/.lollms_client/config.yaml` or `~/.lollms-client/.env` (Config Wizard)

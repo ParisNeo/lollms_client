@@ -351,26 +351,30 @@ def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: 
     ASCIIColors.success(f"[DataFiles] ✅ Schema generated successfully ({len(final_schema)} chars).")
 
     # ── WRITE VERSIONED AND ACTIVE FILES TO WORKSPACE ──
-    # The tests expect _parse_data_file to write the physical files to the workspace directory.
     try:
         workspace_dir = path.parent
-        file_stem = path.stem
         file_ext = path.suffix
 
-        # Write versioned file (e.g., test_data_v1.csv)
-        versioned_filename = f"{art_title}_v{version}{file_ext}"
+        base_title = art_title
+        if file_ext and base_title.lower().endswith(file_ext.lower()):
+            base_title = base_title[:-len(file_ext)]
+
+        # Write versioned file (e.g., sub/test_data_v1.csv)
+        versioned_filename = f"{base_title}_v{version}{file_ext}"
         versioned_path = workspace_dir / versioned_filename
+        versioned_path.parent.mkdir(parents=True, exist_ok=True)
         if raw_physical_data is not None:
             versioned_path.write_bytes(raw_physical_data)
-        else:
+        elif path.exists() and path.resolve() != versioned_path.resolve():
             shutil.copy2(str(path), str(versioned_path))
 
-        # Write active unversioned file (e.g., test_data.csv)
-        active_filename = f"{art_title}{file_ext}"
+        # Write active unversioned file (e.g., sub/test_data.csv)
+        active_filename = f"{base_title}{file_ext}"
         active_path = workspace_dir / active_filename
+        active_path.parent.mkdir(parents=True, exist_ok=True)
         if raw_physical_data is not None:
             active_path.write_bytes(raw_physical_data)
-        else:
+        elif path.exists() and path.resolve() != active_path.resolve():
             shutil.copy2(str(path), str(active_path))
 
     except Exception as write_err:

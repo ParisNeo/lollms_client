@@ -229,6 +229,14 @@ For every task, follow this structured pipeline:
 - After completing a task, ALWAYS create or update a skill.
 - Skills are your long-term memory — they make you better over time.
 
+## SUB-WORKSPACE & REFERENCE FILES (.lollms_code/sub_workspace/)
+You have access to a reference sub-workspace stored in `.lollms_code/sub_workspace/`.
+This area holds external documentation, reference code, specifications, or datasets that do not belong to the project codebase itself.
+- Reference files are listed in your prompt under `=== SUB-WORKSPACE (REFERENCE & DOCUMENTATION) ===`.
+- To load a reference file into your context, use `<unlock_file>sub_workspace/filename.ext</unlock_file>`.
+- To unload when done, use `<lock_file>sub_workspace/filename.ext</lock_file>`.
+- You can read and reference these files, but NEVER modify them unless explicitly instructed.
+
 ## PERSISTENT MEMORY SYSTEM (CRITICAL FOR CONTINUITY)
 You have access to a persistent memory database that survives across sessions.
 1. **STORE FACTS**: When the user shares personal information (name, preferences, project details), you MUST save it immediately:
@@ -1271,9 +1279,11 @@ def ensure_sandbox_structure(config: CodeAgentConfig):
     scratchpad = sandbox_dir / "scratchpad.md"
     current_plan = sandbox_dir / "CURRENT.md"
     memory_dir = sandbox_dir / "memory"
+    sub_ws_dir = sandbox_dir / "sub_workspace"
 
     sandbox_dir.mkdir(parents=True, exist_ok=True)
     memory_dir.mkdir(parents=True, exist_ok=True)
+    sub_ws_dir.mkdir(parents=True, exist_ok=True)
 
     if scripts_dir.exists():
         for f in scripts_dir.glob("*"):
@@ -2092,7 +2102,7 @@ class StreamRenderer:
                 self._update_live_artifact_panel(clean_chunk, fallback_title=art_title, fallback_lang=art_lang)
                 return True
             else:
-                if "<done" in chunk and "/>" in chunk:
+                if ("<done" in chunk or "<end" in chunk) and ("/>" in chunk or ">" in chunk):
                     return True
 
                 # Strip any stray processing tags or comments from the conversational stream
@@ -2344,6 +2354,16 @@ def get_context_fill_status(personality: LollmsPersonality, client: LollmsClient
                     breakdown["active_memories"] = client.count_tokens(mem_zone) or 0
             except (AttributeError, RuntimeError, ValueError) as e:
                 ASCIIColors.warning(f"Failed to compute memory token count: {e}")
+
+        try:
+            from lollms_client.apps.lollms_code.sub_workspace import SubWorkspaceManager
+            sub_ws = SubWorkspaceManager(personality._resolved_workspace)
+            if sub_ws.has_files():
+                block = sub_ws.build_context_block()
+                if block:
+                    breakdown["sub_workspace"] = client.count_tokens(block) or 0
+        except Exception:
+            pass
 
         used_tokens = sum(breakdown.values())
         fill_pct = round((used_tokens / max_ctx) * 100, 1)
@@ -2829,7 +2849,12 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
     prompt_history_file = get_workspace_prompt_history_file(config.workspace_path)
     history = PersistentHistory(prompt_history_file, debug=config.debug)
 
-    slash_commands = ["/exit", "/quit", "/help", "/plan", "/current", "/scratchpad", "/config", "/shell", "/forget", "/skills", "/clear-history", "/clear-files", "/clear-scratchpad", "/models", "/files", "/workspace", "/load", "/unload", "/lock", "/hide", "/unhide"]
+    slash_commands = [
+        "/exit", "/quit", "/help", "/plan", "/current", "/scratchpad", "/config",
+        "/shell", "/forget", "/skills", "/clear-history", "/clear-files",
+        "/clear-scratchpad", "/models", "/files", "/workspace", "/load", "/unload",
+        "/lock", "/hide", "/unhide", "/subws", "/reference"
+    ]
     
     # Display a safe, truncated workspace path to the user
     ws_path_display = Path(config.workspace_path).resolve()
@@ -3035,6 +3060,114 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                     ASCIIColors.yellow("\n  📂 No files are currently loaded in context.")
             except (AttributeError, KeyError, OSError, RuntimeError, ValueError) as e:
                 ASCIIColors.red(f"\n  ❌ Error unloading files: {e}")
+            continue
+
+        if user_input.lower().startswith(("/subws", "/reference", "/ref")):
+            from lollms_client.apps.lollms_code.sub_workspace import SubWorkspaceManager
+            sub_ws = SubWorkspaceManager(config.workspace_path)
+            parts = user_input.strip().split(maxsplit=2)
+            subcmd = parts[1].lower() if len(parts) > 1 else "list"
+            arg = parts[2].strip() if len(parts) > 2 else ""
+
+            if subcmd in ("help", "-h", "--help"):
+                ASCIIColors.rule("[bold cyan]📚 Sub-Workspace Reference Commands[/bold cyan]")
+                ASCIIColors.rich_print("  [cyan]/subws[/cyan] or [cyan]/subws list[/cyan]       - List all files in sub-workspace with [C]/[U] status")
+                ASCIIColors.rich_print("  [cyan]/subws add <file_or_dir>[/cyan]   - Import file or directory into .lollms_code/sub_workspace")
+                ASCIIColors.rich_print("  [cyan]/subws peek <file>[/cyan]         - Peek at content of a reference file")
+                ASCIIColors.rich_print("  [cyan]/subws load <file...>[/cyan]      - Load reference file(s) into LLM context [C]")
+                ASCIIColors.rich_print("  [cyan]/subws unload <file...>[/cyan]    - Unload reference file(s) to [U]")
+                ASCIIColors.rich_print("  [cyan]/subws clear[/cyan]               - Unload all reference files from context")
+                ASCIIColors.rich_print("  [cyan]/subws remove <file>[/cyan]       - Delete a file/folder from sub-workspace")
+                continue
+
+            if subcmd in ("list", "files", "status"):
+                files = sub_ws.list_files()
+                if not files:
+                    ASCIIColors.yellow("  Sub-workspace is currently empty (.lollms_code/sub_workspace/). Use '/subws add <path>' to import reference files.")
+                else:
+                    ASCIIColors.rule(f"[bold cyan]📚 Sub-Workspace ({len(files)} files)[/bold cyan]")
+                    loaded_count = sum(1 for f in files if f["is_loaded"])
+                    ASCIIColors.info(f"  Directory: [yellow]{sub_ws.sub_ws_dir}[/yellow] | Loaded: [green]{loaded_count}[/green] / {len(files)}")
+                    rows = []
+                    for f in files:
+                        marker = "[bold green][C] LOADED[/bold green]" if f["is_loaded"] else "[dim][U] UNLOADED[/dim]"
+                        size_str = f"{f['size'] / 1024:.1f} KB"
+                        rows.append([marker, f["rel_path"], size_str])
+                    table = ASCIIColors.table("Status", "Relative Path", "Size", rows=rows, box="round")
+                    ASCIIColors.rich_print(table)
+                continue
+
+            if subcmd == "add":
+                if not arg:
+                    arg = _safe_input_or_back("Enter file or folder path to import", "")
+                if not arg:
+                    ASCIIColors.yellow("  Import cancelled.")
+                    continue
+                target_p = Path(arg).expanduser().resolve()
+                if not target_p.exists():
+                    ASCIIColors.red(f"  Path does not exist: {target_p}")
+                    continue
+                try:
+                    if target_p.is_dir():
+                        imported = sub_ws.import_folder(target_p)
+                        ASCIIColors.success(f"  ✓ Imported folder with {len(imported)} file(s) into sub-workspace.")
+                    else:
+                        dest = sub_ws.import_file(target_p)
+                        ASCIIColors.success(f"  ✓ Imported file: {dest.name} into sub-workspace.")
+                except Exception as ex:
+                    ASCIIColors.red(f"  Import failed: {ex}")
+                continue
+
+            if subcmd == "peek":
+                if not arg:
+                    arg = _safe_input_or_back("Enter reference file to peek at", "")
+                if not arg:
+                    continue
+                content = sub_ws.peek_file(arg)
+                ASCIIColors.panel(content, title=f"[bold cyan]👁️ Peek: {arg}[/bold cyan]", border_style="cyan")
+                continue
+
+            if subcmd in ("load", "unlock"):
+                if not arg:
+                    ASCIIColors.red("  Usage: /subws load <file1> [file2]...")
+                    continue
+                targets = [t.strip() for t in arg.replace(",", " ").split() if t.strip()]
+                for t in targets:
+                    if sub_ws.load_file(t):
+                        ASCIIColors.green(f"  ✓ Loaded into context [C]: sub_workspace/{t}")
+                    else:
+                        ASCIIColors.red(f"  ✗ File not found in sub-workspace: {t}")
+                continue
+
+            if subcmd in ("unload", "lock"):
+                if not arg:
+                    ASCIIColors.red("  Usage: /subws unload <file1> [file2]...")
+                    continue
+                targets = [t.strip() for t in arg.replace(",", " ").split() if t.strip()]
+                for t in targets:
+                    if sub_ws.unload_file(t):
+                        ASCIIColors.green(f"  ✓ Unloaded to [U]: sub_workspace/{t}")
+                    else:
+                        ASCIIColors.yellow(f"  File was not loaded: {t}")
+                continue
+
+            if subcmd in ("clear", "unload-all"):
+                cnt = sub_ws.unload_all()
+                ASCIIColors.green(f"  ✓ Unloaded all {cnt} reference file(s) from context.")
+                continue
+
+            if subcmd in ("remove", "delete", "rm"):
+                if not arg:
+                    arg = _safe_input_or_back("Enter file to remove from sub-workspace", "")
+                if not arg:
+                    continue
+                if sub_ws.remove_path(arg):
+                    ASCIIColors.green(f"  ✓ Removed: {arg}")
+                else:
+                    ASCIIColors.red(f"  Failed to remove '{arg}'. Verify path.")
+                continue
+
+            ASCIIColors.yellow(f"  Unknown subcommand: {subcmd}. Use '/subws help' for commands.")
             continue
 
         if user_input.lower() == "/models":
@@ -3296,20 +3429,24 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
 
 # ── HIERARCHICAL CONFIGURATION SYSTEM ─────────────────────────────────────────
 
-def _launch_lollms_client_wizard_submenu(cli_env_path: Optional[str] = None):
-    """Embeds the low-level LollmsClient provider & model wizard as a sub-menu."""
+def _launch_lollms_client_wizard_submenu(
+    shared_config_map: dict[str, str],
+    cli_env_path: Optional[str] = None
+):
+    """
+    Embeds the low-level LollmsClient provider & model wizard as a non-standalone sub-menu.
+    The host application (lollms_code) owns the persistence and save lifecycle.
+    """
     from lollms_client.lollms_config_cli_env import (
         build_wizard_menu,
-        _load_existing_env_to_map,
         _is_back_choice,
     )
-    config_map = _load_existing_env_to_map(cli_env_path)
     wizard_menu, wizard_state = build_wizard_menu(
-        config_map=config_map,
-        title="🧠 Models & Provider Profiles (Lollms Client)",
+        config_map=shared_config_map,
+        title="🧠 Models & Provider Profiles (Lollms Client Submenu)",
         exit_text="↩ Back to Agent Config",
-        exit_behavior="ask",
-        include_save_exit=True,
+        exit_behavior="discard",
+        standalone=False,
         cli_env_path=cli_env_path,
     )
     while True:
@@ -3317,8 +3454,10 @@ def _launch_lollms_client_wizard_submenu(cli_env_path: Optional[str] = None):
         if _is_back_choice(selection):
             break
         if callable(selection):
-            selection()
-        if wizard_state.get("saved") or wizard_state.get("exited"):
+            res = selection()
+            if _is_back_choice(res):
+                break
+        if wizard_state.get("exited"):
             break
 
 
@@ -3545,10 +3684,21 @@ def run_lollms_code_config_menu(
 ):
     """
     Main Hierarchical Configuration Menu for lollms_code.
-    Hosts the Lollms Client Wizard as a sub-menu alongside agent-level parameters.
+    Hosts the Lollms Client Wizard as a non-standalone sub-menu.
+    The host application owns the persistence lifecycle across all configurations.
     """
     from ascii_colors import Menu
-    from lollms_client.lollms_config_cli_env import _is_back_choice, _BACK_VALUE
+    from lollms_client.lollms_config_cli_env import (
+        _load_existing_env_to_map,
+        _extract_bindings_from_env,
+        _extract_profiles_from_env,
+        _save_and_validate,
+        _safe_confirm,
+        _is_back_choice,
+        _BACK_VALUE,
+    )
+
+    shared_config_map = _load_existing_env_to_map(cli_env_path)
 
     while True:
         autonomy_badge = "SAFE" if config.shell_autonomy_level == "safe" else "FULL ACCESS"
@@ -3575,20 +3725,20 @@ def run_lollms_code_config_menu(
             break
 
         if selection == "client_wizard":
-            _launch_lollms_client_wizard_submenu(cli_env_path)
-            # Reload updated binding/model profiles
-            updated_cfg = CodeAgentConfig.load(argparse.Namespace(
-                workspace=config.workspace_path,
-                config_path=cli_env_path,
-                profile=config.active_profile,
-                llm_binding=None, model=None, host=None, api_key=None, context_size=None,
-                max_steps=None, temperature=None, max_tokens=None, debug=None,
-                enable_model_switching=None, no_shell_execution=None, shell_autonomy=None,
-                no_sub_agents=None, no_memory=None, skills_dir=None, handbag_path=None
-            ))
-            config.llm_binding_profiles = updated_cfg.llm_binding_profiles
-            config.llm_model_profiles = updated_cfg.llm_model_profiles
-            config.active_profile = updated_cfg.active_profile
+            _launch_lollms_client_wizard_submenu(shared_config_map, cli_env_path)
+            # Update in-memory profiles from the edited shared_config_map so the host app menu reflects changes
+            for modality in ("llm", "tti", "tts", "stt", "ttv", "ttm"):
+                b = _extract_bindings_from_env(modality.upper(), shared_config_map)
+                p = _extract_profiles_from_env(modality.upper(), b, shared_config_map)
+                setattr(config, f"{modality}_binding_profiles", b)
+                setattr(config, f"{modality}_model_profiles", p)
+
+            # Auto-promote default profile alias if available
+            for p_name, p_data in config.llm_model_profiles.items():
+                if p_data.get("is_default"):
+                    config.active_profile = p_name
+                    break
+
         elif selection == "shell_menu":
             _configure_shell_autonomy_menu(config, client=client)
         elif selection == "reasoning_menu":
@@ -3600,8 +3750,10 @@ def run_lollms_code_config_menu(
         elif selection == "paths_menu":
             _configure_paths_menu(config)
         elif selection == "save":
+            # The host application executes the unified save for both client profiles and agent parameters
+            _save_and_validate(shared_config_map, test_connection=False, cli_env_path=cli_env_path)
             config.save()
-            ASCIIColors.green("  ✅ All lollms_code configurations saved successfully.")
+            ASCIIColors.green("  ✅ All configurations (Profiles & Agent Settings) saved successfully.")
             if client and hasattr(client, "tools") and hasattr(client.tools, "mounted_libraries"):
                 for tool_lib in ("system_shell", "execute_python"):
                     if tool_lib in client.tools.mounted_libraries:

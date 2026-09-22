@@ -871,13 +871,14 @@ class CoreMixin:
             if _is_ignored_path(rel_parts):
                 continue
 
-            file_name = f_path.name
+            rel_str = str(rel_parts).replace("\\", "/")
+            file_name = rel_str
             file_ext = f_path.suffix.lower()
 
-            if file_name.startswith("."):
+            if Path(rel_str).name.startswith("."):
                 continue
 
-            existing_art = self.artefacts.get(file_name)
+            existing_art = self.artefacts.get(rel_str)
             if existing_art and _is_ignored_path(existing_art.get("title", "")):
                 continue
 
@@ -906,16 +907,18 @@ class CoreMixin:
 
             if is_binary:
                 content_placeholder = (
-                    f"### Data File: `{file_name}`\n\n"
+                    f"### Data File: `{rel_str}`\n\n"
                     f"- **Type**: {file_ext.upper()} (Binary/Structured Data)\n"
                     f"- **Size**: {file_size:,} bytes\n"
-                    f"- **Location**: `./{file_name}`\n\n"
+                    f"- **Location**: `./{rel_str}`\n\n"
                 )
                 if existing_art is None:
                     self.artefacts.add(
-                        title=file_name,
+                        title=rel_str,
+                        physical_path=rel_str,
                         artefact_type=atype,
                         content=content_placeholder,
+                        logical_content=content_placeholder,
                         active=True,
                         visibility=ArtefactVisibility.TREE_UNLOCKABLE,
                         commit_message="Synced from disk (binary)"
@@ -924,8 +927,10 @@ class CoreMixin:
                 else:
                     if existing_art.get("content", "").find(f"Size**: {file_size:,}") == -1:
                         self.artefacts.update(
-                            title=file_name,
+                            title=rel_str,
+                            physical_path=rel_str,
                             new_content=content_placeholder,
+                            logical_content=content_placeholder,
                             new_type=atype,
                             active=True,
                             visibility=ArtefactVisibility.TREE_UNLOCKABLE,
@@ -941,7 +946,8 @@ class CoreMixin:
 
                 if existing_art is None:
                     self.artefacts.add(
-                        title=file_name,
+                        title=rel_str,
+                        physical_path=rel_str,
                         artefact_type=atype,
                         content=disk_content,
                         active=True,
@@ -953,7 +959,8 @@ class CoreMixin:
                     db_content = existing_art.get("content", "")
                     if db_content != disk_content:
                         self.artefacts.update(
-                            title=file_name,
+                            title=rel_str,
+                            physical_path=rel_str,
                             new_content=disk_content,
                             new_type=atype,
                             active=True,

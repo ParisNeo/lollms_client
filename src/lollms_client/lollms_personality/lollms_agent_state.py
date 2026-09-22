@@ -750,7 +750,7 @@ class _AgentStreamState:
         if not last_line:
             return -1
 
-        for tag in ["<done/>", "<done>"]:
+        for tag in ["<done/>", "<done>", "</done>", "<end/>", "<end>", "</end>"]:
             if last_line.lower() == tag:
                 return len(buffer) - len(last_line)
 
@@ -799,7 +799,7 @@ class _AgentStreamState:
                 return True
 
         if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence and not self._in_inline_code:
-            done_match = re.search(r'(?m)^\s*<done\s*/?>', self._pending_buffer, re.IGNORECASE)
+            done_match = re.search(r'(?m)^\s*</?(?:done|end)\s*/?>', self._pending_buffer, re.IGNORECASE)
             if done_match:
                 text_before = self._pending_buffer[:done_match.start()].strip()
                 if text_before:
@@ -1593,14 +1593,14 @@ class _AgentStreamState:
         # After all buffers are flushed, scan the ENTIRE accumulated content
         # for any termination tag that was missed, strip it, and set the flag.
         if not self._done_intercepted:
-            done_pattern = re.compile(r'(?i)<(?:done|end)\s*/?>')
+            done_pattern = re.compile(r'(?i)</?(?:done|end)\s*/?>')
             if done_pattern.search(self.content):
                 ASCIIColors.info("[AgentStreamState] Post-stream sweep detected missed <done/> or <end/> tag. Setting termination flag.")
                 self._done_intercepted = True
                 self.content = done_pattern.sub('', self.content).strip()
 
         if self._pending_buffer:
-            cleaned_buffer = re.sub(r'<done\s*/?>\s*$', '', self._pending_buffer, flags=re.IGNORECASE).strip()
+            cleaned_buffer = re.sub(r'</?(?:done|end)\s*/?>\s*$', '', self._pending_buffer, flags=re.IGNORECASE).strip()
             if cleaned_buffer:
                 self.content += cleaned_buffer
                 self._cb(cleaned_buffer)

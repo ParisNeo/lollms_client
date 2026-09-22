@@ -2483,6 +2483,8 @@ class LollmsPersonality:
         if self._workspace_path:
             self._workspace_path.mkdir(parents=True, exist_ok=True)
             object.__setattr__(self, '_resolved_workspace', self._workspace_path.resolve())
+            if getattr(self, '_artefact_manager', None) is None:
+                self._init_artefact_system()
         else:
             object.__setattr__(self, '_resolved_workspace', None)
 
@@ -2810,9 +2812,22 @@ class LollmsPersonality:
                     vis = art.get("visibility")
                     if vis in (ArtefactVisibility.FULL, ArtefactVisibility.PINNED):
                         content = art.get("content", "")
-                        if not content:
-                            file_path = self._resolved_workspace / title
-                            if file_path.exists() and file_path.is_file():
+                        phys_target = art.get("physical_path") or title
+                        file_path = self._resolved_workspace / phys_target
+                        if file_path.exists() and file_path.is_file():
+                            ext = file_path.suffix.lower()
+                            is_bin = ext in _BINARY_EXTS
+                            if not is_bin:
+                                try:
+                                    with open(file_path, "rb") as f_bin:
+                                        is_bin = b"\x00" in f_bin.read(4096)
+                                except Exception:
+                                    is_bin = True
+
+                            if is_bin:
+                                lam = getattr(self._artefact_manager, "_get_lam_content", lambda a: "")(art)
+                                content = lam or f"[Non-textual file: {phys_target} ({file_path.stat().st_size:,} bytes). Raw binary content is withheld to protect the context window.]"
+                            elif not content or art.get("content_source") == "disk":
                                 try:
                                     content = file_path.read_text(encoding="utf-8", errors="ignore")
                                     art["content"] = content
@@ -2827,9 +2842,23 @@ class LollmsPersonality:
 
         loaded_block = "\n".join(loaded_parts) + "\n=== END FULLY LOADED FILE CONTENTS ===" if has_loaded else ""
 
+        # ── 📚 SUB-WORKSPACE (REFERENCE & DOCUMENTATION) INGESTION ──
+        sub_ws_block = ""
+        try:
+            from lollms_client.apps.lollms_code.sub_workspace import SubWorkspaceManager
+            sub_ws = SubWorkspaceManager(self._resolved_workspace)
+            if sub_ws.has_files():
+                sub_ws_block = sub_ws.build_context_block(self.lollms_client)
+        except Exception:
+            pass
+
+        parts = [tree_block]
         if loaded_block:
-            return "\n" + tree_block + "\n\n" + loaded_block
-        return "\n" + tree_block
+            parts.append(loaded_block)
+        if sub_ws_block:
+            parts.append(sub_ws_block)
+
+        return "\n\n".join(parts)
 
     def _refresh_workspace_context_in_prompt(self, current_prompt: str, new_ws_block: str) -> str:
         ws_boundary = "=== WORKSPACE CONTEXT BOUNDARY ==="
@@ -3256,6 +3285,9 @@ JSON:"""
             object.__setattr__(self, '_discussion', proxy)
             object.__setattr__(self, '_state_db_path', state_db_path)
             object.__setattr__(self, '_last_ws_sync_time', 0.0)
+
+            # Sync existing files from disk into the index
+            self._sync_artefact_index_with_disk()
 
         except Exception as e:
             ASCIIColors.warning(f"[{self.name}] Failed to initialise artefact system: {e}")
@@ -4480,6 +4512,9 @@ JSON:"""
     
     
     def change_file_visibility(self, targets: List[str], action: str) -> Dict[str, Any]:
+        if getattr(self, '_artefact_manager', None) is None and (self._resolved_workspace or self.workspace_path):
+            self._init_artefact_system()
+
         action_map = {
             "load": "unlock_file",
             "unload": "lock_file",
@@ -4533,6 +4568,39 @@ JSON:"""
         return resolved
 
     def _execute_context_visibility(self, tag_name: str, body: str) -> Dict[str, Any]:
+        if getattr(self, '_artefact_manager', None) is None and (self._resolved_workspace or self.workspace_path):
+            self._init_artefact_system()
+
+        # Check if targets reference sub_workspace/
+        if self._resolved_workspace and ("sub_workspace" in body or (self._resolved_workspace / ".lollms_code" / "sub_workspace").exists()):
+            try:
+                from lollms_client.apps.lollms_code.sub_workspace import SubWorkspaceManager
+                sub_ws = SubWorkspaceManager(self._resolved_workspace)
+                targets = [t.strip().replace("\\", "/") for t in body.splitlines() if t.strip()]
+                handled = []
+                for t in targets:
+                    clean = t[len("sub_workspace/"):].lstrip("/") if t.startswith("sub_workspace/") else t.lstrip("/")
+                    if (sub_ws.sub_ws_dir / clean).exists():
+                        if tag_name in ("unlock_file", "load_file"):
+                            sub_ws.load_file(clean)
+                            handled.append(f"sub_workspace/{clean}")
+                        elif tag_name in ("lock_file", "unload_file"):
+                            sub_ws.unload_file(clean)
+                            handled.append(f"sub_workspace/{clean}")
+                if handled:
+                    status_action = "Unlocked" if tag_name in ("unlock_file", "load_file") else "Locked"
+                    return {
+                        "status_str": f"✅ {status_action} reference files: {', '.join(handled)}",
+                        "processed_files": handled,
+                        "already_in_state": [],
+                        "not_found": [],
+                        "blocked_files": [],
+                        "loaded_contents": {h: sub_ws.peek_file(h.split('/', 1)[-1]) for h in handled} if tag_name in ("unlock_file", "load_file") else {},
+                        "success": True
+                    }
+            except Exception as e:
+                ASCIIColors.warning(f"Sub-workspace visibility handling failed: {e}")
+
         return _core_execute_context_visibility(
             tag_name=tag_name,
             body=body,
@@ -4577,7 +4645,7 @@ JSON:"""
         enable_web_tools: bool = False,
         auto_load_document_editor: bool = True,
         enable_computer_use: bool = False,
-        enforce_end_tag: bool = False,
+        enforce_end_tag: bool = True,
         orchestrator_mode: bool = False,
         event_mode: EventMode = EventMode.PROCESSING_TAG_MODE,
         think: Optional[bool] = None,
@@ -4994,7 +5062,7 @@ JSON:"""
 
             gen_kwargs = {k: v for k, v in kwargs.items() if k not in ("streaming_callback", "temperature", "n_predict", "stream", "think", "reasoning_effort", "reasoning_summary")}
 
-            gen_kwargs["n_predict"] = None
+            gen_kwargs["n_predict"] = n_predict or self.max_tokens_per_turn
 
             gen_kwargs["temperature"] = active_temperature
             if think is not None:
@@ -5112,37 +5180,8 @@ JSON:"""
             has_truncated_artifact = False
             truncated_artifact_title = None
 
-            has_preamble_intent = bool(re.search(
-                r'\b(let me|i will|i\'ll|starting by|checking|first,|now i|let\'s)\b',
-                ss.get_clean_text(),
-                re.IGNORECASE
-            ))
-
-            if (
-                round_count == 1
-                and not enforce_end_tag
-                and not has_preamble_intent
-                and not ss.completed_actions
-                and not tool_calls_this_turn
-                and not workspace_changes
-            ):
-                round1_text = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
-                if round1_text:
-                    final_response = round1_text
-                    if not ss.was_done_detected():
-                        ASCIIColors.info(f"[{self.name}] Round 1 conversational answer. Terminating (authoritative short-circuit).")
-                    if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
-                        try:
-                            streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
-                                "round_id": round_count,
-                                "status": "conversational"
-                            })
-                        except Exception:
-                            pass
-                    break
-
             if ss.was_done_detected():
-                final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
+                final_response = re.sub(r'(?i)</?(?:done|end)\s*/?>', '', ss.get_clean_text()).strip()
 
                 if ss.completed_actions:
                     virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text()))
@@ -6274,35 +6313,6 @@ JSON:"""
 
             raw_round_text = ss.get_clean_text()
 
-            # ── 🛡️ ROUND 1 CONVERSATIONAL SHORT-CIRCUIT ──
-            # Round 1 with pure conversational text and ZERO actions is terminal by
-            # default, whether or not the model emitted <done/>. A greeting, a
-            # clarifying question, or a complete prose answer must never be
-            # force-continued into an agentic loop.
-            # When enforce_end_tag=True, the loop refuses to terminate without the
-            # explicit <done/> tag: a continuation mandate is injected instead.
-            if (
-                round_count == 1
-                and not enforce_end_tag
-                and not has_preamble_intent
-                and not ss.completed_actions
-                and not tool_calls_this_turn
-                and not workspace_changes
-            ):
-                if raw_round_text.strip():
-                    final_response = re.sub(r'(?i)<done\s*/?>', '', raw_round_text).strip()
-                    if not ss.was_done_detected():
-                        ASCIIColors.info(f"[{self.name}] Round 1 conversational answer without <done/>. Terminating (conversational short-circuit).")
-                    if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
-                        try:
-                            streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
-                                "round_id": round_count,
-                                "status": "conversational"
-                            })
-                        except Exception:
-                            pass
-                    break
-
             # ── 🧹 DYNAMIC HISTORY SANITIZATION (Strict Non-Placeholder Strategy) ──
             if virtual_history:
                 history_len = len(virtual_history)
@@ -6654,42 +6664,45 @@ JSON:"""
                     ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Malformed tag detected, injecting format correction ===")
                 continue
 
-            # ── 🛑 ENFORCE END TAG MANDATE ──
-            # When enforce_end_tag=True, the turn MUST NOT terminate without an explicit <done/> tag.
-            if enforce_end_tag and not ss.was_done_detected() and not was_cancelled:
+            # ── 🛑 ENFORCE END TAG MANDATE (UNIVERSAL TERMINATION CONTRACT) ──
+            # The agentic loop MUST NOT terminate without an explicit <done/> or <end/> tag.
+            if not ss.was_done_detected() and not was_cancelled:
                 consecutive_stall_count = getattr(self, '_consecutive_stall_count', 0) + 1
                 object.__setattr__(self, '_consecutive_stall_count', consecutive_stall_count)
-                if consecutive_stall_count >= 4:
-                    ASCIIColors.warning(f"[{self.name}] Terminating after {consecutive_stall_count} consecutive stalls without <done/>.")
-                    final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
+                if consecutive_stall_count >= 5:
+                    ASCIIColors.warning(f"[{self.name}] Terminating after {consecutive_stall_count} consecutive rounds without <done/> or <end/>.")
+                    final_response = re.sub(r'(?i)</?(?:done|end)\s*/?>', '', ss.get_clean_text()).strip()
                     break
 
-                ASCIIColors.warning(f"[{self.name}] No <done/> detected (Round {round_count}, streak {consecutive_stall_count}/4). Enforcing continuation.")
-                virtual_history.append(SimpleNamespace(
-                    sender_type="assistant",
-                    content=ss.get_clean_text().strip()
-                ))
+                ASCIIColors.warning(f"[{self.name}] No <done/> or <end/> detected (Round {round_count}, streak {consecutive_stall_count}/5). Enforcing continuation.")
+                clean_round_text = ss.get_clean_text().strip()
+                if clean_round_text:
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="assistant",
+                        content=clean_round_text
+                    ))
                 recent_tool_names = [tc.get("name", "") for tc in tool_calls_this_turn[-3:]]
+                recent_ctx = f" Recent actions executed: {recent_tool_names}." if recent_tool_names else ""
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
                     content=(
-                        "[SYSTEM DIRECTIVE: You wrote conversational text without executing an action tag or emitting `<done/>`.\n"
-                        "Your task is NOT finished yet. Continue and perform the remaining steps requested by the user:\n"
-                        "- To execute Python code: `<tool>{\"name\": \"tool_execute_python_code\", \"parameters\": {\"code\": \"...\"}}</tool>`\n"
-                        "- To run shell/system commands: `<tool>{\"name\": \"tool_execute_shell_command\", \"parameters\": {\"command\": \"...\"}}</tool>`\n"
-                        "- To delete files: use workspace tools or safe shell commands (e.g., `del <file>` on Windows, `rm <file>` on Linux/macOS).\n"
-                        "- ONLY when ALL steps are genuinely completed and verified, write your final answer and emit `<done/>` on a new line.\n"
-                        "Do NOT write conversational preambles. Output the action tag NOW.]"
+                        f"[SYSTEM DIRECTIVE: TERMINATION REQUIREMENT{recent_ctx}\n"
+                        "Your previous response did NOT execute any action tag and did NOT emit `<done/>` or `<end/>`.\n"
+                        "The conversation does NOT stop until you explicitly finish or take an action.\n"
+                        "You have two options:\n"
+                        "1. If you need to perform more work, emit the appropriate functional tag (`<tool>`, `<artifact>`, `<unlock_file>`, etc.) NOW.\n"
+                        "2. If you have completely finished answering the user's request, provide your final response and you MUST append `<done/>` on a new line.\n"
+                        "Do not output conversational preambles without action tags or `<done/>`.]"
                     )
                 ))
                 ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
                 continue
 
             if not final_response:
-                final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
+                final_response = re.sub(r'(?i)</?(?:done|end)\s*/?>', '', ss.get_clean_text()).strip()
 
             if getattr(self, 'debug_mode', False):
-                ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Clean exit ===")
+                ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Clean exit with <done/> or <end/> ===")
             if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
                 try:
                     streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {

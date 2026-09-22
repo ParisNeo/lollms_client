@@ -43,6 +43,14 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-22 22:42]
+
+- `feat(lollms_client): refactor CLI and GUI interfaces with chat_page and env_config improvements`
+
+## [2026-09-22 22:26]
+
+- ---
+
 ## [2026-09-22 11:36]
 
 - docs(chat): update README examples to reflect new streaming callback parameter

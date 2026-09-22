@@ -204,3 +204,52 @@ if not client.has_vision_capability():
     # Automatically extracts image description using available VLM
     description = client.get_or_generate_image_description(image_bytes)
 ```
+
+---
+
+## 7. Embedded Configuration Wizard Pattern (Non-Standalone Mode)
+
+When embedding the Lollms Client configuration wizard inside a larger application (CLI, WebUI, Desktop GUI):
+
+### The Contract
+1. **The Calling Application Owns the Save Lifecycle**:
+   - The embedded wizard submenu MUST NOT write to disk prematurely or force `Save & Exit`.
+   - The calling app passes `standalone=False` to `build_wizard_menu()`.
+2. **In-Memory Mutation**:
+   - Modifications directly update the passed `config_map` in memory.
+   - Returning via `exit_text` ("↩ Back") returns control to the parent application.
+3. **Unified Persistence**:
+   - When the user selects "Save" in the host application, the host application executes `_save_and_validate(config_map, ...)` alongside its own application settings.
+
+### Host Application Code Example
+```python
+from lollms_client.lollms_config_cli_env import (
+    build_wizard_menu,
+    _load_existing_env_to_map,
+    _save_and_validate,
+    _extract_bindings_from_env,
+    _extract_profiles_from_env,
+)
+
+# 1. Host app loads existing config map
+app_config_map = _load_existing_env_to_map(cli_env_path=None)
+
+# 2. Host app embeds the wizard submenu
+menu, state = build_wizard_menu(
+    config_map=app_config_map,
+    title="Model & Provider Setup",
+    exit_text="↩ Back to My App",
+    exit_behavior="discard",  # Do not persist on back; let app manage it
+    standalone=False,          # Suppresses premature disk save options
+)
+
+# 3. User navigates and configures modalities in memory
+menu.run()
+
+# 4. Host app updates in-memory client profiles
+llm_bindings = _extract_bindings_from_env("LLM", app_config_map)
+llm_profiles = _extract_profiles_from_env("LLM", llm_bindings, app_config_map)
+
+# 5. Host app persists everything together on explicit application save
+_save_and_validate(app_config_map, test_connection=False)
+```

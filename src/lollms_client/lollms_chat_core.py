@@ -121,6 +121,43 @@ _IGNORED_WS_DIRS = {
 }
 _IGNORED_WS_EXTS = {".pyc", ".pyo", ".pyd", ".so", ".dll", ".dylib"}
 
+_EXPLICIT_BINARY_EXTS = {
+    ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet",
+    ".docx", ".pptx", ".odt", ".pdf", ".epub",
+    ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif", ".tiff", ".tif", ".ico",
+    ".zip", ".tar", ".gz", ".7z", ".rar", ".xz", ".bz2", ".zst",
+    ".pt", ".pth", ".ckpt", ".bin", ".safetensors", ".onnx",
+    ".h5", ".hdf5", ".gguf", ".pkl", ".pickle", ".joblib",
+    ".npy", ".npz", ".msgpack", ".pb", ".tflite", ".mlmodel",
+    ".mp3", ".wav", ".ogg", ".flac", ".m4a", ".wma", ".aac",
+    ".mp4", ".avi", ".mov", ".webm", ".mkv",
+    ".pyc", ".pyo", ".pyd", ".so", ".dll", ".dylib", ".exe"
+}
+
+def is_binary_file(file_path: Union[str, Path]) -> bool:
+    """Checks whether a file path points to a non-textual / binary file."""
+    if not file_path:
+        return False
+    p = Path(file_path)
+    if not p.exists() or not p.is_file():
+        return False
+    if p.suffix.lower() in _EXPLICIT_BINARY_EXTS:
+        return True
+    try:
+        with open(p, "rb") as f:
+            chunk = f.read(4096)
+            return b"\x00" in chunk
+    except Exception:
+        return True
+
+def is_binary_content(content: str) -> bool:
+    """Checks whether a string contains non-textual binary markers or raw base64 blobs."""
+    if not isinstance(content, str) or not content:
+        return False
+    if "\x00" in content:
+        return True
+    return is_large_base64(content)
+
 
 # ── Context Opacity & String Sanitization ───────────────────────────────────
 
@@ -1199,17 +1236,26 @@ def execute_context_visibility_operation(
 
         if target_visibility == ArtefactVisibility.FULL:
             content = ""
+            phys_target = art.get("physical_path") or art.get("title", "")
             if workspace_dir:
-                file_path = workspace_dir / art["title"]
+                file_path = workspace_dir / phys_target
                 if file_path.exists():
-                    try:
-                        content = file_path.read_text(encoding="utf-8", errors="ignore")
-                    except Exception:
-                        blocked_files.append((art["title"], 0))
-                        continue
+                    if is_binary_file(file_path):
+                        content = getattr(artefact_manager, "_get_lam_content", lambda a: "")(art)
+                        if not content:
+                            size = file_path.stat().st_size
+                            content = f"[Non-textual file: {phys_target} ({size:,} bytes). Raw binary content is withheld to protect the context window. Use appropriate tools to inspect or query this file.]"
+                    else:
+                        try:
+                            content = file_path.read_text(encoding="utf-8", errors="ignore")
+                        except Exception:
+                            blocked_files.append((art["title"], 0))
+                            continue
 
             if not content:
                 content = art.get("content", "")
+                if is_binary_content(content):
+                    content = getattr(artefact_manager, "_get_lam_content", lambda a: "")(art) or f"[Non-textual file: {phys_target}]"
 
             token_count = len(content) // 4
             if token_count > _MAX_UNLOCK_TOKENS:

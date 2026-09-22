@@ -317,6 +317,69 @@ _IGNORED_ARTEFACT_EXTS = {
     ".lam"
 }
 
+_EXPLICIT_BINARY_EXTS = {
+    ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet",
+    ".docx", ".pptx", ".odt", ".pdf", ".epub",
+    ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif", ".tiff", ".tif", ".ico",
+    ".zip", ".tar", ".gz", ".7z", ".rar", ".xz", ".bz2", ".zst",
+    ".pt", ".pth", ".ckpt", ".bin", ".safetensors", ".onnx",
+    ".h5", ".hdf5", ".gguf", ".pkl", ".pickle", ".joblib",
+    ".npy", ".npz", ".msgpack", ".pb", ".tflite", ".mlmodel",
+    ".mp3", ".wav", ".ogg", ".flac", ".m4a", ".wma", ".aac",
+    ".mp4", ".avi", ".mov", ".webm", ".mkv",
+}
+
+def is_binary_file(file_path: Union[str, Path]) -> bool:
+    """Checks whether a file path points to a non-textual / binary file."""
+    if not file_path:
+        return False
+    p = Path(file_path)
+    if not p.exists() or not p.is_file():
+        return False
+    if p.suffix.lower() in _EXPLICIT_BINARY_EXTS:
+        return True
+    try:
+        with open(p, "rb") as f:
+            chunk = f.read(4096)
+            return b"\x00" in chunk
+    except Exception:
+        return True
+
+def is_binary_content(content: str) -> bool:
+    """Checks whether a string contains non-textual binary markers."""
+    if not isinstance(content, str) or not content:
+        return False
+    if "\x00" in content:
+        return True
+    return False
+
+def is_lam_content(content: Any, logical_content: Optional[str] = None, atype: Optional[str] = None) -> bool:
+    """Returns True if the content is .lam / virtual metadata rather than physical file bytes."""
+    if not isinstance(content, str) or not content:
+        return False
+    if logical_content and content == logical_content:
+        return True
+    if atype == ArtefactType.DATA and (
+        logical_content or content.startswith(("# Data Interface:", "# SQLite Database:", "# Data Bundle:", "### Data File"))
+    ):
+        return True
+    lam_indicators = (
+        "# Data Interface:",
+        "# SQLite Database:",
+        "# Data Bundle:",
+        "# As-Is File:",
+        "### Data File Generated:",
+        "### Data File Modified:",
+        "### Data File:",
+        "### Binary File Detected:",
+        "### Binary File Modified:",
+        "### Binary File:",
+        "### Rich Document:",
+        "### Image:",
+    )
+    stripped = content.strip()
+    return any(stripped.startswith(ind) for ind in lam_indicators)
+
 
 def _is_ignored_path(path: Union[str, Path]) -> bool:
     """Returns True if the given file or directory path matches ignored compilation or internal artifacts."""
@@ -393,18 +456,36 @@ class ArtefactManager:
 
         clean_path = self._sanitize_path_segments(physical_path)
         filename = self._get_filename_with_ext(clean_path, atype, language, file_ext)
-        name_part, _ = os.path.splitext(filename) if '.' in filename else (filename, "")
+        file_stem = Path(filename).stem
 
         art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_path))
-        lam_path = self._get_versions_root() / art_id / f"{name_part}.lam"
+        # Primary flat location inside art_id folder
+        lam_path = self._get_versions_root() / art_id / f"{file_stem}.lam"
 
         if lam_path.exists():
             try:
                 return lam_path.read_text(encoding="utf-8", errors="ignore").strip()
             except Exception:
                 pass
+
+        # Legacy location check
+        name_part, _ = os.path.splitext(filename) if '.' in filename else (filename, "")
+        legacy_lam = self._get_versions_root() / art_id / f"{name_part}.lam"
+        if legacy_lam.exists():
+            try:
+                return legacy_lam.read_text(encoding="utf-8", errors="ignore").strip()
+            except Exception:
+                pass
+
         logical_content = art.get("logical_content", "")
-        return logical_content.strip() if isinstance(logical_content, str) else ""
+        if isinstance(logical_content, str) and logical_content.strip():
+            return logical_content.strip()
+
+        raw_content = art.get("content", "")
+        if is_lam_content(raw_content, logical_content, atype):
+            return raw_content.strip()
+
+        return ""
 
     def _get_all_raw(self) -> List[Dict]:
         metadata = self._discussion.metadata or {}
@@ -560,8 +641,10 @@ class ArtefactManager:
                 self._discussion, "disable_artefact_versioning", False
             )
 
-            name_part, ext_part = os.path.splitext(filename) if '.' in filename else (filename, "")
-            versioned_filename = f"{name_part}_v{version}{ext_part}"
+            file_basename = Path(filename).name
+            file_stem = Path(filename).stem
+            file_ext_part = Path(filename).suffix
+            versioned_filename = f"{file_stem}_v{version}{file_ext_part}"
 
             if versioning_enabled:
                 art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_path))
@@ -583,41 +666,22 @@ class ArtefactManager:
                 except Exception as e:
                     trace_exception(e)
 
-            if not wrote_physical and isinstance(content, str) and content:
-                is_binary_db = file_ext in (".db", ".sqlite", ".sqlite3")
-                if not is_binary_db:
-                    title_suffix = Path(title).suffix.lower()
-                    is_binary_db = title_suffix in (".db", ".sqlite", ".sqlite3")
+            # ── UNIVERSAL LAM PROTECTION: NEVER OVERWRITE PHYSICAL FILES WITH VIRTUAL METADATA ──
+            # The .lam content is strictly virtual metadata shown to the LLM.
+            # Regardless of file type or whether the file is empty (0 bytes), .lam content
+            # MUST NEVER be written into active_file_path.
+            is_virtual_lam = is_lam_content(content, logical_content, atype)
 
-                # ── INVARIANT: THE PHYSICAL TWIN IS IMMUTABLE AGAINST .LAM OVERWRITES ──
-                # We MUST NEVER replace a created physical artefact with its logical
-                # twin (.lam). The .lam is a schema/metadata abstraction destined
-                # exclusively for `.versions/{id}/{name}.lam`. When raw physical
-                # bytes are absent, string `content` may still be a legitimate
-                # verbatim text update — but ONLY for pure text artefacts. For
-                # any binary/rich format (docx, xlsx, db, pdf, images), string
-                # content can only be a .lam card, and an existing non-empty
-                # physical file must be preserved byte-for-byte.
-                _BINARY_TWIN_EXTS = {
-                    ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet",
-                    ".docx", ".pptx", ".odt", ".pdf", ".epub",
-                    ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif", ".tiff", ".tif", ".ico",
-                }
-                _target_ext = active_file_path.suffix.lower()
-                _is_binary_twin = _target_ext in _BINARY_TWIN_EXTS
-                if (
-                    _is_binary_twin
-                    and active_file_path.exists()
-                    and active_file_path.stat().st_size > 0
-                ):
-                    ASCIIColors.info(
-                        f"[ArtefactManager] Preserving existing physical file '{filename}' "
-                        f"({active_file_path.stat().st_size:,} bytes). Logical twin (.lam) holds metadata/schema."
-                    )
+            if is_virtual_lam:
+                # If physical file already exists (even if 0 bytes), preserve it!
+                if active_file_path.exists():
                     wrote_physical = True
-                elif is_binary_db:
-                    ASCIIColors.error(f"[ArtefactManager] Refusing to write text content to binary database file '{filename}'. Physical data is missing.")
-                    return False
+            elif not wrote_physical and isinstance(content, str) and content:
+                # Protect non-textual files from being written with raw text strings
+                is_bin_dest = is_binary_file(active_file_path) or active_file_path.suffix.lower() in _EXPLICIT_BINARY_EXTS
+                if is_bin_dest:
+                    if active_file_path.exists():
+                        wrote_physical = True
                 elif atype != ArtefactType.IMAGE or file_ext == ".svg":
                     try:
                         active_file_path.write_text(content, encoding="utf-8", errors="ignore")
@@ -626,28 +690,27 @@ class ArtefactManager:
                         wrote_physical = True
                     except Exception as e:
                         trace_exception(e)
-                if wrote_physical:
-                    object.__setattr__(
-                        self._discussion, "_workspace_write_revision",
-                        int(getattr(self._discussion, "_workspace_write_revision", 0)) + 1,
-                    )
+
+            if wrote_physical:
+                object.__setattr__(
+                    self._discussion, "_workspace_write_revision",
+                    int(getattr(self._discussion, "_workspace_write_revision", 0)) + 1,
+                )
 
             # 2. Write Logical Twin (.lam) into .versions/ — DISCUSSION MODE ONLY.
-            if versioning_enabled:
-                lam_filename = f"{name_part}.lam"
+            if versioning_enabled and art_version_dir:
+                lam_filename = f"{file_stem}.lam"
                 lam_path = art_version_dir / lam_filename
 
-                if logical_content:
+                lam_to_write = logical_content if logical_content else (content if is_virtual_lam else None)
+                if not lam_to_write and (atype in (ArtefactType.DATA, ArtefactType.IMAGE, ArtefactType.FILE) or active_file_path.suffix.lower() in _EXPLICIT_BINARY_EXTS):
+                    lam_to_write = f"# Artefact Metadata: {filename}\n- **Type**: {atype}\n- **Version**: {version}\n- **Physical Path**: {filename}\n\n"
+
+                if lam_to_write:
                     try:
-                        lam_path.write_text(logical_content, encoding="utf-8", errors="ignore")
+                        lam_path.write_text(lam_to_write, encoding="utf-8", errors="ignore")
                     except Exception as e:
                         trace_exception(e)
-                elif wrote_physical and atype in (ArtefactType.DATA, ArtefactType.IMAGE):
-                    minimal_lam = f"# Artefact Metadata: {filename}\n- **Type**: {atype}\n- **Version**: {version}\n- **Physical Path**: {filename}\n\n"
-                    try:
-                        lam_path.write_text(minimal_lam, encoding="utf-8", errors="ignore")
-                    except Exception:
-                        pass
 
         except Exception as e:
             ASCIIColors.warning(f"Failed to sync artifact '{title}' to disk: {e}")
@@ -673,6 +736,7 @@ class ArtefactManager:
         """
         Filesystem-as-Source-of-Truth reader.
         Reads content directly from the active file in the workspace root.
+        Strictly protects against reading non-textual binary content into memory.
         """
         title = art.get("title", "")
         atype = art.get("type", "document")
@@ -686,6 +750,12 @@ class ArtefactManager:
         try:
             active_file_path = self._resolve_confined_path(filename)
             if active_file_path.exists():
+                if is_binary_file(active_file_path):
+                    lam = self._get_lam_content(art)
+                    if lam:
+                        return lam
+                    size = active_file_path.stat().st_size
+                    return f"[Non-textual file: {clean_path} ({size:,} bytes). Raw binary content is withheld to protect the context window. Use appropriate tools to inspect or query this file.]"
                 return active_file_path.read_text(encoding="utf-8", errors="ignore")
         except PermissionError as pe:
             ASCIIColors.error(f"[ArtefactManager] Security block reading '{title}': {pe}")
@@ -1554,8 +1624,7 @@ class ArtefactManager:
     def _cleanup_artefact_files(self, title: str, version: Optional[int] = None):
         """
         Git-like deletion: removes the active file from the workspace root.
-        If keep_deleted_versions is True, preserves the .versions/ directory for restore.
-        If False (default), purges the entire .versions/{id} history to maintain disk-source-of-truth.
+        Cleans up empty parent subdirectories to keep workspace hygiene pristine.
         """
         try:
             ws_root = self._get_workspace_root()
@@ -1576,30 +1645,41 @@ class ArtefactManager:
                         active_path.unlink()
                     except Exception:
                         pass
+                    # Prune empty parent folders in the workspace
+                    curr = active_path.parent
+                    while curr != ws_root and curr.is_relative_to(ws_root):
+                        try:
+                            if not any(curr.iterdir()):
+                                curr.rmdir()
+                                curr = curr.parent
+                            else:
+                                break
+                        except Exception:
+                            break
 
-                # 2. Delete from .versions/ (unless keep_deleted_versions is True)
-                name_part, ext_part = os.path.splitext(filename) if '.' in filename else (filename, "")
+                # 2. Delete from .versions/
+                file_stem = Path(filename).stem
+                file_ext_part = Path(filename).suffix
                 art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_path))
                 art_version_dir = versions_root / art_id
 
                 if getattr(self, 'keep_deleted_versions', False):
                     if version is not None and art_version_dir.exists():
-                        versioned_phys = art_version_dir / f"{name_part}_v{version}{ext_part}"
+                        versioned_phys = art_version_dir / f"{file_stem}_v{version}{file_ext_part}"
                         if versioned_phys.exists():
                             try:
                                 versioned_phys.unlink()
                             except Exception:
                                 pass
-                    ASCIIColors.info(f"[ArtefactManager] Preserved version history for '{title}' in .versions/ (keep_deleted_versions=True)")
                 else:
                     if version is not None and art_version_dir.exists():
-                        versioned_phys = art_version_dir / f"{name_part}_v{version}{ext_part}"
+                        versioned_phys = art_version_dir / f"{file_stem}_v{version}{file_ext_part}"
                         if versioned_phys.exists():
                             try:
                                 versioned_phys.unlink()
                             except Exception:
                                 pass
-                        versioned_lam = art_version_dir / f"{name_part}.lam"
+                        versioned_lam = art_version_dir / f"{file_stem}.lam"
                         if versioned_lam.exists():
                             try:
                                 versioned_lam.unlink()
@@ -1623,8 +1703,7 @@ class ArtefactManager:
         """
         Filesystem-as-Source-of-Truth Synchronization.
         Scans the workspace root and purges database records for files that no longer exist on disk.
-        Strictly ignores compilation files (__pycache__, .pyc, .versions).
-        Returns the list of purged artifact titles.
+        Preserves relative subfolder paths accurately.
         """
         purged: List[str] = []
         try:
@@ -1639,7 +1718,6 @@ class ArtefactManager:
                     if _is_ignored_path(rel):
                         continue
                     active_files_on_disk.add(str(rel).replace("\\", "/"))
-                    active_files_on_disk.add(f.name)
 
             arts = self._get_all_raw()
             existing_titles = {a.get("title") for a in arts}
@@ -1649,18 +1727,6 @@ class ArtefactManager:
                 if title.endswith("::images"):
                     parent_title = title.rsplit("::images", 1)[0]
                     if parent_title in existing_titles:
-                        continue
-                    orphaned_titles.append(title)
-                    continue
-
-                if a.get("type") == "image":
-                    phys_path = a.get("physical_path") or title
-                    clean_path = self._sanitize_path_segments(phys_path)
-                    filename = self._get_filename_with_ext(
-                        clean_path, a.get("type", "image"),
-                        a.get("language"), a.get("file_ext")
-                    )
-                    if filename in active_files_on_disk:
                         continue
                     orphaned_titles.append(title)
                     continue
@@ -1676,16 +1742,13 @@ class ArtefactManager:
                     a.get("language"),
                     a.get("file_ext")
                 )
-                safe_fname = sanitize_artifact_filename(a.get("title", ""))
 
                 file_on_disk = (
                     filename in active_files_on_disk
                     or clean_path in active_files_on_disk
                     or a.get("title") in active_files_on_disk
-                    or safe_fname in active_files_on_disk
                     or (ws_root / filename).exists()
                     or (ws_root / clean_path).exists()
-                    or (ws_root / safe_fname).exists()
                 )
 
                 if not file_on_disk:
@@ -2100,6 +2163,11 @@ class ArtefactManager:
 
                 if not content_text:
                     continue
+
+                # 🛡️ PROTECT LLM FROM NON-TEXTUAL CONTENT
+                if is_binary_content(content_text):
+                    lam = self._get_lam_content(item).strip()
+                    content_text = lam if lam else f"[Non-textual file: {display_path}. Raw binary content is withheld to protect the context window. Use appropriate tools to inspect or query this file.]"
 
                 _MAX_FULL_CONTENT_CHARS = 200_000
                 was_truncated = False
