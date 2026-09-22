@@ -209,6 +209,21 @@ _BINARY_BLOB_KEYS = {
     "binary", "raw_image", "image_data", "raw_data",
 }
 
+_EXPLICIT_BINARY_EXTS = {
+    ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet",
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg",
+    ".zip", ".tar", ".gz", ".7z", ".rar", ".xz", ".bz2", ".zst",
+    ".pt", ".pth", ".ckpt", ".bin", ".safetensors", ".onnx",
+    ".h5", ".hdf5", ".gguf", ".pkl", ".pickle", ".joblib",
+    ".npy", ".npz", ".msgpack", ".pb", ".tflite", ".mlmodel",
+}
+
+_ML_WEIGHT_EXTS = {
+    ".pt", ".pth", ".ckpt", ".bin", ".safetensors", ".onnx",
+    ".h5", ".hdf5", ".gguf", ".pkl", ".pickle", ".joblib",
+    ".npy", ".npz", ".msgpack", ".pb", ".tflite", ".mlmodel",
+}
+
 _MAX_TOOL_RESULT_CHARS = 24000
 
 def _calculate_dynamic_tool_char_limit(client: Optional[Any] = None) -> int:
@@ -3117,17 +3132,14 @@ class ChatMixin:
                 except Exception as read_err:
                     ASCIIColors.warning(f"[ChatMixin] Failed to read physical bytes for '{file_name}': {read_err}")
 
-            EXPLICIT_BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet",
-                                    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
-                                    ".zip", ".tar", ".gz"}
-
             should_read_content = True
             content_placeholder = None
+            physical_bytes = rich_doc_bytes
 
             if rich_doc_content is not None:
                 should_read_content = False
                 content_placeholder = rich_doc_content
-            elif file_ext in EXPLICIT_BINARY_EXTS:
+            elif file_ext in _EXPLICIT_BINARY_EXTS:
                 should_read_content = False
                 content_placeholder = (
                     f"### Data File Generated: `{file_name}`\n\n"
@@ -3137,6 +3149,10 @@ class ChatMixin:
                     f"- **Location**: `./{file_name}`\n\n"
                     f"> **Action**: You can download this file from the Workspace Artifacts panel or reference it in SQL/Python tools."
                 )
+                try:
+                    physical_bytes = file_path.read_bytes()
+                except Exception as read_err:
+                    ASCIIColors.warning(f"[ChatMixin] Failed to read physical bytes for '{file_name}': {read_err}")
             else:
                 try:
                     with open(file_path, 'rb') as f:
@@ -3151,6 +3167,10 @@ class ChatMixin:
                                 f"- **Location**: `./{file_name}`\n\n"
                                 f"> **Action**: Download from Workspace Artifacts panel."
                             )
+                            try:
+                                physical_bytes = file_path.read_bytes()
+                            except Exception as read_err:
+                                ASCIIColors.warning(f"[ChatMixin] Failed to read physical bytes for '{file_name}': {read_err}")
                         else:
                             forced_content = file_path.read_text(encoding='utf-8', errors='ignore')
                             file_info["content"] = forced_content
@@ -3160,6 +3180,8 @@ class ChatMixin:
                     content_placeholder = f"### File Error: `{file_name}`\n\nFailed to read or inspect file: {e}"
 
             if not should_read_content and content_placeholder:
+                if file_ext in _ML_WEIGHT_EXTS:
+                    atype = "data"
                 existing_art = self.artefacts.get(file_name)
                 _agentic_mode = bool(getattr(self, "disable_artefact_versioning", False))
                 if existing_art:
@@ -3169,9 +3191,9 @@ class ChatMixin:
                         new_type=atype,
                         active=False,
                         visibility=ArtefactVisibility.TREE_UNLOCKABLE,
-                        physical_data=rich_doc_bytes,
+                        physical_data=physical_bytes,
                         logical_content=None if _agentic_mode else content_placeholder,
-                        commit_message=f"Updated rich document by tool '{tool_name}'"
+                        commit_message=f"Updated binary file by tool '{tool_name}'"
                     )
                 else:
                     art = self.artefacts.add(
@@ -3180,7 +3202,7 @@ class ChatMixin:
                         content=content_placeholder,
                         active=False,
                         visibility=ArtefactVisibility.TREE_UNLOCKABLE,
-                        physical_data=rich_doc_bytes,
+                        physical_data=physical_bytes,
                         logical_content=None if _agentic_mode else content_placeholder,
                         commit_message=f"Created by tool '{tool_name}'"
                     )
@@ -3261,17 +3283,14 @@ class ChatMixin:
                     except Exception as read_err:
                         ASCIIColors.warning(f"[ChatMixin] Failed to read physical bytes for '{file_name}': {read_err}")
 
-                EXPLICIT_BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet",
-                                        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
-                                        ".zip", ".tar", ".gz"}
-
                 should_read_content = True
                 content_placeholder = None
+                physical_bytes = rich_doc_bytes
 
                 if rich_doc_content is not None:
                     should_read_content = False
                     content_placeholder = rich_doc_content
-                elif file_ext in EXPLICIT_BINARY_EXTS:
+                elif file_ext in _EXPLICIT_BINARY_EXTS:
                     should_read_content = False
                     content_placeholder = (
                         f"### Data File Modified: `{file_name}`\n\n"
@@ -3281,6 +3300,10 @@ class ChatMixin:
                         f"- **Location**: `./{file_name}`\n\n"
                         f"> **Action**: You can download this file from the Workspace Artifacts panel or reference it in SQL/Python tools."
                     )
+                    try:
+                        physical_bytes = file_path.read_bytes()
+                    except Exception as read_err:
+                        ASCIIColors.warning(f"[ChatMixin] Failed to read physical bytes for '{file_name}': {read_err}")
                 else:
                     try:
                         with open(file_path, 'rb') as f:
@@ -3295,6 +3318,10 @@ class ChatMixin:
                                     f"- **Location**: `./{file_name}`\n\n"
                                     f"> **Action**: Download from Workspace Artifacts panel."
                                 )
+                                try:
+                                    physical_bytes = file_path.read_bytes()
+                                except Exception as read_err:
+                                    ASCIIColors.warning(f"[ChatMixin] Failed to read physical bytes for '{file_name}': {read_err}")
                             else:
                                 forced_content = file_path.read_text(encoding='utf-8', errors='ignore')
                                 after_info["content"] = forced_content
@@ -3311,6 +3338,8 @@ class ChatMixin:
                             img_mtypes = [f"image/{file_ext[1:]}"]
                         except Exception as ex:
                             trace_exception(ex)
+                    elif file_ext in _ML_WEIGHT_EXTS:
+                        atype = "data"
 
                     existing_art = self.artefacts.get(file_name)
                     if existing_art:
@@ -3323,6 +3352,7 @@ class ChatMixin:
                             active=(atype == "image"),
                             visibility=ArtefactVisibility.FULL if atype == "image" else ArtefactVisibility.TREE_UNLOCKABLE,
                             bump_version=True,
+                            physical_data=physical_bytes,
                             commit_message=f"Updated binary file reference by tool '{tool_name}'"
                         )
                     else:
@@ -3334,6 +3364,7 @@ class ChatMixin:
                             image_media_types=img_mtypes,
                             active=(atype == "image"),
                             visibility=ArtefactVisibility.FULL if atype == "image" else ArtefactVisibility.TREE_UNLOCKABLE,
+                            physical_data=physical_bytes,
                             commit_message=f"Created by tool '{tool_name}'"
                         )
                     self.commit()

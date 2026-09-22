@@ -689,7 +689,6 @@ This combination of architectural persistence (Dual-Copy) and explicit cognitive
 
 The `chat()` method is the primary entry point for interacting with the LollmsDiscussion session. It orchestrates the entire agentic loop, including pre-hydration, multi-step reasoning, tool execution, and self-healing file restoration.
 
-```python
 def chat(
     self,
     user_message: str,

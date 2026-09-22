@@ -1119,26 +1119,27 @@ def chat(
     tools=None,
     add_user_message: bool = True,
     images=None,
-    debug: bool = False,
+    streaming_callback: Callable[[Any, MSG_TYPE, dict], bool] = None,
     remove_thinking_blocks: bool = True,
     enable_image_generation: bool = True,
     enable_image_editing:    bool = True,
     auto_activate_artefacts: bool = True,
     enable_inline_widgets:        bool = False,
+    enable_forms:                 bool = False,
     enable_notes:                 bool = True,
     enable_skills:                bool = True,
-    enable_forms:                 bool = True,
     enable_books:                 bool = False,
     enable_presentations:         bool = False,
     memory_manager=None,
     enable_artefacts:             bool = True,
     enable_memory:                bool = True,
+    enable_episodic_memory:       bool = True,
     enable_auto_dream:            bool = True,
     enable_deep_memory_pulling:   bool = True,
     prehydrate_rag:               bool = True,
-    max_reasoning_steps:          int = 20,
+    max_nb_rounds:                Optional[int] = None,
+    max_reasoning_steps:          Optional[int] = None,
     enable_in_message_status:     bool = False,
-    enable_sub_agents:            bool = False,
     forward_artefact_chunks:      bool = False,
     fast_artefact_replicas:       Optional[List[str]] = None,
     tolerance_level:              Optional[str] = "strict",
@@ -1146,18 +1147,34 @@ def chat(
     enable_data_tools:            bool = True,
     enable_code_execution:        bool = False,
     suppress_images:              bool = False,
+    orchestrator_mode:            bool = False,
+    orchestrator_persona:         bool = False,
     debug_export:                 bool = False,
+    debug:                        bool = False,
+    enable_vlm_query:             bool = False,
+    enable_computer_use:          bool = False,
+    event_mode:                   EventMode = EventMode.PROCESSING_TAG_MODE,
+    think:                        Optional[bool] = None,
+    reasoning_effort:             Optional[str] = None,
+    reasoning_summary:            Optional[str] = None,
+    shell_autonomy_level:         Optional[str] = "safe",
+    python_autonomy_level:        Optional[str] = "safe",
+    auto_approve_python:          bool = False,
+    confirm_handler:              Optional[Callable] = None,
     **kwargs
 ) -> Dict[str, Any]:
 ```
 
 **Key Parameters:**
 
-*   **Core Conversation**: `user_message`, `personality`, `branch_tip_id`, `add_user_message`, `images`, `suppress_images` (set `True` for non-vision LLMs).
+*   **Core Conversation**: `user_message`, `personality`, `branch_tip_id`, `add_user_message`, `images`, `suppress_images` (set `True` for non-vision LLMs), `streaming_callback` (receives chunks, `MSG_TYPE` events, and metadata dicts).
 *   **Feature Flags**: `enable_artefacts`, `enable_inline_widgets`, `enable_notes`, `enable_skills`, `enable_forms`, `enable_books`, `enable_presentations`, `enable_image_generation`, `enable_image_editing`.
-*   **Security Gates**: `allow_dynamic_tools` (LLM writes its own tools), `enable_code_execution` (arbitrary Python string execution), `enable_data_tools` (auto-mounts `semantic_data_engineer` if data files exist).
-*   **Memory & RAG**: `memory_manager`, `enable_memory`, `enable_deep_memory_pulling`, `enable_auto_dream`, `prehydrate_rag`.
-*   **Debugging & UI**: `debug`, `debug_export`, `enable_in_message_status`, `remove_thinking_blocks`, `event_mode` (see Event Modes below).
+*   **Agentic Loop**: `max_nb_rounds` (primary round budget, defaults to 20 if `None`), `max_reasoning_steps` (deprecated alias for `max_nb_rounds`), `orchestrator_mode` (runs the turn through the two-tier `AgenticRunner`: delegation-only Orchestrator spawning bounded Workers), `orchestrator_persona` (delegation-only persona inside the standard loop — no tool grammar, no artifact writes), `tolerance_level`, `forward_artefact_chunks`, `fast_artefact_replicas`.
+*   **Security Gates**: `allow_dynamic_tools` (LLM writes its own tools), `enable_code_execution` (arbitrary Python string execution), `enable_data_tools` (auto-mounts `semantic_data_engineer` if data files exist), `enable_vlm_query` (mounts `tool_vlm_query` vision fallback when the active model lacks vision), `enable_computer_use` (mounts the desktop automation toolset — requires a vision-capable model).
+*   **Human-in-the-Loop Autonomy**: `shell_autonomy_level` (`"safe"` / `"full_access"`), `python_autonomy_level` (`"safe"` / `"full_access"`), `auto_approve_python` (bypass confirmations for headless runs), `confirm_handler` (custom UI confirmation callback).
+*   **Memory & RAG**: `memory_manager`, `enable_memory`, `enable_episodic_memory` (set `False` to skip saving conversation turns as episodic memories), `enable_deep_memory_pulling`, `enable_auto_dream`, `prehydrate_rag`.
+*   **Reasoning Controls**: `think` (legacy flag; `True` maps to `reasoning_effort="high"`), `reasoning_effort` (`'low'` / `'medium'` / `'high'` / `'max'`), `reasoning_summary` (`'auto'` / `'concise'` / `'detailed'`).
+*   **Debugging & UI**: `debug` (mounts the `debug_toolset` LCP library), `debug_export` (per-turn scientific debug dumps), `enable_in_message_status`, `remove_thinking_blocks`, `event_mode` (see Event Modes below).
 
 **Return Value:**
 Returns a dictionary containing the complete result of the conversational turn:
@@ -1170,7 +1187,8 @@ Returns a dictionary containing the complete result of the conversational turn:
     "artefacts": List[Dict],        # Artifacts created/modified this turn
     "memory_report": Dict,          # Memory operations report
     "dream_report": Optional[Dict], # Auto-dream consolidation report
-    "was_cancelled": bool           # Cancellation status
+    "was_cancelled": bool,          # Cancellation status
+    "tti_available": bool           # Whether a text-to-image engine is available
 }
 ```
 
