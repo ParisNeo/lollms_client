@@ -651,31 +651,29 @@ class LollmsClient():
         if getattr(self, "use_fast_token_estimate", False):
             return self._estimate_tokens_locally(text, self._fast_token_coefficient)
 
-        # In-memory MD5 token-count caching to prevent redundant backend server floods
-        import hashlib
-        text_hash = hashlib.md5(text.encode('utf-8', errors='ignore')).hexdigest()
+        # Fast in-memory token count caching to prevent redundant tokenizer round-trips
+        cache_key = f"{len(text)}:{hash(text)}"
         if not hasattr(self, "_token_count_cache"):
             self._token_count_cache = {}
 
-        if text_hash in self._token_count_cache:
-            return self._token_count_cache[text_hash]
+        cached = self._token_count_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
         if self.llm:
             if not getattr(self, "_remote_tokenizer_healthy", True):
                 count = len(text) // 4
-                self._token_count_cache[text_hash] = count
+                self._token_count_cache[cache_key] = count
                 return count
             try:
-                # Attempt to get exact token count from active LLM binding
                 count = self.llm.count_tokens(text)
                 self._remote_tokenizer_healthy = True
-                self._token_count_cache[text_hash] = count
+                self._token_count_cache[cache_key] = count
                 return count
             except Exception:
-                # Fast offline fallback: estimate tokens to prevent external API flooding on connection errors
                 self._remote_tokenizer_healthy = False
                 count = len(text) // 4
-                self._token_count_cache[text_hash] = count
+                self._token_count_cache[cache_key] = count
                 return count
         raise RuntimeError("LLM binding not initialized.")
 

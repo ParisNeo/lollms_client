@@ -2886,26 +2886,29 @@ class LollmsPersonality:
         return base_prompt + "\n" + new_ws_block.strip()
 
     def _calculate_context_fill(self, full_system_prompt: str, base_conversation: List[Dict], virtual_history: List, final_response: str = "") -> Dict[str, Any]:
-        """Calculates the current context window fill percentage."""
+        """Calculates current context window fill percentage using fast cached token lookups."""
         try:
+            max_ctx = 0
             if self.lollms_client and hasattr(self.lollms_client, 'get_ctx_size'):
                 max_ctx = self.lollms_client.get_ctx_size() or 0
-                if max_ctx > 0 and hasattr(self.lollms_client, 'count_tokens'):
-                    total_used = self.lollms_client.count_tokens(full_system_prompt)
-                    for msg in base_conversation:
-                        total_used += self.lollms_client.count_tokens(msg.get("content", ""))
-                    for vh in virtual_history:
-                        total_used += self.lollms_client.count_tokens(vh.content)
-                    total_used += self.lollms_client.count_tokens(final_response)
+            if max_ctx <= 0:
+                max_ctx = 8192
 
-                    if total_used <= 0:
-                        return {"used_tokens": 0, "max_tokens": max_ctx, "fill_percentage": 0.0}
+            total_used = self._count_tokens_cached(full_system_prompt)
+            for msg in base_conversation:
+                total_used += self._count_tokens_cached(msg.get("content", ""))
+            for vh in virtual_history:
+                content = getattr(vh, "content", "")
+                if content:
+                    total_used += self._count_tokens_cached(content)
+            if final_response:
+                total_used += self._count_tokens_cached(final_response)
 
-                    return {
-                        "used_tokens": total_used,
-                        "max_tokens": max_ctx,
-                        "fill_percentage": round((total_used / max_ctx) * 100, 1)
-                    }
+            return {
+                "used_tokens": total_used,
+                "max_tokens": max_ctx,
+                "fill_percentage": round((total_used / max_ctx) * 100, 1)
+            }
         except Exception:
             pass
         return {"used_tokens": 0, "max_tokens": 0, "fill_percentage": 0.0}
@@ -3029,9 +3032,26 @@ JSON:"""
 
         return user_prompt
 
+    def _count_tokens_cached(self, text: str) -> int:
+        """Fast cached token counter: caches by string length and hash to eliminate redundant tokenizations."""
+        if not text:
+            return 0
+        if not hasattr(self, "_token_cache"):
+            object.__setattr__(self, "_token_cache", {})
+        cache_key = f"{len(text)}:{hash(text)}"
+        cached = self._token_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        if self.lollms_client and hasattr(self.lollms_client, "count_tokens"):
+            count = self.lollms_client.count_tokens(text) or 0
+        else:
+            count = len(text) // 4
+        self._token_cache[cache_key] = count
+        return count
+
     def _calculate_context_telemetry(self, stable_prompt: str, history: List[Dict], ws_ctx: str, virtual_history: List) -> Dict[str, int]:
-        """Calculates token consumption per context segment using the LLM client's tokenizer.
-        Does NOT trigger workspace sync — uses the provided ws_ctx string as-is."""
+        """Calculates token consumption per context segment using cached token counts."""
         telemetry = {
             "system_prompt": 0,
             "history": 0,
@@ -3040,26 +3060,28 @@ JSON:"""
             "virtual_history": 0,
             "total": 0
         }
-        if not self.lollms_client or not hasattr(self.lollms_client, 'count_tokens'):
+        if not self.lollms_client:
             return telemetry
 
         try:
-            telemetry["system_prompt"] = self.lollms_client.count_tokens(stable_prompt)
+            telemetry["system_prompt"] = self._count_tokens_cached(stable_prompt)
 
             for msg in history:
-                telemetry["history"] += self.lollms_client.count_tokens(msg.get("content", ""))
+                telemetry["history"] += self._count_tokens_cached(msg.get("content", ""))
 
             if ws_ctx:
-                telemetry["workspace_tree"] = self.lollms_client.count_tokens(ws_ctx)
-
                 if "## Fully Loaded File Contents [C]" in ws_ctx:
                     parts = ws_ctx.split("## Fully Loaded File Contents [C]", 1)
                     if len(parts) == 2:
-                        telemetry["loaded_contents"] = self.lollms_client.count_tokens(parts[1])
-                        telemetry["workspace_tree"] = self.lollms_client.count_tokens(parts[0])
+                        telemetry["loaded_contents"] = self._count_tokens_cached(parts[1])
+                        telemetry["workspace_tree"] = self._count_tokens_cached(parts[0])
+                else:
+                    telemetry["workspace_tree"] = self._count_tokens_cached(ws_ctx)
 
             for vh in virtual_history:
-                telemetry["virtual_history"] += self.lollms_client.count_tokens(vh.content)
+                content = getattr(vh, "content", "")
+                if content:
+                    telemetry["virtual_history"] += self._count_tokens_cached(content)
 
             telemetry["total"] = sum(telemetry.values())
 
@@ -7009,21 +7031,25 @@ JSON:"""
         try:
             if self.lollms_client and hasattr(self.lollms_client, 'get_ctx_size'):
                 max_ctx = self.lollms_client.get_ctx_size() or 0
-                if max_ctx > 0:
-                    total_used = 0
-                    if hasattr(self.lollms_client, 'count_tokens'):
-                        total_used = self.lollms_client.count_tokens(stable_system_prompt)
-                        if use_internal_history:
-                            for msg in self._conversation:
-                                total_used += self.lollms_client.count_tokens(msg.get("content", ""))
-                        for vh in virtual_history:
-                            total_used += self.lollms_client.count_tokens(vh.content)
-                        total_used += self.lollms_client.count_tokens(final_response)
-                    context_health = {
-                        "used_tokens": total_used,
-                        "max_tokens": max_ctx,
-                        "fill_percentage": round((total_used / max_ctx) * 100, 1)
-                    }
+                if max_ctx <= 0:
+                    max_ctx = 8192
+
+                total_used = self._count_tokens_cached(stable_system_prompt)
+                if use_internal_history:
+                    for msg in self._conversation:
+                        total_used += self._count_tokens_cached(msg.get("content", ""))
+                for vh in virtual_history:
+                    content = getattr(vh, "content", "")
+                    if content:
+                        total_used += self._count_tokens_cached(content)
+                if final_response:
+                    total_used += self._count_tokens_cached(final_response)
+
+                context_health = {
+                    "used_tokens": total_used,
+                    "max_tokens": max_ctx,
+                    "fill_percentage": round((total_used / max_ctx) * 100, 1)
+                }
         except Exception:
             pass
 

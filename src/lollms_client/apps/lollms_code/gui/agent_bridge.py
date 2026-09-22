@@ -212,6 +212,9 @@ def create_client(env: EnvStore, prefs: GuiPrefs):
         except Exception:
             pass
 
+    # ⚡ Enable fast token estimation (heuristic, no remote tokenizer HTTP calls)
+    client.enable_fast_token_estimate()
+
     return client
 
 

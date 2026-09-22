@@ -4835,18 +4835,32 @@ class ChatMixin:
             if reasoning_summary is not None:
                 gen_kwargs["reasoning_summary"] = reasoning_summary
 
-            # ── 📊 CONTEXT FILL TELEMETRY & AUTO-COMPACTION GATE ──
+            # ── 📊 CONTEXT FILL TELEMETRY & AUTO-COMPACTION GATE (CACHED O(1) LOOKUP) ──
             try:
                 total_tokens = 0
-                if self.lollmsClient and hasattr(self.lollmsClient, "count_tokens"):
+                if self.lollmsClient:
+                    if not hasattr(self, "_chat_token_cache"):
+                        object.__setattr__(self, "_chat_token_cache", {})
+
+                    def _count_msg_tokens_cached(text_val: str) -> int:
+                        if not text_val:
+                            return 0
+                        ckey = f"{len(text_val)}:{hash(text_val)}"
+                        hit = self._chat_token_cache.get(ckey)
+                        if hit is not None:
+                            return hit
+                        c_val = self.lollmsClient.count_tokens(text_val) or (len(text_val) // 4)
+                        self._chat_token_cache[ckey] = c_val
+                        return c_val
+
                     for msg in messages_list:
                         content = msg.get("content", "") if isinstance(msg, dict) else ""
                         if isinstance(content, str):
-                            total_tokens += self.lollmsClient.count_tokens(content)
+                            total_tokens += _count_msg_tokens_cached(content)
                         elif isinstance(content, list):
                             for part in content:
                                 if isinstance(part, dict) and part.get("type") == "text":
-                                    total_tokens += self.lollmsClient.count_tokens(part.get("text", ""))
+                                    total_tokens += _count_msg_tokens_cached(part.get("text", ""))
 
                 max_ctx = 4096
                 if self.lollmsClient and hasattr(self.lollmsClient, "get_ctx_size"):
