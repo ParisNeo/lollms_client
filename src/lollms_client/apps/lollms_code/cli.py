@@ -96,7 +96,7 @@ For every non-trivial task, you MUST maintain a macro-level plan in `.lollms_cod
    - Never finish with `<done/>` before executing and inspecting the output!
 3. **SYSTEM SHELL EXECUTION**: Use `tool_execute_shell_command` to run tests, scripts, or OS commands.
    - On Windows, the shell is `cmd.exe`. Use `del` to delete files (NOT `rm`), `rmdir /s /q` to delete directories (NOT `rm -rf`), `dir` to list, and `type` to view. Never use `rm` on Windows.
-   - To check file deletion, use `python -c "import os; print(not os.path.exists('file'))"` or `if not exist file.py (echo DELETED)`. Do not use `dir <deleted_file>` which returns exit code 1.
+   - To check file deletion on Windows, use `if not exist file.py (echo DELETED)`. Do not use `dir <deleted_file>` which returns exit code 1.
 4. **TERMINATION**: When all objectives are met and verified, summarize your work and end with `<done/>` on a new line.
 === END AUTONOMOUS EXECUTION & SHELL CAPABILITIES ===
 """
@@ -268,8 +268,7 @@ You have access to the `tool_execute_shell_command` tool. This is used for runni
 2. **CODE EXECUTION**: To execute Python code, use `python scripts/script.py` or `python -c "import math; print(math.pi)"`.
 3. **PACKAGE MANAGEMENT**: If a package is missing, use `pip install package_name`.
 4. **TESTING**: Run tests using `python -m pytest` or `python -m unittest`.
-5. **WINDOWS COMMAND PROMPT (cmd.exe)**: When running on Windows, the shell is `cmd.exe`. Use `del` to delete files (NOT `rm`), `rmdir /s /q` to delete directories (NOT `rm -rf`), `dir` to list files, and `type` to view files. Never use `rm` on Windows. To check if a file is deleted without tripping exit-code errors, use `python -c "import os; print(not os.path.exists('file'))"` or `if not exist file.py (echo DELETED)` (do not use `dir <deleted_file>` which returns exit code 1).
-
+5. **WINDOWS COMMAND PROMPT (cmd.exe)**: When running on Windows, the shell is `cmd.exe`. Use `del` to delete files (NOT `rm`), `rmdir /s /q` to delete directories (NOT `rm -rf`), `dir` to list files, and `type` to view files. Never use `rm` on Windows. To check if a file is deleted without tripping exit-code errors, use `if not exist file.py (echo DELETED)` (do not use `dir <deleted_file>` which returns exit code 1).
 ### GIT OPERATIONS (HIGH-EFFICIENCY PROTOCOL)
 When asked to "commit", "push", or perform any git operation, you MUST follow this 2-round protocol:
 - **Round 1**: Run `git diff` (or `git diff --stat` for large changes) to inspect what changed. DO NOT unlock or load any files into context.
@@ -531,6 +530,7 @@ class CodeAgentConfig:
         self.skills_dir: str = str(APP_DEFAULT_SKILLS_DIR)
         self.memory_db: str = f"sqlite:///{APP_DEFAULT_MEMORY_DB}"
         self.handbag_path: str = str(APP_DEFAULT_HANDBAG_DIR / "default_coder")
+        self.auto_approve_python: bool = False
         self.show_tool_calls: bool = True
         self.show_workspace_changes: bool = True
         self.show_skills: bool = True
@@ -739,6 +739,9 @@ class CodeAgentConfig:
                 "is_default": True,
                 "forced_context_size": 8192
             }
+
+        if getattr(cli_args, "auto_approve_python", False):
+            config.auto_approve_python = True
 
         if cli_args.workspace:
             config.workspace_path = str(Path(cli_args.workspace).resolve())
@@ -1023,9 +1026,12 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
     host_tool_configs = {
         "system_shell": {
             "autonomy_level": config.shell_autonomy_level
+        },
+        "execute_python": {
+            "autonomy_level": config.shell_autonomy_level,
+            "auto_approve": getattr(config, "auto_approve_python", False)
         }
     }
-
     client_kwargs = {
         "tools_binding_name": "lcp",
         "tools_binding_config": {
@@ -1674,8 +1680,13 @@ class StreamRenderer:
                 error = meta.get("error")
                 params = meta.get("parameters", {})
 
-                status_str = "[bold green]✅ Success[/bold green]" if success else "[bold red]❌ Failed[/bold red]"
-                border = "green" if success else "red"
+                # Defense-in-depth: If output contains explicit failure indicators, enforce failure styling
+                log_source = output if success else (error or output or "")
+                log_source_str = str(log_source or "")
+                is_actual_success = bool(success) and not ("Tool Execution Failed" in log_source_str or "BLOCKED BY SANDBOX" in log_source_str)
+
+                status_str = "[bold green]✅ Success[/bold green]" if is_actual_success else "[bold red]❌ Failed[/bold red]"
+                border = "green" if is_actual_success else "red"
 
                 content_parts = [f"[cyan]Status:[/cyan] {status_str}"]
 
@@ -1697,7 +1708,7 @@ class StreamRenderer:
                 max_lines = 30
                 display_logs = log_lines[:15] + [f"\n... [{len(log_lines)-30} lines omitted for display] ...\n"] + log_lines[-15:] if len(log_lines) > max_lines else log_lines
 
-                log_label = "Execution Output" if success else "Error Details"
+                log_label = "Execution Output" if is_actual_success else "Error Details"
                 content_parts.append(f"\n[bold cyan]{log_label}:[/bold cyan]")
                 for ll in display_logs:
                     content_parts.append(f"  {_clean_str(ll)}")
@@ -1932,12 +1943,15 @@ class StreamRenderer:
             if msg_type == MSG_TYPE.MSG_TYPE_TOOL_END and meta and meta.get("stream_complete") and "success" not in meta:
                 return True
             if msg_type == MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START and meta:
-                start_key = (meta.get("title"), meta.get("is_patch"))
+                title_val = meta.get("title")
+                start_key = title_val or "artifact"
                 if start_key in self._rendered_artefact_starts:
                     return True
                 self._rendered_artefact_starts.add(start_key)
             if msg_type == MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END and meta:
-                end_key = (meta.get("title"), meta.get("is_patch"))
+                title_val = meta.get("title")
+                is_patch_val = meta.get("is_patch")
+                end_key = (title_val, is_patch_val)
                 if end_key in self._rendered_artefact_ends:
                     return True
                 self._rendered_artefact_ends.add(end_key)
@@ -2890,24 +2904,7 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
             continue
 
         if user_input.lower() == "/config":
-            from lollms_client.lollms_config_cli_env import build_wizard_menu, _load_existing_env_to_map, _is_back_choice
-            wizard_menu, wizard_state = build_wizard_menu(
-                config_map=_load_existing_env_to_map(),
-                title="⚙️ Lollms Client Configuration",
-                exit_text="↩ Back to Chat",
-                exit_behavior="ask",
-                include_save_exit=True,
-            )
-            while True:
-                selection = wizard_menu.run()
-                if _is_back_choice(selection):
-                    break
-                if callable(selection):
-                    selection()
-                if wizard_state.get("saved") or wizard_state.get("exited"):
-                    break
-            if wizard_state.get("saved"):
-                ASCIIColors.green("  Configuration updated. Restart lollms-code for changes to take effect.")
+            run_lollms_code_config_menu(config, client=client, personality=personality)
             continue
 
         if user_input.lower() == "/shell":
@@ -2982,23 +2979,22 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                     ASCIIColors.yellow("\n  ❌ Aborted. Shell remains in 'full_access' mode.")
 
             ASCIIColors.rule()
-            continue
-
+            continue        
         if user_input.lower() == "/shell":
-            ASCIIColors.rule("[bold cyan]⚙️ Shell Autonomy Configuration[/bold cyan]")
+            ASCIIColors.rule("[bold cyan]⚙️ Shell & Execution Autonomy Configuration[/bold cyan]")
             current_mode = config.shell_autonomy_level
             mode_color = "red" if current_mode == "full_access" else "green"
-            ASCIIColors.info(f"Current shell autonomy level: [{mode_color}]{current_mode}[/{mode_color}]")
+            ASCIIColors.info(f"Current execution autonomy level: [{mode_color}]{current_mode}[/{mode_color}]")
 
             if current_mode == "safe":
-                ASCIIColors.red("\n  ⚠️  WARNING: Switching to 'full_access' mode grants the agent UNRESTRICTED access to your system shell.")
-                ASCIIColors.red("  This means it can potentially execute destructive commands (e.g., `rm -rf`, `format`), modify system files, or install software without asking.")
+                ASCIIColors.red("\n  ⚠️  WARNING: Switching to 'full_access' mode grants the agent UNRESTRICTED access to your system shell and Python process execution.")
+                ASCIIColors.red("  This means it can execute arbitrary commands (e.g., `rm -rf`, network commands, scripts), modify system files, or install software without asking.")
                 ASCIIColors.yellow("  Only enable this if you trust the agent and the task requires elevated privileges.")
 
                 try:
                     confirm = input("\n  ❓ Type 'ENABLE FULL ACCESS' to proceed, or anything else to abort: ").strip()
                 except (EOFError, KeyboardInterrupt):
-                    ASCIIColors.yellow("\n  ❌ Aborted. Shell remains in 'safe' mode.")
+                    ASCIIColors.yellow("\n  ❌ Aborted. Execution remains in 'safe' mode.")
                     continue
 
                 if confirm == "ENABLE FULL ACCESS":
@@ -3006,21 +3002,18 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                     config.save()
 
                     if hasattr(client, 'tools') and hasattr(client.tools, 'mounted_libraries'):
-                        if 'system_shell' in client.tools.mounted_libraries:
-                            lib = client.tools.mounted_libraries['system_shell']
-                            if hasattr(lib, 'init_tools_library'):
-                                lib.init_tools_library({"autonomy_level": "full_access"})
-                                ASCIIColors.red("\n  🔓 Shell autonomy set to 'full_access'. The agent now has unrestricted shell access.")
-                            else:
-                                ASCIIColors.yellow("\n  ⚠️ Config saved, but the active tool library does not support hot-reloading. Please restart lollms-code.")
-                        else:
-                            ASCIIColors.yellow("\n  ⚠️ Config saved, but the 'system_shell' library is not mounted. Please restart lollms-code.")
+                        for tool_lib in ("system_shell", "execute_python"):
+                            if tool_lib in client.tools.mounted_libraries:
+                                lib = client.tools.mounted_libraries[tool_lib]
+                                if hasattr(lib, 'init_tools_library'):
+                                    lib.init_tools_library({"autonomy_level": "full_access", "auto_approve": True})
+                        ASCIIColors.red("\n  🔓 Execution autonomy set to 'full_access'. The agent now has unrestricted shell and Python process access.")
                     else:
                         ASCIIColors.yellow("\n  ⚠️ Config saved, but client tool binding is unavailable for hot-reload. Please restart lollms-code.")
                 else:
-                    ASCIIColors.green("\n  ✅ Aborted. Shell remains in 'safe' mode.")
+                    ASCIIColors.green("\n  ✅ Aborted. Execution remains in 'safe' mode.")
             else:
-                ASCIIColors.green("\n  Shell is currently in 'full_access' mode.")
+                ASCIIColors.green("\n  Execution is currently in 'full_access' mode.")
                 try:
                     confirm = input("\n  ❓ Switch back to 'safe' mode? (y/n): ").strip().lower()
                 except (EOFError, KeyboardInterrupt):
@@ -3032,19 +3025,16 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                     config.save()
 
                     if hasattr(client, 'tools') and hasattr(client.tools, 'mounted_libraries'):
-                        if 'system_shell' in client.tools.mounted_libraries:
-                            lib = client.tools.mounted_libraries['system_shell']
-                            if hasattr(lib, 'init_tools_library'):
-                                lib.init_tools_library({"autonomy_level": "safe"})
-                                ASCIIColors.green("\n  🛡️ Shell autonomy set back to 'safe'.")
-                            else:
-                                ASCIIColors.yellow("\n  ⚠️ Config saved, but the active tool library does not support hot-reloading. Please restart lollms-code.")
-                        else:
-                            ASCIIColors.yellow("\n  ⚠️ Config saved, but the 'system_shell' library is not mounted. Please restart lollms-code.")
+                        for tool_lib in ("system_shell", "execute_python"):
+                            if tool_lib in client.tools.mounted_libraries:
+                                lib = client.tools.mounted_libraries[tool_lib]
+                                if hasattr(lib, 'init_tools_library'):
+                                    lib.init_tools_library({"autonomy_level": "safe", "auto_approve": False})
+                        ASCIIColors.green("\n  🛡️ Execution autonomy set back to 'safe'. Interactive Python code authorization re-engaged.")
                     else:
                         ASCIIColors.yellow("\n  ⚠️ Config saved, but client tool binding is unavailable for hot-reload. Please restart lollms-code.")
                 else:
-                    ASCIIColors.yellow("\n  ❌ Aborted. Shell remains in 'full_access' mode.")
+                    ASCIIColors.yellow("\n  ❌ Aborted. Execution remains in 'full_access' mode.")
 
             ASCIIColors.rule()
             continue
@@ -3181,6 +3171,325 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
         ASCIIColors.rich_print(f"\n[dim]⏱️  {elapsed:.1f}s | Rounds: {result.get('rounds', 0)} | Tools: {len(result.get('tool_calls', []))}{ctx_str}[/dim]")
 
 
+# ── HIERARCHICAL CONFIGURATION SYSTEM ─────────────────────────────────────────
+
+def _launch_lollms_client_wizard_submenu(cli_env_path: Optional[str] = None):
+    """Embeds the low-level LollmsClient provider & model wizard as a sub-menu."""
+    from lollms_client.lollms_config_cli_env import (
+        build_wizard_menu,
+        _load_existing_env_to_map,
+        _is_back_choice,
+    )
+    config_map = _load_existing_env_to_map(cli_env_path)
+    wizard_menu, wizard_state = build_wizard_menu(
+        config_map=config_map,
+        title="🧠 Models & Provider Profiles (Lollms Client)",
+        exit_text="↩ Back to Agent Config",
+        exit_behavior="ask",
+        include_save_exit=True,
+        cli_env_path=cli_env_path,
+    )
+    while True:
+        selection = wizard_menu.run()
+        if _is_back_choice(selection):
+            break
+        if callable(selection):
+            selection()
+        if wizard_state.get("saved") or wizard_state.get("exited"):
+            break
+
+
+def _configure_shell_autonomy_menu(config: CodeAgentConfig, client=None):
+    """Sub-menu for configuring system shell and Python code execution policies."""
+    from ascii_colors import Menu
+    from lollms_client.lollms_config_cli_env import _is_back_choice, _BACK_VALUE
+
+    while True:
+        mode_label = "SAFE (Whitelisted & Code Prompting)" if config.shell_autonomy_level == "safe" else "FULL ACCESS (Unrestricted)"
+        approve_label = "YES (Skip confirmation)" if config.auto_approve_python else "NO (Prompt user with preview)"
+        shell_exec_label = "ENABLED" if config.enable_shell_execution else "DISABLED"
+
+        menu = Menu("🛡️ Shell & Code Execution Policies", mode=Menu.MODE_RETURN, exit_text="↩ Back")
+        menu.set_intro("Configure execution privileges and human-in-the-loop security boundaries.")
+        menu.add_choice(f"🔒 Autonomy Level: [{mode_label}]", value="toggle_autonomy")
+        menu.add_choice(f"⚡ Safe Mode Python Auto-Approve: [{approve_label}]", value="toggle_auto_approve")
+        menu.add_choice(f"💻 Shell Tool Execution: [{shell_exec_label}]", value="toggle_shell")
+        menu.add_choice("↩ Back", value=_BACK_VALUE)
+
+        selection = menu.run()
+        if _is_back_choice(selection):
+            break
+
+        if selection == "toggle_autonomy":
+            if config.shell_autonomy_level == "safe":
+                config.shell_autonomy_level = "full_access"
+                ASCIIColors.red("  🔓 Autonomy switched to 'full_access' (Unrestricted).")
+            else:
+                config.shell_autonomy_level = "safe"
+                config.auto_approve_python = False
+                ASCIIColors.green("  🛡️ Autonomy switched to 'safe' (Whitelisted commands & Python approval).")
+        elif selection == "toggle_auto_approve":
+            config.auto_approve_python = not config.auto_approve_python
+            status = "enabled (runs will not prompt)" if config.auto_approve_python else "disabled (runs will prompt with code preview)"
+            ASCIIColors.cyan(f"  ℹ️ Python auto-approval {status}.")
+        elif selection == "toggle_shell":
+            config.enable_shell_execution = not config.enable_shell_execution
+            status = "enabled" if config.enable_shell_execution else "disabled"
+            ASCIIColors.cyan(f"  ℹ️ Shell execution tool {status}.")
+
+        # Hot-reload active tool libraries if client is connected
+        if client and hasattr(client, "tools") and hasattr(client.tools, "mounted_libraries"):
+            for tool_lib in ("system_shell", "execute_python"):
+                if tool_lib in client.tools.mounted_libraries:
+                    lib = client.tools.mounted_libraries[tool_lib]
+                    if hasattr(lib, "init_tools_library"):
+                        lib.init_tools_library({
+                            "autonomy_level": config.shell_autonomy_level,
+                            "auto_approve": config.auto_approve_python,
+                        })
+
+
+def _configure_reasoning_menu(config: CodeAgentConfig, personality=None):
+    """Sub-menu for configuring sampling parameters and token budgets."""
+    from ascii_colors import Menu
+    from lollms_client.lollms_config_cli_env import _is_back_choice, _safe_input, _BACK_VALUE
+
+    while True:
+        menu = Menu("🎛️ Agent Reasoning & Budgets", mode=Menu.MODE_RETURN, exit_text="↩ Back")
+        menu.set_intro("Tune sampling temperature, max reasoning steps, and token ceilings.")
+        menu.add_choice(f"🌡️  Temperature: [{config.temperature}]", value="temp")
+        menu.add_choice(f"🔄 Max Reasoning Steps: [{config.max_reasoning_steps}]", value="steps")
+        menu.add_choice(f"📊 Max Tokens / Turn: [{config.max_tokens_per_turn}]", value="tokens")
+        menu.add_choice("↩ Back", value=_BACK_VALUE)
+
+        selection = menu.run()
+        if _is_back_choice(selection):
+            break
+
+        if selection == "temp":
+            raw = _safe_input("Enter sampling temperature (0.0 - 1.2)", str(config.temperature))
+            try:
+                config.temperature = max(0.0, min(1.5, float(raw)))
+                ASCIIColors.green(f"  ✓ Temperature set to {config.temperature}")
+            except ValueError:
+                ASCIIColors.warning("  Invalid number.")
+        elif selection == "steps":
+            raw = _safe_input("Enter maximum reasoning rounds (steps)", str(config.max_reasoning_steps))
+            try:
+                config.max_reasoning_steps = max(1, int(raw))
+                ASCIIColors.green(f"  ✓ Max steps set to {config.max_reasoning_steps}")
+            except ValueError:
+                ASCIIColors.warning("  Invalid integer.")
+        elif selection == "tokens":
+            raw = _safe_input("Enter max tokens generated per turn", str(config.max_tokens_per_turn))
+            try:
+                config.max_tokens_per_turn = max(256, int(raw))
+                if personality:
+                    personality.max_tokens_per_turn = config.max_tokens_per_turn
+                ASCIIColors.green(f"  ✓ Max tokens per turn set to {config.max_tokens_per_turn}")
+            except ValueError:
+                ASCIIColors.warning("  Invalid integer.")
+
+
+def _configure_subagents_menu(config: CodeAgentConfig):
+    """Sub-menu for configuring sub-agent delegation and depth."""
+    from ascii_colors import Menu
+    from lollms_client.lollms_config_cli_env import _is_back_choice, _safe_input, _BACK_VALUE
+
+    while True:
+        sa_status = "ENABLED" if config.enable_sub_agents else "DISABLED"
+        ms_status = "ENABLED" if config.enable_model_switching else "DISABLED"
+
+        menu = Menu("🤖 Sub-Agent Delegation", mode=Menu.MODE_RETURN, exit_text="↩ Back")
+        menu.set_intro("Configure specialist worker delegation limits.")
+        menu.add_choice(f"👥 Sub-Agent Spawning: [{sa_status}]", value="toggle_sa")
+        menu.add_choice(f"🌳 Max Recursion Depth: [{config.max_sub_agent_depth}]", value="depth")
+        menu.add_choice(f"🔢 Max Sub-Agents / Turn: [{config.max_sub_agents_per_turn}]", value="max_per_turn")
+        menu.add_choice(f"🔄 Mid-Task Model Switching: [{ms_status}]", value="toggle_ms")
+        menu.add_choice("↩ Back", value=_BACK_VALUE)
+
+        selection = menu.run()
+        if _is_back_choice(selection):
+            break
+
+        if selection == "toggle_sa":
+            config.enable_sub_agents = not config.enable_sub_agents
+            ASCIIColors.cyan(f"  ℹ️ Sub-agent delegation {'enabled' if config.enable_sub_agents else 'disabled'}.")
+        elif selection == "depth":
+            raw = _safe_input("Enter max recursion depth (1-5)", str(config.max_sub_agent_depth))
+            try:
+                config.max_sub_agent_depth = max(1, min(5, int(raw)))
+                ASCIIColors.green(f"  ✓ Max depth set to {config.max_sub_agent_depth}")
+            except ValueError:
+                ASCIIColors.warning("  Invalid integer.")
+        elif selection == "max_per_turn":
+            raw = _safe_input("Enter max sub-agents spawned per turn (1-10)", str(config.max_sub_agents_per_turn))
+            try:
+                config.max_sub_agents_per_turn = max(1, min(10, int(raw)))
+                ASCIIColors.green(f"  ✓ Max sub-agents per turn set to {config.max_sub_agents_per_turn}")
+            except ValueError:
+                ASCIIColors.warning("  Invalid integer.")
+        elif selection == "toggle_ms":
+            config.enable_model_switching = not config.enable_model_switching
+            ASCIIColors.cyan(f"  ℹ️ Mid-task model switching {'enabled' if config.enable_model_switching else 'disabled'}.")
+
+
+def _configure_skills_memory_menu(config: CodeAgentConfig):
+    """Sub-menu for configuring skills visibility tiers and cognitive memory."""
+    from ascii_colors import Menu
+    from lollms_client.lollms_config_cli_env import _is_back_choice, _safe_select, _safe_input, _BACK_VALUE
+
+    while True:
+        mem_status = "ENABLED" if config.enable_memory else "DISABLED"
+        sc_status = "ENABLED" if config.enable_skill_creation else "DISABLED"
+        sl_status = "ENABLED" if config.enable_skill_loading else "DISABLED"
+
+        menu = Menu("🎓 Skills & Memory Systems", mode=Menu.MODE_RETURN, exit_text="↩ Back")
+        menu.set_intro("Configure persistent memory and reusable SKILL.md libraries.")
+        menu.add_choice(f"💾 Persistent Cognitive Memory: [{mem_status}]", value="toggle_mem")
+        menu.add_choice(f"📚 Skills Mode: [{config.skills_mode}]", value="mode")
+        menu.add_choice(f"✍️  Skill Creation: [{sc_status}]", value="toggle_sc")
+        menu.add_choice(f"📖 Skill Loading: [{sl_status}]", value="toggle_sl")
+        menu.add_choice(f"📂 Skills Directory: [{Path(config.skills_dir).name}]", value="dir")
+        menu.add_choice("↩ Back", value=_BACK_VALUE)
+
+        selection = menu.run()
+        if _is_back_choice(selection):
+            break
+
+        if selection == "toggle_mem":
+            config.enable_memory = not config.enable_memory
+            ASCIIColors.cyan(f"  ℹ️ Persistent memory {'enabled' if config.enable_memory else 'disabled'}.")
+        elif selection == "mode":
+            chosen = _safe_select("Select skills mode:", ["mixed", "loadable", "always_on", "off"])
+            if chosen:
+                config.skills_mode = chosen
+                ASCIIColors.green(f"  ✓ Skills mode set to '{chosen}'.")
+        elif selection == "toggle_sc":
+            config.enable_skill_creation = not config.enable_skill_creation
+            ASCIIColors.cyan(f"  ℹ️ Skill creation {'enabled' if config.enable_skill_creation else 'disabled'}.")
+        elif selection == "toggle_sl":
+            config.enable_skill_loading = not config.enable_skill_loading
+            ASCIIColors.cyan(f"  ℹ️ Skill loading {'enabled' if config.enable_skill_loading else 'disabled'}.")
+        elif selection == "dir":
+            raw = _safe_input("Enter directory path for SKILL.md files", config.skills_dir)
+            if raw.strip():
+                config.skills_dir = str(Path(raw).resolve())
+                ASCIIColors.green(f"  ✓ Skills directory set to: {config.skills_dir}")
+
+
+def _configure_paths_menu(config: CodeAgentConfig):
+    """Sub-menu for inspecting and updating paths."""
+    from ascii_colors import Menu
+    from lollms_client.lollms_config_cli_env import _is_back_choice, _safe_input, _BACK_VALUE
+
+    while True:
+        menu = Menu("📂 Workspace & System Paths", mode=Menu.MODE_RETURN, exit_text="↩ Back")
+        menu.set_intro("Inspect and modify workspace, handbag, and database paths.")
+        menu.add_choice(f"📁 Workspace: [{Path(config.workspace_path).name}]", value="ws")
+        menu.add_choice(f"👜 Handbag:   [{Path(config.handbag_path).name}]", value="hb")
+        menu.add_choice(f"💾 Memory DB: [{Path(config.memory_db.replace('sqlite:///', '')).name}]", value="db")
+        menu.add_choice("↩ Back", value=_BACK_VALUE)
+
+        selection = menu.run()
+        if _is_back_choice(selection):
+            break
+
+        if selection == "ws":
+            raw = _safe_input("Enter workspace root directory", config.workspace_path)
+            if raw.strip():
+                config.workspace_path = str(Path(raw).resolve())
+                ASCIIColors.green(f"  ✓ Workspace set to: {config.workspace_path}")
+        elif selection == "hb":
+            raw = _safe_input("Enter handbag directory path", config.handbag_path)
+            if raw.strip():
+                config.handbag_path = str(Path(raw).resolve())
+                ASCIIColors.green(f"  ✓ Handbag path set to: {config.handbag_path}")
+        elif selection == "db":
+            raw = _safe_input("Enter SQLite database URL", config.memory_db)
+            if raw.strip():
+                config.memory_db = raw.strip()
+                ASCIIColors.green(f"  ✓ Memory DB set to: {config.memory_db}")
+
+
+def run_lollms_code_config_menu(
+    config: CodeAgentConfig,
+    client=None,
+    personality=None,
+    cli_env_path: Optional[str] = None
+):
+    """
+    Main Hierarchical Configuration Menu for lollms_code.
+    Hosts the Lollms Client Wizard as a sub-menu alongside agent-level parameters.
+    """
+    from ascii_colors import Menu
+    from lollms_client.lollms_config_cli_env import _is_back_choice, _BACK_VALUE
+
+    while True:
+        autonomy_badge = "SAFE" if config.shell_autonomy_level == "safe" else "FULL ACCESS"
+        active_model = config.active_model_name
+
+        menu = Menu("⚙️  lollms_code Configuration Menu", mode=Menu.MODE_RETURN, exit_text="↩ Back / Exit")
+        menu.set_intro(
+            f"Active Model: [bold cyan]{active_model}[/bold cyan] | "
+            f"Autonomy: [bold {'green' if config.shell_autonomy_level == 'safe' else 'red'}]{autonomy_badge}[/bold {'green' if config.shell_autonomy_level == 'safe' else 'red'}] | "
+            f"Temp: {config.temperature}"
+        )
+
+        menu.add_choice("🧠 Models & Provider Profiles (Lollms Client Wizard)", value="client_wizard")
+        menu.add_choice(f"🛡️ Shell & Python Execution (Autonomy: {autonomy_badge})", value="shell_menu")
+        menu.add_choice(f"🎛️ Reasoning & Token Budgets (Temp: {config.temperature}, Steps: {config.max_reasoning_steps})", value="reasoning_menu")
+        menu.add_choice("🤖 Sub-Agents & Delegation", value="subagents_menu")
+        menu.add_choice(f"🎓 Skills & Memory (Skills: {config.skills_mode})", value="skills_menu")
+        menu.add_choice("📂 Workspace & System Paths", value="paths_menu")
+        menu.add_choice("💾 Save & Apply All Settings", value="save")
+        menu.add_choice("↩ Back / Exit", value=_BACK_VALUE)
+
+        selection = menu.run()
+        if _is_back_choice(selection):
+            break
+
+        if selection == "client_wizard":
+            _launch_lollms_client_wizard_submenu(cli_env_path)
+            # Reload updated binding/model profiles
+            updated_cfg = CodeAgentConfig.load(argparse.Namespace(
+                workspace=config.workspace_path,
+                config_path=cli_env_path,
+                profile=config.active_profile,
+                llm_binding=None, model=None, host=None, api_key=None, context_size=None,
+                max_steps=None, temperature=None, max_tokens=None, debug=None,
+                enable_model_switching=None, no_shell_execution=None, shell_autonomy=None,
+                no_sub_agents=None, no_memory=None, skills_dir=None, handbag_path=None
+            ))
+            config.llm_binding_profiles = updated_cfg.llm_binding_profiles
+            config.llm_model_profiles = updated_cfg.llm_model_profiles
+            config.active_profile = updated_cfg.active_profile
+        elif selection == "shell_menu":
+            _configure_shell_autonomy_menu(config, client=client)
+        elif selection == "reasoning_menu":
+            _configure_reasoning_menu(config, personality=personality)
+        elif selection == "subagents_menu":
+            _configure_subagents_menu(config)
+        elif selection == "skills_menu":
+            _configure_skills_memory_menu(config)
+        elif selection == "paths_menu":
+            _configure_paths_menu(config)
+        elif selection == "save":
+            config.save()
+            ASCIIColors.green("  ✅ All lollms_code configurations saved successfully.")
+            if client and hasattr(client, "tools") and hasattr(client.tools, "mounted_libraries"):
+                for tool_lib in ("system_shell", "execute_python"):
+                    if tool_lib in client.tools.mounted_libraries:
+                        lib = client.tools.mounted_libraries[tool_lib]
+                        if hasattr(lib, "init_tools_library"):
+                            lib.init_tools_library({
+                                "autonomy_level": config.shell_autonomy_level,
+                                "auto_approve": config.auto_approve_python,
+                            })
+                ASCIIColors.info("  ℹ️ Live session tool policies updated.")
+            break
+
+
 def list_skills(config: CodeAgentConfig):
     skills_dir = Path(config.skills_dir)
     if not skills_dir.exists():
@@ -3233,6 +3542,7 @@ Examples:
     parser.add_argument("--enable-model-switching", action="store_true", help="Allow the agent to switch models.")
     parser.add_argument("--no-shell-execution", action="store_true", help="Disable autonomous shell command execution.")
     parser.add_argument("--shell-autonomy", type=str, default="safe", choices=["safe", "full_access"], help="Autonomy level for shell execution.")
+    parser.add_argument("--auto-approve-python", action="store_true", help="Auto-approve Python execution in safe mode without confirmation prompts.")
     parser.add_argument("--no-sub-agents", action="store_true", help="Disable sub-agent delegation.")
     parser.add_argument("--no-memory", action="store_true", help="Disable persistent memory.")
     parser.add_argument("--list-skills", action="store_true", help="List all learned skills and exit.")
@@ -3271,21 +3581,24 @@ def main():
             ASCIIColors.red(f"Failed to import GUI dependencies: {e}")
             ASCIIColors.yellow("Please install the GUI requirements: pip install nicegui pywebview")
             return 1
-        except (RuntimeError, ValueError, OSError) as e:
+        except Exception as e:
             trace_exception(e)
             ASCIIColors.red(f"GUI crashed: {e}")
             return 1
 
     config = CodeAgentConfig.load(args)
 
-    # The CLI requires at least the LLM modality to be configured.
-    if args.config or not config.is_configured(require_llm=True):
+    # First-time configuration gate
+    if not config.is_configured(require_llm=True):
+        ASCIIColors.yellow("⚠️ No LLM model profile configured yet. Opening setup wizard...")
         from lollms_client.lollms_config_cli_env import run_wizard_and_save
         run_wizard_and_save(cli_env_path=args.config_path)
         config = CodeAgentConfig.load(args)
-        if args.config:
-            ASCIIColors.green("\n✅ Configuration saved successfully!")
-            return 0
+
+    if args.config:
+        run_lollms_code_config_menu(config, cli_env_path=args.config_path)
+        ASCIIColors.green("\n✅ Configuration saved successfully!")
+        return 0
 
     if args.list_skills:
         list_skills(config)

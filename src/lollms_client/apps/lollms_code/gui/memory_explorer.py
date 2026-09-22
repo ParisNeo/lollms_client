@@ -344,15 +344,19 @@ def build_memory_graph_options(
                         })
 
     return {
+        "backgroundColor": "#020617",
         "tooltip": {
             "trigger": "item",
             "confine": True,
+            "backgroundColor": "#0f172a",
+            "borderColor": "#334155",
+            "textStyle": {"color": "#f1f5f9"},
         },
         "legend": {
             "data": [c["name"] for c in categories],
             "orient": "horizontal",
             "top": 6,
-            "textStyle": {"fontSize": 11},
+            "textStyle": {"fontSize": 11, "color": "#cbd5e1"},
         },
         "series": [{
             "type": "graph",
@@ -511,9 +515,9 @@ def open_memory_explorer_dialog(session: Any, prefs: Any) -> None:
 
                 sort_select.on_value_change(on_sort_change)
 
-                search_input = ui.input(placeholder="Search content or tags…").classes("w-56 bg-white dark:bg-slate-800 text-xs").props(
-                    "dense outlined clearable input-debounce=300"
-                )
+                search_input = ui.input(placeholder="Search content or tags…").classes(
+                    "w-56 bg-slate-900 text-slate-100 text-xs"
+                ).props(':dark="Quasar.Dark.isActive" dense outlined clearable input-debounce=300')
                 search_input.on("clear", lambda: on_search_change(""))
                 search_input.on_value_change(lambda e: on_search_change(e.value))
 
@@ -523,7 +527,7 @@ def open_memory_explorer_dialog(session: Any, prefs: Any) -> None:
                     reload_memories()
 
         # ---- Statistics & Pagination Bar (List View) ----
-        list_nav_bar = ui.row().classes("w-full items-center justify-between px-3 py-1.5 bg-slate-100 dark:bg-slate-800 rounded text-xs font-mono border border-slate-200 dark:border-slate-700")
+        list_nav_bar = ui.row().classes("w-full items-center justify-between px-3 py-1.5 bg-slate-900 rounded text-xs font-mono border border-slate-800 text-slate-200")
         with list_nav_bar:
             stats_label = ui.label("Loading stats...").classes("text-slate-700 dark:text-slate-300 font-semibold")
 
@@ -553,7 +557,7 @@ def open_memory_explorer_dialog(session: Any, prefs: Any) -> None:
                 reload_memories()
 
         # ---- Graph Controls Bar (Graph View Only) ----
-        graph_controls_bar = ui.row().classes("w-full items-center justify-between px-3 py-1.5 bg-slate-100 dark:bg-slate-800 rounded text-xs font-mono border border-slate-200 dark:border-slate-700 flex-wrap gap-2")
+        graph_controls_bar = ui.row().classes("w-full items-center justify-between px-3 py-1.5 bg-slate-900 rounded text-xs font-mono border border-slate-800 text-slate-200 flex-wrap gap-2")
         graph_controls_bar.visible = False
         with graph_controls_bar:
             with ui.row().classes("items-center gap-2"):
@@ -595,7 +599,7 @@ def open_memory_explorer_dialog(session: Any, prefs: Any) -> None:
                 memories_list = ui.column().classes("w-full gap-2")
 
             # 2. Graph Area
-            graph_container = ui.row().classes("w-full h-full flex-1 min-h-[500px] border border-slate-200 dark:border-slate-800 rounded-lg overflow-hidden bg-white dark:bg-slate-950 flex-nowrap relative")
+            graph_container = ui.row().classes("w-full h-full flex-1 min-h-[500px] border border-slate-800 rounded-lg overflow-hidden bg-slate-950 flex-nowrap relative")
             graph_container.visible = False
 
             with graph_container:
@@ -953,7 +957,7 @@ def render_memory_card(memory: Dict[str, Any], mm: Any, on_change: Any) -> None:
         else "text-slate-500 font-bold"
     )
 
-    with ui.card().classes("w-full p-3 no-shadow border border-slate-300 dark:border-slate-800 bg-white dark:bg-slate-950 rounded-lg gap-2 shadow-sm"):
+    with ui.card().classes("w-full p-3.5 no-shadow border border-slate-800 bg-slate-900 dark:bg-slate-950 rounded-lg gap-2 shadow-sm text-slate-100").props(':dark="Quasar.Dark.isActive"'):
         with ui.row().classes("w-full items-center justify-between"):
             with ui.row().classes("items-center gap-2 flex-wrap"):
                 ui.badge(lvl_name, color=lvl_color).props("rounded dense")
@@ -979,13 +983,13 @@ def render_memory_card(memory: Dict[str, Any], mm: Any, on_change: Any) -> None:
                     "flat round dense size=xs color=red"
                 ).tooltip("Delete memory (Hard Purge or Soft Archive)")
 
-        ui.markdown(content).classes("text-sm text-slate-900 dark:text-slate-100 break-words leading-relaxed")
+        ui.markdown(content).classes("text-sm text-slate-100 break-words leading-relaxed")
 
         if tags:
             tag_list = [t.strip() for t in tags.split(",") if t.strip()]
             with ui.row().classes("items-center gap-1.5 pt-1"):
                 for t in tag_list:
-                    ui.label(f"#{t}").classes("text-[11px] text-slate-700 dark:text-slate-300 bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 rounded font-mono border border-slate-200 dark:border-slate-700")
+                    ui.label(f"#{t}").classes("text-[11px] text-slate-300 bg-slate-800 px-1.5 py-0.5 rounded font-mono border border-slate-700")
 
 
 def promote_to_working(memory_id: str, mm: Any, on_change: Any):
@@ -1066,7 +1070,7 @@ def confirm_purge_faded(mm: Any, on_change: Any):
 def open_edit_memory_dialog(memory: Dict[str, Any], mm: Any, on_change: Any):
     mid = memory.get("id", "")
     dialog = ui.dialog()
-    with dialog, ui.card().classes("w-[560px] p-4 flex flex-col gap-3 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100"):
+    with dialog, ui.card().classes("w-[560px] p-4 flex flex-col gap-3 bg-slate-900 text-slate-100 border border-slate-800 rounded-xl").props(':dark="Quasar.Dark.isActive"'):
         ui.label(f"Edit Memory [{mid[:8]}]").classes("text-base font-bold")
 
         content_input = ui.textarea("Content", value=memory.get("content", "")).classes("w-full bg-white dark:bg-slate-800").props("outlined autogrow dense")
@@ -1115,10 +1119,10 @@ def open_edit_memory_dialog(memory: Dict[str, Any], mm: Any, on_change: Any):
 
 def open_add_memory_dialog(mm: Any, on_change: Any):
     dialog = ui.dialog()
-    with dialog, ui.card().classes("w-[560px] p-4 flex flex-col gap-3 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100"):
+    with dialog, ui.card().classes("w-[560px] p-4 flex flex-col gap-3 bg-slate-900 text-slate-100 border border-slate-800 rounded-xl").props(':dark="Quasar.Dark.isActive"'):
         ui.label("Add New Memory").classes("text-base font-bold")
 
-        content_input = ui.textarea("Content", placeholder="Enter the knowledge, rule, or preference to persist…").classes("w-full bg-white dark:bg-slate-800").props("outlined autogrow dense")
+        content_input = ui.textarea("Content", placeholder="Enter the knowledge, rule, or preference to persist…").classes("w-full bg-slate-950").props(':dark="Quasar.Dark.isActive" outlined autogrow dense')
 
         with ui.row().classes("w-full gap-3 items-center"):
             level_select = ui.select(

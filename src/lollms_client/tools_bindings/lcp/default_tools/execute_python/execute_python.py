@@ -13,27 +13,31 @@ persisted to a timestamped .log file in the workspace and the tool result
 embeds a head/tail windowed preview plus an explicit pointer telling the LLM
 which inspection tools to use to read the omitted middle.
 
-TOOL SELECTION DOCTRINE:
-    Privilege tool_execute_python_file. Only fall back to
-    tool_execute_python_code when the code is short, punctual, and disposable.
-    Multi-step logic, algorithms, classes, or anything worth inspecting, fixing,
-    iterating on, or reusing belongs in a persisted .py artifact.
+HUMAN-IN-THE-LOOP AUTHORIZATION:
+In safe mode, execution prompts the user with a code preview and authorization choices:
+[y]es (run once), [a]lways (auto-approve for this session), [n]o (reject with feedback), [v]iew full code.
 """
 
+import ast
 import os
 import re
 import sys
 import io
 import uuid
 import base64
+import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from ascii_colors import ASCIIColors
 
 TOOL_LIBRARY_NAME = "Execute Python"
 TOOL_LIBRARY_DESC = "Executes sandboxed Python code. PREFERRED path: persist code as a .py artifact and run it with tool_execute_python_file. tool_execute_python_code is strictly reserved for short, punctual inline snippets. Long outputs are persisted to a .log file with a head/tail preview returned inline. Returns stdout, stderr, and generated plots."
 TOOL_LIBRARY_ICON = "🐍"
+
+AUTONOMY_LEVEL: str = "safe"
+_AUTO_APPROVE_PYTHON: bool = False
+_CONFIRM_HANDLER: Optional[Any] = None
 
 _PREVIEW_WINDOW_CHARS = 8000
 _PREVIEW_HALF_CHARS = _PREVIEW_WINDOW_CHARS // 2
@@ -42,7 +46,28 @@ _STRIP_MARKER = (
 )
 
 
+def set_confirm_handler(handler: Optional[Any]) -> None:
+    """Sets a custom confirmation handler (used by GUI or host app)."""
+    global _CONFIRM_HANDLER
+    _CONFIRM_HANDLER = handler
+
+
 def init_tools_library(config: dict = None) -> None:
+    global AUTONOMY_LEVEL, _AUTO_APPROVE_PYTHON, _CONFIRM_HANDLER
+    if config and isinstance(config, dict):
+        autonomy = config.get("autonomy_level", "safe").lower()
+        if autonomy in ("safe", "full_access"):
+            AUTONOMY_LEVEL = autonomy
+            ASCIIColors.info(f"[execute_python] Configured autonomy level: {AUTONOMY_LEVEL}")
+        else:
+            AUTONOMY_LEVEL = "safe"
+        if "auto_approve" in config:
+            _AUTO_APPROVE_PYTHON = bool(config.get("auto_approve"))
+        if "confirm_handler" in config:
+            _CONFIRM_HANDLER = config.get("confirm_handler")
+    else:
+        AUTONOMY_LEVEL = "safe"
+
     try:
         import pipmaster as pm
         pm.ensure_packages(["matplotlib", "pipmaster"])
@@ -52,6 +77,93 @@ def init_tools_library(config: dict = None) -> None:
     except Exception as e:
         import ascii_colors
         ascii_colors.ASCIIColors.warning(f"[execute_python] Failed to ensure dependencies: {e}")
+
+
+def _can_prompt_interactive() -> bool:
+    """Checks whether the standard input stream is an interactive terminal."""
+    if not sys.stdin:
+        return False
+    try:
+        return sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+def _prompt_user_validation(source: str, script_label: str, argv: Optional[List[Any]] = None) -> Tuple[str, str]:
+    """
+    Prompts the user for validation when executing Python code in safe mode.
+    Returns:
+        (decision, reason)
+        where decision is one of: "allow", "always", "reject"
+    """
+    # 1. Check custom host/GUI confirmation handler first
+    if _CONFIRM_HANDLER is not None and callable(_CONFIRM_HANDLER):
+        try:
+            decision, reason = _CONFIRM_HANDLER(source, script_label, argv)
+            return decision, reason
+        except Exception as handler_err:
+            ASCIIColors.warning(f"[execute_python] Confirm handler failed: {handler_err}")
+            return "allow", ""
+
+    # 2. Check interactive TTY for terminal CLI
+    if not _can_prompt_interactive():
+        return "allow", ""
+
+    source_lines = source.splitlines()
+    total_lines = len(source_lines)
+    max_preview = 25
+
+    preview_lines = []
+    for i, line in enumerate(source_lines[:max_preview], 1):
+        preview_lines.append(f"[dim]{i:3d} |[/dim] {line}")
+    if total_lines > max_preview:
+        preview_lines.append(f"[dim]    ... [{total_lines - max_preview} more lines — enter 'v' to view all][/dim]")
+
+    panel_parts = [
+        f"[bold cyan]Script / Target:[/bold cyan] [yellow]{script_label}[/yellow]",
+        f"[bold cyan]Autonomy Mode:[/bold cyan] [green]SAFE[/green] (Protected Workspace Sandbox)",
+    ]
+    if argv and len(argv) > 1:
+        panel_parts.append(f"[bold cyan]Arguments:[/bold cyan] {argv[1:]}")
+
+    panel_parts.append(f"\n[bold cyan]Code Preview ({total_lines} lines):[/bold cyan]")
+    panel_parts.extend(preview_lines)
+    panel_parts.append(
+        "\n[bold yellow]⚠️  The LLM agent wants to execute this Python code in your workspace.[/bold yellow]"
+    )
+
+    ASCIIColors.panel(
+        "\n".join(panel_parts),
+        title="[bold yellow]🛡️ Python Execution Authorization (Safe Mode)[/bold yellow]",
+        border_style="yellow"
+    )
+
+    while True:
+        try:
+            choice = input("  Authorize execution? [y]es / [n]o / [a]lways for session / [v]iew full code (default: y): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "reject", "Execution interrupted by user (Ctrl+C / EOF)."
+
+        if choice in ("", "y", "yes"):
+            return "allow", ""
+        elif choice in ("a", "always"):
+            return "always", ""
+        elif choice in ("n", "no"):
+            try:
+                reason = input("  Reason / feedback for the LLM (optional, press Enter to skip): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                reason = ""
+            return "reject", reason
+        elif choice in ("v", "view"):
+            print("\n" + "=" * 80)
+            print(f"📄 FULL SOURCE CODE: {script_label} ({total_lines} lines)")
+            print("=" * 80)
+            for i, line in enumerate(source_lines, 1):
+                print(f"{i:4d} | {line}")
+            print("=" * 80 + "\n")
+        else:
+            ASCIIColors.yellow("  Invalid choice. Please enter 'y', 'n', 'a', or 'v'.")
 
 
 def _ensure_import(module_name: str, package_name: str = None):
@@ -120,11 +232,114 @@ def _persist_full_output(text: str, script_label: str) -> Optional[str]:
         return None
 
 
+def _check_python_code_safety(source: str) -> Optional[str]:
+    """
+    Enforces sandbox integrity in safe mode by analyzing code AST before execution.
+    Rejects process execution escapes (subprocess, os.system, os.popen, pty) and
+    prevents using Python to circumvent shell command restrictions.
+    """
+    if AUTONOMY_LEVEL != "safe":
+        return None
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+
+    forbidden_modules = {"subprocess", "pty", "commands"}
+    forbidden_os_attrs = {
+        "system", "popen", "spawnl", "spawnle", "spawnlp", "spawnlpe",
+        "spawnv", "spawnve", "spawnvp", "spawnvpe", "execl", "execle",
+        "execlp", "execlpe", "execv", "execve", "execvp", "execvpe"
+    }
+
+    for node in ast.walk(tree):
+        # 1. Direct imports
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root_mod = alias.name.split(".")[0].lower()
+                if root_mod in forbidden_modules:
+                    return (
+                        f"🛑 BLOCKED BY SANDBOX (SAFE MODE): Importing '{alias.name}' is prohibited in safe mode.\n"
+                        "Spawning system processes and executing shell commands from Python is blocked by the sandbox.\n"
+                        "You cannot bypass shell restrictions using Python. "
+                        "If this task genuinely requires elevated privileges, ask the user to enable 'full_access' mode via `/shell`."
+                    )
+
+        # 2. From imports
+        elif isinstance(node, ast.ImportFrom):
+            mod = (node.module or "").lower()
+            root_mod = mod.split(".")[0]
+            if root_mod in forbidden_modules:
+                return (
+                    f"🛑 BLOCKED BY SANDBOX (SAFE MODE): Importing from '{mod}' is prohibited in safe mode.\n"
+                    "Spawning system processes and executing shell commands from Python is blocked by the sandbox.\n"
+                    "If this task genuinely requires elevated privileges, ask the user to enable 'full_access' mode via `/shell`."
+                )
+            if root_mod == "os":
+                for alias in node.names:
+                    if alias.name.lower() in forbidden_os_attrs:
+                        return (
+                            f"🛑 BLOCKED BY SANDBOX (SAFE MODE): Importing 'os.{alias.name}' is prohibited in safe mode.\n"
+                            "Executing shell commands via Python is blocked by the sandbox.\n"
+                            "If this task genuinely requires elevated privileges, ask the user to enable 'full_access' mode via `/shell`."
+                        )
+
+        # 3. Call expressions on os.system, os.popen, etc.
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute):
+                attr_name = node.func.attr.lower()
+                if attr_name in forbidden_os_attrs:
+                    if isinstance(node.func.value, ast.Name) and node.func.value.id.lower() == "os":
+                        return (
+                            f"🛑 BLOCKED BY SANDBOX (SAFE MODE): Calling 'os.{node.func.attr}' is prohibited in safe mode.\n"
+                            "Executing arbitrary shell commands via Python is blocked by the sandbox.\n"
+                            "If this task genuinely requires elevated privileges, ask the user to enable 'full_access' mode via `/shell`."
+                        )
+            elif isinstance(node.func, ast.Name) and node.func.id == "__import__":
+                if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                    mod_name = node.args[0].value.split(".")[0].lower()
+                    if mod_name in forbidden_modules:
+                        return f"🛑 BLOCKED BY SANDBOX (SAFE MODE): Dynamic import of '{node.args[0].value}' is prohibited in safe mode."
+
+    return None
+
+
 def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]] = None) -> Dict[str, Any]:
     """
     Executes the given Python source string in a sandboxed namespace with
-    stdout/stderr capture, sys.argv override, and matplotlib figure interception.
+    user validation, stdout/stderr capture, sys.argv override, safety enforcement, and matplotlib interception.
     """
+    global _AUTO_APPROVE_PYTHON
+
+    safety_violation = _check_python_code_safety(source)
+    if safety_violation:
+        ASCIIColors.error(f"[execute_python] {safety_violation}")
+        return {
+            "success": False,
+            "error": safety_violation,
+            "output": "",
+            "stderr": safety_violation
+        }
+
+    # ── SYSTEMIC HUMAN VALIDATION IN SAFE MODE ──
+    if AUTONOMY_LEVEL == "safe" and not _AUTO_APPROVE_PYTHON:
+        decision, rejection_reason = _prompt_user_validation(source, script_label, argv)
+        if decision == "reject":
+            reason_msg = rejection_reason or "The user reviewed the code and declined permission to execute it."
+            ASCIIColors.warning(f"[execute_python] ❌ Execution rejected by user: {reason_msg}")
+            return {
+                "success": False,
+                "error": f"🛑 EXECUTION REJECTED BY USER: {reason_msg}\nThe user inspected your Python code and denied execution authorization. Revise your approach, ask the user for clarification, or modify the code based on their feedback.",
+                "output": "",
+                "stderr": f"Execution rejected by user: {reason_msg}"
+            }
+        elif decision == "always":
+            _AUTO_APPROVE_PYTHON = True
+            ASCIIColors.success("[execute_python] 🔓 Auto-approval enabled for this session. Python execution will run autonomously without prompts.")
+        elif decision == "allow":
+            pass
+
     _np = None
     _plt = None
 
@@ -156,6 +371,96 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
     if cwd_repr not in sys.path:
         sys.path.insert(0, cwd_repr)
 
+    workspace_root = _get_workspace_root().resolve()
+
+    # ── PURGE STALE WORKSPACE MODULES FROM sys.modules ──
+    # When scripts or modules inside the workspace are edited/patched between rounds,
+    # Python's default sys.modules cache holds onto the stale old module definitions.
+    # Purge any module located within the workspace root so imports are always fresh from disk.
+    import importlib
+    modules_to_purge = []
+    for mod_name, mod in list(sys.modules.items()):
+        if mod is None:
+            continue
+        mod_file = getattr(mod, '__file__', None)
+        if mod_file:
+            try:
+                mod_path = Path(mod_file).resolve()
+                if mod_path.is_relative_to(workspace_root):
+                    modules_to_purge.append(mod_name)
+            except (ValueError, Exception):
+                pass
+
+    for mod_name in modules_to_purge:
+        sys.modules.pop(mod_name, None)
+
+    importlib.invalidate_caches()
+
+    # ── DEFENSE-IN-DEPTH: RUNTIME SANDBOX WRAPPERS (SAFE MODE) ──
+    safe_builtins = dict(__builtins__ if isinstance(__builtins__, dict) else __builtins__.__dict__)
+    orig_import = safe_builtins.get("__import__", __import__)
+
+    def _sandboxed_import(name, *args, **kwargs):
+        if AUTONOMY_LEVEL == "safe":
+            root_mod = name.split(".")[0].lower()
+            if root_mod in ("subprocess", "pty", "commands"):
+                raise PermissionError(
+                    f"🛑 BLOCKED BY SANDBOX (SAFE MODE): Importing '{name}' is forbidden in safe mode. "
+                    "Process execution and shell escapes via Python are blocked. Ask user to enable 'full_access' mode if required."
+                )
+        return orig_import(name, *args, **kwargs)
+
+    safe_builtins["__import__"] = _sandboxed_import
+
+    orig_os_system = getattr(os, "system", None)
+    orig_os_popen = getattr(os, "popen", None)
+    orig_os_remove = getattr(os, "remove", None)
+    orig_os_unlink = getattr(os, "unlink", None)
+    orig_os_rmdir = getattr(os, "rmdir", None)
+    orig_shutil_rmtree = getattr(shutil, "rmtree", None)
+
+    if AUTONOMY_LEVEL == "safe":
+        def _blocked_system(*args, **kwargs):
+            raise PermissionError("🛑 BLOCKED BY SANDBOX (SAFE MODE): 'os.system' cannot be used to run shell commands in safe mode.")
+
+        def _blocked_popen(*args, **kwargs):
+            raise PermissionError("🛑 BLOCKED BY SANDBOX (SAFE MODE): 'os.popen' cannot be used to run shell commands in safe mode.")
+
+        def _bounded_remove(path, *args, **kwargs):
+            p = Path(path).resolve()
+            try:
+                p.relative_to(workspace_root)
+            except ValueError:
+                raise PermissionError(f"🛑 BLOCKED BY SANDBOX (SAFE MODE): Deleting file '{path}' outside workspace is forbidden.")
+            return orig_os_remove(path, *args, **kwargs)
+
+        def _bounded_rmdir(path, *args, **kwargs):
+            p = Path(path).resolve()
+            try:
+                p.relative_to(workspace_root)
+            except ValueError:
+                raise PermissionError(f"🛑 BLOCKED BY SANDBOX (SAFE MODE): Deleting folder '{path}' outside workspace is forbidden.")
+            return orig_os_rmdir(path, *args, **kwargs)
+
+        def _bounded_rmtree(path, *args, **kwargs):
+            p = Path(path).resolve()
+            try:
+                p.relative_to(workspace_root)
+            except ValueError:
+                raise PermissionError(f"🛑 BLOCKED BY SANDBOX (SAFE MODE): Deleting directory tree '{path}' outside workspace is forbidden.")
+            return orig_shutil_rmtree(path, *args, **kwargs)
+
+        os.system = _blocked_system
+        os.popen = _blocked_popen
+        if orig_os_remove:
+            os.remove = _bounded_remove
+        if orig_os_unlink:
+            os.unlink = _bounded_remove
+        if orig_os_rmdir:
+            os.rmdir = _bounded_rmdir
+        if orig_shutil_rmtree:
+            shutil.rmtree = _bounded_rmtree
+
     local_vars = {
         "Path": Path,
         "pd": pandas_mod,
@@ -165,7 +470,7 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
         "sklearn": sklearn_mod,
         "scipy": scipy_mod,
         "_ensure_import": _ensure_import,
-        "__builtins__": __builtins__,
+        "__builtins__": safe_builtins,
         "__file__": script_label,
         "__name__": "__main__",
     }
@@ -188,7 +493,7 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
         sys.argv = argv
 
     try:
-        ASCIIColors.info(f"⚡ Executing arbitrary Python code (label: {script_label})")
+        ASCIIColors.info(f"⚡ Executing Python code (label: {script_label}, autonomy: {AUTONOMY_LEVEL})")
         if _plt is not None:
             _plt.clf()
             _plt.close('all')
@@ -268,6 +573,21 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
         sys.__stderr__ = old_dunder_stderr
         sys.argv = old_argv
 
+        # Restore system functions if modified
+        if AUTONOMY_LEVEL == "safe":
+            if orig_os_system:
+                os.system = orig_os_system
+            if orig_os_popen:
+                os.popen = orig_os_popen
+            if orig_os_remove:
+                os.remove = orig_os_remove
+            if orig_os_unlink:
+                os.unlink = orig_os_unlink
+            if orig_os_rmdir:
+                os.rmdir = orig_os_rmdir
+            if orig_shutil_rmtree:
+                shutil.rmtree = orig_shutil_rmtree
+
     out_str = redirected_output.getvalue()
     err_str = redirected_error.getvalue()
 
@@ -293,8 +613,7 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
                 f"{out_str[:_PREVIEW_HALF_CHARS]}"
                 f"\n... [stripped for brevity — {stripped_chars} middle characters omitted] ...\n"
                 f"[FULL OUTPUT SAVED] The complete output was persisted to '{log_name}' in the workspace. "
-                "Use read file tools (e.g. unlock the .log file, or run a short Python snippet that reads "
-                f"and prints a slice of '{log_name}') to inspect the omitted middle.\n"
+                "Use read file tools to inspect the omitted middle.\n"
                 f"{out_str[-_PREVIEW_HALF_CHARS:]}"
             )
         else:
@@ -312,9 +631,8 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
 def _get_workspace_root() -> Path:
     """
     Resolves the workspace root.
-    The orchestrator (ChatMixin) chdirs into the sandboxed workspace before
-    invoking this tool, so the process CWD is authoritative. We only fall back
-    to ./data_workspace when running completely standalone (e.g., manual tests).
+    The orchestrator chdirs into the sandboxed workspace before invoking this tool,
+    so process CWD is authoritative.
     """
     cwd = Path.cwd()
     if cwd.name in ("workspace_data", "data_workspace") or (cwd / "data_workspace").exists():
@@ -404,15 +722,9 @@ def tool_execute_python_code(code: str = "") -> Dict[str, Any]:
     <artifact type="code"> tag to persist the .py file, then run it with
     'tool_execute_python_file'.
 
-    OUTPUT WINDOWING: when stdout exceeds the inline preview window, the FULL
-    output is saved to a .log file in the workspace and the result contains a
-    head/tail windowed preview (beginning + end) plus a pointer to the .log
-    file. Use that pointer with read file tools to inspect the omitted middle.
-
-    The execution environment automatically provides common aliases:
-    - pd (pandas), np (numpy), plt (matplotlib.pyplot)
-    - sns (seaborn), sklearn (scikit-learn), scipy
-    If any of these libraries are missing, they will be automatically installed.
+    SANDBOX INTEGRITY: in safe mode, process execution and shell escape calls
+    (subprocess, os.system, os.popen) are blocked. You cannot use this tool
+    to bypass shell restrictions.
 
     Args:
         code (str): The raw Python source code to execute inline. Required.
@@ -452,15 +764,8 @@ def tool_execute_python_file(
     exposed via sys.argv[1:] or argparse. This tool ONLY READS existing files — it never
     saves, creates, or overwrites files.
 
-    WORKFLOW (mandatory for substantial code): FIRST emit an <artifact type="code">
-    tool to create the .py file, THEN call this tool with its file name. Persisting
-    scripts makes them inspectable, patchable via SEARCH/REPLACE, and reusable.
-    'tool_execute_python_code' is strictly reserved for short, punctual snippets.
-
-    OUTPUT WINDOWING: when stdout exceeds the inline preview window, the FULL
-    output is saved to a .log file in the workspace and the result contains a
-    head/tail windowed preview (beginning + end) plus a pointer to the .log
-    file. Use that pointer with read file tools to inspect the omitted middle.
+    SANDBOX INTEGRITY: in safe mode, process execution and shell escape calls
+    (subprocess, os.system, os.popen) are blocked.
 
     Args:
         file_name (str): Name of an existing .py file in the workspace to execute. Required. Path traversal is blocked.

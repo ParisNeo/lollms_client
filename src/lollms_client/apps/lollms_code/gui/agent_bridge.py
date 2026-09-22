@@ -178,7 +178,10 @@ def create_client(env: EnvStore, prefs: GuiPrefs):
     default_tools_path = package_root / "tools_bindings" / "lcp" / "default_tools"
     tools_folders = [str(default_tools_path)] if default_tools_path.exists() else []
 
-    host_tool_configs = {"system_shell": {"autonomy_level": prefs.shell_autonomy_level}}
+    host_tool_configs = {
+        "system_shell": {"autonomy_level": prefs.shell_autonomy_level},
+        "execute_python": {"autonomy_level": prefs.shell_autonomy_level},
+    }
 
     client_kwargs: Dict[str, Any] = {
         "llm_binding_profiles": llm_bindings,
@@ -270,6 +273,9 @@ def create_personality(prefs: GuiPrefs, client):
     personality.capabilities = caps
     personality.max_tokens_per_turn = prefs.max_tokens_per_turn
     personality.debug_mode = prefs.debug
+
+    # Grant autonomous workspace authority for coding tasks (exempt from git prompt blocks)
+    object.__setattr__(personality, "_git_autonomy_granted", True)
 
     # ── Project-Local Memory Setup (matching CLI) ──
     if prefs.enable_memory:
@@ -469,6 +475,14 @@ class QueueStreamingCallback:
 
 def cancel_agent_turn(personality, client=None) -> bool:
     """Cancels an active agent turn across personality, client, and low-level LLM bindings."""
+    global _CURRENT_RESP_QUEUE
+    if _CURRENT_RESP_QUEUE is not None:
+        try:
+            _CURRENT_RESP_QUEUE.put(("reject", "Generation cancelled by user."))
+        except Exception:
+            pass
+        _CURRENT_RESP_QUEUE = None
+
     cancelled = False
     if personality is not None:
         if hasattr(personality, "cancel_generation"):
@@ -509,12 +523,61 @@ def cancel_agent_turn(personality, client=None) -> bool:
     return cancelled
 
 
+_CURRENT_RESP_QUEUE: Optional[queue.Queue] = None
+
+
+def make_gui_python_confirm_handler(event_queue: "queue.Queue[AgentEvent]", prefs: GuiPrefs):
+    """
+    Creates a confirmation handler for execute_python that dispatches a modal dialog
+    request to NiceGUI and blocks the worker thread until the user decides.
+    """
+    def _handler(source: str, script_label: str, argv: Optional[List[Any]]) -> Tuple[str, str]:
+        global _CURRENT_RESP_QUEUE
+        if getattr(prefs, "auto_approve_python", False):
+            return "allow", ""
+
+        resp_queue = queue.Queue(maxsize=1)
+        _CURRENT_RESP_QUEUE = resp_queue
+
+        event_queue.put(AgentEvent(
+            "python_approval_request",
+            source=source,
+            script_label=script_label,
+            argv=argv,
+            response_queue=resp_queue,
+        ))
+
+        try:
+            decision, reason = resp_queue.get()
+            _CURRENT_RESP_QUEUE = None
+            if decision == "always":
+                prefs.auto_approve_python = True
+                try:
+                    prefs.save()
+                except Exception:
+                    pass
+            return decision, reason
+        except Exception as e:
+            _CURRENT_RESP_QUEUE = None
+            return "reject", f"Approval interrupted: {e}"
+
+    return _handler
+
+
 def run_agent_turn_in_thread(
     personality, client, prompt: str, prefs: GuiPrefs,
     event_queue: "queue.Queue[AgentEvent]", use_history: bool = True,
 ) -> threading.Thread:
     """Runs personality.chat(...) in a background thread so the NiceGUI
     event loop never blocks, and reports completion/errors via the queue."""
+
+    # Register GUI validation handler with execute_python tool library
+    try:
+        from lollms_client.tools_bindings.lcp.default_tools.execute_python import execute_python as _ep_mod
+        _ep_mod.set_confirm_handler(make_gui_python_confirm_handler(event_queue, prefs))
+        _ep_mod._AUTO_APPROVE_PYTHON = getattr(prefs, "auto_approve_python", False)
+    except Exception:
+        pass
 
     callback = QueueStreamingCallback(event_queue)
 
@@ -529,6 +592,10 @@ def run_agent_turn_in_thread(
                 n_predict=prefs.max_tokens_per_turn,
                 enable_artefacts=True,
                 use_internal_history=use_history,
+                enable_shell=getattr(prefs, "enable_shell_execution", True),
+                enable_python_exec=True,
+                enable_workspace_tools=True,
+                enforce_end_tag=True,
                 event_mode=EventMode.FULL_CALLBACK_MODE,
                 debug=prefs.debug,
                 debug_export=prefs.debug,

@@ -13,6 +13,14 @@ from gui_prefs import GuiPrefs
 from env_config import EnvStore
 import agent_bridge
 try:
+    from folder_picker import pick_folder
+except ImportError:
+    try:
+        from lollms_client.apps.lollms_code.gui.folder_picker import pick_folder
+    except ImportError:
+        pick_folder = None
+
+try:
     from memory_explorer import open_memory_explorer_dialog
 except ImportError:
     try:
@@ -27,6 +35,7 @@ HELP_TEXT = """\
 **Commands**
 
 - `/help` — this list
+- `/history` — browse and resend prompt history (Ctrl+H)
 - `/clear-history` (alias `/clear`) — clear the conversation shown here (and the agent's in-memory history)
 - `/clear-files` (alias `/unload-all`) — unload every currently loaded file from context
 - `/load <file1> [file2] ...` — load files into context (`/load all` loads everything indexed)
@@ -51,6 +60,7 @@ Ctrl+Shift+C copy the last agent message.
 
 SLASH_COMMANDS = [
     ("/help", "Show command list"),
+    ("/history", "Browse and resend prompt history"),
     ("/clear-history", "Clear the conversation"),
     ("/clear-files", "Unload all files from context"),
     ("/load", "Load file(s) into context (or 'all')"),
@@ -75,6 +85,7 @@ SHORTCUTS = [
     ("↑ / ↓ (empty input)", "Browse prompt history"),
     ("Tab", "Accept slash-command suggestion"),
     ("Ctrl+K", "Command palette"),
+    ("Ctrl+H", "Open prompt history (browse & resend)"),
     ("Ctrl+F", "Search the conversation"),
     ("Esc", "Close search"),
     ("Ctrl+/", "Show this shortcut list"),
@@ -98,6 +109,31 @@ class ChatSession:
         self.prompt_history: List[str] = []
         self.history_index: int = -1
         self.turn_start_ts: Optional[float] = None
+        self.load_prompt_history()
+
+    def get_prompt_history_path(self) -> Path:
+        return Path(self.prefs.workspace_path).resolve() / ".lollms_code" / "prompt_history.json"
+
+    def load_prompt_history(self) -> None:
+        p = self.get_prompt_history_path()
+        if p.exists():
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    self.prompt_history = [str(x) for x in data if str(x).strip()]
+            except Exception:
+                self.prompt_history = []
+        else:
+            self.prompt_history = []
+        self.history_index = -1
+
+    def save_prompt_history(self) -> None:
+        p = self.get_prompt_history_path()
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(self.prompt_history, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
 
     def ensure_ready(self):
         if self.client is None:
@@ -120,46 +156,200 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
 
     show_tree_sidebar = True
 
-    # ---- Theme ----------------------------------------------------------
-    # Created FIRST so every widget below can reference it. NiceGUI's
-    # ui.dark_mode drives Quasar's global dark plugin, so any component that
-    # does NOT carry a hardcoded `dark` prop follows it automatically.
-    #
-    # Three modes, cycled by the toolbar button: auto → light → dark → auto.
-    # "auto" follows the wall clock: light during the day, dark at night.
+    # ── Theme State (Directly driven by GuiPrefs.is_dark()) ─────────────────
+    dark_mode = ui.dark_mode(value=prefs.is_dark())
     THEME_MODES = ("auto", "light", "dark")
-    DAY_START_HOUR = int(getattr(prefs, "theme_day_start_hour", 7))    # ≥ this hour → light
-    NIGHT_START_HOUR = int(getattr(prefs, "theme_night_start_hour", 19))  # ≥ this hour → dark
-
-    theme_state = {"mode": getattr(prefs, "theme_mode", "auto")}
-    if theme_state["mode"] not in THEME_MODES:
-        theme_state["mode"] = "auto"
-
-    def _is_night(now: Optional[datetime] = None) -> bool:
-        hour = (now or datetime.now()).hour
-        if DAY_START_HOUR <= NIGHT_START_HOUR:
-            # Normal case, e.g. day 07:00–19:00.
-            return hour < DAY_START_HOUR or hour >= NIGHT_START_HOUR
-        # Inverted window (day spans midnight) — rare, but don't break on it.
-        return NIGHT_START_HOUR <= hour < DAY_START_HOUR
-
-    def _resolve_dark(mode: str) -> bool:
-        if mode == "light":
-            return False
-        if mode == "dark":
-            return True
-        return _is_night()
-
-    dark_mode = ui.dark_mode(value=_resolve_dark(theme_state["mode"]))
+    THEME_ICONS = {"auto": "brightness_auto", "light": "light_mode", "dark": "dark_mode"}
 
     # Dual-mode Tailwind tokens with verified high contrast in both themes.
     SURFACE = "bg-slate-100 dark:bg-slate-900"
     SURFACE_ALT = "bg-slate-100/80 dark:bg-slate-900/80"
-    CANVAS = "bg-white dark:bg-slate-950"
+    CANVAS = "bg-slate-50 dark:bg-slate-950"
     BORDER = "border-slate-300 dark:border-slate-800"
     MUTED = "text-slate-700 dark:text-slate-300"
     MUTED_DIM = "text-slate-600 dark:text-slate-400"
     STRONG = "text-slate-900 dark:text-slate-100"
+
+    # UI Element Forward References
+    prompt_input = None
+    transcript = None
+    scroll_area = None
+    input_counter = None
+    theme_btn = None
+    thinking_indicator = None
+    thinking_label = None
+
+    # ── Core Action & Dialog Helpers (Defined First to Avoid UnboundLocalError) ─
+    def set_prompt_input(text_to_set: str):
+        if prompt_input is None:
+            return
+        clean = re.sub(r"^🔁 _Rerun:_\s*", "", text_to_set).strip()
+        prompt_input.value = clean
+        prompt_input.run_method("focus")
+        _update_input_counter()
+        ui.notify("Copied to prompt input.", type="info", timeout=1200)
+
+    def _theme_tooltip() -> str:
+        mode = getattr(prefs, "theme_mode", "auto")
+        if mode == "auto":
+            is_d = prefs.is_dark()
+            return f"Theme: Auto ({'Dark' if is_d else 'Light'} at night/day) — Click for Light"
+        elif mode == "light":
+            return "Theme: Light — Click for Dark"
+        else:
+            return "Theme: Dark — Click for Auto"
+
+    def _sync_theme_button():
+        if theme_btn is None:
+            return
+        try:
+            mode = getattr(prefs, "theme_mode", "auto")
+            theme_btn._props["icon"] = THEME_ICONS.get(mode, "brightness_auto")
+            theme_btn._props["title"] = _theme_tooltip()
+            theme_btn.update()
+        except Exception:
+            pass
+
+    def toggle_theme():
+        modes = list(THEME_MODES)
+        curr = getattr(prefs, "theme_mode", "auto")
+        next_mode = modes[(modes.index(curr) + 1) % len(modes)] if curr in modes else "dark"
+        prefs.theme_mode = next_mode
+        want_dark = prefs.is_dark()
+        prefs.dark_mode = want_dark
+        dark_mode.set_value(want_dark)
+        try:
+            prefs.save()
+        except Exception:
+            pass
+        _sync_theme_button()
+        label = next_mode.capitalize()
+        if next_mode == "auto":
+            label += f" ({'Dark' if want_dark else 'Light'} right now)"
+        ui.notify(f"Theme: {label}", type="info", timeout=1500)
+
+    def show_thinking_indicator(message: str = "Thinking…"):
+        nonlocal thinking_indicator, thinking_label
+        if transcript is None:
+            return
+        if thinking_indicator is not None:
+            if thinking_label is not None:
+                thinking_label.set_text(message)
+            return
+
+        with transcript:
+            thinking_indicator = ui.row().classes(
+                f"w-fit items-center gap-2.5 px-4 py-2.5 rounded-xl border {BORDER} "
+                f"{SURFACE} text-slate-800 dark:text-slate-200 shadow-sm transition-all select-none"
+            )
+            with thinking_indicator:
+                ui.icon("psychology", size="18px").classes("text-primary shrink-0 animate-pulse")
+                thinking_label = ui.label(message).classes(f"text-xs font-mono {MUTED}")
+                with ui.row().classes("items-center gap-1 shrink-0 ml-1"):
+                    ui.element("span").classes("w-1.5 h-1.5 rounded-full bg-primary animate-bounce").style(
+                        "animation-delay: -0.32s; animation-duration: 1.1s;"
+                    )
+                    ui.element("span").classes("w-1.5 h-1.5 rounded-full bg-primary animate-bounce").style(
+                        "animation-delay: -0.16s; animation-duration: 1.1s;"
+                    )
+                    ui.element("span").classes("w-1.5 h-1.5 rounded-full bg-primary animate-bounce").style(
+                        "animation-delay: 0s; animation-duration: 1.1s;"
+                    )
+        if scroll_area:
+            scroll_area.scroll_to(percent=1.0)
+
+    def hide_thinking_indicator():
+        nonlocal thinking_indicator, thinking_label
+        if thinking_indicator is not None:
+            try:
+                thinking_indicator.delete()
+            except Exception:
+                pass
+            thinking_indicator = None
+            thinking_label = None
+
+    def open_history_dialog():
+        dialog = ui.dialog()
+        with dialog, ui.card().classes(
+            f"w-[680px] max-w-[95vw] h-[580px] max-h-[90vh] flex flex-col p-4 gap-3 "
+            f"{CANVAS} text-slate-900 dark:text-slate-100 rounded-xl shadow-2xl border {BORDER}"
+        ):
+            with ui.row().classes(f"w-full items-center justify-between pb-2 border-b {BORDER}"):
+                with ui.row().classes("items-center gap-2"):
+                    ui.icon("history", size="24px").classes("text-primary")
+                    with ui.column().classes("gap-0"):
+                        ui.label("Prompt History").classes("text-base font-bold")
+                        ui.label("Browse, reuse, or resend messages previously sent to the agent.").classes(
+                            f"text-xs {MUTED_DIM}"
+                        )
+                ui.button(icon="close", on_click=dialog.close).props("flat round dense size=xs")
+
+            search_bar = ui.input(placeholder="Search previous prompts…").classes(
+                "w-full text-xs"
+            ).props("dense outlined clearable input-debounce=100")
+
+            scroll = ui.scroll_area().classes(f"w-full flex-1 border {BORDER} rounded p-2")
+            with scroll:
+                history_list = ui.column().classes("w-full gap-2")
+
+            def refresh_history_items():
+                history_list.clear()
+                q = (search_bar.value or "").strip().lower()
+                entries = list(reversed(session.prompt_history))
+                if q:
+                    entries = [e for e in entries if q in e.lower()]
+
+                with history_list:
+                    if not entries:
+                        ui.label("No history matching your search." if q else "No prompt history recorded yet.").classes(
+                            f"text-xs {MUTED_DIM} italic p-4 text-center w-full"
+                        )
+                        return
+
+                    for prompt_text in entries:
+                        with ui.card().classes(
+                            f"w-full p-2.5 rounded-lg border {BORDER} {SURFACE} hover:border-primary/50 transition-colors gap-1.5 shadow-none"
+                        ):
+                            ui.label(prompt_text).classes(
+                                "text-xs font-mono break-words whitespace-pre-wrap max-h-24 overflow-hidden select-all"
+                            )
+                            with ui.row().classes("w-full items-center justify-end gap-1.5 pt-1"):
+                                def _use_in_input(p=prompt_text):
+                                    set_prompt_input(p)
+                                    dialog.close()
+
+                                async def _resend_now(p=prompt_text):
+                                    dialog.close()
+                                    if session.busy:
+                                        ui.notify("Agent is busy — wait for current turn to finish.", type="warning")
+                                        return
+                                    await send_prompt_with_text(p)
+
+                                ui.button("Use in input", icon="edit_note", on_click=_use_in_input).props(
+                                    "flat dense size=xs no-caps text-color=primary font-semibold"
+                                ).tooltip("Place into textarea to edit before sending")
+
+                                ui.button("Resend", icon="send", on_click=_resend_now).props(
+                                    "unelevated dense size=xs color=primary no-caps font-semibold"
+                                ).tooltip("Send this prompt immediately")
+
+            search_bar.on_value_change(lambda _: refresh_history_items())
+            refresh_history_items()
+
+            with ui.row().classes(f"w-full items-center justify-between pt-2 border-t {BORDER}"):
+                def _clear_all_history():
+                    session.prompt_history.clear()
+                    session.save_prompt_history()
+                    refresh_history_items()
+                    ui.notify("Prompt history cleared.", type="positive")
+
+                ui.button("Clear History", icon="delete_sweep", on_click=_clear_all_history).props(
+                    "flat dense size=xs color=red no-caps"
+                ).tooltip("Delete all saved prompt history from this workspace")
+
+                ui.button("Close", on_click=dialog.close).props("flat dense size=sm no-caps")
+
+        dialog.open()
 
     with ui.column().classes("w-full h-full flex-1 min-h-0 flex-nowrap gap-0 overflow-hidden flex flex-col"):
         # ---- Slim status strip (replaces the old sidebar cards) ----
@@ -167,6 +357,10 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
             f"w-full items-center justify-between px-3 py-1.5 shrink-0 {SURFACE} border-b {BORDER}"
         ):
             with ui.row().classes("items-center gap-2"):
+                ui.button(
+                    "Projects", icon="view_carousel",
+                    on_click=lambda: ui.navigate.to("/"),
+                ).props("flat dense size=sm no-caps text-color=primary font-semibold").tooltip("Return to Workspace Deck")
                 tree_toggle_btn = ui.button(
                     "Tree", icon="folder",
                     on_click=lambda: toggle_tree_visibility(),
@@ -188,9 +382,9 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     on_click=lambda: open_search(),
                 ).props("flat dense round size=sm").tooltip("Search this conversation (Ctrl+F)")
                 theme_btn = ui.button(
-                    icon="brightness_auto",
+                    icon=THEME_ICONS.get(getattr(prefs, "theme_mode", "auto"), "brightness_auto"),
                     on_click=lambda: toggle_theme(),
-                ).props("flat dense round size=sm").tooltip("Theme: Auto / Light / Dark")
+                ).props("flat dense round size=sm").tooltip(_theme_tooltip())
                 ui.button(
                     icon="keyboard",
                     on_click=lambda: open_shortcuts_dialog(),
@@ -223,8 +417,8 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         with search_row:
             ui.icon("search").classes(MUTED_DIM)
             search_input = ui.input(placeholder="Search conversation…").classes(
-                "flex-1"
-            ).props("dense outlined input-debounce=100")
+                "flex-1 bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-100 text-xs"
+            ).props(':dark="Quasar.Dark.isActive" dense outlined input-debounce=100')
             search_count_label = ui.label("").classes(f"text-xs {MUTED_DIM} font-mono")
             ui.button(icon="close", on_click=lambda: close_search()).props("flat dense round size=xs")
 
@@ -248,8 +442,8 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
 
                 with ui.row().classes("w-full px-2 pt-2 shrink-0"):
                     tree_search_input = ui.input(placeholder="Filter files…").props(
-                        "dense outlined clearable"
-                    ).classes("w-full")
+                        ':dark="Quasar.Dark.isActive" dense outlined clearable'
+                    ).classes("w-full bg-slate-50 dark:bg-slate-900 text-xs text-slate-900 dark:text-slate-100")
 
                 tree_scroll = ui.scroll_area().classes("w-full flex-1 p-2")
                 with tree_scroll:
@@ -302,17 +496,20 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 prompt_input = ui.textarea(
                     placeholder="Describe task, or type / for commands… (Enter to send, Shift+Enter for new line)"
                 ).classes(
-                    "w-full bg-white dark:bg-slate-800/80 text-slate-900 dark:text-slate-100 rounded"
-                ).props("outlined autogrow dense rows=1 input-debounce=0")
+                    "w-full bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-100 rounded"
+                ).props(':dark="Quasar.Dark.isActive" outlined autogrow dense rows=1 input-debounce=0')
                 input_counter = ui.label("").classes(f"text-[10px] {MUTED_DIM} self-end pr-1")
+            history_button = ui.button(icon="history", on_click=lambda: open_history_dialog()).props(
+                "round flat dense size=md"
+            ).tooltip("Prompt history (Ctrl+H) — browse and resend past messages")
             regen_button = ui.button(icon="autorenew", on_click=lambda: regenerate_last()).props(
-                "round flat"
+                "round flat dense size=md"
             ).tooltip("Regenerate last response")
             stop_button = ui.button(icon="stop", on_click=lambda: stop_generation()).props(
-                "round color=negative"
+                "round dense size=md color=negative"
             ).tooltip("Stop generation")
             stop_button.bind_visibility_from(session, "busy")
-            send_button = ui.button(icon="send").props("round color=primary")
+            send_button = ui.button(icon="send").props("round dense size=md color=primary")
 
     # ---- Upload dialog (drop a file straight into the workspace root) ----
     upload_dialog = ui.dialog()
@@ -343,10 +540,14 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
             with outer_row:
                 actions = ui.row().classes("opacity-40 hover:opacity-100 transition-opacity gap-0")
                 with actions:
+                    use_btn = ui.button(icon="edit_note", on_click=lambda t=text: set_prompt_input(t)).props(
+                        "flat round dense size=xs text-color=primary"
+                    )
+                    use_btn.tooltip("Copy prompt into input box to edit")
                     edit_btn = ui.button(icon="edit", on_click=lambda: open_edit_dialog(msg_id)).props(
                         "flat round dense size=xs"
                     )
-                    edit_btn.tooltip("Edit this prompt")
+                    edit_btn.tooltip("Edit this prompt in place")
                     rerun_btn = ui.button(icon="replay", on_click=lambda: rerun_prompt(msg_id)).props(
                         "flat round dense size=xs"
                     )
@@ -421,7 +622,11 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         except Exception:
             ui.notify(toast, type="negative", timeout=8000)
             return
-        ui.notify(f"{toast} — full details in the transcript card (copyable).", type="negative", timeout=5000)
+        ui.notify(
+            f"{toast} — full details in the transcript card.",
+            type="negative",
+            timeout=7000
+        )
 
     def add_system_notice(text: str, is_error: bool = False):
         entry = {"type": "system", "text": text, "error": is_error}
@@ -460,7 +665,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     ).props("flat round dense size=xs color=grey")
                     copy_btn.tooltip("Copy panel content")
                 ui.code(body or "(no output)").classes(
-                    "w-full text-xs bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 p-2.5 rounded border border-slate-300 dark:border-slate-800"
+                    "w-full text-xs bg-slate-900 dark:bg-slate-950 text-slate-100 p-2.5 rounded border border-slate-700 dark:border-slate-800"
                 )
         return panel
 
@@ -521,25 +726,27 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 return entry
         return None
 
-    def rerun_prompt(msg_id: str):
+    def set_prompt_input(text_to_set: str):
+        clean = re.sub(r"^🔁 _Rerun:_\s*", "", text_to_set).strip()
+        prompt_input.value = clean
+        prompt_input.run_method("focus")
+        _update_input_counter()
+        ui.notify("Copied to prompt input.", type="info", timeout=1200)
+
+    async def rerun_prompt(msg_id: str):
         """Re-sends a previously sent prompt as a fresh agent turn (history preserved)."""
         entry = find_message_entry(msg_id)
         if entry is None or entry.get("type") != "user":
             ui.notify("Cannot rerun this message.", type="warning")
             return
-        prompt_text = entry.get("text", "").strip()
+        prompt_text = re.sub(r"^🔁 _Rerun:_\s*", "", entry.get("text", "").strip())
         if not prompt_text:
             ui.notify("Nothing to rerun.", type="warning")
             return
         if session.busy:
             ui.notify("Agent is busy — wait for the current turn to finish.", type="warning")
             return
-        if prompt_text.startswith("/"):
-            async def _rerun_slash():
-                await send_prompt_with_text(prompt_text)
-            ui.timer(0.1, _rerun_slash, once=True)
-            return
-        send_prompt_with_text(prompt_text, rerun_marker=True)
+        await send_prompt_with_text(prompt_text, rerun_marker=True)
 
     def regenerate_last():
         """Re-sends the most recent user prompt (skips /slash commands)."""
@@ -565,8 +772,24 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         ui.timer(0.05, _go, once=True)
 
     def stop_generation():
+        hide_thinking_indicator()
         if not session.busy:
             return
+        # Clean up any active approval modal dialog if open
+        if active_approval_dialog_holder.get("dialog") is not None:
+            try:
+                active_approval_dialog_holder["dialog"].close()
+            except Exception:
+                pass
+            rq = active_approval_dialog_holder.get("resp_queue")
+            if rq:
+                try:
+                    rq.put(("reject", "Generation cancelled by user."))
+                except Exception:
+                    pass
+            active_approval_dialog_holder["dialog"] = None
+            active_approval_dialog_holder["resp_queue"] = None
+
         try:
             session.ensure_ready()
             cancelled = False
@@ -617,6 +840,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         session.turn_start_ts = time.time()
         send_button.props("loading")
         status_label.set_text("Thinking…")
+        show_thinking_indicator("Thinking…")
         try:
             session.ensure_ready()
         except Exception as e:
@@ -704,6 +928,15 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         confirm.open()
 
     def new_session():
+        hide_thinking_indicator()
+        if active_approval_dialog_holder.get("dialog") is not None:
+            try:
+                active_approval_dialog_holder["dialog"].close()
+            except Exception:
+                pass
+            active_approval_dialog_holder["dialog"] = None
+            active_approval_dialog_holder["resp_queue"] = None
+
         transcript.clear()
         debug_log.clear()
         message_refs.clear()
@@ -755,61 +988,27 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 ui.button("Close", on_click=dialog.close).props("flat")
         dialog.open()
 
-    THEME_ICONS = {"auto": "brightness_auto", "light": "light_mode", "dark": "dark_mode"}
-
-    def _theme_tooltip() -> str:
-        mode = theme_state["mode"]
-        if mode == "auto":
-            return (
-                f"Theme: Auto — light from {DAY_START_HOUR:02d}:00, "
-                f"dark from {NIGHT_START_HOUR:02d}:00 (click for Light)"
-            )
-        if mode == "light":
-            return "Theme: Light (click for Dark)"
-        return "Theme: Dark (click for Auto)"
-
     def _sync_theme_button():
-        # Re-issuing `.props("icon=…")` appends rather than replaces, so Quasar
-        # can keep the stale icon. Set the prop dict directly and force an update.
-        theme_btn._props["icon"] = THEME_ICONS[theme_state["mode"]]
-        theme_btn._props["title"] = _theme_tooltip()
-        theme_btn.update()
-
-    def _apply_theme(notify: bool = False):
-        want_dark = _resolve_dark(theme_state["mode"])
-        if dark_mode.value != want_dark:
-            dark_mode.set_value(want_dark)
-        _sync_theme_button()
-        if notify:
-            label = theme_state["mode"].capitalize()
-            if theme_state["mode"] == "auto":
-                label += f" ({'dark' if want_dark else 'light'} right now)"
-            ui.notify(f"Theme: {label}", type="info", timeout=1500)
-
-    def toggle_theme():
-        idx = THEME_MODES.index(theme_state["mode"])
-        theme_state["mode"] = THEME_MODES[(idx + 1) % len(THEME_MODES)]
-        _apply_theme(notify=True)
         try:
-            prefs.theme_mode = theme_state["mode"]
-            # Kept for any older code still reading prefs.dark_mode.
-            prefs.dark_mode = dark_mode.value
-            if hasattr(prefs, "save"):
-                prefs.save()
+            is_dark = bool(dark_mode.value)
+            theme_btn._props["icon"] = "dark_mode" if is_dark else "light_mode"
+            theme_btn._props["title"] = "Theme: Dark (click for Light)" if is_dark else "Theme: Light (click for Dark)"
+            theme_btn.update()
         except Exception:
             pass
 
-    def _theme_autotick():
-        """In auto mode, flip the theme when the clock crosses dawn/dusk."""
-        if theme_state["mode"] != "auto":
-            return
-        want_dark = _resolve_dark("auto")
-        if dark_mode.value != want_dark:
-            dark_mode.set_value(want_dark)
-            _sync_theme_button()
+    def toggle_theme():
+        new_dark = not bool(dark_mode.value)
+        dark_mode.set_value(new_dark)
+        prefs.dark_mode = new_dark
+        try:
+            prefs.save()
+        except Exception:
+            pass
+        _sync_theme_button()
+        ui.notify(f"Theme: {'Dark' if new_dark else 'Light'}", type="info", timeout=1200)
 
-    _apply_theme()
-    ui.timer(60.0, _theme_autotick)
+    _sync_theme_button()
 
     # ---------------- Transcript search ----------------
 
@@ -849,12 +1048,182 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         # 3. Strip any stray closing tags or status comments
         cleaned = re.sub(r"</?processing[^>]*>", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"<!--\s*status:[^>]*-->", "", cleaned, flags=re.IGNORECASE)
-        return cleaned.strip()
+
+        # 4. Comprehensive de-duplication (exact halving, duplicate paragraphs, repeated sentences)
+        cleaned_text = cleaned.strip()
+        if not cleaned_text:
+            return ""
+
+        # Exact-halving check (e.g. text literally echoed as A + A)
+        h = len(cleaned_text) // 2
+        for offset in (0, -1, 1, -2, 2):
+            test_h = h + offset
+            if 15 < test_h < len(cleaned_text):
+                p1 = cleaned_text[:test_h].strip()
+                p2 = cleaned_text[test_h:].strip()
+                if p1 and p1 == p2:
+                    cleaned_text = p1
+                    break
+
+        # Paragraph & line collapse
+        lines = cleaned_text.splitlines()
+        deduped_lines = []
+        recent_lines = []
+        for line in lines:
+            st = line.strip()
+            if not st:
+                if deduped_lines and deduped_lines[-1] != "":
+                    deduped_lines.append("")
+                continue
+            if recent_lines and st == recent_lines[-1]:
+                continue
+            recent_lines.append(st)
+            if len(recent_lines) > 5:
+                recent_lines.pop(0)
+            deduped_lines.append(line)
+
+        cleaned_text = "\n".join(deduped_lines).strip()
+
+        # Sentence-level duplication collapse
+        def _collapse_sentences(para: str) -> str:
+            parts = re.split(r'(?<=[.!?])\s+', para)
+            if len(parts) < 2:
+                return para
+            out = []
+            for s in parts:
+                st = s.strip()
+                if st and out and out[-1].strip() == st:
+                    continue
+                out.append(s)
+            return " ".join(out)
+
+        paras = cleaned_text.split("\n\n")
+        cleaned_paras = [_collapse_sentences(p) for p in paras]
+        return "\n\n".join(cleaned_paras).strip()
 
     current_agent_md: Optional[ui.markdown] = None
     agent_text_buffer = ""
     active_tool_panels: Dict[str, Dict[str, Any]] = {}
     active_artefact_panels: Dict[str, Dict[str, Any]] = {}
+    active_approval_dialog_holder: Dict[str, Any] = {"dialog": None, "resp_queue": None}
+    thinking_indicator: Optional[ui.element] = None
+    thinking_label: Optional[ui.label] = None
+
+    def show_thinking_indicator(message: str = "Thinking…"):
+        nonlocal thinking_indicator, thinking_label
+        if thinking_indicator is not None:
+            if thinking_label is not None:
+                thinking_label.set_text(message)
+            return
+
+        with transcript:
+            thinking_indicator = ui.row().classes(
+                f"w-fit items-center gap-2.5 px-4 py-2.5 rounded-xl border {BORDER} "
+                f"{SURFACE} text-slate-800 dark:text-slate-200 shadow-sm transition-all select-none"
+            )
+            with thinking_indicator:
+                ui.icon("psychology", size="18px").classes("text-primary shrink-0 animate-pulse")
+                thinking_label = ui.label(message).classes(f"text-xs font-mono {MUTED}")
+                with ui.row().classes("items-center gap-1 shrink-0 ml-1"):
+                    ui.element("span").classes("w-1.5 h-1.5 rounded-full bg-primary animate-bounce").style(
+                        "animation-delay: -0.32s; animation-duration: 1.1s;"
+                    )
+                    ui.element("span").classes("w-1.5 h-1.5 rounded-full bg-primary animate-bounce").style(
+                        "animation-delay: -0.16s; animation-duration: 1.1s;"
+                    )
+                    ui.element("span").classes("w-1.5 h-1.5 rounded-full bg-primary animate-bounce").style(
+                        "animation-delay: 0s; animation-duration: 1.1s;"
+                    )
+        scroll_area.scroll_to(percent=1.0)
+
+    def hide_thinking_indicator():
+        nonlocal thinking_indicator, thinking_label
+        if thinking_indicator is not None:
+            try:
+                thinking_indicator.delete()
+            except Exception:
+                pass
+            thinking_indicator = None
+            thinking_label = None
+
+    def open_python_approval_dialog(source: str, script_label: str, argv: Optional[List[Any]], resp_queue: Any):
+        """Displays a modal dialog asking the user to authorize Python execution in safe mode."""
+        dialog = ui.dialog().props("persistent")
+        active_approval_dialog_holder["dialog"] = dialog
+        active_approval_dialog_holder["resp_queue"] = resp_queue
+
+        source_lines = source.splitlines()
+        line_count = len(source_lines)
+
+        with dialog, ui.card().classes(
+            "w-[760px] max-w-[95vw] max-h-[90vh] flex flex-col p-4 gap-3 "
+            "bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 "
+            "rounded-xl shadow-2xl border-2 border-amber-500/80"
+        ):
+            with ui.row().classes("w-full items-center justify-between pb-2 border-b border-slate-200 dark:border-slate-800"):
+                with ui.row().classes("items-center gap-2.5"):
+                    ui.icon("security", size="28px").classes("text-amber-500")
+                    with ui.column().classes("gap-0"):
+                        ui.label("🛡️ Python Execution Authorization (Safe Mode)").classes("text-base font-bold")
+                        ui.label("The AI agent wants to execute this Python code in your workspace sandbox.").classes(
+                            "text-xs text-slate-500 dark:text-slate-400"
+                        )
+
+            with ui.row().classes("items-center gap-3 text-xs font-mono"):
+                ui.label(f"Target: {script_label}").classes("font-semibold text-primary")
+                if argv and len(argv) > 1:
+                    ui.label(f"Args: {argv[1:]}").classes("text-slate-500")
+                ui.label(f"Lines: {line_count:,}").classes("text-slate-400")
+
+            with ui.scroll_area().classes(
+                "w-full max-h-[360px] border border-slate-300 dark:border-slate-800 rounded bg-slate-50 dark:bg-slate-950 p-2"
+            ):
+                ui.code(source, language="python").classes("w-full text-xs")
+
+            feedback_input = ui.input(
+                placeholder="Optional feedback / instruction if rejecting (e.g. 'Use requests instead', 'Fix syntax error')..."
+            ).classes("w-full text-xs").props("outlined dense clearable")
+
+            with ui.row().classes("w-full items-center justify-between pt-2 border-t border-slate-200 dark:border-slate-800"):
+                def _do_reject():
+                    dialog.close()
+                    fb = (feedback_input.value or "").strip()
+                    if resp_queue:
+                        resp_queue.put(("reject", fb or "User declined execution."))
+                    active_approval_dialog_holder["dialog"] = None
+                    active_approval_dialog_holder["resp_queue"] = None
+                    ui.notify("Python execution rejected.", type="warning")
+
+                def _do_allow():
+                    dialog.close()
+                    if resp_queue:
+                        resp_queue.put(("allow", ""))
+                    active_approval_dialog_holder["dialog"] = None
+                    active_approval_dialog_holder["resp_queue"] = None
+                    ui.notify("Authorized single execution.", type="positive")
+
+                def _do_always():
+                    dialog.close()
+                    if resp_queue:
+                        resp_queue.put(("always", ""))
+                    prefs.auto_approve_python = True
+                    active_approval_dialog_holder["dialog"] = None
+                    active_approval_dialog_holder["resp_queue"] = None
+                    ui.notify("Auto-approval enabled for this session.", type="positive")
+
+                ui.button("Reject", icon="cancel", on_click=_do_reject).props(
+                    "unelevated color=negative size=sm no-caps"
+                ).tooltip("Reject execution and pass optional feedback to the LLM")
+
+                with ui.row().classes("items-center gap-2"):
+                    ui.button("Always Allow (This Session)", icon="done_all", on_click=_do_always).props(
+                        "outline color=emerald size=sm no-caps"
+                    ).tooltip("Auto-approve all Python executions for this session (removes human bottleneck)")
+                    ui.button("Run Once", icon="play_arrow", on_click=_do_allow).props(
+                        "unelevated color=primary size=sm no-caps"
+                    ).tooltip("Authorize this execution only")
+
+        dialog.open()
 
     def seal_current_text_block():
         """Seals the current conversational agent bubble so that the next action
@@ -897,6 +1266,8 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 if chunk_text.strip().startswith('{"') and chunk_text.strip().endswith('}'):
                     continue
 
+                hide_thinking_indicator()
+
                 if current_agent_md is None:
                     current_agent_md = add_agent_message_container()
                     agent_text_buffer = ""
@@ -908,7 +1279,15 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 if entry is not None:
                     entry["text"] = cleaned
 
+            elif ev.kind == "python_approval_request":
+                source = ev.data.get("source", "")
+                script_label = ev.data.get("script_label", "script.py")
+                argv = ev.data.get("argv")
+                resp_queue = ev.data.get("response_queue")
+                open_python_approval_dialog(source, script_label, argv, resp_queue)
+
             elif ev.kind == "thought":
+                hide_thinking_indicator()
                 seal_current_text_block()
                 add_event_panel("💭 Thinking", "", ev.data.get("text", ""), "gray-400", "psychology")
 
@@ -919,25 +1298,33 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 name = ev.data.get("tool_name", "tool")
                 if name == "pending":
                     continue
+                hide_thinking_indicator()
                 seal_current_text_block()
                 params = ev.data.get("parameters", {})
                 params_str = json.dumps(params, indent=2, ensure_ascii=False) if isinstance(params, dict) else str(params)
 
-                panel = add_event_panel(f"🛠️ Running: {name}", "executing…", params_str, "blue-500", "build")
-                active_tool_panels[name] = {"panel": panel, "params": params}
+                # Avoid duplicate running panels if already registered for this active tool call
+                if name not in active_tool_panels:
+                    panel = add_event_panel(f"🛠️ Running: {name}", "executing…", params_str, "blue-500", "build")
+                    active_tool_panels[name] = {"panel": panel, "params": params}
                 status_label.set_text(f"Running {name}…")
                 _paint_round(timeline_slots, session.current_round, "bg-blue-500 animate-pulse")
 
             elif ev.kind == "tool_end":
                 name = ev.data.get("tool_name", "tool")
-                if name == "pending" and not ev.data.get("output") and not ev.data.get("error"):
+                if name == "pending":
                     continue
+                # Discard parser stream completion signals that lack an actual execution output/status
+                has_result = "success" in ev.data or bool(ev.data.get("output")) or bool(ev.data.get("error"))
+                if not has_result:
+                    continue
+
                 seal_current_text_block()
-                success = ev.data.get("success", False)
+                success = bool(ev.data.get("success", False))
                 output = ev.data.get("output") or ev.data.get("error") or ""
                 color = "green-500" if success else "red-500"
 
-                # Update existing running panel if present to prevent duplicate disjoint panels
+                # Remove the 'Running...' panel so the completed result replaces it cleanly
                 if name in active_tool_panels:
                     active_item = active_tool_panels.pop(name)
                     try:
@@ -958,13 +1345,27 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 )
 
             elif ev.kind == "context_update":
+                files = ev.data.get("files", [])
+                status = ev.data.get("status", "")
+                error = ev.data.get("error")
+
+                # Discard streaming/parser signals that carry no files and no error
+                if not files and not error:
+                    continue
+
                 seal_current_text_block()
                 _paint_round(timeline_slots, session.current_round, "bg-amber-500")
+
+                action = ev.data.get("action", "context")
+                color = "green-500" if status == "success" else ("red-500" if status == "failure" else "amber-500")
+                body = "\n".join(files) if files else str(error or "(no files)")
+
                 add_event_panel(
-                    "📂 Context update",
-                    ev.data.get("action", ""),
-                    "\n".join(ev.data.get("files", [])) or "(no files)",
-                    "amber-500", "folder_open",
+                    f"📂 Context: {action.replace('_', ' ').title()}",
+                    status or "completed",
+                    body,
+                    color,
+                    "folder_open",
                 )
 
             elif ev.kind == "scratchpad_update":
@@ -975,6 +1376,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 add_event_panel("📝 Scratchpad", action, message, "yellow-600", "edit_note")
 
             elif ev.kind == "artefact_start":
+                hide_thinking_indicator()
                 title = ev.data.get("title", "artifact")
                 lang = ev.data.get("language", "")
                 op = ev.data.get("operation", "write")
@@ -995,13 +1397,16 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
 
             elif ev.kind == "artefact_end":
                 title = ev.data.get("title", "artifact")
-                success = ev.data.get("success", False)
+                # Discard pre-execution parser stream_complete signals to prevent duplicate panels
+                if ev.data.get("stream_complete") and not ev.data.get("execution_phase") and "error" not in ev.data:
+                    continue
+
+                seal_current_text_block()
+                success = bool(ev.data.get("success", False))
                 version = ev.data.get("version", 1)
                 lines = ev.data.get("line_count", 0)
                 chars = ev.data.get("size_chars", 0)
                 is_patch = ev.data.get("is_patch", False)
-
-                seal_current_text_block()
 
                 if title in active_artefact_panels:
                     active_art_item = active_artefact_panels.pop(title)
@@ -1052,6 +1457,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                         ui.label(f"R{r_int}").classes("text-[10px] font-mono text-gray-400 w-6 shrink-0")
                         dot = ui.element("div").classes("h-2.5 w-2.5 rounded-full bg-gray-300")
                 timeline_slots[r_int] = dot
+                show_thinking_indicator(f"Round {r_int}: Thinking…")
 
             elif ev.kind == "round_info":
                 r = ev.data.get("round", "?")
@@ -1059,6 +1465,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 status_label.set_text(f"Round {r}/{m}")
 
             elif ev.kind == "done":
+                hide_thinking_indicator()
                 seal_current_text_block()
                 result = ev.data.get("result", {}) or {}
                 session.busy = False
@@ -1133,6 +1540,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     ui.notify("✅ Agent turn finished.", type="positive", timeout=2000)
 
             elif ev.kind == "error":
+                hide_thinking_indicator()
                 seal_current_text_block()
                 session.busy = False
                 session.turn_start_ts = None
@@ -1193,9 +1601,98 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
     def _remember_prompt(text: str):
         if not text or text.startswith("/"):
             return
-        if not session.prompt_history or session.prompt_history[-1] != text:
-            session.prompt_history.append(text)
+        clean_text = text.strip()
+        if not clean_text:
+            return
+        if not session.prompt_history or session.prompt_history[-1] != clean_text:
+            session.prompt_history.append(clean_text)
+            if len(session.prompt_history) > 200:
+                session.prompt_history = session.prompt_history[-200:]
+            session.save_prompt_history()
         session.history_index = -1
+
+    def open_history_dialog():
+        dialog = ui.dialog()
+        with dialog, ui.card().classes(
+            f"w-[680px] max-w-[95vw] h-[580px] max-h-[90vh] flex flex-col p-4 gap-3 "
+            f"{CANVAS} text-slate-900 dark:text-slate-100 rounded-xl shadow-2xl border {BORDER}"
+        ):
+            with ui.row().classes(f"w-full items-center justify-between pb-2 border-b {BORDER}"):
+                with ui.row().classes("items-center gap-2"):
+                    ui.icon("history", size="24px").classes("text-primary")
+                    with ui.column().classes("gap-0"):
+                        ui.label("Prompt History").classes("text-base font-bold")
+                        ui.label("Browse, reuse, or resend messages previously sent to the agent.").classes(
+                            f"text-xs {MUTED_DIM}"
+                        )
+                ui.button(icon="close", on_click=dialog.close).props("flat round dense size=xs")
+
+            search_bar = ui.input(placeholder="Search previous prompts…").classes(
+                "w-full text-xs"
+            ).props("dense outlined clearable input-debounce=100")
+
+            scroll = ui.scroll_area().classes(f"w-full flex-1 border {BORDER} rounded p-2")
+            with scroll:
+                history_list = ui.column().classes("w-full gap-2")
+
+            def refresh_history_items():
+                history_list.clear()
+                q = (search_bar.value or "").strip().lower()
+                entries = list(reversed(session.prompt_history))
+                if q:
+                    entries = [e for e in entries if q in e.lower()]
+
+                with history_list:
+                    if not entries:
+                        ui.label("No history matching your search." if q else "No prompt history recorded yet.").classes(
+                            f"text-xs {MUTED_DIM} italic p-4 text-center w-full"
+                        )
+                        return
+
+                    for prompt_text in entries:
+                        with ui.card().classes(
+                            f"w-full p-2.5 rounded-lg border {BORDER} {SURFACE} hover:border-primary/50 transition-colors gap-1.5 shadow-none"
+                        ):
+                            ui.label(prompt_text).classes(
+                                "text-xs font-mono break-words whitespace-pre-wrap max-h-24 overflow-hidden select-all"
+                            )
+                            with ui.row().classes("w-full items-center justify-end gap-1.5 pt-1"):
+                                def _use_in_input(p=prompt_text):
+                                    set_prompt_input(p)
+                                    dialog.close()
+
+                                async def _resend_now(p=prompt_text):
+                                    dialog.close()
+                                    if session.busy:
+                                        ui.notify("Agent is busy — wait for current turn to finish.", type="warning")
+                                        return
+                                    await send_prompt_with_text(p)
+
+                                ui.button("Use in input", icon="edit_note", on_click=_use_in_input).props(
+                                    "flat dense size=xs no-caps text-color=primary font-semibold"
+                                ).tooltip("Place into textarea to edit before sending")
+
+                                ui.button("Resend", icon="send", on_click=_resend_now).props(
+                                    "unelevated dense size=xs color=primary no-caps font-semibold"
+                                ).tooltip("Send this prompt immediately")
+
+            search_bar.on_value_change(lambda _: refresh_history_items())
+            refresh_history_items()
+
+            with ui.row().classes(f"w-full items-center justify-between pt-2 border-t {BORDER}"):
+                def _clear_all_history():
+                    session.prompt_history.clear()
+                    session.save_prompt_history()
+                    refresh_history_items()
+                    ui.notify("Prompt history cleared.", type="positive")
+
+                ui.button("Clear History", icon="delete_sweep", on_click=_clear_all_history).props(
+                    "flat dense size=xs color=red no-caps"
+                ).tooltip("Delete all saved prompt history from this workspace")
+
+                ui.button("Close", on_click=dialog.close).props("flat dense size=sm no-caps")
+
+        dialog.open()
 
     def _update_input_counter():
         n = len(prompt_input.value or "")
@@ -1277,6 +1774,10 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
 
         if cmd == "/export":
             export_history()
+            return True
+
+        if cmd == "/history":
+            open_history_dialog()
             return True
 
         if cmd == "/help":
@@ -1420,6 +1921,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 try:
                     session.ensure_ready()
                     session.personality = agent_bridge.switch_workspace(prefs, session.client, path)
+                    session.load_prompt_history()
                     add_system_notice(f"📂 Workspace switched to `{prefs.workspace_path}`")
                     refresh_workspace_tree()
                 except Exception as e:
@@ -1433,16 +1935,22 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     ui.label("Switch workspace").classes("font-bold")
                     path_input = ui.input("New workspace path", value=prefs.workspace_path).classes("w-full")
 
-                    def pick_folder():
-                        try:
-                            import webview
-                            result = webview.windows[0].create_file_dialog(webview.FOLDER_DIALOG)
-                            if result:
-                                path_input.value = result[0]
-                        except Exception:
-                            ui.notify("Native folder picker unavailable — type the path manually.", type="warning")
+                    async def pick_folder_action():
+                        _picker = pick_folder
+                        if not _picker:
+                            try:
+                                from lollms_client.apps.lollms_code.gui.folder_picker import pick_folder as _p
+                                _picker = _p
+                            except Exception:
+                                pass
+                        if _picker:
+                            chosen = await _picker(title="Select New Workspace", initial_dir=path_input.value)
+                            if chosen:
+                                path_input.value = chosen
+                        else:
+                            ui.notify("Folder picker unavailable — enter path manually.", type="warning")
 
-                    ui.button("Browse…", icon="folder_open", on_click=pick_folder).props("flat")
+                    ui.button("Browse…", icon="folder_open", on_click=pick_folder_action).props("flat")
                     with ui.row().classes("w-full justify-end gap-2 mt-2"):
                         ui.button("Cancel", on_click=dialog.close).props("flat")
 
@@ -1475,6 +1983,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         session.turn_start_ts = time.time()
         send_button.props("loading")
         status_label.set_text("Thinking…")
+        show_thinking_indicator("Thinking…")
 
         try:
             session.ensure_ready()
@@ -2127,6 +2636,12 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
     ui.keyboard(
         on_key=lambda e: open_command_palette()
         if e.action.keydown and e.modifiers.ctrl and e.key == "k" else None,
+        ignore=[],
+    )
+
+    ui.keyboard(
+        on_key=lambda e: open_history_dialog()
+        if e.action.keydown and e.modifiers.ctrl and e.key == "h" else None,
         ignore=[],
     )
 

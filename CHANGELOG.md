@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-21 19:17]
+
+- fix(editor:): restructured CLI and GUI initialization to enforce strict task macro-level requirements and minor refactoring in chat_page
+
 ## [2026-09-21 08:10]
 
 - `fix: update core and client library imports to resolve circular dependency warnings in lollms_core and client API modules`

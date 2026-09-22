@@ -407,7 +407,11 @@ def _detect_structural_symbols(buffer: str, language: Optional[str] = None, art_
     if not buffer:
         return []
 
-    lines = buffer.splitlines()
+    # Only detect symbols on fully completed lines to prevent streaming prefix spam
+    if "\n" not in buffer:
+        return []
+    completed_buffer = buffer[:buffer.rfind("\n")]
+    lines = completed_buffer.splitlines()
     symbols: List[Dict[str, Any]] = []
     lang = (language or "").lower()
     in_py_class: Optional[str] = None
@@ -780,12 +784,18 @@ class _AgentStreamState:
         if self._in_think_block:
             close_idx = self._pending_buffer.find("</think>")
             if close_idx != -1:
-                self._think_buffer += self._pending_buffer[:close_idx]
+                thought_chunk = self._pending_buffer[:close_idx]
+                self._think_buffer += thought_chunk
+                if thought_chunk:
+                    self._cb(thought_chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
                 self._pending_buffer = self._pending_buffer[close_idx + 8:]
                 self._in_think_block = False
             else:
-                self._think_buffer += self._pending_buffer
+                thought_chunk = self._pending_buffer
+                self._think_buffer += thought_chunk
                 self._pending_buffer = ""
+                if thought_chunk:
+                    self._cb(thought_chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
                 return True
 
         if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence and not self._in_inline_code:
@@ -816,7 +826,7 @@ class _AgentStreamState:
             proc_match = re.search(r'(?m)^\s*<processing', self._pending_buffer, re.IGNORECASE)
             if proc_match:
                 self._pending_buffer = re.sub(r'(?m)^\s*<processing[^>]*>', '', self._pending_buffer, flags=re.IGNORECASE)
-                return False
+                return True
 
         if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence and not self._in_inline_code:
             context_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<(unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|user_profile_update|user_profile_clear|mem_new|mem_update|generate_image|edit_image)\b', self._pending_buffer, re.IGNORECASE)
@@ -833,9 +843,6 @@ class _AgentStreamState:
                 self._context_tag_name = tag_name
                 self._tool_buffer = self._pending_buffer[tag_start_idx:]
                 self._pending_buffer = ""
-
-                if self.is_callback_mode:
-                    self._cb("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "streaming"})
 
                 if self.is_tag_mode:
                     self._cb(f'\n<processing type="context" title="{tag_name}">\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
@@ -1380,9 +1387,9 @@ class _AgentStreamState:
                         resolved_params = {}
                         ASCIIColors.warning(f"[AgentStreamState] Failed to parse tool call JSON even after repair: {sanitized_json_body[:200]}")
 
-        if self.is_callback_mode:
+        if self.is_callback_mode and resolved_tool_name != "malformed_tool_call":
             try:
-                self._cb("", MSG_TYPE.MSG_TYPE_TOOL_END, {
+                self._cb("", MSG_TYPE.MSG_TYPE_TOOL_START, {
                     "tool_name": resolved_tool_name,
                     "parameters": resolved_params,
                     "stream_complete": True
@@ -1451,36 +1458,6 @@ class _AgentStreamState:
         is_patch_end = self.live_artifact_meta.get("is_patch", False) if self.live_artifact_meta else False
         operation_end = self.live_artifact_meta.get("operation", "full_rewrite") if self.live_artifact_meta else "full_rewrite"
 
-        if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
-            try:
-                # Extract clean body text for meta inspection
-                body_content = ""
-                b_match = re.search(r'<art(?:ifact|efact)[^>]*>(.*)</art(?:ifact|efact)>', full_artifact_call, re.DOTALL | re.IGNORECASE)
-                if b_match:
-                    body_content = b_match.group(1).strip()
-
-                meta_summary = _extract_artefact_meta(body_content, self.live_artifact_meta.get("language") if self.live_artifact_meta else None, art_type_end)
-                self._cb("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {
-                    "title": title_end,
-                    "art_type": art_type_end,
-                    "language": self.live_artifact_meta.get("language") if self.live_artifact_meta else None,
-                    "version": 1,
-                    "success": True,
-                    "error": None,
-                    "stream_complete": True,
-                    "content": body_content,
-                    "is_patch": is_patch_end,
-                    "operation": operation_end,
-                    "line_count": meta_summary["line_count"],
-                    "size_chars": meta_summary["size_chars"],
-                    "estimated_tokens": meta_summary["estimated_tokens"],
-                    "sections": meta_summary["sections"],
-                    "sections_count": meta_summary["sections_count"],
-                    "patch_stats": meta_summary["patch_stats"],
-                    "preview": meta_summary["preview"]
-                })
-            except Exception:
-                pass
 
         if self.is_tag_mode:
             self._cb('\n</processing>\n', MSG_TYPE.MSG_TYPE_CHUNK, {
@@ -1519,12 +1496,6 @@ class _AgentStreamState:
             if remaining:
                 self._pending_buffer = remaining
 
-            if self.is_callback_mode:
-                try:
-                    self._cb("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": self._context_tag_name, "files": [], "status": "stream_complete"})
-                except Exception:
-                    pass
-
             if self.is_tag_mode:
                 self._cb('\n</processing>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
@@ -1545,12 +1516,6 @@ class _AgentStreamState:
 
             if remaining:
                 self._pending_buffer = remaining
-
-            if self.is_callback_mode:
-                try:
-                    self._cb("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": self._context_tag_name, "files": [], "status": "stream_complete"})
-                except Exception:
-                    pass
 
             if self.is_tag_mode:
                 self._cb('\n</processing>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})

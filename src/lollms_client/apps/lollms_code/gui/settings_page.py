@@ -12,6 +12,14 @@ from nicegui import ui
 from env_config import EnvStore, MODALITIES, MODALITY_LABELS
 from gui_prefs import GuiPrefs, SHELL_AUTONOMY_LEVELS, SKILLS_MODES, ACCENT_PRESETS
 
+try:
+    from folder_picker import pick_folder
+except ImportError:
+    try:
+        from lollms_client.apps.lollms_code.gui.folder_picker import pick_folder
+    except ImportError:
+        pick_folder = None
+
 MODALITY_ICONS = {
     "llm": "psychology",
     "tti": "palette",
@@ -65,6 +73,24 @@ def build_settings_page(
                 ui.dark_mode(prefs.dark_mode)
                 prefs.save()
 
+            def _toggle_fs():
+                try:
+                    import webview
+                    if webview.windows and len(webview.windows) > 0:
+                        webview.windows[0].toggle_fullscreen()
+                        return
+                except Exception:
+                    pass
+                ui.run_javascript(
+                    "if (!document.fullscreenElement) { document.documentElement.requestFullscreen(); } "
+                    "else { if (document.exitFullscreen) { document.exitFullscreen(); } }"
+                )
+
+            ui.button(
+                icon="fullscreen",
+                on_click=_toggle_fs,
+            ).props("flat round dense size=sm").tooltip("Toggle Fullscreen (F11)")
+
             ui.button(
                 icon="dark_mode" if not prefs.dark_mode else "light_mode",
                 on_click=toggle_theme,
@@ -72,6 +98,15 @@ def build_settings_page(
 
             if on_back:
                 ui.button("Back to Chat", icon="chat", on_click=on_back).props("flat dense size=sm no-caps")
+
+            ui.button(
+                icon="close",
+                on_click=lambda: _exit_from_settings(),
+            ).props("flat round dense size=sm color=red text-color=white").tooltip("Exit Application")
+
+    def _exit_from_settings():
+        from main import confirm_exit_dialog
+        confirm_exit_dialog()
 
     # ---- Main Two-Pane Body ----
     with ui.row().classes(f"w-full flex-1 min-h-0 items-stretch overflow-hidden flex-nowrap gap-0 {CANVAS}"):
@@ -421,12 +456,19 @@ def _render_agent_section(prefs: GuiPrefs) -> None:
         shell_switch = ui.switch("Enable Shell Execution", value=prefs.enable_shell_execution)
         shell_switch.on_value_change(lambda e: setattr(prefs, "enable_shell_execution", e.value))
 
-        autonomy_select = ui.select(
-            {"safe": "Safe Mode (Whitelisted Commands Only)", "full_access": "Full Access (Unrestricted System Shell)"},
-            value=prefs.shell_autonomy_level,
-            label="Shell Autonomy Level"
-        ).classes("w-full").props("outlined dense").bind_visibility_from(shell_switch, "value")
-        autonomy_select.on_value_change(lambda e: setattr(prefs, "shell_autonomy_level", e.value))
+        with ui.column().classes("w-full gap-2").bind_visibility_from(shell_switch, "value"):
+            autonomy_select = ui.select(
+                {"safe": "Safe Mode (Whitelisted Commands & Code Authorization)", "full_access": "Full Access (Unrestricted Shell & Python)"},
+                value=prefs.shell_autonomy_level,
+                label="Shell & Code Autonomy Level"
+            ).classes("w-full").props("outlined dense")
+            autonomy_select.on_value_change(lambda e: setattr(prefs, "shell_autonomy_level", e.value))
+
+            auto_py_switch = ui.switch(
+                "Auto-Approve Python Execution in Safe Mode (Skip authorization dialog)",
+                value=getattr(prefs, "auto_approve_python", False)
+            ).props("dense")
+            auto_py_switch.on_value_change(lambda e: setattr(prefs, "auto_approve_python", e.value))
 
     # Card 3: Sub-Agents & Model Switching
     with ui.card().classes(f"w-full p-5 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-3"):
@@ -492,15 +534,21 @@ def _render_paths_section(prefs: GuiPrefs) -> None:
         with ui.row().classes("w-full items-center gap-2"):
             ws_input = ui.input("Active Workspace Path", value=prefs.workspace_path).classes("flex-1").props("outlined dense")
 
-            def pick_ws():
-                try:
-                    import webview
-                    res = webview.windows[0].create_file_dialog(webview.FOLDER_DIALOG)
-                    if res:
-                        ws_input.value = res[0]
-                        prefs.workspace_path = res[0]
-                except Exception:
-                    ui.notify("Native picker unavailable — enter path manually.", type="warning")
+            async def pick_ws():
+                _picker = pick_folder
+                if not _picker:
+                    try:
+                        from lollms_client.apps.lollms_code.gui.folder_picker import pick_folder as _p
+                        _picker = _p
+                    except Exception:
+                        pass
+                if _picker:
+                    chosen = await _picker(title="Select Workspace Directory", initial_dir=ws_input.value)
+                    if chosen:
+                        ws_input.value = chosen
+                        prefs.workspace_path = chosen
+                else:
+                    ui.notify("Folder picker unavailable — enter path manually.", type="warning")
 
             ui.button("Browse…", icon="folder_open", on_click=pick_ws).props("outline dense no-caps")
 
@@ -540,6 +588,9 @@ def _render_appearance_section(prefs: GuiPrefs) -> None:
             prefs.dark_mode = e.value
             ui.dark_mode(e.value)
         dark_sw.on_value_change(on_dark_toggle)
+
+        fullscreen_sw = ui.switch("Start Application in Fullscreen", value=getattr(prefs, "start_fullscreen", True))
+        fullscreen_sw.on_value_change(lambda e: setattr(prefs, "start_fullscreen", e.value))
 
         with ui.row().classes("w-full gap-4 items-center"):
             preset_select = ui.select(

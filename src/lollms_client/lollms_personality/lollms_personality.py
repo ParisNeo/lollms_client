@@ -4598,6 +4598,8 @@ JSON:"""
         seen_context_signatures: set = set()
         final_response = ""
         workspace_changes: List[Dict[str, Any]] = []
+        base_temperature = temperature
+        active_temperature = temperature
 
         while round_count < resolved_max_rounds:
             if self.is_generation_cancelled():
@@ -4786,7 +4788,7 @@ JSON:"""
 
             gen_kwargs["n_predict"] = None
 
-            gen_kwargs["temperature"] = temperature
+            gen_kwargs["temperature"] = active_temperature
             if think is not None:
                 gen_kwargs["think"] = think
             if reasoning_effort is not None:
@@ -4902,9 +4904,16 @@ JSON:"""
             has_truncated_artifact = False
             truncated_artifact_title = None
 
+            has_preamble_intent = bool(re.search(
+                r'\b(let me|i will|i\'ll|starting by|checking|first,|now i|let\'s)\b',
+                ss.get_clean_text(),
+                re.IGNORECASE
+            ))
+
             if (
                 round_count == 1
                 and not enforce_end_tag
+                and not has_preamble_intent
                 and not ss.completed_actions
                 and not tool_calls_this_turn
                 and not workspace_changes
@@ -5019,15 +5028,16 @@ JSON:"""
                                         object.__setattr__(self, '_pending_vlm_images', [])
                                     self._pending_vlm_images.extend(vlm_images)
 
-                                tool_success = isinstance(tool_res, dict) and tool_res.get("success", True) is not False
                                 inner_res = tool_res.get("output", tool_res) if isinstance(tool_res, dict) else tool_res
                                 is_failure = (
-                                    (isinstance(inner_res, dict) and inner_res.get("success") is False)
+                                    (isinstance(tool_res, dict) and tool_res.get("success") is False)
+                                    or (isinstance(inner_res, dict) and inner_res.get("success") is False)
                                     or (isinstance(tool_res, dict) and tool_res.get("status_code", 200) not in (200, 201))
+                                    or (isinstance(inner_res, dict) and inner_res.get("status_code", 200) not in (200, 201))
                                     or (isinstance(tool_res, dict) and bool(tool_res.get("error")))
                                     or (isinstance(inner_res, dict) and bool(inner_res.get("error")) and not inner_res.get("success", True))
-                                    or (isinstance(tool_res, dict) and tool_res.get("return_code", 0) != 0)
-                                    or (isinstance(inner_res, dict) and inner_res.get("return_code", 0) != 0)
+                                    or (isinstance(tool_res, dict) and tool_res.get("return_code") is not None and tool_res.get("return_code") != 0)
+                                    or (isinstance(inner_res, dict) and inner_res.get("return_code") is not None and inner_res.get("return_code") != 0)
                                 )
                                 tool_success = not is_failure
 
@@ -5270,6 +5280,26 @@ JSON:"""
                                     )
                                 action_reports.append(f"[SYSTEM ERROR] Failed to process artifact tag: {e}")
 
+                        elif action["type"] == "malformed_json":
+                            raw_body = action.get("raw_body", "")
+                            fail_msg = (
+                                f"❌ MALFORMED TOOL CALL: The tool payload could not be parsed as valid JSON.\n"
+                                f"Raw payload:\n```\n{raw_body[:400]}\n```\n"
+                                "You MUST use valid JSON inside the tool tag: `<tool>{\"name\": \"...\", \"parameters\": {...}}</tool>`."
+                            )
+                            action_reports.append(fail_msg)
+                            if (event_mode.has_callbacks or event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE)) and streaming_callback:
+                                try:
+                                    streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_END, {
+                                        "tool_name": "malformed_tool_call",
+                                        "parameters": {},
+                                        "success": False,
+                                        "output": None,
+                                        "error": fail_msg
+                                    })
+                                except Exception:
+                                    pass
+
                         elif action["type"] == "context":
                             tag_name = action["tag_name"]
                             raw_xml = action["xml"]
@@ -5379,6 +5409,9 @@ JSON:"""
                         report_text = "\n\n".join(str(r) for r in action_reports) + "\n\nAnalyze these results and continue your task, or emit <done/> if finished."
                         virtual_history.append(SimpleNamespace(sender_type="user", content=report_text))
 
+                    # Reset stall tracking since concrete actions were executed
+                    object.__setattr__(self, '_consecutive_stall_count', 0)
+                    active_temperature = base_temperature
                     ss.completed_actions = []
                     final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
                     if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
@@ -5596,19 +5629,6 @@ JSON:"""
 
                             tool_calls_this_turn.append({"round": round_count, "name": tool_name, "parameters": tool_params})
                             tool_results_this_turn.append({"round": round_count, "name": tool_name, "result": tool_res, "success": tool_success})
-                            if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
-                                try:
-                                    streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_START, {"tool_name": tool_name, "parameters": tool_params})
-                                except Exception:
-                                    pass
-
-                            tool_res = self._execute_tool(tool_name, tool_params, active_tools)
-
-                            vlm_images = self._inject_tool_images_for_vlm(tool_res)
-                            if vlm_images:
-                                if not hasattr(self, '_pending_vlm_images'):
-                                    object.__setattr__(self, '_pending_vlm_images', [])
-                                self._pending_vlm_images.extend(vlm_images)
 
                             clean_result_str = _sanitize_tool_result(tool_res, client=self.lollms_client)
                             actions_executed_count += 1
@@ -6058,6 +6078,9 @@ JSON:"""
                         content="[SYSTEM: Your context visibility operation was executed. Continue your task or emit <done/> if finished.]"
                     ))
 
+                # Reset stall tracking since actions were executed in this round
+                object.__setattr__(self, '_consecutive_stall_count', 0)
+                active_temperature = base_temperature
                 ss.completed_actions = []
                 ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
                 if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
@@ -6097,6 +6120,7 @@ JSON:"""
             if (
                 round_count == 1
                 and not enforce_end_tag
+                and not has_preamble_intent
                 and not ss.completed_actions
                 and not tool_calls_this_turn
                 and not workspace_changes
@@ -6223,13 +6247,14 @@ JSON:"""
             if not text_is_repetitive and stripped_round_text:
                 lines_in_response = stripped_round_text.splitlines()
                 non_empty_lines = [l.strip() for l in lines_in_response if l.strip()]
-                if len(non_empty_lines) >= 2:
+                if len(non_empty_lines) >= 4:
                     from collections import Counter as _Counter
                     line_counts = _Counter(non_empty_lines)
                     most_common_line, most_common_count = line_counts.most_common(1)[0]
-                    if most_common_count >= 2 and len(most_common_line) > 20:
+                    # Only treat as true repetition if identical multi-sentence blocks are looping
+                    if most_common_count >= 3 and len(most_common_line) > 30:
                         repetition_ratio = most_common_count / len(non_empty_lines)
-                        if repetition_ratio >= 0.5:
+                        if repetition_ratio >= 0.6:
                             text_is_repetitive = True
                             deduplicated_lines = []
                             seen_lines = set()
@@ -6241,31 +6266,17 @@ JSON:"""
                                 stripped_round_text = "\n".join(deduplicated_lines)
                                 raw_round_text = stripped_round_text
                                 ss.content = stripped_round_text
-                            ASCIIColors.warning(f"[{self.name}] Intra-round text duplication detected (line repeated {most_common_count}x, ratio: {repetition_ratio:.0%}). Deduplicated to {len(deduplicated_lines)} unique line(s).")
-                        elif most_common_count >= 2:
-                            consecutive_dup_count = 0
-                            for i in range(1, len(non_empty_lines)):
-                                if non_empty_lines[i] == non_empty_lines[i - 1]:
-                                    consecutive_dup_count += 1
-                            if consecutive_dup_count >= 1:
-                                text_is_repetitive = True
-                                deduplicated_lines = []
-                                prev_line = None
-                                for l in non_empty_lines:
-                                    if l != prev_line:
-                                        deduplicated_lines.append(l)
-                                    prev_line = l
-                                if deduplicated_lines:
-                                    stripped_round_text = "\n".join(deduplicated_lines)
-                                    raw_round_text = stripped_round_text
-                                    ss.content = stripped_round_text
-                                ASCIIColors.warning(f"[{self.name}] Intra-round consecutive text duplication detected ({consecutive_dup_count} consecutive duplicate lines). Deduplicated to {len(deduplicated_lines)} unique line(s).")
+                            ASCIIColors.warning(f"[{self.name}] Intra-round text duplication detected ({most_common_count}x). Deduplicated.")
 
             if text_is_repetitive:
                 consecutive_stall_count = getattr(self, '_consecutive_stall_count', 0) + 1
                 object.__setattr__(self, '_consecutive_stall_count', consecutive_stall_count)
 
-                if consecutive_stall_count >= 3:
+                # Dynamically increase temperature to shake the greedy decoding out of the repetition trap
+                active_temperature = min(0.95, base_temperature + (0.2 * consecutive_stall_count))
+                ASCIIColors.warning(f"[{self.name}] Repetitive text preamble detected (Round {round_count}, streak: {consecutive_stall_count}/4). Shaking decoding temperature to {active_temperature:.2f}.")
+
+                if consecutive_stall_count >= 4:
                     ASCIIColors.error(f"[{self.name}] Breaking after {consecutive_stall_count} consecutive repetition+stall cycle(s). Repetitive text detected.")
                     final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
                     if not final_response:
@@ -6280,21 +6291,25 @@ JSON:"""
                             pass
                     break
 
-                ASCIIColors.warning(f"[{self.name}] Repetitive text preamble detected (Round {round_count}, streak: {consecutive_stall_count}/3). Injecting correction — NOT terminating.")
                 virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text()))
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
                     content=(
-                        "[SYSTEM: You repeated the same transitional text from a previous round. "
-                        "This is acceptable when progressing through batched work (e.g., reading a document page by page), "
-                        "but you MUST vary your transitional phrasing and IMMEDIATELY emit the next functional tag to continue your task.\n\n"
-                        "If you were in the middle of a batched operation (reading pages, annotating sections), emit the next tool call NOW.\n"
-                        "If your task is complete, output your final summary and end with <done/>.\n\n"
-                        "Do NOT repeat the same preamble text again.]"
+                        "[SYSTEM DIRECTIVE: REPETITION INHIBITION ACTIVATED\n"
+                        "You repeated the exact same conversational preamble or sentence from the previous round.\n"
+                        "You are STRICTLY FORBIDDEN from outputting conversational sentences announcing what you are about to do (e.g. 'Now let me create...', 'Let me verify...').\n"
+                        "Your very next response MUST START with an XML tag as the FIRST character:\n"
+                        "- To create or edit code: `<artifact name=\"path/to/file.ext\" type=\"code\">...</artifact>`\n"
+                        "- To execute shell commands: `<tool>{\"name\": \"tool_execute_shell_command\", \"parameters\": {\"command\": \"...\"}}</tool>`\n"
+                        "- To finish your task: summarize your achievements in 1 sentence and output `<done/>`.\n"
+                        "DO NOT WRITE INTRODUCTORY PREAMBLES. OUTPUT THE FUNCTIONAL TAG NOW.]"
                     )
                 ))
                 ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
                 continue
+            else:
+                # Reset temperature back to base once repetition breaks
+                active_temperature = base_temperature
 
             # ── 🧹 AUTONOMOUS CONTEXT COMPACTION ──
             ctx_health = self._calculate_context_fill(stable_system_prompt, base_conversation, virtual_history, raw_round_text)
@@ -6320,7 +6335,9 @@ JSON:"""
                 consecutive_stall_count = getattr(self, '_consecutive_stall_count', 0) + 1
                 object.__setattr__(self, '_consecutive_stall_count', consecutive_stall_count)
 
-                if consecutive_stall_count >= 3:
+                active_temperature = min(0.95, base_temperature + (0.15 * consecutive_stall_count))
+
+                if consecutive_stall_count >= 4:
                     ASCIIColors.warning(f"[{self.name}] Terminating after {consecutive_stall_count} consecutive stalls. The LLM is stuck in preamble mode.")
                     final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
                     if not final_response:
@@ -6335,7 +6352,7 @@ JSON:"""
                             pass
                     break
 
-                ASCIIColors.warning(f"[{self.name}] Mid-task stall detected (Round {round_count}, consecutive: {consecutive_stall_count}). LLM stopped without <done/> or new actions. Forcing continuation.")
+                ASCIIColors.warning(f"[{self.name}] Mid-task stall detected (Round {round_count}, consecutive: {consecutive_stall_count}). Adjusting temperature to {active_temperature:.2f} and forcing continuation.")
                 virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text().strip()))
                 recent_tool_names = [tc.get("name", "") for tc in tool_calls_this_turn[-3:]]
                 virtual_history.append(SimpleNamespace(
@@ -6496,7 +6513,7 @@ JSON:"""
                         "Your task is NOT finished yet. Continue and perform the remaining steps requested by the user:\n"
                         "- To execute Python code: `<tool>{\"name\": \"tool_execute_python_code\", \"parameters\": {\"code\": \"...\"}}</tool>`\n"
                         "- To run shell/system commands: `<tool>{\"name\": \"tool_execute_shell_command\", \"parameters\": {\"command\": \"...\"}}</tool>`\n"
-                        "- To delete files: run a command via `tool_execute_shell_command` or Python code via `tool_execute_python_code`.\n"
+                        "- To delete files: use workspace tools or safe shell commands (e.g., `del <file>` on Windows, `rm <file>` on Linux/macOS).\n"
                         "- ONLY when ALL steps are genuinely completed and verified, write your final answer and emit `<done/>` on a new line.\n"
                         "Do NOT write conversational preambles. Output the action tag NOW.]"
                     )

@@ -1,9 +1,11 @@
 import os
 import sys
+import re
 import subprocess
 import platform
 import shlex
 from typing import Any, Dict
+from pathlib import Path
 from ascii_colors import ASCIIColors
 
 TOOL_LIBRARY_NAME = "System Shell"
@@ -71,8 +73,37 @@ def _is_safe_command(command: str) -> bool:
             base_cmd = os.path.basename(parts[0]).lower()
             if base_cmd.endswith(".exe"):
                 base_cmd = base_cmd[:-4]
+
+            # Block python -c one-liners that execute system processes or shell commands in safe mode
+            if base_cmd in ("python", "py"):
+                if "-c" in parts:
+                    idx = parts.index("-c")
+                    if idx + 1 < len(parts):
+                        code_payload = parts[idx + 1].lower()
+                        forbidden_patterns = [
+                            "subprocess", "os.system", "os.popen", "pty", "popen",
+                            "spawn", "execv", "execl"
+                        ]
+                        if any(p in code_payload for p in forbidden_patterns):
+                            return False
+                        # If running a script file under python in safe mode, verify via Python authorization if interactive
+                        if AUTONOMY_LEVEL == "safe":
+                            from lollms_client.tools_bindings.lcp.default_tools.execute_python import execute_python as _ep
+                            if not getattr(_ep, "_AUTO_APPROVE_PYTHON", False) and hasattr(sys.stdin, "isatty") and sys.stdin.isatty():
+                                script_target = next((p for p in parts[1:] if p.endswith(".py") and not p.startswith("-")), None)
+                                if script_target and os.path.exists(script_target):
+                                    try:
+                                        src = Path(script_target).read_text(encoding="utf-8", errors="ignore")
+                                        dec, reason = _ep._prompt_user_validation(src, f"shell: {command}", parts)
+                                        if dec == "reject":
+                                            return False
+                                        elif dec == "always":
+                                            _ep._AUTO_APPROVE_PYTHON = True
+                                    except Exception:
+                                        pass
+
             if base_cmd in safe_commands:
-                return True
+                return True                
             for safe in safe_commands:
                 sl = safe.lower()
                 if (stripped.lower() == sl or 
@@ -81,6 +112,8 @@ def _is_safe_command(command: str) -> bool:
                     stripped.lower().startswith(sl + '(')):
                     return True
             return False
+
+        
     except ValueError:
         pass
     stripped_lower = command.strip().lower()
@@ -102,7 +135,7 @@ def tool_execute_shell_command_prompt() -> str:
     os_name = platform.system()
     os_release = platform.release()
     os_arch = platform.machine()
-    cwd = os.getcwd()
+    cwd = os.getcwd()   
     py_exec = sys.executable
 
     safe_cmds_str = ", ".join(sorted(_get_safe_commands()))
@@ -194,6 +227,18 @@ def tool_execute_shell_command(
                 timeout=120
             )
         else:
+            # On Windows cmd.exe, rmdir /s /q only accepts a single directory. Expand multiple targets.
+            if is_windows:
+                stripped_cmd = command.strip()
+                rmdir_match = re.match(r'^(rmdir|rd)\s+(/[sS]\s+/[qQ]|/[qQ]\s+/[sS])\s+(.+)$', stripped_cmd)
+                if rmdir_match:
+                    cmd_name = rmdir_match.group(1)
+                    cmd_flags = rmdir_match.group(2)
+                    raw_dirs = rmdir_match.group(3).strip()
+                    parts = shlex.split(raw_dirs, posix=False)
+                    if len(parts) > 1:
+                        command = " & ".join(f'{cmd_name} {cmd_flags} "{d}"' for d in parts)
+
             if not _is_safe_command(command):
                 allowed_list = ", ".join(sorted(_get_safe_commands()))
                 hint = ""
@@ -233,7 +278,13 @@ def tool_execute_shell_command(
 
         error_msg = None
         if result.returncode != 0:
-            error_msg = result.stderr if result.stderr else f"Command failed with exit code {result.returncode}"
+            if result.stderr and result.stderr.strip():
+                error_msg = result.stderr
+            else:
+                if "2>nul" in command or "2>/dev/null" in command:
+                    error_msg = f"Command failed with exit code {result.returncode} (stderr was suppressed by 2>nul redirection; target path or file likely does not exist)."
+                else:
+                    error_msg = f"Command failed with exit code {result.returncode}"
 
         return {
             "success": result.returncode == 0,

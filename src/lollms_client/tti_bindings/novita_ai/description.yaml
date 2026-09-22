@@ -1,11 +1,14 @@
 title: 'Novita.ai TTI'
 author: 'ParisNeo & Lollms'
-version: 2.0.0
+version: 3.1.0
 binding_name: 'novita_ai'
 description: >
-  A binding for Novita.ai asynchronous image generation and editing API (V3).
-  Provides fast access to popular open-source diffusion models like SDXL, Juggernaut XL,
-  and Realistic Vision via txt2img and img2img task polling.
+  A binding for the Novita.ai image generation and editing APIs.
+  Qwen-Image requests are routed to the asynchronous v3 task pipeline
+  and Ming-Image requests to the OpenAI-compatible v1 image protocol.
+  Novita retired the legacy checkpoint-based txt2img/img2img routes, so
+  generic Stable Diffusion checkpoint names are rejected with an
+  explicit migration error listing the supported foundation models.
 
 global_input_parameters:
   - name: "api_key"
@@ -22,43 +25,44 @@ global_input_parameters:
 model_input_parameters:
   - name: "model_name"
     type: "str"
-    default: "sd_xl_base_1.0.safetensors"
-    description: "The model checkpoint name to use on Novita.ai."
+    default: "qwen-image"
+    description: "The Novita.ai foundation model to use. Legacy Stable Diffusion checkpoints are no longer served by the Novita API."
     options:
-      - "sd_xl_base_1.0.safetensors"
-      - "juggernaut_xl_v9_rundiffusion.safetensors"
-      - "dreamshaper_xl_1_0.safetensors"
-      - "realistic_vision_v5.1.safetensors"
-      - "absolutereality_v1.8.1.safetensors"
-      - "meinamix_meina_v11.safetensors"
+      - "qwen-image"
+      - "ming-image-0.1-design"
+      - "ming-image-0.1-design-layer"
 
 generate_image_parameters:
   - name: "prompt"
     type: "str"
     description: "The text prompt describing the image."
-  - name: "negative_prompt"
-    type: "str"
-    description: "Optional negative prompt to avoid unwanted features."
   - name: "width"
     type: "int"
     default: 1024
-    description: "Image width in pixels."
+    description: "Image width in pixels. Clamped to the model's supported range (Qwen-Image: 256-1536, Ming-Image: 1024 minimum)."
   - name: "height"
     type: "int"
     default: 1024
-    description: "Image height in pixels."
-  - name: "num_inference_steps"
-    type: "int"
-    default: 25
-    description: "Number of denoising steps."
-  - name: "guidance_scale"
-    type: "float"
-    default: 7.0
-    description: "Prompt adherence strength (CFG scale)."
+    description: "Image height in pixels. Clamped to the model's supported range (Qwen-Image: 256-1536, Ming-Image: 1024 minimum)."
+  - name: "size"
+    type: "str"
+    description: "Explicit output size for Ming-Image requests, e.g. '1024x1024'. Overrides width/height when provided."
   - name: "seed"
     type: "int"
     default: -1
-    description: "Seed for reproducibility (-1 for random)."
+    description: "Seed for reproducibility (-1 for random). Qwen-Image edits only."
+  - name: "output_format"
+    type: "str"
+    default: "png"
+    description: "Output image format. Qwen-Image accepts jpeg/png/webp, Ming-Image accepts png/jpeg."
+  - name: "watermark"
+    type: "bool"
+    default: false
+    description: "Applies the official Novita watermark to Ming-Image results."
+  - name: "timeout"
+    type: "int"
+    default: 180
+    description: "Maximum seconds to wait for asynchronous task completion (Qwen-Image defaults to 300)."
 
 commands:
   - name: get_user_balance
@@ -66,4 +70,4 @@ commands:
     description: "Queries the user account balance from Novita AI."
   - name: validate_key
     title: Validate API Key
-    description: "Tests the API key against Novita AI models endpoint."
+    description: "Tests the API key against the authenticated Novita AI model endpoint."
