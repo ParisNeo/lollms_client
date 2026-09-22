@@ -443,13 +443,13 @@ class LCPBinding(LollmsToolBinding):
             if isinstance(lib_cfg, dict):
                 lib_cfg["confirm_handler"] = handler
         for mod_name, mod in list(sys.modules.items()):
-            if mod_name.startswith("lollms_client.tools_bindings.lcp.persistent_"):
+            if "execute_python" in mod_name or "system_shell" in mod_name:
                 if hasattr(mod, "set_confirm_handler") and callable(mod.set_confirm_handler):
                     try:
                         mod.set_confirm_handler(handler)
                     except Exception:
                         pass
-                elif hasattr(mod, "_CONFIRM_HANDLER"):
+                if hasattr(mod, "_CONFIRM_HANDLER"):
                     try:
                         mod._CONFIRM_HANDLER = handler
                     except Exception:
@@ -626,6 +626,11 @@ class LCPBinding(LollmsToolBinding):
                 tool_module = self._get_or_load_tool_module(python_file_path)
                 if not tool_module:
                     return {"error": f"Tool initialization failed for '{python_file_path.stem}'.", "status_code": 500}
+                if self.confirm_handler and hasattr(tool_module, "set_confirm_handler") and callable(tool_module.set_confirm_handler):
+                    try:
+                        tool_module.set_confirm_handler(self.confirm_handler)
+                    except Exception:
+                        pass
             else:
                 tool_module = tool_def.get("_dynamic_module")
                 if not tool_module:

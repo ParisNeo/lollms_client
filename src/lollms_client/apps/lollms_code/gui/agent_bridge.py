@@ -602,18 +602,19 @@ def make_gui_python_confirm_handler(event_queue: "queue.Queue[AgentEvent]", pref
         ))
 
         try:
-            decision, reason = resp_queue.get()
+            # Wait for user decision with safety timeout to avoid hanging if the frontend has no interaction
+            decision, reason = resp_queue.get(timeout=180.0)
             _CURRENT_RESP_QUEUE = None
             if decision == "always":
+                # Enable auto-approval in-memory for this active session only (do not persist to disk)
                 prefs.auto_approve_python = True
-                try:
-                    prefs.save()
-                except Exception:
-                    pass
             return decision, reason
+        except queue.Empty:
+            _CURRENT_RESP_QUEUE = None
+            return "reject", "Authorization timed out: no operator response received from the user interface."
         except Exception as e:
             _CURRENT_RESP_QUEUE = None
-            return "reject", f"Approval interrupted: {e}"
+            return "reject", f"Approval interrupted or no user interaction channel available: {e}"
 
     return _handler
 

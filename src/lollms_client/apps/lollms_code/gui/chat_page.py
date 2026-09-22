@@ -1292,6 +1292,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
 
         source_lines = source.splitlines()
         line_count = len(source_lines)
+        is_shell = script_label.startswith("shell:") or script_label.startswith("[RISKY:") or script_label.startswith("[STRICT]")
 
         with dialog, ui.card().classes(
             "w-[780px] max-w-[95vw] max-h-[90vh] flex flex-col p-4 gap-3 "
@@ -1302,8 +1303,8 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 with ui.row().classes("items-center gap-2.5"):
                     ui.icon("security", size="28px").classes("text-amber-500")
                     with ui.column().classes("gap-0"):
-                        ui.label("🛡️ Execution Authorization Request (Safe Mode)").classes("text-base font-bold")
-                        ui.label("The agent requested execution of the code below in your workspace sandbox.").classes(
+                        ui.label(f"🛡️ Authorization Request ({prefs.shell_autonomy_level.upper()} Mode)").classes("text-base font-bold")
+                        ui.label("The agent requested execution of the command/code below.").classes(
                             "text-xs text-slate-500 dark:text-slate-400"
                         )
 
@@ -1316,10 +1317,11 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
             with ui.scroll_area().classes(
                 "w-full max-h-[360px] border border-slate-300 dark:border-slate-800 rounded bg-slate-50 dark:bg-slate-950 p-2"
             ):
-                ui.code(source, language="python" if script_label.endswith(".py") or "def " in source or "import " in source else "text").classes("w-full text-xs")
+                lang = "bash" if is_shell else ("python" if script_label.endswith(".py") or "def " in source or "import " in source else "text")
+                ui.code(source, language=lang).classes("w-full text-xs")
 
             feedback_input = ui.input(
-                placeholder="Optional feedback / instruction if rejecting (e.g. 'Use requests instead of urllib', 'Check variable types')..."
+                placeholder="Optional feedback / instruction if rejecting..."
             ).classes("w-full text-xs").props("outlined dense clearable")
 
             with ui.row().classes("w-full items-center justify-between pt-2 border-t border-slate-200 dark:border-slate-800"):
@@ -1345,13 +1347,9 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     if resp_queue:
                         resp_queue.put(("always", ""))
                     prefs.auto_approve_python = True
-                    try:
-                        prefs.save()
-                    except Exception:
-                        pass
                     active_approval_dialog_holder["dialog"] = None
                     active_approval_dialog_holder["resp_queue"] = None
-                    ui.notify("Auto-approval enabled for this session.", type="positive")
+                    ui.notify("Auto-approval enabled for this active session.", type="positive")
 
                 ui.button("Reject", icon="cancel", on_click=_do_reject).props(
                     "unelevated color=negative size=sm no-caps"

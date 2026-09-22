@@ -1000,8 +1000,9 @@ def make_cli_confirm_handler(config: CodeAgentConfig) -> Callable:
             script_label = kwargs.get("script_label") or kwargs.get("label") or "script.py"
             argv = kwargs.get("argv")
 
-        if not sys.stdin or not sys.stdin.isatty():
-            return "allow", ""
+        # If the environment is non-interactive (no TTY / no user interaction), assume refusal and don't block
+        if not sys.stdin or not hasattr(sys.stdin, "isatty") or not sys.stdin.isatty():
+            return "reject", "Non-interactive environment: user interaction is unavailable, assuming refusal in safe mode."
 
         source_lines = source.splitlines()
         total_lines = len(source_lines)

@@ -4,9 +4,8 @@ import re
 import subprocess
 import platform
 import shlex
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
-from typing import Optional
 from ascii_colors import ASCIIColors
 
 TOOL_LIBRARY_NAME = "System Shell"
@@ -18,16 +17,13 @@ _CONFIRM_HANDLER: Optional[Any] = None
 
 
 def set_confirm_handler(handler: Optional[Any]) -> None:
-    """Sets a custom confirmation handler across both current and persistent LCP module instances."""
+    """Sets a custom confirmation handler across all loaded and persistent LCP module instances."""
     global _CONFIRM_HANDLER
     _CONFIRM_HANDLER = handler
-    for mod_name in (
-        "lollms_client.tools_bindings.lcp.persistent_system_shell",
-        "lollms_client.tools_bindings.lcp.default_tools.system_shell.system_shell"
-    ):
-        if mod_name in sys.modules and sys.modules[mod_name] is not sys.modules.get(__name__):
+    for mod_name, mod in list(sys.modules.items()):
+        if "system_shell" in mod_name and mod is not sys.modules.get(__name__):
             try:
-                sys.modules[mod_name]._CONFIRM_HANDLER = handler
+                mod._CONFIRM_HANDLER = handler
             except Exception:
                 pass
 
@@ -48,12 +44,24 @@ def init_tools_library(config: dict|None = None) -> None:
         AUTONOMY_LEVEL = "safe"
 
 
+_NETWORK_DOWNLOAD_COMMANDS = {
+    "curl", "wget", "nc", "ncat", "netcat", "ssh", "scp", "sftp", "ftp",
+    "telnet", "certutil", "bitsadmin", "nslookup", "ping", "tracert",
+    "traceroute", "nmap", "tshark", "tcpdump", "iwr", "irm",
+    "invoke-webrequest", "invoke-restmethod", "start-bitstransfer"
+}
+
+_SYSTEM_DESTRUCTIVE_COMMANDS = {
+    "format", "diskpart", "shutdown", "reboot", "taskkill", "kill", "pkill",
+    "reg", "regedit", "net", "netsh", "sc", "chmod", "chown", "useradd",
+    "usermod", "iptables", "ufw"
+}
+
 def _get_safe_commands() -> set:
     is_windows = platform.system() == "Windows"
     cmds = {
         "dir", "echo", "type", "cd", "pip", "python", "py", "git",
         "ls", "pwd", "cat", "head", "tail", "mkdir", "rmdir", "del",
-        "powershell", "pwsh", "cmd", "node", "npm", "npx",
         "where", "which", "set", "env"
     }
     if is_windows:
@@ -66,68 +74,177 @@ def _get_safe_commands() -> set:
         cmds.update({"rm", "cp", "mv", "touch", "grep", "clear", "export", "find", "sort"})
     return cmds
 
-def _is_safe_command(command: str) -> bool:
+def _classify_shell_command(command: str) -> tuple[bool, Optional[str]]:
+    """
+    Evaluates shell command safety in safe mode.
+    Returns (is_safe: bool, risky_reason: Optional[str]).
+    """
     is_windows = platform.system() == "Windows"
     safe_commands = _get_safe_commands()
+    stripped = command.strip()
+    if not stripped:
+        return True, None
+
     try:
-        stripped = command.strip()
         parts = shlex.split(stripped, posix=(not is_windows))
-        if parts:
-            base_cmd = os.path.basename(parts[0]).lower()
-            if base_cmd.endswith(".exe"):
-                base_cmd = base_cmd[:-4]
-
-            # Block python -c one-liners that execute system processes or shell commands in safe mode
-            if base_cmd in ("python", "py"):
-                if "-c" in parts:
-                    idx = parts.index("-c")
-                    if idx + 1 < len(parts):
-                        code_payload = parts[idx + 1].lower()
-                        forbidden_patterns = [
-                            "subprocess", "os.system", "os.popen", "pty", "popen",
-                            "spawn", "execv", "execl"
-                        ]
-                        if any(p in code_payload for p in forbidden_patterns):
-                            return False
-                        # If running a script file under python in safe mode, verify via Python authorization if interactive
-                        if AUTONOMY_LEVEL == "safe":
-                            from lollms_client.tools_bindings.lcp.default_tools.execute_python import execute_python as _ep
-                            if not getattr(_ep, "_AUTO_APPROVE_PYTHON", False) and hasattr(sys.stdin, "isatty") and sys.stdin.isatty():
-                                script_target = next((p for p in parts[1:] if p.endswith(".py") and not p.startswith("-")), None)
-                                if script_target and os.path.exists(script_target):
-                                    try:
-                                        src = Path(script_target).read_text(encoding="utf-8", errors="ignore")
-                                        dec, reason = _ep._prompt_user_validation(src, f"shell: {command}", parts)
-                                        if dec == "reject":
-                                            return False
-                                        elif dec == "always":
-                                            _ep._AUTO_APPROVE_PYTHON = True
-                                    except Exception:
-                                        pass
-
-            if base_cmd in safe_commands:
-                return True                
-            for safe in safe_commands:
-                sl = safe.lower()
-                if (stripped.lower() == sl or 
-                    stripped.lower().startswith(sl + " ") or 
-                    stripped.lower().startswith(sl + '"') or 
-                    stripped.lower().startswith(sl + '(')):
-                    return True
-            return False
-
-        
     except ValueError:
-        pass
-    stripped_lower = command.strip().lower()
-    for safe in safe_commands:
-        sl = safe.lower()
-        if (stripped_lower == sl or 
-            stripped_lower.startswith(sl + " ") or 
-            stripped_lower.startswith(sl + '"') or 
-            stripped_lower.startswith(sl + '(')):
-            return True
-    return False
+        parts = stripped.split()
+
+    if not parts:
+        return True, None
+
+    base_cmd = os.path.basename(parts[0]).lower()
+    if base_cmd.endswith(".exe"):
+        base_cmd = base_cmd[:-4]
+
+    # 1. Direct check for Network / Download utilities
+    if base_cmd in _NETWORK_DOWNLOAD_COMMANDS:
+        return False, f"Outbound network / download utility '{base_cmd}'"
+
+    # 2. Direct check for System Destructive / Privileged commands
+    if base_cmd in _SYSTEM_DESTRUCTIVE_COMMANDS:
+        return False, f"Privileged / destructive system command '{base_cmd}'"
+
+    # 3. Peeling shell interpreter escapes (cmd /c, powershell -command, bash -c)
+    if base_cmd in ("cmd", "powershell", "pwsh", "bash", "sh", "zsh"):
+        sub_cmd_parts = []
+        for idx, token in enumerate(parts[1:]):
+            if token.lower() in ("/c", "-c", "-command", "-enc", "-encodedcommand"):
+                sub_cmd_parts = parts[idx + 2:]
+                break
+        if sub_cmd_parts:
+            inner_sub_cmd = " ".join(sub_cmd_parts)
+            return _classify_shell_command(inner_sub_cmd)
+        else:
+            return False, f"Interactive shell interpreter invocation '{base_cmd}'"
+
+    # 4. Inspect Python invocations
+    if base_cmd in ("python", "py", "python3"):
+        if "-c" in parts:
+            idx = parts.index("-c")
+            if idx + 1 < len(parts):
+                code_payload = parts[idx + 1].lower()
+                forbidden_patterns = [
+                    "subprocess", "os.system", "os.popen", "pty", "popen",
+                    "spawn", "execv", "execl", "socket", "urllib", "requests", "httpx"
+                ]
+                for p in forbidden_patterns:
+                    if p in code_payload:
+                        return False, f"Python one-liner with process or network escape '{p}'"
+        return True, None
+
+    # 5. Check if command is in safe commands whitelist
+    if base_cmd in safe_commands:
+        cmd_lower = stripped.lower()
+        for net_tool in _NETWORK_DOWNLOAD_COMMANDS:
+            if re.search(r'\b' + re.escape(net_tool) + r'\b', cmd_lower):
+                return False, f"Command references network tool '{net_tool}'"
+        return True, None
+
+    return False, f"Unwhitelisted shell binary '{base_cmd}'"
+
+def _is_safe_command(command: str) -> bool:
+    safe, _ = _classify_shell_command(command)
+    return safe
+
+def _can_prompt_interactive() -> bool:
+    """Checks whether standard input stream is an interactive terminal."""
+    if not sys.stdin:
+        return False
+    try:
+        return sys.stdin.isatty()
+    except Exception:
+        return False
+
+def _prompt_user_validation(command: str, script_label: str) -> Tuple[str, str]:
+    """
+    Validates command execution using:
+      1. Registered host confirm_handler (GUI, async queue, headless API).
+      2. Interactive terminal CLI prompt if stdin is a TTY.
+      3. Non-interactive fallback: cleanly assumes refusal without blocking.
+    """
+    global _CONFIRM_HANDLER
+
+    handler = _CONFIRM_HANDLER
+    if not handler:
+        persistent_name = "lollms_client.tools_bindings.lcp.persistent_system_shell"
+        if persistent_name in sys.modules:
+            handler = getattr(sys.modules[persistent_name], "_CONFIRM_HANDLER", None)
+
+    # 1. Custom host/GUI confirmation handler
+    if handler is not None and callable(handler):
+        try:
+            try:
+                res = handler(command, script_label)
+            except TypeError:
+                try:
+                    res = handler(command, script_label, None)
+                except TypeError:
+                    try:
+                        res = handler({
+                            "tool_name": "system_shell",
+                            "action_type": "shell_command",
+                            "command": command,
+                            "source": command,
+                            "script_label": script_label,
+                            "label": script_label,
+                            "content": command,
+                            "metadata": {"command": command, "autonomy_level": AUTONOMY_LEVEL}
+                        })
+                    except TypeError:
+                        res = handler(command)
+
+            if isinstance(res, tuple):
+                decision = res[0]
+                reason = res[1] if len(res) > 1 else ""
+            elif isinstance(res, bool):
+                decision, reason = ("allow", "") if res else ("reject", "Declined by operator.")
+            elif isinstance(res, str):
+                decision, reason = res, ""
+            else:
+                decision, reason = "allow", ""
+            return str(decision).lower().strip(), str(reason)
+        except Exception as handler_err:
+            ASCIIColors.warning(f"[system_shell] Confirm handler failed: {handler_err}")
+            return "reject", f"Confirmation handler failed: {handler_err}"
+
+    # 2. Interactive terminal prompt
+    if _can_prompt_interactive():
+        panel_parts = [
+            f"[bold cyan]Command:[/bold cyan] [yellow]$ {command}[/yellow]",
+            f"[bold cyan]Autonomy Mode:[/bold cyan] [green]{AUTONOMY_LEVEL.upper()}[/green] (Protected Workspace Sandbox)",
+            "\n[bold yellow]⚠️  The LLM agent wants to execute this shell command on your system.[/bold yellow]"
+        ]
+
+        ASCIIColors.panel(
+            "\n".join(panel_parts),
+            title=f"[bold yellow]🛡️ Shell Command Authorization ({AUTONOMY_LEVEL.upper()} Mode)[/bold yellow]",
+            border_style="yellow"
+        )
+
+        while True:
+            try:
+                choice = input("  Authorize command? [y]es / [n]o / [a]lways for session: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return "reject", "Execution interrupted by operator (Ctrl+C / EOF)."
+
+            if choice in ("", "y", "yes"):
+                return "allow", ""
+            elif choice in ("a", "always"):
+                return "always", ""
+            elif choice in ("n", "no"):
+                try:
+                    reason = input("  Reason / feedback for the LLM (optional, press Enter to skip): ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    reason = ""
+                return "reject", reason or "Operator declined execution."
+            else:
+                ASCIIColors.yellow("  Invalid choice. Please enter 'y', 'n', or 'a'.")
+
+    # 3. Non-interactive fallback: assume refusal immediately without blocking
+    return "reject", "Non-interactive environment: no user interaction channel available to authorize command execution in safe mode (refusal assumed without blocking)."
+
 
 def tool_execute_shell_command_prompt() -> str:
     """
@@ -190,9 +307,9 @@ POSIX SHELL SYNTAX RULES:
         )
     else:
         autonomy_desc = (
-            f"AUTONOMY: SAFE MODE is active. Whitelisted commands run automatically:\n"
-            f"Allowed safe commands: {safe_cmds_str}\n"
-            "Commands outside this whitelist will prompt the user for authorization before execution."
+            f"AUTONOMY: SAFE MODE is active (Default):\n"
+            f"• Auto-approved local commands: {safe_cmds_str}\n"
+            f"• Network & diagnostic utilities (ping, curl, wget, ssh, nslookup, etc.) are NOT auto-approved and will prompt the user for authorization before running."
         )
 
     return f"""Executes a shell command in the current workspace directory.
@@ -201,6 +318,7 @@ Use this for environment management (pip install), running tests, or interacting
 {shell_info}
 
 {autonomy_desc}"""
+
 
 def tool_execute_shell_command(
     command: str
@@ -212,6 +330,7 @@ def tool_execute_shell_command(
     Args:
         command (str): The shell command to execute.
     """
+    global AUTONOMY_LEVEL
     is_windows = platform.system() == "Windows"
     autonomy_level = AUTONOMY_LEVEL
 
@@ -233,7 +352,6 @@ def tool_execute_shell_command(
                 timeout=120
             )
         else:
-            # On Windows cmd.exe, rmdir /s /q only accepts a single directory. Expand multiple targets.
             if is_windows:
                 stripped_cmd = command.strip()
                 rmdir_match = re.match(r'^(rmdir|rd)\s+(/[sS]\s+/[qQ]|/[qQ]\s+/[sS])\s+(.+)$', stripped_cmd)
@@ -245,24 +363,23 @@ def tool_execute_shell_command(
                     if len(parts) > 1:
                         command = " & ".join(f'{cmd_name} {cmd_flags} "{d}"' for d in parts)
 
-            if not _is_safe_command(command) or autonomy_level == "strict":
-                handler = _CONFIRM_HANDLER
-                if not handler:
-                    persistent_name = "lollms_client.tools_bindings.lcp.persistent_system_shell"
-                    if persistent_name in sys.modules:
-                        handler = getattr(sys.modules[persistent_name], "_CONFIRM_HANDLER", None)
+            is_safe, risky_reason = _classify_shell_command(command)
 
-                user_authorized = False
-                if handler is not None and callable(handler):
-                    try:
-                        res = handler(command, f"shell: {command}")
-                        decision = res[0] if isinstance(res, tuple) else (res if isinstance(res, str) else ("allow" if res else "reject"))
-                        if str(decision).lower().strip() in ("allow", "always"):
-                            user_authorized = True
-                    except Exception as handler_err:
-                        ASCIIColors.warning(f"[system_shell] Confirm handler failed: {handler_err}")
+            if not is_safe or autonomy_level == "strict":
+                prompt_label = f"shell: {command}"
+                if autonomy_level == "strict":
+                    prompt_label = f"[STRICT] shell: {command}"
+                elif risky_reason:
+                    prompt_label = f"[RISKY: {risky_reason}] shell: {command}"
 
-                if not user_authorized:
+                decision, rejection_reason = _prompt_user_validation(command, prompt_label)
+
+                if decision in ("allow", "always"):
+                    if decision == "always":
+                        AUTONOMY_LEVEL = "full_access"
+                        ASCIIColors.success("[system_shell] 🔓 Shell autonomy upgraded to full_access for this session.")
+                else:
+                    reason_msg = rejection_reason or f"Restricted shell operation ({risky_reason or 'unwhitelisted command'}) denied by operator."
                     allowed_list = ", ".join(sorted(_get_safe_commands()))
                     hint = ""
                     stripped_cmd = command.strip().lower()
@@ -279,14 +396,16 @@ def tool_execute_shell_command(
                     return {
                         "success": False,
                         "output": (
-                            f"🛑 BLOCKED BY SANDBOX: The command '{command}' is not in the safe whitelist.\n\n"
+                            f"🛑 BLOCKED BY SANDBOX: The command '{command}' was not authorized.\n\n"
+                            f"Reason: {reason_msg}\n"
                             f"The system shell is currently in '{autonomy_level}' mode on {platform.system()} ({'cmd.exe' if is_windows else 'sh/bash'}).\n"
                             f"Allowed safe commands include: {allowed_list}.{hint}\n\n"
-                            f"⚠️ **ACTION REQUIRED FROM THE USER**: If this task requires elevated privileges, "
-                            f"please ask the user to enable 'full_access' mode by typing `/shell` in the CLI or settings."
+                            f"⚠️ **ACTION REQUIRED FROM THE OPERATOR**: If this task requires elevated privileges, "
+                            f"please enable 'full_access' mode by typing `/shell` or configuring the host application."
                         ),
-                        "error": f"Blocked by sandbox ({autonomy_level} mode). The command '{command}' is not whitelisted.{hint}"
+                        "error": f"Blocked by sandbox ({autonomy_level} mode): {reason_msg}{hint}"
                     }
+
             result = subprocess.run(
                 command,
                 shell=True,

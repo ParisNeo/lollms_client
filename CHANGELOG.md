@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-22 07:18]
+
+- `fix(binding): resolve LCP binding initialization issues in lcp/__init__.py and system_shell`
+
 ## [2026-09-22 07:07]
 
 - fix(lcp): Fix race condition in default_tools shell components and ensure proper CLI integration

@@ -16,6 +16,7 @@ which inspection tools to use to read the omitted middle.
 HUMAN-IN-THE-LOOP AUTHORIZATION:
 In safe mode, execution prompts the user with a code preview and authorization choices:
 [y]es (run once), [a]lways (auto-approve for this session), [n]o (reject with feedback), [v]iew full code.
+In non-interactive environments without an interactive handler, refusal is cleanly assumed without blocking.
 """
 
 import ast
@@ -47,16 +48,13 @@ _STRIP_MARKER = (
 
 
 def set_confirm_handler(handler: Optional[Any]) -> None:
-    """Sets a custom confirmation handler across both current and persistent LCP module instances."""
+    """Sets a custom confirmation handler across all loaded and persistent LCP module instances."""
     global _CONFIRM_HANDLER
     _CONFIRM_HANDLER = handler
-    for mod_name in (
-        "lollms_client.tools_bindings.lcp.persistent_execute_python",
-        "lollms_client.tools_bindings.lcp.default_tools.execute_python.execute_python"
-    ):
-        if mod_name in sys.modules and sys.modules[mod_name] is not sys.modules.get(__name__):
+    for mod_name, mod in list(sys.modules.items()):
+        if "execute_python" in mod_name and mod is not sys.modules.get(__name__):
             try:
-                sys.modules[mod_name]._CONFIRM_HANDLER = handler
+                mod._CONFIRM_HANDLER = handler
             except Exception:
                 pass
 
@@ -99,42 +97,43 @@ def _can_prompt_interactive() -> bool:
 
 
 def _prompt_user_validation(source: str, script_label: str, argv: Optional[List[Any]] = None) -> Tuple[str, str]:
-    """
-    Prompts for validation when executing Python code in safe mode.
-    Prioritizes registered confirmation handler (GUI / WebUI / custom callback),
-    falls back to interactive terminal prompt if stdin is a TTY,
-    and returns ('allow', '') safely if running in a non-interactive environment without a TTY.
-    """
     global _CONFIRM_HANDLER
 
     handler = _CONFIRM_HANDLER
     if not handler:
-        persistent_name = "lollms_client.tools_bindings.lcp.persistent_execute_python"
-        if persistent_name in sys.modules:
-            handler = getattr(sys.modules[persistent_name], "_CONFIRM_HANDLER", None)
+        for mod_name, mod in list(sys.modules.items()):
+            if "execute_python" in mod_name and hasattr(mod, "_CONFIRM_HANDLER") and mod._CONFIRM_HANDLER:
+                handler = mod._CONFIRM_HANDLER
+                break
 
-    # 1. Check custom host/GUI confirmation handler first
+    # 1. Check custom host/GUI confirmation handler first (NiceGUI, WebUI, etc.)
     if handler is not None and callable(handler):
         try:
             try:
                 res = handler(source, script_label, argv)
             except TypeError:
-                res = handler({
-                    "tool_name": "execute_python",
-                    "action_type": "python_execution",
-                    "source": source,
-                    "script_label": script_label,
-                    "argv": argv,
-                    "label": script_label,
-                    "content": source,
-                    "metadata": {"argv": argv, "autonomy_level": AUTONOMY_LEVEL}
-                })
+                try:
+                    res = handler(source, script_label)
+                except TypeError:
+                    try:
+                        res = handler({
+                            "tool_name": "execute_python",
+                            "action_type": "python_execution",
+                            "source": source,
+                            "script_label": script_label,
+                            "argv": argv,
+                            "label": script_label,
+                            "content": source,
+                            "metadata": {"argv": argv, "autonomy_level": AUTONOMY_LEVEL}
+                        })
+                    except TypeError:
+                        res = handler(source)
 
             if isinstance(res, tuple):
                 decision = res[0]
                 reason = res[1] if len(res) > 1 else ""
             elif isinstance(res, bool):
-                decision, reason = ("allow", "") if res else ("reject", "Declined by user.")
+                decision, reason = ("allow", "") if res else ("reject", "Declined by operator.")
             elif isinstance(res, str):
                 decision, reason = res, ""
             else:
@@ -142,68 +141,68 @@ def _prompt_user_validation(source: str, script_label: str, argv: Optional[List[
             return str(decision).lower().strip(), str(reason)
         except Exception as handler_err:
             ASCIIColors.warning(f"[execute_python] Confirm handler failed: {handler_err}")
-            return "allow", ""
+            return "reject", f"Confirmation handler failed: {handler_err}"
 
     # 2. Check interactive TTY for terminal CLI
-    if not _can_prompt_interactive():
-        # In non-interactive environments without a handler, do not attempt input()
-        return "allow", ""
+    if _can_prompt_interactive():
+        source_lines = source.splitlines()
+        total_lines = len(source_lines)
+        max_preview = 25
 
-    source_lines = source.splitlines()
-    total_lines = len(source_lines)
-    max_preview = 25
+        preview_lines = []
+        for i, line in enumerate(source_lines[:max_preview], 1):
+            preview_lines.append(f"[dim]{i:3d} |[/dim] {line}")
+        if total_lines > max_preview:
+            preview_lines.append(f"[dim]    ... [{total_lines - max_preview} more lines — enter 'v' to view all][/dim]")
 
-    preview_lines = []
-    for i, line in enumerate(source_lines[:max_preview], 1):
-        preview_lines.append(f"[dim]{i:3d} |[/dim] {line}")
-    if total_lines > max_preview:
-        preview_lines.append(f"[dim]    ... [{total_lines - max_preview} more lines — enter 'v' to view all][/dim]")
+        panel_parts = [
+            f"[bold cyan]Script / Target:[/bold cyan] [yellow]{script_label}[/yellow]",
+            f"[bold cyan]Autonomy Mode:[/bold cyan] [green]{AUTONOMY_LEVEL.upper()}[/green] (Protected Workspace Sandbox)",
+        ]
+        if argv and len(argv) > 1:
+            panel_parts.append(f"[bold cyan]Arguments:[/bold cyan] {argv[1:]}")
 
-    panel_parts = [
-        f"[bold cyan]Script / Target:[/bold cyan] [yellow]{script_label}[/yellow]",
-        f"[bold cyan]Autonomy Mode:[/bold cyan] [green]SAFE[/green] (Protected Workspace Sandbox)",
-    ]
-    if argv and len(argv) > 1:
-        panel_parts.append(f"[bold cyan]Arguments:[/bold cyan] {argv[1:]}")
+        panel_parts.append(f"\n[bold cyan]Code Preview ({total_lines} lines):[/bold cyan]")
+        panel_parts.extend(preview_lines)
+        panel_parts.append(
+            "\n[bold yellow]⚠️  The LLM agent wants to execute this Python code in your workspace.[/bold yellow]"
+        )
 
-    panel_parts.append(f"\n[bold cyan]Code Preview ({total_lines} lines):[/bold cyan]")
-    panel_parts.extend(preview_lines)
-    panel_parts.append(
-        "\n[bold yellow]⚠️  The LLM agent wants to execute this Python code in your workspace.[/bold yellow]"
-    )
+        ASCIIColors.panel(
+            "\n".join(panel_parts),
+            title=f"[bold yellow]🛡️ Python Execution Authorization ({AUTONOMY_LEVEL.upper()} Mode)[/bold yellow]",
+            border_style="yellow"
+        )
 
-    ASCIIColors.panel(
-        "\n".join(panel_parts),
-        title="[bold yellow]🛡️ Python Execution Authorization (Safe Mode)[/bold yellow]",
-        border_style="yellow"
-    )
-
-    while True:
-        try:
-            choice = input("  Authorize execution? [y]es / [n]o / [a]lways for session / [v]iew full code (default: y): ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return "reject", "Execution interrupted by user (Ctrl+C / EOF)."
-
-        if choice in ("", "y", "yes"):
-            return "allow", ""
-        elif choice in ("a", "always"):
-            return "always", ""
-        elif choice in ("n", "no"):
+        while True:
             try:
-                reason = input("  Reason / feedback for the LLM (optional, press Enter to skip): ").strip()
+                choice = input("  Authorize execution? [y]es / [n]o / [a]lways for session / [v]iew full code (default: y): ").strip().lower()
             except (EOFError, KeyboardInterrupt):
-                reason = ""
-            return "reject", reason
-        elif choice in ("v", "view"):
-            print("\n" + "=" * 80)
-            print(f"📄 FULL SOURCE CODE: {script_label} ({total_lines} lines)")
-            print("=" * 80)
-            for i, line in enumerate(source_lines, 1):
-                print(f"{i:4d} | {line}")
-            print("=" * 80 + "\n")
-        else:
-            ASCIIColors.yellow("  Invalid choice. Please enter 'y', 'n', 'a', or 'v'.")
+                print()
+                return "reject", "Execution interrupted by operator (Ctrl+C / EOF)."
+
+            if choice in ("", "y", "yes"):
+                return "allow", ""
+            elif choice in ("a", "always"):
+                return "always", ""
+            elif choice in ("n", "no"):
+                try:
+                    reason = input("  Reason / feedback for the LLM (optional, press Enter to skip): ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    reason = ""
+                return "reject", reason or "Operator declined execution."
+            elif choice in ("v", "view"):
+                print("\n" + "=" * 80)
+                print(f"📄 FULL SOURCE CODE: {script_label} ({total_lines} lines)")
+                print("=" * 80)
+                for i, line in enumerate(source_lines, 1):
+                    print(f"{i:4d} | {line}")
+                print("=" * 80 + "\n")
+            else:
+                ASCIIColors.yellow("  Invalid choice. Please enter 'y', 'n', 'a', or 'v'.")
+
+    # 3. Fallback for non-interactive environments without an attached handler (assume refusal, do not block)
+    return "reject", "Non-interactive environment: no user interaction channel available to authorize execution in safe mode (refusal assumed without blocking)."
 
 
 def _ensure_import(module_name: str, package_name: str = None):
@@ -342,15 +341,15 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
     global _AUTO_APPROVE_PYTHON
 
     # ── AUTONOMY LEVEL DECISION MATRIX ──
-    # 1. STRICT: Prompts operator on EVERY execution turn (maximum scrutiny).
-    # 2. SAFE (Default): Auto-approves benign computational code, data analysis (numpy/pandas/scipy/sklearn),
-    #    document generation (docx/pptx/pdf/xlsx), and plotting (matplotlib/seaborn). Prompts ONLY when
-    #    risky operations (process spawning, os.system/subprocess calls, system escapes) are detected.
+    # 1. STRICT: Prompts operator on EVERY execution turn.
+    # 2. SAFE (Default): Auto-approves benign code (algorithms, data science, docx/pptx/pdf/xlsx, matplotlib/seaborn).
+    #    Prompts user / blocks when risky operations (process spawning, subprocess/os.system, network calls) are detected.
     # 3. FULL ACCESS: Executes everything without confirmation prompts.
     risky_reason = _detect_risky_operations(source)
 
     requires_user_prompt = False
     prompt_label = script_label
+    user_authorized_risky = False
 
     if not _AUTO_APPROVE_PYTHON:
         if AUTONOMY_LEVEL == "strict":
@@ -363,19 +362,22 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
     if requires_user_prompt:
         decision, rejection_reason = _prompt_user_validation(source, prompt_label, argv)
         if decision == "reject":
-            reason_msg = rejection_reason or "The user reviewed the code and declined permission to execute it."
-            ASCIIColors.warning(f"[execute_python] ❌ Execution rejected by user: {reason_msg}")
+            reason_msg = rejection_reason or f"Risky operation detected ({risky_reason or 'Restricted operation'}) and not authorized by operator."
+            ASCIIColors.warning(f"[execute_python] ❌ Execution blocked: {reason_msg}")
             return {
                 "success": False,
-                "error": f"🛑 EXECUTION REJECTED BY USER: {reason_msg}\nThe user inspected your Python code and denied execution authorization. Revise your approach, ask the user for clarification, or modify the code based on their feedback.",
+                "error": f"🛑 BLOCKED BY SANDBOX ({AUTONOMY_LEVEL.upper()} MODE): {reason_msg}\n"
+                         f"Code execution was blocked because it contains restricted operations ({risky_reason or 'unauthorized actions'}).\n"
+                         "In safe mode, process spawning (subprocess, os.system, curl) and network calls require operator approval or 'full_access' mode.",
                 "output": "",
-                "stderr": f"Execution rejected by user: {reason_msg}"
+                "stderr": f"Execution blocked: {reason_msg}"
             }
         elif decision == "always":
             _AUTO_APPROVE_PYTHON = True
-            ASCIIColors.success("[execute_python] 🔓 Auto-approval enabled for this session. Python execution will run autonomously without prompts.")
+            user_authorized_risky = True
+            ASCIIColors.success("[execute_python] 🔓 Auto-approval enabled for this session.")
         elif decision == "allow":
-            pass
+            user_authorized_risky = True
 
     _np = None
     _plt = None
@@ -437,17 +439,35 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
     safe_builtins = dict(__builtins__ if isinstance(__builtins__, dict) else __builtins__.__dict__)
     orig_import = safe_builtins.get("__import__", __import__)
 
+    is_restricted = (AUTONOMY_LEVEL in ("safe", "strict")) and not user_authorized_risky and not _AUTO_APPROVE_PYTHON
+
     def _sandboxed_import(name, *args, **kwargs):
-        if AUTONOMY_LEVEL in ("safe", "strict") and not _AUTO_APPROVE_PYTHON:
+        if is_restricted:
             root_mod = name.split(".")[0].lower()
-            if root_mod in ("subprocess", "pty", "commands"):
+            if root_mod in ("subprocess", "pty", "commands", "multiprocessing"):
                 raise PermissionError(
-                    f"🛑 BLOCKED BY SANDBOX: Importing '{name}' to spawn external processes is restricted. "
+                    f"🛑 BLOCKED BY SANDBOX: Importing '{name}' to spawn external processes is restricted in {AUTONOMY_LEVEL.upper()} mode. "
+                    "Authorize execution or switch to 'full_access' mode if required."
+                )
+            if root_mod in ("socket", "requests", "urllib", "httpx", "aiohttp", "ftplib", "smtplib", "paramiko"):
+                raise PermissionError(
+                    f"🛑 BLOCKED BY SANDBOX: Importing network library '{name}' is restricted in {AUTONOMY_LEVEL.upper()} mode. "
                     "Authorize execution or switch to 'full_access' mode if required."
                 )
         return orig_import(name, *args, **kwargs)
 
     safe_builtins["__import__"] = _sandboxed_import
+
+    import subprocess as _sub_mod
+    import socket as _socket_mod
+
+    orig_sub_run = getattr(_sub_mod, "run", None)
+    orig_sub_popen = getattr(_sub_mod, "Popen", None)
+    orig_sub_call = getattr(_sub_mod, "call", None)
+    orig_sub_check_output = getattr(_sub_mod, "check_output", None)
+
+    orig_socket_connect = _socket_mod.socket.connect
+    orig_create_connection = getattr(_socket_mod, "create_connection", None)
 
     orig_os_system = getattr(os, "system", None)
     orig_os_popen = getattr(os, "popen", None)
@@ -456,16 +476,18 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
     orig_os_rmdir = getattr(os, "rmdir", None)
     orig_shutil_rmtree = getattr(shutil, "rmtree", None)
 
-    if AUTONOMY_LEVEL in ("safe", "strict"):
+    if is_restricted:
+        def _blocked_subprocess(*args, **kwargs):
+            raise PermissionError("🛑 BLOCKED BY SANDBOX: Process execution via 'subprocess' is restricted in safe mode without user authorization.")
+
         def _blocked_system(*args, **kwargs):
-            if not _AUTO_APPROVE_PYTHON:
-                raise PermissionError("🛑 BLOCKED BY SANDBOX: 'os.system' cannot be used without explicit authorization.")
-            return orig_os_system(*args, **kwargs) if orig_os_system else None
+            raise PermissionError("🛑 BLOCKED BY SANDBOX: 'os.system' cannot be used to execute shell commands in safe mode without user authorization.")
 
         def _blocked_popen(*args, **kwargs):
-            if not _AUTO_APPROVE_PYTHON:
-                raise PermissionError("🛑 BLOCKED BY SANDBOX: 'os.popen' cannot be used without explicit authorization.")
-            return orig_os_popen(*args, **kwargs) if orig_os_popen else None
+            raise PermissionError("🛑 BLOCKED BY SANDBOX: 'os.popen' cannot be used in safe mode without user authorization.")
+
+        def _blocked_network_connect(*args, **kwargs):
+            raise PermissionError("🛑 BLOCKED BY SANDBOX (SAFE MODE): Outbound network / socket connections (HTTP/HTTPS/TCP) are restricted without explicit operator authorization.")
 
         def _bounded_remove(path, *args, **kwargs):
             p = Path(path).resolve()
@@ -491,16 +513,21 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
                 raise PermissionError(f"🛑 BLOCKED BY SANDBOX: Deleting directory tree '{path}' outside workspace is forbidden.")
             return orig_shutil_rmtree(path, *args, **kwargs)
 
+        if orig_sub_run: _sub_mod.run = _blocked_subprocess
+        if orig_sub_popen: _sub_mod.Popen = _blocked_subprocess
+        if orig_sub_call: _sub_mod.call = _blocked_subprocess
+        if orig_sub_check_output: _sub_mod.check_output = _blocked_subprocess
+
+        _socket_mod.socket.connect = _blocked_network_connect
+        if orig_create_connection:
+            _socket_mod.create_connection = _blocked_network_connect
+
         os.system = _blocked_system
         os.popen = _blocked_popen
-        if orig_os_remove:
-            os.remove = _bounded_remove
-        if orig_os_unlink:
-            os.unlink = _bounded_remove
-        if orig_os_rmdir:
-            os.rmdir = _bounded_rmdir
-        if orig_shutil_rmtree:
-            shutil.rmtree = _bounded_rmtree
+        if orig_os_remove: os.remove = _bounded_remove
+        if orig_os_unlink: os.unlink = _bounded_remove
+        if orig_os_rmdir: os.rmdir = _bounded_rmdir
+        if orig_shutil_rmtree: shutil.rmtree = _bounded_rmtree
 
     local_vars = {
         "Path": Path,
@@ -615,19 +642,22 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
         sys.argv = old_argv
 
         # Restore system functions if modified
-        if AUTONOMY_LEVEL in ("safe", "strict"):
-            if orig_os_system:
-                os.system = orig_os_system
-            if orig_os_popen:
-                os.popen = orig_os_popen
-            if orig_os_remove:
-                os.remove = orig_os_remove
-            if orig_os_unlink:
-                os.unlink = orig_os_unlink
-            if orig_os_rmdir:
-                os.rmdir = orig_os_rmdir
-            if orig_shutil_rmtree:
-                shutil.rmtree = orig_shutil_rmtree
+        if is_restricted:
+            if orig_sub_run: _sub_mod.run = orig_sub_run
+            if orig_sub_popen: _sub_mod.Popen = orig_sub_popen
+            if orig_sub_call: _sub_mod.call = orig_sub_call
+            if orig_sub_check_output: _sub_mod.check_output = orig_sub_check_output
+
+            _socket_mod.socket.connect = orig_socket_connect
+            if orig_create_connection:
+                _socket_mod.create_connection = orig_create_connection
+
+            if orig_os_system: os.system = orig_os_system
+            if orig_os_popen: os.popen = orig_os_popen
+            if orig_os_remove: os.remove = orig_os_remove
+            if orig_os_unlink: os.unlink = orig_os_unlink
+            if orig_os_rmdir: os.rmdir = orig_os_rmdir
+            if orig_shutil_rmtree: shutil.rmtree = orig_shutil_rmtree
 
     out_str = redirected_output.getvalue()
     err_str = redirected_error.getvalue()

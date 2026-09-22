@@ -76,11 +76,14 @@ class GuiPrefs:
                 data = json.loads(GUI_PREFS_FILE.read_text(encoding="utf-8"))
                 known = {f.name for f in dataclasses.fields(cls)}
                 inst = cls(**{k: v for k, v in data.items() if k in known})
+                # Ephemeral session permissions always start False on fresh app start
+                inst.auto_approve_python = False
                 inst._ensure_workspaces_seeded()
                 return inst
             except Exception:
                 pass
         inst = cls()
+        inst.auto_approve_python = False
         inst._ensure_workspaces_seeded()
         return inst
 

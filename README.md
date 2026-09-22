@@ -2928,6 +2928,94 @@ else:
 
 This powerful feature allows for complex creative tasks like character swapping, background replacement, and style transfer directly through the `lollms_client` library.
 
+## 🛡️ Execution Autonomy & Human-in-the-Loop (HITL) Security Architecture
+
+`lollms_client` provides a secure, multi-tier execution sandbox for system shell commands and Python execution. The security / autonomy level governs all execution boundaries across CLI, GUI, and headless environments.
+
+### 1. Autonomy Levels Matrix
+
+| Autonomy Level | Behavior | Interactive TTY / UI Action | Non-Interactive / Headless Fallback |
+| :--- | :--- | :--- | :--- |
+| **`strict`** | Maximum security oversight. Prompts the operator for authorization on **every** Python execution and shell command. | Prompts operator with code preview (`[y]es / [n]o / [a]lways / [v]iew` in CLI, modal dialog in GUI). | **Assumes Refusal Immediately**: Returns a clean blocked result without hanging on stdin. |
+| **`safe`** (Default) | Intelligent balanced sandbox. Automatically runs benign computations, algorithms, math, data science (`numpy`, `pandas`, `scipy`, `sklearn`), document generation (`python-docx`, `python-pptx`, `openpyxl`, `reportlab`), plots (`matplotlib`, `seaborn`), and workspace sandbox I/O. | Prompts operator **only** when risky operations are detected (process spawning via `subprocess`/`multiprocessing`, `os.system`/`os.popen`, unwhitelisted shell binaries, network commands). | If benign: runs autonomously.<br>If risky: **Assumes Refusal Immediately** without blocking. |
+| **`full_access`** | Unrestricted developer autonomy. Runs all scripts, tests, and shell commands without prompts. | Executes immediately without prompts. | Executes immediately without prompts. |
+
+---
+
+### 2. Calling Application Interactivity Contract
+
+`lollms_client` guarantees that tool execution **never hangs** when running inside non-interactive or headless environments:
+
+1. **Headless / API / Background Services (No Interaction Handling)**:
+   - When running in an environment without a connected interactive TTY and without an attached `confirm_handler`, safe code and commands run automatically.
+   - When a risky operation or `strict` mode is encountered, the tool **cleanly assumes refusal** and returns a descriptive error dictionary back to the LLM agent. No stdin reading is attempted, eliminating deadlocks.
+
+2. **Interactive CLI Applications (Terminal TTY)**:
+   - When `sys.stdin.isatty() == True` and no custom handler is attached, an interactive ASCIIColors terminal panel displays the target script, code preview, and prompt options (`[y]es`, `[n]o`, `[a]lways`, `[v]iew`).
+
+3. **Interactive GUI / Web / Asynchronous Applications (NiceGUI, WebUI, Desktop)**:
+   - Attach a custom confirmation callback via `LCPBinding.set_confirm_handler()` or `chat(..., confirm_handler=...)`.
+   - The worker thread dispatches the authorization request to the UI queue and awaits modal dialog confirmation.
+
+---
+
+### 3. Programmatic Confirmation Handler Integration
+
+#### A. Interactive GUI Callback Pattern (e.g. NiceGUI, WebUI)
+
+```python
+import queue
+from lollms_client import LollmsClient
+
+# 1. Create asynchronous queue bridge
+approval_queue = queue.Queue()
+
+def gui_confirm_handler(source: str, script_label: str, argv: list = None) -> tuple[str, str]:
+    resp_queue = queue.Queue(maxsize=1)
+
+    # Dispatch modal dialog event to UI thread
+    approval_queue.put({
+        "source": source,
+        "script_label": script_label,
+        "argv": argv,
+        "response_queue": resp_queue,
+    })
+
+    # Worker thread awaits user decision
+    try:
+        decision, reason = resp_queue.get(timeout=180.0)
+        return decision, reason
+    except queue.Empty:
+        return "reject", "Authorization timed out (operator did not respond)."
+
+# 2. Register with client
+client = LollmsClient(
+    tools_binding_name="lcp",
+    tools_binding_config={
+        "confirm_handler": gui_confirm_handler,
+        "host_tool_configs": {
+            "system_shell": {"autonomy_level": "safe", "confirm_handler": gui_confirm_handler},
+            "execute_python": {"autonomy_level": "safe", "confirm_handler": gui_confirm_handler},
+        }
+    }
+)
+```
+
+#### B. Direct Discussion or Personality Execution
+
+```python
+# Pass confirmation handler and autonomy level directly at chat time
+result = personality.chat(
+    prompt="Generate the annual report and execute tests",
+    lollms_client=client,
+    shell_autonomy_level="safe",
+    python_autonomy_level="safe",
+    confirm_handler=gui_confirm_handler,
+)
+```
+
+---
+
 ## 🔌 Tool Bindings: LCP & MCP
 
 The library supports two primary tool execution frameworks:
