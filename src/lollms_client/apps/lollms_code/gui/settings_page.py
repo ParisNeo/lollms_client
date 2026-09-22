@@ -444,9 +444,11 @@ def _render_agent_section(prefs: GuiPrefs) -> None:
         with ui.row().classes("w-full gap-4 items-center"):
             tokens_in = ui.number("Max Tokens / Turn", value=prefs.max_tokens_per_turn, min=512, step=512).classes("flex-1").props("outlined dense")
             steps_in = ui.number("Max Reasoning Steps (Rounds)", value=prefs.max_reasoning_steps, min=1, max=200, step=1).classes("flex-1").props("outlined dense")
+            compact_in = ui.number("Auto-Compaction Threshold (%)", value=int(getattr(prefs, "context_compaction_threshold", 0.85) * 100), min=50, max=95, step=5).classes("flex-1").props("outlined dense").tooltip("Context fill % at which non-essential files are locked and history compacted to prevent server disconnects")
 
         tokens_in.on_value_change(lambda e: setattr(prefs, "max_tokens_per_turn", int(e.value)))
         steps_in.on_value_change(lambda e: setattr(prefs, "max_reasoning_steps", int(e.value)))
+        compact_in.on_value_change(lambda e: setattr(prefs, "context_compaction_threshold", float(e.value) / 100.0))
         temp_slider.on_value_change(lambda e: setattr(prefs, "temperature", float(e.value)))
 
     # Card 2: Shell Autonomy & Python Execution Security Policies

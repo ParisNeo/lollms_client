@@ -1353,7 +1353,7 @@ class LollmsClient():
         if self.llm: return self.llm.tp.update_code(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
 
-    def generate_structured_content(self, *args, **kwargs):
+    def generate_structured_content(self, *args, **kwargs)->dict:
         if self.llm: return self.llm.tp.generate_structured_content(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
 

@@ -238,7 +238,7 @@ def create_personality(prefs: GuiPrefs, client):
         enable_stt=has_stt,
     )
 
-    personality = LollmsPersonality.from_handbag(prefs.handbag_path)
+    personality = LollmsPersonality.from_handbag(prefs.handbag_path, lollms_client=client)
     personality.lollms_client = client
     personality.workspace_path = Path(prefs.workspace_path)
     personality.system_prompt = (
@@ -690,6 +690,7 @@ def run_agent_turn_in_thread(
                 max_reasoning_steps=prefs.max_reasoning_steps,
                 temperature=prefs.temperature,
                 n_predict=prefs.max_tokens_per_turn,
+                context_compaction_threshold=getattr(prefs, "context_compaction_threshold", 0.85),
                 enable_artefacts=True,
                 use_internal_history=use_history,
                 enable_shell=getattr(prefs, "enable_shell_execution", True),

@@ -45,6 +45,8 @@ from lollms_client.lollms_chat_core import (
     detect_structural_symbols as _detect_structural_symbols,
     extract_artefact_meta as _extract_artefact_meta,
     dump_error as _core_dump_error,
+    is_connection_or_server_error as _core_is_connection_or_server_error,
+    run_fast_context_compaction as _core_run_fast_context_compaction,
 )
 
 _HEARTBEAT_MESSAGES = [
@@ -1472,7 +1474,7 @@ class _StreamState:
                 open_match = re.search(pattern, lower_buffer)
                 if open_match:
                     open_idx = open_match.start()
-                    tag_start_idx = lower_buffer.find(tag_tag_prefix, open_idx)
+                    tag_start_idx = lower_buffer.find(tag_prefix, open_idx)
                     if tag_start_idx == -1:
                         tag_start_idx = open_idx
                     if self._opening_tag_is_malformed(self._pending_buffer, tag_start_idx):
@@ -3733,6 +3735,7 @@ class ChatMixin:
         debug:                        bool = False,
         enable_vlm_query:             bool = False,
         enable_computer_use:          bool = False,
+        context_compaction_threshold: float = 0.85,
         event_mode:                   EventMode = EventMode.PROCESSING_TAG_MODE,
         think:                        Optional[bool] = None,
         reasoning_effort:             Optional[str] = None,
@@ -4596,6 +4599,8 @@ class ChatMixin:
         # This prevents the LLM from re-dispatching the same artifact in a subsequent round,
         # which causes infinite loops and unwanted version bumps.
         persistent_processed_tags = set()
+        consecutive_connection_errors = 0
+        last_connection_error_desc = ""
 
         # Initialize pending memory searches list for this turn
         object.__setattr__(self, '_pending_memory_searches', [])
@@ -4830,7 +4835,7 @@ class ChatMixin:
             if reasoning_summary is not None:
                 gen_kwargs["reasoning_summary"] = reasoning_summary
 
-            # ── 📊 CONTEXT FILL TELEMETRY ──
+            # ── 📊 CONTEXT FILL TELEMETRY & AUTO-COMPACTION GATE ──
             try:
                 total_tokens = 0
                 if self.lollmsClient and hasattr(self.lollmsClient, "count_tokens"):
@@ -4850,6 +4855,78 @@ class ChatMixin:
                 if max_ctx > 1:
                     fill_pct = (total_tokens / max_ctx) * 100.0
                     ASCIIColors.info(f"[Context] Round {round_count} fill: {total_tokens}/{max_ctx} tokens ({fill_pct:.1f}%)")
+
+                    norm_thresh = context_compaction_threshold if context_compaction_threshold <= 1.0 else context_compaction_threshold / 100.0
+                    thresh_pct = norm_thresh * 100.0
+
+                    if fill_pct >= thresh_pct and not was_cancelled:
+                        ASCIIColors.warning(
+                            f"[ChatMixin] 🚨 Context fill at {fill_pct:.1f}% >= {thresh_pct:.0f}%. "
+                            "Triggering Fast Compactor Agent to lock files and compact history..."
+                        )
+
+                        all_raw_arts = self.artefacts._get_all_raw() if getattr(self, "artefacts", None) else []
+                        loaded_arts = [
+                            a for a in all_raw_arts
+                            if a.get("visibility") == ArtefactVisibility.FULL and not a.get("title", "").endswith("::images")
+                        ]
+                        pinned_titles = {
+                            a.get("title", "") for a in all_raw_arts
+                            if a.get("visibility") == ArtefactVisibility.PINNED
+                        }
+
+                        history_dicts = [
+                            {"role": vh.sender_type, "content": getattr(vh, "content", "")}
+                            for vh in virtual_history
+                        ]
+
+                        compaction_res = _core_run_fast_context_compaction(
+                            client=self.lollmsClient,
+                            task=user_message,
+                            loaded_files=loaded_arts,
+                            pinned_files=pinned_titles,
+                            history_items=history_dicts,
+                            fill_pct=fill_pct,
+                            threshold_pct=thresh_pct,
+                        )
+
+                        files_to_lock = compaction_res.get("files_to_lock", [])
+                        history_summary = compaction_res.get("history_summary", "").strip()
+
+                        for f_title in files_to_lock:
+                            self.artefacts.set_visibility(f_title, ArtefactVisibility.TREE_LOCKED)
+
+                        if history_summary and len(virtual_history) > 1:
+                            virtual_history.clear()
+                            virtual_history.append(SimpleNamespace(
+                                sender_type="user",
+                                content=(
+                                    f"[SYSTEM: CONTEXT AUTO-COMPACTED ({fill_pct:.1f}% >= {thresh_pct:.0f}%)]\n"
+                                    f"Previous tool execution transcripts were summarized to prevent server disconnect:\n\n"
+                                    f"{history_summary}\n\n"
+                                    f"Continue your task based on this summary. If finished, output <done/>."
+                                )
+                            ))
+
+                        if callback:
+                            _cb(
+                                callback,
+                                f"\n\n🧹 [Context Health Guard: {fill_pct:.1f}% >= {thresh_pct:.0f}%] "
+                                f"Locked {len(files_to_lock)} file(s) and compacted history to prevent backend disconnect.\n\n",
+                                MSG_TYPE.MSG_TYPE_INFO,
+                                {"type": "context_compression", "locked_files": files_to_lock, "fill_pct": fill_pct},
+                            )
+
+                        messages_list = self.export(
+                            format_type="openai_chat",
+                            branch_tip_id=current_branch_tip,
+                            suppress_system_prompt=False,
+                            suppress_images=suppress_images,
+                            virtual_history=virtual_history,
+                            debug=debug_enabled,
+                            system_prompt_override=current_system_prompt,
+                        )
+
             except Exception as ctx_err:
                 ASCIIColors.warning(f"[Context] Failed to calculate context fill: {ctx_err}")
 
@@ -4857,8 +4934,10 @@ class ChatMixin:
             ASCIIColors.info(f"[Trace] Starting generation for round {round_count}...")
             _t_gen_start = time.perf_counter()
             object.__setattr__(self, "_ttft_logged", False)
+            round_connection_error = None
+
             try:
-                self.lollmsClient.generate_from_messages(
+                gen_res = self.lollmsClient.generate_from_messages(
                     messages=messages_list,
                     images=round_images if round_images else None,
                     stream=True,
@@ -4866,24 +4945,69 @@ class ChatMixin:
                     streaming_callback=_inline_relay,
                     **gen_kwargs
                 )
+                if isinstance(gen_res, dict):
+                    is_conn_dict, conn_reason_dict = _core_is_connection_or_server_error(gen_res)
+                    if is_conn_dict:
+                        round_connection_error = conn_reason_dict
+
                 _t_gen_end = time.perf_counter()
                 ASCIIColors.info(f"[Trace] Generation round {round_count} stream completed in {(_t_gen_end - _t_gen_start):.2f} s.")
             except Exception as gen_err:
                 _t_gen_end = time.perf_counter()
                 ASCIIColors.warning(f"[Trace] Generation round {round_count} failed after {(_t_gen_end - _t_gen_start):.2f} s.")
-                if debug_enabled:
-                    self._dump_error(
-                        error=gen_err,
-                        context_desc="LLM Generation Error",
-                        round_count=round_count,
-                        extra_data={"raw_llm_output": _sanitize_host_paths(raw_llm_output_buffer[0][-4000:])}
-                    )
                 if self.is_generation_cancelled():
                     was_cancelled = True
                     _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="cancelled")
                     break
+
+                is_conn, conn_reason = _core_is_connection_or_server_error(gen_err)
+                if is_conn:
+                    round_connection_error = conn_reason
                 else:
+                    if debug_enabled:
+                        self._dump_error(
+                            error=gen_err,
+                            context_desc="LLM Generation Error",
+                            round_count=round_count,
+                            extra_data={"raw_llm_output": _sanitize_host_paths(raw_llm_output_buffer[0][-4000:])}
+                        )
                     raise
+
+            # ── 🛑 BROKEN SERVER & CONSECUTIVE CONNECTION ERROR CIRCUIT BREAKER ──
+            if round_connection_error:
+                consecutive_connection_errors += 1
+                last_connection_error_desc = round_connection_error
+                ASCIIColors.warning(
+                    f"[ChatMixin] ⚠️ LLM Server connection failure on round {round_count} "
+                    f"(consecutive failures: {consecutive_connection_errors}/3): {round_connection_error}"
+                )
+
+                if consecutive_connection_errors >= 3:
+                    ASCIIColors.error(
+                        f"[ChatMixin] 🛑 Server unreachable for 3 consecutive rounds ({last_connection_error_desc}). "
+                        f"Aborting agentic loop to preserve round budget."
+                    )
+                    ai_msg.content = (
+                        f"❌ **Server Connection Failure**: Unable to communicate with the LLM backend after 3 consecutive failed attempts.\n\n"
+                        f"**Details**: {last_connection_error_desc}\n\n"
+                        f"**Action Required**: The LLM server is unresponsive or disconnected. "
+                        f"Please check that your server (Ollama, vLLM, OpenAI, LoLLMs, etc.) is running, reachable at the configured address, "
+                        f"and has sufficient resources."
+                    )
+                    _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="connection_error")
+                    _persist_round_state()
+                    break
+
+                time.sleep(2.0)
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content=f"[SYSTEM: Server connection error on round {round_count} ({last_connection_error_desc}). Retrying attempt {consecutive_connection_errors + 1}/3...]"
+                ))
+                _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="connection_error")
+                _persist_round_state()
+                continue
+            else:
+                consecutive_connection_errors = 0
 
             # Check cancellation after generation completes
             if self.is_generation_cancelled():

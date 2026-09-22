@@ -159,6 +159,183 @@ def is_binary_content(content: str) -> bool:
     return is_large_base64(content)
 
 
+def run_fast_context_compaction(
+    client: Any,
+    task: str,
+    loaded_files: List[Dict[str, Any]],
+    pinned_files: Set[str],
+    history_items: List[Dict[str, str]],
+    fill_pct: float,
+    threshold_pct: float = 85.0,
+) -> Dict[str, Any]:
+    """
+    Fast, lightweight agent using few-shot guidance to decide which loaded files
+    to lock and how to compact conversation history when approaching context capacity.
+    """
+    files_info = []
+    for f in loaded_files:
+        title = f.get("title") or f.get("name") or "file"
+        tokens = f.get("token_count") or (len(f.get("content", "")) // 4) or 0
+        is_pinned = title in pinned_files
+        pin_tag = " [📌 PINNED - CANNOT BE LOCKED]" if is_pinned else ""
+        files_info.append(f"- {title} (~{tokens:,} tokens){pin_tag}")
+
+    files_text = "\n".join(files_info) if files_info else "(No files currently loaded)"
+    pinned_list = sorted(list(pinned_files)) if pinned_files else ["None"]
+
+    history_snippets = []
+    for idx, item in enumerate(history_items[-6:], 1):
+        role = item.get("role") or item.get("sender_type") or "user"
+        content = item.get("content") or ""
+        clean_content = sanitize_host_paths(re.sub(r'<[^>]+>', '', str(content)).strip())
+        snippet = clean_content[:250] + ("..." if len(clean_content) > 250 else "")
+        if snippet:
+            history_snippets.append(f"[{role.upper()}]: {snippet}")
+
+    history_text = "\n".join(history_snippets) if history_snippets else "(No prior history)"
+
+    fast_agent_prompt = f"""You are a high-speed Context Optimization Specialist.
+The context window is currently at {fill_pct:.1f}% fill (threshold: {threshold_pct:.0f}%).
+To prevent backend connection disconnects and context overflow, you must:
+1. Select which loaded files are NOT essential for the immediate next step and should be locked.
+   RULE: Files marked PINNED must NEVER be locked.
+2. Produce a dense, factual 2-3 sentence technical summary of previous progress and next steps.
+
+=== FEW-SHOT EXAMPLES ===
+Example 1:
+TASK: "Refactor database models in auth.py"
+LOADED FILES:
+- auth.py (~2,500 tokens) [📌 PINNED - CANNOT BE LOCKED]
+- legacy_tests.py (~7,800 tokens)
+- user_schema.sql (~1,200 tokens)
+DECISION:
+```json
+{{
+  "files_to_lock": ["legacy_tests.py", "user_schema.sql"],
+  "history_summary": "Task: Refactor auth.py database models. Inspected legacy tests and user schema. Created async User model in auth.py. Next: write validation functions."
+}}
+```
+
+Example 2:
+TASK: "Write unit tests for math_utils.py and run pytest"
+LOADED FILES:
+- math_utils.py (~1,800 tokens)
+- old_docs.md (~5,200 tokens)
+- requirements.txt (~400 tokens)
+DECISION:
+```json
+{{
+  "files_to_lock": ["old_docs.md", "requirements.txt"],
+  "history_summary": "Task: Unit tests for math_utils.py. Implemented test suite in test_math.py. Ran pytest with 1 failure. Next: fix edge case in division by zero."
+}}
+```
+=== END EXAMPLES ===
+
+CURRENT TASK: "{task[:300]}"
+LOADED FILES:
+{files_text}
+PINNED FILES: {', '.join(pinned_list)}
+RECENT HISTORY:
+{history_text}
+
+Output ONLY valid JSON matching the format above:"""
+
+    try:
+        raw_res = client.generate_text(
+            prompt=fast_agent_prompt,
+            temperature=0.1,
+            n_predict=512,
+        )
+        json_match = re.search(r'\{.*\}', str(raw_res), re.DOTALL)
+        if json_match:
+            parsed = json.loads(json_match.group(0))
+            raw_to_lock = parsed.get("files_to_lock", [])
+            valid_to_lock = [f for f in raw_to_lock if f not in pinned_files and any(f in lf.get("title", "") for lf in loaded_files)]
+            summary = parsed.get("history_summary", "").strip()
+            if summary:
+                return {
+                    "files_to_lock": valid_to_lock,
+                    "history_summary": summary,
+                    "success": True,
+                }
+    except Exception as e:
+        ASCIIColors.warning(f"[ContextGuard] Fast compaction agent failed ({e}). Applying deterministic fallback.")
+
+    # Deterministic fallback if LLM call fails
+    fallback_lock = [
+        f.get("title") for f in loaded_files
+        if f.get("title") and f.get("title") not in pinned_files
+    ]
+    # Keep the single smallest file as working context, lock the rest
+    if len(fallback_lock) > 1:
+        fallback_lock = fallback_lock[:-1]
+
+    return {
+        "files_to_lock": fallback_lock,
+        "history_summary": f"Task: {task[:150]}. Context reached {fill_pct:.1f}%. Prior steps were compacted to preserve context health.",
+        "success": False,
+    }
+
+
+def is_connection_or_server_error(err: Any) -> Tuple[bool, str]:
+    """
+    Detects if an exception, dictionary, or error string represents a backend
+    LLM server connection, network unreachable, or service availability failure.
+    Returns (is_connection_error: bool, descriptive_reason: str).
+    """
+    if err is None:
+        return False, ""
+
+    msg = ""
+    type_name = ""
+
+    if isinstance(err, Exception):
+        type_name = type(err).__name__
+        msg = str(err)
+    elif isinstance(err, dict):
+        type_name = str(err.get("status") or err.get("type") or "dict_error")
+        msg = str(err.get("message") or err.get("error") or err)
+    elif isinstance(err, str):
+        msg = err
+        type_name = "str_error"
+    else:
+        msg = str(err)
+        type_name = type(err).__name__
+
+    msg_lower = msg.lower()
+    type_lower = type_name.lower()
+
+    connection_type_indicators = (
+        "connectionerror", "connecterror", "connectionrefused",
+        "connecttimeout", "timeouterror", "timeoutexception", "readtimeout",
+        "remoteprotocolerror", "apiconnectionerror", "serverdisconnected",
+        "badstatusline", "maxretryerror", "clientconnectorerror",
+        "brokenpipeerror", "networkerror"
+    )
+
+    if any(ind in type_lower for ind in connection_type_indicators):
+        clean_msg = sanitize_host_paths(msg.strip()[:300]) or type_name
+        return True, f"{type_name}: {clean_msg}"
+
+    connection_message_indicators = (
+        "connection refused", "failed to establish a new connection",
+        "actively refused", "network is unreachable", "connection reset",
+        "remote end closed connection", "connection closed",
+        "peer closed connection", "name or service not known",
+        "getaddrinfo failed", "could not connect to server",
+        "connection error", "connect error", "connection timed out",
+        "read timed out", "all connection attempts failed",
+        "502 bad gateway", "503 service unavailable", "504 gateway timeout",
+        "service unavailable", "bad gateway"
+    )
+
+    if any(ind in msg_lower for ind in connection_message_indicators):
+        clean_msg = sanitize_host_paths(msg.strip()[:300])
+        return True, clean_msg or "Backend server connection error"
+
+    return False, ""
+
+
 # ── Context Opacity & String Sanitization ───────────────────────────────────
 
 def sanitize_unicode(text: str) -> str:
@@ -1380,6 +1557,8 @@ __all__ = [
     "is_tool_binding",
     "format_orchestrator_history",
     "format_user_view",
+    "is_connection_or_server_error",
+    "run_fast_context_compaction",
     "_BASE64_RE",
     "_BINARY_BLOB_KEYS",
 ]

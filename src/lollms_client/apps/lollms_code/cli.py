@@ -524,6 +524,7 @@ class CodeAgentConfig:
         self.max_reasoning_steps: int = 100
         self.temperature: float = 0.3
         self.max_tokens_per_turn: int = 8192
+        self.context_compaction_threshold: float = 0.85
         self.enable_shell_execution: bool = True
         self.shell_autonomy_level: str = "safe"
         self.enable_sub_agents: bool = True
@@ -762,6 +763,8 @@ class CodeAgentConfig:
             config.temperature = cli_args.temperature
         if cli_args.max_tokens:
             config.max_tokens_per_turn = cli_args.max_tokens
+        if getattr(cli_args, "context_compaction_threshold", None) is not None:
+            config.context_compaction_threshold = cli_args.context_compaction_threshold
         if cli_args.debug is not None:
             config.debug = cli_args.debug
         else:
@@ -1386,7 +1389,7 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
         ASCIIColors.rich_print("  [green]✓[/green] [dim]Speech-to-Text tools enabled (STT)[/dim]")
 
     ASCIIColors.rich_print("  [dim]🧠 Loading handbag & building personality...[/dim]", end="")
-    personality = LollmsPersonality.from_handbag(config.handbag_path)
+    personality = LollmsPersonality.from_handbag(config.handbag_path, lollms_client=client)
     personality.lollms_client = client
     personality.workspace_path = Path(config.workspace_path)
 
@@ -2269,6 +2272,8 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
             max_reasoning_steps=config.max_reasoning_steps,
             temperature=config.temperature,
             n_predict=config.max_tokens_per_turn,
+            context_compaction_threshold=config.context_compaction_threshold,
+            context_compaction_threshold=config.context_compaction_threshold,
             enable_artefacts=True,
             use_internal_history=False,
             enable_shell=config.enable_shell_execution,
@@ -3815,6 +3820,7 @@ Examples:
     parser.add_argument("--max-steps", type=int, default=None, help="Maximum reasoning steps.")
     parser.add_argument("--temperature", type=float, default=None, help="Sampling temperature.")
     parser.add_argument("--max-tokens", type=int, default=None, help="Maximum tokens per generation turn.")
+    parser.add_argument("--context-compaction-threshold", type=float, default=0.85, help="Context fill threshold (default 0.85 for 85%%) to run autonomous file locking and history compaction.")
     parser.add_argument("--skills-dir", type=str, default=None, help="Directory for SKILL.md files.")
     parser.add_argument("--enable-model-switching", action="store_true", help="Allow the agent to switch models.")
     parser.add_argument("--no-shell-execution", action="store_true", help="Disable autonomous shell command execution.")

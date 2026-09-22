@@ -33,6 +33,7 @@ class GuiPrefs:
     temperature: float = 0.3
     max_tokens_per_turn: int = 8192
     max_reasoning_steps: int = 100
+    context_compaction_threshold: float = 0.85
     enable_shell_execution: bool = True
     shell_autonomy_level: str = "safe"
     auto_approve_python: bool = False

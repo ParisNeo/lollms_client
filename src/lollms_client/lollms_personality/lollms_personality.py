@@ -50,6 +50,8 @@ from lollms_client.lollms_chat_core import (
     sync_workspace_diff as _core_sync_workspace_diff,
     execute_tool_call as _core_execute_tool_call,
     execute_context_visibility_operation as _core_execute_context_visibility,
+    is_connection_or_server_error as _core_is_connection_or_server_error,
+    run_fast_context_compaction as _core_run_fast_context_compaction,
 )
 
 if not callable(getattr(builtins, 'compile', None)) or builtins.compile.__module__ != 'builtins':
@@ -1810,6 +1812,11 @@ class LollmsPersonality:
         self.role = role
         self.model_params = model_params or {}
 
+        # ── Initialize Core Attributes Early (Before Properties & Setters) ──
+        object.__setattr__(self, '_lollms_client', resolved_client)
+        self.disable_artefact_versioning = disable_artefact_versioning
+        self.enable_artefact_system = enable_artefact_system
+
         self.mcp_tool_names: List[str] = []
         self._tool_binding: Any = _NULL_TOOL_BINDING
         self._has_explicit_allowlist: bool = False
@@ -1864,10 +1871,7 @@ class LollmsPersonality:
         self.enable_git_management = enable_git_management
         self.coworkers: Dict[str, 'LollmsPersonality'] = {}
 
-        self.lollms_client = resolved_client
         self.max_tokens_per_turn = max_tokens_per_turn
-        self.enable_artefact_system = enable_artefact_system
-        self.disable_artefact_versioning = disable_artefact_versioning
 
         # Capabilities
         if CapabilityFlags is not None:
@@ -1914,6 +1918,17 @@ class LollmsPersonality:
     @property
     def _agent_id(self) -> str:
         return self.personality_id
+
+    @property
+    def lollms_client(self) -> Optional[Any]:
+        return getattr(self, '_lollms_client', None)
+
+    @lollms_client.setter
+    def lollms_client(self, value: Optional[Any]) -> None:
+        object.__setattr__(self, '_lollms_client', value)
+        proxy = getattr(self, '_artefact_proxy', None)
+        if proxy is not None:
+            setattr(proxy, 'lollmsClient', value)
 
     @property
     def lc(self) -> Optional[Any]:
@@ -3268,15 +3283,15 @@ JSON:"""
             metadata_dir.mkdir(parents=True, exist_ok=True)
 
             proxy = SimpleNamespace(
-                id=f"pers_{self.personality_id[:8]}",
+                id=f"pers_{getattr(self, 'personality_id', 'unknown')[:8]}",
                 workspace_path=str(ws_path),
                 workspace_data_path=str(ws_path),
                 artefacts_metadata_path=str(metadata_dir),
-                lollmsClient=self.lollms_client, 
+                lollmsClient=getattr(self, 'lollms_client', None), 
                 metadata={},
                 _is_db_backed=False,
                 commit=lambda: None,
-                disable_artefact_versioning=self.disable_artefact_versioning,
+                disable_artefact_versioning=getattr(self, 'disable_artefact_versioning', True),
             )
 
             am = ArtefactManager(proxy)
@@ -4647,6 +4662,7 @@ JSON:"""
         enable_computer_use: bool = False,
         enforce_end_tag: bool = True,
         orchestrator_mode: bool = False,
+        context_compaction_threshold: float = 0.85,
         event_mode: EventMode = EventMode.PROCESSING_TAG_MODE,
         think: Optional[bool] = None,
         reasoning_effort: Optional[str] = None,
@@ -4877,6 +4893,9 @@ JSON:"""
         base_temperature = temperature
         active_temperature = temperature
 
+        consecutive_connection_errors = 0
+        last_connection_error_desc = ""
+
         while round_count < resolved_max_rounds:
             if self.is_generation_cancelled():
                 was_cancelled = True
@@ -4910,6 +4929,82 @@ JSON:"""
                 virtual_history
             )
             pre_gen_fill = pre_gen_telemetry.get("fill_percentage", 0.0)
+
+            # ── 🧹 AUTONOMOUS CONTEXT COMPACTION (FAST AGENT PRE-GENERATION GATE) ──
+            norm_threshold = context_compaction_threshold if context_compaction_threshold <= 1.0 else context_compaction_threshold / 100.0
+            threshold_pct = norm_threshold * 100.0
+
+            if pre_gen_fill >= threshold_pct and not was_cancelled:
+                ASCIIColors.warning(
+                    f"[{self.name}] 🚨 Context fill at {pre_gen_fill:.1f}% (>= {threshold_pct:.0f}% threshold). "
+                    "Running Fast Context Compaction Agent to lock non-essential files and compact history before generation..."
+                )
+
+                all_raw_arts = self._artefact_manager._get_all_raw() if getattr(self, "_artefact_manager", None) else []
+                loaded_arts = [
+                    a for a in all_raw_arts
+                    if a.get("visibility") == ArtefactVisibility.FULL and not a.get("title", "").endswith("::images")
+                ]
+                pinned_titles = {
+                    a.get("title", "") for a in all_raw_arts
+                    if a.get("visibility") == ArtefactVisibility.PINNED
+                }
+
+                history_dicts = [
+                    {"role": vh.sender_type, "content": getattr(vh, "content", "")}
+                    for vh in virtual_history
+                ]
+
+                compaction_res = _core_run_fast_context_compaction(
+                    client=self.lollms_client,
+                    task=prompt,
+                    loaded_files=loaded_arts,
+                    pinned_files=pinned_titles,
+                    history_items=history_dicts,
+                    fill_pct=pre_gen_fill,
+                    threshold_pct=threshold_pct,
+                )
+
+                files_to_lock = compaction_res.get("files_to_lock", [])
+                history_summary = compaction_res.get("history_summary", "").strip()
+
+                if files_to_lock:
+                    self._execute_context_visibility("lock_file", "\n".join(files_to_lock))
+                    object.__setattr__(self, "_last_ws_sync_time", 0.0)
+                    ASCIIColors.success(f"[{self.name}] 🔒 Locked {len(files_to_lock)} non-essential file(s): {', '.join(files_to_lock)}")
+
+                if history_summary and len(virtual_history) > 1:
+                    virtual_history.clear()
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content=(
+                            f"[SYSTEM: CONTEXT AUTO-COMPACTED ({pre_gen_fill:.1f}% >= {threshold_pct:.0f}%)]\n"
+                            f"Previous conversation and tool executions were summarized to prevent server disconnect:\n\n"
+                            f"{history_summary}\n\n"
+                            f"Continue your task based on this summary. If finished, output <done/>."
+                        )
+                    ))
+                    ASCIIColors.success(f"[{self.name}] 📝 Compacted virtual history into concise state summary.")
+
+                if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                    try:
+                        streaming_callback(
+                            f"\n\n🧹 [Context Health Guard: {pre_gen_fill:.1f}% >= {threshold_pct:.0f}%] "
+                            f"Locked {len(files_to_lock)} file(s) and compacted history to prevent backend disconnect.\n\n",
+                            MSG_TYPE.MSG_TYPE_INFO,
+                            {"type": "context_compression", "locked_files": files_to_lock, "fill_pct": pre_gen_fill}
+                        )
+                    except Exception:
+                        pass
+
+                # Re-calculate workspace context block and telemetry after compaction
+                ws_ctx = self._build_workspace_context_block() if hasattr(self, '_build_workspace_context_block') else ""
+                pre_gen_telemetry = self._calculate_context_telemetry(
+                    stable_system_prompt, base_conversation, ws_ctx, virtual_history
+                )
+                pre_gen_fill = pre_gen_telemetry.get("fill_percentage", 0.0)
+                ASCIIColors.info(f"[{self.name}] ✅ Post-compaction context fill: {pre_gen_fill:.1f}% ({pre_gen_telemetry.get('total', 0):,} tokens).")
+
             if pre_gen_fill > 98.0 and round_count == 1:
                 ASCIIColors.error(f"[{self.name}] 🛑 CONTEXT WINDOW EXHAUSTED ({pre_gen_fill:.1f}% fill). Cannot generate — the system prompt + workspace context exceeds the model's context window ({pre_gen_telemetry.get('total', 0):,} / {pre_gen_telemetry.get('max_tokens', 0):,} tokens). Refusing to generate to prevent silent empty-response exit.")
 
@@ -5072,18 +5167,25 @@ JSON:"""
             if reasoning_summary is not None:
                 gen_kwargs["reasoning_summary"] = reasoning_summary
 
-            _max_retries = 3
-            _retry_delay = 2.0
+            _max_retries = 2
+            _retry_delay = 1.0
             _generation_succeeded = False
+            round_connection_error = None
 
             for _retry_attempt in range(_max_retries):
                 try:
-                    self.lollms_client.generate_from_messages(
+                    gen_res = self.lollms_client.generate_from_messages(
                         messages=messages,
                         stream=True,
                         streaming_callback=_inline_relay,
                         **gen_kwargs
                     )
+                    if isinstance(gen_res, dict):
+                        is_conn_dict, conn_reason_dict = _core_is_connection_or_server_error(gen_res)
+                        if is_conn_dict:
+                            round_connection_error = conn_reason_dict
+                            raise ConnectionError(conn_reason_dict)
+
                     if hasattr(self.lollms_client, 'llm') and hasattr(self.lollms_client.llm, 'flush_stream'):
                         try:
                             self.lollms_client.llm.flush_stream()
@@ -5096,6 +5198,10 @@ JSON:"""
                         was_cancelled = True
                         break
 
+                    is_conn, conn_reason = _core_is_connection_or_server_error(gen_err)
+                    if is_conn:
+                        round_connection_error = conn_reason
+
                     ss.completed_actions = []
                     ss._is_accumulating_tool = False
                     ss._is_accumulating_artifact = False
@@ -5103,17 +5209,8 @@ JSON:"""
                     ss._tool_buffer = ""
                     ss._pending_buffer = ""
 
-                    is_transient = False
-                    try:
-                        err_type_name = type(gen_err).__name__
-                        err_module = type(gen_err).__module__
-                        if "RemoteProtocolError" in err_type_name or "ConnectionError" in err_type_name or "TimeoutError" in err_type_name or "APIConnectionError" in err_type_name:
-                            is_transient = True
-                    except Exception:
-                        pass
-
-                    if is_transient and _retry_attempt < _max_retries - 1:
-                        ASCIIColors.warning(f"[{self.name}] Transient network error during generation (attempt {_retry_attempt + 1}/{_max_retries}). Retrying in {_retry_delay}s... Error: {gen_err}")
+                    if is_conn and _retry_attempt < _max_retries - 1:
+                        ASCIIColors.warning(f"[{self.name}] Transient network error during generation (attempt {_retry_attempt + 1}/{_max_retries}): {conn_reason}")
                         try:
                             import time as _time
                             _time.sleep(_retry_delay)
@@ -5123,30 +5220,63 @@ JSON:"""
                         ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
                         continue
                     else:
-                        if getattr(self, 'debug_mode', False):
-                            self._dump_error(
-                                error=gen_err,
-                                context_desc="LLM Generation Error",
-                                round_count=round_count,
-                                extra_data={"messages": messages}
-                            )
-                        ASCIIColors.error(f"[{self.name}] Generation error: {gen_err}")
-                        final_response = f"[Generation error: The LLM server connection failed. Please check your server and retry. Details: {gen_err}]"
                         break
 
             if was_cancelled:
                 break
 
-            if not _generation_succeeded and not final_response:
-                if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+            # ── 🛑 BROKEN SERVER & CONSECUTIVE CONNECTION ERROR CIRCUIT BREAKER ──
+            if not _generation_succeeded or round_connection_error:
+                if not round_connection_error:
+                    is_conn_raw, conn_reason_raw = _core_is_connection_or_server_error(raw_llm_output_buffer)
+                    if is_conn_raw:
+                        round_connection_error = conn_reason_raw
+
+                if round_connection_error:
+                    consecutive_connection_errors += 1
+                    last_connection_error_desc = round_connection_error
+                    ASCIIColors.warning(
+                        f"[{self.name}] ⚠️ LLM Server connection failure on round {round_count} "
+                        f"(consecutive failures: {consecutive_connection_errors}/3): {round_connection_error}"
+                    )
+
+                    if consecutive_connection_errors >= 3:
+                        ASCIIColors.error(
+                            f"[{self.name}] 🛑 Server unreachable for 3 consecutive rounds ({last_connection_error_desc}). "
+                            f"Aborting agentic loop immediately to preserve round budget."
+                        )
+                        final_response = (
+                            f"❌ **Server Connection Failure**: Unable to communicate with the LLM backend after 3 consecutive failed attempts.\n\n"
+                            f"**Details**: {last_connection_error_desc}\n\n"
+                            f"**Action Required**: The LLM server is unresponsive or disconnected. "
+                            f"Please check that your backend engine (Ollama, vLLM, OpenAI, LoLLMs, etc.) is running, reachable, and has sufficient memory."
+                        )
+                        if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                            try:
+                                streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                                    "round_id": round_count,
+                                    "status": "connection_error"
+                                })
+                            except Exception:
+                                pass
+                        break
+
                     try:
-                        streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
-                            "round_id": round_count,
-                            "status": "generation_error"
-                        })
+                        import time as _time
+                        _time.sleep(2.0)
                     except Exception:
                         pass
-                break
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content=f"[SYSTEM: Server connection error on round {round_count} ({last_connection_error_desc}). Retrying attempt {consecutive_connection_errors + 1}/3...]"
+                    ))
+                    continue
+                else:
+                    ASCIIColors.error(f"[{self.name}] Generation failed on round {round_count}.")
+                    final_response = "[Generation error: The LLM failed to produce a response.]"
+                    break
+            else:
+                consecutive_connection_errors = 0
 
             if self.is_generation_cancelled():
                 was_cancelled = True
