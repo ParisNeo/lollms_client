@@ -138,6 +138,18 @@ class LollmsBinding(LollmsLLMBinding):
             ASCIIColors.yellow(f"[LollmsBinding][SSL-DEBUG] verify flag for httpx/requests: {self.verify!r} | httpx verify object type: {type(verify).__name__}")
             ASCIIColors.yellow(f"[LollmsBinding][SSL-DEBUG] base_url={self.open_ai_host_address!r} model={self.model_name!r}")
 
+        self._verify_obj = verify
+        self._init_client()
+        self.completion_format = ELF_COMPLETION_FORMAT.Chat
+
+    def _init_client(self) -> None:
+        """Initializes or re-initializes the httpx Client and OpenAI wrapper."""
+        try:
+            if hasattr(self, "_http_client") and self._http_client and not self._http_client.is_closed:
+                self._http_client.close()
+        except Exception:
+            pass
+        verify = getattr(self, "_verify_obj", True)
         self._http_client = httpx.Client(verify=verify, timeout=300.0)
         self.client = openai.OpenAI(
             api_key=self.service_key or "nokey",
@@ -145,18 +157,26 @@ class LollmsBinding(LollmsLLMBinding):
             http_client=self._http_client,
         )
 
-        self.completion_format = ELF_COMPLETION_FORMAT.Chat
+    def _ensure_client(self) -> None:
+        """Guarantees the HTTP client is open and ready to transmit requests."""
+        if not hasattr(self, "_http_client") or self._http_client is None or self._http_client.is_closed:
+            self._init_client()
 
     # ── Cancellation ──────────────────────────────────────────────────────
 
     def cancel(self) -> None:
         """Close the httpx connection to abort in-flight HTTP requests, then set the cancel event."""
         try:
-            if self._http_client and not self._http_client.is_closed:
+            if hasattr(self, "_http_client") and self._http_client and not self._http_client.is_closed:
                 self._http_client.close()
         except Exception as e:
             ASCIIColors.warning(f"[LollmsBinding] Error closing HTTP client during cancel: {e}")
         super().cancel()
+
+    def reset_cancel(self) -> None:
+        """Reset cancellation and guarantee HTTP client is open for the next request."""
+        super().reset_cancel()
+        self._ensure_client()
 
     def close(self) -> None:
         """Clean resource disposal."""
@@ -563,6 +583,7 @@ class LollmsBinding(LollmsLLMBinding):
         reasoning_summary: Optional[str] = "auto",
         **kwargs,
     ) -> Union[str, dict]:
+        self._ensure_client()
         count = 0
         output = ""
         messages = [{"role": "system", "content": system_prompt or "You are a helpful assistant."}]
@@ -721,6 +742,7 @@ class LollmsBinding(LollmsLLMBinding):
         reasoning_summary: Optional[str] = "auto",
         **kwargs,
     ) -> Union[str, dict]:
+        self._ensure_client()
         _OPENAI_ROLE_MAP = {
             "system": "system", "developer": "developer", "user": "user",
             "assistant": "assistant", "tool": "tool", "function": "function",

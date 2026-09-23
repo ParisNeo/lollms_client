@@ -1288,14 +1288,7 @@ def ensure_sandbox_structure(config: CodeAgentConfig):
     memory_dir.mkdir(parents=True, exist_ok=True)
     sub_ws_dir.mkdir(parents=True, exist_ok=True)
 
-    if scripts_dir.exists():
-        for f in scripts_dir.glob("*"):
-            if f.is_file():
-                try:
-                    f.unlink()
-                except OSError as e:
-                    ASCIIColors.warning(f"Failed to remove transient script {f.name}: {e}")
-    scripts_dir.mkdir(exist_ok=True)
+    scripts_dir.mkdir(parents=True, exist_ok=True)
 
     if not scratchpad.exists():
         scratchpad.write_text("# Agent Scratchpad\n\nUse this space to store long-term notes, code snippets, and task context.\n", encoding="utf-8")
@@ -2272,7 +2265,6 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
             max_reasoning_steps=config.max_reasoning_steps,
             temperature=config.temperature,
             n_predict=config.max_tokens_per_turn,
-            context_compaction_threshold=config.context_compaction_threshold,
             context_compaction_threshold=config.context_compaction_threshold,
             enable_artefacts=True,
             use_internal_history=False,

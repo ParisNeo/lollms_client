@@ -136,14 +136,7 @@ def ensure_sandbox_structure(prefs: GuiPrefs) -> None:
     sub_ws_dir = sandbox_dir / "sub_workspace"
     sandbox_dir.mkdir(parents=True, exist_ok=True)
     sub_ws_dir.mkdir(parents=True, exist_ok=True)
-    if scripts_dir.exists():
-        for f in scripts_dir.glob("*"):
-            if f.is_file():
-                try:
-                    f.unlink()
-                except Exception:
-                    pass
-    scripts_dir.mkdir(exist_ok=True)
+    scripts_dir.mkdir(parents=True, exist_ok=True)
     if not scratchpad.exists():
         scratchpad.write_text(
             "# Agent Scratchpad\n\nLong-term notes and task state.\n", encoding="utf-8"

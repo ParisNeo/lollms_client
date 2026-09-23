@@ -2917,14 +2917,23 @@ class LollmsPersonality:
         """
         Evaluates the conversation turn and extracts high-density architectural facts 
         or user constraints to commit to long-term associative memory.
-        Trivial interactions (greetings, simple lookups) are discarded to prevent context bloat.
+        Trivial interactions and failed turns are discarded.
         """
         if not self.lollms_client or not hasattr(self.memory_manager, 'add'):
             return
 
+        # Do not run memory consolidation on failed or error responses
+        if not ai_response or isinstance(ai_response, dict):
+            return
+
+        ai_response_str = str(ai_response)
+        if "[Generation error:" in ai_response_str or "Server Connection Failure" in ai_response_str or "Connection error" in ai_response_str:
+            return
+
         try:
-            clean_ai = re.sub(r'<[^>]+>', '', ai_response).strip()
-            clean_user = user_prompt.strip()
+            user_prompt_str = str(user_prompt) if not isinstance(user_prompt, str) else user_prompt
+            clean_ai = re.sub(r'<[^>]+>', '', ai_response_str).strip()
+            clean_user = user_prompt_str.strip()
 
             if not clean_user or not clean_ai or len(clean_user) < 10 or len(clean_ai) < 10:
                 return
@@ -2948,6 +2957,9 @@ JSON:"""
                 temperature=0.1,
                 n_predict=256
             )
+
+            if not isinstance(reflection, str):
+                return
 
             import json as _json
             json_match = re.search(r'\{.*\}', reflection, re.DOTALL)
@@ -7001,16 +7013,18 @@ JSON:"""
 
         object.__setattr__(self, '_compaction_triggered_this_turn', False)
 
-        if self.memory_manager:
-            try:
-                if hasattr(self.memory_manager, 'process_llm_output'):
-                    cleaned_response, mem_report = self.memory_manager.process_llm_output(final_response)
-                    if cleaned_response != final_response:
-                        final_response = cleaned_response
+        if self.memory_manager and not was_cancelled and consecutive_connection_errors < 3:
+            final_resp_str = str(final_response) if final_response is not None else ""
+            if not final_resp_str.startswith("[Generation error:") and "Server Connection Failure" not in final_resp_str:
+                try:
+                    if hasattr(self.memory_manager, 'process_llm_output'):
+                        cleaned_response, mem_report = self.memory_manager.process_llm_output(final_response)
+                        if cleaned_response != final_response:
+                            final_response = cleaned_response
 
-                self._autonomous_memory_consolidation(prompt, final_response)
-            except Exception as mem_ex:
-                ASCIIColors.warning(f"[{self.name}] Failed to process memory tags: {mem_ex}")
+                    self._autonomous_memory_consolidation(prompt, final_response)
+                except Exception as mem_ex:
+                    ASCIIColors.warning(f"[{self.name}] Failed to process memory tags: {mem_ex}")
 
         try:
             if prompt.strip().lower() in ("yes", "y", "oui", "ye", "yeah"):

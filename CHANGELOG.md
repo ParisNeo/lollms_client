@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-23 00:01]
+
+- fix(sandbox): resolve race condition in connection pool logic for sandboxed LLM execution
+
 ## [2026-09-22 23:35]
 
 - fix(lollms_core): optimize token estimation logic for performance

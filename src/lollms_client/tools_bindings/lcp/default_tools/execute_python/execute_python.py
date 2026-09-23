@@ -705,32 +705,55 @@ def _get_workspace_root() -> Path:
     The orchestrator chdirs into the sandboxed workspace before invoking this tool,
     so process CWD is authoritative.
     """
-    cwd = Path.cwd()
-    if cwd.name in ("workspace_data", "data_workspace") or (cwd / "data_workspace").exists():
-        return cwd
-    return Path("./data_workspace").resolve()
+    cwd = Path.cwd().resolve()
+    if (cwd / "workspace_data").exists() and (cwd / "workspace_data").is_dir():
+        return (cwd / "workspace_data").resolve()
+    if (cwd / "data_workspace").exists() and (cwd / "data_workspace").is_dir():
+        return (cwd / "data_workspace").resolve()
+    return cwd
 
 
 def _resolve_workspace_path(file_name: str) -> Optional[Path]:
     """
     Safely resolves a file path inside the workspace sandbox.
     Blocks path traversal ('..') and absolute paths escaping the root.
-    Returns None when the path is unsafe.
+    Supports direct resolution as well as resolution under .lollms_code/scripts/.
     """
     if not file_name or not isinstance(file_name, str):
         return None
 
     root = _get_workspace_root()
-    clean = file_name.replace("\\", "/").lstrip("/")
+    clean = file_name.replace("\\", "/").strip().lstrip("/")
 
     if not clean or ".." in Path(clean).parts:
         return None
 
+    # 1. Direct path check under root
     candidate = (root / clean).resolve()
     try:
-        candidate.relative_to(root.resolve())
+        candidate.relative_to(root)
+        if candidate.exists() and candidate.is_file():
+            return candidate
     except ValueError:
         return None
+
+    # 2. Resilient check under .lollms_code/scripts/ or scripts/
+    sub_candidates = [
+        root / ".lollms_code" / "scripts" / clean,
+        root / ".lollms_code" / clean,
+        root / "scripts" / clean,
+        root / ".lollms_code" / "scripts" / Path(clean).name,
+    ]
+    for sc in sub_candidates:
+        try:
+            res_sc = sc.resolve()
+            res_sc.relative_to(root)
+            if res_sc.exists() and res_sc.is_file():
+                return res_sc
+        except Exception:
+            continue
+
+    # Return candidate path for error reporting
     return candidate
 
 
