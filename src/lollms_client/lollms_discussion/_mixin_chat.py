@@ -5,7 +5,7 @@
 #
 # Resolves RAG pre-hydration, tiered memory, and direct inline tool calls,
 # exposing specialized sub-agents as executable tools to preserve KV-cache.
-
+from __future__ import annotations
 import re
 import json
 import html
@@ -3577,10 +3577,6 @@ class ChatMixin:
         lcp_binding = getattr(self.lollmsClient, "tools", None)
 
         workspace_dir = Path(self.workspace_data_path) if getattr(self, "workspace_data_path", None) else Path("./data_workspace")
-
-        data_extensions = {".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"}
-        doc_extensions = {".pdf", ".docx", ".pptx", ".odt", ".epub", ".txt", ".md", ".json", ".yaml", ".xml"}
-
         all_files, has_data_files, has_doc_files = self._cached_workspace_file_scan(workspace_dir)
         needs_lcp_binding = enable_data_tools or enable_code_execution or has_data_files or has_doc_files
 
@@ -3727,7 +3723,6 @@ class ChatMixin:
         tolerance_level:              Optional[str] = "strict",
         allow_dynamic_tools:          bool = False,
         enable_data_tools:            bool = True,
-        enable_code_execution:        bool = False,
         suppress_images:              bool = False,
         orchestrator_mode:            bool = False,
         orchestrator_persona:         bool = False,
@@ -3740,9 +3735,11 @@ class ChatMixin:
         think:                        Optional[bool] = None,
         reasoning_effort:             Optional[str] = None,
         reasoning_summary:            Optional[str] = None,
+        
+        enable_code_execution:        bool = False,
+        auto_approve_python:          bool = False,
         shell_autonomy_level:         Optional[str] = "safe",
         python_autonomy_level:        Optional[str] = "safe",
-        auto_approve_python:          bool = False,
         confirm_handler:              Optional[Callable] = None,
         **kwargs
     ) -> Dict[str, Any]:
@@ -3784,7 +3781,6 @@ class ChatMixin:
             tolerance_level (Optional[str]): Tolerance level for data tools ('strict', 'lenient'). Default 'strict'.
             allow_dynamic_tools (bool): Allow dynamic tool registration from artifacts. Default False.
             enable_data_tools (bool): Enable data manipulation tools (SQL, pandas). Default True.
-            enable_code_execution (bool): Enable arbitrary Python code execution tool. Default False.
             suppress_images (bool): Suppress image hydration in context. Default False.
             orchestrator_persona (bool): Run this turn as the delegation-only
                 Orchestrator persona: the prompt shows a plain-language worker
@@ -3803,6 +3799,7 @@ class ChatMixin:
             think (Optional[bool]): Legacy flag to toggle reasoning/thinking output. If True, maps to reasoning_effort='high'. If False, disables reasoning. Default None.
             reasoning_effort (Optional[str]): Level of reasoning effort for reasoning/thinking models ('low', 'medium', 'high', 'max'). Overrides `think`. Default None.
             reasoning_summary (Optional[str]): Format of reasoning summary for thinking models ('auto', 'concise', 'detailed'). Default None.
+            enable_code_execution (bool): Enable arbitrary Python code execution tool. Default False.
             **kwargs: Additional generation parameters passed to the LLM binding.
 
         Returns:
