@@ -323,6 +323,9 @@ def set_profile_params(
     instance_name: Optional[str] = None,
     is_default: bool = False,
     vision_enabled: bool = False,
+    video_enabled: bool = False,
+    glm_image_embedding: bool = False,
+    supported_reasoning_efforts: Optional[Union[str, List[str]]] = None,
     forced_context_size: Optional[int] = None,
     routing_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, str]:
@@ -342,6 +345,13 @@ def set_profile_params(
     if instance_name is not None:
         config_map[prefix + "INSTANCE_NAME"] = str(instance_name)
     config_map[prefix + "VISION_ENABLED"] = "true" if vision_enabled else "false"
+    config_map[prefix + "VIDEO_ENABLED"] = "true" if video_enabled else "false"
+    config_map[prefix + "GLM_IMAGE_EMBEDDING"] = "true" if glm_image_embedding else "false"
+    if supported_reasoning_efforts is not None:
+        if isinstance(supported_reasoning_efforts, list):
+            config_map[prefix + "SUPPORTED_REASONING_EFFORTS"] = ", ".join(supported_reasoning_efforts)
+        else:
+            config_map[prefix + "SUPPORTED_REASONING_EFFORTS"] = str(supported_reasoning_efforts).strip()
     if forced_context_size is not None:
         config_map[prefix + "FORCED_CONTEXT_SIZE"] = str(int(forced_context_size))
     for rkey, rvalue in (routing_config or {}).items():

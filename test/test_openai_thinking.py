@@ -207,6 +207,17 @@ def test_normalize_video_input():
     assert b64_block["video_url"]["url"].startswith("data:video/mp4;base64,")
 
 
+def test_string_supported_reasoning_efforts_parsing():
+    from lollms_client.llm_bindings.openai import OpenAIBinding
+
+    binding = OpenAIBinding(
+        host_address="http://localhost:8000/v1",
+        supported_reasoning_efforts="low, high, max"
+    )
+    assert binding.supported_reasoning_efforts == ["low", "high", "max"]
+    assert binding.get_effective_reasoning_effort(reasoning_effort="medium") == "high"
+
+
 def test_video_capability_profile_propagation():
     from lollms_client.lollms_core import LollmsClient, LollmsBindingProfile, LollmsModelProfile
 

@@ -387,6 +387,14 @@ class LollmsClient():
                 if isinstance(p_data, LollmsModelProfile):
                     profile = p_data
                 else:
+                    raw_efforts = p_data.get("supported_reasoning_efforts") or p_data.get("reasoning_efforts")
+                    if isinstance(raw_efforts, str) and raw_efforts.strip():
+                        parsed_efforts = [s.strip() for s in raw_efforts.split(",") if s.strip()]
+                    elif isinstance(raw_efforts, list):
+                        parsed_efforts = raw_efforts
+                    else:
+                        parsed_efforts = None
+
                     profile = LollmsModelProfile(
                         name=alias,
                         binding_profile_name=p_data.get("binding_profile_name") or p_data.get("binding_alias") or "master",
@@ -396,7 +404,7 @@ class LollmsClient():
                         forced_context_size=p_data.get("forced_context_size"),
                         routing_config=p_data.get("routing_config") or p_data.get("routing_profile"),
                         glm_image_embedding=p_data.get("glm_image_embedding", False),
-                        supported_reasoning_efforts=p_data.get("supported_reasoning_efforts") or p_data.get("reasoning_efforts"),
+                        supported_reasoning_efforts=parsed_efforts,
                         video_enabled=p_data.get("video_enabled", False)
                     )
                 registry[alias] = profile
@@ -448,21 +456,22 @@ class LollmsClient():
                 **{k: v for k, v in b_config.items() if k != "binding_name"}
             )
             if binding:
-                binding.vision_enabled = model_profile.vision_enabled
-                binding.video_enabled = model_profile.video_enabled
+                binding.vision_enabled = model_profile.vision_enabled or getattr(binding, "vision_enabled", False)
+                binding.video_enabled = model_profile.video_enabled or getattr(binding, "video_enabled", False)
                 if hasattr(binding, "forced_context_size"):
                     binding.forced_context_size = model_profile.forced_context_size
                 if hasattr(binding, "routing_config"):
                     binding.routing_config = model_profile.routing_config
                 if hasattr(binding, "glm_image_embedding"):
-                    binding.glm_image_embedding = model_profile.glm_image_embedding
+                    binding.glm_image_embedding = model_profile.glm_image_embedding or getattr(binding, "glm_image_embedding", False)
                 else:
-                    setattr(binding, "glm_image_embedding", model_profile.glm_image_embedding)
+                    setattr(binding, "glm_image_embedding", model_profile.glm_image_embedding or getattr(binding, "glm_image_embedding", False))
                 if hasattr(binding, "supported_reasoning_efforts"):
                     if model_profile.supported_reasoning_efforts is not None:
                         binding.supported_reasoning_efforts = model_profile.supported_reasoning_efforts
                 else:
-                    setattr(binding, "supported_reasoning_efforts", model_profile.supported_reasoning_efforts)
+                    if model_profile.supported_reasoning_efforts is not None:
+                        setattr(binding, "supported_reasoning_efforts", model_profile.supported_reasoning_efforts)
                 return binding
         except Exception as e:
             trace_exception(e)

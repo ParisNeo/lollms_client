@@ -370,16 +370,25 @@ def _render_profiles_cards(env: EnvStore, modality: str, container: ui.column, r
             model = keys.get("MODEL_NAME", "default")
             is_default = keys.get("IS_DEFAULT", "").lower() == "true"
             vision_enabled = keys.get("VISION_ENABLED", "").lower() == "true"
+            video_enabled = keys.get("VIDEO_ENABLED", "").lower() == "true"
+            glm_embedding = keys.get("GLM_IMAGE_EMBEDDING", "").lower() == "true"
+            efforts = keys.get("SUPPORTED_REASONING_EFFORTS", "")
             forced_ctx = keys.get("FORCED_CONTEXT_SIZE")
 
             with ui.card().classes(f"w-full p-4 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-2"):
                 with ui.row().classes("w-full items-center justify-between"):
-                    with ui.row().classes("items-center gap-3 flex-wrap"):
+                    with ui.row().classes("items-center gap-2 flex-wrap"):
                         ui.label(alias).classes("font-mono font-bold text-sm text-slate-900 dark:text-slate-100")
                         if is_default:
                             ui.badge("⭐ Default", color="emerald").props("rounded dense")
                         if vision_enabled:
                             ui.badge("👁️ Vision", color="purple").props("rounded dense")
+                        if video_enabled:
+                            ui.badge("🎬 Video", color="teal").props("rounded dense")
+                        if glm_embedding:
+                            ui.badge("📐 GLM-5", color="blue").props("rounded dense")
+                        if efforts:
+                            ui.badge(f"🧠 {efforts}", color="indigo").props("rounded dense")
                         if forced_ctx:
                             ui.badge(f"{forced_ctx} ctx", color="slate").props("rounded dense")
 
@@ -987,11 +996,23 @@ def _profile_form_body(env: EnvStore, modality: str, existing: Optional[Dict[str
     )
 
     vision_switch = None
+    video_switch = None
+    glm_switch = None
+    efforts_input = None
     ctx_input = None
     routing_widgets: Dict[str, Any] = {}
 
     if modality == "llm":
-        vision_switch = ui.switch("Multimodal Vision Support Enabled", value=existing.get("VISION_ENABLED", "").lower() == "true")
+        with ui.row().classes("w-full gap-4 items-center flex-wrap"):
+            vision_switch = ui.switch("Multimodal Vision Support", value=existing.get("VISION_ENABLED", "").lower() == "true").props("dense")
+            video_switch = ui.switch("Video Input Comprehension", value=existing.get("VIDEO_ENABLED", "").lower() == "true").props("dense")
+            glm_switch = ui.switch("GLM-5.3-Flash / GLM-4V Image Embedding", value=existing.get("GLM_IMAGE_EMBEDDING", "").lower() == "true").props("dense")
+
+        efforts_input = ui.input(
+            "Supported Reasoning Efforts (e.g. low, high, max)",
+            value=existing.get("SUPPORTED_REASONING_EFFORTS", "")
+        ).classes("w-full").props("outlined dense").tooltip("Comma-separated list of reasoning levels supported by this model")
+
         ctx_input = ui.input(
             "Forced Context Size (tokens, blank = auto-detect)",
             value=existing.get("FORCED_CONTEXT_SIZE", "")
@@ -1027,6 +1048,9 @@ def _profile_form_body(env: EnvStore, modality: str, existing: Optional[Dict[str
             model_name=resolved_model_name,
             is_default=is_default_switch.value,
             vision_enabled=vision_switch.value if vision_switch else False,
+            video_enabled=video_switch.value if video_switch else False,
+            glm_image_embedding=glm_switch.value if glm_switch else False,
+            supported_reasoning_efforts=efforts_input.value if efforts_input else "",
             forced_context_size=ctx_input.value if ctx_input else "",
             routing=routing,
         )

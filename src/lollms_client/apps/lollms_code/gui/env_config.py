@@ -328,6 +328,8 @@ class EnvStore:
     def save_profile(
         self, binding_type: str, alias: str, binding_alias: str, model_name: str,
         is_default: bool = False, vision_enabled: bool = False,
+        video_enabled: bool = False, glm_image_embedding: bool = False,
+        supported_reasoning_efforts: str = "",
         forced_context_size: str = "", routing: Optional[Dict[str, str]] = None,
     ) -> None:
         alias = alias.strip().upper()
@@ -353,6 +355,22 @@ class EnvStore:
                 self.config_map[prefix + "VISION_ENABLED"] = "true"
             else:
                 self.config_map.pop(prefix + "VISION_ENABLED", None)
+
+            if video_enabled:
+                self.config_map[prefix + "VIDEO_ENABLED"] = "true"
+            else:
+                self.config_map.pop(prefix + "VIDEO_ENABLED", None)
+
+            if glm_image_embedding:
+                self.config_map[prefix + "GLM_IMAGE_EMBEDDING"] = "true"
+            else:
+                self.config_map.pop(prefix + "GLM_IMAGE_EMBEDDING", None)
+
+            if supported_reasoning_efforts and supported_reasoning_efforts.strip():
+                self.config_map[prefix + "SUPPORTED_REASONING_EFFORTS"] = supported_reasoning_efforts.strip()
+            else:
+                self.config_map.pop(prefix + "SUPPORTED_REASONING_EFFORTS", None)
+
             if forced_context_size.strip():
                 self.config_map[prefix + "FORCED_CONTEXT_SIZE"] = forced_context_size.strip()
             else:

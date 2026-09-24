@@ -350,11 +350,17 @@ class OpenAIBinding(LollmsLLMBinding):
         self.thinking_effort_keyword = kwargs.get("thinking_effort_keyword", "enable_thinking")
         self.glm_image_embedding = kwargs.get("glm_image_embedding", False)
         self.video_enabled = kwargs.get("video_enabled", False)
-        default_efforts = ["low", "high", "max"] if self.glm_image_embedding else ["low", "medium", "high"]
-        self.supported_reasoning_efforts = kwargs.get("supported_reasoning_efforts", default_efforts)
-        default_efforts = ["low", "high", "max"] if self.glm_image_embedding else ["low", "medium", "high"]
-        self.supported_reasoning_efforts = kwargs.get("supported_reasoning_efforts", default_efforts)
 
+
+        raw_efforts = kwargs.get("supported_reasoning_efforts")
+        if isinstance(raw_efforts, str) and raw_efforts.strip():
+            self.supported_reasoning_efforts = [s.strip() for s in raw_efforts.split(",") if s.strip()]
+        elif isinstance(raw_efforts, list):
+            self.supported_reasoning_efforts = raw_efforts
+        else:
+            default_efforts = ["low", "high", "max"] if self.glm_image_embedding else ["low", "medium", "high"]
+            self.supported_reasoning_efforts = default_efforts
+                    
         self.base_address = self.host_address
         if self.base_address:
             self.open_ai_host_address = (

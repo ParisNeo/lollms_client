@@ -56,6 +56,21 @@ global_input_parameters:
     description: "The default completion format to use. 'Chat' for chat.completions endpoint, 'Completion' for the legacy completions endpoint."
     mandatory: false
     default: "Chat"
+  - name: glm_image_embedding
+    type: bool
+    description: "Enable GLM-5.3-Flash / GLM-4V compatible image embedding format (sequential text-first layout and standard image_url data blocks)."
+    mandatory: false
+    default: false
+  - name: video_enabled
+    type: bool
+    description: "Enable video input comprehension for multimodal video models (e.g. Qwen2.5-VL, GLM-5.3-Flash)."
+    mandatory: false
+    default: false
+  - name: supported_reasoning_efforts
+    type: str
+    description: "Comma-separated list of reasoning effort levels supported by this backend (e.g. 'low, medium, high' for OpenAI, 'low, high, max' for GLM-5.3-Flash). Incoming efforts are projected to the closest supported level."
+    mandatory: false
+    default: ""
 model_input_parameters:
   - name: model_name
     type: str
@@ -73,10 +88,10 @@ model_input_parameters:
     mandatory: false
     default: false
   - name: supported_reasoning_efforts
-    type: list
-    description: "List of reasoning effort levels supported by this model (e.g. ['low', 'medium', 'high'] for OpenAI, ['low', 'high', 'max'] for GLM-5.3-Flash). Incoming efforts are automatically projected to the closest supported level."
+    type: str
+    description: "Comma-separated list of reasoning effort levels supported by this model (e.g. 'low, medium, high' for OpenAI, 'low, high, max' for GLM-5.3-Flash). Incoming efforts are automatically projected to the closest supported level."
     mandatory: false
-    default: null
+    default: ""
   - name: supported_reasoning_efforts
     type: list
     description: "List of reasoning effort levels supported by this model (e.g. ['low', 'medium', 'high'] for OpenAI, ['low', 'high', 'max'] for GLM-5.3-Flash). Incoming efforts are automatically projected to the closest supported level."

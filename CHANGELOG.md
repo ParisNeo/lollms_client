@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-24 21:15]
+
+- git commit -m "fix(openai): add OpenAI API description updates and minor GUI refinements"
+
 ## [2026-09-24 22:30]
 
 - feat(reasoning): add cross-model reasoning effort translation (`supported_reasoning_efforts`) with topological anchor projection
