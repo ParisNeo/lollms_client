@@ -3115,7 +3115,13 @@ class ArtefactManager:
         ASCIIColors.success(f"[ArtefactManager] Imported {len(imported_artefacts)} artefact(s) from {lab_path}")
         return imported_artefacts
 
-    def import_file(self, file_path: Union[str, Path], title: Optional[str] = None, active: bool = True) -> Dict[str, Any]:
+    def import_file(
+        self,
+        file_path: Union[str, Path],
+        title: Optional[str] = None,
+        active: bool = True,
+        parse_data_schema: bool = True
+    ) -> Dict[str, Any]:
         path = Path(file_path)
         if not path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
@@ -3144,15 +3150,26 @@ class ArtefactManager:
 
         content = ""
         if artefact_type == ArtefactType.DATA:
-            try:
-                from lollms_client.lollms_artefact.data_files import _parse_data_file
-                schema_result = _parse_data_file(path, title, version=1)
-                if len(schema_result) == 3:
-                    content, _, _ = schema_result
-                else:
-                    content, _ = schema_result
-            except Exception as e:
-                content = f"# Data Interface: {title}\n"
+            if parse_data_schema:
+                try:
+                    from lollms_client.lollms_artefact.data_files import _parse_data_file
+                    schema_result = _parse_data_file(path, title, version=1)
+                    if len(schema_result) == 3:
+                        content, _, _ = schema_result
+                    else:
+                        content, _ = schema_result
+                except Exception as e:
+                    content = f"# Data Interface: {title}\n"
+            else:
+                # Lightweight indexing for autonomous agents without eager library loading
+                file_size = path.stat().st_size if path.exists() else 0
+                content = (
+                    f"# Data Interface: {title}\n"
+                    f"- **Filename**: `{title}`\n"
+                    f"- **Type**: {ext.upper().lstrip('.')} (Data File)\n"
+                    f"- **Size**: {file_size:,} bytes\n\n"
+                    f"> To inspect table schemas, column names, and statistics on demand, use `tool_get_table_schema`."
+                )
         elif artefact_type == ArtefactType.IMAGE:
             content = f"### Image: `{title}{ext}`\n\n<artefact_image id=\"{title}{ext}::0\" />"
         elif ext == ".pdf":

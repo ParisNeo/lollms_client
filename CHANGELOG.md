@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-24 09:35]
+
+- fix(lollms): minor refactoring and API adjustment for data validation and personality interface handling
+
 ## [2026-09-24 08:54]
 
 - fix(gui): consolidate GUI page error checks for consistent CLI validation alignment

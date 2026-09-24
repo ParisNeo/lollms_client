@@ -1,11 +1,38 @@
 from __future__ import annotations
 
 import io
+import json
 import shutil
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ascii_colors import ASCIIColors
+
+# ── Persistent Schema Cache (Disk & In-Memory) ──────────────────────────────
+_SCHEMA_CACHE_FILE = Path.home() / ".lollms_client" / "data_schema_cache.json"
+_SCHEMA_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _load_schema_cache() -> Dict[str, Dict[str, Any]]:
+    global _SCHEMA_CACHE
+    if _SCHEMA_CACHE:
+        return _SCHEMA_CACHE
+    if _SCHEMA_CACHE_FILE.exists():
+        try:
+            with open(_SCHEMA_CACHE_FILE, "r", encoding="utf-8") as f:
+                _SCHEMA_CACHE = json.load(f)
+        except Exception:
+            _SCHEMA_CACHE = {}
+    return _SCHEMA_CACHE
+
+
+def _save_schema_cache() -> None:
+    try:
+        _SCHEMA_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(_SCHEMA_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_SCHEMA_CACHE, f, ensure_ascii=False)
+    except Exception:
+        pass
 
 # ── pipmaster integration for optional dependencies ─────────────────────────
 try:
@@ -121,22 +148,44 @@ def _dataframe_to_markdown(df: Any) -> str:
         return "\n".join(lines)
 
 
-def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: Optional[Callable[[str], None]] = None) -> Tuple[str, List[Tuple[str, str]]]:
+def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: Optional[Callable[[str], None]] = None) -> Tuple[str, List[Tuple[str, str]], Optional[bytes]]:
     """
     Parses a data file (CSV, Excel, SQLite, etc.) and returns a rich Markdown schema (.lam content)
     along with the raw physical bytes for tool execution.
+    Checks persistent cache first (based on path, mtime, and size) to avoid re-parsing unchanged files.
     """
-    # 🛑 CRITICAL: Force install dependencies BEFORE any import attempts
+    resolved_path = str(path.resolve())
+    try:
+        st = path.stat()
+        file_mtime = st.st_mtime
+        file_size = st.st_size
+    except Exception:
+        file_mtime = 0.0
+        file_size = 0
+
+    # ── 1. Check Cache: Execute only once unless file changed ──
+    cache = _load_schema_cache()
+    cached = cache.get(resolved_path)
+    if cached and cached.get("mtime") == file_mtime and cached.get("size") == file_size:
+        cached_schema = cached.get("schema")
+        if cached_schema:
+            raw_bytes = None
+            try:
+                raw_bytes = path.read_bytes()
+            except Exception:
+                pass
+            return cached_schema, [], raw_bytes
+
+    # ── 2. Cache Miss or File Modified: Perform Parsing ──
     try:
         _ensure_installed("pandas")
         _ensure_installed("openpyxl")
         _ensure_installed("sqlalchemy")
         import pandas as pd
-        ASCIIColors.success(f"[DataFiles] ✅ Pandas/OpenPyXL successfully loaded for schema extraction.")
     except Exception as install_err:
-        ASCIIColors.error(f"[DataFiles] ❌ CRITICAL: Failed to install/load pandas: {install_err}")
-        # Fallback to minimal schema if pandas completely fails
-        return f"# Data Interface: {art_title}\n\n⚠️ **Critical Error**: Pandas library unavailable. Cannot extract schema.", [], None
+        ASCIIColors.warning(f"[DataFiles] Missing pandas/openpyxl: {install_err}")
+        fallback_msg = f"# Data Interface: {art_title}\n\n⚠️ **Notice**: Pandas/OpenPyXL library unavailable for schema extraction."
+        return fallback_msg, [], None
 
     ext = path.suffix.lower()
     schema_parts = [f"# Data Interface: {art_title}\n"]
@@ -341,14 +390,20 @@ def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: 
     # Read the raw binary data from the source file
     try:
         raw_physical_data = path.read_bytes()
-        ASCIIColors.info(f"[DataFiles] Read {len(raw_physical_data):,} bytes of raw physical data from {path.name}")
     except Exception as e:
         ASCIIColors.error(f"Failed to read raw binary data from {path}: {e}")
         raw_physical_data = None
 
-    # Return both: Schema for context, Raw Bytes for disk storage
     final_schema = "\n\n".join(schema_parts)
-    ASCIIColors.success(f"[DataFiles] ✅ Schema generated successfully ({len(final_schema)} chars).")
+
+    # ── 3. Store in Persistent Schema Cache ──
+    cache[resolved_path] = {
+        "mtime": file_mtime,
+        "size": file_size,
+        "schema": final_schema
+    }
+    _save_schema_cache()
+    ASCIIColors.info(f"[DataFiles] Indexed and cached schema for '{path.name}' ({len(final_schema)} chars).")
 
     # ── WRITE VERSIONED AND ACTIVE FILES TO WORKSPACE ──
     try:

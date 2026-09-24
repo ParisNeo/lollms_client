@@ -2663,7 +2663,7 @@ class LollmsPersonality:
     # ------------------------------------------------------------------ Workspace & Sub-Agents
 
     def _sync_artefact_index_with_disk(self) -> None:
-        """Synchronizes workspace files on disk with the internal artefact manager."""
+        """Synchronizes workspace files on disk with the internal artefact manager without eager schema generation."""
         if hasattr(self, '_artefact_manager') and self._artefact_manager and self._resolved_workspace:
             ws_path = self._resolved_workspace
             if ws_path.exists():
@@ -2678,7 +2678,7 @@ class LollmsPersonality:
                         existing = self._artefact_manager.get(title)
                         if not existing:
                             try:
-                                self._artefact_manager.import_file(f, title=title, active=False)
+                                self._artefact_manager.import_file(f, title=title, active=False, parse_data_schema=False)
                             except Exception:
                                 pass
 
@@ -3886,7 +3886,14 @@ JSON:"""
                             t_name.startswith("tool_annotate_document")
                         ):
                             active_tools[t_name] = t_spec
-                        if has_data_files and t_name == "tool_execute_python_data_query":
+                        if has_data_files and t_name in (
+                            "tool_execute_python_data_query",
+                            "tool_get_table_schema",
+                            "tool_filter_and_slice_data",
+                            "tool_get_unique_values",
+                            "tool_compute_column_aggregations",
+                            "tool_query_database_sql",
+                        ):
                             active_tools[t_name] = t_spec
                 except Exception as e:
                     ASCIIColors.warning(f"[LollmsPersonality] Failed to extract LCP tool specs: {e}")
@@ -4609,7 +4616,7 @@ JSON:"""
             candidate = self._resolved_workspace / target
             if candidate.is_file():
                 try:
-                    imported = self._artefact_manager.import_file(file_path=candidate, title=target, active=False)
+                    imported = self._artefact_manager.import_file(file_path=candidate, title=target, active=False, parse_data_schema=False)
                     if imported:
                         resolved.append(imported.get("title", target))
                     else:
