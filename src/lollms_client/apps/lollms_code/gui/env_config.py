@@ -390,6 +390,7 @@ class EnvStore:
         host_addr = ""
         service_key = ""
         verify_ssl = "false"
+        certificate_file_path = ""
 
         b_prefix = f"{prefix}_BINDINGS_{binding_alias.upper()}_"
         for k, v in self.config_map.items():
@@ -401,6 +402,8 @@ class EnvStore:
                 service_key = v
             elif k.upper() == f"{b_prefix}VERIFY_SSL_CERTIFICATE":
                 verify_ssl = v
+            elif k.upper() == f"{b_prefix}CERTIFICATE_FILE_PATH":
+                certificate_file_path = v
 
         return dict(
             binding_name=b_name or "",
@@ -408,4 +411,5 @@ class EnvStore:
             host_address=host_addr,
             api_key=service_key,
             verify_ssl=verify_ssl,
+            certificate_file_path=certificate_file_path,
         )

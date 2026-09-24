@@ -3538,6 +3538,13 @@ JSON:"""
             params = spec.get("parameters", [])
             source_file = spec.get("_source_file") or spec.get("_python_file_path")
 
+            if not source_file and "callable" in spec and callable(spec["callable"]):
+                try:
+                    import inspect
+                    source_file = inspect.getfile(spec["callable"])
+                except Exception:
+                    pass
+
             if name in handbag_tool_names or (self.handbag_path and source_file and str(self.handbag_path) in str(source_file)):
                 source = "handbag"
                 category = "handbag_tools"

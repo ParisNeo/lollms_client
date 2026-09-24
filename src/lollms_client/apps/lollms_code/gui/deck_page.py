@@ -157,6 +157,10 @@ def build_deck_page(env: EnvStore, prefs: GuiPrefs) -> None:
                 "unelevated dense size=sm color=white text-color=primary no-caps font-bold"
             ).classes("px-3 shadow-sm")
             ui.button(
+                "Zoo Hub", icon="pets",
+                on_click=lambda: _open_deck_zoo_dialog(),
+            ).props("flat dense size=sm no-caps").tooltip("Open Zoo Package Hub: browse and install community tools, skills, and personas")
+            ui.button(
                 "Chat Active", icon="chat",
                 on_click=lambda: ui.navigate.to("/chat"),
             ).props("flat dense size=sm no-caps").tooltip("Go to currently open workspace chat")
@@ -193,6 +197,46 @@ def build_deck_page(env: EnvStore, prefs: GuiPrefs) -> None:
     def _confirm_exit():
         from main import confirm_exit_dialog
         confirm_exit_dialog()
+
+    def _open_deck_zoo_dialog():
+        from lollms_client.apps.lollms_code.zoo import ZooManager
+        zm = ZooManager(prefs.workspace_path)
+        d = ui.dialog().props("maximized")
+        with d, ui.card().classes("w-full h-full flex flex-col p-4 bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 gap-3"):
+            with ui.row().classes("w-full items-center justify-between pb-2 border-b border-slate-200 dark:border-slate-800"):
+                with ui.row().classes("items-center gap-2"):
+                    ui.icon("pets", size="26px").classes("text-amber-500")
+                    ui.label("LoLLMS Zoo Package Hub").classes("text-base font-bold")
+                ui.button("Close", icon="close", on_click=d.close).props("flat dense round size=sm")
+
+            with ui.scroll_area().classes("w-full flex-1 p-2"):
+                ui.label("Manage official LoLLMS community packages from GitHub.").classes("text-xs text-slate-500 mb-2")
+                with ui.row().classes("w-full gap-2 mb-3"):
+                    def _sync_all():
+                        ui.notify("Syncing zoos from GitHub...", type="info")
+                        zm.sync_all()
+                        ui.notify("Zoos synced!", type="positive")
+                    ui.button("Sync All Repositories", icon="sync", on_click=_sync_all).props("unelevated color=primary size=sm no-caps")
+
+                for z in ("tools", "skills", "personalities"):
+                    with ui.expansion(f"{z.upper()} ZOO", icon="inventory_2").classes("w-full bg-slate-100 dark:bg-slate-900 rounded mb-2"):
+                        items = zm.list_items(z)
+                        with ui.column().classes("w-full gap-1 p-2"):
+                            if not items:
+                                ui.label("No items or repo not synced yet. Click 'Sync All Repositories' above.").classes("text-xs text-slate-400 italic")
+                            for it in items[:25]:
+                                with ui.row().classes("w-full items-center justify-between text-xs py-1 border-b border-slate-200 dark:border-slate-800"):
+                                    ui.label(f"{it.category}/{it.name}").classes("font-semibold truncate max-w-sm")
+                                    with ui.row().classes("gap-1"):
+                                        def _inst_g(target=it):
+                                            ok, msg = zm.install_item(target, scope="global")
+                                            ui.notify(msg, type="positive" if ok else "negative")
+                                        def _inst_p(target=it):
+                                            ok, msg = zm.install_item(target, scope="project")
+                                            ui.notify(msg, type="positive" if ok else "negative")
+                                        ui.button("+ Project", on_click=lambda t=it: _inst_p(t)).props("unelevated dense size=xs color=primary no-caps")
+                                        ui.button("+ Global", on_click=lambda t=it: _inst_g(t)).props("outline dense size=xs color=primary no-caps")
+        d.open()
 
     def toggle_theme():
         prefs.dark_mode = not prefs.dark_mode

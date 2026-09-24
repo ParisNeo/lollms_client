@@ -154,6 +154,8 @@ class LollmsToolBinding(LollmsBaseBinding):
                 # Keep raw metadata for introspection / show_tools
                 "_source":     "personality_tools",
                 "_binding":    self.binding_name,
+                "_source_file": tool.get("_python_file_path") or tool.get("_source_file"),
+                "_python_file_path": tool.get("_python_file_path"),
             }
 
         return specs

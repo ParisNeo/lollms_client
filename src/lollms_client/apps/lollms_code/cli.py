@@ -55,6 +55,7 @@ APP_CONFIG_FILE = APP_CONFIG_DIR / "config.json"
 APP_USER_PROFILE_FILE = Path.home() / ".lollms_client" / "user_profile.md"
 APP_DEFAULT_WORKSPACE = Path.cwd()
 APP_DEFAULT_SKILLS_DIR = APP_CONFIG_DIR / "skills"
+APP_DEFAULT_TOOLS_DIR = APP_CONFIG_DIR / "tools"
 APP_DEFAULT_MEMORY_DB = APP_CONFIG_DIR / "memory.db"
 APP_DEFAULT_HANDBAG_DIR = APP_CONFIG_DIR / "handbags"
 
@@ -1124,6 +1125,15 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
 
     tools_folders = [str(default_tools_path)] if default_tools_path.exists() else []
 
+    # ── Zoo & Custom Tools Directories (Global & Project Scope) ──
+    global_tools_dir = APP_CONFIG_DIR / "tools"
+    if global_tools_dir.exists():
+        tools_folders.append(str(global_tools_dir.resolve()))
+
+    ws_tools_dir = Path(config.workspace_path) / ".lollms_code" / "tools"
+    if ws_tools_dir.exists():
+        tools_folders.append(str(ws_tools_dir.resolve()))
+
     cli_confirm_handler = make_cli_confirm_handler(config)
 
     host_tool_configs = {
@@ -1243,7 +1253,6 @@ def ensure_handbag_structure(config: CodeAgentConfig):
             "author": "ParisNeo",
             "category": "software_engineering",
             "description": "An elite autonomous software engineering agent that writes, tests, and fixes code iteratively.",
-            "temperature": str(config.temperature)
         }
         yaml_lines = [f"{k}: {v}" for k, v in metadata.items()]
         soul_content = f"---\n{chr(10).join(yaml_lines)}\n---\n\n{CODING_SYSTEM_PROMPT}"
@@ -1283,10 +1292,16 @@ def ensure_sandbox_structure(config: CodeAgentConfig):
     current_plan = sandbox_dir / "CURRENT.md"
     memory_dir = sandbox_dir / "memory"
     sub_ws_dir = sandbox_dir / "sub_workspace"
+    ws_tools_dir = sandbox_dir / "tools"
+    ws_skills_dir = sandbox_dir / "skills"
+    ws_handbags_dir = sandbox_dir / "handbags"
 
     sandbox_dir.mkdir(parents=True, exist_ok=True)
     memory_dir.mkdir(parents=True, exist_ok=True)
     sub_ws_dir.mkdir(parents=True, exist_ok=True)
+    ws_tools_dir.mkdir(parents=True, exist_ok=True)
+    ws_skills_dir.mkdir(parents=True, exist_ok=True)
+    ws_handbags_dir.mkdir(parents=True, exist_ok=True)
 
     scripts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2848,9 +2863,9 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
 
     slash_commands = [
         "/exit", "/quit", "/help", "/plan", "/current", "/scratchpad", "/config",
-        "/shell", "/forget", "/skills", "/clear-history", "/clear-files",
+        "/shell", "/forget", "/skills", "/tools", "/clear-history", "/clear-files",
         "/clear-scratchpad", "/models", "/files", "/workspace", "/load", "/unload",
-        "/lock", "/hide", "/unhide", "/subws", "/reference"
+        "/lock", "/hide", "/unhide", "/subws", "/reference", "/zoo", "/handbag", "/persona"
     ]
     
     # Display a safe, truncated workspace path to the user
@@ -2964,29 +2979,120 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                 ASCIIColors.yellow("  No scratchpad.md file found in this workspace (.lollms_code/scratchpad.md).")
             continue
 
-        if user_input.lower() in ("/handbag", "/persona"):
-            ASCIIColors.rule("[bold cyan]👜 Active Handbag & Persona[/bold cyan]")
-            ASCIIColors.rich_print(f"Handbag Path: [yellow]{config.handbag_path}[/yellow]")
-            ASCIIColors.rich_print(f"Persona Name: [green]{personality.name}[/green]")
-            ASCIIColors.rich_print(f"Category:     {personality.category}")
-            ASCIIColors.rich_print(f"Description:  {personality.description or '(none)'}")
+        if user_input.lower().startswith(("/handbag", "/persona")):
+            parts = user_input.strip().split(maxsplit=1)
+            target_alias = parts[1].strip() if len(parts) > 1 else ""
+            if not target_alias:
+                ASCIIColors.rule("[bold cyan]👜 Active Handbag & Persona[/bold cyan]")
+                ASCIIColors.rich_print(f"Handbag Path: [yellow]{config.handbag_path}[/yellow]")
+                ASCIIColors.rich_print(f"Persona Name: [green]{personality.name}[/green]")
+                ASCIIColors.rich_print(f"Category:     {personality.category}")
+                ASCIIColors.rich_print(f"Description:  {personality.description or '(none)'}")
+
+                from lollms_client.apps.lollms_code.zoo import ZooManager
+                zm = ZooManager(config.workspace_path)
+                installed_personas = zm.list_installed_items("personalities")
+                if installed_personas:
+                    ASCIIColors.rich_print("\n[bold]Available Installed Personas:[/bold]")
+                    for p_item in installed_personas:
+                        badge = "[green][Project][/green]" if p_item["scope"] == "project" else "[cyan][Global][/cyan]"
+                        ASCIIColors.rich_print(f"  • {badge} [bold]{p_item['name']}[/bold] (Switch via `/persona {p_item['name']}`)")
+                continue
+
+            from lollms_client.apps.lollms_code.zoo import ZooManager
+            zm = ZooManager(config.workspace_path)
+            ok, msg, new_pers = zm.activate_persona_in_session(target_alias, config, personality, client)
+            if ok:
+                ASCIIColors.success(f"  ✓ {msg}")
+                personality = new_pers
+            else:
+                ASCIIColors.error(f"  ✗ {msg}")
+            continue
+
+        if user_input.lower() in ("/zoo", "/zoos"):
+            from lollms_client.apps.lollms_code.zoo import run_cli_zoo_navigator
+            new_pers = run_cli_zoo_navigator(config, client=client, personality=personality)
+            if new_pers:
+                personality = new_pers
             continue
 
         if user_input.lower() == "/skills":
             if personality.skills_manager:
-                skills = personality.skills_manager.list_skills()
-                if not skills:
+                structured_skills = personality.list_skills_structured() if hasattr(personality, "list_skills_structured") else []
+                if not structured_skills:
                     ASCIIColors.yellow("  No skills learned yet.")
                 else:
-                    skills_table = ASCIIColors.table(
-                        "Title", "Category", "Description",
-                        rows=[[s['title'], s.get('category', ''), s.get('description', '')] for s in skills],
-                        title="[bold yellow]📚 Learned Skills[/bold yellow]",
-                        box="round"
-                    )
-                    ASCIIColors.rich_print(skills_table)
+                    h_skills = [s for s in structured_skills if s.get("is_handbag")]
+                    p_skills = [s for s in structured_skills if s.get("source") == "workspace"]
+                    other_skills = [s for s in structured_skills if not s.get("is_handbag") and s.get("source") != "workspace"]
+
+                    ASCIIColors.rule("[bold yellow]📚 Active Session Skills[/bold yellow]")
+                    if h_skills:
+                        h_table = ASCIIColors.table(
+                            "Handbag Skill", "Category", "Description", "Tier",
+                            rows=[[s['title'], s.get('category', ''), s.get('description', '')[:60], s.get('visibility', '')] for s in h_skills],
+                            title="[bold magenta]👜 Handbag Native Skills[/bold magenta]",
+                            box="round"
+                        )
+                        ASCIIColors.rich_print(h_table)
+
+                    if p_skills:
+                        p_table = ASCIIColors.table(
+                            "Project Skill", "Category", "Description", "Tier",
+                            rows=[[s['title'], s.get('category', ''), s.get('description', '')[:60], s.get('visibility', '')] for s in p_skills],
+                            title="[bold green]📁 Project Extra Skills (.lollms_code/skills)[/bold green]",
+                            box="round"
+                        )
+                        ASCIIColors.rich_print(p_table)
+
+                    if other_skills:
+                        o_table = ASCIIColors.table(
+                            "Skill", "Source", "Description", "Tier",
+                            rows=[[s['title'], s.get('source', ''), s.get('description', '')[:60], s.get('visibility', '')] for s in other_skills],
+                            title="[bold cyan]🌐 Global / Bundled Skills[/bold cyan]",
+                            box="round"
+                        )
+                        ASCIIColors.rich_print(o_table)
             else:
                 ASCIIColors.yellow("  Skills manager not initialized.")
+            continue
+
+        if user_input.lower() == "/tools":
+            active_tools = personality.list_tools_structured() if hasattr(personality, "list_tools_structured") else []
+            if not active_tools:
+                ASCIIColors.yellow("  No tools mounted in active session.")
+            else:
+                h_tools = [t for t in active_tools if t.get("is_handbag")]
+                p_tools = [t for t in active_tools if t.get("source_file") and ".lollms_code" in t["source_file"]]
+                b_tools = [t for t in active_tools if t not in h_tools and t not in p_tools]
+
+                ASCIIColors.rule("[bold cyan]🛠️ Active Session Tools[/bold cyan]")
+                if h_tools:
+                    h_table = ASCIIColors.table(
+                        "Tool Name", "Category", "Description",
+                        rows=[[t['name'], t.get('category', ''), t.get('description', '')[:70]] for t in h_tools],
+                        title="[bold magenta]👜 Handbag Native Tools[/bold magenta]",
+                        box="round"
+                    )
+                    ASCIIColors.rich_print(h_table)
+
+                if p_tools:
+                    p_table = ASCIIColors.table(
+                        "Project Tool", "Category", "Description",
+                        rows=[[t['name'], t.get('category', ''), t.get('description', '')[:70]] for t in p_tools],
+                        title="[bold green]📁 Project Extra Tools (.lollms_code/tools)[/bold green]",
+                        box="round"
+                    )
+                    ASCIIColors.rich_print(p_table)
+
+                if b_tools:
+                    b_table = ASCIIColors.table(
+                        "System Tool", "Category", "Description",
+                        rows=[[t['name'], t.get('category', ''), t.get('description', '')[:70]] for t in b_tools],
+                        title="[bold blue]⚙️ Built-in / System Tools[/bold blue]",
+                        box="round"
+                    )
+                    ASCIIColors.rich_print(b_table)
             continue
 
         if user_input.lower() in ("/clear-history", "/clear"):
@@ -3713,6 +3819,7 @@ def run_lollms_code_config_menu(
         menu.add_choice(f"🎛️ Reasoning & Token Budgets (Temp: {config.temperature}, Steps: {config.max_reasoning_steps})", value="reasoning_menu")
         menu.add_choice("🤖 Sub-Agents & Delegation", value="subagents_menu")
         menu.add_choice(f"🎓 Skills & Memory (Skills: {config.skills_mode})", value="skills_menu")
+        menu.add_choice("🦁 Zoos Hub (Tools, Skills, Personas)", value="zoo_menu")
         menu.add_choice("📂 Workspace & System Paths", value="paths_menu")
         menu.add_choice("💾 Save & Apply All Settings", value="save")
         menu.add_choice("↩ Back / Exit", value=_BACK_VALUE)
@@ -3744,6 +3851,11 @@ def run_lollms_code_config_menu(
             _configure_subagents_menu(config)
         elif selection == "skills_menu":
             _configure_skills_memory_menu(config)
+        elif selection == "zoo_menu":
+            from lollms_client.apps.lollms_code.zoo import run_cli_zoo_navigator
+            new_pers = run_cli_zoo_navigator(config, client=client, personality=personality)
+            if new_pers and personality:
+                personality = new_pers
         elif selection == "paths_menu":
             _configure_paths_menu(config)
         elif selection == "save":
@@ -3823,6 +3935,7 @@ Examples:
     parser.add_argument("--list-skills", action="store_true", help="List all learned skills and exit.")
     parser.add_argument("--clear-history", action="store_true", help="Clear conversation history and exit.")
     parser.add_argument("--config", action="store_true", help="Run configuration wizard and exit.")
+    parser.add_argument("--zoo", action="store_true", help="Launch interactive Zoo Package Hub Navigator (tools, skills, personas).")
     parser.add_argument("--config-path", type=str, default=None, dest="config_path", help="Path to a specific configuration file (.env, .json or .yaml) used by both the client and the wizard.")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
     parser.add_argument("--version", action="version", version=f"lollms_code v{APP_VERSION}")
@@ -3857,6 +3970,10 @@ def main():
             ASCIIColors.yellow("Please install the GUI requirements: pip install nicegui pywebview")
             return 1
         except Exception as e:
+            # Handle benign desktop window closure during Uvicorn server teardown
+            err_msg = str(e)
+            if "CloseConnection" in err_msg or "ConnectionState.CLOSED" in err_msg or "LocalProtocolError" in type(e).__name__:
+                return 0
             trace_exception(e)
             ASCIIColors.red(f"GUI crashed: {e}")
             return 1
@@ -3877,6 +3994,11 @@ def main():
 
     if args.list_skills:
         list_skills(config)
+        return 0
+
+    if getattr(args, "zoo", False):
+        from lollms_client.apps.lollms_code.zoo import run_cli_zoo_navigator
+        run_cli_zoo_navigator(config)
         return 0
 
     if args.clear_history:

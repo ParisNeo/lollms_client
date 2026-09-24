@@ -253,3 +253,15 @@ llm_profiles = _extract_profiles_from_env("LLM", llm_bindings, app_config_map)
 # 5. Host app persists everything together on explicit application save
 _save_and_validate(app_config_map, test_connection=False)
 ```
+
+---
+
+## 8. LoLLMS Community Zoos (Tools, Skills, Personas)
+
+`lollms_code` provides an integrated package manager and browser for the official community zoos on GitHub:
+- **Tools Zoo**: `https://github.com/ParisNeo/lollms_tools_zoo.git`
+- **Skills Zoo**: `https://github.com/ParisNeo/lollms_skills_zoo.git`
+- **Personalities Zoo**: `https://github.com/ParisNeo/lollms_personalities_zoo.git`
+
+Packages can be installed with **Project Scope** (stored in `.lollms_code/<tools|skills|handbags>/`) or **Global Scope** (stored in `~/.lollms_client/lollms_code/<tools|skills|handbags>/`). The LCP tool engine and SkillsManager automatically discover and load all installed packages into active sessions.
+```

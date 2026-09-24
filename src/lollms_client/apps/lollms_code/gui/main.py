@@ -297,14 +297,21 @@ def main():
         except Exception:
             pass
 
-    ui.run(
-        title="lollms_code",
-        native=True,
-        window_size=(p.window_width, p.window_height),
-        fullscreen=getattr(p, "start_fullscreen", False),
-        reload=False,
-        dark=p.is_dark(),
-    )
+    try:
+        ui.run(
+            title="lollms_code",
+            native=True,
+            window_size=(p.window_width, p.window_height),
+            fullscreen=getattr(p, "start_fullscreen", False),
+            reload=False,
+            dark=p.is_dark(),
+        )
+    except Exception as e:
+        # Absorb benign desktop window close race condition in wsproto/uvicorn shutdown
+        err_msg = str(e)
+        if "CloseConnection" in err_msg or "ConnectionState.CLOSED" in err_msg or "LocalProtocolError" in type(e).__name__:
+            return
+        raise
 
 
 # ── ROUTE 1: PROJECTS DECK (DEFAULT HOME) ────────────────────────────────────

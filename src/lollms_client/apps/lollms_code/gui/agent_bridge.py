@@ -118,7 +118,6 @@ def ensure_handbag_structure(prefs: GuiPrefs) -> None:
         "author": "ParisNeo",
         "category": "software_engineering",
         "description": "An elite autonomous software engineering agent.",
-        "temperature": str(prefs.temperature),
     }
     yaml_lines = [f"{k}: {v}" for k, v in metadata.items()]
     soul_content = f"---\n{chr(10).join(yaml_lines)}\n---\n\n{CODING_SYSTEM_PROMPT}"
@@ -134,8 +133,15 @@ def ensure_sandbox_structure(prefs: GuiPrefs) -> None:
     scratchpad = sandbox_dir / "scratchpad.md"
     current_plan = sandbox_dir / "CURRENT.md"
     sub_ws_dir = sandbox_dir / "sub_workspace"
+    ws_tools_dir = sandbox_dir / "tools"
+    ws_skills_dir = sandbox_dir / "skills"
+    ws_handbags_dir = sandbox_dir / "handbags"
+
     sandbox_dir.mkdir(parents=True, exist_ok=True)
     sub_ws_dir.mkdir(parents=True, exist_ok=True)
+    ws_tools_dir.mkdir(parents=True, exist_ok=True)
+    ws_skills_dir.mkdir(parents=True, exist_ok=True)
+    ws_handbags_dir.mkdir(parents=True, exist_ok=True)
     scripts_dir.mkdir(parents=True, exist_ok=True)
     if not scratchpad.exists():
         scratchpad.write_text(
@@ -172,6 +178,15 @@ def create_client(env: EnvStore, prefs: GuiPrefs):
     package_root = Path(lollms_client.__file__).resolve().parent
     default_tools_path = package_root / "tools_bindings" / "lcp" / "default_tools"
     tools_folders = [str(default_tools_path)] if default_tools_path.exists() else []
+
+    # ── Register Global and Project-Local Tools Directories ──
+    global_tools_dir = Path.home() / ".lollms_client" / "lollms_code" / "tools"
+    if global_tools_dir.exists():
+        tools_folders.append(str(global_tools_dir.resolve()))
+
+    ws_tools_dir = Path(prefs.workspace_path) / ".lollms_code" / "tools"
+    if ws_tools_dir.exists():
+        tools_folders.append(str(ws_tools_dir.resolve()))
 
     host_tool_configs = {
         "system_shell": {"autonomy_level": prefs.shell_autonomy_level},
@@ -357,6 +372,269 @@ def switch_workspace(prefs: GuiPrefs, client, new_workspace_path: str):
     prefs.workspace_path = str(new_path)
     prefs.save()
     return create_personality(prefs, client)
+
+
+def switch_persona_handbag(prefs: GuiPrefs, client, handbag_path: str):
+    """Switches the active persona handbag and rebuilds the personality."""
+    target_p = Path(handbag_path).resolve()
+    if not target_p.exists() or not target_p.is_dir():
+        raise ValueError(f"Handbag folder does not exist: {target_p}")
+    prefs.handbag_path = str(target_p)
+    prefs.save()
+    return create_personality(prefs, client)
+
+
+def get_subws_tools_and_skills(personality, prefs: GuiPrefs, client=None) -> Dict[str, Any]:
+    """
+    Assembles a complete, structured view of active session capabilities,
+    strictly segregating native Handbag assets from Project Extra assets (.lollms_code/).
+    """
+    ws_root = Path(prefs.workspace_path).resolve()
+    hb_root = Path(prefs.handbag_path).resolve() if prefs.handbag_path else None
+    default_hb_root = (Path.home() / ".lollms_client" / "lollms_code" / "handbags" / "default_coder").resolve()
+
+    # 1. Persona State
+    p_name = getattr(personality, "name", "lollms_code")
+    p_cat = getattr(personality, "category", "software_engineering")
+    p_desc = getattr(personality, "description", "")
+    p_soul = ""
+    soul_p = hb_root / "SOUL.md" if hb_root else None
+    if soul_p and soul_p.exists():
+        try:
+            p_soul = soul_p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            pass
+
+    persona_source = "handbag"
+    if hb_root:
+        if hb_root == default_hb_root:
+            persona_source = "default"
+        elif str(hb_root).startswith(str(ws_root / ".lollms_code")):
+            persona_source = "project"
+        elif ".lollms_client" in str(hb_root):
+            persona_source = "global"
+
+    # 2. Tools Segregation (with canonical deduplication)
+    handbag_tools: List[Dict[str, Any]] = []
+    project_tools: List[Dict[str, Any]] = []
+    builtin_tools: List[Dict[str, Any]] = []
+
+    raw_tools = []
+    if personality and hasattr(personality, "list_tools_structured"):
+        try:
+            raw_tools = personality.list_tools_structured()
+        except Exception:
+            pass
+
+    seen_tool_keys = set()
+    for t in raw_tools:
+        name = t.get("name", "")
+        seen_tool_keys.add(name.lower())
+        src_file = t.get("source_file") or ""
+        if src_file:
+            p_obj = Path(src_file).resolve()
+            seen_tool_keys.add(p_obj.stem.lower())
+            seen_tool_keys.add(p_obj.name.lower())
+            seen_tool_keys.add(p_obj.parent.name.lower())
+            seen_tool_keys.add(str(p_obj).lower())
+
+        is_in_project_tools = bool(src_file and str(ws_root / ".lollms_code" / "tools").lower() in str(src_file).lower())
+        is_in_handbag_tools = bool(t.get("is_handbag") or (hb_root and src_file and str(hb_root).lower() in str(src_file).lower()))
+
+        if is_in_handbag_tools:
+            handbag_tools.append(t)
+        elif is_in_project_tools:
+            project_tools.append(t)
+        else:
+            # All other tools (LCP default tools, document editor, execution, spinoff sub-agents, etc.) are built-in
+            builtin_tools.append(t)
+
+    # Disk scan for project extra tools strictly in .lollms_code/tools
+    proj_tools_dir = ws_root / ".lollms_code" / "tools"
+    if proj_tools_dir.exists():
+        for entry in sorted(proj_tools_dir.iterdir()):
+            if entry.name.startswith(".") or entry.name in ("__pycache__",):
+                continue
+            entry_res = entry.resolve()
+            item_name = entry.stem if entry.is_file() else entry.name
+
+            # Check if any tool in project_tools already matches this path or name
+            already_tracked = any(
+                p_tool.get("name") == item_name
+                or p_tool.get("source_file") == str(entry_res)
+                or (p_tool.get("source_file") and str(entry_res) in p_tool.get("source_file"))
+                for p_tool in project_tools
+            )
+
+            if already_tracked:
+                continue
+
+            desc = f"Project tool package in .lollms_code/tools/{entry.name}"
+            doc_p = entry / "README.md" if entry.is_dir() else None
+            py_p = entry / f"{entry.name}.py" if entry.is_dir() else entry
+
+            if doc_p and doc_p.exists():
+                try:
+                    for line in doc_p.read_text(encoding="utf-8", errors="ignore").splitlines():
+                        if line.strip() and not line.startswith("#"):
+                            desc = line.strip()[:140]
+                            break
+                except Exception:
+                    pass
+
+            project_tools.append({
+                "name": item_name,
+                "description": desc,
+                "is_handbag": False,
+                "source": "project_extra",
+                "source_file": str(entry_res),
+                "parameters": [],
+            })
+
+    # 3. Skills Segregation (with title, slug, and canonical path deduplication)
+    handbag_skills: List[Dict[str, Any]] = []
+    project_skills: List[Dict[str, Any]] = []
+    other_skills: List[Dict[str, Any]] = []
+
+    raw_skills = []
+    if personality and hasattr(personality, "list_skills_structured"):
+        try:
+            raw_skills = personality.list_skills_structured(include_content=True)
+        except Exception:
+            pass
+
+    seen_skill_keys = set()
+    for s in raw_skills:
+        title = s.get("title", "")
+        fp = s.get("file_path") or ""
+
+        seen_skill_keys.add(title.lower())
+        if fp:
+            p_obj = Path(fp).resolve()
+            seen_skill_keys.add(p_obj.stem.lower())
+            seen_skill_keys.add(p_obj.name.lower())
+            seen_skill_keys.add(p_obj.parent.name.lower())
+            seen_skill_keys.add(str(p_obj).lower())
+
+        if s.get("is_handbag") or (hb_root and fp and str(hb_root) in fp):
+            handbag_skills.append(s)
+        elif s.get("source") == "workspace" or (fp and str(ws_root / ".lollms_code" / "skills") in fp):
+            project_skills.append(s)
+        else:
+            other_skills.append(s)
+
+    # Disk scan for project extra skills in .lollms_code/skills
+    proj_skills_dir = ws_root / ".lollms_code" / "skills"
+    if proj_skills_dir.exists():
+        for entry in sorted(proj_skills_dir.iterdir()):
+            if entry.name.startswith(".") or entry.name in ("__pycache__", "README.md"):
+                continue
+            entry_res = entry.resolve()
+            skill_slug = entry.stem if entry.is_file() else entry.name
+
+            # Skip if already tracked by in-memory registry
+            if (
+                skill_slug.lower() in seen_skill_keys
+                or str(entry_res).lower() in seen_skill_keys
+                or str(entry_res / "SKILL.md").lower() in seen_skill_keys
+            ):
+                continue
+
+            skill_md = entry / "SKILL.md" if entry.is_dir() else entry
+            content_preview = ""
+            desc = "Project skill"
+            final_title = skill_slug
+
+            if skill_md.exists():
+                try:
+                    content_preview = skill_md.read_text(encoding="utf-8", errors="ignore")
+                    # Check YAML frontmatter for real title
+                    if content_preview.startswith("---"):
+                        fm_match = re.match(r"^---\n(.*?)\n---", content_preview, re.DOTALL)
+                        if fm_match:
+                            for line in fm_match.group(1).splitlines():
+                                if line.startswith("title:"):
+                                    final_title = line.split(":", 1)[1].strip().strip('"\'')
+                                elif line.startswith("description:"):
+                                    desc = line.split(":", 1)[1].strip().strip('"\'')
+
+                    if desc == "Project skill":
+                        for line in content_preview.splitlines():
+                            if line.strip() and not line.startswith("#") and not line.startswith("---"):
+                                desc = line.strip()[:100]
+                                break
+                except Exception:
+                    pass
+
+            if final_title.lower() in seen_skill_keys:
+                continue
+
+            project_skills.append({
+                "title": final_title,
+                "description": desc,
+                "category": "project_skills",
+                "tags": ["project"],
+                "visibility": "loadable",
+                "source": "workspace",
+                "is_handbag": False,
+                "file_path": str(skill_md.resolve()),
+                "content_preview": content_preview[:200],
+            })
+
+    # 4. Available Handbags (for switching)
+    available_handbags: List[Dict[str, Any]] = []
+    # A. Default Coder
+    if default_hb_root.exists():
+        available_handbags.append({
+            "name": "default_coder",
+            "title": "Default Coder (lollms_code)",
+            "path": str(default_hb_root),
+            "scope": "default",
+        })
+    # B. Project Handbags (.lollms_code/handbags/)
+    ws_hb_dir = ws_root / ".lollms_code" / "handbags"
+    if ws_hb_dir.exists():
+        for item in sorted(ws_hb_dir.iterdir()):
+            if item.is_dir() and not item.name.startswith("."):
+                available_handbags.append({
+                    "name": item.name,
+                    "title": item.name.replace("_", " ").title(),
+                    "path": str(item.resolve()),
+                    "scope": "project",
+                })
+    # C. Global Handbags (~/.lollms_client/lollms_code/handbags/)
+    glob_hb_dir = Path.home() / ".lollms_client" / "lollms_code" / "handbags"
+    if glob_hb_dir.exists():
+        for item in sorted(glob_hb_dir.iterdir()):
+            if item.is_dir() and not item.name.startswith(".") and item.name != "default_coder":
+                available_handbags.append({
+                    "name": item.name,
+                    "title": item.name.replace("_", " ").title(),
+                    "path": str(item.resolve()),
+                    "scope": "global",
+                })
+
+    return {
+        "persona": {
+            "name": p_name,
+            "category": p_cat,
+            "description": p_desc,
+            "handbag_path": str(hb_root) if hb_root else "",
+            "source": persona_source,
+            "soul_content": p_soul,
+        },
+        "tools": {
+            "handbag": handbag_tools,
+            "project": project_tools,
+            "builtin": builtin_tools,
+        },
+        "skills": {
+            "handbag": handbag_skills,
+            "project": project_skills,
+            "other": other_skills,
+        },
+        "available_handbags": available_handbags,
+    }
 
 
 def get_workspace_stats(personality) -> Dict[str, Any]:

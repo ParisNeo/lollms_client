@@ -65,6 +65,7 @@ SLASH_COMMANDS = [
     ("/plan", "View and edit active macro plan (CURRENT.md)"),
     ("/current", "View active macro plan (CURRENT.md)"),
     ("/scratchpad", "View and edit agent scratchpad notes"),
+    ("/zoo", "Open Zoo Package Hub (Tools, Skills, Personas)"),
     ("/subws", "Open Sub-Workspace Manager (Documentation & Reference files)"),
     ("/reference", "Open Sub-Workspace Manager (Documentation & Reference files)"),
     ("/history", "Browse and resend prompt history"),
@@ -401,6 +402,10 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     on_click=lambda: open_memory_explorer_dialog(session, prefs) if open_memory_explorer_dialog else ui.notify("Memory Explorer not available", type="warning"),
                 ).props("flat dense size=sm no-caps text-color=purple").tooltip("Open Memory Explorer (inspect, edit, dream)")
                 ui.button(
+                    "Zoo Hub", icon="pets",
+                    on_click=lambda: open_zoo_dialog(),
+                ).props("flat dense size=sm no-caps text-color=amber font-semibold").tooltip("Open Zoo Hub: install & manage tools, skills, and personas from GitHub")
+                ui.button(
                     "Reference", icon="auto_stories",
                     on_click=lambda: open_sub_workspace_dialog(),
                 ).props("flat dense size=sm no-caps text-color=emerald font-semibold").tooltip("Open Sub-Workspace (Documentation & Reference files in .lollms_code/sub_workspace)")
@@ -520,6 +525,9 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                                     ui.notify("Unloaded all reference files [U]", type="info")
                                     refresh_subws_tree()
 
+                                ui.button(icon="note_add", on_click=lambda: open_paste_reference_dialog()).props(
+                                    "flat round dense size=xs color=primary"
+                                ).tooltip("Paste text as a new reference file")
                                 ui.button(icon="upload_file", on_click=_import_subws_file_sidebar).props(
                                     "flat round dense size=xs"
                                 ).tooltip("Import reference file into .lollms_code/sub_workspace")
@@ -2072,7 +2080,14 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
             return True
 
         if cmd in ("/subws", "/reference", "/sub-workspace", "/ref"):
-            open_sub_workspace_dialog()
+            if arg.lower() in ("paste", "new", "add-text"):
+                open_paste_reference_dialog()
+            else:
+                open_sub_workspace_dialog()
+            return True
+
+        if cmd in ("/zoo", "/zoos", "/hub"):
+            open_zoo_dialog()
             return True
 
         if cmd in ("/scratchpad", "/scratch"):
@@ -2911,31 +2926,41 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                         ui.label("Reference documentation and external files in .lollms_code/sub_workspace/").classes(f"text-xs {MUTED_DIM}")
 
                 with ui.row().classes("items-center gap-1.5"):
-                    async def do_import_file():
+                    def do_import_file():
                         _picker = pick_folder
                         if _picker:
-                            chosen = await _picker(title="Select Reference File to Import")
-                            if chosen:
-                                try:
-                                    dest = sub_ws.import_file(chosen)
-                                    ui.notify(f"Imported reference: {dest.name}", type="positive")
-                                    refresh_sub_ws_items()
-                                    refresh_workspace_tree()
-                                except Exception as ex:
-                                    notify_error(f"Import file failed: {ex}")
+                            async def _pick():
+                                chosen = await _picker(title="Select Reference File to Import")
+                                if chosen:
+                                    try:
+                                        dest = sub_ws.import_file(chosen)
+                                        ui.notify(f"Imported reference: {dest.name}", type="positive")
+                                        refresh_sub_ws_items()
+                                        refresh_workspace_tree()
+                                    except Exception as ex:
+                                        notify_error(f"Import file failed: {ex}")
+                            _pick()
 
-                    async def do_import_folder():
+                    def do_import_folder():
                         _picker = pick_folder
                         if _picker:
-                            chosen = await _picker(title="Select Folder to Import as Reference")
-                            if chosen:
-                                try:
-                                    imported = sub_ws.import_folder(chosen)
-                                    ui.notify(f"Imported {len(imported)} files into sub-workspace.", type="positive")
-                                    refresh_sub_ws_items()
-                                    refresh_workspace_tree()
-                                except Exception as ex:
-                                    notify_error(f"Import folder failed: {ex}")
+                            async def _pick_f():
+                                chosen = await _picker(title="Select Folder to Import as Reference")
+                                if chosen:
+                                    try:
+                                        imported = sub_ws.import_folder(chosen)
+                                        ui.notify(f"Imported {len(imported)} files into sub-workspace.", type="positive")
+                                        refresh_sub_ws_items()
+                                        refresh_workspace_tree()
+                                    except Exception as ex:
+                                        notify_error(f"Import folder failed: {ex}")
+                            _pick_f()
+
+                    ui.button("Paste Text", icon="note_add", on_click=lambda: open_paste_reference_dialog()).props(
+                        "unelevated dense size=xs color=primary no-caps"
+                    ).tooltip("Paste text directly as a new reference file")
+                    ui.button("Import File", icon="upload_file", on_click=do_import_file).props("outline dense size=xs color=primary no-caps")
+                    ui.button("Import Folder", icon="drive_folder_upload", on_click=do_import_folder).props("outline dense size=xs color=primary no-caps")
 
                     def do_load_all():
                         cnt = sub_ws.load_all()
@@ -3026,275 +3051,834 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
 
         dialog.open()
 
-    # ── Sub-Workspace Tree Management ──────────────────────
-    subws_children: Dict[str, list] = {}
-    subws_expanded: set = set()
-    subws_loading: set = set()
+    # ── Zoo Hub Modal Dialog (Tools, Skills, Personas) ─────────────────
+    def open_zoo_dialog():
+        from lollms_client.apps.lollms_code.zoo import ZooManager
+        zm = ZooManager(prefs.workspace_path)
 
-    def _scan_subws_dir_sync(folder_str: str, root_str: str) -> list:
-        import os
-        root = Path(root_str)
-        nodes = []
-        if not os.path.exists(folder_str):
-            return []
+        dialog = ui.dialog().props("maximized")
+        with dialog, ui.card().classes(
+            f"w-full h-full flex flex-col p-4 {CANVAS} text-slate-900 dark:text-slate-100 gap-3"
+        ):
+            # Header
+            with ui.row().classes(f"w-full items-center justify-between pb-2 border-b {BORDER} shrink-0"):
+                with ui.row().classes("items-center gap-2.5"):
+                    ui.icon("pets", size="26px").classes("text-amber-500")
+                    with ui.column().classes("gap-0"):
+                        ui.label("LoLLMS Zoo Package Hub").classes("text-base font-bold")
+                        ui.label("Browse categorized Tools, Skills, and Personas across categories and subcategories.").classes(
+                            f"text-xs {MUTED_DIM}"
+                        )
+
+                with ui.row().classes("items-center gap-2"):
+                    def _sync_all_dialog():
+                        ui.notify("Synchronizing all zoos from GitHub...", type="info")
+                        results = zm.sync_all()
+                        for z, (ok, msg) in results.items():
+                            if ok:
+                                ui.notify(f"✓ {z.capitalize()}: {msg}", type="positive")
+                            else:
+                                ui.notify(f"⚠ {z.capitalize()}: {msg}", type="warning")
+                        _refresh_zoo_view()
+
+                    ui.button("Sync Zoos", icon="sync", on_click=_sync_all_dialog).props(
+                        "unelevated dense size=sm color=primary no-caps"
+                    ).tooltip("Clone or update all three zoo repositories from GitHub")
+                    ui.button("Close", icon="close", on_click=dialog.close).props("flat dense round size=sm")
+
+            # Main Body: Tab switcher & Category + Items layout
+            with ui.tabs().classes(f"w-full {SURFACE} border-b {BORDER} shrink-0").props('dense no-caps active-color="primary" indicator-color="primary"') as zoo_tabs:
+                tab_tools = ui.tab('tools', label='🛠️ Tools Zoo', icon='build').classes('text-xs py-1.5 flex-1')
+                tab_skills = ui.tab('skills', label='🧠 Skills Zoo', icon='psychology').classes('text-xs py-1.5 flex-1')
+                tab_personas = ui.tab('personalities', label='🎭 Personalities Zoo', icon='face').classes('text-xs py-1.5 flex-1')
+
+            active_zoo_type = {"type": "tools"}
+            active_cat = {"name": "", "label": ""}
+
+            with ui.row().classes("w-full flex-1 min-h-0 items-stretch overflow-hidden flex-nowrap gap-3 pt-2"):
+                # Left Pane: Categories with Subcategories
+                cat_sidebar = ui.column().classes(f"w-72 h-full shrink-0 border-r {BORDER} {SURFACE_ALT} p-2 overflow-y-auto gap-0.5")
+
+                # Center/Right Pane: Search, Items & Documentation Preview
+                with ui.column().classes("flex-1 h-full min-w-0 flex flex-col gap-2 overflow-hidden"):
+                    with ui.row().classes("w-full items-center justify-between gap-2 shrink-0"):
+                        zoo_search_input = ui.input(placeholder="Search packages by name, description, tags…").props(
+                            ':dark="Quasar.Dark.isActive" dense outlined clearable'
+                        ).classes("flex-1 text-xs bg-slate-50 dark:bg-slate-900")
+
+                        cat_readme_btn = ui.button("Category Documentation", icon="menu_book", on_click=lambda: _show_cat_readme()).props(
+                            "flat dense size=sm no-caps color=primary"
+                        )
+                        cat_readme_btn.visible = False
+
+                    items_scroll = ui.scroll_area().classes("w-full flex-1 min-h-0")
+                    with items_scroll:
+                        items_container = ui.column().classes("w-full gap-3 p-1")
+
+            def _show_cat_readme():
+                c_name = active_cat["name"]
+                z_type = active_zoo_type["type"]
+                cats = zm.list_categories(z_type)
+                match = next((c for c in cats if c.full_path == c_name or c.name == c_name), None)
+                if match and match.readme_content:
+                    r_dlg = ui.dialog()
+                    with r_dlg, ui.card().classes(f"w-[780px] max-w-[95vw] h-[580px] flex flex-col p-4 {CANVAS} rounded-xl border {BORDER}"):
+                        with ui.row().classes(f"w-full items-center justify-between pb-2 border-b {BORDER}"):
+                            ui.label(f"📖 Category Documentation: {match.full_path}").classes("text-sm font-bold")
+                            ui.button(icon="close", on_click=r_dlg.close).props("flat dense round size=xs")
+                        with ui.scroll_area().classes("w-full flex-1 p-2"):
+                            ui.markdown(match.readme_content).classes("text-xs leading-relaxed")
+                    r_dlg.open()
+                else:
+                    ui.notify(f"No README.md found for category '{c_name}'.", type="info")
+
+            def _refresh_zoo_view():
+                z_type = active_zoo_type["type"]
+                cat_sidebar.clear()
+                categories = zm.list_categories(z_type)
+
+                if not zm.is_repo_cloned(z_type):
+                    with cat_sidebar:
+                        ui.label(f"{z_type.capitalize()} Zoo not downloaded.").classes(f"text-xs {MUTED_DIM} p-2")
+                        def _do_clone_now():
+                            ui.notify(f"Cloning {z_type} zoo...", type="info")
+                            ok, msg = zm.sync_repo(z_type)
+                            if ok:
+                                ui.notify(msg, type="positive")
+                                _refresh_zoo_view()
+                            else:
+                                ui.notify(msg, type="negative")
+                        ui.button("Clone Repo", icon="download", on_click=_do_clone_now).props("unelevated dense size=xs color=primary no-caps")
+                    items_container.clear()
+                    return
+
+                with cat_sidebar:
+                    ui.label("CATEGORIES & SUBCATEGORIES").classes(f"text-[10px] font-bold text-slate-500 px-1 pt-1 mb-1")
+
+                    def _select_cat(cat_path="", cat_label=""):
+                        active_cat["name"] = cat_path
+                        active_cat["label"] = cat_label
+                        # Check if selected category has documentation
+                        cats = zm.list_categories(active_zoo_type["type"])
+                        match = next((c for c in cats if c.full_path == cat_path), None)
+                        cat_readme_btn.visible = bool(match and match.readme_content)
+                        if cat_readme_btn.visible:
+                            cat_readme_btn.text = f"Docs: {match.name}"
+                        _refresh_items_view()
+                        _refresh_cat_buttons()
+
+                    def _refresh_cat_buttons():
+                        for btn_obj, c_id in cat_btn_refs:
+                            is_sel = (c_id == active_cat["name"])
+                            btn_obj.classes(
+                                replace="w-full justify-start text-xs rounded transition-colors " +
+                                        ("bg-primary/20 text-primary font-bold border-l-2 border-primary" if is_sel else "hover:bg-slate-200 dark:hover:bg-slate-800")
+                            )
+
+                    cat_btn_refs = []
+                    all_count = sum(c.items_count for c in categories if not c.is_subcategory)
+                    all_btn = ui.button(f"All Categories ({all_count})", on_click=lambda: _select_cat("", "All")).props("flat dense no-caps")
+                    cat_btn_refs.append((all_btn, ""))
+
+                    for c in categories:
+                        indent = "pl-4 text-[11px] " if c.is_subcategory else "font-semibold "
+                        icon_prefix = "↳ " if c.is_subcategory else "📁 "
+                        btn = ui.button(
+                            f"{icon_prefix}{c.name} ({c.items_count})",
+                            on_click=lambda cp=c.full_path, cl=c.name: _select_cat(cp, cl)
+                        ).props("flat dense no-caps").classes(f"{indent}")
+                        cat_btn_refs.append((btn, c.full_path))
+
+                    _refresh_cat_buttons()
+
+                _refresh_items_view()
+
+            def _refresh_items_view():
+                items_container.clear()
+                z_type = active_zoo_type["type"]
+                q = (zoo_search_input.value or "").strip().lower()
+                c_name = active_cat["name"]
+
+                if q:
+                    items = zm.search(q, zoo_type=z_type)
+                else:
+                    items = zm.list_items(z_type, category=c_name or None)
+
+                with items_container:
+                    if not items:
+                        ui.label("No packages found matching the selected filters.").classes(
+                            f"text-xs {MUTED_DIM} p-4 italic text-center w-full"
+                        )
+                        return
+
+                    for it in items:
+                        with ui.card().classes(
+                            f"w-full p-3 rounded-lg border {BORDER} {SURFACE} hover:border-primary/50 transition-colors gap-2 shadow-none"
+                        ):
+                            with ui.row().classes("w-full items-start justify-between flex-nowrap"):
+                                with ui.column().classes("gap-0.5 flex-1 min-w-0"):
+                                    with ui.row().classes("items-center gap-2"):
+                                        item_icon = "build" if it.zoo_type == "tools" else ("psychology" if it.zoo_type == "skills" else "face")
+                                        ui.icon(item_icon, size="18px").classes("text-primary shrink-0")
+                                        ui.label(it.name).classes("text-sm font-bold truncate text-slate-900 dark:text-slate-100")
+                                        ui.label(f"in {it.category}").classes(f"text-[10px] {MUTED_DIM} font-mono")
+
+                                    ui.label(it.description).classes(f"text-xs {MUTED} line-clamp-2")
+
+                                with ui.row().classes("items-center gap-1 shrink-0"):
+                                    if it.is_installed_project:
+                                        ui.badge("Project", color="emerald").props("dense rounded text-[10px]").tooltip("Installed in active project (.lollms_code/)")
+                                    if it.is_installed_global:
+                                        ui.badge("Global", color="indigo").props("dense rounded text-[10px]").tooltip("Installed globally (~/.lollms_client/)")
+
+                            # Actions Row
+                            with ui.row().classes("w-full items-center justify-between pt-1 border-t border-slate-200 dark:border-slate-800"):
+                                with ui.row().classes("items-center gap-1.5"):
+                                    def _show_doc(target=it):
+                                        d_dlg = ui.dialog()
+                                        with d_dlg, ui.card().classes(f"w-[780px] max-w-[95vw] h-[580px] flex flex-col p-4 {CANVAS} rounded-xl border {BORDER}"):
+                                            with ui.row().classes(f"w-full items-center justify-between pb-2 border-b {BORDER}"):
+                                                ui.label(f"📖 {target.name} ({target.category})").classes("text-sm font-bold")
+                                                ui.button(icon="close", on_click=d_dlg.close).props("flat dense round size=xs")
+                                            with ui.scroll_area().classes("w-full flex-1 p-2"):
+                                                content = target.readme_content or "No documentation provided."
+                                                ui.markdown(content).classes("text-xs leading-relaxed")
+                                        d_dlg.open()
+
+                                    ui.button("Read Docs", icon="menu_book", on_click=_show_doc).props("flat dense size=xs no-caps text-color=primary")
+
+                                    if it.zoo_type == "personalities" and it.is_installed:
+                                        def _activate_p(target=it):
+                                            prefs.handbag_path = str((zm.get_project_target_dir("personalities") / target.name).resolve() if target.is_installed_project else (zm.get_global_target_dir("personalities") / target.name).resolve())
+                                            prefs.save()
+                                            try:
+                                                session.personality = agent_bridge.create_personality(prefs, session.client)
+                                                ui.notify(f"Active persona switched to '{session.personality.name}'!", type="positive")
+                                            except Exception as ex:
+                                                ui.notify(f"Failed to switch persona: {ex}", type="negative")
+
+                                        ui.button("Use Persona", icon="play_arrow", on_click=_activate_p).props("unelevated dense size=xs color=purple no-caps font-semibold")
+
+                                with ui.row().classes("items-center gap-1"):
+                                    def _install(target=it, scope="project"):
+                                        ok, msg = zm.install_item(target, scope=scope)
+                                        if ok:
+                                            ui.notify(msg, type="positive")
+                                            # Reload in-memory components if active
+                                            if target.zoo_type == "skills" and session.personality and session.personality.skills_manager:
+                                                session.personality.skills_manager.reload()
+                                            elif target.zoo_type == "tools" and session.client and session.client.tools:
+                                                if hasattr(session.client.tools, "_discover_local_tools"):
+                                                    session.client.tools._discover_local_tools()
+                                            _refresh_items_view()
+                                            refresh_subws_panel()
+                                        else:
+                                            ui.notify(msg, type="negative")
+
+                                    def _uninstall(target=it, scope="project"):
+                                        ok, msg = zm.uninstall_item(target, scope=scope)
+                                        if ok:
+                                            ui.notify(msg, type="info")
+                                            if target.zoo_type == "skills" and session.personality and session.personality.skills_manager:
+                                                session.personality.skills_manager.reload()
+                                            elif target.zoo_type == "tools" and session.client and session.client.tools:
+                                                if hasattr(session.client.tools, "_discover_local_tools"):
+                                                    session.client.tools._discover_local_tools()
+                                            _refresh_items_view()
+                                            refresh_subws_panel()
+                                        else:
+                                            ui.notify(msg, type="negative")
+
+                                    if not it.is_installed_project:
+                                        ui.button("+ Project", on_click=lambda t=it: _install(t, "project")).props("unelevated dense size=xs color=primary no-caps").tooltip("Install into current project (.lollms_code/)")
+                                    else:
+                                        ui.button("Remove (Proj)", on_click=lambda t=it: _uninstall(t, "project")).props("flat dense size=xs color=red no-caps")
+
+                                    if not it.is_installed_global:
+                                        ui.button("+ Global", on_click=lambda t=it: _install(t, "global")).props("outline dense size=xs color=primary no-caps").tooltip("Install globally (~/.lollms_client/)")
+                                    else:
+                                        ui.button("Remove (Glob)", on_click=lambda t=it: _uninstall(t, "global")).props("flat dense size=xs color=red no-caps")
+
+            zoo_tabs.on('update:model-value', lambda e: (active_zoo_type.update({"type": e.args}), active_cat.update({"name": "", "label": ""}), _refresh_zoo_view()))
+            zoo_search_input.on_value_change(lambda _: _refresh_items_view())
+
+            _refresh_zoo_view()
+
+        dialog.open()
+
+    # ── Paste Text as Reference Dialog ────────────────────────────────
+    def open_paste_reference_dialog(initial_filename: str = "reference.md", initial_text: str = ""):
+        from lollms_client.apps.lollms_code.sub_workspace import SubWorkspaceManager
+        sub_ws = SubWorkspaceManager(prefs.workspace_path)
+
+        d = ui.dialog().props("persistent")
+        with d, ui.card().classes(f"w-[760px] max-w-[95vw] h-[580px] flex flex-col p-4 {CANVAS} rounded-xl border {BORDER} gap-3"):
+            with ui.row().classes(f"w-full items-center justify-between pb-2 border-b {BORDER} shrink-0"):
+                with ui.row().classes("items-center gap-2"):
+                    ui.icon("post_add", size="24px").classes("text-primary")
+                    with ui.column().classes("gap-0"):
+                        ui.label("New Reference Document").classes("text-sm font-bold text-slate-900 dark:text-slate-100")
+                        ui.label("Paste text or Markdown into .lollms_code/sub_workspace/").classes(f"text-[10px] {MUTED_DIM}")
+                ui.button(icon="close", on_click=d.close).props("flat dense round size=xs")
+
+            with ui.row().classes("w-full items-center gap-3 shrink-0"):
+                filename_input = ui.input(
+                    "Reference Filename",
+                    value=initial_filename,
+                    placeholder="e.g. api_spec.md, notes.txt, design.md"
+                ).classes("flex-1 text-xs").props("outlined dense")
+                load_now_check = ui.checkbox("Load into context [C] immediately", value=True).props("dense").tooltip("Automatically mark as [C] so the agent sees this content")
+
+            with ui.column().classes("w-full flex-1 min-h-0 gap-1"):
+                ui.label("Content:").classes(f"text-xs font-semibold {STRONG}")
+                content_input = ui.textarea(
+                    placeholder="Paste your documentation, requirements, code snippets, or notes here…"
+                ).classes(f"w-full flex-1 text-xs font-mono {SURFACE} rounded border {BORDER}").props(
+                    ':dark="Quasar.Dark.isActive" outlined autogrow rows=12'
+                )
+                if initial_text:
+                    content_input.value = initial_text
+
+            with ui.row().classes(f"w-full items-center justify-between pt-2 border-t {BORDER} shrink-0"):
+                ui.button("Cancel", on_click=d.close).props("flat dense no-caps")
+
+                def _do_save():
+                    raw_fn = (filename_input.value or "").strip()
+                    if not raw_fn:
+                        raw_fn = "reference.md"
+                    if "." not in raw_fn:
+                        raw_fn = f"{raw_fn}.md"
+
+                    raw_text = content_input.value or ""
+                    if not raw_text.strip():
+                        ui.notify("Reference content cannot be empty.", type="warning")
+                        return
+
+                    try:
+                        dest = sub_ws.save_text_file(raw_fn, raw_text)
+                        if load_now_check.value:
+                            sub_ws.load_file(raw_fn)
+                            ui.notify(f"✓ Saved & loaded: sub_workspace/{raw_fn} [C]", type="positive")
+                        else:
+                            ui.notify(f"✓ Saved: sub_workspace/{raw_fn} [U]", type="positive")
+                        d.close()
+                        refresh_subws_panel()
+                    except Exception as ex:
+                        notify_error(f"Failed to save reference: {ex}")
+
+                ui.button("Save Reference", icon="check", on_click=_do_save).props(
+                    "unelevated dense color=primary no-caps"
+                )
+
+        d.open()
+
+    # ── Sub-Workspace Hub: Subscribed Persona, Tools, Skills & Reference Files ──
+
+    def refresh_subws_panel():
+        """Refreshes the entire Sub-WS sidebar panel, separating Handbag from Project Extra assets."""
         try:
-            with os.scandir(folder_str) as it:
-                entries = sorted(it, key=lambda e: (not e.is_dir(follow_symlinks=False), e.name.lower()))
-        except Exception as e:
-            return [{"rel": "__err__", "name": f"(cannot read folder: {e})", "path": "", "is_dir": False, "error": True}]
+            session.ensure_ready()
+        except Exception:
+            pass
 
-        for entry in entries:
-            try:
-                if entry.is_symlink() or _should_skip(entry.name):
-                    continue
-                is_dir = entry.is_dir(follow_symlinks=False)
-                p = Path(entry.path)
-                rel = str(p.relative_to(root)).replace("\\", "/")
-                nodes.append({"rel": rel, "name": entry.name, "path": str(p), "is_dir": is_dir})
-            except OSError:
-                continue
-        return nodes
-
-    async def _children_of_subws_async(rel: str) -> list:
-        if rel in subws_children:
-            return subws_children[rel]
+        data = agent_bridge.get_subws_tools_and_skills(session.personality, prefs, session.client)
         from lollms_client.apps.lollms_code.sub_workspace import SubWorkspaceManager
         sub_ws = SubWorkspaceManager(prefs.workspace_path)
-        folder = sub_ws.sub_ws_dir if rel == "" else (sub_ws.sub_ws_dir / rel)
-        nodes = await _nicegui_run.io_bound(_scan_subws_dir_sync, str(folder), str(sub_ws.sub_ws_dir))
-        subws_children[rel] = nodes
-        return nodes
+        ref_files = sub_ws.list_files()
 
-    def _children_of_subws_cached(rel: str) -> list:
-        return subws_children.get(rel, [])
+        # Update badge count
+        p_tools_cnt = len(data["tools"]["project"])
+        p_skills_cnt = len(data["skills"]["project"])
+        ref_loaded_cnt = sum(1 for f in ref_files if f["is_loaded"])
+        total_subscribed = p_tools_cnt + p_skills_cnt + ref_loaded_cnt
 
-    def refresh_subws_tree():
-        subws_children.clear()
-        subws_expanded.clear()
-        from lollms_client.apps.lollms_code.sub_workspace import SubWorkspaceManager
-        sub_ws = SubWorkspaceManager(prefs.workspace_path)
-        files = sub_ws.list_files()
-        loaded_count = sum(1 for f in files if f["is_loaded"])
-        if files:
-            subws_tab_badge.set_text(f"{loaded_count}/{len(files)}")
+        if total_subscribed > 0:
+            subws_tab_badge.set_text(str(total_subscribed))
             subws_tab_badge.visible = True
         else:
             subws_tab_badge.visible = False
 
-        async def _load_subws_root():
-            subws_loading.add("")
-            _paint_subws_tree()
-            try:
-                await _children_of_subws_async("")
-            finally:
-                subws_loading.discard("")
-            _paint_subws_tree()
-
-        ui.timer(0.01, _load_subws_root, once=True)
-
-    def _paint_subws_tree():
         subws_tree_container.clear()
+
         with subws_tree_container:
-            q = (subws_tree_search_input.value or "").lower().strip()
-            if q:
-                _render_subws_search_results(q)
-                return
-            roots = _children_of_subws_cached("")
-            if not roots:
-                ui.label("Loading…" if "" in subws_loading else "(No reference files in .lollms_code/sub_workspace/)").classes(
-                    f"text-xs {MUTED_DIM} p-2 italic"
-                )
-                return
-            _render_subws_nodes(roots, 0)
-
-    def _render_subws_nodes(nodes: list, depth: int):
-        for node in nodes:
-            try:
-                _render_subws_one_node(node, depth)
-            except Exception as e:
-                ui.label(f"⚠ {node.get('name', '?')} ({e})").classes("text-xs text-red-400 pl-2")
-
-    def _render_subws_one_node(node: Dict[str, Any], depth: int):
-        if node.get("error"):
-            ui.label(node["name"]).classes(f"text-xs {MUTED_DIM} pl-2 italic")
-            return
-
-        from lollms_client.apps.lollms_code.sub_workspace import SubWorkspaceManager
-        sub_ws = SubWorkspaceManager(prefs.workspace_path)
-        loaded_set = sub_ws.get_loaded_files()
-
-        rel = node["rel"]
-        is_dir = node["is_dir"]
-        expanded = rel in subws_expanded
-        is_loaded = (not is_dir) and (rel in loaded_set)
-        icon, colour = _icon_for(node["name"], is_dir, expanded)
-
-        row = ui.row().classes(_row_classes(is_loaded)).style(f"padding-left: {6 + depth * 12}px")
-        with row:
-            if is_dir:
-                if rel in subws_loading:
-                    ui.spinner(size="14px").classes("shrink-0")
-                else:
-                    ui.icon("chevron_right" if not expanded else "expand_more").classes(
-                        "text-slate-500 shrink-0"
-                    ).props("size=14px")
-            else:
-                ui.element("div").classes("shrink-0").style("width: 14px")
-            ui.icon(icon).classes(f"{colour} shrink-0").props("size=16px")
-            label = ui.label(node["name"]).classes(
-                "text-xs truncate "
-                + ("font-semibold " if is_loaded else "")
-                + ("text-emerald-700 dark:text-emerald-300" if is_loaded else STRONG)
-            )
-            ui.element("div").classes("flex-1")
-            if is_loaded:
-                ui.icon("task_alt").classes("text-emerald-500 shrink-0").props("size=13px").tooltip(
-                    "Loaded into agent context [C]"
-                )
-
-        if not is_dir:
-            label.tooltip(f"sub_workspace/{rel}\n{_file_meta(node['path'])}")
-
-        if is_dir:
-            row.on("click", lambda r=rel: _toggle_subws_dir(r))
-        else:
-            row.on("dblclick", lambda p=node["path"]: open_in_default_editor(p))
-
-        _attach_subws_context_menu(row, node, is_loaded)
-
-        if is_dir and expanded:
-            _render_subws_nodes(_children_of_subws_cached(rel), depth + 1)
-
-    async def _toggle_subws_dir(rel: str):
-        if rel in subws_expanded:
-            subws_expanded.discard(rel)
-            _paint_subws_tree()
-            return
-        subws_expanded.add(rel)
-        if rel not in subws_children:
-            subws_loading.add(rel)
-            _paint_subws_tree()
-            try:
-                await _children_of_subws_async(rel)
-            finally:
-                subws_loading.discard(rel)
-        _paint_subws_tree()
-
-    def _attach_subws_context_menu(container, node: Dict[str, Any], is_loaded: bool):
-        rel = node["rel"]
-        abs_path = node["path"]
-        from lollms_client.apps.lollms_code.sub_workspace import SubWorkspaceManager
-        sub_ws = SubWorkspaceManager(prefs.workspace_path)
-        with container:
-            with ui.context_menu():
-                if node["is_dir"]:
-                    def _load_subws_folder(r=rel):
-                        target_dir = sub_ws.sub_ws_dir / r
-                        for f in target_dir.rglob("*"):
-                            if f.is_file() and not sub_ws._is_ignored(f):
-                                sub_ws.load_file(str(f.relative_to(sub_ws.sub_ws_dir)).replace("\\", "/"))
-                        ui.notify(f"Loaded folder '{r}' into context [C]", type="positive")
-                        refresh_subws_tree()
-
-                    def _unload_subws_folder(r=rel):
-                        target_dir = sub_ws.sub_ws_dir / r
-                        for f in target_dir.rglob("*"):
-                            if f.is_file() and not sub_ws._is_ignored(f):
-                                sub_ws.unload_file(str(f.relative_to(sub_ws.sub_ws_dir)).replace("\\", "/"))
-                        ui.notify(f"Unloaded folder '{r}' [U]", type="info")
-                        refresh_subws_tree()
-
-                    def _delete_subws_folder(r=rel):
-                        sub_ws.remove_path(r)
-                        ui.notify(f"Removed folder '{r}'", type="info")
-                        refresh_subws_tree()
-
-                    ui.menu_item("📥 Load all files in folder [C]", _load_subws_folder)
-                    ui.menu_item("📤 Unload all files in folder [U]", _unload_subws_folder)
-                    ui.separator()
-                    ui.menu_item("📂 Open folder in native software", lambda p=abs_path: open_in_default_editor(p))
-                    ui.menu_item("📁 Reveal in file manager", lambda p=abs_path: reveal_in_file_manager(p))
-                    ui.separator()
-                    ui.menu_item("🗑️ Delete folder from sub-workspace", _delete_subws_folder)
-                else:
-                    def _toggle_load(r=rel, loaded=is_loaded):
-                        if loaded:
-                            sub_ws.unload_file(r)
-                            ui.notify(f"Unloaded {r} [U]", type="info")
-                        else:
-                            sub_ws.load_file(r)
-                            ui.notify(f"Loaded {r} into context [C]", type="positive")
-                        refresh_subws_tree()
-
-                    def _peek_action(r=rel):
-                        content = sub_ws.peek_file(r)
-                        dlg = ui.dialog()
-                        with dlg, ui.card().classes(f"w-[760px] max-w-[95vw] h-[550px] flex flex-col p-4 {CANVAS} text-slate-900 dark:text-slate-100 rounded-xl border {BORDER}"):
-                            with ui.row().classes(f"w-full items-center justify-between pb-2 border-b {BORDER}"):
-                                ui.label(f"👁️ Peek: sub_workspace/{r}").classes("text-sm font-bold font-mono")
-                                ui.button(icon="close", on_click=dlg.close).props("flat round dense size=xs")
-                            with ui.scroll_area().classes(f"w-full flex-1 border {BORDER} rounded p-2 bg-slate-900 dark:bg-slate-950"):
-                                ui.code(content, language="markdown" if r.endswith(".md") else "python" if r.endswith(".py") else "text").classes("w-full text-xs")
-                        dlg.open()
-
-                    def _delete_action(r=rel):
-                        sub_ws.remove_path(r)
-                        ui.notify(f"Removed {r}", type="info")
-                        refresh_subws_tree()
-
-                    if is_loaded:
-                        ui.menu_item("📤 Unload from context [U]", lambda: _toggle_load())
-                    else:
-                        ui.menu_item("📥 Load into context [C]", lambda: _toggle_load())
-                    ui.menu_item("👁️ Peek content", _peek_action)
-                    ui.separator()
-                    ui.menu_item("💬 Mention in prompt", lambda r=rel: _insert_into_prompt(f"sub_workspace/{r}"))
-                    ui.menu_item("✏️ Open in native software", lambda p=abs_path: open_in_default_editor(p))
-                    ui.menu_item("📁 Reveal in file manager", lambda p=abs_path: reveal_in_file_manager(p))
-                    ui.separator()
-                    ui.menu_item("📋 Copy relative path", lambda r=rel: _copy_text(f"sub_workspace/{r}", "Relative path"))
-                    ui.menu_item("📋 Copy absolute path", lambda p=abs_path: _copy_text(p, "Absolute path"))
-                    ui.separator()
-                    ui.menu_item("🗑️ Delete from sub-workspace", _delete_action)
-
-    def _render_subws_search_results(q: str):
-        from lollms_client.apps.lollms_code.sub_workspace import SubWorkspaceManager
-        sub_ws = SubWorkspaceManager(prefs.workspace_path)
-        files = sub_ws.list_files(q)
-        if not files:
-            ui.label("(no matches)").classes(f"text-xs {MUTED_DIM} p-2")
-            return
-        ui.label(f"{len(files)} match(es)").classes(f"text-[10px] {MUTED_DIM} px-2 pb-1")
-        for f in files:
-            node = {
-                "rel": f["rel_path"],
-                "name": f["name"],
-                "path": f["full_path"],
-                "is_dir": False,
+            # ── 1. ACTIVE PERSONA / HANDBAG SECTION ──
+            persona_info = data["persona"]
+            src_label_map = {
+                "handbag": ("Handbag", "purple"),
+                "project": ("Project Extra", "emerald"),
+                "global": ("Global Machine", "indigo"),
+                "default": ("Default Coder", "blue"),
             }
-            _render_subws_search_row(node, f["is_loaded"])
+            src_txt, src_col = src_label_map.get(persona_info["source"], ("Handbag", "purple"))
 
-    def _render_subws_search_row(node: Dict[str, Any], is_loaded: bool):
-        icon, colour = _icon_for(node["name"], False)
-        row = ui.row().classes(_row_classes(is_loaded) + " px-1.5")
-        with row:
-            ui.icon(icon).classes(f"{colour} shrink-0").props("size=16px")
-            with ui.column().classes("gap-0 min-w-0 flex-1"):
-                ui.label(node["name"]).classes(
-                    "text-xs truncate "
-                    + ("text-emerald-700 dark:text-emerald-300 font-semibold" if is_loaded else STRONG)
-                )
-                ui.label(f"sub_workspace/{node['rel']}").classes(f"text-[10px] truncate {MUTED_DIM}")
-            if is_loaded:
-                ui.icon("task_alt").classes("text-emerald-500 shrink-0").props("size=13px")
-        row.on("dblclick", lambda p=node["path"]: open_in_default_editor(p))
-        _attach_subws_context_menu(row, node, is_loaded)
+            with ui.card().classes(f"w-full p-2.5 rounded-lg border {BORDER} {SURFACE} gap-1 shadow-none mb-1"):
+                with ui.row().classes("w-full items-center justify-between"):
+                    with ui.row().classes("items-center gap-1.5"):
+                        ui.icon("face", size="18px").classes("text-purple-500")
+                        ui.label(persona_info["name"]).classes("text-xs font-bold truncate text-slate-900 dark:text-slate-100")
+                    ui.badge(src_txt, color=src_col).props("dense rounded text-[9px]")
 
-    subws_tree_search_input.on_value_change(lambda _: _paint_subws_tree())
+                if persona_info["description"]:
+                    ui.label(persona_info["description"]).classes(f"text-[10px] {MUTED} line-clamp-1 italic")
+
+                with ui.row().classes("w-full items-center justify-between pt-1 border-t border-slate-200 dark:border-slate-800"):
+                    def _view_soul():
+                        soul_text = persona_info["soul_content"] or f"You are {persona_info['name']}."
+
+                        from lollms_client.lollms_personality import PersonalityBundle
+                        meta, prompt_body = PersonalityBundle.parse_soul_md(soul_text)
+
+                        d = ui.dialog()
+                        with d, ui.card().classes(f"w-[760px] max-w-[95vw] h-[580px] flex flex-col p-4 {CANVAS} rounded-xl border {BORDER} gap-2"):
+                            with ui.row().classes(f"w-full items-center justify-between pb-2 border-b {BORDER}"):
+                                with ui.row().classes("items-center gap-2"):
+                                    ui.icon("theater_masks", size="22px").classes("text-purple-500")
+                                    ui.label(f"Persona SOUL: {meta.get('name') or persona_info['name']}").classes("text-sm font-bold")
+                                ui.button(icon="close", on_click=d.close).props("flat dense round size=xs")
+
+                            # Metadata summary row (cleanly styled without Markdown Setext heading artifacts)
+                            with ui.row().classes("w-full items-center gap-2 px-2 py-1.5 bg-slate-100 dark:bg-slate-900 rounded border border-slate-200 dark:border-slate-800 flex-wrap text-xs"):
+                                ui.label(f"Author: {meta.get('author', 'ParisNeo')}").classes("font-semibold text-slate-700 dark:text-slate-300")
+                                ui.label("·").classes("text-slate-400")
+                                ui.label(f"Category: {meta.get('category', persona_info['category'])}").classes("text-purple-600 dark:text-purple-400 font-mono")
+                                if meta.get("description"):
+                                    ui.label("·").classes("text-slate-400")
+                                    ui.label(meta.get("description")).classes("text-[11px] text-slate-500 dark:text-slate-400 italic truncate max-w-sm")
+
+                            with ui.scroll_area().classes("w-full flex-1 p-3 bg-white dark:bg-slate-950 rounded border border-slate-200 dark:border-slate-800"):
+                                ui.markdown(prompt_body.strip()).classes("text-xs leading-relaxed text-slate-900 dark:text-slate-100")
+
+                        d.open()
+
+                    ui.button("View SOUL", icon="visibility", on_click=_view_soul).props("flat dense size=xs no-caps text-color=purple")
+
+                    # Switch Persona Dropdown
+                    handbags_list = data["available_handbags"]
+                    if len(handbags_list) > 1:
+                        def _switch_p(e):
+                            val = e.value
+                            if val:
+                                try:
+                                    session.personality = agent_bridge.switch_persona_handbag(prefs, session.client, val)
+                                    ui.notify(f"Switched persona to: {session.personality.name}", type="positive")
+                                    refresh_subws_panel()
+                                except Exception as err:
+                                    notify_error(f"Switch persona failed: {err}")
+
+                        hb_options = {h["path"]: f"{h['title']} ({h['scope']})" for h in handbags_list}
+                        curr_val = persona_info["handbag_path"]
+                        hb_sel = ui.select(hb_options, value=curr_val if curr_val in hb_options else None).classes("w-32 text-[10px]").props("dense options-dense")
+                        hb_sel.on_value_change(_switch_p)
+
+            # ── 2. TOOLS SECTION (Handbag vs Project Extra) ──
+            h_tools = data["tools"]["handbag"]
+            p_tools = data["tools"]["project"]
+            b_tools = data["tools"]["builtin"]
+
+            def _view_tool_content(t_item: Dict[str, Any]):
+                title = t_item.get("name", "Tool")
+                desc = t_item.get("description", "(No description)")
+                src_path = t_item.get("source_file") or ""
+                params = t_item.get("parameters", [])
+
+                # ── Resilient Source Path Resolution ──
+                if not src_path or not Path(src_path).exists():
+                    # 1. Check LCP discovered tools
+                    if session.client and session.client.tools and hasattr(session.client.tools, "discovered_tools"):
+                        match = next((t for t in session.client.tools.discovered_tools if t.get("name") == title), None)
+                        if match and match.get("_python_file_path") and Path(match["_python_file_path"]).exists():
+                            src_path = match["_python_file_path"]
+
+                    # 2. Check default tools path in lollms_client
+                    if not src_path or not Path(src_path).exists():
+                        import lollms_client
+                        default_tools_base = Path(lollms_client.__file__).resolve().parent / "tools_bindings" / "lcp" / "default_tools"
+                        clean_stem = title[5:] if title.startswith("tool_") else title
+                        candidates = [
+                            default_tools_base / clean_stem / f"{clean_stem}.py",
+                            default_tools_base / "document_editor" / "document_editor.py",
+                            default_tools_base / "as_is_document_tools" / "as_is_document_tools.py",
+                            default_tools_base / "execute_python" / "execute_python.py",
+                            default_tools_base / "system_shell" / "system_shell.py",
+                            default_tools_base / "workspace_tools" / "workspace_tools.py",
+                            default_tools_base / "git_manager" / "git_manager.py",
+                            Path(lollms_client.__file__).resolve().parent / "lollms_agentic" / "spinoff_tools.py",
+                        ]
+                        for cand in candidates:
+                            if cand.exists():
+                                try:
+                                    content = cand.read_text(encoding="utf-8", errors="ignore")
+                                    if title in content:
+                                        src_path = str(cand.resolve())
+                                        break
+                                except Exception:
+                                    pass
+
+                # Extract Documentation (README.md) and Python code
+                doc_text = ""
+                code_text = ""
+
+                if src_path and Path(src_path).exists():
+                    p_file = Path(src_path)
+                    try:
+                        if p_file.is_file():
+                            code_text = p_file.read_text(encoding="utf-8", errors="ignore")
+                            # Check sibling README.md
+                            sibling_readme = p_file.parent / "README.md"
+                            if sibling_readme.exists():
+                                doc_text = sibling_readme.read_text(encoding="utf-8", errors="ignore")
+                        elif p_file.is_dir():
+                            readme = p_file / "README.md"
+                            if readme.exists():
+                                doc_text = readme.read_text(encoding="utf-8", errors="ignore")
+                            for py_f in p_file.glob("*.py"):
+                                if py_f.name != "__init__.py":
+                                    code_text = py_f.read_text(encoding="utf-8", errors="ignore")
+                                    break
+                    except Exception as err:
+                        code_text = f"Error reading file: {err}"
+
+                d = ui.dialog()
+                with d, ui.card().classes(f"w-[800px] max-w-[95vw] h-[600px] flex flex-col p-4 {CANVAS} rounded-xl border {BORDER} gap-2"):
+                    with ui.row().classes(f"w-full items-center justify-between pb-2 border-b {BORDER} shrink-0"):
+                        with ui.row().classes("items-center gap-2"):
+                            ui.icon("construction", size="22px").classes("text-primary")
+                            ui.label(f"Tool Specification: {title}").classes("text-sm font-bold text-slate-900 dark:text-slate-100")
+                        ui.button(icon="close", on_click=d.close).props("flat dense round size=xs")
+
+                    ui.label(desc).classes(f"text-xs {MUTED} italic shrink-0 px-1")
+                    if src_path:
+                        ui.label(f"Source: {src_path}").classes(f"text-[10px] {MUTED_DIM} font-mono truncate px-1 shrink-0")
+
+                    # Tab switcher between Documentation, Python Code, and Parameters
+                    has_both = bool(doc_text and code_text)
+                    default_tab = 'doc' if doc_text else 'code'
+
+                    with ui.tabs().classes(f"w-full {SURFACE} border-b {BORDER} shrink-0").props('dense no-caps active-color="primary" indicator-color="primary"') as tool_tabs:
+                        if doc_text:
+                            tab_doc = ui.tab('doc', label='📖 Documentation', icon='menu_book').classes('text-xs py-1 flex-1')
+                        tab_code = ui.tab('code', label='🐍 Python Source Code', icon='code').classes('text-xs py-1 flex-1')
+                        if params:
+                            tab_params = ui.tab('params', label=f'⚙️ Parameters ({len(params)})', icon='tune').classes('text-xs py-1 flex-1')
+
+                    with ui.tab_panels(tool_tabs, value=default_tab).classes('w-full flex-1 min-h-0 p-0 bg-transparent flex flex-col overflow-hidden'):
+                        if doc_text:
+                            with ui.tab_panel('doc').classes('w-full h-full p-2 flex flex-col overflow-hidden'):
+                                with ui.scroll_area().classes(f"w-full flex-1 p-3 {SURFACE} rounded border {BORDER}"):
+                                    ui.markdown(doc_text).classes("text-xs leading-relaxed text-slate-900 dark:text-slate-100")
+
+                        with ui.tab_panel('code').classes('w-full h-full p-2 flex flex-col overflow-hidden'):
+                            with ui.scroll_area().classes(f"w-full flex-1 p-2 {SURFACE} rounded border {BORDER}"):
+                                ui.code(code_text or "(No Python source code directly attached)", language="python").classes("w-full text-xs")
+
+                        if params:
+                            with ui.tab_panel('params').classes('w-full h-full p-2 flex flex-col overflow-hidden'):
+                                with ui.scroll_area().classes(f"w-full flex-1 p-3 {SURFACE} rounded border {BORDER}"):
+                                    ui.label("PARAMETER SCHEMA:").classes(f"text-[10px] font-bold text-slate-500 mb-2")
+                                    for p in params:
+                                        with ui.column().classes(f"w-full p-2 rounded border {BORDER} bg-white dark:bg-slate-900 mb-1.5 gap-0.5"):
+                                            with ui.row().classes("items-center gap-2"):
+                                                ui.label(p.get("name", "param")).classes("text-xs font-mono font-bold text-primary")
+                                                ui.badge(p.get("type", "string"), color="slate").props("dense rounded text-[9px]")
+                                                if p.get("optional"):
+                                                    ui.badge("optional", color="grey").props("dense rounded text-[9px]")
+                                            if p.get("description"):
+                                                ui.label(p["description"]).classes(f"text-[11px] {MUTED} pl-1")
+                d.open()
+
+            with ui.expansion(f"🧰 Tools (H:{len(h_tools)} | P:{len(p_tools)})", icon="build").classes(
+                f"w-full border {BORDER} rounded-lg {SURFACE} mb-1"
+            ).props('header-class="py-1 px-2 text-xs font-bold text-slate-900 dark:text-slate-100 flex-nowrap"'):
+                with ui.column().classes("w-full gap-2 p-1.5"):
+                    # 1. Project Extra Tools (.lollms_code/tools/) — HAS REMOVE / UNINSTALL BUTTON
+                    with ui.column().classes("w-full gap-1"):
+                        ui.label(f"📁 PROJECT EXTRA TOOLS ({len(p_tools)})").classes("text-[10px] font-bold text-emerald-600 dark:text-emerald-400")
+                        if not p_tools:
+                            ui.label("(No project tools in .lollms_code/tools)").classes(f"text-[10px] {MUTED_DIM} italic pl-1")
+                        for t in p_tools:
+                            with ui.row().classes("w-full items-center justify-between p-1 rounded hover:bg-slate-200/50 dark:hover:bg-slate-800/50 flex-nowrap"):
+                                with ui.row().classes("items-center gap-1.5 flex-1 min-w-0 flex-nowrap"):
+                                    ui.icon("build_circle", size="14px").classes("text-emerald-500 shrink-0")
+                                    ui.label(t["name"]).classes("text-xs font-mono font-semibold truncate text-slate-900 dark:text-slate-100 max-w-[120px]").tooltip(f"{t['name']}\n{t.get('description', '')}")
+                                with ui.row().classes("items-center gap-1 shrink-0 flex-nowrap"):
+                                    ui.badge("Project", color="emerald").props("dense rounded text-[9px]")
+                                    ui.button(icon="visibility", on_click=lambda item=t: _view_tool_content(item)).props("flat dense round size=xs color=primary").tooltip("View Tool Code / Documentation")
+
+                                    def _confirm_delete_tool(t_item=t):
+                                        dlg = ui.dialog()
+                                        with dlg, ui.card().classes(f"w-[420px] p-4 gap-3 bg-white dark:bg-slate-900 rounded-xl border {BORDER}"):
+                                            ui.label("Remove Tool from Project?").classes("text-sm font-bold text-red-500")
+                                            ui.label(f"Are you sure you want to remove '{t_item['name']}' from this project's .lollms_code/tools folder?").classes("text-xs text-slate-600 dark:text-slate-300")
+                                            with ui.row().classes("w-full justify-end gap-2 mt-2"):
+                                                ui.button("Cancel", on_click=dlg.close).props("flat dense")
+                                                def _do_remove():
+                                                    dlg.close()
+                                                    p_to_del = Path(t_item.get("source_file", ""))
+                                                    if p_to_del.exists():
+                                                        try:
+                                                            if p_to_del.is_dir():
+                                                                import shutil
+                                                                shutil.rmtree(str(p_to_del))
+                                                            else:
+                                                                p_to_del.unlink()
+                                                            if session.client and session.client.tools and hasattr(session.client.tools, "_discover_local_tools"):
+                                                                session.client.tools._discover_local_tools()
+                                                            ui.notify(f"Removed tool '{t_item['name']}' from project", type="info")
+                                                            refresh_subws_panel()
+                                                        except Exception as err:
+                                                            notify_error(f"Failed to delete tool: {err}")
+                                                ui.button("Remove from Project", on_click=_do_remove).props("unelevated dense color=red no-caps")
+                                        dlg.open()
+
+                                    ui.button(icon="delete", on_click=_confirm_delete_tool).props("flat dense round size=xs color=red").tooltip("Remove tool from project (.lollms_code/tools/)")
+
+                    # 2. Handbag Tools (PROTECTED - VIEW ONLY, NO DELETE BUTTON)
+                    with ui.column().classes("w-full gap-1 pt-1 border-t border-slate-200 dark:border-slate-800"):
+                        ui.label(f"👜 HANDBAG TOOLS ({len(h_tools)})").classes("text-[10px] font-bold text-purple-600 dark:text-purple-400")
+                        if not h_tools:
+                            ui.label("(None bundled in active handbag)").classes(f"text-[10px] {MUTED_DIM} italic pl-1")
+                        for t in h_tools:
+                            with ui.row().classes("w-full items-center justify-between p-1 rounded hover:bg-slate-200/50 dark:hover:bg-slate-800/50 flex-nowrap"):
+                                with ui.row().classes("items-center gap-1.5 flex-1 min-w-0 flex-nowrap"):
+                                    ui.icon("construction", size="14px").classes("text-purple-500 shrink-0")
+                                    ui.label(t["name"]).classes("text-xs font-mono font-semibold truncate text-slate-900 dark:text-slate-100 max-w-[130px]").tooltip(f"{t['name']}\n{t.get('description', '')}")
+                                with ui.row().classes("items-center gap-1 shrink-0 flex-nowrap"):
+                                    ui.badge("Handbag", color="purple").props("dense rounded text-[9px]").tooltip("Handbag native tool (read-only, cannot be removed from project)")
+                                    ui.button(icon="visibility", on_click=lambda item=t: _view_tool_content(item)).props("flat dense round size=xs color=purple").tooltip("View Tool Code / Info")
+
+                    # 3. Built-in & System Tools (PROTECTED - VIEW ONLY)
+                    if b_tools:
+                        with ui.expansion(f"⚙️ System & LCP Built-ins ({len(b_tools)})", icon="settings").classes(
+                            f"w-full border border-slate-200 dark:border-slate-800 rounded bg-slate-100/50 dark:bg-slate-900/50"
+                        ).props('header-class="py-0.5 px-1.5 text-[10px] font-bold text-slate-500 flex-nowrap"'):
+                            with ui.column().classes("w-full gap-0.5 p-1"):
+                                for t in b_tools:
+                                    with ui.row().classes("w-full items-center justify-between p-1 rounded hover:bg-slate-200/50 dark:hover:bg-slate-800/50 flex-nowrap"):
+                                        with ui.row().classes("items-center gap-1 flex-1 min-w-0 flex-nowrap"):
+                                            ui.icon("memory", size="13px").classes("text-slate-400 shrink-0")
+                                            ui.label(t["name"]).classes("text-[11px] font-mono truncate text-slate-700 dark:text-slate-300 max-w-[130px]").tooltip(f"{t['name']}\n{t.get('description', '')}")
+                                        ui.button(icon="visibility", on_click=lambda item=t: _view_tool_content(item)).props("flat dense round size=xs color=grey").tooltip("View Built-in Tool Specification")
+
+                    # Add tools from zoo shortcut
+                    with ui.row().classes("w-full justify-end pt-1"):
+                        ui.button("+ Add Tool from Zoo", icon="add", on_click=lambda: open_zoo_dialog()).props("flat dense size=xs color=primary no-caps")
+
+            # ── 3. SKILLS SECTION (Handbag vs Project Extra) ──
+            h_skills = data["skills"]["handbag"]
+            p_skills = data["skills"]["project"]
+
+            def _view_skill_content(s_item: Dict[str, Any]):
+                title = s_item.get("title", "Skill")
+                desc = s_item.get("description", "")
+                fp = s_item.get("file_path", "")
+                content = s_item.get("content_preview", "")
+                if fp and Path(fp).exists():
+                    try:
+                        content = Path(fp).read_text(encoding="utf-8", errors="ignore")
+                    except Exception:
+                        pass
+
+                d = ui.dialog()
+                with d, ui.card().classes(f"w-[760px] max-w-[95vw] h-[550px] flex flex-col p-4 {CANVAS} rounded-xl border {BORDER} gap-2"):
+                    with ui.row().classes(f"w-full items-center justify-between pb-2 border-b {BORDER} shrink-0"):
+                        with ui.row().classes("items-center gap-2"):
+                            ui.icon("school", size="22px").classes("text-primary")
+                            ui.label(f"Skill: {title}").classes("text-sm font-bold text-slate-900 dark:text-slate-100")
+                        ui.button(icon="close", on_click=d.close).props("flat dense round size=xs")
+                    if desc:
+                        ui.label(desc).classes(f"text-xs {MUTED} italic mb-1 shrink-0 px-1")
+                    with ui.scroll_area().classes(f"w-full flex-1 p-3 {SURFACE} rounded border {BORDER}"):
+                        ui.markdown(content or "No skill content.").classes("text-xs leading-relaxed text-slate-900 dark:text-slate-100")
+                d.open()
+
+            with ui.expansion(f"🧠 Skills (H:{len(h_skills)} | P:{len(p_skills)})", icon="psychology").classes(
+                f"w-full border {BORDER} rounded-lg {SURFACE} mb-1"
+            ).props('header-class="py-1 px-2 text-xs font-bold text-slate-900 dark:text-slate-100 flex-nowrap"'):
+                with ui.column().classes("w-full gap-2 p-1.5"):
+                    # 1. Project Extra Skills (.lollms_code/skills/) — WITH REMOVE / DELETE BUTTON
+                    with ui.column().classes("w-full gap-1"):
+                        ui.label(f"📁 PROJECT EXTRA SKILLS ({len(p_skills)})").classes("text-[10px] font-bold text-emerald-600 dark:text-emerald-400")
+                        if not p_skills:
+                            ui.label("(No project skills in .lollms_code/skills)").classes(f"text-[10px] {MUTED_DIM} italic pl-1")
+                        for s in p_skills:
+                            with ui.row().classes("w-full items-center justify-between p-1 rounded hover:bg-slate-200/50 dark:hover:bg-slate-800/50 flex-nowrap"):
+                                with ui.row().classes("items-center gap-1.5 flex-1 min-w-0 flex-nowrap"):
+                                    ui.icon("psychology", size="14px").classes("text-emerald-500 shrink-0")
+                                    ui.label(s["title"]).classes("text-xs font-semibold truncate text-slate-900 dark:text-slate-100 max-w-[110px]").tooltip(f"{s['title']}\n{s.get('description', '')}")
+
+                                with ui.row().classes("items-center gap-1 shrink-0 flex-nowrap"):
+                                    vis = s.get("visibility", "loadable")
+                                    is_vis = (vis == "visible")
+
+                                    def _toggle_skill_vis(s_item=s, curr_vis=is_vis):
+                                        if session.personality and session.personality.skills_manager:
+                                            new_v = "loadable" if curr_vis else "visible"
+                                            try:
+                                                session.personality.skills_manager.set_skill_visibility(s_item["title"], new_v)
+                                                ui.notify(f"Skill '{s_item['title']}' set to {new_v.upper()}", type="positive")
+                                                refresh_subws_panel()
+                                            except Exception as ex:
+                                                notify_error(f"Failed to change visibility: {ex}")
+
+                                    ui.button(
+                                        "[C]" if is_vis else "[U]",
+                                        on_click=_toggle_skill_vis,
+                                    ).props(f"flat dense size=xs color={'emerald' if is_vis else 'grey'} no-caps").tooltip("Toggle in-context: [C]=Loaded, [U]=Loadable")
+
+                                    ui.button(icon="visibility", on_click=lambda item=s: _view_skill_content(item)).props("flat dense round size=xs color=primary").tooltip("View Skill Content")
+
+                                    def _confirm_delete_skill(s_item=s):
+                                        dlg = ui.dialog()
+                                        with dlg, ui.card().classes(f"w-[420px] p-4 gap-3 bg-white dark:bg-slate-900 rounded-xl border {BORDER}"):
+                                            ui.label("Remove Skill from Project?").classes("text-sm font-bold text-red-500")
+                                            ui.label(f"Are you sure you want to remove '{s_item['title']}' from this project's .lollms_code/skills folder?").classes("text-xs text-slate-600 dark:text-slate-300")
+                                            with ui.row().classes("w-full justify-end gap-2 mt-2"):
+                                                ui.button("Cancel", on_click=dlg.close).props("flat dense")
+                                                def _do_remove():
+                                                    dlg.close()
+                                                    fp = Path(s_item.get("file_path", ""))
+                                                    if fp.exists():
+                                                        try:
+                                                            if fp.is_dir():
+                                                                import shutil
+                                                                shutil.rmtree(str(fp))
+                                                            else:
+                                                                parent_dir = fp.parent
+                                                                fp.unlink()
+                                                                if parent_dir.name != "skills" and not any(parent_dir.iterdir()):
+                                                                    parent_dir.rmdir()
+
+                                                            if session.personality and session.personality.skills_manager:
+                                                                session.personality.skills_manager.reload()
+                                                            ui.notify(f"Removed skill '{s_item['title']}' from project", type="info")
+                                                            refresh_subws_panel()
+                                                        except Exception as err:
+                                                            notify_error(f"Failed to delete skill: {err}")
+                                                ui.button("Remove from Project", on_click=_do_remove).props("unelevated dense color=red no-caps")
+                                        dlg.open()
+
+                                    ui.button(icon="delete", on_click=_confirm_delete_skill).props("flat dense round size=xs color=red").tooltip("Remove skill from project (.lollms_code/skills/)")
+
+                    # 2. Handbag Skills (PROTECTED - VIEW ONLY, NO DELETE BUTTON)
+                    with ui.column().classes("w-full gap-1 pt-1 border-t border-slate-200 dark:border-slate-800"):
+                        ui.label(f"👜 HANDBAG SKILLS ({len(h_skills)})").classes("text-[10px] font-bold text-purple-600 dark:text-purple-400")
+                        if not h_skills:
+                            ui.label("(None bundled in active handbag)").classes(f"text-[10px] {MUTED_DIM} italic pl-1")
+                        for s in h_skills:
+                            with ui.row().classes("w-full items-center justify-between p-1 rounded hover:bg-slate-200/50 dark:hover:bg-slate-800/50 flex-nowrap"):
+                                with ui.row().classes("items-center gap-1.5 flex-1 min-w-0 flex-nowrap"):
+                                    ui.icon("school", size="14px").classes("text-purple-500 shrink-0")
+                                    ui.label(s["title"]).classes("text-xs font-semibold truncate text-slate-900 dark:text-slate-100 max-w-[130px]").tooltip(f"{s['title']}\n{s.get('description', '')}")
+                                with ui.row().classes("items-center gap-1 shrink-0 flex-nowrap"):
+                                    vis = s.get("visibility", "loadable")
+                                    v_badge = "[C]" if vis == "visible" else "[U]"
+                                    ui.badge(v_badge, color="emerald" if vis == "visible" else "grey").props("dense rounded text-[9px]")
+                                    ui.badge("Handbag", color="purple").props("dense rounded text-[9px]").tooltip("Handbag native skill (read-only, cannot be removed from project)")
+                                    ui.button(icon="visibility", on_click=lambda item=s: _view_skill_content(item)).props("flat dense round size=xs color=purple").tooltip("View Skill Content")
+
+                    # Add skills from zoo shortcut
+                    with ui.row().classes("w-full justify-end pt-1"):
+                        ui.button("+ Add Skill from Zoo", icon="add", on_click=lambda: open_zoo_dialog()).props("flat dense size=xs color=primary no-caps")
+
+            # ── 4. REFERENCE FILES SECTION (.lollms_code/sub_workspace/) ──
+            loaded_ref_count = sum(1 for f in ref_files if f["is_loaded"])
+            with ui.expansion(f"📚 Reference Docs ({len(ref_files)} | [C]:{loaded_ref_count})", icon="auto_stories").classes(
+                f"w-full border {BORDER} rounded-lg {SURFACE}"
+            ).props('header-class="py-1 px-2 text-xs font-bold text-slate-900 dark:text-slate-100 flex-nowrap"'):
+                with ui.column().classes("w-full gap-1.5 p-1.5"):
+                    # Toolbar
+                    with ui.row().classes("w-full items-center justify-between pb-1 border-b border-slate-200 dark:border-slate-800"):
+                        async def _import_f():
+                            _picker = pick_folder
+                            if _picker:
+                                chosen = await _picker(title="Select File to Import into Sub-Workspace")
+                                if chosen:
+                                    sub_ws.import_file(chosen)
+                                    ui.notify("Imported reference file.", type="positive")
+                                    refresh_subws_panel()
+
+                        async def _import_d():
+                            _picker = pick_folder
+                            if _picker:
+                                chosen = await _picker(title="Select Folder to Import into Sub-Workspace")
+                                if chosen:
+                                    sub_ws.import_folder(chosen)
+                                    ui.notify("Imported reference folder.", type="positive")
+                                    refresh_subws_panel()
+
+                        def _load_all_ref():
+                            cnt = sub_ws.load_all()
+                            ui.notify(f"Loaded all {cnt} reference files [C]", type="positive")
+                            refresh_subws_panel()
+
+                        def _unload_all_ref():
+                            sub_ws.unload_all()
+                            ui.notify("Unloaded all reference files [U]", type="info")
+                            refresh_subws_panel()
+
+                        with ui.row().classes("gap-0.5"):
+                            ui.button(icon="note_add", on_click=lambda: open_paste_reference_dialog()).props(
+                                "flat dense round size=xs color=primary"
+                            ).tooltip("Paste text as reference document")
+                            ui.button(icon="upload_file", on_click=_import_f).props("flat dense round size=xs").tooltip("Import reference file")
+                            ui.button(icon="drive_folder_upload", on_click=_import_d).props("flat dense round size=xs").tooltip("Import reference folder")
+                        with ui.row().classes("gap-0.5"):
+                            ui.button(icon="download", on_click=_load_all_ref).props("flat dense round size=xs color=emerald").tooltip("Load all [C]")
+                            ui.button(icon="clear_all", on_click=_unload_all_ref).props("flat dense round size=xs color=amber").tooltip("Unload all [U]")
+
+                    if not ref_files:
+                        ui.label("(No reference files in .lollms_code/sub_workspace/)").classes(f"text-[10px] {MUTED_DIM} italic p-1")
+                    else:
+                        for rf in ref_files:
+                            with ui.row().classes("w-full items-center justify-between p-1 rounded hover:bg-slate-200/50 dark:hover:bg-slate-800/50"):
+                                with ui.row().classes("items-center gap-1.5 flex-1 min-w-0"):
+                                    ui.icon("description", size="14px").classes("text-slate-400 shrink-0")
+                                    ui.label(rf["rel_path"]).classes("text-xs font-mono truncate text-slate-900 dark:text-slate-100")
+
+                                with ui.row().classes("items-center gap-1"):
+                                    is_l = rf["is_loaded"]
+
+                                    def _toggle_ref_load(rel=rf["rel_path"], loaded=is_l):
+                                        if loaded:
+                                            sub_ws.unload_file(rel)
+                                            ui.notify(f"Unloaded {rel} [U]", type="info")
+                                        else:
+                                            sub_ws.load_file(rel)
+                                            ui.notify(f"Loaded {rel} [C]", type="positive")
+                                        refresh_subws_panel()
+
+                                    def _peek_ref(rel=rf["rel_path"]):
+                                        content = sub_ws.peek_file(rel)
+                                        dlg = ui.dialog()
+                                        with dlg, ui.card().classes(f"w-[760px] max-w-[95vw] h-[550px] flex flex-col p-4 {CANVAS} rounded-xl border {BORDER} gap-2"):
+                                            with ui.row().classes(f"w-full items-center justify-between pb-2 border-b {BORDER} shrink-0"):
+                                                ui.label(f"👁️ Reference: sub_workspace/{rel}").classes("text-sm font-bold font-mono text-slate-900 dark:text-slate-100")
+                                                ui.button(icon="close", on_click=dlg.close).props("flat round dense size=xs")
+                                            with ui.scroll_area().classes(f"w-full flex-1 p-3 {SURFACE} rounded border {BORDER}"):
+                                                if rel.endswith((".md", ".markdown", ".txt")):
+                                                    ui.markdown(content).classes("text-xs leading-relaxed text-slate-900 dark:text-slate-100")
+                                                else:
+                                                    ui.code(content, language="json" if rel.endswith(".json") else ("python" if rel.endswith(".py") else "text")).classes("w-full text-xs")
+                                        dlg.open()
+
+                                    def _del_ref(rel=rf["rel_path"]):
+                                        sub_ws.remove_path(rel)
+                                        ui.notify(f"Removed {rel}", type="info")
+                                        refresh_subws_panel()
+
+                                    ui.button("[C]" if is_l else "[U]", on_click=_toggle_ref_load).props(
+                                        f"flat dense size=xs color={'emerald' if is_l else 'grey'} no-caps"
+                                    ).tooltip("Toggle context load [C]/[U]")
+                                    ui.button(icon="visibility", on_click=_peek_ref).props("flat dense round size=xs color=primary").tooltip("Peek file content")
+                                    ui.button(icon="delete", on_click=_del_ref).props("flat dense round size=xs color=red").tooltip("Delete reference file")
+
+    def refresh_subws_tree():
+        """Refreshes the Sub-Workspace panel and all subscribed assets."""
+        refresh_subws_panel()
 
     # Initial tree population
     refresh_workspace_tree()
-    refresh_subws_tree()
+    refresh_subws_panel()
     # ---------------- Command Palette (Ctrl+K) ----------------
 
     def open_command_palette():

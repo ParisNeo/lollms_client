@@ -73,8 +73,17 @@ class SubWorkspaceManager:
         return False
 
     def _is_ignored(self, p: Path) -> bool:
-        for part in p.parts:
-            if part in _IGNORED_NAMES or part.startswith("."):
+        """Checks if a file or directory inside sub_workspace should be ignored."""
+        try:
+            rel = p.relative_to(self.sub_ws_dir)
+            check_parts = rel.parts
+        except ValueError:
+            check_parts = p.parts
+
+        for part in check_parts:
+            if part in _IGNORED_NAMES:
+                return True
+            if part.startswith(".") and part not in (".", ".."):
                 return True
         return False
 
@@ -121,6 +130,23 @@ class SubWorkspaceManager:
                 return b"\x00" in chunk
         except Exception:
             return True
+
+    def save_text_file(self, rel_path: str, content: str) -> Path:
+        """Saves a string directly as a reference file in .lollms_code/sub_workspace/."""
+        self.ensure_dirs()
+        clean = rel_path.replace("\\", "/").strip().lstrip("/")
+        if clean.startswith("sub_workspace/"):
+            clean = clean[len("sub_workspace/"):]
+        if not clean:
+            clean = "reference.md"
+
+        target = (self.sub_ws_dir / clean).resolve()
+        if not str(target).startswith(str(self.sub_ws_dir.resolve())):
+            raise PermissionError(f"Path traversal blocked for destination: '{rel_path}'")
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return target
 
     def import_file(self, src: Union[str, Path], dest_rel: Optional[str] = None) -> Path:
         self.ensure_dirs()

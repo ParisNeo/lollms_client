@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
-from nicegui import ui
+from nicegui import ui, run
 
 from env_config import EnvStore, MODALITIES, MODALITY_LABELS
 from gui_prefs import GuiPrefs, SHELL_AUTONOMY_LEVELS, SKILLS_MODES, ACCENT_PRESETS
@@ -734,7 +734,8 @@ def _open_edit_binding_dialog(env: EnvStore, modality: str, alias: str, refresh)
         def do_save():
             params = reader()
             env.save_binding(modality, binding_name, alias, params)
-            ui.notify("Binding updated.", type="positive")
+            env.save()
+            ui.notify(f"Binding '{alias}' updated and saved.", type="positive")
             dialog.close()
             refresh()
 
@@ -768,7 +769,13 @@ def _render_param_form(env: EnvStore, modality: str, binding_name: str, existing
 
         with ui.column().classes("w-full gap-0.5 mb-1"):
             if ptype == "bool":
-                init = existing_val.lower() == "true" if existing_val is not None else bool(pdefault)
+                if existing_val is not None:
+                    if isinstance(existing_val, bool):
+                        init = existing_val
+                    else:
+                        init = str(existing_val).lower().strip() in ("true", "1", "yes", "y", "on")
+                else:
+                    init = bool(pdefault)
                 widgets[pname] = ui.switch(pname.replace("_", " ").title(), value=init)
             elif ptype in ("int", "float"):
                 init = existing_val if existing_val is not None else pdefault
@@ -777,6 +784,32 @@ def _render_param_form(env: EnvStore, modality: str, binding_name: str, existing
                 except (TypeError, ValueError):
                     init = 0
                 widgets[pname] = ui.number(pname.replace("_", " ").title(), value=init, step=1 if ptype == "int" else 0.1).classes("w-full").props("outlined dense")
+            elif "certificate" in pname.lower() or pname.lower().endswith("cert_path"):
+                init = existing_val if existing_val is not None else (pdefault or "")
+                with ui.row().classes("w-full items-center gap-2 flex-nowrap"):
+                    cert_input = ui.input(
+                        pname.replace("_", " ").title(),
+                        value=str(init),
+                    ).classes("flex-1").props("outlined dense clearable")
+                    widgets[pname] = cert_input
+
+                    async def _pick_cert_file(inp=cert_input):
+                        from folder_picker import pick_file
+                        chosen = await pick_file(
+                            title="Select SSL Certificate File (.pem, .crt, .cer)",
+                            initial_dir=inp.value or None,
+                            file_types=[
+                                ("Certificate Files", "*.pem;*.crt;*.cer;*.key"),
+                                ("All Files", "*.*")
+                            ]
+                        )
+                        if chosen:
+                            inp.value = chosen
+                            inp.update()
+
+                    ui.button("Browse...", icon="file_open", on_click=_pick_cert_file).props(
+                        "outline dense no-caps text-xs"
+                    ).tooltip("Browse for certificate file (.pem, .crt, .cer)")
             else:
                 init = existing_val if existing_val is not None else (pdefault or "")
                 is_secret = any(s in pname.lower() for s in ("key", "token", "password", "secret"))
@@ -815,7 +848,8 @@ def _open_add_profile_dialog(env: EnvStore, modality: str, refresh) -> None:
                 return
             values = reader()
             env.save_profile(modality, alias_val, **values)
-            ui.notify(f"Profile '{alias_val.upper()}' registered.", type="positive")
+            env.save()
+            ui.notify(f"Profile '{alias_val.upper()}' registered and saved.", type="positive")
             dialog.close()
             refresh()
 
@@ -843,7 +877,8 @@ def _open_edit_profile_dialog(env: EnvStore, modality: str, alias: str, refresh)
                 return
             values = reader()
             env.save_profile(modality, alias, **values)
-            ui.notify("Profile updated.", type="positive")
+            env.save()
+            ui.notify(f"Profile '{alias}' updated and saved.", type="positive")
             dialog.close()
             refresh()
 
@@ -866,28 +901,82 @@ def _profile_form_body(env: EnvStore, modality: str, existing: Optional[Dict[str
     default_binding_alias = existing.get("BINDING_ALIAS", binding_aliases[0])
     binding_alias_select = ui.select(binding_aliases, value=default_binding_alias, label="Linked Server Binding").classes("w-full").props("outlined dense")
 
-    with ui.row().classes("w-full items-center gap-2"):
-        model_input = ui.input("Model Name / Identifier", value=existing.get("MODEL_NAME", "")).classes("flex-1").props("outlined dense")
+    # ── Interactive Combobox (Type manual model OR select from fetched dropdown) ──
+    initial_model = existing.get("MODEL_NAME", "").strip()
+    initial_options = [initial_model] if initial_model else []
+    typed_model = {"val": initial_model}
+
+    with ui.row().classes("w-full items-center gap-2 flex-nowrap"):
+        model_select = ui.select(
+            options=initial_options,
+            value=initial_model or None,
+            label="Model Name / Identifier",
+            new_value_mode="add-unique",
+        ).classes("flex-1 text-xs").props(
+            ':dark="Quasar.Dark.isActive" outlined dense options-dense use-input fill-input hide-selected input-debounce=0 clearable'
+        )
+
+        def _on_input_val(e):
+            if isinstance(e.args, str):
+                typed_model["val"] = e.args.strip()
+
+        def _on_select_change(e):
+            if e.value:
+                typed_model["val"] = str(e.value).strip()
+
+        def _on_blur(_):
+            val = typed_model["val"]
+            if val and val not in model_select.options:
+                model_select.options = list(model_select.options) + [val]
+                model_select.value = val
+
+        model_select.on("input-value", _on_input_val)
+        model_select.on_value_change(_on_select_change)
+        model_select.on("blur", _on_blur)
 
         async def fetch_models():
-            ui.notify("Querying model endpoint...", type="info")
-            models = env.fetch_models(modality, binding_alias_select.value)
-            if not models:
-                ui.notify("No models discovered automatically — enter name manually.", type="warning")
+            selected_binding = binding_alias_select.value
+            if not selected_binding:
+                ui.notify("Please select a linked server binding first.", type="warning")
                 return
-            model_pick_dialog = ui.dialog()
-            with model_pick_dialog, ui.card().classes("w-96 max-h-96 p-4"):
-                ui.label("Select Discovered Model").classes("font-bold text-sm mb-2")
-                scroll = ui.scroll_area().classes("w-full h-64")
-                with scroll:
-                    for m in models:
-                        def pick(selected_m=m):
-                            model_input.value = selected_m
-                            model_pick_dialog.close()
-                        ui.button(m, on_click=pick).props("flat dense align=left size=sm no-caps").classes("w-full justify-start font-mono text-xs")
-            model_pick_dialog.open()
 
-        ui.button("Fetch", icon="sync", on_click=fetch_models).props("outline dense no-caps")
+            # Trigger loading spinner animation on the Fetch button
+            fetch_btn.props(add="loading")
+            ui.notify(f"Querying models from '{selected_binding}'...", type="info", timeout=2000)
+
+            try:
+                # Run the network query in a background thread so UI spinner animates fluidly
+                models = await run.io_bound(env.fetch_models, modality, selected_binding)
+                if not models:
+                    ui.notify(f"No models discovered from '{selected_binding}'. Enter name manually.", type="warning", timeout=3000)
+                    return
+
+                # Preserve current model if it exists
+                current_val = (model_select.value or typed_model["val"] or "").strip()
+                merged_options = list(models)
+                if current_val and current_val not in merged_options:
+                    merged_options.insert(0, current_val)
+
+                # Populate the combobox options directly in place
+                model_select.options = merged_options
+                if current_val:
+                    model_select.value = current_val
+                elif models:
+                    model_select.value = models[0]
+                    typed_model["val"] = models[0]
+
+                model_select.update()
+
+                # Automatically expand the dropdown menu in place
+                model_select.run_method("showPopup")
+                ui.notify(f"Discovered {len(models)} model(s)!", type="positive", timeout=2500)
+
+            except Exception as ex:
+                ui.notify(f"Failed to fetch models: {ex}", type="negative", timeout=5000)
+            finally:
+                fetch_btn.props(remove="loading")
+
+        fetch_btn = ui.button("Fetch", icon="sync", on_click=fetch_models).props("outline dense no-caps").tooltip("Query endpoint to discover available models into dropdown")
 
     is_default_switch = ui.switch(
         "Make this the Default Profile for this Modality",
@@ -929,9 +1018,10 @@ def _profile_form_body(env: EnvStore, modality: str, existing: Optional[Dict[str
                 "latency": routing_widgets["latency"].value,
                 "complexity": routing_widgets["complexity"].value,
             }
+        resolved_model_name = (model_select.value or typed_model["val"] or "").strip()
         return dict(
             binding_alias=binding_alias_select.value,
-            model_name=model_input.value,
+            model_name=resolved_model_name,
             is_default=is_default_switch.value,
             vision_enabled=vision_switch.value if vision_switch else False,
             forced_context_size=ctx_input.value if ctx_input else "",
