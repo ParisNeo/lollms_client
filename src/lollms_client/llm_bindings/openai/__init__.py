@@ -49,39 +49,37 @@ def _to_data_url(b64_str, mime):
     return f"data:{mime};base64,{b64_str}"
 
 
-def normalize_image_input(img, default_mime="image/jpeg"):
+def normalize_image_input(img: Any, default_mime: str = "image/jpeg", glm_format: bool = False) -> Dict[str, Any]:
     """
-    Returns a Responses API-ready content block:
-      { "type": "input_image", "image_url": "data:<mime>;base64,<...>" }
-    Accepts:
-      - dict {'data': '<base64>', 'mime': 'image/png'}
-      - dict {'path': 'E:\\images\\x.png'}
-      - string raw base64
-      - string local path (Windows/POSIX), including markdown-like "[E:\\path\\img.png]()"
-    URLs are intentionally not supported (base64 only).
+    Returns a Chat Completions API-compliant content block:
+      { "type": "image_url", "image_url": { "url": "data:<mime>;base64,<...>" } }
+    Supports dictionaries (with data, path, or url), local file paths, raw base64 strings,
+    and HTTP/HTTPS URLs.
     """
     if isinstance(img, dict):
+        if "url" in img and isinstance(img["url"], str):
+            return {"type": "image_url", "image_url": {"url": img["url"]}}
         if "data" in img and isinstance(img["data"], str):
             mime = img.get("mime", default_mime)
-            return {"type": "input_image", "image_url": _to_data_url(img["data"], mime)}
+            raw = img["data"]
+            url = raw if raw.startswith(("http://", "https://", "data:")) else _to_data_url(raw, mime)
+            return {"type": "image_url", "image_url": {"url": url}}
         if "path" in img and isinstance(img["path"], str):
             p = _extract_markdown_path(img["path"])
             b64 = _read_file_as_base64(p)
             mime = _guess_mime_from_name(p, default_mime)
-            return {"type": "input_image", "image_url": _to_data_url(b64, mime)}
-        if "url" in img:
-            raise ValueError("URL inputs not allowed here; provide base64 or local path")
+            return {"type": "image_url", "image_url": {"url": _to_data_url(b64, mime)}}
         raise ValueError("Unsupported dict format for image input")
 
     if isinstance(img, str):
         s = _extract_markdown_path(img)
-        if s.startswith("data:"):
-            return {"type": "input_image", "image_url": s}
+        if s.startswith(("http://", "https://", "data:")):
+            return {"type": "image_url", "image_url": {"url": s}}
         if os.path.exists(s) or (":" in s and "\\" in s) or s.startswith(("/", ".")):
             b64 = _read_file_as_base64(s)
             mime = _guess_mime_from_name(s, default_mime)
-            return {"type": "input_image", "image_url": _to_data_url(b64, mime)}
-        return {"type": "input_image", "image_url": _to_data_url(s, default_mime)}
+            return {"type": "image_url", "image_url": {"url": _to_data_url(b64, mime)}}
+        return {"type": "image_url", "image_url": {"url": _to_data_url(s, default_mime)}}
 
     raise ValueError("Unsupported image input type")
 
@@ -315,6 +313,7 @@ class OpenAIBinding(LollmsLLMBinding):
         self.is_vllm = kwargs.get("is_vllm", False)
         self.send_thinking_parameter = kwargs.get("send_thinking_parameter", True)
         self.thinking_effort_keyword = kwargs.get("thinking_effort_keyword", "enable_thinking")
+        self.glm_image_embedding = kwargs.get("glm_image_embedding", False)
 
         self.base_address = self.host_address
         if self.base_address:
@@ -414,7 +413,7 @@ class OpenAIBinding(LollmsLLMBinding):
     def _apply_vllm_thinking_kwargs(self, params: dict, effort: Optional[str]) -> dict:
         if not self.is_vllm:
             return params
-        if not self.send_thinking_parameter:
+        if not self.send_thinking_parameter or getattr(self, "glm_image_embedding", False):
             return params
         params.setdefault("extra_body", {}).setdefault(
             "chat_template_kwargs", {}
@@ -456,6 +455,7 @@ class OpenAIBinding(LollmsLLMBinding):
         ]
 
         if images:
+            img_blocks = [normalize_image_input(img, glm_format=self.glm_image_embedding) for img in images]
             if split:
                 messages += self.split_discussion(
                     prompt,
@@ -463,15 +463,12 @@ class OpenAIBinding(LollmsLLMBinding):
                     ai_keyword=ai_keyword,
                 )
                 last = messages[-1]
-                last["content"] = [{"type": "text", "text": last["content"]}] + [
-                    normalize_image_input(img) for img in images
-                ]
+                last["content"] = [{"type": "text", "text": last["content"]}] + img_blocks
             else:
                 messages.append(
                     {
                         "role": "user",
-                        "content": [{"type": "text", "text": prompt}]
-                        + [normalize_image_input(img) for img in images],
+                        "content": [{"type": "text", "text": prompt}] + img_blocks,
                     }
                 )
         else:
@@ -704,10 +701,8 @@ class OpenAIBinding(LollmsLLMBinding):
             if text_content:
                 openai_content.append({"type": "text", "text": text_content})
             for img in images:
-                img_url = img
-                if not img.startswith(("http", "data:")):
-                    img_url = f"data:image/jpeg;base64,{img}"
-                openai_content.append({"type": "image_url", "image_url": {"url": img_url}})
+                img_block = normalize_image_input(img, glm_format=self.glm_image_embedding)
+                openai_content.append(img_block)
             return {"role": role, "content": openai_content}
 
         openai_messages = [normalize_message(m) for m in messages]

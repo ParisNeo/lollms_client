@@ -60,6 +60,7 @@ class LollmsModelProfile:
     vision_enabled: bool = False
     forced_context_size: Optional[int] = None
     routing_config: Optional[Dict[str, Any]] = None
+    glm_image_embedding: bool = False
 
 
 
@@ -390,7 +391,8 @@ class LollmsClient():
                         is_default=p_data.get("is_default", False),
                         vision_enabled=p_data.get("vision_enabled", False),
                         forced_context_size=p_data.get("forced_context_size"),
-                        routing_config=p_data.get("routing_config") or p_data.get("routing_profile")
+                        routing_config=p_data.get("routing_config") or p_data.get("routing_profile"),
+                        glm_image_embedding=p_data.get("glm_image_embedding", False)
                     )
                 registry[alias] = profile
 
@@ -446,6 +448,10 @@ class LollmsClient():
                     binding.forced_context_size = model_profile.forced_context_size
                 if hasattr(binding, "routing_config"):
                     binding.routing_config = model_profile.routing_config
+                if hasattr(binding, "glm_image_embedding"):
+                    binding.glm_image_embedding = model_profile.glm_image_embedding
+                else:
+                    setattr(binding, "glm_image_embedding", model_profile.glm_image_embedding)
                 return binding
         except Exception as e:
             trace_exception(e)
@@ -730,6 +736,8 @@ class LollmsClient():
         if getattr(target_binding, "vision_enabled", False) is True:
             return True
         if getattr(target_binding, "supports_vision", False) is True:
+            return True
+        if getattr(target_binding, "glm_image_embedding", False) is True:
             return True
 
         if hasattr(target_binding, "child_bindings") and isinstance(target_binding.child_bindings, dict):

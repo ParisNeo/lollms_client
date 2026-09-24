@@ -62,6 +62,11 @@ model_input_parameters:
     description: "The name of the model to use, as exposed by the target service (e.g. 'gpt-4o' on OpenAI, 'llama-3.1-8b-instruct' on a local server, 'Qwen/Qwen3-32B' on vLLM)."
     mandatory: true
     default: "gpt-4o"
+  - name: glm_image_embedding
+    type: bool
+    description: "Enables GLM-5.3-Flash / GLM-4V compatible image embedding format (sequential text-first layout and standard image_url data blocks) for multimodal reasoning."
+    mandatory: false
+    default: false
 compatible_backends:
   official:
     - name: OpenAI

@@ -95,6 +95,7 @@ class LollmsLLMBinding(LollmsBaseBinding):
         self.default_seed = kwargs.get("seed")
         self.default_n_threads = kwargs.get("n_threads")
         self.default_streaming_callback = kwargs.get("streaming_callback")
+        self.glm_image_embedding = kwargs.get("glm_image_embedding", False)
 
         # Prompt Formatting defaults
         self.user_name = kwargs.get("user_name", "user")

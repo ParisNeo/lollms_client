@@ -97,3 +97,46 @@ def test_stream_thinking_handler_in_content_tags():
     processor = LollmsTextProcessor(DummyLLM())
     clean_prompt = processor.remove_thinking_blocks(final_output)
     assert clean_prompt.strip() == "Actual response."
+
+
+def test_glm_image_embedding_normalization():
+    from lollms_client.llm_bindings.openai import normalize_image_input
+
+    url_block = normalize_image_input("https://example.com/test.png", glm_format=True)
+    assert url_block["type"] == "image_url"
+    assert url_block["image_url"]["url"] == "https://example.com/test.png"
+
+    dict_url_block = normalize_image_input({"url": "http://img.site/pic.jpg"}, glm_format=True)
+    assert dict_url_block["type"] == "image_url"
+    assert dict_url_block["image_url"]["url"] == "http://img.site/pic.jpg"
+
+    b64_block = normalize_image_input("aW1nZGF0YQ==", glm_format=True)
+    assert b64_block["type"] == "image_url"
+    assert b64_block["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+def test_glm_image_embedding_profile_propagation():
+    from lollms_client.lollms_core import LollmsClient, LollmsBindingProfile, LollmsModelProfile
+
+    client = LollmsClient(
+        llm_binding_profiles={
+            "mock_openai": LollmsBindingProfile(
+                name="mock_openai",
+                binding_name="openai",
+                binding_config={"host_address": "http://localhost:8000/v1"}
+            )
+        },
+        llm_model_profiles={
+            "glm_flash": LollmsModelProfile(
+                name="glm_flash",
+                binding_profile_name="mock_openai",
+                model_name="zai-org/GLM-5.3-Flash",
+                vision_enabled=True,
+                glm_image_embedding=True,
+                is_default=True
+            )
+        }
+    )
+
+    assert client.has_vision_capability() is True
+    assert getattr(client.llm, "glm_image_embedding", False) is True
