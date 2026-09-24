@@ -705,6 +705,7 @@ def _open_add_binding_dialog(env: EnvStore, modality: str, refresh) -> None:
                 return
             params = reader_holder["read"]()
             env.save_binding(modality, binding_select.value, alias_val, params)
+            env.save()
             ui.notify(f"Binding '{alias_val.upper()}' registered.", type="positive")
             dialog.close()
             refresh()
@@ -766,6 +767,8 @@ def _render_param_form(env: EnvStore, modality: str, binding_name: str, existing
         pdesc = p.get("description", "")
         pdefault = p.get("default")
         existing_val = existing.get(pname.upper())
+        if existing_val is None:
+            existing_val = existing.get(pname.lower())
 
         with ui.column().classes("w-full gap-0.5 mb-1"):
             if ptype == "bool":

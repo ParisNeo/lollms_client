@@ -167,7 +167,11 @@ def build_deck_page(env: EnvStore, prefs: GuiPrefs) -> None:
             ui.button(
                 "Settings", icon="settings",
                 on_click=lambda: ui.navigate.to("/settings"),
-            ).props("flat dense size=sm no-caps")
+            ).props("flat dense size=sm no-caps").tooltip("Open Settings & Model Configuration")
+            ui.button(
+                "Clear Settings", icon="restart_alt",
+                on_click=lambda: open_clear_settings_dialog(),
+            ).props("flat dense size=sm no-caps color=red text-color=white").tooltip("Reset & Clear all LLM/modality configurations")
             ui.button(
                 icon="fullscreen",
                 on_click=lambda: _toggle_fs(),
@@ -257,6 +261,14 @@ def build_deck_page(env: EnvStore, prefs: GuiPrefs) -> None:
                 search_input = ui.input(placeholder="Filter projects…").props(
                     ':dark="Quasar.Dark.isActive" outlined dense clearable input-debounce=100'
                 ).classes("w-64 text-xs bg-slate-100 dark:bg-slate-900 text-slate-900 dark:text-slate-100")
+                ui.button(
+                    "Settings", icon="settings",
+                    on_click=lambda: ui.navigate.to("/settings"),
+                ).props("outline dense size=sm no-caps").tooltip("Open Settings & Configuration")
+                ui.button(
+                    "Clear Settings", icon="restart_alt",
+                    on_click=lambda: open_clear_settings_dialog(),
+                ).props("flat dense size=sm no-caps color=red").tooltip("Reset & Clear all configured settings")
 
         # Container for project cards
         cards_slot = ui.row().classes("w-full max-w-6xl mx-auto grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5")
@@ -354,6 +366,40 @@ def build_deck_page(env: EnvStore, prefs: GuiPrefs) -> None:
         ws_path_input.value = str(Path.cwd().resolve())
         ws_desc_input.value = ""
         add_dialog.open()
+
+    def open_clear_settings_dialog():
+        dialog = ui.dialog().props("persistent")
+        with dialog, ui.card().classes(
+            f"w-[480px] max-w-[95vw] p-5 gap-3 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 "
+            f"border {BORDER} rounded-xl shadow-2xl"
+        ):
+            with ui.row().classes("items-center gap-2.5"):
+                ui.icon("warning", size="26px").classes("text-red-500")
+                ui.label("Clear & Reset Settings?").classes("text-base font-bold text-red-500")
+
+            ui.label(
+                "This will erase your saved model profiles, server bindings, and connection settings "
+                "from ~/.lollms_client/config.yaml and ~/.lollms_client/.env.\n\n"
+                "Your registered project workspaces and local code files on disk will NOT be touched."
+            ).classes("text-xs text-slate-600 dark:text-slate-400 whitespace-pre-line")
+
+            with ui.row().classes("w-full justify-end gap-2 mt-2"):
+                ui.button("Cancel", on_click=dialog.close).props("flat dense no-caps")
+
+                def do_clear():
+                    dialog.close()
+                    try:
+                        env.clear_settings()
+                        ui.notify("All settings have been cleared.", type="positive")
+                        ui.navigate.to("/settings")
+                    except Exception as ex:
+                        ui.notify(f"Failed to clear settings: {ex}", type="negative")
+
+                ui.button("Clear Settings", icon="delete_forever", on_click=do_clear).props(
+                    "unelevated color=red dense no-caps"
+                )
+
+        dialog.open()
 
 
 def _render_workspace_card(ws: Dict[str, Any], prefs: GuiPrefs, on_change) -> None:

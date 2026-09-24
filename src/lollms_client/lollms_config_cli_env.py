@@ -477,11 +477,11 @@ def _get_configured_aliases(binding_type: str, config_map: Dict[str, str], categ
 
 def _get_binding_keys(binding_type: str, alias: str, config_map: Dict[str, str]) -> Dict[str, str]:
     prefix = f"{binding_type.rstrip('_').upper()}_BINDINGS_{alias.upper()}_"
-    return {k[len(prefix):]: v for k, v in config_map.items() if k.upper().startswith(prefix)}
+    return {k[len(prefix):].upper(): v for k, v in config_map.items() if k.upper().startswith(prefix)}
 
 def _get_profile_keys(binding_type: str, alias: str, config_map: Dict[str, str]) -> Dict[str, str]:
     prefix = f"{binding_type.rstrip('_').upper()}_PROFILES_{alias.upper()}_"
-    return {k[len(prefix):]: v for k, v in config_map.items() if k.upper().startswith(prefix)}
+    return {k[len(prefix):].upper(): v for k, v in config_map.items() if k.upper().startswith(prefix)}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Unified Client Resolver
@@ -691,7 +691,11 @@ def _convert_value(raw: str, p_type: str) -> Any:
     return raw
 
 def _format_env_value(value: Any) -> str:
-    return "true" if isinstance(value, bool) else str(value)
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
 
 def _safe_input(prompt: str, default: str = "") -> str:
     try:

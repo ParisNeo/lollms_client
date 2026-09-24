@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-24 11:00]
+
+- `fix(client): resolve import warnings and refactor connection module binding into lollms_bindings_utils`
+
 ## [2026-09-24 09:42]
 
 - fix(lc): correct default tool import paths and resolve circular dependencies in the document editor module

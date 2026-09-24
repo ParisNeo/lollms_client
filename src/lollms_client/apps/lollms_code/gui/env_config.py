@@ -87,7 +87,11 @@ except ImportError as e:
         return []
 
     def format_env_value(value: Any) -> str:
-        return "true" if value is True else "false" if value is False else str(value)
+        if value is None:
+            return ""
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return str(value)
 
     def convert_value(raw: str, ptype: str) -> Any:
         return raw
@@ -149,6 +153,30 @@ class EnvStore:
             self.config_map = {}
             if path and path.exists():
                 self.config_map = load_env_file(path)
+
+    def clear_settings(self) -> None:
+        """Wipes all in-memory configuration and deletes persisted ~/.lollms_client/ config files."""
+        self.config_map.clear()
+        target_dir = Path.home() / ".lollms_client"
+        for fname in ("config.yaml", ".env"):
+            f = target_dir / fname
+            if f.exists():
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+
+        # Also purge any local sandbox config files in current workspace if present
+        local_dir = Path.cwd() / ".lollms_code"
+        for fname in ("config.yaml", ".env"):
+            f = local_dir / fname
+            if f.exists():
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+
+        self.load()
 
     def is_configured(self, require_llm: bool = True, require_tti: bool = False, require_tts: bool = False, require_stt: bool = False, require_ttm: bool = False, require_ttv: bool = False) -> bool:
         """Validates configuration based on required modalities using the Two-Tier Profile System."""
@@ -264,7 +292,12 @@ class EnvStore:
         prefix = f"{binding_type.upper()}_BINDINGS_{alias}_"
         self.config_map[prefix + "BINDING_NAME"] = binding_name
         for pname, value in params.items():
-            self.config_map[prefix + pname.upper()] = format_env_value(value)
+            target_key = prefix + pname.upper()
+            # Clean up any duplicate keys with differing case in config_map
+            for k in list(self.config_map.keys()):
+                if k.upper() == target_key.upper():
+                    del self.config_map[k]
+            self.config_map[target_key] = format_env_value(value)
 
     def delete_binding(self, binding_type: str, alias: str) -> None:
         prefix = f"{binding_type.upper()}_BINDINGS_{alias}_"
