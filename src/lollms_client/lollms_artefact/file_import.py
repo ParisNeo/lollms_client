@@ -59,6 +59,10 @@ import io
 import json
 import mimetypes
 import os
+
+# Suppress noisy C-level MuPDF stdout/stderr message output
+os.environ["PYMUPDF_MESSAGE"] = "0"
+
 import re
 import uuid
 import shutil
@@ -319,6 +323,12 @@ def _extract_pdf_text(path: Path) -> str:
         ASCIIColors.warning(f"[FileImport] pymupdf4llm failed ({pymupdf4llm_err}). Falling back to fitz standard text extraction.")
         try:
             import fitz
+            if hasattr(fitz, "TOOLS"):
+                try:
+                    fitz.TOOLS.mupdf_display_errors(False)
+                    fitz.TOOLS.mupdf_display_warnings(False)
+                except Exception:
+                    pass
             doc = fitz.open(str(path))
             pages = []
             for i, page in enumerate(doc):
@@ -376,6 +386,12 @@ def _pdf_text_with_embedded_images(path: Path, art_title: str, progress_cb: Opti
     _ensure_installed("pymupdf", "fitz")
     try:
         import fitz
+        if hasattr(fitz, "TOOLS"):
+            try:
+                fitz.TOOLS.mupdf_display_errors(False)
+                fitz.TOOLS.mupdf_display_warnings(False)
+            except Exception:
+                pass
         doc    = fitz.open(str(path))
         pages_text: List[str] = []
         images: List[Tuple[str, str]] = []
@@ -436,6 +452,12 @@ def _extract_pdf_pages_as_images(
     _ensure_installed("pymupdf4llm", "fitz")
     try:
         import fitz
+        if hasattr(fitz, "TOOLS"):
+            try:
+                fitz.TOOLS.mupdf_display_errors(False)
+                fitz.TOOLS.mupdf_display_warnings(False)
+            except Exception:
+                pass
         doc   = fitz.open(str(path))
         zoom  = dpi / 72.0
         mat   = fitz.Matrix(zoom, zoom)
@@ -481,6 +503,12 @@ def _pdf_text_with_image_anchors(path: Path, art_title: str, progress_cb: Option
     _ensure_installed("pymupdf", "fitz")
     try:
         import fitz
+        if hasattr(fitz, "TOOLS"):
+            try:
+                fitz.TOOLS.mupdf_display_errors(False)
+                fitz.TOOLS.mupdf_display_warnings(False)
+            except Exception:
+                pass
         doc    = fitz.open(str(path))
         zoom   = _PDF_RENDER_DPI / 72.0
         mat    = fitz.Matrix(zoom, zoom)

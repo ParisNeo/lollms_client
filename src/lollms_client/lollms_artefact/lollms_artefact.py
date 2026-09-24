@@ -4,6 +4,10 @@ from __future__ import annotations
 import re
 import uuid
 import os
+
+# Suppress noisy C-level MuPDF stdout/stderr message output
+os.environ["PYMUPDF_MESSAGE"] = "0"
+
 import json
 import shutil
 import zipfile
@@ -3173,44 +3177,70 @@ class ArtefactManager:
         elif artefact_type == ArtefactType.IMAGE:
             content = f"### Image: `{title}{ext}`\n\n<artefact_image id=\"{title}{ext}::0\" />"
         elif ext == ".pdf":
-            try:
-                import fitz
-                doc = fitz.open(str(path))
-                text_parts = []
-                for page_num, page in enumerate(doc):
-                    page_text = page.get_text("text")
-                    if page_text.strip():
-                        text_parts.append(f"--- Page {page_num + 1} ---\n{page_text.strip()}")
-                doc.close()
-                content = "\n\n".join(text_parts) if text_parts else "[PDF contains no extractable text. It may be image-based and require OCR.]"
-            except ImportError:
-                content = f"[ERROR: PyMuPDF (fitz) is not installed. Cannot parse PDF '{title}'. Install it with 'pip install pymupdf']"
-            except Exception as e:
-                content = f"[ERROR: Failed to parse PDF '{title}': {e}]"
-        elif ext in (".docx", ".pptx", ".odt"):
-            try:
-                if ext == ".docx":
-                    import docx
-                    doc = docx.Document(str(path))
-                    content = "\n\n".join([para.text for para in doc.paragraphs if para.text.strip()])
-                elif ext == ".pptx":
-                    from pptx import Presentation
-                    prs = Presentation(str(path))
+            if not parse_data_schema:
+                file_size = path.stat().st_size if path.exists() else 0
+                content = (
+                    f"# PDF Document: {title}\n"
+                    f"- **Filename**: `{title}`\n"
+                    f"- **Type**: PDF Document\n"
+                    f"- **Size**: {file_size:,} bytes\n\n"
+                    f"> To inspect or read this document, use `<unlock_file>` or document tools (`tool_inspect_document`, `tool_read_document_content`)."
+                )
+            else:
+                try:
+                    import fitz
+                    if hasattr(fitz, "TOOLS"):
+                        try:
+                            fitz.TOOLS.mupdf_display_errors(False)
+                            fitz.TOOLS.mupdf_display_warnings(False)
+                        except Exception:
+                            pass
+                    doc = fitz.open(str(path))
                     text_parts = []
-                    for slide_num, slide in enumerate(prs.slides):
-                        slide_text = []
-                        for shape in slide.shapes:
-                            if hasattr(shape, "text") and shape.text.strip():
-                                slide_text.append(shape.text.strip())
-                        if slide_text:
-                            text_parts.append(f"--- Slide {slide_num + 1} ---\n" + "\n".join(slide_text))
-                    content = "\n\n".join(text_parts) if text_parts else "[Presentation contains no extractable text.]"
-                else:
-                    content = f"[ERROR: Parsing for '{ext}' files is not yet fully implemented. File: {title}]"
-            except ImportError as ie:
-                content = f"[ERROR: Missing library to parse '{ext}' file '{title}'. Error: {ie}. Install 'python-docx' or 'python-pptx']"
-            except Exception as e:
-                content = f"[ERROR: Failed to parse '{ext}' file '{title}': {e}]"
+                    for page_num, page in enumerate(doc):
+                        page_text = page.get_text("text")
+                        if page_text.strip():
+                            text_parts.append(f"--- Page {page_num + 1} ---\n{page_text.strip()}")
+                    doc.close()
+                    content = "\n\n".join(text_parts) if text_parts else "[PDF contains no extractable text. It may be image-based and require OCR.]"
+                except ImportError:
+                    content = f"[ERROR: PyMuPDF (fitz) is not installed. Cannot parse PDF '{title}'. Install it with 'pip install pymupdf']"
+                except Exception as e:
+                    content = f"[ERROR: Failed to parse PDF '{title}': {e}]"
+        elif ext in (".docx", ".pptx", ".odt"):
+            if not parse_data_schema:
+                file_size = path.stat().st_size if path.exists() else 0
+                content = (
+                    f"# Document: {title}\n"
+                    f"- **Filename**: `{title}`\n"
+                    f"- **Type**: {ext.upper().lstrip('.')} Document\n"
+                    f"- **Size**: {file_size:,} bytes\n\n"
+                    f"> To inspect or read this document, use `<unlock_file>` or document tools (`tool_inspect_document`, `tool_read_document_content`)."
+                )
+            else:
+                try:
+                    if ext == ".docx":
+                        import docx
+                        doc = docx.Document(str(path))
+                        content = "\n\n".join([para.text for para in doc.paragraphs if para.text.strip()])
+                    elif ext == ".pptx":
+                        from pptx import Presentation
+                        prs = Presentation(str(path))
+                        text_parts = []
+                        for slide_num, slide in enumerate(prs.slides):
+                            slide_text = []
+                            for shape in slide.shapes:
+                                if hasattr(shape, "text") and shape.text.strip():
+                                    slide_text.append(shape.text.strip())
+                            if slide_text:
+                                text_parts.append(f"--- Slide {slide_num + 1} ---\n" + "\n".join(slide_text))
+                        content = "\n\n".join(text_parts) if text_parts else "[Presentation contains no extractable text.]"
+                    else:
+                        content = f"[ERROR: Parsing for '{ext}' files is not yet fully implemented. File: {title}]"
+                except ImportError as ie:
+                    content = f"[ERROR: Missing library to parse '{ext}' file '{title}'. Error: {ie}. Install 'python-docx' or 'python-pptx']"
+                except Exception as e:
+                    content = f"[ERROR: Failed to parse '{ext}' file '{title}': {e}]"
         elif artefact_type in (ArtefactType.CODE, ArtefactType.DOCUMENT):
             try:
                 content = path.read_text(encoding="utf-8", errors="ignore")

@@ -7,6 +7,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import fitz
+    if hasattr(fitz, "TOOLS"):
+        try:
+            fitz.TOOLS.mupdf_display_errors(False)
+            fitz.TOOLS.mupdf_display_warnings(False)
+        except Exception:
+            pass
 except ImportError:
     fitz = None
 
@@ -52,6 +58,12 @@ def init_tools_library(config: dict = None) -> None:
     if fitz is None:
         try:
             import fitz as _fitz
+            if hasattr(_fitz, "TOOLS"):
+                try:
+                    _fitz.TOOLS.mupdf_display_errors(False)
+                    _fitz.TOOLS.mupdf_display_warnings(False)
+                except Exception:
+                    pass
             fitz = _fitz
         except ImportError:
             import ascii_colors

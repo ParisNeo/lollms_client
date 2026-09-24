@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 from ascii_colors import ASCIIColors
 
-
+os.environ["PYMUPDF_MESSAGE"] = "0"
 TOOL_LIBRARY_NAME = "As-Is Document Tools"
 TOOL_LIBRARY_DESC = "Inspect, search, and extract selective content from binary and structured workspace documents."
 TOOL_LIBRARY_ICON = "📄"

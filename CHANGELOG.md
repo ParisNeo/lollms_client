@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-24 09:42]
+
+- fix(lc): correct default tool import paths and resolve circular dependencies in the document editor module
+
 ## [2026-09-24 09:35]
 
 - fix(lollms): minor refactoring and API adjustment for data validation and personality interface handling
