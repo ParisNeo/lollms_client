@@ -140,3 +140,144 @@ def test_glm_image_embedding_profile_propagation():
 
     assert client.has_vision_capability() is True
     assert getattr(client.llm, "glm_image_embedding", False) is True
+
+
+def test_translate_reasoning_effort_mapping():
+    from lollms_client.lollms_llm_binding import LollmsLLMBinding
+
+    openai_levels = ["low", "medium", "high"]
+    glm_levels = ["low", "high", "max"]
+    binary_levels = ["off", "on"]
+
+    assert LollmsLLMBinding.translate_reasoning_effort("max", openai_levels) == "high"
+    assert LollmsLLMBinding.translate_reasoning_effort("medium", openai_levels) == "medium"
+    assert LollmsLLMBinding.translate_reasoning_effort("minimal", openai_levels) == "low"
+
+    assert LollmsLLMBinding.translate_reasoning_effort("max", glm_levels) == "max"
+    assert LollmsLLMBinding.translate_reasoning_effort("medium", glm_levels) == "high"
+    assert LollmsLLMBinding.translate_reasoning_effort("low", glm_levels) == "low"
+
+    assert LollmsLLMBinding.translate_reasoning_effort("high", binary_levels) == "on"
+    assert LollmsLLMBinding.translate_reasoning_effort("none", binary_levels) == "off"
+    assert LollmsLLMBinding.translate_reasoning_effort("none", openai_levels) is None
+
+    assert LollmsLLMBinding.translate_reasoning_effort(True, glm_levels) == "high"
+    assert LollmsLLMBinding.translate_reasoning_effort(False, glm_levels) is None
+
+
+def test_model_profile_supported_efforts_propagation():
+    from lollms_client.lollms_core import LollmsClient, LollmsBindingProfile, LollmsModelProfile
+
+    client = LollmsClient(
+        llm_binding_profiles={
+            "mock_conn": LollmsBindingProfile(
+                name="mock_conn",
+                binding_name="openai",
+                binding_config={"host_address": "http://localhost:8000/v1"}
+            )
+        },
+        llm_model_profiles={
+            "custom_o3": LollmsModelProfile(
+                name="custom_o3",
+                binding_profile_name="mock_conn",
+                model_name="o3-mini",
+                supported_reasoning_efforts=["low", "medium", "high"],
+                is_default=True
+            )
+        }
+    )
+
+    assert client.llm.supported_reasoning_efforts == ["low", "medium", "high"]
+    assert client.llm.get_effective_reasoning_effort(reasoning_effort="max") == "high"
+
+
+def test_normalize_video_input():
+    from lollms_client.llm_bindings.openai import normalize_video_input
+
+    url_block = normalize_video_input("https://example.com/demo.mp4")
+    assert url_block["type"] == "video_url"
+    assert url_block["video_url"]["url"] == "https://example.com/demo.mp4"
+
+    dict_block = normalize_video_input({"url": "http://vid.site/sample.webm"})
+    assert dict_block["type"] == "video_url"
+    assert dict_block["video_url"]["url"] == "http://vid.site/sample.webm"
+
+    b64_block = normalize_video_input("dmlkZW9kYXRh")
+    assert b64_block["type"] == "video_url"
+    assert b64_block["video_url"]["url"].startswith("data:video/mp4;base64,")
+
+
+def test_video_capability_profile_propagation():
+    from lollms_client.lollms_core import LollmsClient, LollmsBindingProfile, LollmsModelProfile
+
+    client = LollmsClient(
+        llm_binding_profiles={
+            "mock_conn": LollmsBindingProfile(
+                name="mock_conn",
+                binding_name="openai",
+                binding_config={"host_address": "http://localhost:8000/v1"}
+            )
+        },
+        llm_model_profiles={
+            "qwen_video": LollmsModelProfile(
+                name="qwen_video",
+                binding_profile_name="mock_conn",
+                model_name="Qwen/Qwen2.5-VL-7B-Instruct",
+                video_enabled=True,
+                is_default=True
+            )
+        }
+    )
+
+    assert client.has_video_capability() is True
+    assert client.has_vision_capability() is True
+    assert getattr(client.llm, "video_enabled", False) is True
+
+
+def test_translate_reasoning_effort_mapping():
+    from lollms_client.lollms_llm_binding import LollmsLLMBinding
+
+    openai_levels = ["low", "medium", "high"]
+    glm_levels = ["low", "high", "max"]
+    binary_levels = ["off", "on"]
+
+    assert LollmsLLMBinding.translate_reasoning_effort("max", openai_levels) == "high"
+    assert LollmsLLMBinding.translate_reasoning_effort("medium", openai_levels) == "medium"
+    assert LollmsLLMBinding.translate_reasoning_effort("minimal", openai_levels) == "low"
+
+    assert LollmsLLMBinding.translate_reasoning_effort("max", glm_levels) == "max"
+    assert LollmsLLMBinding.translate_reasoning_effort("medium", glm_levels) == "high"
+    assert LollmsLLMBinding.translate_reasoning_effort("low", glm_levels) == "low"
+
+    assert LollmsLLMBinding.translate_reasoning_effort("high", binary_levels) == "on"
+    assert LollmsLLMBinding.translate_reasoning_effort("none", binary_levels) == "off"
+    assert LollmsLLMBinding.translate_reasoning_effort("none", openai_levels) is None
+
+    assert LollmsLLMBinding.translate_reasoning_effort(True, glm_levels) == "high"
+    assert LollmsLLMBinding.translate_reasoning_effort(False, glm_levels) is None
+
+
+def test_model_profile_supported_efforts_propagation():
+    from lollms_client.lollms_core import LollmsClient, LollmsBindingProfile, LollmsModelProfile
+
+    client = LollmsClient(
+        llm_binding_profiles={
+            "mock_conn": LollmsBindingProfile(
+                name="mock_conn",
+                binding_name="openai",
+                binding_config={"host_address": "http://localhost:8000/v1"}
+            )
+        },
+        llm_model_profiles={
+            "custom_o3": LollmsModelProfile(
+                name="custom_o3",
+                binding_profile_name="mock_conn",
+                model_name="o3-mini",
+                supported_reasoning_efforts=["low", "medium", "high"],
+                is_default=True
+            )
+        }
+    )
+
+    assert client.llm.supported_reasoning_efforts == ["low", "medium", "high"]
+    assert client.llm.get_effective_reasoning_effort(reasoning_effort="max") == "high"

@@ -56,12 +56,22 @@ client = LollmsClient(
             "binding_profile_name": "vllm_omni_server",
             "model_name": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
             "vision_enabled": True,
+            "video_enabled": True,
+            "supported_reasoning_efforts": ["low", "medium", "high", "max"],
             "routing_config": {
                 "description": "complex reasoning, math, coding, architecture",
                 "complexity_tier": 3,
                 "cost_per_1k_tokens": 0.0,
                 "avg_latency_ms": 1500
             }
+        },
+        "glm_flash": {
+            "binding_profile_name": "openai_cloud",
+            "model_name": "zai-org/GLM-5.3-Flash",
+            "vision_enabled": True,
+            "video_enabled": True,
+            "glm_image_embedding": True,
+            "supported_reasoning_efforts": ["low", "high", "max"]
         }
     },
     
@@ -666,14 +676,46 @@ response = discussion.chat(
 )
 ```
 
-### Thinking Block Extraction
+### Thinking Block Extraction & Streaming
+
+When using reasoning models (DeepSeek-R1, OpenAI o-series, GLM-5.3-Flash, Qwen), the client separates thoughts during streaming and preserves `<think>` tags:
 
 ```python
-# Extract reasoning traces from models that support it
-thinking, response = client.extract_thinking_blocks(raw_llm_output)
+from lollms_client.lollms_types import MSG_TYPE
 
-# Remove thinking blocks from final output
-clean_response = client.remove_thinking_blocks(raw_llm_output)
+def stream_callback(chunk: str, msg_type: MSG_TYPE):
+    if msg_type == MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK:
+        print(f"\033[90m{chunk}\033[0m", end="", flush=True)  # Grey thought stream
+    elif msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
+        print(chunk, end="", flush=True)  # Final answer
+    return True
+
+# Responses retain visible <think>...</think> tags
+response = client.generate_text(
+    "How many r's in strawberry?",
+    streaming_callback=stream_callback,
+    reasoning_effort="high"
+)
+
+# Extract reasoning traces cleanly
+thoughts = client.extract_thinking_blocks(response)
+
+# Strip thinking blocks when reprompting in conversations
+clean_response = client.remove_thinking_blocks(response)
+```
+
+### Video Input Comprehension
+
+Send videos directly to multimodal models (e.g. Qwen2.5-VL, GLM-5.3-Flash):
+
+```python
+# Check video capability
+if client.has_video_capability():
+    response = client.generate_text(
+        prompt="Describe the actions in this video clip.",
+        videos=["path/to/clip.mp4"]  # Accepts local file path, URL, or base64
+    )
+    print(response)
 ```
 
 ---

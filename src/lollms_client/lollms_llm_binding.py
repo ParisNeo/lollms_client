@@ -96,6 +96,13 @@ class LollmsLLMBinding(LollmsBaseBinding):
         self.default_n_threads = kwargs.get("n_threads")
         self.default_streaming_callback = kwargs.get("streaming_callback")
         self.glm_image_embedding = kwargs.get("glm_image_embedding", False)
+        self.supported_reasoning_efforts: Optional[List[str]] = kwargs.get(
+            "supported_reasoning_efforts"
+        )
+        self.video_enabled = kwargs.get("video_enabled", False)
+        self.supported_reasoning_efforts: Optional[List[str]] = kwargs.get(
+            "supported_reasoning_efforts"
+        )
 
         # Prompt Formatting defaults
         self.user_name = kwargs.get("user_name", "user")
@@ -149,6 +156,216 @@ class LollmsLLMBinding(LollmsBaseBinding):
         if think is True:
             return "high"
         return None
+
+    @staticmethod
+    def translate_reasoning_effort(
+        reasoning_effort: Optional[Union[str, bool]] = None,
+        supported_efforts: Optional[List[str]] = None,
+        think: Optional[bool] = None,
+    ) -> Optional[str]:
+        """
+        Translates an incoming reasoning effort setting to a level supported by the model.
+
+        Anchor score projection:
+          none/off/disabled -> 0.0
+          minimal/min       -> 0.15
+          low               -> 0.30
+          medium/default    -> 0.60
+          high              -> 0.85
+          max/maximum       -> 1.00
+        """
+        if reasoning_effort is None and think is None:
+            return None
+
+        disabled_literals = {"none", "off", "disabled", "false", "0"}
+        raw_str = ""
+        if reasoning_effort is False or (reasoning_effort is None and think is False):
+            raw_str = "none"
+        elif reasoning_effort is True or (reasoning_effort is None and think is True):
+            raw_str = "high"
+        elif reasoning_effort is not None:
+            raw_str = str(reasoning_effort).strip().lower()
+
+        if not supported_efforts:
+            return None if raw_str in disabled_literals else LollmsLLMBinding.normalize_reasoning_effort(think, raw_str)
+
+        supported_lower_map = {s.strip().lower(): s for s in supported_efforts if s}
+        if not supported_lower_map:
+            return None if raw_str in disabled_literals else LollmsLLMBinding.normalize_reasoning_effort(think, raw_str)
+
+        if raw_str in disabled_literals:
+            for dis in ("none", "off", "disabled", "false"):
+                if dis in supported_lower_map:
+                    return supported_lower_map[dis]
+            return None
+
+        if raw_str in supported_lower_map:
+            return supported_lower_map[raw_str]
+
+        anchor_scores = {
+            "none": 0.0,
+            "off": 0.0,
+            "false": 0.0,
+            "disabled": 0.0,
+            "minimal": 0.15,
+            "min": 0.15,
+            "low": 0.30,
+            "medium": 0.60,
+            "med": 0.60,
+            "default": 0.60,
+            "high": 0.85,
+            "on": 0.85,
+            "true": 0.85,
+            "max": 1.00,
+            "maximum": 1.00,
+            "extreme": 1.00,
+        }
+
+        target_score = anchor_scores.get(raw_str, 0.60)
+
+        active_candidates = [
+            s for s in supported_efforts
+            if s and s.strip().lower() not in disabled_literals
+        ]
+        if not active_candidates:
+            active_candidates = list(supported_efforts)
+
+        def score_candidate(cand: str, idx: int, total: int) -> float:
+            lowered = cand.strip().lower()
+            if lowered in anchor_scores:
+                return anchor_scores[lowered]
+            return idx / max(1, total - 1)
+
+        best_cand = active_candidates[0]
+        min_distance = float("inf")
+        best_cand_score = -1.0
+
+        total_cands = len(active_candidates)
+        for idx, cand in enumerate(active_candidates):
+            c_score = score_candidate(cand, idx, total_cands)
+            dist = abs(c_score - target_score)
+            if dist < min_distance or (abs(dist - min_distance) < 1e-5 and c_score > best_cand_score):
+                min_distance = dist
+                best_cand = cand
+                best_cand_score = c_score
+
+        return best_cand
+
+    def get_effective_reasoning_effort(
+        self,
+        think: Optional[bool] = None,
+        reasoning_effort: Optional[Union[str, bool]] = None,
+    ) -> Optional[str]:
+        return self.translate_reasoning_effort(
+            reasoning_effort=reasoning_effort,
+            supported_efforts=getattr(self, "supported_reasoning_efforts", None),
+            think=think,
+        )
+
+    @staticmethod
+    def translate_reasoning_effort(
+        reasoning_effort: Optional[Union[str, bool]] = None,
+        supported_efforts: Optional[List[str]] = None,
+        think: Optional[bool] = None,
+    ) -> Optional[str]:
+        """
+        Translates an incoming reasoning effort setting to a level supported by the model.
+
+        Anchor score projection:
+          none/off/disabled -> 0.0
+          minimal/min       -> 0.15
+          low               -> 0.30
+          medium/default    -> 0.60
+          high              -> 0.85
+          max/maximum       -> 1.00
+        """
+        if reasoning_effort is None and think is None:
+            return None
+
+        disabled_literals = {"none", "off", "disabled", "false", "0"}
+        raw_str = ""
+        if reasoning_effort is False or (reasoning_effort is None and think is False):
+            raw_str = "none"
+        elif reasoning_effort is True or (reasoning_effort is None and think is True):
+            raw_str = "high"
+        elif reasoning_effort is not None:
+            raw_str = str(reasoning_effort).strip().lower()
+
+        if not supported_efforts:
+            return None if raw_str in disabled_literals else LollmsLLMBinding.normalize_reasoning_effort(think, raw_str)
+
+        supported_lower_map = {s.strip().lower(): s for s in supported_efforts if s}
+        if not supported_lower_map:
+            return None if raw_str in disabled_literals else LollmsLLMBinding.normalize_reasoning_effort(think, raw_str)
+
+        if raw_str in disabled_literals:
+            for dis in ("none", "off", "disabled", "false"):
+                if dis in supported_lower_map:
+                    return supported_lower_map[dis]
+            return None
+
+        if raw_str in supported_lower_map:
+            return supported_lower_map[raw_str]
+
+        anchor_scores = {
+            "none": 0.0,
+            "off": 0.0,
+            "false": 0.0,
+            "disabled": 0.0,
+            "minimal": 0.15,
+            "min": 0.15,
+            "low": 0.30,
+            "medium": 0.60,
+            "med": 0.60,
+            "default": 0.60,
+            "high": 0.85,
+            "on": 0.85,
+            "true": 0.85,
+            "max": 1.00,
+            "maximum": 1.00,
+            "extreme": 1.00,
+        }
+
+        target_score = anchor_scores.get(raw_str, 0.60)
+
+        active_candidates = [
+            s for s in supported_efforts
+            if s and s.strip().lower() not in disabled_literals
+        ]
+        if not active_candidates:
+            active_candidates = list(supported_efforts)
+
+        def score_candidate(cand: str, idx: int, total: int) -> float:
+            lowered = cand.strip().lower()
+            if lowered in anchor_scores:
+                return anchor_scores[lowered]
+            return idx / max(1, total - 1)
+
+        best_cand = active_candidates[0]
+        min_distance = float("inf")
+        best_cand_score = -1.0
+
+        total_cands = len(active_candidates)
+        for idx, cand in enumerate(active_candidates):
+            c_score = score_candidate(cand, idx, total_cands)
+            dist = abs(c_score - target_score)
+            if dist < min_distance or (abs(dist - min_distance) < 1e-5 and c_score > best_cand_score):
+                min_distance = dist
+                best_cand = cand
+                best_cand_score = c_score
+
+        return best_cand
+
+    def get_effective_reasoning_effort(
+        self,
+        think: Optional[bool] = None,
+        reasoning_effort: Optional[Union[str, bool]] = None,
+    ) -> Optional[str]:
+        return self.translate_reasoning_effort(
+            reasoning_effort=reasoning_effort,
+            supported_efforts=getattr(self, "supported_reasoning_efforts", None),
+            think=think,
+        )
 
     # ── Cancellation API ─────────────────────────────────────────────────────
 
@@ -207,6 +424,7 @@ class LollmsLLMBinding(LollmsBaseBinding):
     def generate_text(self,
                     prompt: str,
                     images: Optional[List[str]] = None,
+                    videos: Optional[List[str]] = None,
                     system_prompt: str = "",
                     n_predict: Optional[int] = None,
                     stream: Optional[bool] = None,

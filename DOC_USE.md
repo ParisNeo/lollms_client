@@ -158,11 +158,16 @@ full_streamed_response = client.generate_text(
 )
 print("\n--- End of Stream ---")
 
-# --- Multimodal Text Generation (if LLM binding supports it) ---
+# --- Multimodal Text & Video Generation (if LLM binding supports it) ---
 # image_paths = ["path/to/your/image1.jpg"]
-# multimodal_prompt = "Describe this image."
+# video_paths = ["path/to/your/clip.mp4"]
+# multimodal_prompt = "Describe what happens in this video and compare it with the image."
 # try:
-#     multimodal_response = client.generate_text(multimodal_prompt, images=image_paths)
+#     multimodal_response = client.generate_text(
+#         multimodal_prompt,
+#         images=image_paths,
+#         videos=video_paths
+#     )
 #     print(f"Multimodal Response: {multimodal_response}")
 # except Exception as e:
 #     print(f"Multimodal generation failed: {e}")

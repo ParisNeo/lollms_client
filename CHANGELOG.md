@@ -43,6 +43,17 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-24 22:30]
+
+- feat(reasoning): add cross-model reasoning effort translation (`supported_reasoning_efforts`) with topological anchor projection
+- feat(multimodal): add native video comprehension input (`videos`, `video_enabled`, `normalize_video_input`, `has_video_capability`)
+- feat(multimodal): add GLM-5.3-Flash sequential image embedding support (`glm_image_embedding`)
+- fix(openai): preserve visible `<think>` tags in output and stream thoughts via `MSG_TYPE_THOUGHT_CHUNK` for clean reprompt stripping
+
+## [2026-09-24 19:45]
+
+- feat(openai:description) add OpenAI description configuration updates
+
 ## [2026-09-24 18:19]
 
 - feat(openai): add OpenAI description and core API updates

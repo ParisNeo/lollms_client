@@ -61,6 +61,9 @@ class LollmsModelProfile:
     forced_context_size: Optional[int] = None
     routing_config: Optional[Dict[str, Any]] = None
     glm_image_embedding: bool = False
+    supported_reasoning_efforts: Optional[List[str]] = None
+    video_enabled: bool = False
+    supported_reasoning_efforts: Optional[List[str]] = None
 
 
 
@@ -392,7 +395,9 @@ class LollmsClient():
                         vision_enabled=p_data.get("vision_enabled", False),
                         forced_context_size=p_data.get("forced_context_size"),
                         routing_config=p_data.get("routing_config") or p_data.get("routing_profile"),
-                        glm_image_embedding=p_data.get("glm_image_embedding", False)
+                        glm_image_embedding=p_data.get("glm_image_embedding", False),
+                        supported_reasoning_efforts=p_data.get("supported_reasoning_efforts") or p_data.get("reasoning_efforts"),
+                        video_enabled=p_data.get("video_enabled", False)
                     )
                 registry[alias] = profile
 
@@ -444,6 +449,7 @@ class LollmsClient():
             )
             if binding:
                 binding.vision_enabled = model_profile.vision_enabled
+                binding.video_enabled = model_profile.video_enabled
                 if hasattr(binding, "forced_context_size"):
                     binding.forced_context_size = model_profile.forced_context_size
                 if hasattr(binding, "routing_config"):
@@ -452,6 +458,11 @@ class LollmsClient():
                     binding.glm_image_embedding = model_profile.glm_image_embedding
                 else:
                     setattr(binding, "glm_image_embedding", model_profile.glm_image_embedding)
+                if hasattr(binding, "supported_reasoning_efforts"):
+                    if model_profile.supported_reasoning_efforts is not None:
+                        binding.supported_reasoning_efforts = model_profile.supported_reasoning_efforts
+                else:
+                    setattr(binding, "supported_reasoning_efforts", model_profile.supported_reasoning_efforts)
                 return binding
         except Exception as e:
             trace_exception(e)
@@ -737,6 +748,8 @@ class LollmsClient():
             return True
         if getattr(target_binding, "supports_vision", False) is True:
             return True
+        if getattr(target_binding, "video_enabled", False) is True:
+            return True
         if getattr(target_binding, "glm_image_embedding", False) is True:
             return True
 
@@ -747,6 +760,30 @@ class LollmsClient():
         if hasattr(self, "_active_llm_alias") and self._active_llm_alias in self.llm_model_profiles_registry:
             active_profile = self.llm_model_profiles_registry[self._active_llm_alias]
             if getattr(active_profile, "vision_enabled", False):
+                return True
+
+        return False
+
+    def has_video_capability(self, binding: Optional[Any] = None) -> bool:
+        """
+        Checks if the specified binding (or the currently active LLM) has video input capabilities.
+        """
+        target_binding = binding or self.llm
+        if not target_binding:
+            return False
+
+        if getattr(target_binding, "video_enabled", False) is True:
+            return True
+        if getattr(target_binding, "supports_video", False) is True:
+            return True
+
+        if hasattr(target_binding, "child_bindings") and isinstance(target_binding.child_bindings, dict):
+            return any(getattr(child, "video_enabled", False) or getattr(child, "supports_video", False)
+                       for child in target_binding.child_bindings.values())
+
+        if hasattr(self, "_active_llm_alias") and self._active_llm_alias in self.llm_model_profiles_registry:
+            active_profile = self.llm_model_profiles_registry[self._active_llm_alias]
+            if getattr(active_profile, "video_enabled", False):
                 return True
 
         return False
@@ -898,6 +935,15 @@ class LollmsClient():
             if "active_images" in msg_copy:
                 msg_copy.pop("active_images", None)
 
+            if not self.has_video_capability():
+                if "videos" in msg_copy and msg_copy["videos"]:
+                    msg_copy.pop("videos", None)
+                    vid_note = "[Video attached (non-video model)]"
+                    if isinstance(msg_copy["content"], str):
+                        msg_copy["content"] = f"{msg_copy['content']}\n\n{vid_note}".strip()
+                    elif isinstance(msg_copy["content"], list):
+                        msg_copy["content"].append({"type": "text", "text": vid_note})
+
             sanitized_messages.append(msg_copy)
 
         return sanitized_messages
@@ -907,15 +953,18 @@ class LollmsClient():
         if not self.llm:
             raise RuntimeError("LLM binding not initialized. Cannot use generate_text.")
 
-        reasoning_effort = LollmsLLMBinding.normalize_reasoning_effort(
-            kwargs.get("think"), kwargs.get("reasoning_effort")
-        )
+        if self.llm:
+            reasoning_effort = self.llm.get_effective_reasoning_effort(
+                think=kwargs.get("think"),
+                reasoning_effort=kwargs.get("reasoning_effort")
+            )
+        else:
+            reasoning_effort = LollmsLLMBinding.normalize_reasoning_effort(
+                kwargs.get("think"), kwargs.get("reasoning_effort")
+            )
         kwargs.pop("think", None)
         kwargs.pop("reasoning_summary", None)
-        if reasoning_effort is not None:
-            kwargs["reasoning_effort"] = reasoning_effort
-        else:
-            kwargs["reasoning_effort"] = None
+        kwargs["reasoning_effort"] = reasoning_effort
 
         # Non-vision model image stripping and VLM substitution
         prompt = kwargs.get("prompt", args[0] if len(args) > 0 else "")
@@ -939,15 +988,18 @@ class LollmsClient():
         if not self.llm:
             raise RuntimeError("LLM binding not initialized. Cannot use generate_from_messages.")
 
-        reasoning_effort = LollmsLLMBinding.normalize_reasoning_effort(
-            kwargs.get("think"), kwargs.get("reasoning_effort")
-        )
+        if self.llm:
+            reasoning_effort = self.llm.get_effective_reasoning_effort(
+                think=kwargs.get("think"),
+                reasoning_effort=kwargs.get("reasoning_effort")
+            )
+        else:
+            reasoning_effort = LollmsLLMBinding.normalize_reasoning_effort(
+                kwargs.get("think"), kwargs.get("reasoning_effort")
+            )
         kwargs.pop("think", None)
         kwargs.pop("reasoning_summary", None)
-        if reasoning_effort is not None:
-            kwargs["reasoning_effort"] = reasoning_effort
-        else:
-            kwargs["reasoning_effort"] = None
+        kwargs["reasoning_effort"] = reasoning_effort
 
         # Non-vision model message sanitization and VLM substitution
         messages = kwargs.get("messages", args[0] if len(args) > 0 else [])

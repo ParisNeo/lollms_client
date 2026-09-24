@@ -138,7 +138,16 @@ Located in `lollms_client/lollms_core.py`, the `LollmsClient` class is the main 
 (General description of Bindings, ABCs, and Binding Managers remains the same)
 
 ### Supported Modalities and Bindings
-(LLM, TTS, TTI, STT, TTM, TTV sections remain largely the same)
+
+#### Multimodal Video Input & Comprehension
+*   **Execution Layer Support**: LLM bindings accept `videos: Optional[List[str]] = None` in `generate_text()` and structured `{"type": "video_url", ...}` items in `generate_from_messages()`.
+*   **Normalization**: `normalize_video_input()` converts local files (`.mp4`, `.webm`, `.mov`, `.mkv`), raw base64 strings, and HTTP/HTTPS URLs into standardized OpenAI/vLLM `video_url` content blocks.
+*   **Model Profiles**: Set `video_enabled=True` on `LollmsModelProfile` to indicate native video comprehension capability. `LollmsClient.has_video_capability()` enables programmatic capability inspection.
+
+#### Reasoning Effort Projection & Thought Stream Handling
+*   **Topological Effort Projection**: `LollmsLLMBinding.translate_reasoning_effort(effort, supported_efforts)` maps continuous compute intensities ($0.0$ to $1.0$) to the model's declared `supported_reasoning_efforts` (e.g. mapping `"max"` to `"high"` on OpenAI, or `"medium"` to `"high"` on GLM-5.3-Flash).
+*   **Streaming Stream Handler (`_StreamThinkingHandler`)**: Routes thinking chunks to `MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK` while preserving visible `<think>...</think>` XML delimiters in output text. This ensures `LollmsTextProcessor.remove_thinking_blocks()` reliably identifies and strips thoughts during multi-turn discussion reprompting.
+*   **GLM-5.3-Flash Sequential Embedding (`glm_image_embedding`)**: Formats Chat Completions content blocks in strict text-first order (`[{"type": "text", ...}, {"type": "image_url", ...}]`) and suppresses incompatible vLLM `enable_thinking` kwargs.
 
 #### MCP (Model Context Protocol) Bindings
 *   **Directory:** `lollms_client/tools_bindings/`

@@ -116,7 +116,9 @@ save_user_field(user_id, "lollms_config", json.dumps(structured))
 *   **Schema & Pydantic Enforcement**: Easily output structured data with built-in schema validation and truncation-recovery algorithms. If the model's output gets cut off, the Text Processor reconstructs the JSON tree and repairs the output.
 *   **Yes/No & Multi-Choice Helpers**: Built-in helper primitives to perform discrete evaluations, ranking, and classification.
 
-### 🖼️ Multimodal Context Isolation & Multi-Image Fusion
+### 🖼️ Multimodal Context Isolation, Video Comprehension & Multi-Image Fusion
+*   **Native Video Comprehension**: Full multimodal video ingestion (`videos=[...]` or `{"type": "video_url", ...}`) for models like Qwen2.5-VL and GLM-5.3-Flash, supporting local video files, base64 data URLs, and remote streams.
+*   **GLM-5.3-Flash Native Multimodal Format**: Support for sequential text-first multimodal payloads (`glm_image_embedding: True`) and suppression of incompatible chat template flags.
 *   **Fine-Grained Vision Controls**: Multi-image inputs can be selectively toggled active or inactive on each message turn without purging original databases—significantly reducing vision model token costs.
 *   **Qwen Multi-Image Fusion**: Diffusers integration supports cutting-edge local image-to-image engines capable of single-image semantic edits and advanced **multi-image fusion, character swaps, pose transfers, and background transplants**.
 
@@ -126,6 +128,8 @@ save_user_field(user_id, "lollms_config", json.dumps(structured))
 
 ### 🧠 Universal Lazy Profiles & Multi-Model Routing
 *   **Memory-Efficient Multi-Binding**: Define declarative registries of `LollmsBindingProfile` configurations for *any* modality (LLM, TTI, TTS, STT, TTV, TTM). Only the binding marked as `is_default` is eagerly loaded at startup. Other bindings are instantiated lazily *on-demand* when you switch to them, saving massive amounts of RAM and VRAM.
+*   **Cross-Model Reasoning Effort Translation**: Declare `supported_reasoning_efforts` per model profile (e.g. `["low", "medium", "high"]` for OpenAI vs `["low", "high", "max"]` for GLM). LoLLMS automatically translates incoming effort levels to the nearest supported level using distance projection.
+*   **Visible Thought Streams & Reprompt Hygiene**: Generates real-time thought events via `MSG_TYPE_THOUGHT_CHUNK` while preserving visible `<think>...</think>` tags in accumulated responses, guaranteeing clean stripping by `remove_thinking_blocks()` during multi-turn discussions.
 *   **Dynamic Switching**: Seamlessly switch between a local coding model, a cloud vision model, and a fast text model at runtime using `client.switch_model("alias")` or `client.switch_tti("alias")`. Instantiated bindings are cached for zero-latency re-activation.
 *   **100% Backward Compatible**: If you use the legacy `llm_binding_name` or `extra_llms` parameters, they are automatically registered as the `"master"` profiles and eagerly instantiated, ensuring older code runs without modification.
 
@@ -714,7 +718,17 @@ llm_model_profiles = {
         name="deep_coder",
         binding_profile_name="local_ollama",
         model_name="qwen2.5-coder:7b",
-        forced_context_size=32768
+        forced_context_size=32768,
+        supported_reasoning_efforts=["low", "medium", "high"]
+    ),
+    "glm_flash": LollmsModelProfile(
+        name="glm_flash",
+        binding_profile_name="local_ollama",
+        model_name="zai-org/GLM-5.3-Flash",
+        vision_enabled=True,
+        video_enabled=True,
+        glm_image_embedding=True,
+        supported_reasoning_efforts=["low", "high", "max"]
     )
 }
 

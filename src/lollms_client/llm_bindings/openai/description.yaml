@@ -67,6 +67,21 @@ model_input_parameters:
     description: "Enables GLM-5.3-Flash / GLM-4V compatible image embedding format (sequential text-first layout and standard image_url data blocks) for multimodal reasoning."
     mandatory: false
     default: false
+  - name: video_enabled
+    type: bool
+    description: "Enables video input comprehension for multimodal video models (e.g. Qwen2.5-VL, GLM-5.3-Flash)."
+    mandatory: false
+    default: false
+  - name: supported_reasoning_efforts
+    type: list
+    description: "List of reasoning effort levels supported by this model (e.g. ['low', 'medium', 'high'] for OpenAI, ['low', 'high', 'max'] for GLM-5.3-Flash). Incoming efforts are automatically projected to the closest supported level."
+    mandatory: false
+    default: null
+  - name: supported_reasoning_efforts
+    type: list
+    description: "List of reasoning effort levels supported by this model (e.g. ['low', 'medium', 'high'] for OpenAI, ['low', 'high', 'max'] for GLM-5.3-Flash). Incoming efforts are automatically projected to the closest supported level."
+    mandatory: false
+    default: null
 compatible_backends:
   official:
     - name: OpenAI

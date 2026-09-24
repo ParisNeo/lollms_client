@@ -84,6 +84,41 @@ def normalize_image_input(img: Any, default_mime: str = "image/jpeg", glm_format
     raise ValueError("Unsupported image input type")
 
 
+def normalize_video_input(video: Any, default_mime: str = "video/mp4") -> Dict[str, Any]:
+    """
+    Returns an OpenAI / vLLM Chat Completions API-compliant video content block:
+      { "type": "video_url", "video_url": { "url": "data:<mime>;base64,<...>" } }
+    Supports dictionaries (with url, path, or data), local file paths,
+    raw base64 strings, and HTTP/HTTPS URLs.
+    """
+    if isinstance(video, dict):
+        if "url" in video and isinstance(video["url"], str):
+            return {"type": "video_url", "video_url": {"url": video["url"]}}
+        if "data" in video and isinstance(video["data"], str):
+            mime = video.get("mime", default_mime)
+            raw = video["data"]
+            url = raw if raw.startswith(("http://", "https://", "data:")) else _to_data_url(raw, mime)
+            return {"type": "video_url", "video_url": {"url": url}}
+        if "path" in video and isinstance(video["path"], str):
+            p = _extract_markdown_path(video["path"])
+            b64 = _read_file_as_base64(p)
+            mime = _guess_mime_from_name(p, default_mime)
+            return {"type": "video_url", "video_url": {"url": _to_data_url(b64, mime)}}
+        raise ValueError("Unsupported dict format for video input")
+
+    if isinstance(video, str):
+        s = _extract_markdown_path(video)
+        if s.startswith(("http://", "https://", "data:")):
+            return {"type": "video_url", "video_url": {"url": s}}
+        if os.path.exists(s) or (":" in s and "\\" in s) or s.startswith(("/", ".")):
+            b64 = _read_file_as_base64(s)
+            mime = _guess_mime_from_name(s, default_mime)
+            return {"type": "video_url", "video_url": {"url": _to_data_url(b64, mime)}}
+        return {"type": "video_url", "video_url": {"url": _to_data_url(s, default_mime)}}
+
+    raise ValueError("Unsupported video input type")
+
+
 def extract_reasoning(obj: Any) -> Optional[str]:
     """
     Extract reasoning/thinking text from an OpenAI delta or message object.
@@ -314,6 +349,11 @@ class OpenAIBinding(LollmsLLMBinding):
         self.send_thinking_parameter = kwargs.get("send_thinking_parameter", True)
         self.thinking_effort_keyword = kwargs.get("thinking_effort_keyword", "enable_thinking")
         self.glm_image_embedding = kwargs.get("glm_image_embedding", False)
+        self.video_enabled = kwargs.get("video_enabled", False)
+        default_efforts = ["low", "high", "max"] if self.glm_image_embedding else ["low", "medium", "high"]
+        self.supported_reasoning_efforts = kwargs.get("supported_reasoning_efforts", default_efforts)
+        default_efforts = ["low", "high", "max"] if self.glm_image_embedding else ["low", "medium", "high"]
+        self.supported_reasoning_efforts = kwargs.get("supported_reasoning_efforts", default_efforts)
 
         self.base_address = self.host_address
         if self.base_address:
@@ -424,6 +464,7 @@ class OpenAIBinding(LollmsLLMBinding):
         self,
         prompt: str,
         images: Optional[List[str]] = None,
+        videos: Optional[List[str]] = None,
         system_prompt: str = "",
         n_predict: Optional[int] = None,
         stream: Optional[bool] = None,
@@ -445,7 +486,7 @@ class OpenAIBinding(LollmsLLMBinding):
         count = 0
         output = ""
 
-        effort = self.normalize_reasoning_effort(think, reasoning_effort)
+        effort = self.get_effective_reasoning_effort(think=think, reasoning_effort=reasoning_effort)
 
         messages = [
             {
@@ -454,8 +495,13 @@ class OpenAIBinding(LollmsLLMBinding):
             }
         ]
 
+        media_blocks = []
         if images:
-            img_blocks = [normalize_image_input(img, glm_format=self.glm_image_embedding) for img in images]
+            media_blocks.extend([normalize_image_input(img, glm_format=self.glm_image_embedding) for img in images])
+        if videos:
+            media_blocks.extend([normalize_video_input(vid) for vid in videos])
+
+        if media_blocks:
             if split:
                 messages += self.split_discussion(
                     prompt,
@@ -463,12 +509,12 @@ class OpenAIBinding(LollmsLLMBinding):
                     ai_keyword=ai_keyword,
                 )
                 last = messages[-1]
-                last["content"] = [{"type": "text", "text": last["content"]}] + img_blocks
+                last["content"] = [{"type": "text", "text": last["content"]}] + media_blocks
             else:
                 messages.append(
                     {
                         "role": "user",
-                        "content": [{"type": "text", "text": prompt}] + img_blocks,
+                        "content": [{"type": "text", "text": prompt}] + media_blocks,
                     }
                 )
         else:
@@ -692,9 +738,22 @@ class OpenAIBinding(LollmsLLMBinding):
                         if isinstance(val, str) and val:
                             images.append(val)
 
+            videos = []
+            if isinstance(content, list):
+                for item in content:
+                    if item.get("type") in ("video_url", "video", "input_video"):
+                        val = item.get("video_url") or item.get("video")
+                        if isinstance(val, dict):
+                            val = val.get("url") or val.get("base64")
+                        if isinstance(val, str) and val:
+                            videos.append(val)
+
+            if "videos" in msg and msg["videos"]:
+                videos.extend(msg["videos"])
+
             text_content = "\n".join(p for p in text_parts if p.strip())
 
-            if not images:
+            if not images and not videos:
                 return {"role": role, "content": text_content}
 
             openai_content = []
@@ -703,6 +762,9 @@ class OpenAIBinding(LollmsLLMBinding):
             for img in images:
                 img_block = normalize_image_input(img, glm_format=self.glm_image_embedding)
                 openai_content.append(img_block)
+            for vid in videos:
+                vid_block = normalize_video_input(vid)
+                openai_content.append(vid_block)
             return {"role": role, "content": openai_content}
 
         openai_messages = [normalize_message(m) for m in messages]
@@ -746,7 +808,7 @@ class OpenAIBinding(LollmsLLMBinding):
 
         params = {k: v for k, v in params.items() if v is not None}
 
-        effort = self.normalize_reasoning_effort(think, reasoning_effort)
+        effort = self.normalize_reasoning_effort(think=think, reasoning_effort=reasoning_effort)
         if effort is not None:
             if self.is_vllm:
                 self._apply_vllm_thinking_kwargs(params, effort)
