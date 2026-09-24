@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-24 12:17]
+
+- `fix(lollms_client): update version from 1.19.12 → 1.19.13 in __init__.py`
+
 ## [2026-09-24 11:58]
 
 - fix(pymupdf): suppress MuPDF stdout/stderr with "fd:2" instead of "0"
