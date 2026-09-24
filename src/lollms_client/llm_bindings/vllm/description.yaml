@@ -237,3 +237,38 @@ presets:
       max_num_seqs: 16
       enable_prefix_caching: true
       enable_chunked_prefill: true
+
+commands:
+  - name: install_vllm
+    title: Install vLLM
+    description: "Installs vLLM and optimal PyTorch dependencies using uv or pip."
+    parameters:
+      - name: force
+        type: bool
+        description: "Force re-installation even if already present."
+        mandatory: false
+        default: false
+      - name: cuda_version
+        type: str
+        description: "Specific CUDA backend (e.g. 'auto', 'cu128', 'cu126', 'cpu')."
+        mandatory: false
+        default: "auto"
+    output:
+      - name: status
+        type: bool
+        description: "Status of the operation (true for success, false for failure)"
+      - name: message
+        type: str
+        description: "Message describing the operation result"
+
+  - name: update_vllm
+    title: Update vLLM
+    description: "Stops active vLLM daemons and upgrades vLLM to the latest release."
+    parameters: []
+    output:
+      - name: status
+        type: bool
+        description: "Status of the operation"
+      - name: message
+        type: str
+        description: "Result message"

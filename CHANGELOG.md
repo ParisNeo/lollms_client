@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-24 22:14]
+
+- fix(vllm): update description and binding class to reflect vllm registry refactoring
+
 ## [2026-09-24 22:10]
 
 - feat(lollms-client): update server mutualization and recipe presets documentation

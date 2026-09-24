@@ -918,3 +918,140 @@ class VLLMBinding(LollmsLLMBinding):
             except Exception:
                 pass
         return results
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Installation & Update Commands
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def install_vllm(
+        self,
+        force: bool = False,
+        cuda_version: str = "auto",
+        progress_callback: Optional[Callable[[dict], None]] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """
+        Installs vLLM into the Python environment.
+        Supports automatic CUDA backend selection using uv or pip.
+        """
+        def report(status: str, msg: str, percent: int = 0):
+            ASCIIColors.info(f"[vLLM Installer] {msg}")
+            if progress_callback:
+                progress_callback({"status": status, "message": msg, "completed": percent, "total": 100})
+
+        report("starting", "Detecting platform environment...", 10)
+        sys_plat = platform.system()
+
+        if sys_plat == "Windows":
+            msg = (
+                "Native Windows is not officially supported by vLLM. "
+                "Please run vLLM inside WSL 2 (Ubuntu) with 'uv pip install vllm --torch-backend=auto', "
+                "or connect to a remote vLLM instance using the host_address parameter."
+            )
+            report("error", msg, 0)
+            return {"status": False, "message": msg}
+
+        # Check if already installed and not forced
+        if not force:
+            try:
+                import vllm
+                v_ver = getattr(vllm, "__version__", "unknown")
+                msg = f"vLLM is already installed (version {v_ver}). Use force=True to re-install."
+                report("success", msg, 100)
+                return {"status": True, "message": msg}
+            except ImportError:
+                pass
+
+        has_uv = shutil.which("uv") is not None
+        installer_cmd: List[str] = []
+
+        if has_uv:
+            report("working", "Using uv package manager for installation...", 25)
+            installer_cmd = ["uv", "pip", "install", "vllm"]
+            if cuda_version:
+                installer_cmd.append(f"--torch-backend={cuda_version}")
+        else:
+            report("working", "Using standard pip installer...", 25)
+            installer_cmd = [sys.executable, "-m", "pip", "install", "vllm"]
+            if force:
+                installer_cmd.append("--force-reinstall")
+
+        report("working", f"Executing: {' '.join(installer_cmd)}", 40)
+        try:
+            proc = subprocess.Popen(
+                installer_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            for line in proc.stdout:
+                line_str = line.strip()
+                if line_str and progress_callback:
+                    progress_callback({"status": "installing", "message": line_str, "completed": 60, "total": 100})
+
+            proc.wait()
+            if proc.returncode == 0:
+                report("success", "vLLM successfully installed.", 100)
+                return {"status": True, "message": "vLLM successfully installed."}
+            else:
+                err_msg = f"Installation command failed with exit code {proc.returncode}."
+                report("error", err_msg, 0)
+                return {"status": False, "message": err_msg}
+        except Exception as e:
+            trace_exception(e)
+            report("error", f"Installation failed: {e}", 0)
+            return {"status": False, "message": str(e)}
+
+    def update(self, progress_callback: Optional[Callable[[dict], None]] = None, **kwargs) -> Dict[str, Any]:
+        """
+        Terminates running vLLM daemon servers and upgrades vLLM to the latest release.
+        """
+        def report(status: str, msg: str, percent: int = 0):
+            ASCIIColors.info(f"[vLLM Update] {msg}")
+            if progress_callback:
+                progress_callback({"status": status, "message": msg, "completed": percent, "total": 100})
+
+        report("stopping", "Stopping all active vLLM daemons before update...", 10)
+        if self.model_name:
+            self.unload_model(self.model_name)
+
+        # Evict all running servers
+        for rf in list(self.servers_dir.glob("*.json")):
+            try:
+                with open(rf, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                m_name = data.get("model_name")
+                if m_name:
+                    self.unload_model(m_name)
+            except Exception:
+                rf.unlink(missing_ok=True)
+
+        time.sleep(1.5)
+
+        has_uv = shutil.which("uv") is not None
+        cmd = ["uv", "pip", "install", "-U", "vllm"] if has_uv else [sys.executable, "-m", "pip", "install", "--upgrade", "vllm"]
+
+        report("working", f"Executing upgrade: {' '.join(cmd)}", 40)
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            for line in proc.stdout:
+                line_str = line.strip()
+                if line_str and progress_callback:
+                    progress_callback({"status": "updating", "message": line_str, "completed": 75, "total": 100})
+
+            proc.wait()
+            if proc.returncode == 0:
+                report("success", "vLLM successfully updated.", 100)
+                return {"status": True, "message": "vLLM updated successfully."}
+            else:
+                msg = f"Update command failed with exit code {proc.returncode}."
+                report("error", msg, 0)
+                return {"status": False, "message": msg}
+        except Exception as e:
+            trace_exception(e)
+            report("error", f"Update failed: {e}", 0)
+            return {"status": False, "message": str(e)}
+
+    def update_vllm(self, *args, **kwargs) -> Dict[str, Any]:
+        """Alias for update command."""
+        return self.update(*args, **kwargs)

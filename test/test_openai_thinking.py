@@ -247,6 +247,15 @@ def test_vllm_registry_path_format():
     assert "Qwen__Qwen2.5-Coder-7B-Instruct.json" in reg_file.name
 
 
+def test_vllm_binding_commands():
+    from lollms_client.llm_bindings.vllm import VLLMBinding
+
+    binding = VLLMBinding()
+    assert hasattr(binding, "install_vllm")
+    assert hasattr(binding, "update")
+    assert hasattr(binding, "update_vllm")
+
+
 def test_vllm_clean_command_construction():
     from lollms_client.llm_bindings.vllm import VLLMBinding
 
