@@ -720,6 +720,77 @@ if client.has_video_capability():
 
 ---
 
+## 🚀 vLLM Server Mutualization & Recipe Presets
+
+The `vllm` binding allows multiple independent processes (WebUI, CLI agents, background workers) to share a single GPU-resident vLLM model daemon. The first process automatically starts the OpenAI-compatible server on a dedicated port, and all subsequent processes attach to it with zero VRAM overhead.
+
+### Using Recipe Presets in Code & Front-Ends
+
+You can configure models using pre-validated optimization recipes directly via the `preset` parameter:
+
+```python
+from lollms_client import LollmsClient, LollmsBindingProfile, LollmsModelProfile
+
+client = LollmsClient(
+    llm_binding_profiles={
+        "vllm_shared": LollmsBindingProfile(
+            name="vllm_shared",
+            binding_name="vllm",
+            binding_config={"gpu_memory_utilization": 0.90}
+        )
+    },
+    llm_model_profiles={
+        # 1. DeepSeek R1 with Native Multi-Token Prediction (MTP)
+        "deepseek_r1": LollmsModelProfile(
+            name="deepseek_r1",
+            binding_profile_name="vllm_shared",
+            model_name="deepseek-ai/DeepSeek-R1",
+            routing_config={"preset": "deepseek_r1_mtp"},
+            is_default=True
+        ),
+        # 2. Qwen2.5-Coder with FP8 Quantized KV Cache
+        "qwen_coder": LollmsModelProfile(
+            name="qwen_coder",
+            binding_profile_name="vllm_shared",
+            model_name="Qwen/Qwen2.5-Coder-32B-Instruct",
+            routing_config={"preset": "qwen2_5_coder_fp8_kv"}
+        ),
+        # 3. Consumer Low-VRAM (Single 24GB RTX 3090/4090)
+        "local_coder": LollmsModelProfile(
+            name="local_coder",
+            binding_profile_name="vllm_shared",
+            model_name="Qwen/Qwen2.5-Coder-7B-Instruct",
+            routing_config={"preset": "low_vram_consumer"}
+        )
+    }
+)
+```
+
+### Front-End Integration Guide (LoLLMS WebUI & NiceGUI)
+
+Front-end applications can discover all available presets dynamically:
+
+```python
+from lollms_client.lollms_bindings_utils import get_binding_desc
+
+desc = get_binding_desc("vllm", "llm")
+presets = desc.get("presets", [])
+
+# Render dropdown in your settings UI
+preset_choices = {p["id"]: f"{p['title']} — {p['description']}" for p in presets}
+
+def on_select_preset(preset_id: str):
+    selected_preset = next(p for p in presets if p["id"] == preset_id)
+    # Automatically pre-fill the form fields with recipe parameters
+    for param_name, param_val in selected_preset["parameters"].items():
+        update_ui_field(param_name, param_val)
+```
+
+### Strict Parameter Cleanliness Mandate
+The binding guarantees that any parameter with a value of `None`, `""`, or `False` (for boolean flags) is **never passed** to the `vllm.entrypoints.openai.api_server` command line, ensuring zero argument parsing crashes.
+
+---
+
 ## 7. VLM as a Tool (Vision Fallback)
 
 When your primary model lacks vision capabilities, the `vlm_query` tool enables on-demand image analysis:

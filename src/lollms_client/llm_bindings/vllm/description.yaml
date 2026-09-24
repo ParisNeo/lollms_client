@@ -1,37 +1,239 @@
-title: vLLM
+title: vLLM (Mutualized Daemon Server)
 author: ParisNeo
 creation_date: 2025-08-13
-last_update_date: 2025-08-13
-description: A high-performance binding using the vLLM library for fast inference on NVIDIA GPUs. It manages and shares model engines between multiple binding instances.
+last_update_date: 2026-09-25
+description: >
+  High-performance vLLM binding with cross-process server mutualization.
+  The first instance launches a detached OpenAI-compatible server daemon,
+  and subsequent instances across processes automatically share the same
+  running model, memory pools, and continuous batching engine. Includes
+  production-grade recipes for MTP, quantized KV cache, and chunked prefill.
 global_input_parameters:
-  - name: models_folder
+  - name: host
     type: str
-    description: "The path to the directory where local models are stored or downloaded."
+    description: "The host interface for the vLLM server (default: 127.0.0.1)."
     mandatory: false
-    default: ""
+    default: "127.0.0.1"
+  - name: port
+    type: int
+    description: "Specific port for the vLLM server (leave blank/0 for auto-free port)."
+    mandatory: false
+    default: 0
   - name: tensor_parallel_size
     type: int
-    description: "The number of GPUs to use for tensor parallelism. Defaults to the number of available GPUs."
+    description: "Number of GPUs for tensor parallelism (default: 1)."
     mandatory: false
     default: 1
-  - name: quantization
-    type: str
-    description: "The quantization method to use (e.g., 'awq', 'gptq', 'gguf')."
+  - name: pipeline_parallel_size
+    type: int
+    description: "Number of pipeline stages across multiple nodes/GPUs (default: 1)."
     mandatory: false
-    default: ""
+    default: 1
   - name: gpu_memory_utilization
     type: float
-    description: "The fraction of GPU memory to reserve for the model (0.0 to 1.0). Defaults to 0.9."
+    description: "Fraction of GPU VRAM to reserve for vLLM (0.0 to 1.0, default: 0.9)."
     mandatory: false
     default: 0.9
-  - name: trust_remote_code
+  - name: max_model_len
+    type: int
+    description: "Maximum context length in tokens (leave blank for model default)."
+    mandatory: false
+    default: null
+  - name: dtype
+    type: str
+    description: "Data type for model weights ('auto', 'bfloat16', 'float16')."
+    mandatory: false
+    default: "auto"
+    options:
+      - auto
+      - bfloat16
+      - float16
+  - name: quantization
+    type: str
+    description: "Weight quantization method ('awq', 'gptq', 'fp8', 'bitsandbytes')."
+    mandatory: false
+    default: ""
+  - name: kv_cache_dtype
+    type: str
+    description: "Data type for KV cache storage ('auto', 'fp8', 'fp8_e4m3', 'fp8_e5m2'). Using fp8 halves KV cache VRAM."
+    mandatory: false
+    default: "auto"
+    options:
+      - auto
+      - fp8
+      - fp8_e4m3
+      - fp8_e5m2
+  - name: block_size
+    type: int
+    description: "Token block size for contiguous chunks in PagedAttention (16 or 32)."
+    mandatory: false
+    default: 16
+    options:
+      - 16
+      - 32
+  - name: enable_prefix_caching
     type: bool
-    description: "Whether to trust and execute remote code from the model's repository. Use with caution. Defaults to false."
+    description: "Enables automatic prefix caching to reuse KV blocks for repeated system prompts."
+    mandatory: false
+    default: true
+  - name: enable_chunked_prefill
+    type: bool
+    description: "Enables chunked prefill to interleave prompt prefill chunks with token generation."
+    mandatory: false
+    default: true
+  - name: max_num_batched_tokens
+    type: int
+    description: "Maximum number of batched tokens per iteration (e.g. 4096 or 8192)."
+    mandatory: false
+    default: null
+  - name: max_num_seqs
+    type: int
+    description: "Maximum number of concurrent sequences to schedule."
+    mandatory: false
+    default: null
+  - name: speculative_config
+    type: str
+    description: "JSON string for speculative decoding / MTP (e.g. '{\"method\":\"mtp\",\"num_speculative_tokens\":1}')."
+    mandatory: false
+    default: ""
+  - name: tool_call_parser
+    type: str
+    description: "Native tool parser for OpenAI tool calling ('hermes', 'llama3_json', 'mistral', 'qwen3_coder')."
+    mandatory: false
+    default: ""
+    options:
+      - hermes
+      - llama3_json
+      - mistral
+      - qwen3_coder
+      - deepseek_v32
+  - name: reasoning_parser
+    type: str
+    description: "Reasoning parser for thinking models ('deepseek_r1', 'qwen3')."
+    mandatory: false
+    default: ""
+    options:
+      - deepseek_r1
+      - qwen3
+  - name: enable_expert_parallel
+    type: bool
+    description: "Enable expert parallelism for MoE models (DeepSeek, MiMo, Qwen-MoE)."
     mandatory: false
     default: false
+  - name: trust_remote_code
+    type: bool
+    description: "Whether to trust remote code from Hugging Face."
+    mandatory: false
+    default: false
+  - name: enforce_eager
+    type: bool
+    description: "Enforce eager execution mode instead of CUDA graphs."
+    mandatory: false
+    default: false
+  - name: cpu_offload_gb
+    type: float
+    description: "GiB of CPU RAM to allocate for offloading weights or KV blocks."
+    mandatory: false
+    default: null
+  - name: idle_timeout
+    type: float
+    description: "Seconds of inactivity before daemon automatically terminates (default: 600)."
+    mandatory: false
+    default: 600.0
+
 model_input_parameters:
   - name: model_name
     type: str
-    description: "The name, Hugging Face ID, GGUF file ID, or local path of the model to load."
+    description: "The Hugging Face repo ID or local path of the model."
     mandatory: true
     default: ""
+  - name: glm_image_embedding
+    type: bool
+    description: "Enable GLM-5.3-Flash / GLM-4V compatible sequential image embedding format."
+    mandatory: false
+    default: false
+  - name: video_enabled
+    type: bool
+    description: "Enable video comprehension for multimodal video models (e.g. Qwen2.5-VL)."
+    mandatory: false
+    default: false
+  - name: supported_reasoning_efforts
+    type: str
+    description: "Comma-separated list of reasoning effort levels (e.g. 'low, medium, high')."
+    mandatory: false
+    default: ""
+
+presets:
+  - id: deepseek_r1_mtp
+    title: "DeepSeek-R1 / V3 (Native MTP + FP8)"
+    description: "Optimized for DeepSeek 671B/37B MoE on 8x GPUs with native Multi-Token Prediction and FP8 weights."
+    parameters:
+      tensor_parallel_size: 8
+      quantization: "fp8"
+      dtype: "bfloat16"
+      enable_prefix_caching: true
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 8192
+      enable_expert_parallel: true
+      speculative_config: '{"method":"mtp","num_speculative_tokens":1}'
+      tool_call_parser: "deepseek_v32"
+      reasoning_parser: "deepseek_r1"
+      trust_remote_code: true
+
+  - id: qwen2_5_coder_fp8_kv
+    title: "Qwen2.5-Coder (FP8 KV Cache + Chunked Prefill)"
+    description: "High-throughput coding profile with halved KV cache footprint and Hermes tool parsing."
+    parameters:
+      kv_cache_dtype: "fp8_e4m3"
+      enable_prefix_caching: true
+      enable_chunked_prefill: true
+      max_model_len: 32768
+      max_num_batched_tokens: 8192
+      tool_call_parser: "hermes"
+      gpu_memory_utilization: 0.92
+
+  - id: qwen2_5_vl_multimodal
+    title: "Qwen2.5-VL (Vision & Video Comprehension)"
+    description: "Multimodal visual and video input profile with prefix caching."
+    parameters:
+      video_enabled: true
+      max_model_len: 32768
+      enable_prefix_caching: true
+      enable_chunked_prefill: true
+      gpu_memory_utilization: 0.90
+
+  - id: llama_3_3_70b_throughput
+    title: "Llama-3.3-70B (Dual/Quad GPU High-Throughput)"
+    description: "Llama 3.3 70B profile with FP8 KV cache, chunked prefill, and llama3_json tool parser."
+    parameters:
+      tensor_parallel_size: 2
+      kv_cache_dtype: "fp8_e4m3"
+      enable_prefix_caching: true
+      enable_chunked_prefill: true
+      max_model_len: 32768
+      max_num_batched_tokens: 8192
+      tool_call_parser: "llama3_json"
+
+  - id: glm_5_flash_long_ctx
+    title: "GLM-5.3-Flash (1M Long Context + Sequential Multimodal)"
+    description: "GLM-5.3-Flash profile with sequential image formatting, video enabled, and reasoning effort levels."
+    parameters:
+      glm_image_embedding: true
+      video_enabled: true
+      supported_reasoning_efforts: "low, high, max"
+      enable_chunked_prefill: true
+      enable_prefix_caching: true
+      max_model_len: 131072
+      gpu_memory_utilization: 0.94
+
+  - id: low_vram_consumer
+    title: "Consumer GPU / Low VRAM (Single 24GB RTX 3090/4090)"
+    description: "Conservative VRAM budget with FP8 KV cache and batch capping to prevent OOM."
+    parameters:
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.88
+      kv_cache_dtype: "fp8_e4m3"
+      max_model_len: 8192
+      max_num_seqs: 16
+      enable_prefix_caching: true
+      enable_chunked_prefill: true

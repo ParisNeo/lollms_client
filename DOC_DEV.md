@@ -139,6 +139,11 @@ Located in `lollms_client/lollms_core.py`, the `LollmsClient` class is the main 
 
 ### Supported Modalities and Bindings
 
+#### vLLM Server Mutualization & Recipe Presets
+*   **Cross-Process Server Daemon**: `VLLMBinding` manages an inter-process daemon. The first process calling `load_model()` acquires an inter-process `FileLock` (`~/.lollms/bindings_models/vllm_models/global_vllm_manager.lock`), spawns an OpenAI-compatible daemon (`vllm.entrypoints.openai.api_server`), and registers its metadata. Subsequent processes attach directly to the running endpoint with zero VRAM duplication.
+*   **Recipe Presets in `description.yaml`**: Exposes pre-validated deployment recipes (`deepseek_r1_mtp`, `qwen2_5_coder_fp8_kv`, `qwen2_5_vl_multimodal`, `llama_3_3_70b_throughput`, `glm_5_flash_long_ctx`, `low_vram_consumer`). Front-ends can query `desc.get("presets")` to populate instant configuration dropdowns.
+*   **Clean Command Construction**: Any parameter evaluating to `None`, empty string, or `False` (for boolean flags) is omitted from the daemon launch arguments.
+
 #### Multimodal Video Input & Comprehension
 *   **Execution Layer Support**: LLM bindings accept `videos: Optional[List[str]] = None` in `generate_text()` and structured `{"type": "video_url", ...}` items in `generate_from_messages()`.
 *   **Normalization**: `normalize_video_input()` converts local files (`.mp4`, `.webm`, `.mov`, `.mkv`), raw base64 strings, and HTTP/HTTPS URLs into standardized OpenAI/vLLM `video_url` content blocks.

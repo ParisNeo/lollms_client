@@ -190,7 +190,28 @@ def test_model_profile_supported_efforts_propagation():
     assert client.llm.supported_reasoning_efforts == ["low", "medium", "high"]
     assert client.llm.get_effective_reasoning_effort(reasoning_effort="max") == "high"
 
+def test_extract_models_from_diverse_payloads():
+    from lollms_client.llm_bindings.lollms import LollmsBinding
 
+    binding = LollmsBinding(host_address="http://localhost:9642")
+
+    # OpenAI format
+    p1 = {"data": [{"id": "gpt-4o"}, {"id": "claude-3"}]}
+    assert binding._extract_models_from_payload(p1) == ["gpt-4o", "claude-3"]
+
+    # LoLLMS / Ollama list format
+    p2 = {"models": ["llama3:8b", "mistral:latest"]}
+    assert binding._extract_models_from_payload(p2) == ["llama3:8b", "mistral:latest"]
+
+    # Raw list
+    p3 = ["qwen2.5:7b", "deepseek-r1:8b"]
+    assert binding._extract_models_from_payload(p3) == ["qwen2.5:7b", "deepseek-r1:8b"]
+
+    # Video & GLM options initialized
+    assert hasattr(binding, "video_enabled")
+    assert hasattr(binding, "glm_image_embedding")
+    assert hasattr(binding, "supported_reasoning_efforts")
+    
 def test_normalize_video_input():
     from lollms_client.llm_bindings.openai import normalize_video_input
 
@@ -216,6 +237,47 @@ def test_string_supported_reasoning_efforts_parsing():
     )
     assert binding.supported_reasoning_efforts == ["low", "high", "max"]
     assert binding.get_effective_reasoning_effort(reasoning_effort="medium") == "high"
+
+
+def test_vllm_registry_path_format():
+    from lollms_client.llm_bindings.vllm import VLLMBinding
+
+    binding = VLLMBinding(model_name="Qwen/Qwen2.5-Coder-7B-Instruct")
+    reg_file = binding._get_registry_file("Qwen/Qwen2.5-Coder-7B-Instruct")
+    assert "Qwen__Qwen2.5-Coder-7B-Instruct.json" in reg_file.name
+
+
+def test_vllm_clean_command_construction():
+    from lollms_client.llm_bindings.vllm import VLLMBinding
+
+    binding = VLLMBinding(
+        model_name="deepseek-ai/DeepSeek-R1",
+        tensor_parallel_size=8,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=True,
+        kv_cache_dtype="fp8_e4m3",
+        max_num_batched_tokens=8192,
+        speculative_config={"method": "mtp", "num_speculative_tokens": 1},
+        pipeline_parallel_size=None,
+        cpu_offload_gb=None,
+        enforce_eager=False,
+    )
+    cmd = binding._build_server_command("deepseek-ai/DeepSeek-R1", 8000)
+
+    # Valid values present
+    assert "--tensor-parallel-size" in cmd
+    assert "8" in cmd
+    assert "--enable-chunked-prefill" in cmd
+    assert "--enable-prefix-caching" in cmd
+    assert "--kv-cache-dtype" in cmd
+    assert "fp8_e4m3" in cmd
+    assert "--speculative-config" in cmd
+    assert '{"method": "mtp", "num_speculative_tokens": 1}' in cmd
+
+    # None and False values MUST NOT be present
+    assert "--pipeline-parallel-size" not in cmd
+    assert "--cpu-offload-gb" not in cmd
+    assert "--enforce-eager" not in cmd
 
 
 def test_video_capability_profile_propagation():

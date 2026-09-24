@@ -1,13 +1,13 @@
 title: LoLLMs (OpenAI Compatible)
 author: ParisNeo
 creation_date: 2025-08-13
-last_update_date: 2026-04-09
+last_update_date: 2026-09-24
 description: |
   Connects to a LoLLMs service or any other OpenAI-compatible API endpoint.
-  Supports chat completions, streaming, reasoning/thinking, tool calling, embeddings,
-  tokenization/detokenization, context size detection, long context processing,
-  RAG database queries, TTS generation, voice listing, file text extraction,
-  and the OpenAI Responses API.
+  Supports chat completions, completions, streaming, reasoning/thinking separation,
+  tool calling (LCP/MCP), multimodal image and video inputs, embeddings, audio
+  transcriptions and speech, tokenization/detokenization, context size detection,
+  long context processing, RAG database queries, and the OpenAI Responses API.
 global_input_parameters:
   - name: host_address
     type: str
@@ -29,9 +29,62 @@ global_input_parameters:
     description: "Path to a specific SSL certificate file (.pem, .crt) for verifying the server identity. Useful for self-signed certificates."
     mandatory: false
     default: ""
+  - name: default_completion_format
+    type: str
+    description: "The default completion format to use. 'Chat' for chat.completions endpoint, 'Completion' for the legacy completions endpoint."
+    mandatory: false
+    default: "Chat"
+  - name: is_vllm
+    type: bool
+    description: "If true, the server is a vLLM instance. Enables vLLM-specific chat_template_kwargs (e.g. enable_thinking) so reasoning/thinking models like Qwen3 are handled correctly."
+    mandatory: false
+    default: false
+  - name: send_thinking_parameter
+    type: bool
+    description: "Only relevant when is_vllm=true. When true (default), the binding injects chat_template_kwargs.enable_thinking into every request. Set to false to never send enable_thinking to vLLM."
+    mandatory: false
+    default: true
+  - name: thinking_effort_keyword
+    type: str
+    description: "Only relevant when is_vllm=true. Can be enable_thinking or reasoning_effort."
+    mandatory: false
+    default: enable_thinking
+    options:
+      - enable_thinking
+      - reasoning_effort
+  - name: glm_image_embedding
+    type: bool
+    description: "Enable GLM-5.3-Flash / GLM-4V compatible image embedding format (sequential text-first layout and standard image_url data blocks)."
+    mandatory: false
+    default: false
+  - name: video_enabled
+    type: bool
+    description: "Enable video input comprehension for multimodal video models (e.g. Qwen2.5-VL, GLM-5.3-Flash)."
+    mandatory: false
+    default: false
+  - name: supported_reasoning_efforts
+    type: str
+    description: "Comma-separated list of reasoning effort levels supported by this backend (e.g. 'low, medium, high' for OpenAI, 'low, high, max' for GLM-5.3-Flash). Incoming efforts are projected to the closest supported level."
+    mandatory: false
+    default: ""
 model_input_parameters:
   - name: model_name
     type: str
     description: "The name of the model to use from the remote service."
     mandatory: true
+    default: ""
+  - name: glm_image_embedding
+    type: bool
+    description: "Enables GLM-5.3-Flash / GLM-4V compatible image embedding format (sequential text-first layout and standard image_url data blocks) for multimodal reasoning."
+    mandatory: false
+    default: false
+  - name: video_enabled
+    type: bool
+    description: "Enables video input comprehension for multimodal video models (e.g. Qwen2.5-VL, GLM-5.3-Flash)."
+    mandatory: false
+    default: false
+  - name: supported_reasoning_efforts
+    type: str
+    description: "Comma-separated list of reasoning effort levels supported by this model (e.g. 'low, medium, high' for OpenAI, 'low, high, max' for GLM-5.3-Flash). Incoming efforts are automatically projected to the closest supported level."
+    mandatory: false
     default: ""

@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-24 22:10]
+
+- feat(lollms-client): update server mutualization and recipe presets documentation
+
 ## [2026-09-24 21:15]
 
 - git commit -m "fix(openai): add OpenAI API description updates and minor GUI refinements"
