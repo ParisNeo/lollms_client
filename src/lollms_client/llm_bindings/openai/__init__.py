@@ -5,9 +5,10 @@ import base64
 import math
 import mimetypes
 import os
+import re
 import ssl
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import httpx
 import openai
@@ -83,6 +84,205 @@ def normalize_image_input(img, default_mime="image/jpeg"):
         return {"type": "input_image", "image_url": _to_data_url(s, default_mime)}
 
     raise ValueError("Unsupported image input type")
+
+
+def extract_reasoning(obj: Any) -> Optional[str]:
+    """
+    Extract reasoning/thinking text from an OpenAI delta or message object.
+    Supports standard and provider-specific fields (DeepSeek, vLLM, Groq, Together, etc.),
+    checking direct attributes, Pydantic v2 model_extra dictionaries, and dict lookups.
+    """
+    if obj is None:
+        return None
+
+    candidate_keys = (
+        "reasoning_content",
+        "reasoning",
+        "thinking",
+        "reasoning_text",
+        "thought",
+        "thoughts",
+    )
+
+    if isinstance(obj, dict):
+        for k in candidate_keys:
+            val = obj.get(k)
+            if val is not None and val != "":
+                return str(val)
+        return None
+
+    for k in candidate_keys:
+        try:
+            val = getattr(obj, k, None)
+            if val is not None and val != "":
+                return str(val)
+        except Exception:
+            pass
+
+    model_extra = getattr(obj, "model_extra", None)
+    if isinstance(model_extra, dict):
+        for k in candidate_keys:
+            val = model_extra.get(k)
+            if val is not None and val != "":
+                return str(val)
+
+    obj_dict = getattr(obj, "__dict__", None)
+    if isinstance(obj_dict, dict):
+        for k in candidate_keys:
+            val = obj_dict.get(k)
+            if val is not None and val != "":
+                return str(val)
+
+    return None
+
+
+class _StreamThinkingHandler:
+    """
+    Manages streaming chunks for OpenAI-compatible endpoints to guarantee that:
+    1. Dedicated reasoning fields (reasoning_content, reasoning, etc.) are wrapped
+       in visible <think>...</think> tags and dispatched as MSG_TYPE_THOUGHT_CHUNK.
+    2. In-content <think>...</think> tags are detected, streaming thoughts as
+       MSG_TYPE_THOUGHT_CHUNK and answer text as MSG_TYPE_CHUNK, while preserving
+       the <think> and </think> tags in the final output.
+    """
+
+    def __init__(self, streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None):
+        self.callback = streaming_callback
+        self.in_dedicated_reasoning = False
+        self.dedicated_reasoning_opened = False
+        self.in_content_thinking = False
+        self.buffer = ""
+        self.output = ""
+
+    def process_reasoning(self, reasoning: str) -> bool:
+        if not reasoning:
+            return True
+
+        if not self.in_dedicated_reasoning:
+            self.in_dedicated_reasoning = True
+            self.dedicated_reasoning_opened = True
+            open_tag = "<think>\n"
+            self.output += open_tag
+            if self.callback:
+                if self.callback(open_tag, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK) is False:
+                    return False
+
+        self.output += reasoning
+        if self.callback:
+            if self.callback(reasoning, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK) is False:
+                return False
+
+        return True
+
+    def _close_dedicated_reasoning(self) -> bool:
+        if self.in_dedicated_reasoning:
+            self.in_dedicated_reasoning = False
+            close_tag = "\n</think>\n"
+            self.output += close_tag
+            if self.callback:
+                if self.callback(close_tag, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK) is False:
+                    return False
+        return True
+
+    def process_content(self, content: str) -> bool:
+        if not self._close_dedicated_reasoning():
+            return False
+
+        if not content:
+            return True
+
+        if self.dedicated_reasoning_opened:
+            self.output += content
+            if self.callback:
+                return self.callback(content, MSG_TYPE.MSG_TYPE_CHUNK) is not False
+            return True
+
+        text = self.buffer + content
+        self.buffer = ""
+
+        open_tag_re = re.compile(r'<(think|thinking)>', re.IGNORECASE)
+        close_tag_re = re.compile(r'</(think|thinking)>', re.IGNORECASE)
+
+        while text:
+            if not self.in_content_thinking:
+                m = open_tag_re.search(text)
+                if m:
+                    pre = text[:m.start()]
+                    if pre:
+                        self.output += pre
+                        if self.callback and self.callback(pre, MSG_TYPE.MSG_TYPE_CHUNK) is False:
+                            return False
+
+                    tag = m.group(0)
+                    self.output += tag
+                    self.in_content_thinking = True
+                    if self.callback and self.callback(tag, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK) is False:
+                        return False
+
+                    text = text[m.end():]
+                else:
+                    for i in range(min(len(text), 10), 0, -1):
+                        suffix = text[-i:].lower()
+                        if "<thinking"[:i] == suffix or "<think"[:i] == suffix:
+                            self.buffer = text[-i:]
+                            text = text[:-i]
+                            break
+
+                    if text:
+                        self.output += text
+                        if self.callback and self.callback(text, MSG_TYPE.MSG_TYPE_CHUNK) is False:
+                            return False
+                    break
+            else:
+                m = close_tag_re.search(text)
+                if m:
+                    thought_part = text[:m.start()]
+                    if thought_part:
+                        self.output += thought_part
+                        if self.callback and self.callback(thought_part, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK) is False:
+                            return False
+
+                    tag = m.group(0)
+                    self.output += tag
+                    self.in_content_thinking = False
+                    if self.callback and self.callback(tag, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK) is False:
+                        return False
+
+                    text = text[m.end():]
+                else:
+                    for i in range(min(len(text), 11), 0, -1):
+                        suffix = text[-i:].lower()
+                        if "</thinking"[:i] == suffix or "</think"[:i] == suffix:
+                            self.buffer = text[-i:]
+                            text = text[:-i]
+                            break
+
+                    if text:
+                        self.output += text
+                        if self.callback and self.callback(text, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK) is False:
+                            return False
+                    break
+
+        return True
+
+    def flush(self) -> str:
+        self._close_dedicated_reasoning()
+
+        if self.buffer:
+            msg_type = MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK if self.in_content_thinking else MSG_TYPE.MSG_TYPE_CHUNK
+            self.output += self.buffer
+            if self.callback:
+                self.callback(self.buffer, msg_type)
+            self.buffer = ""
+
+        if self.in_content_thinking:
+            self.in_content_thinking = False
+            close_tag = "\n</think>\n"
+            self.output += close_tag
+            if self.callback:
+                self.callback(close_tag, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+
+        return self.output
 
 
 class OpenAIBinding(LollmsLLMBinding):
@@ -198,7 +398,7 @@ class OpenAIBinding(LollmsLLMBinding):
                 if v is not None and kwargs.get("debug", False):
                     ASCIIColors.warning(f"Removed unsupported OpenAI param '{k}'")
 
-        model_lower = model.lower()
+        model_lower = model.lower() if model else ""
         if any(fam in model_lower for fam in restricted_families):
             if "temperature" in params and params["temperature"] != 1:
                 ASCIIColors.warning(
@@ -248,7 +448,6 @@ class OpenAIBinding(LollmsLLMBinding):
 
         effort = self.normalize_reasoning_effort(think, reasoning_effort)
 
-        # ── Build message list ────────────────────────────────────────────────
         messages = [
             {
                 "role": "system",
@@ -287,18 +486,7 @@ class OpenAIBinding(LollmsLLMBinding):
                     {"role": "user", "content": [{"type": "text", "text": prompt}]}
                 )
 
-        # ── Helper: extract reasoning from any delta / message object ─────────
-        def extract_reasoning(obj):
-            for attr in ("reasoning_content", "reasoning", "thinking", "reasoning_text"):
-                value = getattr(obj, attr, None)
-                if value:
-                    return value
-            return None
-
         try:
-            # ══════════════════════════════════════════════════════════════════
-            # Chat-completion path
-            # ══════════════════════════════════════════════════════════════════
             if self.completion_format == ELF_COMPLETION_FORMAT.Chat:
                 params = self._build_openai_params(
                     messages=messages,
@@ -310,15 +498,10 @@ class OpenAIBinding(LollmsLLMBinding):
                     seed=seed,
                 )
 
-                # ── Inject reasoning params ────────────────────────────────
                 if effort is not None:
                     if self.is_vllm:
                         self._apply_vllm_thinking_kwargs(params, effort)
                     else:
-                        # OpenAI extended-thinking models (o3, o4-mini, gpt-5 …)
-                        # Chat Completions uses flat reasoning_effort, not the
-                        # nested `reasoning` dict (that is Responses API only).
-                        # OpenAI accepts minimal/low/medium/high — clamp "max".
                         params["reasoning_effort"] = (
                             effort if effort != "max" else "high"
                         )
@@ -332,14 +515,12 @@ class OpenAIBinding(LollmsLLMBinding):
                     if self.is_vllm:
                         self._apply_vllm_thinking_kwargs(params, None)
 
-                # ── First attempt ─────────────────────────────────────────────
                 try:
                     chat_completion = self.client.chat.completions.create(**params)
 
                 except Exception as ex:
                     trace_exception(ex)
 
-                    # Retry: adapt params for servers that reject certain fields
                     if "max_tokens" in params:
                         params["max_completion_tokens"] = params.pop("max_tokens")
 
@@ -350,17 +531,18 @@ class OpenAIBinding(LollmsLLMBinding):
                     if effort is None:
                         params["temperature"] = 1
 
-                    # Strip vLLM-specific extras so the retry is clean
                     if "extra_body" in params:
                         params["extra_body"].pop("chat_template_kwargs", None)
 
                     chat_completion = self.client.chat.completions.create(**params)
 
-                # ── Streaming ─────────────────────────────────────────────────
                 if stream:
-                    in_reasoning = False
+                    handler = _StreamThinkingHandler(streaming_callback)
 
                     for resp in chat_completion:
+                        if self.is_cancelled():
+                            break
+
                         if count >= (n_predict or float("inf")):
                             break
 
@@ -372,63 +554,28 @@ class OpenAIBinding(LollmsLLMBinding):
                         content = getattr(delta, "content", None)
 
                         if reasoning:
-                            if not in_reasoning:
-                                in_reasoning = True
-                                chunk = "🧠\n"
-                                output += chunk
-                                if streaming_callback:
-                                    streaming_callback(
-                                        chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK
-                                    )
-                            output += reasoning
-                            if streaming_callback:
-                                streaming_callback(
-                                    reasoning, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK
-                                )
+                            if not handler.process_reasoning(reasoning):
+                                break
                             count += 1
                             continue
 
                         if content:
-                            if in_reasoning:
-                                in_reasoning = False
-                                closing = "\n\n✈️\n\n"
-                                output += closing
-                                if streaming_callback:
-                                    streaming_callback(
-                                        closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK
-                                    )
-                            output += content
-                            if streaming_callback:
-                                if not streaming_callback(
-                                    content, MSG_TYPE.MSG_TYPE_CHUNK
-                                ):
-                                    break
+                            if not handler.process_content(content):
+                                break
                             count += 1
 
-                    # Close any dangling 🧠 block
-                    if in_reasoning:
-                        closing = "\n\n✈️\n\n"
-                        output += closing
-                        if streaming_callback:
-                            streaming_callback(closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                    output = handler.flush()
 
-                # ── Non-streaming ─────────────────────────────────────────────
                 else:
                     message_obj = chat_completion.choices[0].message
                     reasoning = extract_reasoning(message_obj)
                     content = message_obj.content or ""
 
-                    if reasoning:
-                        # Server returned reasoning separately — wrap it
-                        output = f"🧠\n{reasoning}\n\n✈️\n\n{content}"
+                    if reasoning and not content.strip().startswith(("<think>", "<thinking>")):
+                        output = f"<think>\n{reasoning}\n</think>\n{content}"
                     else:
-                        # vLLM (and some others) embed 🧠…✈️ directly
-                        # in content, or thinking was disabled — pass through as-is
                         output = content
 
-            # ══════════════════════════════════════════════════════════════════
-            # Legacy completion path  (think / reasoning not supported here)
-            # ══════════════════════════════════════════════════════════════════
             else:
                 params = self._build_openai_params(
                     prompt=prompt,
@@ -457,6 +604,8 @@ class OpenAIBinding(LollmsLLMBinding):
 
                 if stream:
                     for resp in completion:
+                        if self.is_cancelled():
+                            break
                         if count >= (n_predict or float("inf")):
                             break
                         if not resp.choices:
@@ -492,13 +641,10 @@ class OpenAIBinding(LollmsLLMBinding):
         seed: Optional[int] = None,
         streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
         think: Optional[bool] = False,
-        reasoning_effort: Optional[str] = "low",  # low, medium, high
-        reasoning_summary: Optional[str] = "auto",  # auto
+        reasoning_effort: Optional[str] = "low",
+        reasoning_summary: Optional[str] = "auto",
         **kwargs,
     ) -> Union[str, dict]:
-        # ── Normalize messages to the OpenAI wire format ──────────────────────
-        # OpenAI Chat Completions only accepts these roles:
-        #   system, developer, user, assistant, tool, function
         _OPENAI_ROLE_MAP = {
             "system": "system",
             "developer": "developer",
@@ -506,7 +652,6 @@ class OpenAIBinding(LollmsLLMBinding):
             "assistant": "assistant",
             "tool": "tool",
             "function": "function",
-            # Non-standard LoLLMS / agent roles mapped to sanctioned equivalents
             "admin": "system",
             "root": "system",
             "manager": "system",
@@ -565,20 +710,8 @@ class OpenAIBinding(LollmsLLMBinding):
                 openai_content.append({"type": "image_url", "image_url": {"url": img_url}})
             return {"role": role, "content": openai_content}
 
-        # ── Helper: extract reasoning from any delta / message object ─────────
-        def extract_reasoning(obj):
-            for attr in ("reasoning_content", "reasoning", "thinking", "reasoning_text"):
-                value = getattr(obj, attr, None)
-                if value:
-                    return value
-            return None
-
         openai_messages = [normalize_message(m) for m in messages]
 
-        # ── NVIDIA NIM / STRICT ENDPOINT TOOL SANITIZATION ──
-        # The NVIDIA OpenAI-compatible endpoint strictly validates function IDs.
-        # It throws 404 NotFoundError if an unregistered UUID is passed inside the `tools` array.
-        # Ollama and vLLM ignore this, but we must sanitize the payload for strict routers.
         raw_tools = kwargs.get("tools")
         sanitized_tools = None
 
@@ -587,24 +720,18 @@ class OpenAIBinding(LollmsLLMBinding):
             for tool in raw_tools:
                 if not isinstance(tool, dict):
                     continue
-                # Filter out isolated UUIDs or malformed function wrappers
                 if "id" in tool and len(str(tool["id"])) == 36 and "-" in str(tool["id"]):
-                    # Strip the raw isolated UUID that breaks NVIDIA's registry
                     tool.pop("id", None)
 
-                # Enforce standard OpenAI function calling schema
                 if "function" in tool:
                     func_def = tool["function"]
-                    # Force strict=False to prevent rigid schema validation crashes on NIM
                     func_def["strict"] = False
-                    # Remove any UUID hidden inside function name or description
                     if "name" in func_def and isinstance(func_def["name"], str):
                         func_def["name"] = func_def["name"].replace(
                             _NIM_FUNCTION_NAME_PLACEHOLDER, "lcp_tool"
                         )
                 sanitized_tools.append(tool)
 
-        # ── Build base params ─────────────────────────────────────────────────
         params = {
             "model": self.model_name,
             "messages": openai_messages,
@@ -618,23 +745,17 @@ class OpenAIBinding(LollmsLLMBinding):
         if seed is not None:
             params["seed"] = seed
 
-        # Inject sanitized tools if available
         if sanitized_tools:
             params["tools"] = sanitized_tools
-            # Prevent the API from forcing tool calls when the LLM just wants to converse
             params["tool_choice"] = "auto"
 
-        # Drop None values
         params = {k: v for k, v in params.items() if v is not None}
 
-        # ── Inject reasoning params ────────────────────────────────────────
         effort = self.normalize_reasoning_effort(think, reasoning_effort)
         if effort is not None:
             if self.is_vllm:
                 self._apply_vllm_thinking_kwargs(params, effort)
             else:
-                # OpenAI Chat Completions uses flat reasoning_effort.
-                # OpenAI accepts minimal/low/medium/high — clamp "max".
                 params["reasoning_effort"] = effort if effort != "max" else "high"
                 if reasoning_summary and reasoning_summary != "auto":
                     params.setdefault("extra_body", {})[
@@ -649,17 +770,12 @@ class OpenAIBinding(LollmsLLMBinding):
         output = ""
 
         try:
-            # ── First attempt ─────────────────────────────────────────────────
             try:
                 completion = self.client.chat.completions.create(**params)
 
             except Exception as ex:
                 trace_exception(ex)
 
-                # NVIDIA NIM 404 Function Not Found Interceptor
-                # If NVIDIA's strict endpoint still rejects the sanitized tools payload,
-                # we intercept the 404 NotFoundError specifically related to function IDs
-                # and retry WITHOUT the tools array entirely to save the generation.
                 if (
                     isinstance(ex, openai.NotFoundError)
                     and "Function" in str(ex)
@@ -672,7 +788,6 @@ class OpenAIBinding(LollmsLLMBinding):
                     params.pop("tool_choice", None)
                     completion = self.client.chat.completions.create(**params)
                 else:
-                    # Retry: adapt for servers that reject certain fields
                     if "max_tokens" in params:
                         params["max_completion_tokens"] = params.pop("max_tokens")
 
@@ -684,17 +799,18 @@ class OpenAIBinding(LollmsLLMBinding):
                     if effort is None:
                         params["temperature"] = 1
 
-                    # Strip vLLM-specific extras so the retry is clean
                     if "extra_body" in params:
                         params["extra_body"].pop("chat_template_kwargs", None)
 
                     completion = self.client.chat.completions.create(**params)
 
-            # ── Streaming ─────────────────────────────────────────────────────
             if stream:
-                in_reasoning = False
+                handler = _StreamThinkingHandler(streaming_callback)
 
                 for chunk in completion:
+                    if self.is_cancelled():
+                        break
+
                     if not chunk.choices:
                         continue
                     delta = chunk.choices[0].delta
@@ -702,52 +818,24 @@ class OpenAIBinding(LollmsLLMBinding):
                     content = getattr(delta, "content", None)
 
                     if reasoning:
-                        if not in_reasoning:
-                            in_reasoning = True
-                            opening = "🧠\n"
-                            output += opening
-                            if streaming_callback:
-                                streaming_callback(
-                                    opening, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK
-                                )
-                        output += reasoning
-                        if streaming_callback:
-                            streaming_callback(reasoning, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                        if not handler.process_reasoning(reasoning):
+                            break
                         continue
 
                     if content:
-                        if in_reasoning:
-                            in_reasoning = False
-                            closing = "\n\n✈️\n\n"
-                            output += closing
-                            if streaming_callback:
-                                streaming_callback(
-                                    closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK
-                                )
-                        output += content
-                        if streaming_callback:
-                            if not streaming_callback(content, MSG_TYPE.MSG_TYPE_CHUNK):
-                                break
+                        if not handler.process_content(content):
+                            break
 
-                # Close any dangling 🧠 block
-                if in_reasoning:
-                    closing = "\n\n✈️\n\n"
-                    output += closing
-                    if streaming_callback:
-                        streaming_callback(closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                output = handler.flush()
 
-            # ── Non-streaming ─────────────────────────────────────────────────
             else:
                 message_obj = completion.choices[0].message
                 reasoning = extract_reasoning(message_obj)
                 content = message_obj.content or ""
 
-                if reasoning:
-                    # Server returned reasoning separately — wrap it
-                    output = f"🧠\n{reasoning}\n\n✈️\n\n{content}"
+                if reasoning and not content.strip().startswith(("<think>", "<thinking>")):
+                    output = f"<think>\n{reasoning}\n</think>\n{content}"
                 else:
-                    # vLLM (and some others) embed 🧠…✈️ in content,
-                    # or thinking was disabled — pass through as-is
                     output = content
 
         except Exception as e:
@@ -821,7 +909,7 @@ class OpenAIBinding(LollmsLLMBinding):
         for key, price in price_map.items():
             if model_name.lower().startswith(key):
                 return price
-        return 0.0  # Unknown → treat as free
+        return 0.0
 
     def get_output_tokens_price(self, model_name: str | None = None) -> float:
         """
@@ -877,16 +965,13 @@ class OpenAIBinding(LollmsLLMBinding):
                 or a list of embedding vectors if input is list[str].
                 Returns empty list on failure.
         """
-        # Determine the embedding model
         embedding_model = kwargs.get("model", self.model_name)
         if not embedding_model.startswith("text-embedding"):
             embedding_model = "text-embedding-3-small"
 
-        # Ensure input is a list of strings
         is_single_input = isinstance(text, str)
         input_texts = [text] if is_single_input else text
 
-        # Optional safety: truncate if too many tokens for embedding model
         max_tokens_map = {
             "text-embedding-3-small": 8191,
             "text-embedding-3-large": 8191,
@@ -912,7 +997,6 @@ class OpenAIBinding(LollmsLLMBinding):
 
             embeddings = [item.embedding for item in response.data]
 
-            # Normalize if requested
             if normalize:
                 embeddings = [
                     [v / math.sqrt(sum(x * x for x in emb)) for v in emb]
@@ -944,30 +1028,24 @@ class OpenAIBinding(LollmsLLMBinding):
             if model_name is None:
                 return 0
 
-        # Default context sizes (update as needed)
         context_map = {
-            # GPT-4 family
             "gpt-4": 8192,
             "gpt-4-32k": 32768,
             "gpt-4o": 128000,
             "gpt-4o-mini": 128000,
-            # GPT-3.5 family
             "gpt-3.5-turbo": 16385,
             "gpt-3.5-turbo-16k": 16385,
-            # GPT-5 and o-series
             "gpt-5": 200000,
             "o1": 200000,
             "o3": 200000,
             "o4": 200000,
         }
 
-        # Try to find the best match
         model_name_lower = model_name.lower()
         for key, size in context_map.items():
             if model_name_lower.startswith(key):
                 return size
 
-        # Fallback: default safe value
         return None
 
     def get_model_info(self) -> dict:
@@ -985,7 +1063,6 @@ class OpenAIBinding(LollmsLLMBinding):
         }
 
     def list_models(self) -> List[Dict]:
-        # Known context lengths
         known_context_lengths = {
             "gpt-4o": 128000,
             "gpt-4": 8192,
