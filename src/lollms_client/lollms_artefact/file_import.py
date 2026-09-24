@@ -61,7 +61,7 @@ import mimetypes
 import os
 
 # Suppress noisy C-level MuPDF stdout/stderr message output
-os.environ["PYMUPDF_MESSAGE"] = "0"
+os.environ["PYMUPDF_MESSAGE"] = "fd:2"
 
 import re
 import uuid
