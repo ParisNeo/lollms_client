@@ -43,9 +43,24 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-25 05:55]
+
+- fix(lollms_client): cleanup deprecated TTS bindings and update CHATLOG.md entry
+
+## [2026-09-25 05:55]
+
+- a commit message for:
+
 ## [2026-09-25 01:36]
 
 - `fix(lollms_client): update minor version for v1.20.0`
+
+## [2026-09-25 07:55]
+
+- fix(lollms_code): resolve startup freeze by eliminating eager recursive workspace crawling and importing
+- perf(lollms_personality): replace unpruned `Path.rglob('*')` with directory-pruned `os.walk` across workspace scans
+- perf(lollms_chat_core): optimize `take_workspace_snapshot` to prune `.git`, `venv`, and `node_modules` at directory entry
+- test(lollms_code): add unit tests ensuring sub-second startup and on-demand file loading on large workspaces
 
 ## [2026-09-25 00:14]
 

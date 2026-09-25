@@ -1503,6 +1503,7 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
     object.__setattr__(personality, "_git_autonomy_granted", True)
 
     ASCIIColors.rich_print("  [dim]📝 Initializing scratchpad...[/dim]", end="")
+    sys.stdout.flush()
     try:
         if hasattr(personality, "_init_scratchpad"):
             personality._init_scratchpad()
@@ -1510,8 +1511,10 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
     except (OSError, RuntimeError, ValueError) as e:
         ASCIIColors.rich_print(" [red]✗[/red]")
         ASCIIColors.warning(f"Failed to initialize scratchpad: {e}")
+    sys.stdout.flush()
 
     ASCIIColors.rich_print("  [dim]🔍 Building artefact system...[/dim]", end="")
+    sys.stdout.flush()
     try:
         if hasattr(personality, "_init_artefact_system"):
             personality._init_artefact_system()
@@ -1519,6 +1522,7 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
     except (OSError, RuntimeError, ValueError) as e:
         ASCIIColors.rich_print(" [red]✗[/red]")
         ASCIIColors.warning(f"Failed to pre-initialize artefact system for stats: {e}")
+    sys.stdout.flush()
 
     ASCIIColors.rich_print("[bold green]  ✅ Agent initialized and ready.[/bold green]\n")
 

@@ -1156,43 +1156,45 @@ def take_workspace_snapshot(workspace_dir: Path) -> Dict[Path, Dict[str, Any]]:
     files_scanned = 0
 
     try:
-        for f in workspace_dir.rglob("*"):
+        for root, dirs, files in os.walk(workspace_dir):
+            dirs[:] = [d for d in dirs if d not in _IGNORED_WS_DIRS and not d.startswith(".")]
             if files_scanned >= _MAX_SNAPSHOT_FILES:
                 break
-            if not f.is_file():
-                continue
-            rel_parts = f.relative_to(workspace_dir).parts
-            if any(part in _IGNORED_WS_DIRS for part in rel_parts):
-                continue
-            if f.suffix.lower() in _IGNORED_WS_EXTS:
-                continue
+            for fname in files:
+                if files_scanned >= _MAX_SNAPSHOT_FILES:
+                    break
+                if fname.startswith("."):
+                    continue
+                f = Path(root) / fname
+                if f.suffix.lower() in _IGNORED_WS_EXTS:
+                    continue
 
-            files_scanned += 1
-            rel_path = f.relative_to(workspace_dir)
+                files_scanned += 1
+                rel_path = f.relative_to(workspace_dir)
 
-            try:
-                file_size = f.stat().st_size
-                file_hash = None
-                if file_size < _MAX_HASH_SIZE:
-                    content = f.read_text(encoding="utf-8", errors="ignore")
-                    file_hash = hashlib.md5(content.encode("utf-8", errors="ignore")).hexdigest()
-
-                snapshot[rel_path] = {
-                    "hash": file_hash,
-                    "size": file_size,
-                    "mtime": f.stat().st_mtime,
-                    "path": f
-                }
-            except Exception:
                 try:
+                    file_size = f.stat().st_size
+                    file_hash = None
+                    if file_size < _MAX_HASH_SIZE:
+                        content = f.read_text(encoding="utf-8", errors="ignore")
+                        file_hash = hashlib.md5(content.encode("utf-8", errors="ignore")).hexdigest()
+
                     snapshot[rel_path] = {
-                        "hash": None,
-                        "size": f.stat().st_size,
+                        "hash": file_hash,
+                        "size": file_size,
                         "mtime": f.stat().st_mtime,
                         "path": f
                     }
                 except Exception:
-                    pass
+                    try:
+                        snapshot[rel_path] = {
+                            "hash": None,
+                            "size": f.stat().st_size,
+                            "mtime": f.stat().st_mtime,
+                            "path": f
+                        }
+                    except Exception:
+                        pass
     except Exception as e:
         ASCIIColors.warning(f"[Snapshot] Workspace snapshot warning: {e}")
 

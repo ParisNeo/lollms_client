@@ -186,7 +186,8 @@ def _build_workspace_tree_r(directory: Path, workspace_root: Path, current_depth
 
     entries = []
     try:
-        sorted_items = sorted(directory.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        raw_items = [p for p in directory.iterdir() if p.name not in _IGNORED_WS_DIRS and not p.name.startswith(".")]
+        sorted_items = sorted(raw_items, key=lambda p: (not p.is_dir(), p.name.lower()))
     except Exception:
         return []
 
@@ -196,8 +197,6 @@ def _build_workspace_tree_r(directory: Path, workspace_root: Path, current_depth
         entries.append(f"{'  ' * current_depth}... ({remaining} more items in this folder. Use <uncollapse_folder> to see them.)")
 
     for item in sorted_items:
-        if item.name in _IGNORED_WS_DIRS or item.name.startswith("."):
-            continue
         if item.is_dir():
             rel_dir_path = str(item.relative_to(workspace_root)).replace("\\", "/")
             if rel_dir_path in collapsed_set:
@@ -2711,38 +2710,31 @@ class LollmsPersonality:
     # ------------------------------------------------------------------ Workspace & Sub-Agents
 
     def _sync_artefact_index_with_disk(self) -> None:
-        """Synchronizes workspace files on disk with the internal artefact manager without eager schema generation."""
-        if hasattr(self, '_artefact_manager') and self._artefact_manager and self._resolved_workspace:
-            ws_path = self._resolved_workspace
-            if ws_path.exists():
-                for f in ws_path.rglob("*"):
-                    if f.is_file():
-                        rel = f.relative_to(ws_path)
-                        if any(p in _IGNORED_WS_DIRS for p in rel.parts):
-                            continue
-                        if f.suffix.lower() in _IGNORED_WS_EXTS:
-                            continue
-                        title = str(rel).replace("\\", "/")
-                        existing = self._artefact_manager.get(title)
-                        if not existing:
-                            try:
-                                self._artefact_manager.import_file(f, title=title, active=False, parse_data_schema=False)
-                            except Exception:
-                                pass
+        """
+        No-op: Eager recursive scanning and importing of the entire workspace tree on startup
+        is disabled to eliminate startup hangs on large codebases. Files are discovered via the workspace tree
+        and indexed on-demand when unlocked, loaded, or modified.
+        """
+        return
 
     def get_workspace_path(self) -> Optional[str]:
         return str(self._resolved_workspace) if self._resolved_workspace else None
 
     def list_workspace_files(self) -> List[str]:
-        if not self._resolved_workspace:
+        if not self._resolved_workspace or not self._resolved_workspace.exists():
             return []
         result = []
-        for f in self._resolved_workspace.rglob("*"):
-            if f.is_file():
-                rel_parts = f.relative_to(self._resolved_workspace).parts
-                if not any(part in _IGNORED_WS_DIRS for part in rel_parts):
-                    if not f.suffix.lower() in _IGNORED_WS_EXTS:
-                        result.append(str(f.relative_to(self._resolved_workspace)))
+        try:
+            for root, dirs, files in os.walk(self._resolved_workspace):
+                dirs[:] = [d for d in dirs if d not in _IGNORED_WS_DIRS and not d.startswith(".")]
+                for fname in files:
+                    if fname.startswith("."):
+                        continue
+                    p = Path(root) / fname
+                    if p.suffix.lower() not in _IGNORED_WS_EXTS:
+                        result.append(str(p.relative_to(self._resolved_workspace)))
+        except Exception:
+            pass
         return sorted(result)
 
     def _take_workspace_snapshot(self) -> Dict:
@@ -3912,15 +3904,20 @@ JSON:"""
                 _DOC_EXTS = {".pdf", ".docx", ".pptx", ".odt", ".doc", ".txt", ".md", ".xlsx", ".xls"}
 
                 try:
-                    for f in ws_path.rglob("*"):
-                        if f.is_file():
-                            ext = f.suffix.lower()
+                    for root, dirs, files in os.walk(ws_path):
+                        dirs[:] = [d for d in dirs if d not in _IGNORED_WS_DIRS and not d.startswith(".")]
+                        for fname in files:
+                            if fname.startswith("."):
+                                continue
+                            ext = Path(fname).suffix.lower()
                             if ext in _DATA_EXTS:
                                 has_data_files = True
                             elif ext in _DOC_EXTS:
                                 has_document_files = True
                             if has_data_files and has_document_files:
                                 break
+                        if has_data_files and has_document_files:
+                            break
                 except Exception:
                     pass
 

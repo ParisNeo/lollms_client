@@ -290,12 +290,10 @@ def create_personality(prefs: GuiPrefs, client):
     # Grant autonomous workspace authority for coding tasks (exempt from git prompt blocks)
     object.__setattr__(personality, "_git_autonomy_granted", True)
 
-    # ── Ensure Artefact System is initialized and synced with disk ──
+    # ── Ensure Artefact System is initialized ──
     try:
         if hasattr(personality, "_init_artefact_system"):
             personality._init_artefact_system()
-        if hasattr(personality, "_sync_artefact_index_with_disk"):
-            personality._sync_artefact_index_with_disk()
     except Exception:
         pass
 
