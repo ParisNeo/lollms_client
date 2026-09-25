@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-25 01:36]
+
+- `fix(lollms_client): update minor version for v1.20.0`
+
 ## [2026-09-25 00:14]
 
 - fix(docs): update documentation for music and song generation with TTM
