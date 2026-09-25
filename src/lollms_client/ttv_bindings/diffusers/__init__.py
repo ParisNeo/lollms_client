@@ -40,6 +40,7 @@ class DiffusersTTVBinding(LollmsTTVBinding):
         self.wait_for_server = kwargs.get("wait_for_server", False)
         self.server_process = None
         self.base_url = f"http://{self.host}:{self.port}"
+        self.host_address = self.base_url
         self.binding_root = Path(__file__).parent
         self.server_dir = self.binding_root / "server"
         self.venv_dir = Path("./venv/ttv_diffusers_venv")
@@ -98,10 +99,7 @@ class DiffusersTTVBinding(LollmsTTVBinding):
         # Install latest diffusers from git for LTX support
         ASCIIColors.info(f"Installing diffusers library from github")
         pm_v.ensure_packages([
-            {
-                "name": "diffusers",
-                "vcs": "git+https://github.com/huggingface/diffusers.git"
-            }
+            "diffusers @ git+https://github.com/huggingface/diffusers.git"
         ])
 
         ASCIIColors.green("Server dependencies are satisfied.")
@@ -186,7 +184,7 @@ class DiffusersTTVBinding(LollmsTTVBinding):
         """
         try:
             resp = requests.post(
-                f"{self.host_address}/pull_model",
+                f"{self.base_url}/pull_model",
                 json={"model_name": model_name, **kwargs},
                 timeout=3600
             )
@@ -196,13 +194,13 @@ class DiffusersTTVBinding(LollmsTTVBinding):
             return {"status": False, "message": str(e)}
 
     def generate_video(self, prompt: str, **kwargs) -> bytes:
-        response = requests.post(f"{self.host_address}/generate_video", json={"prompt": prompt, **kwargs})
+        response = requests.post(f"{self.base_url}/generate_video", json={"prompt": prompt, **kwargs})
         response.raise_for_status()
         return response.content
 
     def list_models(self) -> List[str]:
         try:
-            response = requests.get(f"{self.host_address}/models", timeout=10)
+            response = requests.get(f"{self.base_url}/list_models", timeout=10)
             response.raise_for_status()
             return response.json().get("models", [])
         except Exception:

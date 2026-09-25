@@ -253,6 +253,7 @@ def _scrub_for_llm_context(text: str) -> str:
     if not text:
         return ""
     cleaned = scrub_processing_and_status_blocks(text)
+    cleaned = re.sub(r'<round\s+id=["\'][^"\']*["\']\s*/?>\n?', '', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'<lollms_artifact[^/]*/>', '', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'<artefact_image[^/]*/>', '', cleaned, flags=re.IGNORECASE)
     return cleaned.strip()
@@ -1229,7 +1230,7 @@ class _StreamState:
                                     _cb(self.callback, status_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
                         # If forward_artefact_chunks is True, also forward the raw chunk
-                        if self.forward_artefact_chunks:
+                        if self.forward_artefact_chunks and self.event_mode.has_callbacks:
                             _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK, event_meta)
 
                 return True
@@ -1669,7 +1670,7 @@ class _StreamState:
                                     _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
                                 tag_info = _SECONDARY_TAG_MAP.get(f"<{self._secondary_tag_name}")
-                                if tag_info:
+                                if tag_info and self.event_mode.has_callbacks:
                                     open_evt = tag_info[0]
                                     _cb(self.callback, "", MSG_TYPE.MSG_TYPE_INFO, {
                                         "type": open_evt,
@@ -1712,7 +1713,7 @@ class _StreamState:
                 sec_attrs = getattr(self, '_secondary_attrs', {}) or {}
                 title_val = sec_attrs.get("title") or sec_attrs.get("name") or self._secondary_tag_name
                 tag_info = _SECONDARY_TAG_MAP.get(f"<{self._secondary_tag_name}")
-                if tag_info:
+                if tag_info and self.event_mode.has_callbacks:
                     done_msg_type = tag_info[2]
                     _cb(self.callback, body_content.strip(), done_msg_type, {
                         "title": title_val,
@@ -1757,7 +1758,7 @@ class _StreamState:
                 sec_attrs = getattr(self, '_secondary_attrs', {}) or {}
                 title_val = sec_attrs.get("title") or sec_attrs.get("name") or self._secondary_tag_name
                 tag_info = _SECONDARY_TAG_MAP.get(f"<{self._secondary_tag_name}")
-                if tag_info and chunk_delta:
+                if tag_info and chunk_delta and self.event_mode.has_callbacks:
                     chunk_msg_type = tag_info[1]
                     _cb(self.callback, chunk_delta, chunk_msg_type, {
                         "title": title_val,
@@ -1929,12 +1930,13 @@ class _StreamState:
                         f"'{title}' to disk: {_sanitize_host_paths(str(sync_ex))}"
                     )
 
-                _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
-                    "type": "artifact_updated",
-                    "title": title,
-                    "version": art.get("version", 1) if art else 1,
-                    "art_type": atype
-                })
+                if self.event_mode.has_callbacks:
+                    _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+                        "type": "artifact_updated",
+                        "title": title,
+                        "version": art.get("version", 1) if art else 1,
+                        "art_type": atype
+                    })
                 return True
             else:
                 if is_new:
@@ -2008,16 +2010,17 @@ class _StreamState:
                     "preview": meta_info["preview"]
                 })
 
-            _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
-                "type": "artifact_updated" if not is_new else "artifact_created",
-                "title": title,
-                "version": art.get("version", 1) if art else 1,
-                "art_type": atype,
-                "line_count": meta_info["line_count"],
-                "size_chars": meta_info["size_chars"],
-                "estimated_tokens": meta_info["estimated_tokens"],
-                "sections": meta_info["sections"]
-            })
+            if self.event_mode.has_callbacks:
+                _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+                    "type": "artifact_updated" if not is_new else "artifact_created",
+                    "title": title,
+                    "version": art.get("version", 1) if art else 1,
+                    "art_type": atype,
+                    "line_count": meta_info["line_count"],
+                    "size_chars": meta_info["size_chars"],
+                    "estimated_tokens": meta_info["estimated_tokens"],
+                    "sections": meta_info["sections"]
+                })
             return True
 
         # 2. Tools Execution Trigger
@@ -2184,11 +2187,12 @@ class _StreamState:
             else:
                 self.ai_message.content = self.ai_message.content.replace(full_match_text, "")
 
-            _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
-                "type": "artifact_created",
-                "title": title,
-                "art_type": "note"
-            })
+            if self.event_mode.has_callbacks:
+                _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+                    "type": "artifact_created",
+                    "title": title,
+                    "art_type": "note"
+                })
             return True
 
         # 3b. Scratchpad (Intermediate Hypothesis Workspace)
@@ -2244,11 +2248,12 @@ class _StreamState:
             else:
                 self.ai_message.content = self.ai_message.content.replace(full_match_text, "")
 
-            _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
-                "type": "artifact_created",
-                "title": title,
-                "art_type": "scratchpad"
-            })
+            if self.event_mode.has_callbacks:
+                _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+                    "type": "artifact_created",
+                    "title": title,
+                    "art_type": "scratchpad"
+                })
             return True
 
         # 4. Long-term Skill
@@ -2355,11 +2360,12 @@ class _StreamState:
                     if full_match_text in self.ai_message.content:
                         self.ai_message.content = self.ai_message.content.replace(full_match_text, "")
 
-                _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
-                    "type": "artifact_created",
-                    "title": title,
-                    "art_type": "skill"
-                })
+                if self.event_mode.has_callbacks:
+                    _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+                        "type": "artifact_created",
+                        "title": title,
+                        "art_type": "skill"
+                    })
                 return True
 
             else:
@@ -2428,11 +2434,12 @@ class _StreamState:
                     if full_match_text in self.ai_message.content:
                         self.ai_message.content = self.ai_message.content.replace(full_match_text, "")
 
-                _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
-                    "type": "artifact_created",
-                    "title": title,
-                    "art_type": "skill"
-                })
+                if self.event_mode.has_callbacks:
+                    _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+                        "type": "artifact_created",
+                        "title": title,
+                        "art_type": "skill"
+                    })
                 return True
 
 
@@ -2665,11 +2672,12 @@ class _StreamState:
                 self.ai_message.content += f"\n\n{anchor}\n"
                 _cb(self.callback, f"\n\n{anchor}\n", MSG_TYPE.MSG_TYPE_CHUNK)
 
-                _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
-                    "type": "artifact_created",
-                    "title": title,
-                    "art_type": "image"
-                })
+                if self.event_mode.has_callbacks:
+                    _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+                        "type": "artifact_created",
+                        "title": title,
+                        "art_type": "image"
+                    })
             else:
                 if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
                     reason = generation_error or "The image engine returned no data."
@@ -4756,11 +4764,16 @@ class ChatMixin:
         round_event_state = {"last_status": None}
 
         def _emit_round_event(msg_type: MSG_TYPE, status: Optional[str] = None, round_id: Optional[int] = None) -> None:
-            if not event_mode.has_callbacks or event_mode.is_silent:
-                return
             effective_round_id = round_id if round_id is not None else round_count
             if msg_type == MSG_TYPE.MSG_TYPE_ROUND_START:
-                _cb(callback, "", msg_type, {"round_id": effective_round_id, "max_rounds": resolved_max_rounds})
+                if event_mode.has_tags:
+                    round_tag = f'<round id="{effective_round_id}"/>\n'
+                    ai_msg.content += round_tag
+                    _cb(callback, round_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True, "round": effective_round_id})
+                if event_mode.has_callbacks and not event_mode.is_silent:
+                    _cb(callback, "", msg_type, {"round_id": effective_round_id, "max_rounds": resolved_max_rounds})
+                return
+            if not event_mode.has_callbacks or event_mode.is_silent:
                 return
             round_event_state["last_status"] = status or "action"
             _cb(callback, "", msg_type, {"round_id": effective_round_id, "status": status or "action"})

@@ -3,6 +3,11 @@
 
 All notable changes to this project will be documented in this file.
 #
+- feat(events): emit `<round id="N"/>` tag in chunk stream on new round start when in PROCESSING_TAG_MODE
+- fix(diffusers): implement get_settings and list_services in DiffusersTTIBinding to fulfill abstract base class
+- fix(diffusers): resolve host_address attribute error and pip requirement format in DiffusersTTVBinding
+- fix(events): ensure non-chunk artifact state events are not emitted in PROCESSING_TAG_MODE
+- fix(personality): ensure evicted unindexed artifacts are on-demand imported and unlocked to [C] during rolling compaction
 - feat(diffusers): add install_model and pull_model commands across TTI, TTM, and TTV diffusers bindings to download Hugging Face models into searchable local directories# [Unreleased]
 
 - feat(events): enforce EventMode doctrine across discussion and agent streams (PROCESSING_TAG_MODE, FULL_CALLBACK_MODE, MIXED_MODE, SILENT_MODE)# [Unreleased]
@@ -46,6 +51,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+
+## [2026-09-25 14:20]
+
+- fix(diffusers): update round ID emission logic for chunk stream in event processing
 
 ## [2026-09-25 11:09]
 

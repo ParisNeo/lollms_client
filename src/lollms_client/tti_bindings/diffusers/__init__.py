@@ -319,6 +319,23 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         except Exception:
             return []
 
+    def list_services(self, **kwargs) -> List[Dict[str, str]]:
+        models = self.list_models()
+        if isinstance(models, list):
+            services = []
+            for m in models:
+                name = m.get("model_name") if isinstance(m, dict) else str(m)
+                services.append({"name": name, "host": self.base_url})
+            return services
+        return [{"name": self.config.get("model_name", "diffusers"), "host": self.base_url}]
+
+    def get_settings(self, **kwargs) -> Optional[Dict[str, Any]]:
+        self.ensure_server_is_running(True)
+        try:
+            return self._get_request("/get_settings").json()
+        except Exception:
+            return self.config
+
     def set_settings(self, settings: Union[Dict[str, Any], List[Dict[str, Any]]], **kwargs) -> bool:
         self.ensure_server_is_running(True)
         parsed = settings if isinstance(settings, dict) else {s["name"]: s["value"] for s in settings if "name" in s and "value" in s}

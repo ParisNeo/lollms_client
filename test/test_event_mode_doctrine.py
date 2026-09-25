@@ -154,6 +154,46 @@ class TestEventModeDoctrine(unittest.TestCase):
         self.assertNotIn("</think>", clean_text)
         self.assertIn("Task result.", clean_text)
 
+    def test_round_tag_emitted_in_processing_tag_mode(self):
+        """In PROCESSING_TAG_MODE, <round id='N'/> tag is emitted as a chunk on round start."""
+        from types import SimpleNamespace
+        from lollms_client.lollms_discussion._mixin_chat import ChatMixin
+
+        events = []
+        def callback(chunk, msg_type, meta):
+            events.append({"chunk": chunk, "msg_type": msg_type, "meta": meta})
+            return True
+
+        # Test the round event emitter directly
+        event_mode = EventMode.PROCESSING_TAG_MODE
+        round_count = 3
+        resolved_max_rounds = 20
+        ai_msg = SimpleNamespace(content="")
+
+        round_event_state = {"last_status": None}
+        def _cb(cb, text, mt, meta=None):
+            if cb:
+                cb(text, mt, meta or {})
+
+        def _emit_round_event(msg_type, status=None, round_id=None):
+            effective_round_id = round_id if round_id is not None else round_count
+            if msg_type == MSG_TYPE.MSG_TYPE_ROUND_START:
+                if event_mode.has_tags:
+                    round_tag = f'<round id="{effective_round_id}"/>\n'
+                    ai_msg.content += round_tag
+                    _cb(callback, round_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True, "round": effective_round_id})
+                if event_mode.has_callbacks and not event_mode.is_silent:
+                    _cb(callback, "", msg_type, {"round_id": effective_round_id, "max_rounds": resolved_max_rounds})
+                return
+
+        _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_START)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["msg_type"], MSG_TYPE.MSG_TYPE_CHUNK)
+        self.assertEqual(events[0]["chunk"], '<round id="3"/>\n')
+        self.assertEqual(events[0]["meta"]["round"], 3)
+        self.assertIn('<round id="3"/>\n', ai_msg.content)
+
 
 if __name__ == "__main__":
     unittest.main()

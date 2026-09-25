@@ -3428,7 +3428,7 @@ JSON:"""
                 for title in evicted_artifact_titles:
                     try:
                         art = self._artefact_manager.get(title)
-                        if art and art.get("visibility") != ArtefactVisibility.FULL:
+                        if art is None or art.get("visibility") != ArtefactVisibility.FULL:
                             self._execute_context_visibility("unlock_file", title)
                     except Exception:
                         pass
@@ -5028,6 +5028,13 @@ JSON:"""
 
             if getattr(self, 'debug_mode', False):
                 ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count}/{self._max_rounds} START ===")
+
+            if event_mode.has_tags and streaming_callback:
+                try:
+                    round_tag = f'<round id="{round_count}"/>\n'
+                    streaming_callback(round_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True, "round": round_count})
+                except Exception:
+                    pass
 
             if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
                 try:
@@ -7108,9 +7115,10 @@ JSON:"""
             ss.completed_actions = []
 
         if use_internal_history and not was_cancelled:
-            # Strip thoughts completely before persisting in conversation history
+            # Strip thoughts and round tags completely before persisting in conversation history
             clean_persisted = re.sub(r'<think\b[^>]*>.*?(?:</think>|$)', '', final_response, flags=re.DOTALL | re.IGNORECASE).strip()
             clean_persisted = re.sub(r'<thought\b[^>]*>.*?(?:</thought>|$)', '', clean_persisted, flags=re.DOTALL | re.IGNORECASE).strip()
+            clean_persisted = re.sub(r'<round\s+id=["\'][^"\']*["\']\s*/?>\n?', '', clean_persisted, flags=re.IGNORECASE).strip()
             if _is_synthetic_agent_response(clean_persisted):
                 ASCIIColors.info(f"[{self.name}] Synthetic failure response suppressed from conversation history.")
             else:
