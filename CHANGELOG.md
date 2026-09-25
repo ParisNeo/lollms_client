@@ -3,6 +3,8 @@
 
 All notable changes to this project will be documented in this file.
 #
+- feat(events): enforce EventMode doctrine across discussion and agent streams (PROCESSING_TAG_MODE, FULL_CALLBACK_MODE, MIXED_MODE, SILENT_MODE)# [Unreleased]
+
 - refactor(lollms_client): update pathlib imports# [Unreleased]
 
 - refactor(bindings): update diffusers and xtts bindings
@@ -42,6 +44,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+
+## [2026-09-25 07:49]
+
+- fix(events): enforce EventMode enforcement in discussion and agent streams with PROCESSING_TAG_MODE compatibility
 
 ## [2026-09-25 06:10]
 

@@ -240,17 +240,27 @@ class EventMode(Enum):
 
     @property
     def has_tags(self) -> bool:
-        """True if this mode should emit or inject <processing> text tags."""
+        """Returns True if this mode renders inline XML processing and think tags in the text stream."""
         return self in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE)
 
     @property
     def has_callbacks(self) -> bool:
-        """True if this mode should emit granular MSG_TYPE_* events."""
+        """Returns True if this mode emits out-of-band structured callback events with metadata."""
         return self in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE)
 
     @property
+    def has_thought_events(self) -> bool:
+        """Returns True if thinking should be emitted as dedicated MSG_TYPE_THOUGHT_CHUNK events."""
+        return self in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE)
+
+    @property
+    def has_thought_tags(self) -> bool:
+        """Returns True if thinking should be embedded as inline <think>...</think> tags in MSG_TYPE_CHUNK."""
+        return self in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE)
+
+    @property
     def is_silent(self) -> bool:
-        """True if telemetry should be completely suppressed."""
+        """Returns True if all progress reporting, events, and special tags are suppressed."""
         return self == EventMode.SILENT_MODE
 
 

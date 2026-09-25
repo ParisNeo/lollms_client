@@ -645,6 +645,7 @@ class _StreamState:
         self._is_accumulating_tool = False
         self._tool_buffer = ""
         self._artefact_buffer = ""
+        self._in_thought_stream = False
 
     @staticmethod
     def _sanitize_unicode(text: str) -> str:
@@ -780,18 +781,65 @@ class _StreamState:
         # CRITICAL FIX: Append to shadow buffer instead of directly to ai_message.content
         self._pending_buffer += chunk
 
-        # ── 🧹 THINKING BLOCK SUPPRESSION ──
-        # If remove_thinking_blocks is True, we strip  ...  blocks from the live stream.
-        if self.remove_thinking_blocks and not self._is_accumulating_tool and not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_secondary and not self._in_code_fence:
-            if "</think>" in self._pending_buffer:
-                end_idx = self._pending_buffer.find(" ")
-                if end_idx != -1:
-                    # Discard the thought block entirely
-                    self._pending_buffer = self._pending_buffer[end_idx + 8:]
+        # ── 🧠 THOUGHT STREAM TRANSITION ──
+        # If we were streaming thoughts in tag mode and now receive normal content chunks, close the <think> tag
+        if self._in_thought_stream:
+            self._in_thought_stream = False
+            if self.event_mode.has_thought_tags:
+                _cb(self.callback, "\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+
+        # ── 🧹 INLINE <think> TAG HANDLING ACCORDING TO EVENT MODE ──
+        # Handle models emitting inline <think>...</think> in their text stream
+        if "<think>" in self._pending_buffer and not self._is_accumulating_tool and not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_secondary and not self._in_code_fence:
+            if self.event_mode == EventMode.FULL_CALLBACK_MODE:
+                # In FULL_CALLBACK_MODE: strip <think> from MSG_TYPE_CHUNK, stream thoughts as MSG_TYPE_THOUGHT_CHUNK
+                idx = self._pending_buffer.find("<think>")
+                text_before = self._pending_buffer[:idx]
+                if text_before:
+                    self.ai_message.content += text_before
+                    _cb(self.callback, text_before, MSG_TYPE.MSG_TYPE_CHUNK)
+
+                rest = self._pending_buffer[idx + 7:]
+                close_idx = rest.find("</think>")
+                if close_idx != -1:
+                    thought_text = rest[:close_idx]
+                    self.ai_message.thoughts = (self.ai_message.thoughts or "") + thought_text
+                    _cb(self.callback, thought_text, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                    self._pending_buffer = rest[close_idx + 8:]
                 else:
-                    # Wait for the closing tag in the next chunk
+                    self.ai_message.thoughts = (self.ai_message.thoughts or "") + rest
+                    _cb(self.callback, rest, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
                     self._pending_buffer = ""
-                    return True
+                return True
+            elif self.event_mode.is_silent:
+                # In SILENT_MODE: strip thoughts completely from chunk stream
+                idx = self._pending_buffer.find("<think>")
+                text_before = self._pending_buffer[:idx]
+                if text_before:
+                    self.ai_message.content += text_before
+                    _cb(self.callback, text_before, MSG_TYPE.MSG_TYPE_CHUNK)
+                rest = self._pending_buffer[idx + 7:]
+                close_idx = rest.find("</think>")
+                if close_idx != -1:
+                    self.ai_message.thoughts = (self.ai_message.thoughts or "") + rest[:close_idx]
+                    self._pending_buffer = rest[close_idx + 8:]
+                else:
+                    self.ai_message.thoughts = (self.ai_message.thoughts or "") + rest
+                    self._pending_buffer = ""
+                return True
+            elif self.remove_thinking_blocks:
+                idx = self._pending_buffer.find("<think>")
+                text_before = self._pending_buffer[:idx]
+                if text_before:
+                    self.ai_message.content += text_before
+                    _cb(self.callback, text_before, MSG_TYPE.MSG_TYPE_CHUNK)
+                rest = self._pending_buffer[idx + 7:]
+                close_idx = rest.find("</think>")
+                if close_idx != -1:
+                    self._pending_buffer = rest[close_idx + 8:]
+                else:
+                    self._pending_buffer = ""
+                return True
 
         # ── 🛑 DONE TAG DETECTION (SUPPORTS ALL VARIANTS) ──
         # Detect <done/>, <done>, <end/>, <end>, </end> at the start of a line to signal explicit termination.
@@ -2709,13 +2757,47 @@ class _StreamState:
         if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
             if msg_type in (MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK, MSG_TYPE.MSG_TYPE_REASONING):
                 self.ai_message.thoughts = (self.ai_message.thoughts or "") + (chunk or "")
-            return _cb(self.callback, chunk, msg_type, meta)
+
+                # In SILENT_MODE: thoughts are never sent to callback
+                if self.event_mode.is_silent:
+                    return True
+
+                # In PROCESSING_TAG_MODE: embed thoughts as <think>...</think> tags inside normal MSG_TYPE_CHUNK
+                if self.event_mode == EventMode.PROCESSING_TAG_MODE:
+                    if not self._in_thought_stream:
+                        self._in_thought_stream = True
+                        _cb(self.callback, "<think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                    _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_CHUNK)
+                    return True
+
+                # In FULL_CALLBACK_MODE: emit dedicated MSG_TYPE_THOUGHT_CHUNK
+                if self.event_mode == EventMode.FULL_CALLBACK_MODE:
+                    return _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK, meta)
+
+                # In MIXED_MODE: both
+                if self.event_mode == EventMode.MIXED_MODE:
+                    if not self._in_thought_stream:
+                        self._in_thought_stream = True
+                        _cb(self.callback, "<think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                    _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_CHUNK)
+                    _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK, meta)
+                    return True
+
+            # Other out-of-band events: only emit if has_callbacks is True
+            if self.event_mode.has_callbacks:
+                return _cb(self.callback, chunk, msg_type, meta)
+            return True
         return True
 
     def flush_remaining_buffer(self):
         """Flushes any safe text remaining in the shadow buffer at the end of generation."""
-        # CRITICAL: Stop heartbeat if artifact was never closed
+        # Flush the heartbeat if artifact was never closed
         self._stop_artefact_heartbeat()
+
+        if self._in_thought_stream:
+            self._in_thought_stream = False
+            if self.event_mode.has_thought_tags:
+                _cb(self.callback, "\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
 
         # ── Handle unclosed code fence ──
         # If we're still in code fence mode at flush time, the fence was never closed.
@@ -4661,7 +4743,7 @@ class ChatMixin:
         round_event_state = {"last_status": None}
 
         def _emit_round_event(msg_type: MSG_TYPE, status: Optional[str] = None, round_id: Optional[int] = None) -> None:
-            if event_mode == EventMode.SILENT_MODE:
+            if not event_mode.has_callbacks or event_mode.is_silent:
                 return
             effective_round_id = round_id if round_id is not None else round_count
             if msg_type == MSG_TYPE.MSG_TYPE_ROUND_START:

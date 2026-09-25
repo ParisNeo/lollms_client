@@ -734,6 +734,28 @@ class _AgentStreamState:
             return
         try:
             mt = msg_type if msg_type is not None else MSG_TYPE.MSG_TYPE_CHUNK
+
+            # Gating based on EventMode doctrine:
+            if self.event_mode == EventMode.SILENT_MODE:
+                if mt != MSG_TYPE.MSG_TYPE_CHUNK:
+                    return
+                # Only clean normal chunks are emitted in SILENT_MODE
+                self.callback(text, mt, meta or {})
+                return
+
+            if self.event_mode == EventMode.PROCESSING_TAG_MODE:
+                # In PROCESSING_TAG_MODE, ONLY MSG_TYPE_CHUNK is emitted
+                if mt != MSG_TYPE.MSG_TYPE_CHUNK:
+                    return
+                self.callback(text, mt, meta or {})
+                return
+
+            if self.event_mode == EventMode.FULL_CALLBACK_MODE:
+                # In FULL_CALLBACK_MODE: emit dedicated events, but ensure chunks have no processing tags
+                self.callback(text, mt, meta or {})
+                return
+
+            # MIXED_MODE: both
             self.callback(text, mt, meta or {})
         except Exception:
             pass
@@ -780,6 +802,10 @@ class _AgentStreamState:
             self._pending_buffer = self._pending_buffer[idx + 7:]
             self._in_think_block = True
             self._think_buffer = ""
+            if self.event_mode.has_thought_tags and not self.event_mode.has_thought_events:
+                self._cb("<think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+            elif self.event_mode == EventMode.MIXED_MODE:
+                self._cb("<think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
 
         if self._in_think_block:
             close_idx = self._pending_buffer.find("</think>")
@@ -787,7 +813,15 @@ class _AgentStreamState:
                 thought_chunk = self._pending_buffer[:close_idx]
                 self._think_buffer += thought_chunk
                 if thought_chunk:
-                    self._cb(thought_chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                    if self.event_mode.has_thought_tags and not self.event_mode.has_thought_events:
+                        self._cb(f"{thought_chunk}\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                    elif self.event_mode == EventMode.MIXED_MODE:
+                        self._cb(f"{thought_chunk}\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                        self._cb(thought_chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                    elif self.event_mode.has_thought_events:
+                        self._cb(thought_chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                elif self.event_mode.has_thought_tags:
+                    self._cb("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
                 self._pending_buffer = self._pending_buffer[close_idx + 8:]
                 self._in_think_block = False
             else:
@@ -795,7 +829,13 @@ class _AgentStreamState:
                 self._think_buffer += thought_chunk
                 self._pending_buffer = ""
                 if thought_chunk:
-                    self._cb(thought_chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                    if self.event_mode.has_thought_tags and not self.event_mode.has_thought_events:
+                        self._cb(thought_chunk, MSG_TYPE.MSG_TYPE_CHUNK)
+                    elif self.event_mode == EventMode.MIXED_MODE:
+                        self._cb(thought_chunk, MSG_TYPE.MSG_TYPE_CHUNK)
+                        self._cb(thought_chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                    elif self.event_mode.has_thought_events:
+                        self._cb(thought_chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
                 return True
 
         if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence and not self._in_inline_code:
