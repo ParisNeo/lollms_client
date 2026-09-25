@@ -5,7 +5,7 @@ import subprocess
 import threading
 import time
 import json
-import socket
+import secrets
 from pathlib import Path
 from typing import Optional, List, Union, Dict, Any
 from ascii_colors import trace_exception, ASCIIColors
@@ -23,239 +23,299 @@ except ImportError:
     sys.exit(1)
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 from lollms_client.lollms_stt_binding import LollmsSTTBinding
 
 BindingName = "WhisperSTTBinding"
 
+
 class WhisperSTTBinding(LollmsSTTBinding):
+    """
+    Speech-To-Text binding for OpenAI Whisper using a resilient, multi-process
+    shared model server architecture with event-driven dynamic micro-batching.
+    Multiple lollms_client instances and worker processes attach to the same running daemon.
+    """
+
     def __init__(self, **kwargs):
         super().__init__(binding_name="whisper")
         self.config = kwargs
-        self.host = kwargs.get("host", "localhost")
-        self.port = kwargs.get("port", 9633)
-        self.auto_start_server = kwargs.get("auto_start_server", False)
-        self.wait_for_server = kwargs.get("wait_for_server", False)
+        self.host = kwargs.get("host", "127.0.0.1")
+        self.port = int(kwargs.get("port", 9633))
+        self.auto_start_server = kwargs.get("auto_start_server", True)
+        self.wait_for_server = kwargs.get("wait_for_server", True)
+        self.batch_window = float(kwargs.get("batch_window", 0.02))
+        self.max_batch_size = int(kwargs.get("max_batch_size", 8))
         self.server_process = None
         self.base_url = f"http://{self.host}:{self.port}"
         self.binding_root = Path(__file__).parent
         self.server_dir = self.binding_root / "server"
-        
+
         self.venv_dir = Path(kwargs.get("venv_path", "./venv/stt_whisper_venv")).resolve()
         self.cache_dir = Path(kwargs.get("cache_dir", "./data/stt_models/whisper")).resolve()
-        
+
         self.venv_dir.mkdir(exist_ok=True, parents=True)
         self.cache_dir.mkdir(exist_ok=True, parents=True)
-        
+
+        self.token_file = self.cache_dir / "whisper_server.token"
+        self.service_key = kwargs.get("service_key")
+        if not self.service_key and self.token_file.exists():
+            try:
+                self.service_key = self.token_file.read_text(encoding="utf-8").strip()
+            except Exception:
+                pass
+
+        self._session = requests.Session()
+        retries = Retry(total=3, backoff_factor=0.2, status_forcelist=[502, 503, 504])
+        self._session.mount("http://", HTTPAdapter(max_retries=retries))
+
         if self.auto_start_server:
             self.ensure_server_is_running(self.wait_for_server)
 
+    def _get_headers(self) -> Dict[str, str]:
+        headers = {"Accept": "application/json"}
+        if self.service_key:
+            headers["Authorization"] = f"Bearer {self.service_key}"
+            headers["X-Server-Token"] = self.service_key
+        return headers
+
     def is_server_running(self) -> bool:
+        """Probes the server on loopback with a fast timeout (<= 1.5s)."""
         try:
-            response = requests.get(f"{self.base_url}/status", timeout=4)
-            if response.status_code == 200 and response.json().get("status") == "running":
+            resp = requests.get(
+                f"{self.base_url}/status",
+                headers=self._get_headers(),
+                timeout=1.5
+            )
+            if resp.status_code == 200:
+                data = resp.json() if callable(getattr(resp, "json", None)) else {}
+                if isinstance(data, dict) and data.get("status") == "running":
+                    return True
+            elif resp.status_code == 401:
+                if self.token_file.exists():
+                    try:
+                        self.service_key = self.token_file.read_text(encoding="utf-8").strip()
+                        retry_resp = requests.get(
+                            f"{self.base_url}/status",
+                            headers=self._get_headers(),
+                            timeout=1.5
+                        )
+                        return retry_resp.status_code == 200
+                    except Exception:
+                        pass
                 return True
         except requests.exceptions.RequestException:
             return False
         return False
 
-    def _is_port_available(self, host: str, port: int) -> bool:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.bind((host, port))
-                return True
-        except OSError:
-            return False
-
-    def ensure_server_is_running(self, wait=False):
-        ASCIIColors.info("Attempting to start or connect to the Whisper server...")
+    def ensure_server_is_running(self, wait: bool = True, timeout_s: int = 120):
+        """
+        Ensures the shared Whisper server daemon is running without port collisions.
+        Uses cross-process FileLock with double-checked probing to guarantee that
+        only the first worker process spawns the daemon while all others attach to it.
+        """
         if self.is_server_running():
-            ASCIIColors.green("Whisper Server is already running and responsive.")
             return
 
-        original_port = self.port
-        while not self._is_port_available(self.host, self.port):
-            ASCIIColors.warning(f"Port {self.port} is busy. Trying next port...")
-            self.port += 1
-            self.base_url = f"http://{self.host}:{self.port}"
+        lock_path = self.cache_dir / "whisper_server_spawn.lock"
+        lock = FileLock(lock_path, timeout=timeout_s)
 
-        if self.port != original_port:
-            ASCIIColors.info(f"Selected new port {self.port} for Whisper server.")
+        try:
+            with lock:
+                if self.is_server_running():
+                    ASCIIColors.green(f"Whisper shared daemon detected on {self.base_url}. Attached successfully.")
+                    return
 
-        self.start_server(wait)
+                ASCIIColors.info(f"Spawning shared Whisper server daemon on {self.base_url}...")
+                self.start_server(wait=wait, timeout_s=timeout_s)
+        except Timeout:
+            if self.is_server_running():
+                return
+            raise RuntimeError(f"Timed out waiting for Whisper shared daemon to start after {timeout_s}s.")
 
     def install_server_dependencies(self):
-        ASCIIColors.info(f"Setting up virtual environment in: {self.venv_dir}")
+        ASCIIColors.info(f"Setting up Whisper virtual environment in: {self.venv_dir}")
         pm_v = pm.PackageManager(venv_path=str(self.venv_dir), create_if_not_exist=True)
 
-        ASCIIColors.info(f"Installing server dependencies")
+        ASCIIColors.info("Installing Whisper server dependencies...")
         pm_v.ensure_packages(["requests", "uvicorn", "fastapi", "python-multipart", "filelock"])
-        pm_v.ensure_packages(["ascii_colors", "pipmaster"])
-        pm_v.ensure_packages(["tqdm", "numpy", "pillow"])
-        
-        ASCIIColors.info(f"Installing pytorch")
+        pm_v.ensure_packages(["ascii_colors>=0.11.10", "pipmaster", "tqdm", "numpy", "pillow", "pydantic"])
+
         torch_index_url = None
         if sys.platform == "win32":
             try:
-                result = subprocess.run(["nvidia-smi"], capture_output=True, text=True, check=True)
+                subprocess.run(["nvidia-smi"], capture_output=True, text=True, check=True)
                 ASCIIColors.green("NVIDIA GPU detected. Installing CUDA-enabled PyTorch.")
                 torch_index_url = "https://download.pytorch.org/whl/cu126"
             except (FileNotFoundError, subprocess.CalledProcessError):
-                ASCIIColors.yellow("`nvidia-smi` not found or failed. Installing standard PyTorch.")
+                ASCIIColors.yellow("No GPU detected or nvidia-smi failed. Installing standard PyTorch.")
 
         pm_v.ensure_packages(["torch", "torchaudio"], index_url=torch_index_url)
         pm_v.ensure_packages(["openai-whisper"])
-        ASCIIColors.green("Server dependencies are satisfied.")
+        ASCIIColors.green("Whisper server dependencies are satisfied.")
 
-    def start_server(self, wait: bool = True, timeout_s: int = 40):
-        def _start_server_background():
-            lock_path = self.venv_dir / "whisper_server.lock"
-            lock = FileLock(lock_path)
+    def start_server(self, wait: bool = True, timeout_s: int = 120):
+        server_script = self.server_dir / "main.py"
+        venv_cfg = self.venv_dir / "pyvenv.cfg"
 
-            try:
-                with lock.acquire(timeout=0):
-                    server_script = self.server_dir / "main.py"
-                    venv_cfg = self.venv_dir / "pyvenv.cfg"
+        if not venv_cfg.exists():
+            self.install_server_dependencies()
 
-                    if not venv_cfg.exists():
-                        ASCIIColors.warning("Invalid or missing virtual environment. Reinstalling...")
-                        self.install_server_dependencies()
+        if sys.platform == "win32":
+            python_executable = self.venv_dir / "Scripts" / "python.exe"
+        else:
+            python_executable = self.venv_dir / "bin" / "python"
 
-                    if sys.platform == "win32":
-                        python_executable = self.venv_dir / "Scripts" / "python.exe"
-                    else:
-                        python_executable = self.venv_dir / "bin" / "python"
+        if not python_executable.exists():
+            raise RuntimeError(f"Python executable not found in venv: {python_executable}.")
 
-                    if not python_executable.exists():
-                        raise RuntimeError(f"Python executable not found in venv: {python_executable}.")
+        if not self.service_key:
+            if self.token_file.exists():
+                try:
+                    self.service_key = self.token_file.read_text(encoding="utf-8").strip()
+                except Exception:
+                    pass
+            if not self.service_key:
+                self.service_key = secrets.token_hex(16)
+                try:
+                    fd = os.open(str(self.token_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                        f.write(self.service_key)
+                except Exception:
+                    self.token_file.write_text(self.service_key, encoding="utf-8")
 
-                    command = [
-                        str(python_executable),
-                        str(server_script),
-                        "--host", self.host,
-                        "--port", str(self.port),
-                        "--cache-dir", str(self.cache_dir.resolve())
-                    ]
+        command = [
+            str(python_executable),
+            str(server_script),
+            "--host", str(self.host),
+            "--port", str(self.port),
+            "--cache-dir", str(self.cache_dir.resolve()),
+            "--token", str(self.service_key),
+            "--batch-window", str(self.batch_window),
+            "--max-batch-size", str(self.max_batch_size),
+        ]
 
-                    log_file_path = self.cache_dir / "whisper_server.log"
-                    log_f = open(log_file_path, "w", encoding="utf-8")
+        log_file_path = self.cache_dir / "whisper_server.log"
+        log_f = open(log_file_path, "w", encoding="utf-8")
 
-                    try:
-                        creationflags = 0
-                        if sys.platform == "win32":
-                            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-                        
-                        self.server_process = subprocess.Popen(
-                            command,
-                            stdout=log_f,
-                            stderr=subprocess.STDOUT,
-                            creationflags=creationflags
-                        )
-                    except Exception as popen_err:
-                        log_f.close()
-                        raise RuntimeError(f"Failed to execute subprocess: {popen_err}")
-                    finally:
-                        log_f.close()
+        try:
+            popen_kwargs: Dict[str, Any] = {
+                "stdout": log_f,
+                "stderr": subprocess.STDOUT,
+            }
+            if sys.platform == "win32":
+                popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            else:
+                popen_kwargs["start_new_session"] = True
 
-                    ASCIIColors.info(f"Whisper server launched on http://{self.host}:{self.port}")
+            self.server_process = subprocess.Popen(command, **popen_kwargs)
+        finally:
+            log_f.close()
 
-                    if wait:
-                        start_time = time.time()
-                        while True:
-                            if self.server_process.poll() is not None:
-                                error_tail = "No log data available."
-                                try:
-                                    with open(log_file_path, "r", encoding="utf-8", errors="ignore") as err_log:
-                                        lines = err_log.readlines()
-                                        error_tail = "".join(lines[-30:]) if lines else "Log file is empty."
-                                except Exception:
-                                    pass
-                                raise RuntimeError(
-                                    f"Whisper server process terminated unexpectedly with code {self.server_process.returncode}.\n"
-                                    f"--- Server Log Tail ---\n{error_tail}"
-                                )
+        ASCIIColors.info(f"Whisper server process launched on http://{self.host}:{self.port} (PID: {self.server_process.pid})")
 
-                            if self.is_server_running():
-                                ASCIIColors.success("Whisper server is ready.")
-                                return
-
-                            elapsed = time.time() - start_time
-                            if elapsed >= timeout_s:
-                                raise TimeoutError(f"Server failed to start within {timeout_s} seconds.")
-                            time.sleep(1)
-            except Exception as ex:
-                ASCIIColors.error(f"Failed to start Whisper server: {ex}")
-                raise
-
-        thread = threading.Thread(target=_start_server_background, daemon=True)
-        thread.start()
         if wait:
-            thread.join()
+            start_time = time.time()
+            while time.time() - start_time < timeout_s:
+                if self.server_process.poll() is not None:
+                    error_tail = "Log file is empty."
+                    try:
+                        if log_file_path.exists():
+                            lines = log_file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+                            error_tail = "\n".join(lines[-30:])
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"Whisper server process terminated unexpectedly with code {self.server_process.returncode}.\n"
+                        f"Log tail:\n{error_tail}"
+                    )
+
+                if self.is_server_running():
+                    ASCIIColors.success(f"Whisper shared daemon is operational on {self.base_url}.")
+                    return
+
+                time.sleep(0.5)
+
+            raise TimeoutError(f"Whisper server failed to become responsive within {timeout_s} seconds.")
 
     def _post_json_request(self, endpoint: str, data: Optional[dict] = None) -> requests.Response:
+        url = f"{self.base_url}{endpoint}"
         try:
-            url = f"{self.base_url}{endpoint}"
-            response = requests.post(url, json=data, timeout=3600)
+            response = requests.post(
+                url,
+                json=data,
+                headers=self._get_headers(),
+                timeout=3600
+            )
             response.raise_for_status()
             return response
         except requests.exceptions.RequestException as e:
             ASCIIColors.error(f"Failed to communicate with Whisper server at {url}. Error: {e}")
-            if hasattr(e, 'response') and e.response:
+            if hasattr(e, 'response') and e.response is not None:
                 try:
                     err_detail = e.response.json().get('detail', e.response.text)
-                except json.JSONDecodeError:
+                except Exception:
                     err_detail = e.response.text
-                ASCIIColors.error(f"Server response: {err_detail}")
                 raise RuntimeError(f"Whisper server error: {err_detail}") from e
-            raise RuntimeError("Communication with the Whisper server failed.") from e
+            raise RuntimeError(f"Communication with Whisper server failed: {e}") from e
 
     def _get_request(self, endpoint: str, params: Optional[dict] = None) -> requests.Response:
+        url = f"{self.base_url}{endpoint}"
         try:
-            url = f"{self.base_url}{endpoint}"
-            response = requests.get(url, params=params, timeout=60)
+            response = requests.get(
+                url,
+                params=params,
+                headers=self._get_headers(),
+                timeout=15
+            )
             response.raise_for_status()
             return response
         except requests.exceptions.RequestException as e:
-            ASCIIColors.error(f"Failed to communicate with Whisper server at {url}.")
-            raise RuntimeError("Communication with the Whisper server failed.") from e
+            raise RuntimeError(f"Communication with Whisper server failed: {e}") from e
 
     def transcribe_audio(self, audio_source: Union[str, Path, bytes], model: Optional[str] = None, **kwargs) -> str:
-        self.ensure_server_is_running(True)
-            
+        self.ensure_server_is_running(wait=True)
+
+        if isinstance(audio_source, (str, Path)):
+            audio_file = Path(audio_source)
+            if not audio_file.exists():
+                raise FileNotFoundError(f"Audio file not found at: {audio_source}")
+            audio_bytes = audio_file.read_bytes()
+            filename_hint = audio_file.name
+        elif isinstance(audio_source, bytes):
+            audio_bytes = audio_source
+            filename_hint = kwargs.get("filename")
+        else:
+            raise ValueError("audio_source must be str, Path, or bytes")
+
+        audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+
+        payload = {
+            "audio_b64": audio_b64,
+            "model_name": model or self.config.get("model_name", "base"),
+            "language": kwargs.get("language"),
+            "task": kwargs.get("task", "transcribe"),
+            "fp16": kwargs.get("fp16"),
+            "device": kwargs.get("device"),
+            "filename": filename_hint
+        }
+
+        response = self._post_json_request("/transcribe", data=payload)
+        return response.json().get("text", "")
+
+    def shutdown_server(self) -> bool:
+        """Sends an authenticated shutdown command to terminate the background server daemon."""
         if not self.is_server_running():
-             raise RuntimeError("Whisper server is not running and couldn't been started.")
-
+            return True
         try:
-            if isinstance(audio_source, (str, Path)):
-                audio_file = Path(audio_source)
-                if not audio_file.exists():
-                    raise FileNotFoundError(f"Audio file not found at: {audio_source}")
-                with open(audio_file, "rb") as f:
-                    audio_bytes = f.read()
-            elif isinstance(audio_source, bytes):
-                audio_bytes = audio_source
-            else:
-                raise ValueError("audio_source must be str, Path, or bytes")
-
-            audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
-            
-            payload = {
-                "audio_b64": audio_b64,
-                "model_name": model or self.config.get("model_name", "base"),
-                "language": kwargs.get("language"),
-                "task": kwargs.get("task", "transcribe"),
-                "fp16": kwargs.get("fp16"),
-                "device": kwargs.get("device"),
-                "filename": audio_file.name if isinstance(audio_source, (str, Path)) else None
-            }
-            
-            response = self._post_json_request("/transcribe", data=payload)
-            return response.json().get("text", "")
-            
-        except Exception as e:
-            ASCIIColors.error(f"Whisper transcription failed: {e}")
-            trace_exception(e)
-            raise Exception(f"Whisper transcription error: {e}") from e
+            resp = self._session.post(
+                f"{self.base_url}/shutdown",
+                headers=self._get_headers(),
+                timeout=5
+            )
+            return resp.status_code == 200
+        except Exception:
+            return False
 
     @staticmethod
     def list_models(**kwargs) -> List[str]:
@@ -266,6 +326,3 @@ class WhisperSTTBinding(LollmsSTTBinding):
             return self._get_request("/ps").json()
         except Exception:
             return [{"error": "Could not connect to server to get process status."}]
-
-    def __del__(self):
-        pass

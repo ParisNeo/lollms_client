@@ -1063,10 +1063,11 @@ class BindingToolsBuilder:
         if stt is not None and caps.enable_stt:
             tools["tool_speech_to_text"] = BindingToolsBuilder._make_stt_tool(stt, workspace_path)
 
-        # TTM (Text-to-Music)
+        # TTM (Text-to-Music & Songs)
         ttm = getattr(client, 'ttm', None)
         if ttm is not None and caps.enable_ttm:
             tools["tool_generate_music"] = BindingToolsBuilder._make_ttm_tool(ttm, workspace_path)
+            tools["tool_generate_song"] = BindingToolsBuilder._make_song_tool(ttm, workspace_path)
 
         # TTV (Text-to-Video)
         ttv = getattr(client, 'ttv', None)
@@ -1327,6 +1328,53 @@ class BindingToolsBuilder:
                 {"name": "file_name", "type": "str", "description": "Output filename without extension.", "optional": True},
             ],
             "callable": tool_generate_music,
+        }
+
+    @staticmethod
+    def _make_song_tool(ttm_binding, workspace_path: Optional[Path]) -> Dict[str, Any]:
+        def tool_generate_song(prompt: str, lyrics: str = "", duration: int = 60, file_name: str = "") -> dict:
+            """
+            Generate a full song with vocals and music conditioned on lyrics and style descriptions.
+
+            Args:
+                prompt (str): Description of the musical style, mood, genre, tempo, instruments.
+                lyrics (str, optional): The song lyrics, optionally formatted with tags like [Verse], [Chorus].
+                duration (int, optional): Duration in seconds (default 60).
+                file_name (str, optional): Output filename (without extension). Auto-generated if empty.
+            """
+            try:
+                audio_bytes = ttm_binding.generate_song_from_lyrics(prompt=prompt, lyrics=lyrics, duration=duration)
+                if not audio_bytes:
+                    return {"success": False, "error": "TTM song generation returned no audio data."}
+
+                fname = file_name or f"song_{uuid.uuid4().hex[:6]}"
+                if not fname.endswith(".wav"):
+                    fname += ".wav"
+
+                save_path = Path(fname)
+                if workspace_path:
+                    save_path = workspace_path / fname
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                save_path.write_bytes(audio_bytes)
+
+                return {
+                    "success": True,
+                    "output": f"Song generated and saved as '{fname}'.",
+                    "audio_filename": fname,
+                }
+            except Exception as e:
+                return {"success": False, "error": f"Song generation failed: {e}"}
+
+        return {
+            "name": "tool_generate_song",
+            "description": "Generate a complete song with vocals and arrangement from lyrics and musical description using the TTM binding.",
+            "parameters": [
+                {"name": "prompt", "type": "str", "description": "Musical style, genre, tempo, and arrangement description."},
+                {"name": "lyrics", "type": "str", "description": "Lyrics for the song with section tags like [Verse] and [Chorus].", "optional": True},
+                {"name": "duration", "type": "int", "description": "Song duration in seconds (default 60).", "optional": True},
+                {"name": "file_name", "type": "str", "description": "Output filename without extension.", "optional": True},
+            ],
+            "callable": tool_generate_song,
         }
 
     @staticmethod
@@ -3776,6 +3824,28 @@ JSON:"""
                         active_tools[t_name] = all_skill_tools[t_name]
 
         if self.capabilities and self.capabilities.enable_sub_agents:
+            if self._sub_agent_spawner:
+                def tool_spawn_sub_agent(instruction: str, personality_conditioning: str = "", model_name: str = "") -> dict:
+                    """
+                    Spawns a child agent to execute a sub-task.
+                    """
+                    return self._sub_agent_spawner.spawn(
+                        instruction=instruction,
+                        personality_conditioning=personality_conditioning or None,
+                        model_name=model_name or None,
+                    )
+
+                active_tools["tool_spawn_sub_agent"] = {
+                    "name": "tool_spawn_sub_agent",
+                    "description": "Spawn a focused sub-agent to perform a specific sub-task in the workspace.",
+                    "parameters": [
+                        {"name": "instruction", "type": "str", "description": "The specific task instructions for the sub-agent."},
+                        {"name": "personality_conditioning", "type": "str", "description": "System prompt conditioning the sub-agent's behavior.", "optional": True},
+                        {"name": "model_name", "type": "str", "description": "Specific model name to use for the sub-agent.", "optional": True}
+                    ],
+                    "callable": tool_spawn_sub_agent
+                }
+
             from lollms_client.lollms_agentic.spinoff_tools import build_spinoff_agent_tools
             spinoff_tools = build_spinoff_agent_tools(
                 discussion=self,
@@ -6793,6 +6863,7 @@ JSON:"""
                 and not tool_calls_this_turn
                 and stripped_round_text
                 and not text_is_repetitive
+                and bool(re.search(r'(?im)^\s*(?:i\s+will|let\s+me|i\'?m\s+going\s+to|i\s+shall|je\s+vais)\b', stripped_round_text))
             ):
                 ASCIIColors.info(f"[{self.name}] Round 1 response without `<done/>` or action tag. Forcing action continuation.")
                 virtual_history.append(SimpleNamespace(
@@ -6844,7 +6915,31 @@ JSON:"""
 
             # ── 🛑 ENFORCE END TAG MANDATE (UNIVERSAL TERMINATION CONTRACT) ──
             # The agentic loop MUST NOT terminate without an explicit <done/> or <end/> tag.
+            # If round 1 produced a pure conversational response with no tool calls, no actions, and no intent, finish immediately
+            if (
+                round_count == 1
+                and not tool_calls_this_turn
+                and not ss.completed_actions
+                and not ss.was_action_dispatched()
+                and not ss.tool_trigger
+                and stripped_round_text
+                and not re.search(r'(?im)^\s*(?:i\s+will|let\s+me|i\'?m\s+going\s+to|i\s+shall|je\s+vais)\b', stripped_round_text)
+            ):
+                final_response = re.sub(r'(?i)</?(?:done|end)\s*/?>', '', stripped_round_text).strip()
+                if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                    try:
+                        streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                            "round_id": round_count,
+                            "status": "done"
+                        })
+                    except Exception:
+                        pass
+                break
+
             if not ss.was_done_detected() and not was_cancelled:
+                if round_count == 1 and not had_prior_actions and not has_new_actions_this_round:
+                    final_response = stripped_round_text
+                    break
                 consecutive_stall_count = getattr(self, '_consecutive_stall_count', 0) + 1
                 object.__setattr__(self, '_consecutive_stall_count', consecutive_stall_count)
                 if consecutive_stall_count >= 5:

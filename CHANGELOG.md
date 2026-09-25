@@ -43,6 +43,76 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-25 00:14]
+
+- fix(docs): update documentation for music and song generation with TTM
+
+## [2026-09-25 02:25]
+
+- docs(phenix): establish Project Phenix documentation suite in `phenix_docs/` covering shared daemon IPC, continuous micro-batching, and unified API reference
+- docs(ttm): document Diffusers TTM binding and MiniMax Music 3 full-song generation across root README, library README, and user/developer guides
+- docs(ports): establish canonical loopback port registry (9632-9637) eliminating port drift across all modalities
+
+## [2026-09-25 02:15]
+
+- feat(ttm:diffusers): introduce new multi-user Diffusers TTM binding on dedicated port 9637 with self-spawning shared singleton daemon, FileLock synchronization, and continuous job queueing
+- feat(ttm:minimax): add MiniMax-Music3 to model zoo, supporting full 5-minute song generation with expressive vocals and structured progression
+- feat(ttm:core): extend LollmsTTMBinding and LollmsClient with first-class `generate_song` and `generate_song_from_lyrics` APIs
+- feat(personality): add `tool_generate_song` to BindingToolsBuilder to enable autonomous agentic full-song generation
+
+## [2026-09-25 02:05]
+
+- fix(test): wire proxy delegation in _mk_discussion fixture so ChatMixin tests access discussion mock methods seamlessly
+- fix(chat_mixin): guard add_message and lollmsClient across ChatMixin.chat() for isolated execution safety
+
+## [2026-09-25 01:45]
+
+- fix(chat_mixin): guard lollmsClient attribute access to support bare ChatMixin test instances
+- fix(chat_mixin): resolve AttributeError on completed_actions in _StreamState empty response guard
+- fix(personality): enable round 1 conversational short-circuit for pure conversational answers without tools or intent announcements
+
+## [2026-09-25 01:10]
+
+- fix(personality): resolve PEP 572 syntax error by replacing unparenthesized assignment expression in round 1 preamble check with standard boolean evaluation
+
+## [2026-09-25 01:05]
+
+- fix(vllm): guard load_model in __init__ with auto_start_server flag to allow isolated test inspection without spawning server
+- fix(chat_core): improve sanitize_host_paths regex to handle quoted and space-containing host paths
+- fix(chat_mixin): add hasattr guard for _get_memory_manager and reinstate duplicate artifact warning break
+- fix(chat_mixin): add zero-token empty response guard to terminate pathological loops immediately
+- fix(artefact): preserve file_ext explicitly for data and rich text imports while omitting it for plain text
+- fix(artefact): remove readme from extensionless files so README documents receive .md extension
+- fix(artefact): preserve db_content in add() to allow healing unlinked files in agentic mode
+- fix(core_mixin): register artifacts with title=f_path.name and physical_path=rel_str during sync
+- fix(agent_state): halt generation by returning False when <processing> tag mimicry is detected
+- fix(personality): allow single-turn conversational answers to finish without forcing continuation
+
+## [2026-09-25 00:45]
+
+- fix(whisper): replace Unicode box characters with ASCII hyphens in server banner to prevent CP1252 charmap encoding crash on Windows
+- fix(whisper): use direct requests calls to ensure test mock compatibility
+- fix(vllm): implement missing abstract method `get_model_info` in VLLMBinding
+- fix(openai): fallback to 'EMPTY' api_key when service_key is omitted to support local inference engines
+- fix(agent): expose `tool_spawn_sub_agent` in `_discover_tools()` when `enable_sub_agents` is active
+- fix(artefact): ensure SVG image artifacts are written to disk by inspecting file suffix
+- fix(memory): remove premature soft-delete purge in `dream()` to allow Dreamer LLM evaluation pass
+- fix(discussion): wire client `chat()` callable override in `regenerate_branch()` and add mimicry interception guard
+
+## [2026-09-25 00:34]
+
+- feat(tts:piper): migrate to self-spawning shared daemon on dedicated port 9635, fix destructive __del__ termination bug, add FileLock and HMAC token auth
+- feat(tts:bark): migrate to shared model daemon on port 9636 with dynamic micro-batch queue, fix __del__ server kill bug, add token auth and shutdown RPC
+- feat(tts:xtts): isolate to non-conflicting port 9634, harden multi-process FileLock with double-checked probe, add queue worker and token auth
+- feat(tti:diffusers): eliminate port-drifting pathology on port 9632 to enforce true single-instance VRAM mutualization, add token auth and shutdown RPC
+
+## [2026-09-25 00:27]
+
+- feat(stt:whisper): implement self-spawning shared daemon architecture with multi-process mutualization, eliminating port drift and race conditions
+- feat(stt:whisper): add event-driven continuous dynamic micro-batching (`batch_window`, `max_batch_size`) with batched mel decoding for short audio queries
+- feat(stt:whisper): add constant-time HMAC token authentication (`whisper_server.token` with 0o600 permissions) and `/shutdown` lifecycle RPC
+- fix(stt:whisper): replace timeout=0 filelock with double-checked probe pattern to allow seamless multi-client attachment
+
 ## [2026-09-24 22:14]
 
 - fix(vllm): update description and binding class to reflect vllm registry refactoring

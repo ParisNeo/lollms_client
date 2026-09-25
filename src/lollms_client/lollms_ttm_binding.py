@@ -26,19 +26,20 @@ class LollmsTTMBinding(LollmsBaseBinding):
         """
         pass
 
-    @abstractmethod
     def generate_song(self, prompt: str, **kwargs) -> bytes:
         """
-        Generates music data from the provided text prompt.
+        Generates a full song (with vocals if supported) from the provided prompt.
+        Default implementation delegates to generate_music.
         """
-        pass
+        return self.generate_music(prompt, **kwargs)
 
-    @abstractmethod
     def generate_song_from_lyrics(self, prompt: str, lyrics: str, **kwargs) -> bytes:
         """
-        Generates music data from the provided text prompt.
+        Generates music data conditioned on both a musical prompt and lyrics.
+        Default implementation concatenates prompt and lyrics and calls generate_music.
         """
-        pass
+        fused = f"{prompt}\n\n[Lyrics]\n{lyrics}" if lyrics else prompt
+        return self.generate_music(fused, **kwargs)
 
 
     @abstractmethod

@@ -413,6 +413,50 @@ for idx, img_bytes in enumerate(result.images):
 
 ---
 
+## 4.5 Music & Full Song Generation (TTM with MiniMax Music 3)
+
+The library provides first-class support for Text-to-Music (TTM) and complete song generation via the dedicated `diffusers` TTM binding (running a multi-user daemon on port `9637`):
+
+```python
+from lollms_client import LollmsClient, LollmsBindingProfile, LollmsModelProfile
+
+client = LollmsClient(
+    ttm_binding_profiles={
+        "local_ttm": LollmsBindingProfile(
+            name="local_ttm",
+            binding_name="diffusers",
+            binding_config={"host": "127.0.0.1", "port": 9637, "auto_start_server": True}
+        )
+    },
+    ttm_model_profiles={
+        "minimax_music": LollmsModelProfile(
+            name="minimax_music",
+            binding_profile_name="local_ttm",
+            model_name="MiniMaxAI/MiniMax-Music3",
+            is_default=True
+        )
+    }
+)
+
+# 1. Generate instrumental music
+music_bytes = client.generate_music(
+    prompt="Chill lo-fi study beat, gentle piano chords, vinyl crackle, warm bass",
+    duration=30
+)
+
+# 2. Generate full song with vocals from lyrics
+song_bytes = client.generate_song_from_lyrics(
+    prompt="Energetic synthwave pop, driving bass, female lead vocals",
+    lyrics="[Verse]\nNeon lights in the dark\n[Chorus]\nIgnite the spark",
+    duration=60
+)
+
+with open("output/song.wav", "wb") as f:
+    f.write(song_bytes)
+```
+
+---
+
 ## 5. Agentic Tool Calling
 
 Enable autonomous tool use with `generate_with_tools`:

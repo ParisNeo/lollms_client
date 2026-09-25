@@ -95,7 +95,11 @@ def _mk_discussion(tmp_path: Path, ctx_size: int = 8192):
     disc.get_branch = MagicMock(return_value=[])
     disc.export = MagicMock(return_value=[])
 
-    mixin = ChatMixin()
+    class _MockChatDiscussion(ChatMixin):
+        def __getattr__(self, name):
+            return getattr(disc, name)
+
+    mixin = _MockChatDiscussion()
     mixin.__dict__["_cancel_flag"] = False
     mixin.__dict__["_failure_memory"] = SimpleNamespace(
         failures=[], _signatures=set(),

@@ -139,6 +139,12 @@ Located in `lollms_client/lollms_core.py`, the `LollmsClient` class is the main 
 
 ### Supported Modalities and Bindings
 
+#### Shared Model Server Daemon Architecture (Project Phenix)
+*   **Zero Port Drift Singletons**: Every local daemon binding (`whisper` on 9633, `xtts` on 9634, `piper_tts` on 9635, `bark` on 9636, `diffusers` TTI on 9632, `diffusers` TTM on 9637) adheres to the "first instance wins" pattern. The first process spawns the daemon with a cross-process `FileLock(timeout=120)` and loopback probe; subsequent processes attach to the same running port with zero VRAM overhead.
+*   **Continuous Dynamic Micro-Batching**: Request queues gather concurrent jobs across an adaptive window (e.g. 20ms) and dispatch them in a single tensor core forward pass.
+*   **HMAC Token Security**: Daemons write a random token (`*.token` with `0o600` permissions) and validate all requests in constant time using `hmac.compare_digest`.
+*   **Text-to-Music & Full Song Synthesis**: The `diffusers` TTM binding provides high-throughput generation for `MiniMaxAI/MiniMax-Music3`, `stabilityai/stable-audio-open-1.0`, and `cvssp/audioldm2-music`.
+
 #### vLLM Server Mutualization & Recipe Presets
 *   **Cross-Process Server Daemon**: `VLLMBinding` manages an inter-process daemon. The first process calling `load_model()` acquires an inter-process `FileLock` (`~/.lollms/bindings_models/vllm_models/global_vllm_manager.lock`), spawns an OpenAI-compatible daemon (`vllm.entrypoints.openai.api_server`), and registers its metadata. Subsequent processes attach directly to the running endpoint with zero VRAM duplication.
 *   **Recipe Presets in `description.yaml`**: Exposes pre-validated deployment recipes (`deepseek_r1_mtp`, `qwen2_5_coder_fp8_kv`, `qwen2_5_vl_multimodal`, `llama_3_3_70b_throughput`, `glm_5_flash_long_ctx`, `low_vram_consumer`). Front-ends can query `desc.get("presets")` to populate instant configuration dropdowns.

@@ -946,7 +946,7 @@ class CoreMixin:
 
                 if existing_art is None:
                     self.artefacts.add(
-                        title=rel_str,
+                        title=f_path.name,
                         physical_path=rel_str,
                         artefact_type=atype,
                         content=disk_content,

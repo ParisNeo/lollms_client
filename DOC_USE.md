@@ -217,6 +217,20 @@ Behavior of `list_models()` and `switch_model()` is binding-dependent.
 
 ### 3.5. Using Other Modalities (TTS, STT, TTI, TTM, TTV)
 
+#### Text-to-Music & Full Song Generation (MiniMax Music 3)
+```python
+# client initialized with ttm_binding_name="diffusers"
+# Generates a complete song from lyrics and musical prompt
+lyrics = "[Verse]\nWalking in the morning sun\n[Chorus]\nThe day has just begun"
+prompt = "Upbeat acoustic folk pop, warm acoustic guitar, cheerful vocals"
+
+song_bytes = client.generate_song_from_lyrics(prompt=prompt, lyrics=lyrics, duration=45)
+if song_bytes:
+    with open("folk_song.wav", "wb") as f:
+        f.write(song_bytes)
+    print("Song saved to folk_song.wav!")
+```
+
 Access modality bindings via attributes like `client.tts`, `client.stt`, etc., if they were configured during initialization.
 
 **Text-to-Speech (TTS) Example (using Bark, as set up in 3.1):**
@@ -471,7 +485,7 @@ As of this documentation, `lollms_client` includes or is designed for bindings s
 *   **TTS (Text-to-Speech):** `lollms`, `bark`, `xtts`, `piper`.
 *   **STT (Speech-to-Text):** `lollms`, `whisper`, `whispercpp`.
 *   **TTI (Text-to-Image):** `lollms`, `dalle`, `diffusers`.
-*   **TTM (Text-to-Music/Sound):** `lollms`, `audiocraft`, `bark`.
+*   **TTM (Text-to-Music/Sound):** `diffusers` (MiniMax Music 3, Stable Audio, AudioLDM2), `lollms`, `audiocraft`, `bark`.
 *   **TTV (Text-to-Video):** `lollms`.
 *   **MCP (Model Context Protocol):**
     *   `local_mcp`: Executes local Python tools. Comes with default tools for file I/O, internet search, Python execution, and image generation (delegates to active TTI binding).

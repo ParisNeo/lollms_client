@@ -1354,8 +1354,40 @@ def _enrich_args_for_family(family: str, pipeline_args: Dict[str, Any], pil_imag
 # API Endpoints
 # ---------------------------------------------------------------------------
 
+auth_token: Optional[str] = None
+
+def verify_auth_token(
+    authorization: Optional[str] = Header(None),
+    x_server_token: Optional[str] = Header(None)
+):
+    if not auth_token:
+        return
+    token = None
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+    elif x_server_token:
+        token = x_server_token.strip()
+
+    import hmac
+    if not token or not hmac.compare_digest(token, auth_token):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+@router.get("/health")
+def health():
+    return {"status": "ok"}
+
+@router.post("/shutdown")
+def shutdown(authorization: Optional[str] = Header(None), x_server_token: Optional[str] = Header(None)):
+    verify_auth_token(authorization, x_server_token)
+    def _delayed_exit():
+        time.sleep(0.5)
+        os._exit(0)
+    threading.Thread(target=_delayed_exit, daemon=True).start()
+    return {"status": "shutting_down"}
+
 @router.post("/generate_image")
-async def generate_image(request: T2IRequest):
+async def generate_image(request: T2IRequest, authorization: Optional[str] = Header(None), x_server_token: Optional[str] = Header(None)):
+    verify_auth_token(authorization, x_server_token)
     manager = None
     temp_config = None
     try:
@@ -1781,17 +1813,37 @@ app.include_router(router)
 if __name__ == "__main__":
     try:
         parser = argparse.ArgumentParser(description="Diffusers TTI Server")
-        parser.add_argument("--host", type=str, default="localhost")
-        parser.add_argument("--port", type=int, default=9630)
+        parser.add_argument("--host", type=str, default="127.0.0.1")
+        parser.add_argument("--port", type=int, default=9632)
         parser.add_argument("--models-path", type=str, required=True)
         parser.add_argument("--extra-models-path", type=str, default=None)
         parser.add_argument("--hf-token", type=str, default=None,
                             help="Hugging Face access token for gated/private repos.")
+        parser.add_argument("--token", type=str, default=None,
+                            help="Authentication token for securing server access.")
 
         args = parser.parse_args()
         MODELS_PATH      = Path(args.models_path)
         EXTRA_MODELS_PATH = Path(args.extra_models_path) if args.extra_models_path else None
         state = ServerState(MODELS_PATH, EXTRA_MODELS_PATH)
+
+        auth_token = args.token
+        token_file = MODELS_PATH / "diffusers_server.token"
+        if not auth_token:
+            if token_file.exists():
+                try:
+                    auth_token = token_file.read_text(encoding="utf-8").strip()
+                except Exception:
+                    pass
+            if not auth_token:
+                import secrets
+                auth_token = secrets.token_hex(16)
+                try:
+                    fd = os.open(str(token_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                        f.write(auth_token)
+                except Exception:
+                    token_file.write_text(auth_token, encoding="utf-8")
 
         if args.hf_token:
             state.config["hf_token"] = args.hf_token

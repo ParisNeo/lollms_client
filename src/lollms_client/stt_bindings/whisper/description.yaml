@@ -1,42 +1,62 @@
 title: Whisper STT Binding
 author: ParisNeo
 creation_date: 2025-10-21
-last_update_date: 2025-10-21
-description: A Speech-To-Text (STT) binding for transcribing audio using OpenAI's Whisper model locally. It requires 'ffmpeg' to be installed on the system. Operates via a standalone shared server to enable multi-process VRAM sharing and OOM management.
+last_update_date: 2026-09-25
+description: >
+  A resilient Speech-To-Text (STT) binding for transcribing audio using OpenAI's
+  Whisper models. Features cross-process server mutualization and event-driven
+  continuous dynamic micro-batching. Multiple lollms_client instances and worker
+  processes attach seamlessly to a single shared daemon on loopback with zero VRAM
+  duplication and zero port drift.
 global_input_parameters:
   - name: host
     type: str
-    description: "The host address for the Whisper server."
+    description: "The host address for the shared Whisper server."
     mandatory: false
-    default: "localhost"
+    default: "127.0.0.1"
   - name: port
     type: int
-    description: "The port number on which the dedicated Whisper server will run."
+    description: "The port on which the shared Whisper server daemon runs."
     mandatory: false
     default: 9633
   - name: auto_start_server
     type: bool
-    description: "If True, the binding will automatically spawn the server in a background process if it is not already running."
+    description: "Automatically spawn the shared server daemon in the background if not already active."
     mandatory: false
-    default: false
+    default: true
   - name: wait_for_server
     type: bool
-    description: "If True, the constructor will block until the server is fully operational."
+    description: "Block until the shared server is fully initialized and operational."
     mandatory: false
-    default: false
+    default: true
+  - name: batch_window
+    type: float
+    description: "Dynamic micro-batch collection window in seconds (default: 0.02s)."
+    mandatory: false
+    default: 0.02
+  - name: max_batch_size
+    type: int
+    description: "Maximum batch size for concurrent transcription requests (default: 8)."
+    mandatory: false
+    default: 8
+  - name: service_key
+    type: str
+    description: "Authentication token for securing server access. Loaded from whisper_server.token if omitted."
+    mandatory: false
+    default: ""
   - name: venv_path
     type: str
-    description: "Path to the virtual environment dedicated to the Whisper server."
+    description: "Path to the dedicated virtual environment for the Whisper server."
     mandatory: false
     default: "./venv/stt_whisper_venv"
   - name: cache_dir
     type: str
-    description: "Directory where Whisper models and server logs will be stored."
+    description: "Directory where Whisper models, logs, and authentication tokens are stored."
     mandatory: false
     default: "./data/stt_models/whisper"
 model_input_parameters:
   - name: model_name
     type: str
-    description: "The Whisper model size to use. Known sizes include 'tiny', 'base', 'small', 'medium', and 'large' variants (e.g., 'large-v3')."
+    description: "The Whisper model size to use ('tiny', 'base', 'small', 'medium', 'large', 'large-v3', 'turbo')."
     mandatory: false
     default: "base"

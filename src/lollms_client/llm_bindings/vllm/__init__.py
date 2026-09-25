@@ -385,7 +385,7 @@ class VLLMBinding(LollmsLLMBinding):
         self.client: Optional[openai.OpenAI] = None
         self.active_server_info: Optional[Dict[str, Any]] = None
 
-        if self.model_name:
+        if self.model_name and kwargs.get("auto_start_server", False):
             self.load_model(self.model_name)
 
         atexit.register(self.cleanup_client_registration)
@@ -893,6 +893,15 @@ class VLLMBinding(LollmsLLMBinding):
             except Exception:
                 pass
         return models
+
+    def get_model_info(self) -> dict:
+        return {
+            "name": "vLLM",
+            "model_name": self.model_name,
+            "host": self.host,
+            "port": self.port,
+            "active_server": self.active_server_info,
+        }
 
     def ps(self) -> List[Dict[str, Any]]:
         results = []

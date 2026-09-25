@@ -197,6 +197,13 @@ class AudioCraftTTMBinding(LollmsTTMBinding):
                  ASCIIColors.yellow("An FFmpeg error occurred. Ensure FFmpeg is installed and accessible in your system's PATH if you are generating MP3s.")
             raise RuntimeError(f"AudioCraft music generation error: {e}") from e
 
+    def generate_song(self, prompt: str, **kwargs) -> bytes:
+        return self.generate_music(prompt, **kwargs)
+
+    def generate_song_from_lyrics(self, prompt: str, lyrics: str, **kwargs) -> bytes:
+        fused = f"{prompt}. Vocal melody singing: {lyrics}" if lyrics else prompt
+        return self.generate_music(fused, **kwargs)
+
     def list_models(self, **kwargs) -> List[str]:
         return DEFAULT_AUDIOCRAFT_MODELS.copy()
 

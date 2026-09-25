@@ -44,6 +44,18 @@ class UtilsMixin:
         else:
             raise ValueError(f"Unexpected sender type: '{target_msg.sender_type}'.")
         self.active_branch_id = user_msg_to_regenerate_from.id
+        if self.lollmsClient and hasattr(self.lollmsClient, 'chat') and callable(self.lollmsClient.chat):
+            try:
+                import inspect
+                sig = inspect.signature(self.lollmsClient.chat)
+                if "discussion" in sig.parameters:
+                    return self.lollmsClient.chat(self, user_message="", add_user_message=False,
+                                                  branch_tip_id=user_msg_to_regenerate_from.id, **kwargs)
+                else:
+                    return self.lollmsClient.chat(user_message="", add_user_message=False,
+                                                  branch_tip_id=user_msg_to_regenerate_from.id, **kwargs)
+            except Exception:
+                pass
         return self.chat(user_message="", add_user_message=False,
                          branch_tip_id=user_msg_to_regenerate_from.id, **kwargs)
 

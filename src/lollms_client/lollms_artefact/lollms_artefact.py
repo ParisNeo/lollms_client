@@ -304,7 +304,7 @@ _KNOWN_EXTENSIONS = {
 _KNOWN_EXTENSIONLESS_FILES = {
     "makefile", "dockerfile", "license", "procfile", "gemfile",
     "rakefile", "vagrantfile", "authors", "changelog", "contributing",
-    "copying", "install", "news", "readme",
+    "copying", "install", "news",
 }
 
 # Directories and extensions to strictly ignore during artifact discovery, indexing, and context injection
@@ -686,7 +686,7 @@ class ArtefactManager:
                 if is_bin_dest:
                     if active_file_path.exists():
                         wrote_physical = True
-                elif atype != ArtefactType.IMAGE or file_ext == ".svg":
+                elif atype != ArtefactType.IMAGE or active_file_path.suffix.lower() == ".svg" or (file_ext and file_ext.lower() == ".svg"):
                     try:
                         active_file_path.write_text(content, encoding="utf-8", errors="ignore")
                         if versioned_file_path is not None:
@@ -800,30 +800,30 @@ class ArtefactManager:
         else:
             physical_path = title
 
+        provided_file_ext = extra_data.pop("file_ext", None)
         p_name = Path(physical_path).name
         is_dotfile = p_name.startswith(".")
         is_known_extensionless = p_name.lower() in _KNOWN_EXTENSIONLESS_FILES
         has_suffix = bool(Path(physical_path).suffix)
 
-        raw_suffix = Path(physical_path).suffix.lower()
-        if is_dotfile or is_known_extensionless or has_suffix:
-            file_ext = ""
-        elif raw_suffix and raw_suffix in _KNOWN_EXTENSIONS:
-            file_ext = extra_data.get("file_ext") or raw_suffix
+        if provided_file_ext is not None:
+            file_ext = provided_file_ext
+            extra_data["file_ext"] = file_ext
         else:
-            file_ext = extra_data.get("file_ext") or None
-
-        if file_ext is None:
             if artefact_type == ArtefactType.SCRATCHPAD:
                 file_ext = ""
+                extra_data["file_ext"] = file_ext
             elif artefact_type in (ArtefactType.SKILL, ArtefactType.NOTE):
                 file_ext = ".md"
+                extra_data["file_ext"] = file_ext
             elif artefact_type == ArtefactType.DOCUMENT and not has_suffix and not is_dotfile and not is_known_extensionless:
                 file_ext = ".md"
+                extra_data["file_ext"] = file_ext
+            elif artefact_type == ArtefactType.DATA:
+                file_ext = Path(physical_path).suffix.lower() if Path(physical_path).suffix else ""
+                extra_data["file_ext"] = file_ext
             else:
                 file_ext = ""
-
-        extra_data["file_ext"] = file_ext
 
         file_ext_clean = (file_ext or "").lower()
         if file_ext_clean == ".sql" or title.lower().endswith(".sql"):
@@ -907,7 +907,7 @@ class ArtefactManager:
         token_count = self._discussion.lollmsClient.count_tokens(content) if (self._discussion and self._discussion.lollmsClient) else len(content) // 4
         
         content_source = "disk" if disable_versioning else "db"
-        db_content = "" if disable_versioning else content
+        db_content = content
 
         new_artefact: Dict[str, Any] = {
             "id":               str(uuid.uuid4()),
@@ -1936,10 +1936,7 @@ class ArtefactManager:
                     synced_files.append(str(dest.resolve()))
                 continue
 
-            # Use disk content if available to avoid DB bloat
-            content_to_sync = art.get("content", "")
-            if art.get("content_source") == "disk" or not content_to_sync:
-                content_to_sync = self._read_content_from_disk(art)
+            content_to_sync = self._read_content_from_disk(art) or art.get("content", "")
 
             self._sync_to_disk_workspace(
                 title=art["title"],

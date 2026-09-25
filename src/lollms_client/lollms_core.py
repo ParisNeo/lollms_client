@@ -1523,6 +1523,16 @@ class LollmsClient():
         if self.ttm: return self.ttm.generate_music(*args, **kwargs)
         raise RuntimeError("TTM binding not initialized.")
 
+    def generate_song(self, *args, **kwargs):
+        self._cooperative_unload_except("ttm")
+        if self.ttm: return self.ttm.generate_song(*args, **kwargs)
+        raise RuntimeError("TTM binding not initialized.")
+
+    def generate_song_from_lyrics(self, *args, **kwargs):
+        self._cooperative_unload_except("ttm")
+        if self.ttm: return self.ttm.generate_song_from_lyrics(*args, **kwargs)
+        raise RuntimeError("TTM binding not initialized.")
+
     def long_context_processing(self, text_to_process: str, contextual_prompt: str, **kwargs) -> str:
         if self.llm:
             return self.llm.tp.long_context_processing(text_to_process, contextual_prompt, **kwargs)

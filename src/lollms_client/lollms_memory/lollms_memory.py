@@ -1210,13 +1210,7 @@ class LollmsMemoryManager:
             "duration_seconds": 0.0
         }
 
-        # 1. Hard purge of all zero-importance marked nodes (Soft Deletes)
-        with self._session() as s:
-            forgotten_count = s.query(_MemoryRecord).filter(_MemoryRecord.importance <= 0.001).delete(synchronize_session=False)
-            report["forgotten"] += forgotten_count
-            s.flush()
-
-        # 2. PageRank degree centrality recalculation across the network
+        # 1. PageRank degree centrality recalculation across the network
         with self._session() as s:
             recs = self._q(s).all()
             for r in recs:

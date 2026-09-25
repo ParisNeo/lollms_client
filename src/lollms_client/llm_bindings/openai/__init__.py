@@ -372,7 +372,7 @@ class OpenAIBinding(LollmsLLMBinding):
             self.open_ai_host_address = None
 
         if not self.service_key:
-            self.service_key = os.getenv("OPENAI_API_KEY", self.service_key)
+            self.service_key = os.getenv("OPENAI_API_KEY", self.service_key) or "EMPTY"
 
         self.verify = True
         verify = True
@@ -392,7 +392,7 @@ class OpenAIBinding(LollmsLLMBinding):
             verify = ssl_context
 
         self.client = openai.OpenAI(
-            api_key=self.service_key,
+            api_key=self.service_key or "EMPTY",
             base_url=self.open_ai_host_address,
             http_client=httpx.Client(
                 verify=verify,

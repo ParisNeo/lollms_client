@@ -1,296 +1,228 @@
 import os
 import sys
-import requests
-import subprocess
 import time
+import secrets
+import subprocess
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
-# Ensure filelock is available for process-safe server startup.
-try:
-    from filelock import FileLock, Timeout
-except ImportError:
-    print("FATAL: The 'filelock' library is required. Please install it by running: pip install filelock")
-    sys.exit(1)
+from filelock import FileLock, Timeout
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
+from ascii_colors import ASCIIColors
 
 from lollms_client.lollms_tts_binding import LollmsTTSBinding
-from ascii_colors import ASCIIColors
 
 BindingName = "XTTSClientBinding"
 
+
 class XTTSClientBinding(LollmsTTSBinding):
     """
-    Client binding for a dedicated, managed XTTS server.
-    This architecture prevents the heavy XTTS model from being loaded into memory
-    by multiple worker processes, solving potential OOM errors and speeding up TTS generation.
+    Client binding for the shared, process-safe XTTS v2 server daemon.
+    Guarantees a single model footprint in VRAM across all processes and workers.
     """
-    def __init__(self,
-                 **kwargs):
-        # Prioritize 'model_name' but accept 'model' as an alias from config files.
+
+    def __init__(self, **kwargs):
         if 'model' in kwargs and 'model_name' not in kwargs:
             kwargs['model_name'] = kwargs.pop('model')
+        super().__init__(binding_name="xtts", **kwargs)
 
         self.config = kwargs
-        self.host = kwargs.get("host", "localhost")
-        self.port = kwargs.get("port", 9633)
-        self.auto_start_server = kwargs.get("auto_start_server", False)
-        self.server_process = None
+        self.host = kwargs.get("host", "127.0.0.1")
+        self.port = int(kwargs.get("port", 9634))
+        self.auto_start_server = kwargs.get("auto_start_server", True)
+        self.wait_for_server = kwargs.get("wait_for_server", True)
         self.base_url = f"http://{self.host}:{self.port}"
         self.binding_root = Path(__file__).parent
         self.server_dir = self.binding_root / "server"
-        self.venv_dir = Path("./venv/tts_xtts_venv")
-        
-        # Python version requirement for XTTS
+        self.venv_dir = Path(kwargs.get("venv_path", "./venv/tts_xtts_venv")).resolve()
+        self.cache_dir = Path(kwargs.get("cache_dir", "./data/tts_models/xtts")).resolve()
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.token_file = self.cache_dir / "xtts_server.token"
+
+        self.service_key = kwargs.get("service_key")
+        if not self.service_key and self.token_file.exists():
+            try:
+                self.service_key = self.token_file.read_text(encoding="utf-8").strip()
+            except Exception:
+                pass
+
+        self._session = requests.Session()
+        retries = Retry(total=3, backoff_factor=0.2, status_forcelist=[502, 503, 504])
+        self._session.mount("http://", HTTPAdapter(max_retries=retries))
+
         self.target_python_version = "3.10"
+        self.server_process = None
 
         if self.auto_start_server:
-            self.ensure_server_is_running()
+            self.ensure_server_is_running(self.wait_for_server)
+
+    def _get_headers(self) -> Dict[str, str]:
+        headers = {"Accept": "application/json"}
+        if self.service_key:
+            headers["Authorization"] = f"Bearer {self.service_key}"
+            headers["X-Server-Token"] = self.service_key
+        return headers
 
     def is_server_running(self) -> bool:
-        """Checks if the server is already running and responsive."""
         try:
-            response = requests.get(f"{self.base_url}/status", timeout=2)
-            if response.status_code == 200 and response.json().get("status") == "running":
+            resp = self._session.get(
+                f"{self.base_url}/status",
+                headers=self._get_headers(),
+                timeout=1.5
+            )
+            if resp.status_code == 200:
+                return resp.json().get("status") == "running"
+            elif resp.status_code == 401:
+                if self.token_file.exists():
+                    try:
+                        self.service_key = self.token_file.read_text(encoding="utf-8").strip()
+                        retry = self._session.get(f"{self.base_url}/status", headers=self._get_headers(), timeout=1.5)
+                        return retry.status_code == 200
+                    except Exception:
+                        pass
                 return True
         except requests.exceptions.RequestException:
             return False
         return False
 
-    def ensure_server_is_running(self):
-        """
-        Ensures the XTTS server is running. If not, it attempts to start it
-        in a process-safe manner using a file lock.
-        """
-        self.server_dir.mkdir(exist_ok=True)
-        lock_path = self.server_dir / "xtts_server.lock"
-        lock = FileLock(lock_path)
-
-        ASCIIColors.info("Attempting to start or connect to the XTTS server...")
-        
+    def ensure_server_is_running(self, wait: bool = True, timeout_s: int = 120):
         if self.is_server_running():
-            ASCIIColors.green("XTTS Server is already running and responsive.")
             return
 
+        lock_path = self.cache_dir / "xtts_server_spawn.lock"
+        lock = FileLock(lock_path, timeout=timeout_s)
+
         try:
-            with lock.acquire(timeout=10):
-                if not self.is_server_running():
-                    ASCIIColors.yellow("Lock acquired. Starting dedicated XTTS server...")
-                    self.start_server()
-                    self._wait_for_server()
-                else:
-                    ASCIIColors.green("Server was started by another process while we waited. Connected successfully.")
+            with lock:
+                if self.is_server_running():
+                    ASCIIColors.green(f"XTTS shared daemon detected on {self.base_url}. Attached successfully.")
+                    return
+                ASCIIColors.info(f"Spawning shared XTTS server daemon on {self.base_url}...")
+                self.start_server(wait=wait, timeout_s=timeout_s)
         except Timeout:
-            ASCIIColors.yellow("Could not acquire lock, another process is starting the server. Waiting...")
-            self._wait_for_server(timeout=60)
-
-        if not self.is_server_running():
-            raise RuntimeError("Failed to start or connect to the XTTS server after all attempts.")
-
+            if self.is_server_running():
+                return
+            raise RuntimeError(f"Timed out waiting for XTTS shared daemon on {self.base_url}.")
 
     def install_server_dependencies(self):
-        """
-        Installs the server's dependencies into a dedicated virtual environment
-        using pipmaster with Python 3.10, which handles complex packages like PyTorch.
-        """
         ASCIIColors.info(f"Setting up Python {self.target_python_version} virtual environment in: {self.venv_dir}")
-        
-        # Ensure pipmaster is available
-        try:
-            import pipmaster as pm
-        except ImportError:
-            print("FATAL: pipmaster is not installed. Please install it using: pip install pipmaster")
-            raise Exception("pipmaster not found")
-        
-        try:
-            # Use pipmaster's new portable Python version feature to ensure Python 3.10
-            ASCIIColors.info(f"Bootstrapping portable Python {self.target_python_version}...")
-            pm_instance = pm.get_pip_manager_for_version(
-                self.target_python_version, 
-                str(self.venv_dir)
-            )
-            
-            ASCIIColors.green(f"Portable Python {self.target_python_version} ready.")
-            ASCIIColors.info(f"Using interpreter: {pm_instance.target_python_executable}")
-            
-        except RuntimeError as e:
-            ASCIIColors.error(f"Failed to bootstrap portable Python {self.target_python_version}: {e}")
-            raise Exception(f"XTTS requires Python {self.target_python_version} but setup failed")
-        
-        # Install server dependencies
+        import pipmaster as pm
+
+        pm_instance = pm.get_pip_manager_for_version(
+            self.target_python_version,
+            str(self.venv_dir)
+        )
         requirements_file = self.server_dir / "requirements.txt"
-        
-        ASCIIColors.info("Installing server dependencies from requirements.txt...")
         success = pm_instance.ensure_requirements(str(requirements_file), verbose=True)
-
         if not success:
-            ASCIIColors.error("Failed to install server dependencies. Please check the console output for errors.")
             raise RuntimeError("XTTS server dependency installation failed.")
-
-        ASCIIColors.green("Server dependencies are satisfied.")
-        
-        # Store the Python executable path for later use
         self._python_executable = pm_instance.target_python_executable
 
-
-    def start_server(self):
-        """
-        Installs dependencies and launches the FastAPI server as a background subprocess.
-        This method should only be called from within a file lock.
-        """
+    def start_server(self, wait: bool = True, timeout_s: int = 120):
         server_script = self.server_dir / "main.py"
-        if not server_script.exists():
-            raise FileNotFoundError(f"Server script not found at {server_script}.")
-
         if not self.venv_dir.exists():
             self.install_server_dependencies()
         else:
-            # Venv exists, get the Python executable path
-            try:
-                import pipmaster as pm
-                pm_instance = pm.get_pip_manager_for_version(
-                    self.target_python_version, 
-                    str(self.venv_dir)
-                )
-                self._python_executable = pm_instance.target_python_executable
-            except Exception as e:
-                ASCIIColors.warning(f"Could not verify Python version: {e}")
-                # Fallback to traditional path detection
-                if sys.platform == "win32":
-                    self._python_executable = str(self.venv_dir / "Scripts" / "python.exe")
-                else:
-                    self._python_executable = str(self.venv_dir / "bin" / "python")
+            if sys.platform == "win32":
+                self._python_executable = str(self.venv_dir / "Scripts" / "python.exe")
+            else:
+                self._python_executable = str(self.venv_dir / "bin" / "python")
+
+        if not self.service_key:
+            if self.token_file.exists():
+                try:
+                    self.service_key = self.token_file.read_text(encoding="utf-8").strip()
+                except Exception:
+                    pass
+            if not self.service_key:
+                self.service_key = secrets.token_hex(16)
+                try:
+                    fd = os.open(str(self.token_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                        f.write(self.service_key)
+                except Exception:
+                    self.token_file.write_text(self.service_key, encoding="utf-8")
+
+        voices_dir = self.server_dir / "voices"
+        voices_dir.mkdir(parents=True, exist_ok=True)
 
         command = [
             str(self._python_executable),
             str(server_script),
-            "--host", self.host,
-            "--port", str(self.port)
+            "--host", str(self.host),
+            "--port", str(self.port),
+            "--voices-dir", str(voices_dir),
+            "--token", str(self.service_key),
         ]
-        
-        # Use DETACHED_PROCESS on Windows to allow the server to run independently.
-        creationflags = subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0
-        
-        self.server_process = subprocess.Popen(command, creationflags=creationflags)
-        ASCIIColors.info("XTTS server process launched in the background.")
 
-    def _wait_for_server(self, timeout=20):
-        """Waits for the server to become responsive."""
-        ASCIIColors.info("Waiting for XTTS server to become available...")
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            if self.is_server_running():
-                ASCIIColors.green("XTTS Server is up and running.")
-                return
-            time.sleep(2)
-        raise RuntimeError("Failed to connect to the XTTS server within the specified timeout.")
+        log_file_path = self.cache_dir / "xtts_server.log"
+        log_f = open(log_file_path, "w", encoding="utf-8")
+        try:
+            popen_kwargs: Dict[str, Any] = {"stdout": log_f, "stderr": subprocess.STDOUT}
+            if sys.platform == "win32":
+                popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            else:
+                popen_kwargs["start_new_session"] = True
+            self.server_process = subprocess.Popen(command, **popen_kwargs)
+        finally:
+            log_f.close()
+
+        if wait:
+            start_time = time.time()
+            while time.time() - start_time < timeout_s:
+                if self.is_server_running():
+                    ASCIIColors.green("XTTS server is ready.")
+                    return
+                time.sleep(1)
+            raise TimeoutError(f"XTTS server failed to start within {timeout_s}s.")
 
     def __del__(self):
-        # The client destructor does not stop the server,
-        # as it is a shared resource for other processes.
+        # Do not kill the server on object destruction as it is a shared daemon
         pass
 
-    def generate_audio(self, text: str, voice: Optional[str] = None, language: str = "en", **kwargs) -> bytes:
-        """Generate audio by calling the server's API
-        
-        Args:
-            text: The text to synthesize
-            voice: The voice file to use (wav/mp3)
-            language: The language code (e.g., 'en', 'fr', 'es'). Defaults to 'en'.
-            **kwargs: Additional parameters
-        """
-        self.ensure_server_is_running()
-        
-        # Construct payload with explicit language support
-        payload = {
-            "text": text, 
-            "voice": voice,
-            "language": language
-        }
-        # Pass other kwargs from the description file (split_sentences)
-        payload.update(kwargs)
-        
+    def shutdown_server(self) -> bool:
+        if not self.is_server_running():
+            return True
         try:
-            response = requests.post(f"{self.base_url}/generate_audio", json=payload, timeout=-1)
-            response.raise_for_status()
-            return response.content
-        except requests.exceptions.RequestException as e:
-            ASCIIColors.error(f"Failed to communicate with XTTS server at {self.base_url}.")
-            ASCIIColors.error(f"Error details: {e}")
-            raise RuntimeError("Communication with the XTTS server failed.") from e
+            resp = self._session.post(f"{self.base_url}/shutdown", headers=self._get_headers(), timeout=5)
+            return resp.status_code == 200
+        except Exception:
+            return False
 
+    def generate_audio(self, text: str, voice: Optional[str] = None, language: str = "en", **kwargs) -> bytes:
+        self.ensure_server_is_running(True)
+        payload = {"text": text, "voice": voice, "language": language}
+        payload.update(kwargs)
+        response = self._session.post(f"{self.base_url}/generate_audio", json=payload, headers=self._get_headers(), timeout=300)
+        response.raise_for_status()
+        return response.content
 
     def list_voices(self, **kwargs) -> List[str]:
-        """Get available voices from the server"""
-        self.ensure_server_is_running()
-        try:
-            response = requests.get(f"{self.base_url}/list_voices")
-            response.raise_for_status()
-            return response.json().get("voices", [])
-        except requests.exceptions.RequestException as e:
-            ASCIIColors.error(f"Failed to get voices from XTTS server: {e}")
-            return []
-
+        self.ensure_server_is_running(True)
+        response = self._session.get(f"{self.base_url}/list_voices", headers=self._get_headers(), timeout=15)
+        response.raise_for_status()
+        return response.json().get("voices", [])
 
     def list_models(self, **kwargs) -> list:
-        """Lists models supported by the server"""
-        self.ensure_server_is_running()
-        try:
-            response = requests.get(f"{self.base_url}/list_models")
-            response.raise_for_status()
-            return response.json().get("models", [])
-        except requests.exceptions.RequestException as e:
-            ASCIIColors.error(f"Failed to get models from XTTS server: {e}")
-            return []
+        return ["tts_models/multilingual/multi-dataset/xtts_v2"]
 
     def upload_voice(self, voice_path: str, voice_name: Optional[str] = None) -> dict:
-        """Upload a voice file to the XTTS server
-        
-        Args:
-            voice_path: Path to the voice file (wav or mp3)
-            voice_name: Optional name for the voice. If not provided, uses filename.
-        
-        Returns:
-            dict: Upload result with success status, voice_name, and message
-        """
-        self.ensure_server_is_running()
-        
+        self.ensure_server_is_running(True)
         voice_file = Path(voice_path)
         if not voice_file.exists():
-            return {
-                "success": False,
-                "voice_name": None,
-                "message": f"Voice file not found: {voice_path}"
-            }
-        
-        # Validate extension
-        allowed_extensions = {'.wav', '.mp3'}
-        if voice_file.suffix.lower() not in allowed_extensions:
-            return {
-                "success": False,
-                "voice_name": None,
-                "message": f"Invalid file type '{voice_file.suffix}'. Only {allowed_extensions} are supported."
-            }
-        
-        try:
-            with open(voice_file, "rb") as f:
-                files = {"voice_file": (voice_file.name, f, f"audio/{voice_file.suffix.lstrip('.')}")}
-                data = {}
-                if voice_name:
-                    data["voice_name"] = voice_name
-                
-                response = requests.post(
-                    f"{self.base_url}/upload_voice",
-                    files=files,
-                    data=data,
-                    timeout=30
-                )
-                response.raise_for_status()
-                return response.json()
-                
-        except requests.exceptions.RequestException as e:
-            ASCIIColors.error(f"Failed to upload voice to XTTS server: {e}")
-            return {
-                "success": False,
-                "voice_name": None,
-                "message": f"Upload failed: {str(e)}"
-            }
+            return {"success": False, "voice_name": None, "message": f"Voice file not found: {voice_path}"}
+
+        with open(voice_file, "rb") as f:
+            files = {"voice_file": (voice_file.name, f, f"audio/{voice_file.suffix.lstrip('.')}")}
+            data = {"voice_name": voice_name} if voice_name else {}
+            response = self._session.post(
+                f"{self.base_url}/upload_voice",
+                files=files,
+                data=data,
+                headers=self._get_headers(),
+                timeout=60
+            )
+            response.raise_for_status()
+            return response.json()

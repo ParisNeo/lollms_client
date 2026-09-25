@@ -360,8 +360,34 @@ def sanitize_host_paths(text: str) -> str:
     if not text:
         return text
     try:
-        cleaned = _HOST_ROOT_RE.sub("<host-path>", text)
-        cleaned = _USER_PREFIX_RE.sub("<host>/", cleaned)
+        # Match quoted Windows / POSIX paths: 'C:\Users\...' or '/home/...'
+        pattern_quoted = re.compile(
+            r"""['"](?:[a-zA-Z]:[\\/]+|/)(?:Users|home|root|var|opt|app|Documents)[^'"]*['"]""",
+            re.IGNORECASE
+        )
+        cleaned = pattern_quoted.sub("'<host-path>'", text)
+
+        # Match unquoted paths starting with drive or standard root folders
+        pattern_unquoted = re.compile(
+            r"""(?<!\w)(?:[a-zA-Z]:[\\/]+|/)(?:Users|home|root|var|opt|app|Documents)[^\s"\'<>|]*""",
+            re.IGNORECASE
+        )
+        cleaned = pattern_unquoted.sub("<host-path>", cleaned)
+
+        # Match .versions internal paths
+        pattern_versions = re.compile(
+            r"""(?<!\w)(?:[a-zA-Z]:[\\/]+|\.[\\/]|/)[^\s"\'<>|]*\.versions[\\/][^\s"\'<>|]*""",
+            re.IGNORECASE
+        )
+        cleaned = pattern_versions.sub("<host-path>", cleaned)
+
+        # Match user prefixes
+        pattern_user = re.compile(
+            r"""(?:[a-zA-Z]:[\\/]+|/)(?:Users|home)[\\/]+[^\s\\/'"]+""",
+            re.IGNORECASE
+        )
+        cleaned = pattern_user.sub("<host>", cleaned)
+
         cleaned = cleaned.replace("\\\\?\\", "")
         return cleaned
     except Exception:

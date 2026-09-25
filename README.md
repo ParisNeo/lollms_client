@@ -116,6 +116,23 @@ save_user_field(user_id, "lollms_config", json.dumps(structured))
 *   **Schema & Pydantic Enforcement**: Easily output structured data with built-in schema validation and truncation-recovery algorithms. If the model's output gets cut off, the Text Processor reconstructs the JSON tree and repairs the output.
 *   **Yes/No & Multi-Choice Helpers**: Built-in helper primitives to perform discrete evaluations, ranking, and classification.
 
+### 🦅 Project Phenix: Shared Model Server Daemons & Continuous Micro-Batching
+*   **Zero Port Drift & Multi-Worker Mutualization**: Multiple worker processes, CLI sessions, and asynchronous GUI applications connect seamlessly to background server daemons on canonical loopback ports without VRAM duplication.
+*   **Event-Driven Dynamic Micro-Batching**: Concurrent requests arriving across processes are pooled in adaptive micro-windows (e.g. 20ms) and executed in a single batched tensor pass, cutting inference latency.
+*   **Constant-Time HMAC Token Protection**: Inter-process communication is protected via cryptographically generated tokens (`0o600` permissions) validated with `hmac.compare_digest`.
+*   **Dedicated Port Matrix**:
+    - **`9632`**: TTI Image Generation (`diffusers`)
+    - **`9633`**: STT Speech Transcription (`whisper`)
+    - **`9634`**: TTS Voice Cloning (`xtts`)
+    - **`9635`**: TTS Neural Speech (`piper_tts`)
+    - **`9636`**: TTS Generative Audio (`bark`)
+    - **`9637`**: TTM Music & Songs (`diffusers` with MiniMax Music 3)
+
+### 🎵 Full Song & Text-to-Music Synthesis (`generate_song`)
+*   **MiniMax Music 3 Flagship Integration**: Complete song generation up to 5 minutes with expressive vocals and structured progression from structured lyrics (`[Verse]`, `[Chorus]`, `[Bridge]`).
+*   **First-Class Core APIs**: `client.generate_song(prompt, **kwargs)` and `client.generate_song_from_lyrics(prompt, lyrics, **kwargs)`.
+*   **Curated Model Zoo**: Instant download and serving for `MiniMaxAI/MiniMax-Music3`, `stabilityai/stable-audio-open-1.0`, and `cvssp/audioldm2-music`.
+
 ### 🖼️ Multimodal Context Isolation, Video Comprehension & Multi-Image Fusion
 *   **Native Video Comprehension**: Full multimodal video ingestion (`videos=[...]` or `{"type": "video_url", ...}`) for models like Qwen2.5-VL and GLM-5.3-Flash, supporting local video files, base64 data URLs, and remote streams.
 *   **GLM-5.3-Flash Native Multimodal Format**: Support for sequential text-first multimodal payloads (`glm_image_embedding: True`) and suppression of incompatible chat template flags.
@@ -864,6 +881,54 @@ img_bytes = lc.generate_image("A cyberpunk cat")
 # Switch to DALL-E 3 for a specific prompt
 lc.switch_tti("cloud_dalle")
 img_bytes = lc.generate_image("A hyperrealistic oil painting of a dog")
+```
+
+---
+
+### 🎵 4. Text-to-Music & Full Song Synthesis (Diffusers TTM)
+The Two-Tier profile system fully supports text-to-music and complete song generation. Connect to our shared model daemon on port `9637` to generate complete songs with vocals using **MiniMax Music 3** or instrumental audio using **Stable Audio Open**:
+
+```python
+from lollms_client import LollmsClient, LollmsBindingProfile, LollmsModelProfile
+
+client = LollmsClient(
+    ttm_binding_profiles={
+        "local_ttm": LollmsBindingProfile(
+            name="local_ttm",
+            binding_name="diffusers",
+            binding_config={"host": "127.0.0.1", "port": 9637, "auto_start_server": True}
+        )
+    },
+    ttm_model_profiles={
+        "minimax_song": LollmsModelProfile(
+            name="minimax_song",
+            binding_profile_name="local_ttm",
+            model_name="MiniMaxAI/MiniMax-Music3",
+            is_default=True
+        )
+    }
+)
+
+# Generate a complete song with vocals from lyrics
+lyrics = """
+[Verse 1]
+Walking through the city in the midnight rain
+Echoes of the melodies washing out the pain
+[Chorus]
+We sing under the neon glow
+Where the electric rivers flow
+"""
+
+prompt = "Modern pop rock anthem, uplifting chorus, powerful female vocals, electric guitar solos"
+
+song_bytes = client.generate_song_from_lyrics(
+    prompt=prompt,
+    lyrics=lyrics,
+    duration=60
+)
+
+with open("neon_river.wav", "wb") as f:
+    f.write(song_bytes)
 ```
 
 ### 4. VLM as a Tool (`vlm_query`)

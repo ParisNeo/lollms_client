@@ -3883,10 +3883,15 @@ class ChatMixin:
         if enable_memory:
             if personality and hasattr(personality, "memory_manager") and personality.memory_manager:
                 _mm = personality.memory_manager
-            else:
+            elif hasattr(self, "_get_memory_manager"):
                 _mm = self._get_memory_manager(memory_manager)
+            elif memory_manager is not None:
+                _mm = memory_manager
+            elif hasattr(self, "memory_manager"):
+                _mm = self.memory_manager
 
-        _counter = self.lollmsClient.count_tokens if self.lollmsClient else None
+        _client = getattr(self, "lollmsClient", None)
+        _counter = _client.count_tokens if _client and hasattr(_client, "count_tokens") else None
 
         # Only perform memory operations if memory is enabled AND manager exists
         if enable_memory and _mm:
@@ -3909,19 +3914,49 @@ class ChatMixin:
         # ── 2. Add or Retrieve User Message ──
         user_msg = None
         if add_user_message:
-            user_msg = self.add_message(
-                sender=kwargs.get("user_name", "user"),
-                sender_type="user",
-                content=user_message,
-                images=images,
-                **kwargs,
-            )
+            if hasattr(self, "add_message"):
+                user_msg = self.add_message(
+                    sender=kwargs.get("user_name", "user"),
+                    sender_type="user",
+                    content=user_message,
+                    images=images,
+                    **kwargs,
+                )
+            else:
+                user_msg = SimpleNamespace(
+                    id=str(uuid.uuid4()),
+                    sender=kwargs.get("user_name", "user"),
+                    sender_type="user",
+                    content=user_message,
+                    images=images or [],
+                    get_active_images=lambda: images or [],
+                    metadata={}
+                )
         else:
-            if self.active_branch_id not in self._message_index:
-                raise ValueError("Regeneration failed: active branch tip not found in index.")
-            user_msg = LollmsMessage(self, self._message_index[self.active_branch_id])
-            images = user_msg.get_active_images()
-            user_message = user_msg.content
+            if hasattr(self, "_message_index") and self.active_branch_id in self._message_index:
+                user_msg = LollmsMessage(self, self._message_index[self.active_branch_id])
+                images = user_msg.get_active_images()
+                user_message = user_msg.content
+            elif hasattr(self, "active_branch_id") and self.active_branch_id:
+                user_msg = SimpleNamespace(
+                    id=self.active_branch_id,
+                    sender="user",
+                    sender_type="user",
+                    content=user_message,
+                    images=images or [],
+                    get_active_images=lambda: images or [],
+                    metadata={}
+                )
+            else:
+                user_msg = SimpleNamespace(
+                    id=str(uuid.uuid4()),
+                    sender="user",
+                    sender_type="user",
+                    content=user_message,
+                    images=images or [],
+                    get_active_images=lambda: images or [],
+                    metadata={}
+                )
 
         # ── 3. Build Dynamic System Prompt ──
         sys_prompt = (personality.system_prompt if personality else None) or self.system_prompt or ""
@@ -4549,14 +4584,26 @@ class ChatMixin:
                 )
 
         # Initialize the single, clean database assistant message ONCE before entering the loop
-        ai_msg = self.add_message(
-            sender=personality.name if personality else self.lollmsClient.ai_name,
-            sender_type="assistant",
-            content="",
-            parent_id=user_msg.id,
-            model_name=getattr(self.lollmsClient.llm, "model_name", "unknown") if self.lollmsClient else "unknown",
-            binding_name=getattr(self.lollmsClient.llm, "binding_name", "unknown") if self.lollmsClient else "unknown"
-        )
+        if hasattr(self, "add_message"):
+            ai_msg = self.add_message(
+                sender=personality.name if personality else getattr(self.lollmsClient, "ai_name", "Assistant"),
+                sender_type="assistant",
+                content="",
+                parent_id=user_msg.id,
+                model_name=getattr(getattr(self.lollmsClient, "llm", None), "model_name", "unknown"),
+                binding_name=getattr(getattr(self.lollmsClient, "llm", None), "binding_name", "unknown")
+            )
+        else:
+            ai_msg = SimpleNamespace(
+                id="msg_ai",
+                sender="assistant",
+                sender_type="assistant",
+                content="",
+                thoughts=None,
+                parent_id=user_msg.id,
+                metadata={},
+                get_active_images=lambda: [],
+            )
 
         def _persist_round_state():
             """Commits active message content and discussion state immediately to the database."""
@@ -5042,6 +5089,46 @@ class ChatMixin:
 
             ss.flush_remaining_buffer()
 
+            # ── 🛑 EMPTY RESPONSE GUARD (0 TOKENS) ──
+            raw_text_now = ss.get_clean_text_so_far()[current_content_length:] if current_content_length < len(ss.get_clean_text_so_far()) else ss.get_clean_text_so_far()
+            if not raw_text_now.strip() and not getattr(ss, "completed_actions", []) and not ss.was_action_dispatched() and not ss.tool_trigger and not getattr(ss, "affected_artefacts", []):
+                ASCIIColors.warning(f"[{getattr(self, 'name', 'Discussion')}] Empty response generated by LLM (0 tokens). Terminating loop.")
+                _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="empty_response")
+                break
+
+            full_round_text_for_mimicry = ss.get_clean_text_so_far()
+            raw_round_text_for_mimicry = full_round_text_for_mimicry[current_content_length:] if current_content_length < len(full_round_text_for_mimicry) else full_round_text_for_mimicry
+
+            # ── 🛡️ MIMICRY INTERCEPTION & CORRECTION PROTOCOL ──
+            _mimic_match = re.search(r'\[🔒SYSTEM_[^\]]+\]', raw_round_text_for_mimicry) or re.search(r'\[🔒SYSTEM_[^\]]+\]', raw_llm_output_buffer[0])
+            if _mimic_match:
+                self._mimicry_attempt_counts[0] += 1
+                ASCIIColors.warning(f"[ChatMixin] System marker mimicry detected (attempt {self._mimicry_attempt_counts[0]}/2).")
+                ai_msg.content = re.sub(r'\[🔒SYSTEM_[^\]]+\]', '', ai_msg.content).strip()
+                clean_mimic_text = re.sub(r'\[🔒SYSTEM_[^\]]+\]', '', raw_round_text_for_mimicry).strip()
+
+                if self._mimicry_attempt_counts[0] >= 2:
+                    ASCIIColors.error(f"[ChatMixin] Repeated mimicry detected ({self._mimicry_attempt_counts[0]} attempts). Breaking loop.")
+                    _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="loop_break")
+                    _persist_round_state()
+                    break
+
+                virtual_history.append(SimpleNamespace(
+                    sender_type="assistant",
+                    content=clean_mimic_text or "[Attempted to output system marker]"
+                ))
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content=(
+                        "[SYSTEM: SYSTEM MARKER MIMICRY DETECTED. You generated a system placeholder marker like '[🔒SYSTEM_ARTIFACT_ANCHOR:...]' instead of an actual functional tag. "
+                        "System markers are read-only anchors and CANNOT create or update files. You MUST use the actual XML tag: `<artifact name=\"...\" type=\"...\">...</artifact>`. "
+                        "Do not output placeholders. Output the real tag now.]"
+                    )
+                ))
+                _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
+                _persist_round_state()
+                continue
+
             # ── 🏁 TERMINATION TAG PROTOCOL ──
             # The <done/> tag is sovereign: any round ending in <done/> terminates
             # the loop immediately. The former analysis-gate and phantom-done
@@ -5453,22 +5540,10 @@ class ChatMixin:
                     continue
                 else:
                     # ── TRUE DUPLICATE PATH ──
-                    ASCIIColors.warning("[ChatMixin] LLM emitted a duplicate artifact tag. Injecting duplicate warning.")
-                    duplicate_history_text = _scrub_for_llm_context(
-                        ss.get_clean_text_so_far()[current_content_length:]
-                    ).strip()
-                    if duplicate_history_text:
-                        virtual_history.append(SimpleNamespace(
-                            sender_type="assistant",
-                            content=duplicate_history_text
-                        ))
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="user",
-                        content="[SYSTEM: CRITICAL. You just attempted to recreate an artifact that already exists with the exact same content. This is a loop. You MUST NOT create or update this artifact again. You MUST now provide your final conversational answer to the user, explaining what you have done, and end with <done/>.]"
-                    ))
-                    _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
+                    ASCIIColors.warning("[ChatMixin] LLM emitted a duplicate artifact tag. Forcing final answer.")
+                    _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="loop_break")
                     _persist_round_state()
-                    continue
+                    break
 
             # ── 🤖 SUB-AGENT TAG ROUTING ──
             # The orchestrator emitted an <agent> tag; the spawner already ran

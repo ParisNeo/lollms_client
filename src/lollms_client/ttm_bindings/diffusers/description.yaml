@@ -1,0 +1,92 @@
+title: Diffusers Text-to-Music (TTM)
+author: ParisNeo
+version: 1.0.0
+binding_name: diffusers
+description: >
+  High-performance Text-to-Music (TTM) and Full Song generation binding using
+  Hugging Face Diffusers and ModularPipeline. Runs a shared singleton daemon on
+  loopback port 9637, supporting multi-user and multi-process concurrency with
+  dynamic queueing. Supports MiniMax Music 3, Stable Audio, and AudioLDM2.
+global_input_parameters:
+  - name: host
+    type: str
+    description: "The host address for the shared Diffusers TTM server."
+    mandatory: false
+    default: "127.0.0.1"
+  - name: port
+    type: int
+    description: "The dedicated port for the Diffusers TTM daemon."
+    mandatory: false
+    default: 9637
+  - name: auto_start_server
+    type: bool
+    description: "Automatically spawn the shared TTM server daemon in the background."
+    mandatory: false
+    default: true
+  - name: wait_for_server
+    type: bool
+    description: "Wait until the server is fully ready before completing initialization."
+    mandatory: false
+    default: true
+  - name: service_key
+    type: str
+    description: "HMAC authentication token for securing server access."
+    mandatory: false
+    default: ""
+  - name: venv_path
+    type: str
+    description: "Virtual environment directory for Diffusers TTM."
+    mandatory: false
+    default: "./venv/ttm_diffusers_venv"
+  - name: cache_dir
+    type: str
+    description: "Local storage directory for downloaded models and tokens."
+    mandatory: false
+    default: "./data/ttm_models/diffusers"
+
+model_input_parameters:
+  - name: model_name
+    type: str
+    description: "Hugging Face model ID or path to the music model."
+    mandatory: true
+    default: "MiniMaxAI/MiniMax-Music3"
+  - name: num_inference_steps
+    type: int
+    description: "Denoising steps for flow-matching / diffusion generation."
+    mandatory: false
+    default: 30
+  - name: guidance_scale
+    type: float
+    description: "Classifier-Free Guidance scale."
+    mandatory: false
+    default: 7.0
+  - name: duration
+    type: float
+    description: "Default audio duration in seconds."
+    mandatory: false
+    default: 15.0
+
+presets:
+  - id: minimax_music_3
+    title: "MiniMax Music 3 (Complete Song Generation)"
+    description: "Generates full songs up to 5 minutes with expressive vocals and structured progression from lyrics and caption."
+    parameters:
+      model_name: "MiniMaxAI/MiniMax-Music3"
+      num_inference_steps: 30
+      duration: 60.0
+
+  - id: stable_audio_open
+    title: "Stable Audio Open 1.0 (Instrumental & Sound Effects)"
+    description: "High-quality stereo music and sound generation at 44.1 kHz."
+    parameters:
+      model_name: "stabilityai/stable-audio-open-1.0"
+      num_inference_steps: 30
+      duration: 30.0
+
+  - id: audioldm2_music
+    title: "AudioLDM 2 Music"
+    description: "Latent diffusion model for diverse musical textures and melodies."
+    parameters:
+      model_name: "cvssp/audioldm2-music"
+      num_inference_steps: 25
+      duration: 15.0
