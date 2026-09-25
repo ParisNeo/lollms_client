@@ -46,6 +46,22 @@ class LollmsTTVBinding(LollmsBaseBinding):
         """
         return {"status": False, "message": "Not implemented"}
 
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        """
+        Installs a video model from a remote repository into the local models directory.
+        """
+        if hasattr(self, "pull_model") and callable(self.pull_model):
+            return self.pull_model(model_name, **kwargs)
+        return {"status": False, "message": f"install_model not implemented for {self.binding_name}"}
+
+    def pull_model(self, model_name: str, **kwargs) -> dict:
+        """
+        Downloads a video model from a remote repository into the local models directory.
+        """
+        if hasattr(self, "install_model") and callable(self.install_model):
+            return self.install_model(model_name, **kwargs)
+        return {"status": False, "message": f"pull_model not implemented for {self.binding_name}"}
+
 class LollmsTTVBindingManager:
     """Manages TTV binding discovery and instantiation."""
 

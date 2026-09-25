@@ -291,12 +291,26 @@ class DiffusersTTMBinding(LollmsTTMBinding):
         try:
             resp = self._session.get(f"{self.base_url}/list_models", headers=self._get_headers(), timeout=15)
             resp.raise_for_status()
-            return resp.json().get("models", [])
+            models = resp.json().get("models", [])
+            if models:
+                return models
         except Exception:
-            return [m["link"] for m in DEFAULT_TTM_ZOO]
+            pass
+        discovered = []
+        if self.cache_dir.exists():
+            for d in self.cache_dir.iterdir():
+                if d.is_dir() and not d.name.startswith("."):
+                    discovered.append(d.name.replace("__", "/"))
+        return list(dict.fromkeys([m["link"] for m in DEFAULT_TTM_ZOO] + discovered))
 
     def get_zoo(self) -> List[Dict[str, Any]]:
         return list(DEFAULT_TTM_ZOO)
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        """
+        Installs a music/song model from Hugging Face into the local cache directory so it becomes searchable.
+        """
+        return self.pull_model(model_name=model_name, **kwargs)
 
     def download_from_zoo(self, index: int, progress_callback: Optional[Callable[[dict], None]] = None) -> dict:
         zoo = self.get_zoo()

@@ -67,11 +67,11 @@ class TestEventModeDoctrine(unittest.TestCase):
         self.assertTrue(all(mt == MSG_TYPE.MSG_TYPE_CHUNK for mt in msg_types),
                         f"Non-chunk message types detected in PROCESSING_TAG_MODE: {set(msg_types) - {MSG_TYPE.MSG_TYPE_CHUNK}}")
         
-        # Verify thought was embedded in tags within chunk
+        # Verify thought was embedded in tags within chunk exactly once
         text_stream = "".join(e["chunk"] for e in events)
-        self.assertIn("<think>", text_stream)
+        self.assertEqual(text_stream.count("<think>"), 1, "There should be exactly one <think> tag")
+        self.assertEqual(text_stream.count("</think>"), 1, "There should be exactly one </think> tag")
         self.assertIn("Considering algorithm...", text_stream)
-        self.assertIn("</think>", text_stream)
 
     def test_full_callback_mode_emits_dedicated_events_and_clean_chunks(self):
         """In FULL_CALLBACK_MODE, thoughts use MSG_TYPE_THOUGHT_CHUNK, text chunks are clean."""

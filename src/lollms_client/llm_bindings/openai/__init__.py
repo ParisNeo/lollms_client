@@ -194,11 +194,7 @@ class _StreamThinkingHandler:
         if not self.in_dedicated_reasoning:
             self.in_dedicated_reasoning = True
             self.dedicated_reasoning_opened = True
-            open_tag = "<think>\n"
-            self.output += open_tag
-            if self.callback:
-                if self.callback(open_tag, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK) is False:
-                    return False
+            self.output += "<think>\n"
 
         self.output += reasoning
         if self.callback:
@@ -210,11 +206,7 @@ class _StreamThinkingHandler:
     def _close_dedicated_reasoning(self) -> bool:
         if self.in_dedicated_reasoning:
             self.in_dedicated_reasoning = False
-            close_tag = "\n</think>\n"
-            self.output += close_tag
-            if self.callback:
-                if self.callback(close_tag, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK) is False:
-                    return False
+            self.output += "\n</think>\n"
         return True
 
     def process_content(self, content: str) -> bool:

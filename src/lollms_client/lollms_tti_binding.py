@@ -237,7 +237,26 @@ class LollmsTTIBinding(LollmsBaseBinding):
         return []
 
     def download_from_zoo(self, index: int, progress_callback: Callable[[dict], None] = None) -> dict:
+        """
+        Downloads a model from the zoo using its index.
+        """
         return {"status": False, "message": "Not implemented"}
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        """
+        Installs a model from a remote repository (e.g. Hugging Face) into the local models directory.
+        """
+        if hasattr(self, "pull_model") and callable(self.pull_model):
+            return self.pull_model(model_name, **kwargs)
+        return {"status": False, "message": f"install_model not implemented for {self.binding_name}"}
+
+    def pull_model(self, model_name: str, **kwargs) -> dict:
+        """
+        Downloads a model from a remote repository (e.g. Hugging Face) into the local models directory.
+        """
+        if hasattr(self, "install_model") and callable(self.install_model):
+            return self.install_model(model_name, **kwargs)
+        return {"status": False, "message": f"pull_model not implemented for {self.binding_name}"}
 
     @abstractmethod
     def set_settings(self, settings: Dict[str, Any], **kwargs) -> bool:

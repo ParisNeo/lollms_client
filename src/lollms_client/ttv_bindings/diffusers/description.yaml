@@ -58,4 +58,35 @@ model_input_parameters:
     default: 7.5
     description: "CFG Scale."
 
-commands: []
+commands:
+  - name: install_model
+    title: Install Model from Hugging Face
+    description: "Downloads and installs a video model from Hugging Face into the local models directory so it becomes searchable and selectable."
+    parameters:
+      - name: model_name
+        type: str
+        description: "Hugging Face model repository ID (e.g. 'damo-vilab/text-to-video-ms-1.7b', 'ali-vilab/i2vgen-xl')."
+        mandatory: true
+    output:
+      - name: status
+        type: bool
+        description: "Status of the operation (true on success)"
+      - name: message
+        type: str
+        description: "Result message"
+
+  - name: pull_model
+    title: Pull Model from Hugging Face
+    description: "Alias for install_model. Downloads a video model from Hugging Face into the local models directory."
+    parameters:
+      - name: model_name
+        type: str
+        description: "Hugging Face model repository ID."
+        mandatory: true
+    output:
+      - name: status
+        type: bool
+        description: "Status of the operation (true on success)"
+      - name: message
+        type: str
+        description: "Result message"

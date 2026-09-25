@@ -811,31 +811,33 @@ class _AgentStreamState:
             close_idx = self._pending_buffer.find("</think>")
             if close_idx != -1:
                 thought_chunk = self._pending_buffer[:close_idx]
-                self._think_buffer += thought_chunk
-                if thought_chunk:
+                clean_chunk = re.sub(r'</?think>\n?', '', thought_chunk, flags=re.IGNORECASE)
+                self._think_buffer += clean_chunk
+                if clean_chunk:
                     if self.event_mode.has_thought_tags and not self.event_mode.has_thought_events:
-                        self._cb(f"{thought_chunk}\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                        self._cb(clean_chunk, MSG_TYPE.MSG_TYPE_CHUNK)
                     elif self.event_mode == EventMode.MIXED_MODE:
-                        self._cb(f"{thought_chunk}\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
-                        self._cb(thought_chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                        self._cb(clean_chunk, MSG_TYPE.MSG_TYPE_CHUNK)
+                        self._cb(clean_chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
                     elif self.event_mode.has_thought_events:
-                        self._cb(thought_chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
-                elif self.event_mode.has_thought_tags:
+                        self._cb(clean_chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                if self.event_mode.has_thought_tags:
                     self._cb("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
                 self._pending_buffer = self._pending_buffer[close_idx + 8:]
                 self._in_think_block = False
             else:
                 thought_chunk = self._pending_buffer
-                self._think_buffer += thought_chunk
+                clean_chunk = re.sub(r'</?think>\n?', '', thought_chunk, flags=re.IGNORECASE)
+                self._think_buffer += clean_chunk
                 self._pending_buffer = ""
-                if thought_chunk:
+                if clean_chunk:
                     if self.event_mode.has_thought_tags and not self.event_mode.has_thought_events:
-                        self._cb(thought_chunk, MSG_TYPE.MSG_TYPE_CHUNK)
+                        self._cb(clean_chunk, MSG_TYPE.MSG_TYPE_CHUNK)
                     elif self.event_mode == EventMode.MIXED_MODE:
-                        self._cb(thought_chunk, MSG_TYPE.MSG_TYPE_CHUNK)
-                        self._cb(thought_chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                        self._cb(clean_chunk, MSG_TYPE.MSG_TYPE_CHUNK)
+                        self._cb(clean_chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
                     elif self.event_mode.has_thought_events:
-                        self._cb(thought_chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                        self._cb(clean_chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
                 return True
 
         if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence and not self._in_inline_code:

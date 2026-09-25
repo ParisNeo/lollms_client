@@ -3,6 +3,8 @@
 
 All notable changes to this project will be documented in this file.
 #
+- feat(diffusers): add install_model and pull_model commands across TTI, TTM, and TTV diffusers bindings to download Hugging Face models into searchable local directories# [Unreleased]
+
 - feat(events): enforce EventMode doctrine across discussion and agent streams (PROCESSING_TAG_MODE, FULL_CALLBACK_MODE, MIXED_MODE, SILENT_MODE)# [Unreleased]
 
 - refactor(lollms_client): update pathlib imports# [Unreleased]
@@ -44,6 +46,15 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+
+## [2026-09-25 11:09]
+
+- feat(lollms-client): add install_model and pull_model commands for diffusers bindings in TTI, TTM, and TTV
+
+## [2026-09-25 13:10]
+
+- fix(events): eliminate triplication of <think> and </think> tags in PROCESSING_TAG_MODE by deduping thought stream wrappers across bindings and stream parser states
+- fix(openai, lollms): stop emitting literal <think> boundary strings as thought chunk payloads to prevent outer handler re-wrapping
 
 ## [2026-09-25 07:49]
 

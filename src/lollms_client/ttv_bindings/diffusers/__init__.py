@@ -173,34 +173,46 @@ class DiffusersTTVBinding(LollmsTTVBinding):
             ASCIIColors.error(f"Failed to communicate with TTV server at {url}: {e}")
             raise RuntimeError("Communication with the TTV server failed.") from e
 
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        """
+        Installs a video model from Hugging Face into the local models directory so it becomes searchable.
+        """
+        return self.pull_model(model_name=model_name, **kwargs)
+
+    def pull_model(self, model_name: str, **kwargs) -> dict:
+        """
+        Downloads a video model from Hugging Face into the local models directory
+        so it becomes searchable and selectable.
+        """
+        try:
+            resp = requests.post(
+                f"{self.host_address}/pull_model",
+                json={"model_name": model_name, **kwargs},
+                timeout=3600
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            return {"status": False, "message": str(e)}
+
     def generate_video(self, prompt: str, **kwargs) -> bytes:
-        """
-        Generates video data from the provided text prompt.
-        """
-        self.ensure_server_is_running(True)
-        
-        params = kwargs.copy()
-        if "model_name" not in params and self.config.get("model_name"):
-            params["model_name"] = self.config["model_name"]
-            
-        payload = {
-            "prompt": prompt,
-            "negative_prompt": params.get("negative_prompt", ""),
-            "params": params
-        }
-        
-        response = self._post_json_request("/generate_video", data=payload)
+        response = requests.post(f"{self.host_address}/generate_video", json={"prompt": prompt, **kwargs})
+        response.raise_for_status()
         return response.content
 
-    def list_models(self, **kwargs) -> List[str]:
-        """
-        Lists available TTV models.
-        """
-        self.ensure_server_is_running(True)
+    def list_models(self) -> List[str]:
         try:
-            return self._get_request("/list_models").json()
+            response = requests.get(f"{self.host_address}/models", timeout=10)
+            response.raise_for_status()
+            return response.json().get("models", [])
         except Exception:
-            return []
+            discovered = []
+            if self.models_path.exists():
+                for d in self.models_path.iterdir():
+                    if d.is_dir() and not d.name.startswith("."):
+                        discovered.append(d.name.replace("__", "/"))
+            default_m = "damo-vilab/text-to-video-ms-1.7b"
+            return list(dict.fromkeys([default_m] + discovered))
 
     def get_zoo(self) -> List[Dict[str, Any]]:
         return [

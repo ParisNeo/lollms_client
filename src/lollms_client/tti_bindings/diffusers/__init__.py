@@ -243,6 +243,26 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         except Exception as e:
             ASCIIColors.warning(f"Could not send unload request to server: {e}")
 
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        """
+        Installs a model from Hugging Face into the local models directory so it becomes searchable.
+        """
+        return self.pull_model(model_name=model_name, **kwargs)
+
+    def pull_model(self, model_name: str, **kwargs) -> dict:
+        """
+        Downloads a model from Hugging Face into the local models directory
+        so it becomes searchable and selectable.
+        """
+        self.ensure_server_is_running(True)
+        payload = {
+            "model_name": model_name,
+            "hf_id": model_name,
+            **kwargs
+        }
+        response = self._post_json_request("/pull_model", data=payload)
+        return response.json()
+
     def generate_image(self, prompt: str, negative_prompt: str = "", **kwargs) -> bytes:
         self.ensure_server_is_running(True)
         params = kwargs.copy()

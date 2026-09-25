@@ -74,6 +74,7 @@ class SafeDict(dict):
         return torch.zeros((256, 256), dtype=torch.bfloat16)
 
 class PullModelRequest(BaseModel):
+    model_name: Optional[str] = Field(default=None, description="Hugging Face repo id or model name")
     hf_id: Optional[str] = Field(default=None, description="Hugging Face repo id or URL, e.g. 'stabilityai/sdxl-turbo'")
     safetensors_url: Optional[str] = Field(default=None, description="Direct URL to a .safetensors file")
     local_name: Optional[str] = Field(default=None, description="Optional name/folder under models/")
@@ -1551,12 +1552,18 @@ async def edit_image(request: EditRequestJSON):
 
 
 @router.post("/pull_model")
-def pull_model_endpoint(payload: PullModelRequest):
-    if not payload.hf_id and not payload.safetensors_url:
-        raise HTTPException(status_code=400, detail="Provide either 'hf_id' or 'safetensors_url'.")
+def pull_model_endpoint(
+    payload: PullModelRequest,
+    authorization: Optional[str] = Header(None),
+    x_server_token: Optional[str] = Header(None)
+):
+    verify_auth_token(authorization, x_server_token)
+    hf_repo = (payload.model_name or payload.hf_id or "").strip()
+    if not hf_repo and not payload.safetensors_url:
+        raise HTTPException(status_code=400, detail="Provide either 'model_name'/'hf_id' or 'safetensors_url'.")
 
-    if payload.hf_id:
-        model_id = payload.hf_id.strip()
+    if hf_repo:
+        model_id = hf_repo
         folder_name = payload.local_name or model_id.replace("/", "__")
         dest_dir = state.models_path / folder_name
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -1594,7 +1601,12 @@ def pull_model_endpoint(payload: PullModelRequest):
                     ASCIIColors.warning(f"Could not convert directory to a standard Diffusers pipeline: {ex}. This folder might contain raw checkpoints/single-file weights.")
 
             ASCIIColors.green(f"Model '{model_id}' pulled to {dest_dir}")
-            return {"status": "ok", "model_name": folder_name}
+            return {
+                "status": "ok",
+                "success": True,
+                "model_name": folder_name,
+                "message": f"Model '{model_id}' downloaded successfully to {dest_dir}"
+            }
         except Exception as e:
             trace_exception(e)
             raise HTTPException(status_code=500, detail=f"Failed to pull HF model: {e}")

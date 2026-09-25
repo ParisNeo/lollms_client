@@ -59,8 +59,7 @@ def test_stream_thinking_handler_dedicated_reasoning():
     thought_chunks = [c for c, m in chunks_received if m == MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK]
     content_chunks = [c for c, m in chunks_received if m == MSG_TYPE.MSG_TYPE_CHUNK]
 
-    assert len(thought_chunks) >= 3
-    assert "<think>\n" in thought_chunks[0]
+    assert len(thought_chunks) >= 2
     assert any("Let me deduce" in c for c in thought_chunks)
     assert any("The final answer is 42." in c for c in content_chunks)
 

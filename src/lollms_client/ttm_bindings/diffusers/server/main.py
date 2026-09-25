@@ -89,7 +89,12 @@ class DiffusersTTMServer:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-            ASCIIColors.info(f"[TTM Server] Loading music model '{model_name}' on {device}...")
+            # Check if model exists locally in cache_dir as an installed repo folder
+            flat_name = model_name.replace("/", "__")
+            local_dir = self.models_cache_dir / flat_name
+            target_source = str(local_dir) if local_dir.exists() and any(local_dir.iterdir()) else model_name
+
+            ASCIIColors.info(f"[TTM Server] Loading music model '{model_name}' (source: {target_source}) on {device}...")
             target_dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
             # Route by model architecture
@@ -97,35 +102,35 @@ class DiffusersTTMServer:
                 try:
                     from diffusers import ModularPipeline
                     self.pipeline = ModularPipeline.from_pretrained(
-                        model_name,
+                        target_source,
                         cache_dir=str(self.models_cache_dir),
                         torch_dtype=target_dtype,
                     )
                 except Exception:
                     from diffusers import DiffusionPipeline
                     self.pipeline = DiffusionPipeline.from_pretrained(
-                        model_name,
+                        target_source,
                         cache_dir=str(self.models_cache_dir),
                         torch_dtype=target_dtype,
                     )
             elif "stable-audio" in model_name.lower():
                 from diffusers import StableAudioPipeline
                 self.pipeline = StableAudioPipeline.from_pretrained(
-                    model_name,
+                    target_source,
                     cache_dir=str(self.models_cache_dir),
                     torch_dtype=torch.float16 if device == "cuda" else torch.float32,
                 )
             elif "audioldm" in model_name.lower():
                 from diffusers import AudioLDM2Pipeline
                 self.pipeline = AudioLDM2Pipeline.from_pretrained(
-                    model_name,
+                    target_source,
                     cache_dir=str(self.models_cache_dir),
                     torch_dtype=torch.float16 if device == "cuda" else torch.float32,
                 )
             else:
                 from diffusers import DiffusionPipeline
                 self.pipeline = DiffusionPipeline.from_pretrained(
-                    model_name,
+                    target_source,
                     cache_dir=str(self.models_cache_dir),
                     torch_dtype=target_dtype,
                 )
@@ -347,15 +352,20 @@ def generate_song(
 @router.get("/list_models")
 def list_models(authorization: Optional[str] = Header(None), x_server_token: Optional[str] = Header(None)):
     verify_auth_token(authorization, x_server_token)
-    return {
-        "models": [
-            "MiniMaxAI/MiniMax-Music3",
-            "stabilityai/stable-audio-open-1.0",
-            "cvssp/audioldm2-music",
-            "cvssp/audioldm2-large",
-            "facebook/musicgen-small",
-        ]
-    }
+    preset_models = [
+        "MiniMaxAI/MiniMax-Music3",
+        "stabilityai/stable-audio-open-1.0",
+        "cvssp/audioldm2-music",
+        "cvssp/audioldm2-large",
+        "facebook/musicgen-small",
+    ]
+    discovered = []
+    if server_instance and server_instance.models_cache_dir.exists():
+        for d in server_instance.models_cache_dir.iterdir():
+            if d.is_dir() and not d.name.startswith("."):
+                discovered.append(d.name.replace("__", "/"))
+    all_models = list(dict.fromkeys(preset_models + discovered))
+    return {"models": all_models}
 
 
 @router.post("/pull_model")

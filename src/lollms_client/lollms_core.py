@@ -1453,6 +1453,25 @@ class LollmsClient():
         raise RuntimeError("LLM binding not initialized.")
 
     # --- Wrappers for other Modality Bindings ---
+    def install_model(self, model_name: str, modality: str = "tti", **kwargs) -> dict:
+        """
+        Installs/downloads a model from Hugging Face on the specified modality binding.
+
+        Args:
+            model_name (str): The Hugging Face repo ID or model name to install.
+            modality (str): Target modality ('tti', 'ttm', 'ttv', 'llm', etc.).
+        """
+        binding = getattr(self, modality, None)
+        if binding and hasattr(binding, "install_model"):
+            return binding.install_model(model_name, **kwargs)
+        elif binding and hasattr(binding, "pull_model"):
+            return binding.pull_model(model_name, **kwargs)
+        raise RuntimeError(f"Modality '{modality}' binding not initialized or does not support install_model.")
+
+    def pull_model(self, model_name: str, modality: str = "tti", **kwargs) -> dict:
+        """Alias for install_model."""
+        return self.install_model(model_name, modality=modality, **kwargs)
+
     def generate_image(self, *args, **kwargs):
         self._cooperative_unload_except("tti")
         if self.tti: return self.tti.generate_image(*args, **kwargs)

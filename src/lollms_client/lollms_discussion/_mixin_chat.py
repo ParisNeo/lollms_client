@@ -784,9 +784,14 @@ class _StreamState:
         # ── 🧠 THOUGHT STREAM TRANSITION ──
         # If we were streaming thoughts in tag mode and now receive normal content chunks, close the <think> tag
         if self._in_thought_stream:
+            # Check if this incoming chunk is closing the thought or beginning normal content
             self._in_thought_stream = False
             if self.event_mode.has_thought_tags:
                 _cb(self.callback, "\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+
+        # If incoming content already begins with <think> and thought stream was open, strip duplicate
+        if self.event_mode.has_thought_tags and self._pending_buffer.startswith("<think>") and "<think>" in self.ai_message.content[-20:]:
+            self._pending_buffer = self._pending_buffer[7:]
 
         # ── 🧹 INLINE <think> TAG HANDLING ACCORDING TO EVENT MODE ──
         # Handle models emitting inline <think>...</think> in their text stream
@@ -2756,7 +2761,11 @@ class _StreamState:
     def passthrough(self, chunk, msg_type=None, meta=None) -> bool:
         if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
             if msg_type in (MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK, MSG_TYPE.MSG_TYPE_REASONING):
-                self.ai_message.thoughts = (self.ai_message.thoughts or "") + (chunk or "")
+                clean_thought = chunk or ""
+                # Strip duplicate boundary tags if provider sent them inside the chunk
+                clean_thought = re.sub(r'</?think>\n?', '', clean_thought, flags=re.IGNORECASE)
+                if clean_thought:
+                    self.ai_message.thoughts = (self.ai_message.thoughts or "") + clean_thought
 
                 # In SILENT_MODE: thoughts are never sent to callback
                 if self.event_mode.is_silent:
@@ -2767,20 +2776,24 @@ class _StreamState:
                     if not self._in_thought_stream:
                         self._in_thought_stream = True
                         _cb(self.callback, "<think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
-                    _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_CHUNK)
+                    if clean_thought:
+                        _cb(self.callback, clean_thought, MSG_TYPE.MSG_TYPE_CHUNK)
                     return True
 
                 # In FULL_CALLBACK_MODE: emit dedicated MSG_TYPE_THOUGHT_CHUNK
                 if self.event_mode == EventMode.FULL_CALLBACK_MODE:
-                    return _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK, meta)
+                    if clean_thought:
+                        return _cb(self.callback, clean_thought, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK, meta)
+                    return True
 
                 # In MIXED_MODE: both
                 if self.event_mode == EventMode.MIXED_MODE:
                     if not self._in_thought_stream:
                         self._in_thought_stream = True
                         _cb(self.callback, "<think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
-                    _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_CHUNK)
-                    _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK, meta)
+                    if clean_thought:
+                        _cb(self.callback, clean_thought, MSG_TYPE.MSG_TYPE_CHUNK)
+                        _cb(self.callback, clean_thought, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK, meta)
                     return True
 
             # Other out-of-band events: only emit if has_callbacks is True

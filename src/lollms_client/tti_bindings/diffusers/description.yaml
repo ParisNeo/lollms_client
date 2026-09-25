@@ -101,37 +101,43 @@ model_input_parameters:
     type: "int"
     default: 1024
     description: "Image height."
+advisory:
+  - "Requires PyTorch with appropriate CUDA support for GPU acceleration."
+  - "FLUX models require substantial VRAM (12B weights). Use quantized variants or enable CPU offload on consumer GPUs."
+  - "Hugging Face access token (hf_token) is required for gated models like FLUX.1 Dev, FLUX.1 Schnell, and SD 3 Medium."
 
 commands:
-  - name: pull_model
-    title: Pull Model
-    description: "Downloads a model from Hugging Face (repo_id) or a direct URL to a safetensors file."
+  - name: install_model
+    title: Install Model from Hugging Face
+    description: "Downloads and installs a diffusion model from Hugging Face into the local models directory so it becomes searchable and selectable."
     parameters:
       - name: model_name
         type: str
-        description: "The Hugging Face repo ID (e.g. 'stabilityai/sdxl-turbo') or URL."
+        description: "Hugging Face model repository ID (e.g. 'stabilityai/sdxl-turbo', 'black-forest-labs/FLUX.1-schnell')."
         mandatory: true
-      - name: local_name
-        type: str
-        description: "Optional custom name for the model folder or file."
-        mandatory: false
     output:
       - name: status
-        type: bool
-        description: "Status of the operation (true for success, false for failure)"
-      - name: message
         type: str
-        description: "Message describing the operation result"
-    callback:
+        description: "Status of the operation ('ok' on success)"
+      - name: model_name
+        type: str
+        description: "Name of the downloaded model folder"
+
+  - name: pull_model
+    title: Pull Model from Hugging Face
+    description: "Alias for install_model. Downloads a model from Hugging Face into the local models directory."
+    parameters:
+      - name: model_name
+        type: str
+        description: "Hugging Face model repository ID."
+        mandatory: true
+    output:
       - name: status
         type: str
-        description: "Current status of the download"
-      - name: completed
-        type: int
-        description: "Bytes or percentage downloaded"
-      - name: total
-        type: int
-        description: "Total bytes or percentage"
+        description: "Status of the operation ('ok' on success)"
+      - name: model_name
+        type: str
+        description: "Name of the downloaded model folder"
 
   - name: upgrade_diffusers
     title: Upgrade Diffusers
