@@ -43,6 +43,14 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-25 06:10]
+
+- `fix(doc: version bump) => Update lollms_client/__init__.py from "1.20.1" to "1.20.2"`
+
+## [2026-09-25 05:56]
+
+- fix(lollms_client): increment version in client initialization for new patch release
+
 ## [2026-09-25 05:55]
 
 - fix(lollms_client): cleanup deprecated TTS bindings and update CHATLOG.md entry
