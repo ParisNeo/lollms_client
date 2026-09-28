@@ -91,6 +91,7 @@ _TAG_STARTS = [
     "<note", "<skill", "<scratchpad",
     "<lollms_inline",
     "<lollms_form",
+    "<effort",
     "<mem_new", "<mem_update", "<mem_tag", "<mem_load", "<mem_delete", "<mem_search", "<mem_rel",
 ]
 
@@ -228,6 +229,63 @@ _ML_WEIGHT_EXTS = {
 
 _MAX_TOOL_RESULT_CHARS = 24000
 
+
+def _extract_sources_from_tool_result(tool_name: str, tool_params: Dict[str, Any], tool_res: Any) -> List[Dict[str, Any]]:
+    """
+    Extracts web search hits and RAG document sources from tool execution outputs.
+    """
+    sources: List[Dict[str, Any]] = []
+    if not tool_res:
+        return sources
+
+    candidate_items: List[Any] = []
+
+    if isinstance(tool_res, dict):
+        if "sources" in tool_res and isinstance(tool_res["sources"], list):
+            candidate_items.extend(tool_res["sources"])
+        elif "results" in tool_res and isinstance(tool_res["results"], list):
+            candidate_items.extend(tool_res["results"])
+        elif "output" in tool_res:
+            out = tool_res["output"]
+            if isinstance(out, list):
+                candidate_items.extend(out)
+            elif isinstance(out, dict):
+                if "sources" in out and isinstance(out["sources"], list):
+                    candidate_items.extend(out["sources"])
+                elif "results" in out and isinstance(out["results"], list):
+                    candidate_items.extend(out["results"])
+            elif isinstance(out, str) and (out.strip().startswith("[") or out.strip().startswith("{")):
+                try:
+                    parsed = json.loads(out)
+                    if isinstance(parsed, list):
+                        candidate_items.extend(parsed)
+                    elif isinstance(parsed, dict) and "sources" in parsed and isinstance(parsed["sources"], list):
+                        candidate_items.extend(parsed["sources"])
+                    elif isinstance(parsed, dict) and "results" in parsed and isinstance(parsed["results"], list):
+                        candidate_items.extend(parsed["results"])
+                except Exception:
+                    pass
+    elif isinstance(tool_res, list):
+        candidate_items.extend(tool_res)
+
+    for item in candidate_items:
+        if isinstance(item, dict):
+            url = item.get("url") or item.get("link") or item.get("href") or item.get("file_path") or ""
+            title = item.get("title") or item.get("source") or item.get("name") or "Source"
+            snippet = item.get("snippet") or item.get("content") or item.get("text") or ""
+            if url or (title and title != "Source") or snippet:
+                sources.append({
+                    "title": str(title),
+                    "url": str(url),
+                    "link": str(url),
+                    "snippet": str(snippet)[:500] if snippet else "",
+                    "source": str(item.get("source") or title),
+                    "score": item.get("score") or item.get("relevance_score"),
+                    "type": "web" if ("http://" in str(url) or "https://" in str(url) or "search" in tool_name.lower()) else "rag",
+                })
+
+    return sources
+
 def _calculate_dynamic_tool_char_limit(client: Optional[Any] = None) -> int:
     """
     Calculates the maximum allowed characters for a tool result based on the LLM's context size.
@@ -260,7 +318,8 @@ def _scrub_for_llm_context(text: str) -> str:
 
 
 _INTENT_ANNOUNCEMENT_RE = re.compile(
-    r'(?im)^\s*(?:'
+    r'(?im)(?:'
+    r'^\s*(?:'
     r'i\s+will\b'
     r'|i\s+am\s+going\s+to\b'
     r'|i\'?m\s+going\s+to\b'
@@ -268,14 +327,16 @@ _INTENT_ANNOUNCEMENT_RE = re.compile(
     r'|let\s+me\b'
     r'|let\'?s\b'
     r'|allow\s+me\b'
-    r'|first[,.]?\s+(?:i\s+will|let\s+me|allow\s+me)\b'
-    r'|now\s+(?:i\s+will|let\s+me|allow\s+me)\b'
-    r'|next[,.]?\s+(?:i\s+will|let\s+me|allow\s+me)\b'
+    r'|first[,.]?\s+(?:i\s+will|let\s+me|allow\s+me|i\'?ll)\b'
+    r'|now\s+(?:i\s+will|let\s+me|allow\s+me|i\'?ll)\b'
+    r'|next[,.]?\s+(?:i\s+will|let\s+me|allow\s+me|i\'?ll)\b'
     r'|je\s+vais\b'
     r'|permettez[- ]moi\b'
     r'|laissez[- ]moi\b'
     r'|laisse[- ]moi\b'
     r'|je\s+commence\b'
+    r')'
+    r'|\b(?:i\'?ll|i\s+will|let\s+me|let\'?s)\s+(?:first\s+)?(?:copy|create|check|run|write|build|execute|delete|modify|update|search|read|inspect|list|look|verify|test|fix|find)\b'
     r')'
 )
 
@@ -571,6 +632,7 @@ class _StreamState:
         self.tool_trigger = False
         self.tool_json_data = ""
         self.affected_artefacts = []
+        self.completed_actions: List[Dict[str, Any]] = []
 
         # Sparse artefact forwarding tracker
         self.forward_artefact_chunks = forward_artefact_chunks
@@ -597,6 +659,9 @@ class _StreamState:
         # ── DONE TAG DETECTION ──
         # Set to True when the LLM emits <done/> to signal explicit task termination.
         self._done_detected = False
+
+        # ── DYNAMIC EFFORT DETECTION ──
+        self.next_reasoning_effort: Optional[str] = None
 
         # ── TOOL-LESS PERSONA REFUSAL STATE ──
         # Set when a <tool> dispatch is refused because this agent tier has
@@ -647,6 +712,8 @@ class _StreamState:
         self._tool_buffer = ""
         self._artefact_buffer = ""
         self._in_thought_stream = False
+        self._in_think_block = False
+        self._think_buffer = ""
 
     @staticmethod
     def _sanitize_unicode(text: str) -> str:
@@ -796,55 +863,55 @@ class _StreamState:
 
         # ── 🧹 INLINE <think> TAG HANDLING ACCORDING TO EVENT MODE ──
         # Handle models emitting inline <think>...</think> in their text stream
-        if "<think>" in self._pending_buffer and not self._is_accumulating_tool and not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_secondary and not self._in_code_fence:
-            if self.event_mode == EventMode.FULL_CALLBACK_MODE:
-                # In FULL_CALLBACK_MODE: strip <think> from MSG_TYPE_CHUNK, stream thoughts as MSG_TYPE_THOUGHT_CHUNK
-                idx = self._pending_buffer.find("<think>")
-                text_before = self._pending_buffer[:idx]
-                if text_before:
-                    self.ai_message.content += text_before
-                    _cb(self.callback, text_before, MSG_TYPE.MSG_TYPE_CHUNK)
+        if "<think>" in self._pending_buffer and not self._in_think_block and not self._is_accumulating_tool and not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_secondary and not self._in_code_fence:
+            idx = self._pending_buffer.find("<think>")
+            text_before = self._pending_buffer[:idx]
+            if text_before:
+                self.ai_message.content += text_before
+                _cb(self.callback, text_before, MSG_TYPE.MSG_TYPE_CHUNK)
 
-                rest = self._pending_buffer[idx + 7:]
-                close_idx = rest.find("</think>")
-                if close_idx != -1:
-                    thought_text = rest[:close_idx]
-                    self.ai_message.thoughts = (self.ai_message.thoughts or "") + thought_text
-                    _cb(self.callback, thought_text, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
-                    self._pending_buffer = rest[close_idx + 8:]
-                else:
-                    self.ai_message.thoughts = (self.ai_message.thoughts or "") + rest
-                    _cb(self.callback, rest, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
-                    self._pending_buffer = ""
-                return True
-            elif self.event_mode.is_silent:
-                # In SILENT_MODE: strip thoughts completely from chunk stream
-                idx = self._pending_buffer.find("<think>")
-                text_before = self._pending_buffer[:idx]
-                if text_before:
-                    self.ai_message.content += text_before
-                    _cb(self.callback, text_before, MSG_TYPE.MSG_TYPE_CHUNK)
-                rest = self._pending_buffer[idx + 7:]
-                close_idx = rest.find("</think>")
-                if close_idx != -1:
-                    self.ai_message.thoughts = (self.ai_message.thoughts or "") + rest[:close_idx]
-                    self._pending_buffer = rest[close_idx + 8:]
-                else:
-                    self.ai_message.thoughts = (self.ai_message.thoughts or "") + rest
-                    self._pending_buffer = ""
-                return True
-            elif self.remove_thinking_blocks:
-                idx = self._pending_buffer.find("<think>")
-                text_before = self._pending_buffer[:idx]
-                if text_before:
-                    self.ai_message.content += text_before
-                    _cb(self.callback, text_before, MSG_TYPE.MSG_TYPE_CHUNK)
-                rest = self._pending_buffer[idx + 7:]
-                close_idx = rest.find("</think>")
-                if close_idx != -1:
-                    self._pending_buffer = rest[close_idx + 8:]
-                else:
-                    self._pending_buffer = ""
+            self._pending_buffer = self._pending_buffer[idx + 7:]
+            self._in_think_block = True
+            self._think_buffer = ""
+
+            if self.event_mode.has_thought_tags and not self.event_mode.has_thought_events:
+                _cb(self.callback, "<think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+            elif self.event_mode == EventMode.MIXED_MODE:
+                _cb(self.callback, "<think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+
+        if self._in_think_block:
+            close_idx = self._pending_buffer.find("</think>")
+            if close_idx != -1:
+                thought_chunk = self._pending_buffer[:close_idx]
+                clean_chunk = re.sub(r'</?think>\n?', '', thought_chunk, flags=re.IGNORECASE)
+                self._think_buffer += clean_chunk
+                if clean_chunk:
+                    self.ai_message.thoughts = (self.ai_message.thoughts or "") + clean_chunk
+                    if self.event_mode.has_thought_tags and not self.event_mode.has_thought_events:
+                        _cb(self.callback, clean_chunk, MSG_TYPE.MSG_TYPE_CHUNK)
+                    elif self.event_mode == EventMode.MIXED_MODE:
+                        _cb(self.callback, clean_chunk, MSG_TYPE.MSG_TYPE_CHUNK)
+                        _cb(self.callback, clean_chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                    elif self.event_mode.has_thought_events:
+                        _cb(self.callback, clean_chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                if self.event_mode.has_thought_tags:
+                    _cb(self.callback, "\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                self._pending_buffer = self._pending_buffer[close_idx + 8:]
+                self._in_think_block = False
+            else:
+                thought_chunk = self._pending_buffer
+                clean_chunk = re.sub(r'</?think>\n?', '', thought_chunk, flags=re.IGNORECASE)
+                self._think_buffer += clean_chunk
+                if clean_chunk:
+                    self.ai_message.thoughts = (self.ai_message.thoughts or "") + clean_chunk
+                    if self.event_mode.has_thought_tags and not self.event_mode.has_thought_events:
+                        _cb(self.callback, clean_chunk, MSG_TYPE.MSG_TYPE_CHUNK)
+                    elif self.event_mode == EventMode.MIXED_MODE:
+                        _cb(self.callback, clean_chunk, MSG_TYPE.MSG_TYPE_CHUNK)
+                        _cb(self.callback, clean_chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                    elif self.event_mode.has_thought_events:
+                        _cb(self.callback, clean_chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                self._pending_buffer = ""
                 return True
 
         # ── 🛑 DONE TAG DETECTION (SUPPORTS ALL VARIANTS) ──
@@ -1044,6 +1111,35 @@ class _StreamState:
         last_open_think = self._pending_buffer.rfind("<think")
         last_close_think = self._pending_buffer.rfind("```")
         is_inside_thoughts = (last_open_think != -1) and (last_open_think > last_close_think)
+
+        # ── ⚡ DYNAMIC EFFORT INTERCEPTION (<effort level="..."/>) ──
+        if not is_inside_thoughts and not self._is_accumulating_tool and not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_secondary and not self._in_code_fence:
+            effort_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<effort\b([^>]*)(?:/>|>.*?</effort>)', self._pending_buffer, re.IGNORECASE | re.DOTALL)
+            if effort_match:
+                tag_start_idx = effort_match.start()
+                tag_full = effort_match.group(0)
+                attrs_part = effort_match.group(1)
+
+                lvl_match = re.search(r'(?:level|value)=["\']([^"\']+)["\']', attrs_part, re.IGNORECASE)
+                effort_level = lvl_match.group(1).lower().strip() if lvl_match else "medium"
+                self.next_reasoning_effort = effort_level
+                ASCIIColors.info(f"[StreamState] Intercepted <effort> tag: level='{effort_level}'. Will apply on next round.")
+
+                text_before = self._pending_buffer[:tag_start_idx]
+                if text_before:
+                    self.ai_message.content += text_before
+                    _cb(self.callback, text_before, MSG_TYPE.MSG_TYPE_CHUNK)
+
+                self._pending_buffer = self._pending_buffer[tag_start_idx + len(tag_full):]
+
+                if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                    effort_notice = f'\n<!-- effort:{effort_level} -->\n'
+                    self.ai_message.content += effort_notice
+                    _cb(self.callback, effort_notice, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                if self.event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                    _cb(self.callback, "", MSG_TYPE.MSG_TYPE_INFO, {"type": "effort_change", "level": effort_level})
+
+                return True
 
         # ── 🛡️ INLINE TAG QUARANTINE (CRITICAL FIX) ──
         # If a functional tag appears in the buffer but is NOT at the absolute start
@@ -2820,6 +2916,11 @@ class _StreamState:
             if self.event_mode.has_thought_tags:
                 _cb(self.callback, "\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
 
+        if self._in_think_block:
+            self._in_think_block = False
+            self._think_buffer = ""
+            self._pending_buffer = ""
+
         # ── Handle unclosed code fence ──
         # If we're still in code fence mode at flush time, the fence was never closed.
         # Re-process the hold buffer through tag detection to intercept any functional tags
@@ -2953,7 +3054,7 @@ class _StreamState:
                 self._pending_buffer = complete_tag_re.sub('', self._pending_buffer)
 
             self._pending_buffer = re.sub(
-                r'(?ms)^[ \t]*<(?:artifact|artefact|skill|note|scratchpad|lollms_inline|lollms_form|generate_image|edit_image|tool)\b[^>]*$',
+                r'(?ms)^[ \t]*<(?:artifact|artefact|skill|note|scratchpad|lollms_inline|lollms_form|generate_image|edit_image|tool|effort)\b[^>]*$',
                 '',
                 self._pending_buffer,
                 flags=re.IGNORECASE,
@@ -3171,6 +3272,58 @@ class ChatMixin:
             workspace_dir=Path(ws_path) if ws_path else None,
             extra_data=extra_data,
             debug_mode=bool(getattr(self, "_debug_mode", False)),
+        )
+
+    def has_resumable_turn(self, branch_tip_id: Optional[str] = None) -> bool:
+        """Checks if the active branch ends with an incomplete or cancelled turn that can be resumed."""
+        target_tip = branch_tip_id or getattr(self, "active_branch_id", None)
+        if not target_tip:
+            return False
+        msg = self.get_message(target_tip)
+        if not msg or getattr(msg, "sender_type", "") != "assistant":
+            return False
+        meta = getattr(msg, "metadata", {}) or {}
+        return meta.get("turn_status") in ("in_progress", "cancelled") or bool(meta.get("virtual_history"))
+
+    def resume_turn(
+        self,
+        ai_message_id: Optional[str] = None,
+        streaming_callback: Optional[Callable] = None,
+        **kwargs: Any
+    ) -> Dict[str, Any]:
+        """
+        Resumes an incomplete, paused, or cancelled turn from its last round checkpoint.
+        Seamlessly restores virtual history and re-engages the agentic loop.
+        """
+        target_id = ai_message_id or getattr(self, "active_branch_id", None)
+        if not target_id:
+            raise ValueError("No active message to resume.")
+
+        ai_msg = self.get_message(target_id)
+        if not ai_msg or getattr(ai_msg, "sender_type", "") != "assistant":
+            raise ValueError(f"Message '{target_id}' is not an assistant message.")
+
+        meta = getattr(ai_msg, "metadata", {}) or {}
+        persisted_vh = meta.get("virtual_history", [])
+        parent_user_msg = self.get_message(ai_msg.parent_id) if ai_msg.parent_id else None
+        original_prompt = parent_user_msg.content if parent_user_msg else ""
+
+        # Migration fallback for older discussions without turn_status
+        if not persisted_vh and ai_msg.content:
+            persisted_vh = [{"sender_type": "assistant", "content": ai_msg.content}]
+
+        ASCIIColors.info(
+            f"[ChatMixin] 🔄 Resuming turn for message '{target_id}' "
+            f"({len(persisted_vh)} virtual history steps restored)."
+        )
+
+        return self.chat(
+            user_message=original_prompt,
+            branch_tip_id=ai_msg.parent_id,
+            add_user_message=False,
+            streaming_callback=streaming_callback,
+            resume_virtual_history=persisted_vh,
+            **kwargs
         )
 
     def submit_form_response(self, form_id: str, answers: Dict[str, Any]) -> bool:
@@ -3655,6 +3808,34 @@ class ChatMixin:
             active_tools.update(personality.build_rag_tools())
 
         if personality and hasattr(personality, "skills_manager") and personality.skills_manager and not _persona_active:
+            sm = personality.skills_manager
+            # Wire LCP dynamic tool loading for skills
+            if lcp_binding:
+                def _disc_check_tool(t_name: str) -> bool:
+                    clean = t_name.lower().strip()
+                    if clean in active_tools:
+                        return True
+                    return lcp_binding.is_tool_available(clean) if hasattr(lcp_binding, "is_tool_available") else False
+
+                def _disc_load_tool(t_name: str) -> Optional[Dict[str, Any]]:
+                    clean = t_name.strip()
+                    if clean in active_tools:
+                        return active_tools[clean]
+                    if hasattr(lcp_binding, "load_tool_by_name"):
+                        raw_def = lcp_binding.load_tool_by_name(clean)
+                        if raw_def:
+                            specs = lcp_binding.to_chat_tool_specs(
+                                discussion_instance=self,
+                                lollms_client_instance=self.lollmsClient
+                            )
+                            if clean in specs:
+                                active_tools[clean] = specs[clean]
+                                return specs[clean]
+                    return None
+
+                sm.tool_availability_checker = _disc_check_tool
+                sm.tool_loader = _disc_load_tool
+
             active_tools.update(personality.skills_manager.build_skill_tools())
 
         if isinstance(tools, dict):
@@ -3689,7 +3870,6 @@ class ChatMixin:
                 lcp_binding = LCPBinding(tools_folders=[])
                 if not hasattr(self.lollmsClient, "tools") or self.lollmsClient.tools is None:
                     self.lollmsClient.tools = lcp_binding
-                ASCIIColors.success("[ChatMixin] Auto-provisioned shared LCPBinding for context-aware tools.")
             except Exception as ex:
                 trace_exception(ex)
                 lcp_binding = None
@@ -3713,20 +3893,18 @@ class ChatMixin:
                 if auto_approve_python is not None:
                     py_cfg["auto_approve"] = auto_approve_python
 
-            if enable_data_tools and has_data_files:
-                lcp_binding.mount_tool_library("semantic_data_engineer")
-                ASCIIColors.info("[ChatMixin] Mounted 'semantic_data_engineer' (data files detected).")
-
-            if enable_data_tools and has_doc_files:
-                lcp_binding.mount_tool_library("as_is_document_tools")
-                lcp_binding.mount_tool_library_if_absent("document_editor")
-                ASCIIColors.info("[ChatMixin] Mounted 'document_editor' and 'as_is_document_tools' (document files detected).")
-
+            # ── 1. MOUNT CORE EXECUTION & WORKSPACE TOOLS STRICT MINIMUM ──
+            lcp_binding.mount_tool_library_if_absent("workspace_tools")
             if enable_code_execution:
                 lcp_binding.mount_tool_library_if_absent("execute_python")
-                ASCIIColors.info("[ChatMixin] Mounted 'execute_python' (inline + file execution enabled).")
-                lcp_binding.mount_tool_library_if_absent("inspect_text")
-                ASCIIColors.info("[ChatMixin] Mounted 'inspect_text' (targeted log inspection enabled).")
+
+            # ── 2. CONTEXTUAL MOUNTING: ONLY WHEN MATCHING FILES EXIST ──
+            if enable_data_tools and has_data_files:
+                lcp_binding.mount_tool_library_if_absent("semantic_data_engineer")
+
+            if enable_data_tools and has_doc_files:
+                lcp_binding.mount_tool_library_if_absent("as_is_document_tools")
+                lcp_binding.mount_tool_library_if_absent("document_editor")
 
             try:
                 lcp_tools = lcp_binding.to_chat_tool_specs(
@@ -3734,17 +3912,20 @@ class ChatMixin:
                     lollms_client_instance=self.lollmsClient,
                 )
                 for t_name, t_spec in lcp_tools.items():
-                    if t_name == "tool_execute_python_data_query" and enable_data_tools and has_data_files:
+                    # Core minimum search/grep/workspace tools
+                    if t_name in ("tool_find_files", "tool_grep_files", "tool_list_files", "tool_read_file", "tool_write_file"):
                         active_tools[t_name] = t_spec
+                    # Core execution
                     elif t_name in ("tool_execute_python_code", "tool_execute_python_file") and enable_code_execution:
                         active_tools[t_name] = t_spec
-                    elif t_name in ("tool_read_lines", "tool_read_chars", "tool_grep_file") and enable_code_execution:
+                    # Contextual data query
+                    elif t_name in ("tool_execute_python_data_query", "tool_get_table_schema", "tool_query_database_sql") and enable_data_tools and has_data_files:
                         active_tools[t_name] = t_spec
-                    elif t_name.startswith(("tool_inspect_document", "tool_read_document_content", "tool_grep_document", "tool_modify_docx", "tool_modify_excel", "tool_edit_document_text", "tool_annotate_document", "tool_modify_pdf_annotation", "tool_modify_pptx_slide")) and enable_data_tools and has_doc_files:
+                    # Contextual document annotation
+                    elif t_name in ("tool_inspect_document", "tool_read_document_content", "tool_annotate_document", "tool_edit_document_text") and enable_data_tools and has_doc_files:
                         active_tools[t_name] = t_spec
             except Exception as ex:
                 trace_exception(ex)
-                ASCIIColors.error(f"[ChatMixin] Failed to extract tool specs from LCP binding: {ex}")
 
             for td in lcp_binding.discovered_tools:
                 t_name = td.get("name", "")
@@ -3818,6 +3999,8 @@ class ChatMixin:
         enable_auto_dream:            bool = True,
         enable_deep_memory_pulling:   bool = True,
         prehydrate_rag:               bool = True,
+        web_search:                   bool = False,
+        internet_search:              bool = False,
         max_nb_rounds:                Optional[int] = None,
         max_reasoning_steps:          Optional[int] = None,
         enable_in_message_status:     bool = False,
@@ -3844,6 +4027,8 @@ class ChatMixin:
         shell_autonomy_level:         Optional[str] = "safe",
         python_autonomy_level:        Optional[str] = "safe",
         confirm_handler:              Optional[Callable] = None,
+        dynamic_effort:               bool = False,
+        enforce_end_tag:              bool = False,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -3918,6 +4103,13 @@ class ChatMixin:
         resolved_max_rounds = max_nb_rounds if max_nb_rounds is not None else max_reasoning_steps
         if resolved_max_rounds is None:
             resolved_max_rounds = 20
+
+        is_infinite_rounds = resolved_max_rounds <= 0 or resolved_max_rounds == float("inf")
+        if is_infinite_rounds:
+            ASCIIColors.warning(
+                "[ChatMixin] ⚠️ WARNING: Infinite reasoning rounds enabled (max_rounds <= 0). "
+                "The loop will continue running until <done/> is emitted or cancelled by user."
+            )
 
         callback = streaming_callback
 
@@ -4136,6 +4328,10 @@ class ChatMixin:
         if enable_memory and _mm:
             extra_instructions += _mm.build_system_instructions()
 
+        # Dynamic Reasoning Effort Instructions
+        if dynamic_effort:
+            extra_instructions += self._build_dynamic_effort_instructions()
+
         # Image Generation Instructions (only if image generation/editing is enabled AND TTI capability exists)
         _has_tti = getattr(self.lollmsClient, 'tti', None) is not None or bool(getattr(self.lollmsClient, 'tti_model_profiles_registry', None))
         if (enable_image_generation or enable_image_editing) and _has_tti and not orchestrator_persona:
@@ -4144,33 +4340,99 @@ class ChatMixin:
         # Combine core sections (feature rules will be added later after active_tools is built)
         full_system_prompt = sys_prompt + "\n" + core_rules + "\n" + extra_instructions
 
-        # ── 4. RAG Ingestion & Pre-Hydration ──
+        # ── 4. RAG & Web Search Pre-Hydration ──
+        collected_sources: List[Dict[str, Any]] = []
         rag_context = ""
-        if prehydrate_rag and personality and hasattr(personality, "has_data") and personality.has_data:
-            try:
-                rag_res = personality.query_data(user_message)
-                if rag_res and rag_res.get("success") and rag_res.get("sources"):
-                    sources_text = []
-                    _MAX_RAG_CHARS = 50000
-                    current_rag_chars = 0
-                    for src in rag_res.get("sources", []):
-                        title = src.get("title") or src.get("source") or "Document"
-                        ds_label = f" [{src.get('datasource_name')}]" if src.get('datasource_name') else ""
-                        score_val = src.get("score")
-                        score_str = f" (Score: {score_val:.2f})" if isinstance(score_val, (int, float)) and score_val <= 1.0 else (f" (Score: {score_val})" if score_val is not None else "")
-                        chunk_text = f"--- Source [{title}]{ds_label}{score_str} ---\n{src.get('content')}"
-                        if current_rag_chars + len(chunk_text) > _MAX_RAG_CHARS:
-                            sources_text.append(f"... [Remaining RAG context truncated at {_MAX_RAG_CHARS} chars to prevent context bloat]")
-                            break
-                        sources_text.append(chunk_text)
-                        current_rag_chars += len(chunk_text)
-                    if sources_text:
-                        rag_context = "\n=== RETRIEVED RAG CONTEXT ===\n" + "\n\n".join(sources_text) + "\n=== END RAG CONTEXT ===\n"
-            except Exception as e:
-                trace_exception(e)
+
+        if prehydrate_rag:
+            rag_sources_raw: List[Dict[str, Any]] = []
+            if personality and hasattr(personality, "has_data") and personality.has_data:
+                try:
+                    rag_res = personality.query_data(user_message)
+                    if rag_res and rag_res.get("success") and rag_res.get("sources"):
+                        rag_sources_raw = rag_res.get("sources", [])
+                except Exception as e:
+                    trace_exception(e)
+            elif self.lollmsClient and (getattr(self.lollmsClient, "rag", None) is not None or bool(getattr(self.lollmsClient, "rag_model_profiles_registry", None))):
+                try:
+                    client_rag_res = self.lollmsClient.query_rag(user_message)
+                    if client_rag_res:
+                        rag_sources_raw = client_rag_res if isinstance(client_rag_res, list) else client_rag_res.get("sources", [])
+                except Exception as e:
+                    trace_exception(e)
+
+            if rag_sources_raw:
+                sources_text = []
+                _MAX_RAG_CHARS = 50000
+                current_rag_chars = 0
+                for src in rag_sources_raw:
+                    title = src.get("title") or src.get("source") or "Document"
+                    ds_label = f" [{src.get('datasource_name')}]" if src.get('datasource_name') else ""
+                    score_val = src.get("score")
+                    score_str = f" (Score: {score_val:.2f})" if isinstance(score_val, (int, float)) and score_val <= 1.0 else (f" (Score: {score_val})" if score_val is not None else "")
+
+                    src_idx = len(collected_sources) + 1
+                    raw_snippet = src.get("snippet") or (src.get("content", "")[:300] if src.get("content") else "")
+                    src_entry = {
+                        "id": src_idx,
+                        "index": src_idx,
+                        "title": title,
+                        "source": src.get("source") or title,
+                        "url": src.get("url") or src.get("link") or src.get("file_path") or "",
+                        "snippet": str(raw_snippet)[:500],
+                        "score": score_val,
+                        "type": "rag",
+                        "datasource_name": src.get("datasource_name", "")
+                    }
+                    collected_sources.append(src_entry)
+
+                    chunk_text = f"--- Source [{src_idx}] {title}{ds_label}{score_str} ---\n{src.get('content')}"
+                    if current_rag_chars + len(chunk_text) > _MAX_RAG_CHARS:
+                        sources_text.append(f"... [Remaining RAG context truncated at {_MAX_RAG_CHARS} chars to prevent context bloat]")
+                        break
+                    sources_text.append(chunk_text)
+                    current_rag_chars += len(chunk_text)
+                if sources_text:
+                    rag_context = "\n=== RETRIEVED RAG CONTEXT ===\n" + "\n\n".join(sources_text) + "\n=== END RAG CONTEXT ===\n"
 
         if rag_context:
             full_system_prompt += "\n" + rag_context
+
+        # ── Web Search Pre-Hydration ──
+        enable_web_search = bool(
+            web_search
+            or internet_search
+            or kwargs.get("web_search")
+            or kwargs.get("internet_search")
+            or kwargs.get("enable_web_search")
+            or kwargs.get("enable_internet_search")
+        )
+        if enable_web_search and hasattr(self, "internet_search"):
+            try:
+                web_hits = self.internet_search(user_message, nb_results=5)
+                if web_hits:
+                    web_lines = [f"=== RETRIEVED WEB SEARCH CONTEXT ==="]
+                    for h in web_hits:
+                        w_idx = len(collected_sources) + 1
+                        w_url = h.get("url") or h.get("link") or ""
+                        w_snippet = h.get("snippet") or (h.get("content", "")[:300] if h.get("content") else "")
+                        w_entry = {
+                            "id": w_idx,
+                            "index": w_idx,
+                            "title": h.get("title", "Web Page"),
+                            "source": h.get("source") or w_url,
+                            "url": w_url,
+                            "link": w_url,
+                            "snippet": str(w_snippet)[:500],
+                            "type": "web"
+                        }
+                        collected_sources.append(w_entry)
+                        web_lines.append(f"--- Source [{w_idx}] {w_entry['title']} ({w_url}) ---")
+                        web_lines.append(f"{w_entry['snippet']}\n")
+                    web_lines.append("=== END WEB SEARCH CONTEXT ===\n")
+                    full_system_prompt += "\n" + "\n".join(web_lines)
+            except Exception as web_ex:
+                ASCIIColors.warning(f"[ChatMixin] Web search pre-hydration failed: {web_ex}")
 
         if personality and hasattr(personality, "build_rag_system_block"):
             rag_sys_block = personality.build_rag_system_block()
@@ -4425,15 +4687,25 @@ class ChatMixin:
                 "=== END SUB-AGENT DELEGATION ===\n"
             )
 
-        # Thinking & Reasoning Constraint (only if agentic features are enabled)
+        # Thinking & Reasoning Directive
         if (enable_artefacts or active_tools or enable_memory) and not orchestrator_persona:
-            feature_rules += (
-                "\n=== THINKING & REASONING CONSTRAINT ===\n"
-                "If you decide to output a thought process enclosed in  tags, "
-                "you MUST output all functional XML tags (such as <artifact>, <tool>, or <mem_new>) "
-                "on a NEW LINE strictly AFTER the closing  warn_tag tag. "
-                "NEVER place functional tags inside the  warn_tag reasoning block.\n"
-            )
+            is_thinking_off = (think is False and reasoning_effort is None) or reasoning_effort in ("none", "off", "disabled", "false", "0")
+            if is_thinking_off:
+                feature_rules += (
+                    "\n=== THINKING / REASONING MODE: DISABLED ===\n"
+                    "Reasoning and chain-of-thought is strictly DEACTIVATED.\n"
+                    "Do NOT output any <think> tags, internal monologue, planning, or reasoning traces.\n"
+                    "Answer directly and immediately with the final response.\n"
+                    "=== END THINKING MODE ===\n"
+                )
+            else:
+                feature_rules += (
+                    "\n=== THINKING & REASONING CONSTRAINT ===\n"
+                    "If you decide to output a thought process enclosed in <think> tags, "
+                    "you MUST output all functional XML tags (such as <artifact>, <tool>, or <mem_new>) "
+                    "on a NEW LINE strictly AFTER the closing </think> tag. "
+                    "NEVER place functional tags inside the reasoning block.\n"
+                )
 
         # Anti-Mimicry Protocol (only if agentic features are enabled)
         if (enable_artefacts or active_tools) and not orchestrator_persona:
@@ -4686,6 +4958,12 @@ class ChatMixin:
                     f"{len(virtual_history)} message(s) remain verbatim in window."
                 )
 
+        # Initialize loop-state flags early so nested closures can safely access them
+        was_cancelled = False
+        failed_tools_pending_fix = False
+        ss = None
+        raw_llm_output_buffer = [""]
+
         # Initialize the single, clean database assistant message ONCE before entering the loop
         if hasattr(self, "add_message"):
             ai_msg = self.add_message(
@@ -4708,14 +4986,29 @@ class ChatMixin:
                 get_active_images=lambda: [],
             )
 
-        def _persist_round_state():
-            """Commits active message content and discussion state immediately to the database."""
-            if self._is_db_backed:
-                try:
+        def _persist_round_state(status_override: Optional[str] = None):
+            """Commits active message content, turn checkpoint metadata, and discussion state immediately."""
+            try:
+                if hasattr(ai_msg, "metadata"):
+                    vh_serializable = [
+                        {"sender_type": getattr(vh, "sender_type", "user"), "content": getattr(vh, "content", "")}
+                        for vh in virtual_history
+                    ]
+                    meta = dict(ai_msg.metadata or {})
+                    meta["turn_status"] = status_override or ("cancelled" if was_cancelled else "in_progress")
+                    meta["current_round"] = round_count
+                    meta["virtual_history"] = vh_serializable
+                    meta["tool_calls"] = list(tool_calls_this_turn)
+                    meta["artefacts_modified"] = [a.get("title") for a in (ss.affected_artefacts if ss else [])]
+                    meta["last_checkpoint_at"] = datetime.utcnow().isoformat()
+                    meta["sources"] = list(collected_sources)
+                    ai_msg.metadata = meta
+
+                if getattr(self, "_is_db_backed", False):
                     self.touch()
                     self.commit()
-                except Exception as commit_err:
-                    ASCIIColors.warning(f"[ChatMixin] Mid-turn round commit warning: {commit_err}")
+            except Exception as commit_err:
+                ASCIIColors.warning(f"[ChatMixin] Mid-turn round commit warning: {commit_err}")
 
         # Commit initial user message and assistant message anchor immediately so message is never lost
         _persist_round_state()
@@ -4726,17 +5019,6 @@ class ChatMixin:
 
         if callback:
             callback(ai_msg.id, MSG_TYPE.MSG_TYPE_NEW_MESSAGE, {"message_id": ai_msg.id})
-
-        # Track if we exited due to cancellation
-        was_cancelled = False
-        failed_tools_pending_fix = False
-
-        raw_llm_output_buffer = [""]
-        raw_llm_output_buffer = [""]
-
-        # CRITICAL FIX: Initialize ss to None to prevent UnboundLocalError
-        # if the loop breaks before _StreamState is instantiated (e.g., pre-turn cancellation).
-        ss = None
 
         # Initialize mimicry attempt counter exactly once at the start of the turn
         # CRITICAL FIX: Use a list to ensure safe mutation across reasoning rounds.
@@ -4762,23 +5044,34 @@ class ChatMixin:
         object.__setattr__(self, "_bump_environment_epoch", _bump_environment_epoch)
 
         round_event_state = {"last_status": None}
+        if dynamic_effort:
+            if reasoning_effort:
+                active_reasoning_effort = str(reasoning_effort).strip().lower()
+                active_think_flag = active_reasoning_effort not in ("none", "off", "0", "disabled", "false")
+            else:
+                active_reasoning_effort = "none"
+                active_think_flag = False
+        else:
+            active_reasoning_effort = reasoning_effort
+            active_think_flag = think
 
         def _emit_round_event(msg_type: MSG_TYPE, status: Optional[str] = None, round_id: Optional[int] = None) -> None:
             effective_round_id = round_id if round_id is not None else round_count
+            display_max = "∞" if is_infinite_rounds else resolved_max_rounds
             if msg_type == MSG_TYPE.MSG_TYPE_ROUND_START:
                 if event_mode.has_tags:
                     round_tag = f'<round id="{effective_round_id}"/>\n'
                     ai_msg.content += round_tag
                     _cb(callback, round_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True, "round": effective_round_id})
                 if event_mode.has_callbacks and not event_mode.is_silent:
-                    _cb(callback, "", msg_type, {"round_id": effective_round_id, "max_rounds": resolved_max_rounds})
+                    _cb(callback, "", msg_type, {"round_id": effective_round_id, "max_rounds": display_max})
                 return
             if not event_mode.has_callbacks or event_mode.is_silent:
                 return
             round_event_state["last_status"] = status or "action"
             _cb(callback, "", msg_type, {"round_id": effective_round_id, "status": status or "action"})
 
-        while round_count < resolved_max_rounds:
+        while is_infinite_rounds or round_count < resolved_max_rounds:
             round_count += 1
 
             # Check cancellation at the start of each reasoning round
@@ -4979,13 +5272,45 @@ class ChatMixin:
                 return True
 
             # Sanitize kwargs to prevent duplicate argument passing
-            gen_kwargs = {k: v for k, v in kwargs.items() if k not in ("streaming_callback", "temperature", "stream", "think", "reasoning_effort", "reasoning_summary")}
-            if think is not None:
-                gen_kwargs["think"] = think
-            if reasoning_effort is not None:
-                gen_kwargs["reasoning_effort"] = reasoning_effort
-            if reasoning_summary is not None:
-                gen_kwargs["reasoning_summary"] = reasoning_summary
+            gen_kwargs = {k: v for k, v in kwargs.items() if k not in ("streaming_callback", "temperature", "stream", "think", "reasoning_effort", "reasoning_summary", "web_search", "internet_search", "enable_web_search", "enable_internet_search")}
+            is_thinking_off = (think is False and reasoning_effort is None) or reasoning_effort in ("none", "off", "disabled", "false", "0")
+            if is_thinking_off:
+                gen_kwargs["think"] = False
+                gen_kwargs["reasoning_effort"] = None
+                m_name = getattr(getattr(self.lollmsClient, "llm", None), "model_name", "") or ""
+                extra_b = gen_kwargs.setdefault("extra_body", {})
+                if isinstance(extra_b, dict):
+                    extra_b.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
+                    extra_b.setdefault("chat_template_kwargs", {})["thinking"] = False
+                    if "glm" in m_name.lower():
+                        extra_b["thinking"] = {"type": "disabled"}
+                    else:
+                        extra_b["thinking"] = False
+            else:
+                if think is not None:
+                    gen_kwargs["think"] = think
+                if reasoning_effort is not None:
+                    gen_kwargs["reasoning_effort"] = reasoning_effort
+                if reasoning_summary is not None:
+                    gen_kwargs["reasoning_summary"] = reasoning_summary
+
+            ASCIIColors.info(
+                f"[ChatMixin.chat] Round {round_count}: think={gen_kwargs.get('think')}, "
+                f"reasoning_effort={gen_kwargs.get('reasoning_effort')}"
+            )
+
+            if dynamic_effort:
+                if round_count == 1:
+                    if reasoning_effort:
+                        current_effort_val = str(reasoning_effort).strip().lower()
+                        gen_kwargs["reasoning_effort"] = current_effort_val
+                        gen_kwargs["think"] = current_effort_val not in ("none", "off", "0", "disabled", "false")
+                    else:
+                        gen_kwargs["reasoning_effort"] = "none"
+                        gen_kwargs["think"] = False
+                else:
+                    gen_kwargs["reasoning_effort"] = active_reasoning_effort
+                    gen_kwargs["think"] = active_think_flag
 
             # ── 📊 CONTEXT FILL TELEMETRY & AUTO-COMPACTION GATE (CACHED O(1) LOOKUP) ──
             try:
@@ -5198,14 +5523,15 @@ class ChatMixin:
             ss.flush_remaining_buffer()
 
             # ── 🛑 EMPTY RESPONSE GUARD (0 TOKENS) ──
-            raw_text_now = ss.get_clean_text_so_far()[current_content_length:] if current_content_length < len(ss.get_clean_text_so_far()) else ss.get_clean_text_so_far()
-            if not raw_text_now.strip() and not getattr(ss, "completed_actions", []) and not ss.was_action_dispatched() and not ss.tool_trigger and not getattr(ss, "affected_artefacts", []):
+            raw_round_delta = ss.get_clean_text_so_far()[current_content_length:]
+            raw_text_now = re.sub(r'<round\s+id=["\'][^"\']*["\']\s*/?>\n?', '', raw_round_delta, flags=re.IGNORECASE).strip()
+            if not raw_text_now and not getattr(ss, "completed_actions", []) and not ss.was_action_dispatched() and not ss.tool_trigger and not getattr(ss, "affected_artefacts", []):
                 ASCIIColors.warning(f"[{getattr(self, 'name', 'Discussion')}] Empty response generated by LLM (0 tokens). Terminating loop.")
                 _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="empty_response")
                 break
 
             full_round_text_for_mimicry = ss.get_clean_text_so_far()
-            raw_round_text_for_mimicry = full_round_text_for_mimicry[current_content_length:] if current_content_length < len(full_round_text_for_mimicry) else full_round_text_for_mimicry
+            raw_round_text_for_mimicry = full_round_text_for_mimicry[current_content_length:]
 
             # ── 🛡️ MIMICRY INTERCEPTION & CORRECTION PROTOCOL ──
             _mimic_match = re.search(r'\[🔒SYSTEM_[^\]]+\]', raw_round_text_for_mimicry) or re.search(r'\[🔒SYSTEM_[^\]]+\]', raw_llm_output_buffer[0])
@@ -5249,6 +5575,18 @@ class ChatMixin:
                 _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="done")
                 break
 
+            # ── ⚡ UPDATE DYNAMIC EFFORT FOR NEXT ROUND ──
+            if dynamic_effort and getattr(ss, "next_reasoning_effort", None) is not None:
+                new_effort_level = ss.next_reasoning_effort.lower().strip()
+                if new_effort_level in ("none", "off", "disabled", "false", "0"):
+                    active_reasoning_effort = "none"
+                    active_think_flag = False
+                else:
+                    active_reasoning_effort = new_effort_level
+                    active_think_flag = True
+                ASCIIColors.info(f"[ChatMixin] Dynamic reasoning effort updated to '{active_reasoning_effort}' for upcoming round.")
+                ss.next_reasoning_effort = None
+
             # ── 🛑 TOOL-LESS PERSONA REFUSAL HANDLING ──
             # A tool-less tier (orchestrator persona) attempted a <tool> call.
             # The dispatcher already refused execution; convert the refusal into
@@ -5287,7 +5625,7 @@ class ChatMixin:
                 # the <mem_search> tag). We MUST capture this response and add it to virtual_history
                 # BEFORE processing the search, so the LLM can see its own answer in the next round.
                 full_round_text = ss.get_clean_text_so_far()
-                raw_round_text_delta = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
+                raw_round_text_delta = full_round_text[current_content_length:]
 
                 # Sanitize the response to remove processing blocks and functional tags
                 clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text_delta, flags=re.DOTALL | re.IGNORECASE)
@@ -5644,13 +5982,13 @@ class ChatMixin:
                         sender_type="user",
                         content=correction_body
                     ))
-                    _persist_round_state()
+                    _persist_round_state(status_override="in_progress")
                     continue
                 else:
                     # ── TRUE DUPLICATE PATH ──
                     ASCIIColors.warning("[ChatMixin] LLM emitted a duplicate artifact tag. Forcing final answer.")
                     _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="loop_break")
-                    _persist_round_state()
+                    _persist_round_state(status_override="completed")
                     break
 
             # ── 🤖 SUB-AGENT TAG ROUTING ──
@@ -5741,7 +6079,7 @@ class ChatMixin:
                 _bump_environment_epoch()
 
                 full_round_text = ss.get_clean_text_so_far()
-                raw_delegate_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
+                raw_delegate_text = full_round_text[current_content_length:]
                 delegate_gist = _scrub_for_llm_context(raw_delegate_text).strip()
                 if delegate_gist:
                     virtual_history.append(SimpleNamespace(
@@ -6558,6 +6896,21 @@ class ChatMixin:
                             finally:
                                 os.chdir(old_cwd)
 
+                        # Extract any sources produced by tool execution (e.g. search / RAG tools)
+                        if tool_res is not None:
+                            tool_sources = _extract_sources_from_tool_result(tool_name, tool_params, tool_res)
+                            for t_src in tool_sources:
+                                already_known = any(
+                                    (t_src.get("url") and t_src["url"] == cs.get("url")) or
+                                    (t_src.get("title") and t_src["title"] == cs.get("title") and t_src.get("snippet") == cs.get("snippet"))
+                                    for cs in collected_sources
+                                )
+                                if not already_known:
+                                    n_idx = len(collected_sources) + 1
+                                    t_src["id"] = n_idx
+                                    t_src["index"] = n_idx
+                                    collected_sources.append(t_src)
+
                         if tool_res is None:
                             tool_res = {
                                 "success": False,
@@ -6983,10 +7336,12 @@ class ChatMixin:
                     continue
 
                 # ── 🛑 SOVEREIGN <done/> TERMINATION CONTRACT ──
-                # A text-only round is NOT a terminal state. Per the single-
-                # signal doctrine, the loop runs until the model explicitly
-                # emits <done/> (or <end/>). Persist the round and prompt the
-                # model to either take a real action or terminate.
+                had_prior_actions = bool(tool_calls_this_turn or (ss and ss.affected_artefacts) or len(virtual_history) > 0)
+                if not enforce_end_tag and round_count == 1 and not had_prior_actions and not getattr(ss, "completed_actions", []) and not ss.was_action_dispatched() and not ss.tool_trigger:
+                    ASCIIColors.info("[ChatMixin] Pure conversational round 1 without enforce_end_tag. Finishing turn.")
+                    _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="conversational")
+                    break
+
                 ASCIIColors.info("[ChatMixin] Text-only round without <done/>. Continuing loop until explicit termination.")
                 clean_history_text = scrub_processing_and_status_blocks(raw_round_text)
                 if clean_history_text.strip():
@@ -7015,7 +7370,7 @@ class ChatMixin:
         # ── 11. Final Post-Processing & Database Commit ──
 
         if ss is not None and round_event_state["last_status"] is None:
-            _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="max_rounds")
+            _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="done" if is_infinite_rounds else "max_rounds")
 
         # Handle cancellation cleanup
         if was_cancelled:
@@ -7024,18 +7379,21 @@ class ChatMixin:
             else:
                 ai_msg.content = "[Generation cancelled by user]"
             ai_msg.metadata = {
+                **(ai_msg.metadata or {}),
                 "mode": "cancelled",
                 "tool_calls": tool_calls_this_turn,
                 "artefacts_modified": [a.get("title") for a in (ss.affected_artefacts if ss else [])],
-                "cancelled": True
+                "cancelled": True,
+                "turn_status": "cancelled",
+                "sources": list(collected_sources),
+                "virtual_history": [
+                    {"sender_type": getattr(vh, "sender_type", "user"), "content": getattr(vh, "content", "")}
+                    for vh in virtual_history
+                ]
             }
-            _persist_round_state()
+            _persist_round_state(status_override="cancelled")
         else:
             # ── 🧠 DUAL-COPY PERSISTENCE PROTOCOL ──
-            # If this turn involved multiple agentic steps (tool calls or artifact dispatches),
-            # we persist the FULL virtual_history into the message metadata.
-            # This allows the next turn's export() to reconstruct the exact KV-cache state
-            # so the LLM can continue multi-turn sequences without losing the path.
             has_virtual_history = len(virtual_history) > 0 and (
                 any(vh.sender_type == "user" and "<tool_result" in (vh.content or "") for vh in virtual_history)
                 or any(vh.sender_type == "assistant" and "<tool" in (vh.content or "") for vh in virtual_history)
@@ -7048,13 +7406,15 @@ class ChatMixin:
             )
 
             ai_msg.metadata = {
+                **(ai_msg.metadata or {}),
                 "mode": "agentic" if tool_calls_this_turn else "direct",
                 "tool_calls": tool_calls_this_turn,
                 "artefacts_modified": [a.get("title") for a in (ss.affected_artefacts if ss else [])],
+                "turn_status": "completed",
+                "sources": list(collected_sources),
             }
 
             if has_virtual_history:
-                # Store the virtual history as a list of serializable dicts
                 ai_msg.metadata["virtual_history"] = [
                     {"sender_type": vh.sender_type, "content": vh.content}
                     for vh in virtual_history
@@ -7063,7 +7423,8 @@ class ChatMixin:
         if remove_thinking_blocks:
             ai_msg.content = self.lollmsClient.remove_thinking_blocks(ai_msg.content)
 
-        # Ensure any mimicked markers are purged from the saved content
+        # Strip round tags and mimicked markers from final saved message content
+        ai_msg.content = re.sub(r'<round\s+id=["\'][^"\']*["\']\s*/?>\n?', '', ai_msg.content, flags=re.IGNORECASE)
         ai_msg.content = re.sub(r'\[🔒[^\]]*\]', '', ai_msg.content).strip()
 
         # The Dual-Stream Buffer architecture now ensures raw <artifact> XML 
@@ -7208,14 +7569,21 @@ class ChatMixin:
         existing_sub_agent_runs = ai_msg.metadata.get("sub_agent_runs")
         existing_virtual_history = ai_msg.metadata.get("virtual_history")
         ai_msg.metadata = {
+            **(ai_msg.metadata or {}),
             "mode": "agentic" if tool_calls_this_turn else "direct",
             "tool_calls": tool_calls_this_turn,
-            "artefacts_modified": [a.get("title") for a in (ss.affected_artefacts if ss else [])]
+            "artefacts_modified": [a.get("title") for a in (ss.affected_artefacts if ss else [])],
+            "turn_status": "completed",
         }
         if existing_sub_agent_runs:
             ai_msg.metadata["sub_agent_runs"] = existing_sub_agent_runs
         if existing_virtual_history:
             ai_msg.metadata["virtual_history"] = existing_virtual_history
+        else:
+            ai_msg.metadata["virtual_history"] = [
+                {"sender_type": getattr(vh, "sender_type", "user"), "content": getattr(vh, "content", "")}
+                for vh in virtual_history
+            ]
         if failed_tools_pending_fix and round_count >= resolved_max_rounds:
             ai_msg.metadata["ended_on_unresolved_failure"] = True
 
@@ -7228,7 +7596,7 @@ class ChatMixin:
                 trace_exception(ex)
 
         # Unconditionally commit the final message and discussion state to the database
-        _persist_round_state()
+        _persist_round_state(status_override="completed" if not was_cancelled else "cancelled")
 
         self.scratchpad = ""
         object.__setattr__(self, '_active_callback', None)
@@ -7290,7 +7658,7 @@ class ChatMixin:
         return {
             "user_message": user_msg,
             "ai_message": ai_msg,
-            "sources": [],
+            "sources": collected_sources,
             "artefacts": all_turn_artefacts,
             "memory_report": mem_report,
             "dream_report": dream_report,

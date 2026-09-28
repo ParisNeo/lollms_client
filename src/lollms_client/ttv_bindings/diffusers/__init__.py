@@ -43,8 +43,8 @@ class DiffusersTTVBinding(LollmsTTVBinding):
         self.host_address = self.base_url
         self.binding_root = Path(__file__).parent
         self.server_dir = self.binding_root / "server"
-        self.venv_dir = Path("./venv/ttv_diffusers_venv")
-        self.models_path = Path(kwargs.get("models_path", "./data/ttv_models/diffusers")).resolve()
+        self.venv_dir = self.resolve_system_path(kwargs.get("venv_path", "venv/ttv_diffusers_venv"))
+        self.models_path = self.resolve_system_path(kwargs.get("models_path", "data/ttv_models/diffusers"))
         self.hf_token = kwargs.get("hf_token", "")
         
         self.models_path.mkdir(exist_ok=True, parents=True)

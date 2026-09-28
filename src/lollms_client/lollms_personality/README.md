@@ -510,6 +510,8 @@ Returns a structured list of all skills registered with this personality, distin
 - **`n_predict`**: Maximum tokens to generate.
 - **`enable_artefacts`**: Toggles the artifact creation system.
 - **`use_internal_history`**: If `True`, maintains a separate internal conversation history.
+- **`dynamic_effort`**: If `True`, allows the agent to dynamically scale reasoning effort across rounds using `<effort level="none|low|medium|high"/>`.
+- **`max_nb_rounds`**: Set to `0` or `-1` for infinite unbounded reasoning turns (with console warning).
 
 #### `tool_specs(client_binding=None, **discover_kwargs) -> Dict[str, Dict[str, Any]]`
 Resolves the tool allowlist against the available binding and returns the tool specifications formatted for the `LollmsDiscussion.chat()` method.

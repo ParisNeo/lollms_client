@@ -1,0 +1,19 @@
+name: file_organizer
+title: File Organizer Tool
+version: 1.0.0
+author: ParisNeo
+description: Automatically reorganizes and moves workspace files and directories in batches according to structured YAML or JSON migration plans.
+tools:
+  - name: tool_organize_files_from_plan
+    description: Reads a YAML or JSON migration plan (e.g. mapping.yaml) and safely executes the directory creation and file moving/copying operations.
+    parameters:
+      - name: plan_file
+        type: str
+        description: Path to the migration plan file (YAML or JSON).
+        mandatory: false
+        default: "mapping.yaml"
+      - name: move_files
+        type: bool
+        description: Whether to move the files (true) or copy them (false).
+        mandatory: false
+        default: true

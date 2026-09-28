@@ -36,8 +36,8 @@ class XTTSClientBinding(LollmsTTSBinding):
         self.base_url = f"http://{self.host}:{self.port}"
         self.binding_root = Path(__file__).parent
         self.server_dir = self.binding_root / "server"
-        self.venv_dir = Path(kwargs.get("venv_path", "./venv/tts_xtts_venv")).resolve()
-        self.cache_dir = Path(kwargs.get("cache_dir", "./data/tts_models/xtts")).resolve()
+        self.venv_dir = self.resolve_system_path(kwargs.get("venv_path", "venv/tts_xtts_venv"))
+        self.cache_dir = self.resolve_system_path(kwargs.get("cache_dir", "data/tts_models/xtts"))
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.token_file = self.cache_dir / "xtts_server.token"
 

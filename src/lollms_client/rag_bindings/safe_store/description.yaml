@@ -1,0 +1,123 @@
+name: safe_store
+title: SafeStore Local Multi-Modal Vector & Graph Engine
+version: 1.0.0
+author: ParisNeo
+binding_name: safe_store
+description: >
+  High-performance sovereign knowledge engine for Python. Combines dense semantic
+  vector search (Sentence-Transformers, Ollama, OpenAI), sparse lexical search (BM25 FTS5),
+  overlapping chunk reconstruction, W3C SPARQL 1.1 knowledge graphs, and AES-128/HMAC
+  encryption at rest.
+
+global_input_parameters:
+  - name: vectorizer_name
+    type: str
+    description: "Embedding backend ('st', 'ollama', 'openai', 'cohere', 'lollms', 'tfidf', 'grepper')."
+    mandatory: false
+    default: "st"
+
+  - name: chunk_size
+    type: int
+    description: "Target tokens per chunk."
+    mandatory: false
+    default: 128
+
+  - name: chunk_overlap
+    type: int
+    description: "Token overlap between consecutive chunks."
+    mandatory: false
+    default: 16
+
+  - name: chunking_strategy
+    type: str
+    description: "Chunking strategy: 'token', 'recursive', 'structure', 'semantic', 'contextual', 'paragraph'."
+    mandatory: false
+    default: "token"
+
+  - name: encryption_key
+    type: str
+    description: "Optional AES-128 passphrase for zero-leakage encrypted storage at rest."
+    mandatory: false
+    default: ""
+    is_secret: true
+
+  - name: use_shared_server
+    type: bool
+    description: "Run shared SentenceTransformer model daemon across processes with micro-batching."
+    mandatory: false
+    default: false
+
+  - name: port
+    type: int
+    description: "Port for shared SentenceTransformer daemon."
+    mandatory: false
+    default: 8765
+
+model_input_parameters:
+  - name: db_path
+    type: str
+    description: "Path to the SQLite knowledge base database file (e.g. 'knowledge.db')."
+    mandatory: false
+    default: "knowledge.db"
+
+  - name: model_name
+    type: str
+    description: "Embedding model identifier (e.g. 'all-MiniLM-L6-v2', 'text-embedding-3-small')."
+    mandatory: false
+    default: "all-MiniLM-L6-v2"
+
+commands:
+  - name: info
+    title: Inspect Database Diagnostics
+    description: "Prints detailed diagnostics of documents, chunk counts, vectorizer, and graph topology."
+    parameters: []
+    output:
+      - name: status
+        type: bool
+      - name: info
+        type: dict
+
+  - name: revectorize_database
+    title: Re-Vectorize Entire Database
+    description: "Migrates all stored documents and chunks in-place to a new embedding model."
+    parameters:
+      - name: new_vectorizer_name
+        type: str
+        description: "New vectorizer backend name ('st', 'ollama', 'openai', etc.)."
+        mandatory: true
+      - name: new_model
+        type: str
+        description: "New embedding model identifier."
+        mandatory: false
+    output:
+      - name: status
+        type: bool
+      - name: message
+        type: str
+
+  - name: export_db_file
+    title: Export Database Backup
+    description: "Performs an online atomic SQLite backup of the active knowledge store to a destination file."
+    parameters:
+      - name: output_path
+        type: str
+        description: "Destination file path for the database backup."
+        mandatory: true
+    output:
+      - name: status
+        type: bool
+      - name: message
+        type: str
+
+  - name: cluster_documents
+    title: Semantic Document Clustering
+    description: "Clusters documents by semantic similarity centroids and synthesizes thematic topic tags."
+    parameters:
+      - name: method
+        type: str
+        description: "Clustering algorithm ('kmeans', 'hdbscan')."
+        mandatory: false
+        default: "kmeans"
+    output:
+      - name: clusters
+        type: list

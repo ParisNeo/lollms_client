@@ -238,7 +238,6 @@ def _parse_yaml_frontmatter(content: str) -> Tuple[Optional[Dict[str, Any]], str
     Enforces strict checks to differentiate skill files from Hugging Face model/dataset README cards,
     while remaining robust to leading BOMs, whitespace, or injected page headers.
     """
-    import re
     content_stripped = content.strip()
 
     # Search for frontmatter block anywhere within the first 1000 characters

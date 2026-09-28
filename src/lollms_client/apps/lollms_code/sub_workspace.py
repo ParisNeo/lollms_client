@@ -151,8 +151,14 @@ class SubWorkspaceManager:
     def import_file(self, src: Union[str, Path], dest_rel: Optional[str] = None) -> Path:
         self.ensure_dirs()
         src_path = Path(src).resolve()
-        if not src_path.exists() or not src_path.is_file():
-            raise FileNotFoundError(f"Source file not found: {src}")
+        if not src_path.exists():
+            raise FileNotFoundError(f"Source path not found: {src}")
+
+        if src_path.is_dir():
+            imported = self.import_folder(src_path, dest_rel)
+            if imported:
+                return imported[0]
+            return self.sub_ws_dir / (dest_rel or src_path.name)
 
         rel_dest_clean = dest_rel.replace("\\", "/").lstrip("/") if dest_rel else src_path.name
         dest_path = (self.sub_ws_dir / rel_dest_clean).resolve()

@@ -99,6 +99,7 @@ class SubAgentConfig:
     __slots__ = (
         "name", "task", "context_files", "max_rounds",
         "system_prompt", "spawn_tag_verbatim",
+        "reasoning_effort", "dynamic_effort",
     )
 
     def __init__(
@@ -109,6 +110,8 @@ class SubAgentConfig:
         max_rounds: int,
         system_prompt: Optional[str],
         spawn_tag_verbatim: str,
+        reasoning_effort: Optional[str] = None,
+        dynamic_effort: bool = False,
     ):
         self.name = name
         self.task = task
@@ -116,6 +119,8 @@ class SubAgentConfig:
         self.max_rounds = max_rounds
         self.system_prompt = system_prompt
         self.spawn_tag_verbatim = spawn_tag_verbatim
+        self.reasoning_effort = reasoning_effort
+        self.dynamic_effort = dynamic_effort
 
 
 def parse_agent_tag(opening_tag: str, body: str) -> Optional[SubAgentConfig]:
@@ -154,6 +159,9 @@ def parse_agent_tag(opening_tag: str, body: str) -> Optional[SubAgentConfig]:
     if len(task) > _MAX_TASK_CHARS:
         task = task[:_MAX_TASK_CHARS] + "\n... [task truncated by spawner]"
 
+    raw_effort = attrs.get("effort") or attrs.get("reasoning_effort") or None
+    dynamic_effort = attrs.get("dynamic_effort", "false").lower() in ("true", "1", "yes")
+
     return SubAgentConfig(
         name=attrs.get("name") or f"sub_agent_{len(body) % 97}",
         task=task,
@@ -161,6 +169,8 @@ def parse_agent_tag(opening_tag: str, body: str) -> Optional[SubAgentConfig]:
         max_rounds=max_rounds,
         system_prompt=system_prompt,
         spawn_tag_verbatim=opening_tag,
+        reasoning_effort=raw_effort,
+        dynamic_effort=dynamic_effort,
     )
 
 
@@ -440,6 +450,8 @@ def run_sub_agent(
             orchestrator_mode=False,
             event_mode=event_mode,
             streaming_callback=worker_stream_relay,
+            reasoning_effort=config.reasoning_effort,
+            dynamic_effort=config.dynamic_effort,
         )
         ai_message = (result or {}).get("ai_message")
         full_text = getattr(ai_message, "content", "") or ""

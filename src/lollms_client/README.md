@@ -928,3 +928,11 @@ class MyBinding(LollmsTTIBinding):
     def set_settings(self, settings, **kwargs): ...
     def list_models(self): ...
 ```
+
+## 🔄 Turn Checkpointing & Resumption
+
+`lollms_client` features native round-end state checkpointing across both `LollmsDiscussion` and `LollmsPersonality`.
+
+- **Atomic Checkpoints**: At each round's end, tool results, artifact state, and virtual history are committed immediately to SQLite or JSON checkpoints.
+- **Turn Resumption**: Call `discussion.resume_turn()` or `personality.chat(..., resume_turn=True)` to resume an interrupted turn from its exact round without repeating previously executed tools or recreating already written files.
+- **Immediate Disk Materialization**: When an `<artifact>` closing tag arrives, the file is written to disk immediately, protecting work even during lengthy multi-minute tasks.

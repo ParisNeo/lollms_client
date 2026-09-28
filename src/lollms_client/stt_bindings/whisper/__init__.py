@@ -51,8 +51,8 @@ class WhisperSTTBinding(LollmsSTTBinding):
         self.binding_root = Path(__file__).parent
         self.server_dir = self.binding_root / "server"
 
-        self.venv_dir = Path(kwargs.get("venv_path", "./venv/stt_whisper_venv")).resolve()
-        self.cache_dir = Path(kwargs.get("cache_dir", "./data/stt_models/whisper")).resolve()
+        self.venv_dir = self.resolve_system_path(kwargs.get("venv_path", "venv/stt_whisper_venv"))
+        self.cache_dir = self.resolve_system_path(kwargs.get("cache_dir", "data/stt_models/whisper"))
 
         self.venv_dir.mkdir(exist_ok=True, parents=True)
         self.cache_dir.mkdir(exist_ok=True, parents=True)

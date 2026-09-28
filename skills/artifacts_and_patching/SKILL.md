@@ -9,6 +9,12 @@ created: 2026-05-24
 
 # Lollms Artifacts and Surgical Patching
 
+## 0. UI Header vs. Content Streaming Protocol
+When artifacts are built or patched:
+- **Header Presentation**: Only file names and structural boundaries (e.g., `Section: 1. Setup`, `def calculate_metrics()`, `class SessionManager`) are displayed in UI titles and subtitles.
+- **Content Viewport**: Verbatim content, code lines, table records, and text streams exclusively inside the collapsible artifact container.
+- **Immediate Real-time Flush**: Artifacts are synchronized to disk the exact millisecond the closing `</artifact>` tag is received, ensuring persistent safety across interruptions.
+
 This skill explains how to utilize, create, and surgically update persistent artifacts using Lollms.
 
 ## 1. Creating and Updating Artifacts

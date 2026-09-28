@@ -91,6 +91,29 @@ _SYNTHETIC_RESPONSE_PREFIXES = (
     "[Context Window Exhausted:",
 )
 
+_INTENT_ANNOUNCEMENT_RE = re.compile(
+    r'(?im)(?:'
+    r'^\s*(?:'
+    r'i\s+will\b'
+    r'|i\s+am\s+going\s+to\b'
+    r'|i\'?m\s+going\s+to\b'
+    r'|i\'?ll\b'
+    r'|let\s+me\b'
+    r'|let\'?s\b'
+    r'|allow\s+me\b'
+    r'|first[,.]?\s+(?:i\s+will|let\s+me|allow\s+me|i\'?ll)\b'
+    r'|now\s+(?:i\s+will|let\s+me|allow\s+me|i\'?ll)\b'
+    r'|next[,.]?\s+(?:i\s+will|let\s+me|allow\s+me|i\'?ll)\b'
+    r'|je\s+vais\b'
+    r'|permettez[- ]moi\b'
+    r'|laissez[- ]moi\b'
+    r'|laisse[- ]moi\b'
+    r'|je\s+commence\b'
+    r')'
+    r'|\b(?:i\'?ll|i\s+will|let\s+me|let\'?s)\s+(?:first\s+)?(?:copy|create|check|run|write|build|execute|delete|modify|update|search|read|inspect|list|look|verify|test|fix|find)\b'
+    r')'
+)
+
 
 def _is_synthetic_agent_response(text: str) -> bool:
     stripped = (text or "").strip()
@@ -111,11 +134,14 @@ class _HistoryContextAdapter:
         self._personality = personality
         self._system_prompt_ref = stable_system_prompt
         self.lollmsClient = personality.lollms_client
-        self.scratchpad = getattr(personality, '_scratchpad_content', '')
+        # Both scratchpad and active memories are already curated into stable_system_prompt.
+        # Leaving them empty here prevents HistoryManager.export() from duplicating the scratchpad
+        # inside the user's message and re-injecting memories into the system prompt.
+        self.scratchpad = ""
+        self.memory_manager = None
         self.pruning_summary = None
         self.pruning_point_id = None
         self.artefacts = getattr(personality, '_artefact_manager', None) or _NullArtefactManager()
-        self.memory_manager = personality.memory_manager
         self.workspace_data_path = str(personality._resolved_workspace) if personality._resolved_workspace else "."
 
     @property
@@ -177,67 +203,130 @@ _TEXT_EXTS = {".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".scss", ".s
 _BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp", ".zip", ".tar", ".gz", ".pdf", ".docx", ".mp3", ".wav", ".mp4", ".avi", ".mov"}
 
 _MAX_TREE_DEPTH = 2
-_MAX_DIR_ITEMS = 15
+_MAX_DIR_ITEMS = 12
 
 
-def _build_workspace_tree_r(directory: Path, workspace_root: Path, current_depth: int, collapsed_set: set, max_depth: int, max_items: int) -> List[str]:
+def _format_compact_size(size_bytes: int) -> str:
+    """Formats bytes into compact 1-2 token strings (e.g. 11.7 MB, 124 KB)."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+    return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
+
+
+def _cluster_similar_files(files: List[Path]) -> Tuple[List[str], int, int]:
+    """
+    Groups sequences of similarly named/numbered files (e.g. img_dalle__1.png..img_dalle__16.png)
+    to save tokens while preserving structural inventory.
+    """
+    from collections import defaultdict
+    clusters = defaultdict(list)
+    standalone = []
+
+    for f in files:
+        m = re.match(r'^(.*?)(\d+)(\.[a-zA-Z0-9]+)$', f.name)
+        if m:
+            prefix, _, ext = m.groups()
+            clusters[(prefix, ext)].append(f)
+        else:
+            standalone.append(f)
+
+    lines = []
+    total_size = sum(f.stat().st_size for f in files if f.is_file())
+
+    for (prefix, ext), cl_files in sorted(clusters.items()):
+        if len(cl_files) >= 4:
+            cl_size = sum(f.stat().st_size for f in cl_files)
+            nums = []
+            for cf in cl_files:
+                m = re.search(r'\d+', cf.name)
+                if m:
+                    nums.append(int(m.group(0)))
+            if nums:
+                min_n, max_n = min(nums), max(nums)
+                lines.append(f"{prefix}{min_n}{ext} .. {prefix}{max_n}{ext} ({len(cl_files)} {ext.lstrip('.').upper()} files, {_format_compact_size(cl_size)})")
+            else:
+                lines.append(f"{prefix}*{ext} ({len(cl_files)} files, {_format_compact_size(cl_size)})")
+        else:
+            standalone.extend(cl_files)
+
+    for sf in standalone:
+        s_sz = sf.stat().st_size if sf.is_file() else 0
+        lines.append(f"{sf.name} ({_format_compact_size(s_sz)})")
+
+    return lines, len(files), total_size
+
+
+def _build_workspace_tree_r(
+    directory: Path,
+    workspace_root: Path,
+    current_depth: int,
+    collapsed_set: set,
+    max_depth: int,
+    max_items: int
+) -> List[str]:
     if current_depth >= max_depth:
         return []
 
-    entries = []
+    lines = []
     try:
         raw_items = [p for p in directory.iterdir() if p.name not in _IGNORED_WS_DIRS and not p.name.startswith(".")]
-        sorted_items = sorted(raw_items, key=lambda p: (not p.is_dir(), p.name.lower()))
     except Exception:
         return []
 
-    if len(sorted_items) > max_items:
-        remaining = len(sorted_items) - max_items
-        sorted_items = sorted_items[:max_items]
-        entries.append(f"{'  ' * current_depth}... ({remaining} more items in this folder. Use <uncollapse_folder> to see them.)")
+    subdirs = sorted([p for p in raw_items if p.is_dir()], key=lambda p: p.name.lower())
+    files = sorted([p for p in raw_items if p.is_file() and p.suffix.lower() not in _IGNORED_WS_EXTS], key=lambda p: p.name.lower())
 
-    for item in sorted_items:
-        if item.is_dir():
-            rel_dir_path = str(item.relative_to(workspace_root)).replace("\\", "/")
-            if rel_dir_path in collapsed_set:
-                entries.append(f"{'  ' * current_depth}[📁 COLLAPSED] {item.name}/ ({_count_files_recursive(item, collapsed_set, max_depth, current_depth)} items)")
-            elif current_depth + 1 >= max_depth:
-                entries.append(f"{'  ' * current_depth}[📁 DEEP] {item.name}/ (Use <uncollapse_folder> to explore)")
-            else:
-                entries.append(f"{'  ' * current_depth}[📁] {item.name}/")
-                entries.extend(_build_workspace_tree_r(item, workspace_root, current_depth + 1, collapsed_set, max_depth, max_items))
-        elif item.is_file():
-            if item.suffix.lower() in _IGNORED_WS_EXTS:
-                continue
-            rel_path = str(item.relative_to(workspace_root)).replace("\\", "/")
-            size = item.stat().st_size
-            entries.append(f"{'  ' * current_depth}- {rel_path} ({size:,} bytes)")
+    indent = "  " * current_depth
 
-    return entries
+    # 1. Render Subdirectories
+    for d in subdirs:
+        rel_dir = str(d.relative_to(workspace_root)).replace("\\", "/")
+        try:
+            d_files = [p for p in d.rglob("*") if p.is_file() and p.name not in _IGNORED_WS_DIRS and not p.name.startswith(".")]
+            d_count = len(d_files)
+            d_size = sum(p.stat().st_size for p in d_files)
+            meta_str = f" ({d_count} items, {_format_compact_size(d_size)})" if d_count else ""
+        except Exception:
+            meta_str = ""
 
-def _count_files_recursive(directory: Path, collapsed_set: set, max_depth: int, current_depth: int) -> int:
-    if current_depth >= max_depth:
-        return 0
-    count = 0
-    try:
-        for item in directory.iterdir():
-            if item.name in _IGNORED_WS_DIRS or item.name.startswith("."):
-                continue
-            if item.is_dir():
-                count += _count_files_recursive(item, collapsed_set, max_depth, current_depth + 1)
-            elif item.is_file():
-                if item.suffix.lower() not in _IGNORED_WS_EXTS:
-                    count += 1
-    except Exception:
-        pass
-    return count
+        if rel_dir in collapsed_set:
+            lines.append(f"{indent}[📁 COLLAPSED] {d.name}/{meta_str}")
+        elif current_depth + 1 >= max_depth:
+            lines.append(f"{indent}[📁 DEEP] {d.name}/{meta_str}")
+        else:
+            lines.append(f"{indent}[📁] {d.name}/{meta_str}")
+            lines.extend(_build_workspace_tree_r(d, workspace_root, current_depth + 1, collapsed_set, max_depth, max_items))
+
+    # 2. Render Clustered Files
+    if files:
+        file_lines, total_f_cnt, total_f_sz = _cluster_similar_files(files)
+        displayed_lines = file_lines[:max_items]
+
+        for fl in displayed_lines:
+            lines.append(f"{indent}├── {fl}")
+
+        if len(file_lines) > max_items:
+            overflow = len(file_lines) - max_items
+            lines.append(f"{indent}└── ... (+{overflow} more files in this directory. Use tool_list_files to view)")
+
+    return lines
+
 
 def _build_workspace_context(workspace_path: Path, max_file_size: int = 12000, max_total_chars: int = 30000, collapsed_folders: Optional[set] = None) -> str:
     if not workspace_path or not workspace_path.exists():
         return ""
 
     collapsed_set = collapsed_folders or set()
-    lines = ["=== WORKSPACE TREE ==="]
+
+    try:
+        all_root_items = [p for p in workspace_path.iterdir() if p.name not in _IGNORED_WS_DIRS and not p.name.startswith(".")]
+        total_items_count = len(all_root_items)
+    except Exception:
+        total_items_count = 0
 
     tree_entries = _build_workspace_tree_r(
         directory=workspace_path,
@@ -249,13 +338,18 @@ def _build_workspace_context(workspace_path: Path, max_file_size: int = 12000, m
     )
 
     if not tree_entries:
-        lines.append("(Workspace is empty)")
-        lines.append("=== END WORKSPACE TREE ===")
-        return "\n".join(lines)
+        return "=== WORKSPACE TREE ===\n(Workspace is empty)\n=== END WORKSPACE TREE ==="
 
-    lines.extend(tree_entries)
-    lines.append("=== END WORKSPACE TREE ===")
-    return "\n".join(lines)
+    content_str = "\n".join(tree_entries)
+    # Wrap inside preformatted ```text to guarantee literal line returns and prevent markdown horizontal collapsing
+    return (
+        f"=== WORKSPACE TREE ===\n"
+        f"```text\n"
+        f"Root: ./ ({total_items_count} items total)\n"
+        f"{content_str}\n"
+        f"```\n"
+        f"=== END WORKSPACE TREE ==="
+    )
 
 
 
@@ -785,7 +879,7 @@ class ToolsManager:
 class SubAgentSpawner:
     """
     Spawns child agents for sub-task delegation.
-    Enforces recursion depth and per-turn spawn count limits.
+    Enforces recursion depth, per-turn spawn count limits, and cooperative cancellation.
     """
 
     def __init__(self, parent_agent: 'Agent', max_depth: int = 3, max_per_turn: int = 5):
@@ -794,15 +888,26 @@ class SubAgentSpawner:
         self.max_per_turn = max_per_turn
         self._current_depth = 0
         self._spawned_this_turn = 0
+        self.active_child_agent: Optional[LollmsPersonality] = None
 
     def reset_turn(self):
         self._spawned_this_turn = 0
+        self.active_child_agent = None
 
     def set_depth(self, depth: int):
         self._current_depth = depth
 
+    def cancel_active_child(self):
+        """Immediately terminates any active running sub-agent."""
+        if self.active_child_agent is not None:
+            try:
+                self.active_child_agent.cancel_generation()
+            except Exception:
+                pass
+
     def can_spawn(self) -> bool:
         return (
+            not self.parent.is_generation_cancelled() and
             self._current_depth < self.max_depth and
             self._spawned_this_turn < self.max_per_turn
         )
@@ -814,6 +919,9 @@ class SubAgentSpawner:
         model_name: Optional[str] = None,
         temperature: float = 0.3,
         max_steps: int = 5,
+        effort: Optional[str] = None,
+        dynamic_effort: bool = False,
+        **kwargs,
     ) -> Dict[str, Any]:
         """
         Spawns a child agent to perform a sub-task.
@@ -826,6 +934,8 @@ class SubAgentSpawner:
             model_name: Specific model to use (None = parent's model).
             temperature: Low temperature for focused work (default 0.3).
             max_steps: Maximum reasoning steps for the child (default 5).
+            effort: Reasoning effort tier for the child ('none', 'low', 'medium', 'high').
+            dynamic_effort: Whether child can adjust its reasoning effort dynamically.
         """
         if not self.can_spawn():
             return {
@@ -836,16 +946,37 @@ class SubAgentSpawner:
         self._spawned_this_turn += 1
 
         try:
+            if self.parent.is_generation_cancelled():
+                return {"success": False, "error": "Operation cancelled before sub-agent execution."}
+
             child_caps = CapabilityFlags(
-                enable_code_execution=self.parent.capabilities.enable_code_execution if self.parent.capabilities else False,
+                enable_code_execution=self.parent.capabilities.enable_code_execution if self.parent.capabilities else True,
                 enable_image_generation=False,
                 enable_image_editing=False,
                 enable_sub_agents=False,  # Prevent infinite recursion
                 enable_model_switching=False,
                 enable_skill_loading=self.parent.capabilities.enable_skill_loading if self.parent.capabilities else True,
                 enable_skill_creation=False,
+                enable_workspace_tools=True,
                 skills_mode="loadable",
                 max_sub_agent_depth=0,
+            )
+
+            # Authoritative Worker Sub-Agent Doctrine
+            base_worker_prompt = (
+                "=== WORKER SUB-AGENT OPERATING DOCTRINE (STRICT & MANDATORY) ===\n"
+                "1. YOU ARE AN AUTONOMOUS SPECIALIST SUB-AGENT SPAWNED BY THE PRIMARY ORCHESTRATOR.\n"
+                "2. NO HUMAN IN THE LOOP: You are running headlessly inside an isolated sub-task. You are strictly FORBIDDEN from asking the user questions, requesting human confirmation, or pausing for feedback. Make sound engineering assumptions and proceed!\n"
+                "3. AUTONOMOUS ACTION MANDATE: Stating intent does nothing. You MUST immediately emit the functional XML tags (`<tool>`, `<artifact>`, `<unlock_file>`) in the same turn to execute code, read files, or write artifacts.\n"
+                "4. FULL COMPLETION IN SILENCE: Complete all steps required for your assigned task thoroughly. Do not stop midway.\n"
+                "5. REPORTING CONTRACT: When your task is finished, summarize all your actions, code written, and test results inside `<report>...</report>` and conclude with `<done/>` on a new line.\n"
+                "=== END WORKER SUB-AGENT DOCTRINE ==="
+            )
+
+            conditioned_prompt = (
+                f"{personality_conditioning.strip()}\n\n{base_worker_prompt}"
+                if personality_conditioning
+                else base_worker_prompt
             )
 
             child_agent = LollmsPersonality(
@@ -853,10 +984,7 @@ class SubAgentSpawner:
                 author="lollms_personality",
                 category="sub_agent",
                 description="A focused sub-agent spawned for a specific task.",
-                system_prompt=personality_conditioning or (
-                    "You are a focused sub-agent. Execute the given task precisely and return the result. "
-                    "Do not engage in conversational pleasantries. Focus solely on the task."
-                ),
+                system_prompt=conditioned_prompt,
                 role=AgentRole.IMPLEMENTER,
                 workspace_path=self.parent.get_workspace_path(),
                 capabilities=child_caps,
@@ -868,22 +996,99 @@ class SubAgentSpawner:
                 _parent_depth=self._current_depth + 1,
             )
 
-            # If model_name specified, temporarily switch
-            original_model = None
-            if model_name and hasattr(self.parent.lc, 'llm'):
+            # Grant workspace autonomy to child agent
+            object.__setattr__(child_agent, "_git_autonomy_granted", True)
+
+            self.active_child_agent = child_agent
+
+            parent_cb = getattr(self.parent, '_active_streaming_callback', None)
+            spawn_start_time = time.time()
+            if parent_cb:
                 try:
-                    original_model = getattr(self.parent.lc.llm, 'model_name', None)
+                    parent_cb(
+                        f"🤖 Spawning sub-agent '{child_agent.name}' for task:\n{instruction[:250]}...",
+                        getattr(MSG_TYPE, "MSG_TYPE_WORKER_SPAWN_START", MSG_TYPE.MSG_TYPE_INFO),
+                        {
+                            "agent_name": child_agent.name,
+                            "task": instruction,
+                            "worker_index": self._spawned_this_turn,
+                            "depth": self._current_depth + 1,
+                            "max_depth": self.max_depth,
+                            "max_steps": max_steps,
+                            "model_name": model_name or "parent model",
+                            "effort": effort or "default",
+                            "dynamic_effort": dynamic_effort,
+                            "personality_conditioning": personality_conditioning or "Autonomous Worker Specialist",
+                        }
+                    )
                 except Exception:
                     pass
 
-            # Execute child chat (non-streaming, no internal history)
-            result = child_agent.chat(
-                prompt=instruction,
-                streaming_callback=None,
-                max_reasoning_steps=max_steps,
-                temperature=temperature,
-                use_internal_history=False,
+            def child_stream_relay(chunk: str, msg_type=None, meta=None) -> bool:
+                if self.parent.is_generation_cancelled() or child_agent.is_generation_cancelled():
+                    child_agent.cancel_generation()
+                    return False
+                if parent_cb is None:
+                    return True
+                try:
+                    m = dict(meta or {})
+                    m["sub_agent"] = child_agent.name
+                    # Relay tool, artifact, and info events live to the UI
+                    if msg_type in (
+                        MSG_TYPE.MSG_TYPE_TOOL_START, MSG_TYPE.MSG_TYPE_TOOL_END,
+                        MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END,
+                        MSG_TYPE.MSG_TYPE_INFO, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK
+                    ):
+                        return parent_cb(chunk, msg_type, m)
+                    elif msg_type == MSG_TYPE.MSG_TYPE_CHUNK and not m.get("live_tool_chunk") and not m.get("was_processed"):
+                        return parent_cb(chunk, MSG_TYPE.MSG_TYPE_CHUNK, m)
+                except Exception:
+                    return True
+                return True
+
+            task_wrapped_prompt = (
+                f"[ASSIGNED SUB-AGENT TASK]\n{instruction}\n\n"
+                "[EXECUTION DIRECTIVE]\n"
+                "Execute the task autonomously using your available tools and artifact tags.\n"
+                "Do NOT ask questions or await human approval. When complete, provide your summary inside `<report>...</report>` and end with `<done/>`."
             )
+
+            try:
+                # Execute child chat with live streaming relay
+                result = child_agent.chat(
+                    prompt=task_wrapped_prompt,
+                    streaming_callback=child_stream_relay,
+                    max_reasoning_steps=max_steps,
+                    temperature=temperature,
+                    use_internal_history=False,
+                    reasoning_effort=effort,
+                    dynamic_effort=dynamic_effort,
+                    enable_shell=getattr(self.parent.capabilities, "enable_code_execution", True),
+                    enable_workspace_tools=True,
+                    enable_python_exec=True,
+                )
+            finally:
+                self.active_child_agent = None
+
+            spawn_elapsed = time.time() - spawn_start_time
+            if parent_cb:
+                try:
+                    parent_cb(
+                        f"✅ Sub-agent '{child_agent.name}' completed in {result.get('rounds', 0)} round(s).",
+                        getattr(MSG_TYPE, "MSG_TYPE_WORKER_SPAWN_END", MSG_TYPE.MSG_TYPE_INFO),
+                        {
+                            "agent_name": child_agent.name,
+                            "task": instruction,
+                            "rounds": result.get("rounds", 0),
+                            "tools_count": len(result.get("tool_calls", [])),
+                            "success": not result.get("was_cancelled", False),
+                            "report_digest": result.get("response", ""),
+                            "elapsed_seconds": round(spawn_elapsed, 1),
+                            "worker_index": self._spawned_this_turn,
+                        }
+                    )
+                except Exception:
+                    pass
 
             child_response = result.get("response", "")
             child_tool_calls = result.get("tool_calls", [])
@@ -1078,6 +1283,159 @@ class BindingToolsBuilder:
         has_connections = bool(connection_registry)
         if has_connections or getattr(client, 'connection', None) is not None:
             tools["tool_send_connection"] = BindingToolsBuilder._make_connection_tool(client)
+
+        # RAG (Knowledge base & semantic vector/graph store)
+        rag_registry = getattr(client, 'rag_model_profiles_registry', None)
+        has_rag = bool(rag_registry)
+        if has_rag or getattr(client, 'rag', None) is not None:
+            tools.update(BindingToolsBuilder._make_rag_binding_tools(client, workspace_path))
+
+        return tools
+
+    @staticmethod
+    def _make_rag_binding_tools(client, workspace_path: Optional[Path]) -> Dict[str, Any]:
+        """Exposes native RAG data store operations as callable agent tools."""
+        tools = {}
+
+        def tool_query_rag(query: str, store_alias: str = "", top_k: int = 5, hybrid: bool = True) -> dict:
+            """
+            Query the active RAG knowledge base for semantically relevant document excerpts,
+            facts, or technical guidelines.
+
+            Args:
+                query (str): The search keywords or question.
+                store_alias (str, optional): Target knowledge store profile alias. Uses default store if empty.
+                top_k (int, optional): Maximum number of matching excerpts to return. Defaults to 5.
+                hybrid (bool, optional): If True (default), fuses dense semantic vector search with sparse BM25.
+            """
+            try:
+                results = client.query_rag(query, top_k=top_k, store_alias=store_alias or None, hybrid=hybrid)
+                if not results:
+                    return {"success": True, "output": f"No matching documents found in RAG store for '{query}'."}
+
+                output_parts = [f"Found {len(results)} relevant excerpt(s) in RAG store:"]
+                for idx, r in enumerate(results, 1):
+                    src = r.get("source") or r.get("title") or "Document"
+                    score = r.get("relevance_percent", r.get("score", ""))
+                    score_str = f" ({score:.1f}% relevance)" if isinstance(score, (int, float)) else ""
+                    content = r.get("content", "").strip()
+                    output_parts.append(f"[{idx}] {src}{score_str}:\n{content}\n")
+
+                return {
+                    "success": True,
+                    "count": len(results),
+                    "output": "\n".join(output_parts)
+                }
+            except Exception as e:
+                return {"success": False, "error": f"RAG query failed: {e}"}
+
+        def tool_sparql_query(sparql_query: str, store_alias: str = "") -> dict:
+            """
+            Execute a W3C SPARQL 1.1 query (SELECT, ASK, CONSTRUCT) against the RAG knowledge graph.
+
+            Args:
+                sparql_query (str): The W3C SPARQL 1.1 query string.
+                store_alias (str, optional): Target knowledge store profile alias.
+            """
+            try:
+                res = client.query_sparql(sparql_query, store_alias=store_alias or None)
+                if isinstance(res, dict) and "results" in res and "bindings" in res["results"]:
+                    bindings = res["results"]["bindings"]
+                    if not bindings:
+                        return {"success": True, "output": "SPARQL query executed successfully (0 matching bindings)."}
+                    lines = [f"SPARQL Results ({len(bindings)} binding(s)):"]
+                    for b in bindings[:25]:
+                        row_items = [f"{var}: {info.get('value', '')}" for var, info in b.items()]
+                        lines.append("  • " + " | ".join(row_items))
+                    if len(bindings) > 25:
+                        lines.append(f"  ... (+{len(bindings) - 25} more bindings)")
+                    return {"success": True, "output": "\n".join(lines)}
+                elif isinstance(res, dict) and "boolean" in res:
+                    return {"success": True, "output": f"SPARQL ASK Result: {res['boolean']}"}
+                else:
+                    import json
+                    return {"success": True, "output": json.dumps(res, indent=2, default=str)}
+            except Exception as e:
+                return {"success": False, "error": f"SPARQL execution failed: {e}"}
+
+        def tool_add_document_to_rag(file_name: str, store_alias: str = "") -> dict:
+            """
+            Ingests a file from the workspace into the RAG knowledge base.
+            Supports .pdf, .docx, .xlsx, .csv, .md, .txt, and code files.
+
+            Args:
+                file_name (str): Path or filename of the document in the workspace.
+                store_alias (str, optional): Target knowledge store profile alias.
+            """
+            try:
+                p = Path(file_name)
+                if not p.exists() and workspace_path:
+                    p = workspace_path / file_name
+
+                if not p.exists():
+                    return {"success": False, "error": f"File '{file_name}' not found in workspace."}
+
+                ok = client.add_document_to_rag(p, store_alias=store_alias or None)
+                if ok:
+                    return {"success": True, "output": f"Document '{p.name}' successfully indexed into RAG store."}
+                return {"success": False, "error": f"Failed to ingest document '{p.name}'."}
+            except Exception as e:
+                return {"success": False, "error": f"RAG ingestion failed: {e}"}
+
+        def tool_get_rag_info(store_alias: str = "") -> dict:
+            """
+            Inspects diagnostic information about the active RAG store (total documents, chunks, vectorizer, and graph stats).
+
+            Args:
+                store_alias (str, optional): Target knowledge store profile alias.
+            """
+            try:
+                info_data = client.get_rag_info(store_alias=store_alias or None)
+                import json
+                return {"success": True, "output": json.dumps(info_data, indent=2, default=str)}
+            except Exception as e:
+                return {"success": False, "error": f"Failed to get RAG info: {e}"}
+
+        tools["tool_query_rag"] = {
+            "name": "tool_query_rag",
+            "description": "Query the RAG knowledge store for semantically relevant document excerpts and facts.",
+            "parameters": [
+                {"name": "query", "type": "str", "description": "The search query or keywords."},
+                {"name": "store_alias", "type": "str", "description": "Target store alias (default = active).", "optional": True},
+                {"name": "top_k", "type": "int", "description": "Maximum excerpts to return (default 5).", "optional": True},
+                {"name": "hybrid", "type": "bool", "description": "Fuse dense vectors with sparse BM25 (default True).", "optional": True},
+            ],
+            "callable": tool_query_rag,
+        }
+
+        tools["tool_sparql_query"] = {
+            "name": "tool_sparql_query",
+            "description": "Execute a W3C SPARQL 1.1 query (SELECT, ASK, CONSTRUCT) against the RAG knowledge graph.",
+            "parameters": [
+                {"name": "sparql_query", "type": "str", "description": "W3C SPARQL 1.1 query string."},
+                {"name": "store_alias", "type": "str", "description": "Target store alias (default = active).", "optional": True},
+            ],
+            "callable": tool_sparql_query,
+        }
+
+        tools["tool_add_document_to_rag"] = {
+            "name": "tool_add_document_to_rag",
+            "description": "Ingest and index a document file from the workspace into the RAG knowledge store.",
+            "parameters": [
+                {"name": "file_name", "type": "str", "description": "Path of the file to index."},
+                {"name": "store_alias", "type": "str", "description": "Target store alias (default = active).", "optional": True},
+            ],
+            "callable": tool_add_document_to_rag,
+        }
+
+        tools["tool_get_rag_info"] = {
+            "name": "tool_get_rag_info",
+            "description": "Inspect diagnostic metadata and statistics of the RAG knowledge store.",
+            "parameters": [
+                {"name": "store_alias", "type": "str", "description": "Target store alias (default = active).", "optional": True},
+            ],
+            "callable": tool_get_rag_info,
+        }
 
         return tools
 
@@ -1892,25 +2250,13 @@ class LollmsPersonality:
                 self.skills_manager._skills_dirs.extend([Path(d).resolve() for d in skills_dirs if Path(d).exists()])
                 self.skills_manager.reload()
         elif skills_dirs:
-            self.skills_manager = SkillsManager(skills_dirs=skills_dirs, mode="mixed", max_visible_tokens=8000)
+            self.skills_manager = SkillsManager(skills_dirs=skills_dirs, mode="loadable", max_visible_tokens=1200)
         else:
             self.skills_manager = None
 
-        # Pre-inject skills context into the system prompt so that
-        # external callers (like LollmsDiscussion) inherit the skills
-        # without needing to invoke the private _build_system_prompt().
-        if self.skills_manager:
-            skills_ctx_str = self.skills_manager.build_context()
-            if skills_ctx_str:
-                if "=== SKILLS SYSTEM ===" not in self.system_prompt:
-                    self.system_prompt = f"{self.system_prompt}\n\n{skills_ctx_str}".strip()
-                    self._skills_context_injected = True
-                else:
-                    self._skills_context_injected = True
-            else:
-                self._skills_context_injected = False
-        else:
-            self._skills_context_injected = False
+        # Do not pre-bake dynamic skills context into the immutable base system_prompt.
+        # Skills context is rendered dynamically per turn in _build_system_prompt().
+        self._skills_context_injected = False
 
         self.memory_manager = memory_manager
         self._workspace_path: Optional[Path] = None
@@ -1986,8 +2332,14 @@ class LollmsPersonality:
         self.lollms_client = value
 
     def clear_conversation(self) -> None:
-        """Clears the agent's internal multi-turn conversation memory."""
+        """Clears the agent's internal multi-turn conversation memory and ephemeral session scratchpad."""
         self._conversation = []
+        object.__setattr__(self, '_scratchpad_content', '')
+        if getattr(self, '_scratchpad_path', None) and self._scratchpad_path.exists():
+            try:
+                self._scratchpad_path.write_text("# Scratchpad\n\n(Empty - session notes only)\n", encoding="utf-8")
+            except Exception:
+                pass
 
     def save_history_to_disk(self, history_file: Path) -> None:
         """Persists the internal conversation history to a JSON file."""
@@ -2133,7 +2485,7 @@ class LollmsPersonality:
         description = meta.get("description", "")
 
         # Initialize Skills
-        skills_mode = meta.get("skills_mode") or hb.manifest.get("skills_mode", "mixed")
+        skills_mode = meta.get("skills_mode") or hb.manifest.get("skills_mode", "loadable")
         # CRITICAL: Explicitly pass the handbag's skills directory as the primary target.
         # This ensures tool_create_skill and tool_update_skill route file writes to the
         # correct physical handbag folder, even if external dirs are merged later.
@@ -2408,6 +2760,21 @@ class LollmsPersonality:
         return _runner
 
     def query_data(self, query: str, datasource_name: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+        # 1. Query client RAG binding if available and no specific custom datasource was requested
+        if self.lollms_client and getattr(self.lollms_client, "rag", None) and (not datasource_name or datasource_name == "rag_binding"):
+            try:
+                res = self.lollms_client.query_rag(query, store_alias=datasource_name if datasource_name != "rag_binding" else None, **kwargs)
+                if res:
+                    return {
+                        "success": True,
+                        "sources": res,
+                        "count": len(res),
+                        "query": query,
+                        "datasource_name": getattr(self.lollms_client.rag, "store_name", "rag_binding")
+                    }
+            except Exception as ex:
+                ASCIIColors.warning(f"[{self.name}] Client RAG query error: {ex}")
+
         if not self.data_sources:
             if self.query_rag_callback:
                 try:
@@ -2533,6 +2900,7 @@ class LollmsPersonality:
             or self._raw_data_source is not None
             or self.query_rag_callback is not None
             or bool(self.data_files)
+            or (self.lollms_client is not None and (getattr(self.lollms_client, "rag", None) is not None or bool(getattr(self.lollms_client, "rag_model_profiles_registry", None))))
         )
 
     @property
@@ -2747,6 +3115,11 @@ class LollmsPersonality:
 
     def cancel_generation(self) -> bool:
         object.__setattr__(self, '_cancel_flag', True)
+        if hasattr(self, '_sub_agent_spawner') and self._sub_agent_spawner:
+            try:
+                self._sub_agent_spawner.cancel_active_child()
+            except Exception:
+                pass
         if hasattr(self, 'lollms_client') and self.lollms_client:
             if hasattr(self.lollms_client, 'cancel'):
                 try:
@@ -2979,15 +3352,18 @@ class LollmsPersonality:
                 return
 
             consolidation_prompt = f"""Analyze the following interaction between a User and an AI Engineer.
-Determine if a CRITICAL FACT, ARCHITECTURAL RULE, or USER PREFERENCE was established.
-Ignore greetings, trivial progress updates, and conversational filler.
+Determine if a CRITICAL USER PREFERENCE, PERMANENT ARCHITECTURAL RULE, or IDENTITY FACT was established.
+CRITICAL EXCLUSIONS:
+- DO NOT save ephemeral task requests (e.g., 'User wants to add tool X', 'User asked to build Y').
+- DO NOT save to-do lists, progress updates, greetings, or conversational filler.
+- ONLY save permanent rules (e.g., 'User prefers 4 spaces indentation', 'Command alias c&p means commit and push').
 
 User: "{clean_user}"
 AI: "{clean_ai}"
 
-If a high-density fact was established, output EXACTLY a JSON object with:
-{{"save_memory": true, "content": "The specific fact/rule", "tags": ["relevant", "tags"], "importance": 0.0-1.0}}
-If the interaction is trivial, output:
+If a permanent rule/fact was established, output EXACTLY a JSON object with:
+{{"save_memory": true, "content": "The specific fact/rule (written as a passive fact, NOT an imperative task)", "tags": ["relevant", "tags"], "importance": 0.0-1.0}}
+If the interaction is a task, greeting, or ephemeral request, output:
 {{"save_memory": false}}
 
 JSON:"""
@@ -3006,13 +3382,31 @@ JSON:"""
             if json_match:
                 data = _json.loads(json_match.group(0))
                 if data.get("save_memory"):
-                    self.memory_manager.add(
-                        content=data.get("content", ""),
-                        importance=float(data.get("importance", 0.8)),
-                        tags=data.get("tags", ["architectural", "fact"]),
-                        level=2
-                    )
-                    ASCIIColors.success(f"[{self.name}] 💾 Consolidated high-density memory: {data.get('content', '')[:50]}...")
+                    content_to_save = data.get("content", "").strip()
+                    task_reject_regex = re.compile(r'^(?:user\s+wants\s+to|user\s+asked\s+to|organize|create|implement|build|fix|add)\b', re.IGNORECASE)
+                    if not task_reject_regex.search(content_to_save):
+                        self.memory_manager.add(
+                            content=content_to_save,
+                            importance=float(data.get("importance", 0.8)),
+                            tags=data.get("tags", ["architectural", "fact"]),
+                            level=2
+                        )
+                        ASCIIColors.success(f"[{self.name}] 💾 Consolidated high-density memory: {content_to_save[:50]}...")
+                        cb = getattr(self, '_active_streaming_callback', None)
+                        if cb:
+                            try:
+                                cb(
+                                    f"💾 **Memory Consolidated**: {content_to_save}",
+                                    MSG_TYPE.MSG_TYPE_INFO,
+                                    {
+                                        "type": "memory_consolidated",
+                                        "content": content_to_save,
+                                        "tags": data.get("tags", ["architectural", "fact"]),
+                                        "importance": float(data.get("importance", 0.8))
+                                    }
+                                )
+                            except Exception:
+                                pass
 
         except Exception as e:
             ASCIIColors.warning(f"[{self.name}] Memory consolidation failed: {e}")
@@ -3496,7 +3890,14 @@ JSON:"""
         ws_dir = Path(self.workspace_path).resolve() if self.workspace_path else None
 
         skills_list = []
-        for s in self.skills_manager.skills.values():
+        seen_keys = set()
+        unique_skills = self.skills_manager.get_unique_skills() if hasattr(self.skills_manager, "get_unique_skills") else self.skills_manager.skills.values()
+        for s in unique_skills:
+            canonical_key = str(s.file_path.resolve()) if s.file_path else s.title.lower().strip()
+            if canonical_key in seen_keys:
+                continue
+            seen_keys.add(canonical_key)
+
             fp = s.file_path.resolve() if s.file_path else None
             source = "custom"
             is_handbag = False
@@ -3735,22 +4136,22 @@ JSON:"""
 
             _libraries_to_mount.append("git_manager")
 
-            _computer_use_vision_ready = False
-            if enable_computer_use and self.lollms_client:
+            _has_vision = False
+            if self.lollms_client:
                 if hasattr(self.lollms_client, "has_vision_capability"):
                     try:
-                        _computer_use_vision_ready = bool(self.lollms_client.has_vision_capability())
+                        _has_vision = bool(self.lollms_client.has_vision_capability())
                     except Exception:
-                        _computer_use_vision_ready = False
-                if not _computer_use_vision_ready:
+                        _has_vision = False
+                if not _has_vision:
                     active_llm = getattr(self.lollms_client, "llm", None)
-                    _computer_use_vision_ready = bool(getattr(active_llm, "vision_enabled", False))
-                    if not _computer_use_vision_ready and active_llm and hasattr(active_llm, "child_bindings"):
-                        _computer_use_vision_ready = any(
-                            getattr(child, "vision_enabled", False)
-                            for child in active_llm.child_bindings.values()
-                        )
-            if enable_computer_use and _computer_use_vision_ready:
+                    _has_vision = bool(getattr(active_llm, "vision_enabled", False))
+
+            if _has_vision:
+                _libraries_to_mount.append("vlm_query")
+
+            _computer_use_vision_ready = enable_computer_use and _has_vision
+            if _computer_use_vision_ready:
                 _libraries_to_mount.append("computer_use")
 
             for lib_name in _libraries_to_mount:
@@ -3795,6 +4196,9 @@ JSON:"""
 
                     allowed_tool_names.update(_GIT_TOOL_NAMES)
 
+                    if _has_vision:
+                        allowed_tool_names.update({"tool_inspect_image", "tool_vlm_query"})
+
                     if enable_computer_use and _computer_use_vision_ready:
                         allowed_tool_names.update(_COMPUTER_USE_TOOL_NAMES)
 
@@ -3804,84 +4208,254 @@ JSON:"""
                 except Exception as e:
                     ASCIIColors.warning(f"[{self.name}] Failed to extract LCP tool specs: {e}")
 
-        if BindingToolsBuilder and self.lollms_client and self.capabilities:
-            binding_tools = BindingToolsBuilder.build_tools(self.lollms_client, self.capabilities, self._resolved_workspace)
-            active_tools.update(binding_tools)
+        # ── 1. CORE MINIMUM TOOLS ONLY (File search/grep, Python, Shell) ──
+        # Git, Multimodal, Computer Use, Sub-agents, and Memory tools are kept LOADABLE on demand.
 
-        if self.capabilities and self.capabilities.enable_skill_loading:
-            if self.skills_manager:
-                all_skill_tools = self.skills_manager.build_skill_tools()
-                for t_name in ("tool_load_skill", "tool_search_skills", "tool_list_skills"):
-                    if t_name in all_skill_tools:
-                        active_tools[t_name] = all_skill_tools[t_name]
+        # ── 2. CONTEXTUAL DETECTION: Data vs Document files in workspace ──
+        ws_path = self._resolved_workspace
+        has_data_files = False
+        has_document_files = False
+        if ws_path and ws_path.exists():
+            _DATA_EXTS = {".csv", ".tsv", ".db", ".sqlite", ".sqlite3", ".parquet"}
+            _DOC_EXTS = {".pdf", ".docx", ".pptx", ".odt", ".epub", ".doc"}
+            try:
+                for root, dirs, files in os.walk(ws_path):
+                    dirs[:] = [d for d in dirs if d not in _IGNORED_WS_DIRS and not d.startswith(".")]
+                    for fname in files:
+                        ext = Path(fname).suffix.lower()
+                        if ext in _DATA_EXTS:
+                            has_data_files = True
+                        elif ext in _DOC_EXTS:
+                            has_document_files = True
+                        if has_data_files and has_document_files:
+                            break
+                    if has_data_files and has_document_files:
+                        break
+            except Exception:
+                pass
 
-        if self.capabilities and self.capabilities.enable_sub_agents:
-            if self._sub_agent_spawner:
-                def tool_spawn_sub_agent(instruction: str, personality_conditioning: str = "", model_name: str = "") -> dict:
-                    """
-                    Spawns a child agent to execute a sub-task.
-                    """
-                    return self._sub_agent_spawner.spawn(
-                        instruction=instruction,
-                        personality_conditioning=personality_conditioning or None,
-                        model_name=model_name or None,
+        # ── 3. MOUNT CONTEXTUAL TOOLS ONLY WHEN MATCHING FILES EXIST ──
+        if lcp_binding and hasattr(lcp_binding, 'mount_tool_library'):
+            if has_data_files:
+                lcp_binding.mount_tool_library_if_absent("semantic_data_engineer")
+                try:
+                    specs = lcp_binding.to_chat_tool_specs(
+                        discussion_instance=getattr(self, '_artefact_proxy', None),
+                        lollms_client_instance=self.lollms_client
                     )
+                    for t_name in ("tool_execute_python_data_query", "tool_get_table_schema", "tool_query_database_sql"):
+                        if t_name in specs:
+                            active_tools[t_name] = specs[t_name]
+                    ASCIIColors.info(f"[{self.name}] Mounted database & tabular query tools (data files detected).")
+                except Exception as ex:
+                    ASCIIColors.warning(f"Failed to mount data query tools: {ex}")
 
-                active_tools["tool_spawn_sub_agent"] = {
-                    "name": "tool_spawn_sub_agent",
-                    "description": "Spawn a focused sub-agent to perform a specific sub-task in the workspace.",
-                    "parameters": [
-                        {"name": "instruction", "type": "str", "description": "The specific task instructions for the sub-agent."},
-                        {"name": "personality_conditioning", "type": "str", "description": "System prompt conditioning the sub-agent's behavior.", "optional": True},
-                        {"name": "model_name", "type": "str", "description": "Specific model name to use for the sub-agent.", "optional": True}
-                    ],
-                    "callable": tool_spawn_sub_agent
+            if has_document_files:
+                lcp_binding.mount_tool_library_if_absent("as_is_document_tools")
+                lcp_binding.mount_tool_library_if_absent("document_editor")
+                try:
+                    specs = lcp_binding.to_chat_tool_specs(
+                        discussion_instance=getattr(self, '_artefact_proxy', None),
+                        lollms_client_instance=self.lollms_client
+                    )
+                    for t_name in ("tool_inspect_document", "tool_read_document_content", "tool_annotate_document", "tool_edit_document_text"):
+                        if t_name in specs:
+                            active_tools[t_name] = specs[t_name]
+                    ASCIIColors.info(f"[{self.name}] Mounted document annotation & reading tools (rich documents detected).")
+                except Exception as ex:
+                    ASCIIColors.warning(f"Failed to mount document tools: {ex}")
+
+        # ── 4. WIRE DYNAMIC TOOL LOADER & UNLOADER (TOOL-ON-DEMAND) ──
+        loadable_tool_index = {
+            "file_organizer": "Automated workspace file migration from YAML/JSON plans (tool_organize_files_from_plan)",
+            "git_manager": "Git version control operations (tool_git_status, tool_git_commit, tool_git_diff, tool_git_branch, tool_git_checkout)",
+            "generate_image": "Text-to-Image creation and editing (tool_generate_image, tool_edit_image)",
+            "speech_to_text": "Audio transcription (tool_speech_to_text)",
+            "text_to_speech": "Audio synthesis (tool_text_to_speech)",
+            "generate_music": "Music and song generation (tool_generate_music, tool_generate_song)",
+            "send_connection": "Message dispatch to Slack, Discord, webhooks (tool_send_connection)",
+            "computer_use": "Desktop UI automation and clicking (tool_computer_screenshot, tool_computer_click, tool_computer_type)",
+            "vlm_query": "Vision model inspection of images (tool_inspect_image, tool_vlm_query)",
+            "model_switcher": "On-the-fly model switching (tool_switch_model, tool_list_models)",
+            "memory_tools": "Cognitive memory persistence (tool_save_memory, tool_search_memory, tool_load_memory)",
+        }
+        object.__setattr__(self, "_loadable_tool_index", loadable_tool_index)
+
+        def _resolve_and_mount_tool(target_name: str) -> List[str]:
+            """Helper that resolves, mounts, and registers a tool into active_tools."""
+            target = target_name.strip()
+            loaded = []
+
+            # 1. Already in active_tools
+            if target in active_tools:
+                return [target]
+
+            # 2. Direct check in LCP binding
+            if lcp_binding:
+                if target in ("file_organizer", "tool_organize_files_from_plan") or "organize" in target.lower():
+                    lcp_binding.mount_tool_library_if_absent("file_organizer")
+                    specs = lcp_binding.to_chat_tool_specs(
+                        discussion_instance=getattr(self, '_artefact_proxy', None),
+                        lollms_client_instance=self.lollms_client
+                    )
+                    for tn in ("tool_organize_files_from_plan",):
+                        if tn in specs:
+                            active_tools[tn] = specs[tn]
+                            loaded.append(tn)
+
+                lib_name = lcp_binding.find_library_for_tool(target)
+                if lib_name:
+                    lcp_binding.mount_tool_library_if_absent(lib_name)
+                    all_specs = lcp_binding.to_chat_tool_specs(
+                        discussion_instance=getattr(self, '_artefact_proxy', None),
+                        lollms_client_instance=self.lollms_client
+                    )
+                    for s_name, s_def in all_specs.items():
+                        if s_name == target or target in s_name or s_name.endswith(target.replace("tool_", "")):
+                            active_tools[s_name] = s_def
+                            loaded.append(s_name)
+
+            # 3. Check special categories (git, multimodal, sub_agents)
+            if ("git" in target.lower() or target.startswith("tool_git_")) and lcp_binding:
+                lcp_binding.mount_tool_library_if_absent("git_manager")
+                specs = lcp_binding.to_chat_tool_specs()
+                for gn in ("tool_git_status", "tool_git_diff", "tool_git_commit", "tool_git_branch", "tool_git_checkout", "tool_git_log"):
+                    if gn in specs:
+                        active_tools[gn] = specs[gn]
+                        loaded.append(gn)
+
+            elif ("image" in target.lower() or target in ("tool_generate_image", "tool_edit_image")) and BindingToolsBuilder and self.lollms_client:
+                b_tools = BindingToolsBuilder.build_tools(self.lollms_client, self.capabilities, self._resolved_workspace)
+                for iname in ("tool_generate_image", "tool_edit_image"):
+                    if iname in b_tools:
+                        active_tools[iname] = b_tools[iname]
+                        loaded.append(iname)
+
+            elif "sub_agent" in target.lower() or "spinoff" in target.lower():
+                if self._sub_agent_spawner:
+                    active_tools["tool_spawn_sub_agent"] = {
+                        "name": "tool_spawn_sub_agent",
+                        "description": "Spawn a focused sub-agent to perform a specific sub-task in the workspace.",
+                        "parameters": [
+                            {"name": "instruction", "type": "str", "description": "The specific task instructions for the sub-agent."},
+                            {"name": "personality_conditioning", "type": "str", "description": "System prompt conditioning the sub-agent's behavior.", "optional": True},
+                            {"name": "model_name", "type": "str", "description": "Specific model name to use for the sub-agent.", "optional": True},
+                        ],
+                        "callable": lambda instruction, personality_conditioning="", model_name="": self._sub_agent_spawner.spawn(
+                            instruction=instruction, personality_conditioning=personality_conditioning or None, model_name=model_name or None
+                        )
+                    }
+                    loaded.append("tool_spawn_sub_agent")
+
+            elif "computer" in target.lower() and lcp_binding:
+                lcp_binding.mount_tool_library_if_absent("computer_use")
+                specs = lcp_binding.to_chat_tool_specs()
+                for cn in ("tool_computer_desktop_info", "tool_computer_screenshot", "tool_computer_click", "tool_computer_type"):
+                    if cn in specs:
+                        active_tools[cn] = specs[cn]
+                        loaded.append(cn)
+
+            # 4. Search and auto-install from tools zoo if missing
+            if not loaded and self._resolved_workspace:
+                try:
+                    from lollms_client.apps.lollms_code.zoo import ZooManager
+                    zm = ZooManager(self._resolved_workspace)
+                    zoo_tool = zm.find_tool_for_requirement(target)
+                    if zoo_tool:
+                        ok, _ = zm.install_item(zoo_tool, scope="project")
+                        if ok and lcp_binding:
+                            lcp_binding._discover_local_tools()
+                            specs = lcp_binding.to_chat_tool_specs()
+                            for s_name, s_def in specs.items():
+                                if s_name == target or target in s_name or s_name.endswith(target.replace("tool_", "")):
+                                    active_tools[s_name] = s_def
+                                    loaded.append(s_name)
+                except Exception as zoo_ex:
+                    ASCIIColors.warning(f"[{self.name}] Zoo search for tool '{target}' failed: {zoo_ex}")
+
+            return list(dict.fromkeys(loaded))
+
+        def tool_load_tool(tool_name: str) -> dict:
+            """
+            Loads and activates an on-demand tool or toolset into your active tool registry for this session.
+
+            Args:
+                tool_name (str): Name of the tool or toolkit to load (e.g. 'file_organizer', 'git_manager', 'generate_image', 'computer_use', 'sub_agents', 'vlm_query').
+            """
+            target = tool_name.strip()
+            loaded_specs = _resolve_and_mount_tool(target)
+
+            if loaded_specs:
+                return {
+                    "success": True,
+                    "output": f"Successfully loaded and activated tool(s): {', '.join(loaded_specs)}. Their schemas are now available in your active tool registry.",
+                    "loaded_tools": loaded_specs
                 }
 
-            from lollms_client.lollms_agentic.spinoff_tools import build_spinoff_agent_tools
-            spinoff_tools = build_spinoff_agent_tools(
-                discussion=self,
-                images=[],
-                orchestrator_mode=False,
-                streaming_callback=getattr(self, '_active_streaming_callback', None)
-            )
-            active_tools.update(spinoff_tools)
-
-        if self._model_switcher and self.capabilities and self.capabilities.enable_model_switching:
-            def tool_switch_model(model_name: str) -> dict:
-                return self._model_switcher.switch_model(model_name)
-
-            def tool_list_models() -> dict:
-                models = self._model_switcher.list_models()
-                return {"success": True, "models": models, "output": ", ".join(models)}
-
-            active_tools["tool_switch_model"] = {
-                "name": "tool_switch_model",
-                "description": "Switch to a different model.",
-                "parameters": [{"name": "model_name", "type": "str", "description": "The name of the model to switch to."}],
-                "callable": tool_switch_model
-            }
-            active_tools["tool_list_models"] = {
-                "name": "tool_list_models",
-                "description": "List available models.",
-                "parameters": [],
-                "callable": tool_list_models
+            return {
+                "success": False,
+                "error": f"Tool '{target}' could not be resolved or loaded. Check available toolkits in your prompt."
             }
 
-        # Merge Handbag / Personality-level Tools (LCPBinding / tool_specs)
-        if self._tool_binding and _is_tool_binding(self._tool_binding):
-            try:
-                handbag_tools = self._tool_binding.to_chat_tool_specs(
-                    discussion_instance=getattr(self, '_artefact_proxy', None),
-                    lollms_client_instance=self.lollms_client
-                )
-                active_tools.update(handbag_tools)
-            except Exception as e:
-                ASCIIColors.warning(f"[{self.name}] Failed to extract handbag tools: {e}")
+        def tool_unload_tool(tool_name: str) -> dict:
+            """Unloads a tool from active context to free token space."""
+            target = tool_name.strip()
+            removed = []
+            for k in list(active_tools.keys()):
+                if k == target or target in k:
+                    # Do not allow unloading the strict core minimum
+                    if k in ("tool_find_files", "tool_grep_files", "tool_list_files", "tool_read_file", "tool_write_file", "tool_execute_python_code", "tool_execute_python_file", "tool_execute_shell_command", "tool_load_tool", "tool_load_skill"):
+                        continue
+                    del active_tools[k]
+                    removed.append(k)
+            if removed:
+                return {"success": True, "output": f"Unloaded tool(s): {', '.join(removed)} from active context."}
+            return {"success": False, "error": f"Tool '{target}' not found in active tools or is part of the protected core."}
 
-        # Mount RAG Query Tool if personality has RAG data sources
-        if self.has_data:
-            active_tools.update(self.build_rag_tools())
+        active_tools["tool_load_tool"] = {
+            "name": "tool_load_tool",
+            "description": "Loads on-demand toolsets (git, image generation, speech, computer use, sub-agents, etc.) into active context when needed.",
+            "parameters": [
+                {"name": "tool_name", "type": "str", "description": "The name of the tool or toolkit to load (e.g. 'git_manager', 'generate_image', 'computer_use', 'sub_agents')."}
+            ],
+            "callable": tool_load_tool
+        }
+        active_tools["tool_unload_tool"] = {
+            "name": "tool_unload_tool",
+            "description": "Unloads an active tool from context to save tokens when no longer needed.",
+            "parameters": [
+                {"name": "tool_name", "type": "str", "description": "The name of the tool to unload."}
+            ],
+            "callable": tool_unload_tool
+        }
+
+        # ── 5. SKILLS MANAGER REGISTRATION WITH AUTO-TOOL LOADING ──
+        if self.capabilities and self.capabilities.enable_skill_loading and self.skills_manager:
+            def _skill_tool_availability_checker(t_name: str) -> bool:
+                clean = t_name.lower().strip()
+                if clean in active_tools:
+                    return True
+                if lcp_binding and (lcp_binding.is_tool_available(clean) or lcp_binding.is_tool_available(f"tool_{clean}")):
+                    return True
+                return clean in loadable_tool_index or any(clean in k for k in loadable_tool_index)
+
+            def _skill_tool_loader(t_name: str) -> Optional[Dict[str, Any]]:
+                clean = t_name.strip()
+                mounted_names = _resolve_and_mount_tool(clean)
+                for m_name in mounted_names:
+                    if m_name in active_tools:
+                        return active_tools[m_name]
+                if clean in active_tools:
+                    return active_tools[clean]
+                return None
+
+            self.skills_manager.tool_availability_checker = _skill_tool_availability_checker
+            self.skills_manager.tool_loader = _skill_tool_loader
+
+            all_skill_tools = self.skills_manager.build_skill_tools()
+            for t_name in ("tool_load_skill", "tool_unload_skill", "tool_search_skills", "tool_list_skills"):
+                if t_name in all_skill_tools:
+                    active_tools[t_name] = all_skill_tools[t_name]
 
         lcp_binding = getattr(self.lollms_client, 'tools', None)
         if not _is_tool_binding(lcp_binding) or hasattr(lcp_binding, "_mock_return_value"):
@@ -4031,15 +4605,20 @@ JSON:"""
             object.__setattr__(self, '_user_profile_content', "")
 
     def _build_scratchpad_context(self) -> str:
-        """Reads the scratchpad content for injection into the dynamic suffix."""
+        """Reads the ephemeral scratchpad content for injection into the dynamic suffix."""
         if not getattr(self, '_scratchpad_path', None) or not self._scratchpad_path.exists():
             return ""
 
         try:
             content = self._scratchpad_path.read_text(encoding="utf-8", errors="ignore")
-            if not content.strip():
+            # If the scratchpad has no meaningful notes (only headers or blank lines), do not inject
+            meaningful_lines = [
+                l.strip() for l in content.splitlines()
+                if l.strip() and not l.startswith("#") and "(Empty - " not in l and "Use this space to store" not in l
+            ]
+            if not meaningful_lines:
                 return ""
-            return f"=== SCRATCHPAD CONTENT ===\n{content}\n=== END SCRATCHPAD ==="
+            return f"=== SCRATCHPAD CONTENT (CURRENT SESSION ONLY) ===\n{content.strip()}\n=== END SCRATCHPAD ==="
         except Exception:
             return ""
 
@@ -4363,227 +4942,83 @@ JSON:"""
         except Exception:
             return None
 
-    def _build_system_prompt(self, active_tools: Optional[Dict] = None) -> str:
+    def _build_system_prompt(self, active_tools: Optional[Dict] = None, dynamic_effort: bool = False) -> str:
         sys_prompt = self.system_prompt or ""
         onboarding_block = self._build_onboarding_block()
+        memory_doctrine = (
+            "\n=== MEMORY DOCTRINE: PASSIVE CONTEXT VS ACTIVE TASK (CRITICAL) ===\n"
+            "1. **MEMORIES ARE PASSIVE BACKGROUND KNOWLEDGE**: Memories in `=== ACTIVE MEMORIES ===` or `=== WORKING MEMORY ===` contain background facts, user preferences, and historical milestones. They are strictly INFORMATIONAL REFERENCE.\n"
+            "2. **NEVER RESUME PAST TASKS ON GREETINGS**: If the user says 'Hi', 'Hello', or enters a greeting, simple conversational question, or new request, DO NOT start working on past tasks or actions mentioned in memory. Greet the user politely, acknowledge their query, and await their explicit task instructions.\n"
+            "3. **SOLE TASK = LATEST USER MESSAGE**: Your task in this turn is determined ONLY by the latest user message. Memories provide context on how the user prefers things, but DO NOT dictate what task to perform.\n"
+            "=== END MEMORY DOCTRINE ===\n"
+        )
+        greeting_invariant = (
+            "\n=== GREETINGS & CASUAL REPLIES (STRICT INVARIANT) ===\n"
+            "If the user's message is a greeting (e.g. 'hi', 'hi there', 'hello', 'hey') or casual remark:\n"
+            "- You MUST reply with a friendly greeting and ask what they would like to work on.\n"
+            "- You are STRICTLY FORBIDDEN from creating or modifying files, emitting <artifact> tags, or calling tools!\n"
+            "- DO NOT resume or execute any past task mentioned in CURRENT.md, memories, or scratchpad.\n"
+            "- Conclude your greeting with `<done/>` on a new line.\n"
+            "=== END GREETINGS INVARIANT ===\n"
+        )
+        skill_mandate = (
+            "\n=== SKILL-FIRST EXECUTION MANDATE (CRITICAL) ===\n"
+            "Before beginning any non-trivial task:\n"
+            "1. **CHECK LOADABLE SKILLS FIRST**: Review the `=== AVAILABLE SKILLS ===` and any `=== RECOMMENDED SKILL ===` block.\n"
+            "2. **LOAD MATCHING SKILL IN ROUND 1**: If a skill matches the user's request (e.g. `file_organization` for organizing/cleaning folders, `document_analysis_and_extraction` for parsing/annotating docs, `deep_websearch_and_extraction` for web research, `fullstack_development` for web apps/APIs):\n"
+            "   - You MUST call `<tool>{\"name\": \"tool_load_skill\", \"parameters\": {\"title\": \"<skill_title>\"}}</tool>` as your VERY FIRST ACTION in Round 1!\n"
+            "   - DO NOT improvise ad-hoc plans or guess workflows when a specialized skill exists. Load the skill and follow its exact protocol.\n"
+            "   - Do NOT emit `<done/>` after loading the skill; the system will return its full doctrine in the next round so you can execute it.\n"
+            "=== END SKILL-FIRST MANDATE ===\n"
+        )
         rules = (
-          "\n=== ACTION EXECUTION & SAME-RESPONSE MANDATE (CRITICAL) ===\n"
-          "1. **INTENT ≠ EXECUTION (SAME-RESPONSE EXECUTION MANDATE)**: Stating an intent to perform an action (search, query, read file, create/modify file, execute tool, save skill/memory) in ANY language (English, Arabic, Chinese, French, etc.) DOES NOT execute the action. Conversational text is completely inert.\n"
-          "   - You MUST output the corresponding functional XML tag (`<tool>`, `<artifact>`, `<skill>`, `<unlock_file>`, `<mem_new>`, etc.) IN THE EXACT SAME RESPONSE immediately after stating your intent.\n"
-          "   - **NEVER SPLIT INTENT AND TAGS**: Never announce what you are going to do and then stop without emitting the tag. If you do not emit the tag in the same response, the turn will end with nothing done.\n"
-          "   - **DESTRUCTIVE VS CONSTRUCTIVE ACTIONS**:\n"
-          "     • If an action is destructive, risky, or irreversible (e.g. deleting files, force-pushing git, dropping database tables), explicitly ask the user for confirmation and wait for their reply before emitting destructive tags.\n"
-          "     • For ALL normal, constructive tasks (creating/editing files, querying data, running tools, reading files), output the functional tag IMMEDIATELY in the same turn without asking or waiting.\n"
-          "2. **EXPLICIT TERMINATION WITH `<done/>`**: When all objectives are met and tests pass, end with a `<done/>` tag on a new line.\n"
-          "3. **SAME-SESSION CONTINUATION**: When executing a sequence, emit the next action's tag in your IMMEDIATE NEXT response.\n"
-          "4. **AGENTIC TRIGGER**: If the user requests code generation, file modification, testing, or multi-step work, you MUST enter the agentic loop and use `<tool>` or `<artifact>` tags. Do NOT write code directly in conversational prose.\n"
-          "5. **ROUND 1 SHORT-CIRCUIT**: If the user's request is purely conversational (e.g., greetings, simple questions), respond conversationally. **MANDATORY**: You MUST end EVERY completed turn with `<done/>` on a new line, including pure conversational answers. `<done/>` is the only valid turn terminator; never end a turn without it.\n"
-          "6. **NO PROSE BEFORE TOOLS**: DO NOT write verbose introductory text before a tool call. Output the `<tool>` tag immediately after any brief 1-line explanation.\n"
-          "7. **BATCH CONTEXT OPERATIONS (MANDATORY)**: When locking, unlocking, or hiding multiple files, you MUST use a SINGLE tag containing all files separated by newlines. DO NOT emit multiple sequential tags for batch operations.\n"
-            "   Example:\n"
-            "   <lock_file>\n"
-            "   file1.py\n"
-            "   file2.py\n"
-            "   file3.py\n"
-            "   </lock_file>\n"
-            "10. **DEPENDENCY SEPARATION (CRITICAL)**: You MAY emit multiple independent `<tool>` or `<artifact>` tags in a single response. They will be buffered and executed sequentially.\n"
-            "    HOWEVER, if you need the RESULT of Tool A to construct the parameters for Tool B, they MUST be executed in separate rounds.\n"
-            "    - Do NOT guess the output of Tool A. Emit Tool A, end your turn, and wait for the system to return the result.\n"
-            "    - Once you have the result, emit Tool B in your next response.\n"
-            "    - Example of WRONG behavior: `<tool>{\"name\": \"find_file\", \"parameters\": {\"pattern\": \"config.yml\"}}</tool>` followed by `<tool>{\"name\": \"read_file\", \"parameters\": {\"path\": \"./config.yml\"}}</tool>` (The path is guessed).\n"
-            "    - Example of CORRECT behavior: Emit `<tool>{\"name\": \"find_file\", \"parameters\": {\"pattern\": \"config.yml\"}}</tool>` and end your turn. In the next turn, use the returned path to call `read_file`.\n"
-            "11. **EXPLANATION BEFORE ARTIFACTS (MANDATORY)**: Before emitting an `<artifact>` tag, you MUST provide a brief, 2-3 sentence explanation of what you are about to write and why. Do NOT emit the `<artifact>` tag as the very first token of your response.\n"
-            "\n=== TOOL CALLING DISCIPLINE (XML HYBRID PROTOCOL) ===\n"
-            "To call a tool, you have TWO options. **Option 1 is strongly preferred for code execution** to avoid escaping errors.\n\n"
-            "OPTION 1: Raw XML Parameters (No JSON escaping needed)\n"
-            "Use this for tools with code or long text parameters. Wrap each parameter in its own tag.\n"
-            "<tool>\n"
-            "  <tool_name name=\"tool_execute_python_code\" />\n"
-            "  <parameter name=\"code\">\n"
-            "import sys\n"
-            "print(\"Hello World\")\n"
-            "  </parameter>\n"
-            "</tool>\n\n"
-            "OPTION 2: JSON Parameters (For simple, non-code parameters)\n"
-            "Use this for simple parameters (filenames, booleans, numbers).\n"
-            "<tool>\n"
-            "  <tool_name name=\"tool_find_files\" />\n"
-            "  <parameters>{\"pattern\": \"*.py\", \"path\": \".\"}</parameters>\n"
-            "</tool>\n\n"
-            "1. **Tool Results ≠ Tool Calls**: When a tool returns JSON, it's a RESULT, not a new call.\n"
-            "2. **One Call Per Task**: Once a tool succeeds, analyze and answer.\n"
-            "3. **Loop Prevention**: Repeating a successful tool call with identical parameters is a CRITICAL ERROR.\n"
-            "4. **File Outputs**: When a tool returns a file, it's ALREADY saved. Do NOT call it again.\n"
-            "\n=== FILE EDITING & WRITING PROTOCOL ===\n"
-            "You have a massive output token limit. Write complete files whenever possible.\n"
-            "For surgical updates to existing files, you MUST use the `<artifact>` tag with SEARCH/REPLACE blocks.\n"
-            "The system automatically applies fuzzy matching and auto-correction if the exact search string isn't found.\n"
-            "Syntax:\n"
-            "<artifact name=\"filename.ext\" type=\"code\" language=\"python\">\n"
-            "<<<<<<< SEARCH\n"
-            "// exact lines to find\n"
-            "=======\n"
-            "// new lines to replace with\n"
-            ">>>>>>> REPLACE\n"
-            "</artifact>\n"
-            "If a patch fails, the system will return the error. You MUST read the error carefully. The file content is already available in your context under the `## Fully Loaded File Contents [C]` section. Concentrate on the exact text, fix your SEARCH block, and re-emit the `<artifact>` tag. Do not attempt to use a `tool_read_file` tool, as it does not exist.\n"
-            "\n**SEGMENTED WRITING (APPEND OPERATION)**\n"
-            "If you are writing a very large file and prefer to write it in chunks (or if you hit a generation limit), you can use the `operation=\"append\"` attribute.\n"
-            "This adds the content inside the tag to the end of the specified file without overwriting what is already there.\n"
-            "Syntax:\n"
-            "<artifact name=\"filename.ext\" type=\"code\" language=\"python\" operation=\"append\">\n"
-            "// content to add to the end of the file\n"
-            "</artifact>\n"
-            "You MUST ensure the file exists before appending to it. Use `operation=\"append\"` sequentially to build massive files piece by piece.\n"
-            "\n=== SKILLS SYSTEM ===\n"
-            "Skills are persistent knowledge capsules stored outside the workspace. They survive across sessions.\n"
-            "They are categorized by visibility:\n"
-            "1. **Visible**: Automatically loaded in your system prompt. Costs 0 turns.\n"
-            "2. **Loadable**: Listed in your context block. Use `tool_load_skill` to pull the full content (Costs 1 turn).\n"
-            "3. **Searchable**: Hidden from your context block. Use `tool_search_skills` then `tool_load_skill` (Costs 2 turns).\n"
-            "Use `tool_list_skills` to programmatically list all skills and their tiers.\n"
-            "If you discover a reusable methodology or best practice, use `tool_create_skill` to save it for future use.\n"
-            "Use `tool_update_skill` to refine existing skills as you learn more.\n"
-            "\n=== SUB-AGENT DELEGATION ===\n"
-            "If `tool_spawn_sub_agent` is available, you can delegate complex sub-tasks to a focused child agent.\n"
-            "The child shares your workspace but cannot spawn further sub-agents.\n"
-            "Use this for heavy tasks like writing large scripts, researching topics, or designing presentations.\n"
-            "\n=== STATE & MEMORY SEGREGATION DOCTRINE (CRITICAL) ===\n"
-            "You have TWO distinct mechanisms for persisting information. You MUST strictly segregate what goes where.\n"
-            "1. **THE SCRATCHPAD (`<scratchpad_append>` / `<scratchpad_patch>`)**:\n"
-            "   - **Scope**: LOCAL to the current project/workspace.\n"
-            "   - **Usage**: Use for SHORT-TERM, project-specific state. Examples: temporary file paths, intermediate calculation results, active task checklists, or branching strategies specific to this codebase.\n"
-            "   - **Clearing**: Use `<scratchpad_clear></scratchpad_clear>` when the specific task is done to free up context space.\n"
-            "2. **PERSISTENT MEMORY (`<mem_new>` / `<mem_update>`)**:\n"
-            "   - **Scope**: UNIVERSAL. Survives across ALL projects and sessions.\n"
-            "   - **Usage**: Use for LONG-TERM facts, architectural rules, and universal user preferences. Examples: 'The user prefers 4-space indentation', 'Library X requires initialization before use', 'The user's name is Saif'.\n"
-            "   - **Mandatory Action**: If the user states a personal fact or a universal coding standard, you MUST emit `<mem_new>` immediately.\n"
-            "3. **USER PROFILE (`<user_profile_update>`)**:\n"
-            "   - Used exclusively for the user's identity and universal interaction preferences.\n"
-            "=== END STATE & MEMORY SEGREGATION DOCTRINE ===\n"
-            "\n=== OPERATIONAL SAFETY DOCTRINE ===\n"
-            "1. **GIT BRANCHING & CONFIRMATION PROTOCOL (MANDATORY)**: \n"
-            "   Before modifying, overwriting, or deleting ANY existing file in the workspace, you MUST follow this protocol:\n"
-            "   a. Check if a `.git` directory exists in the workspace root.\n"
-            "   b. If it exists, you MUST ask the user for explicit permission to proceed.\n"
-            "      Example: \"⚠️ I am about to modify `critic.md`. This action will be executed on a new git branch. Do you approve? (yes/no)\"\n"
-            "   c. Upon receiving 'yes', you MUST create and checkout a new branch before emitting any `<artifact>` tags.\n"
-            "      Use the shell tool: `git checkout -b update/<short-branch-name>`.\n"
-            "      Work exclusively in this branch. Only merge back to `main` after all tests pass.\n"
-            "   d. If no `.git` directory exists, you may proceed with modifications, but you should still inform the user before overwriting large files.\n"
-            "2. **DANGEROUS OPERATIONS (HUMAN-IN-THE-LOOP)**: Operations that are destructive or irreversible REQUIRE explicit user confirmation.\n"
-            "   Examples: `git push --force`, `rm -rf`, dropping database tables, modifying system configs.\n"
-            "   Before executing such a command via a tool, you MUST output a message like:\n"
-            "   \"⚠️ DANGER: I am about to run `git push --force`. This will overwrite remote history. Do you approve? (yes/no)\"\n"
-            "   Wait for the user's response before emitting the tool tag.\n"
-            "3. **AUTONOMOUS DEBUGGING LOOPS**: Fixing failing tests, resolving merge conflicts, and iterating on code during a debug cycle is EXEMPT from the confirmation rule.\n"
-            "   If tests fail, autonomously read the logs, fix the code, and re-run tests until they pass. Do NOT ask the user for help.\n"
-            "4. **GIT STATE PRESERVATION (ABSOLUTE PROHIBITION)**: \n"
-            "   Before creating a new branch (`git checkout -b`), you MUST ensure the working tree is clean.\n"
-            "   a. Run `git status`.\n"
-            "   b. If there are uncommitted changes, you are STRICTLY FORBIDDEN from running `git stash` or `git commit` autonomously.\n"
-            "   c. You MUST stop and output EXACTLY: \"⚠️ I need to create a new branch, but you have uncommitted changes. Do you want me to `git stash` them (temporary) or `git commit` them (permanent) before I switch branches? (stash/commit/cancel)\n</done>\" the done tag is important, it stops the loop and gives the hand back to user"
-            "   d. You MUST wait for the user's explicit response ('stash' or 'commit') before executing either command.\n"
-            "   e. NEVER execute `git checkout -b` on a dirty working tree. This carries changes to the new branch and pollutes it.\n"
-            "   f. Before stashing or switching, use `<scratchpad_append>` to save your current plan and reasoning so you don't lose your train of thought.\n"
-            "=== END OPERATIONAL SAFETY DOCTRINE ===\n"
-            f"{onboarding_block}"
-            "\n=== THINKING & REASONING CONSTRAINT ===\n"
-            "If you output thoughts enclosed in  tags, you MUST output all functional XML tags AFTER the closing tag.\n"
-            "\n=== TOOL CALLING SYNTAX (STRICT) ===\n"
-            "1. **EXACT CLOSING TAG**: The closing tag is `</tool>`. You MUST NOT write ``` or any other variation.\n"
-            "2. **NEW LINE ONLY**: The `<tool>` tag MUST start on a brand new line.\n"
-            "3. **NO PROSE AROUND IT**: Do NOT write introductory text before the tag, and do NOT write text after it on the same line.\n"
-            "4. **XML HYBRID FORMAT**: You MUST use `<tool_name name=\"...\" />` inside the `<tool>` tag.\n"
-            "=== END TOOL CALLING SYNTAX ===\n"
-            "\n=== ANTI-MIMICRY PROTOCOL (CRITICAL) ===\n"
-            "1. **NEVER OUTPUT SYSTEM MARKERS**: You are STRICTLY FORBIDDEN from generating `<processing>` blocks or `[SYSTEM:` markers.\n"
-            "2. **USE REAL TAGS**: To call tools, use the actual `<tool>` XML tags.\n"
-            "\n=== GLOBAL USER PROFILE MANAGEMENT ===\n"
-            "You have access to a universal user profile that persists across ALL projects and sessions.\n"
-            "It contains the user's identity, global constraints, and universal preferences.\n"
-            "CRITICAL: Do NOT store project-specific information (like 'this project uses React') in the user profile. Use the Scratchpad for project state.\n"
-            "To update the user profile when you learn a new universal fact, emit:\n"
-            "<user_profile_update>\n"
-            "<<<<<<< SEARCH\n"
-            "// exact lines to find\n"
-            "=======\n"
-            "// new lines to replace with\n"
-            ">>>>>>> REPLACE\n"
-            "</user_profile_update>\n"
-            "\n=== WORKSPACE CONTEXT & DYNAMIC STATE PROTOCOL (CRITICAL) ===\n"
-            "You operate inside a workspace. At the beginning of EVERY turn, the user's prompt will be suffixed with a dynamic context block.\n"
-            "This block contains:\n"
-            "1. **Workspace Directory Tree**: A list of all files with markers indicating their state.\n"
-            "   - [C] Fully Loaded in Context (Verbatim text/code is provided below the tree)\n"
-            "   - [M] Signature / Metadata Only (Exposes schemas, layouts, or code signatures)\n"
-            "   - [U] Inactive/Unlockable (Excluded from context, but you can unlock it to [C] by calling <unlock_file>)\n"
-            "   - [L] Locked in Tree (Excluded from context and cannot be unlocked)\n"
-            "2. **Fully Loaded File Contents**: The raw text of any files marked [C].\n"
-            "3. **Persistent Scratchpad**: Your long-term notes for state recovery across sessions.\n"
-            "   To update it, use:\n"
-            "   1. `<scratchpad_append>content to add</scratchpad_append>`\n"
-            "   2. `<scratchpad_patch>` with Aider SEARCH/REPLACE blocks to surgically update sections.\n"
-            "4. **Active Memories**: Relevant memories hydrated from your persistent database.\n"
-            "5. **Context Telemetry**: A live breakdown of token consumption per segment (System, History, Tree, Contents, Virtual History).\n"
-            "\n**CONTEXT VISIBILITY OPERATIONS**\n"
-            "To manage your context budget, you can emit the following tags:\n"
-            "- `<unlock_file>filename.py</unlock_file>`: Loads a file into your context (changes [U] to [C]).\n"
-            "- `<lock_file>filename.py</lock_file>`: Removes a file from your context (changes [C] to [U]).\n"
-            "- `<hide_file>filename.py</hide_file>`: Completely removes a file from your view.\n"
-            "- `<collapse_folder>folder_name</collapse_folder>`: Hides all files within a folder.\n"
-            "- `<uncollapse_folder>folder_name</uncollapse_folder>`: Restores a collapsed folder.\n"
-            "- Batch operations are supported and encouraged. You can list multiple files separated by newlines, commas, or semicolons inside a single tag:\n"
-            "  <unlock_file>\n"
-            "    file1.py,\n"
-            "    file2.py,\n"
-            "    file3.py\n"
-            "  </unlock_file>\n"
-            "\n**AUTONOMOUS HISTORY REFACTORING**\n"
-            "If the Context Telemetry indicates that `History` or `Virtual History` is consuming an excessive amount of tokens (e.g., > 40% of total context),\n"
-            "or if the user explicitly asks to refactor, summarize, or compress the conversation history, you MUST emit:\n"
-            "<refactor_history></refactor_history>\n"
-            "This will trigger an autonomous background process that summarizes the older conversation history into a dense, factual block,\n"
-            "freeing up massive amounts of context space without losing critical state.\n"
-            "\n=== EPHEMERAL CONTEXT & SCRATCHPAD ENFORCEMENT (CRITICAL) ===\n"
-            "When you load a file into your context using `<unlock_file>`, its content is visible to you ONLY for the current turn.\n"
-            "Once you emit `<done/>` or the turn ends, the file content is EVICTED from the active context window.\n"
-            "If you need to remember specific details from that file for future turns (e.g., a variable name, a function signature, a configuration value),\n"
-            "you MUST extract those notes and write them to your Scratchpad using `<scratchpad_append>` BEFORE finishing your turn.\n"
-            "Do not rely on your ability to 're-read' the file later, as context budget may prevent re-loading.\n"
-            "=== END EPHEMERAL CONTEXT ENFORCEMENT ===\n"
-            "\n=== WORKSPACE TREE COMPACTION PROTOCOL ===\n"
-            "The workspace tree is COMPACTED to save context tokens. Deep directories are marked as `[📁 DEEP]`.\n"
-            "Large directories are auto-collapsed and marked as `[📁 COLLAPSED]` with an item count.\n"
-            "To see the contents of a collapsed or deep folder, emit:\n"
-            "<uncollapse_folder>folder_name/</uncollapse_folder>\n"
-            "To collapse it again (saving context), emit:\n"
-            "<collapse_folder>folder_name/</collapse_folder>\n"
-            "\n=== STICKY CONTEXT & PINNING (CRITICAL FOR CODING) ===\n"
-            "When performing complex coding tasks or cross-file refactoring, you need to keep the exact source code of the files you are editing in your context.\n"
-            "To prevent the system from auto-locking or evicting these files, you can PIN them:\n"
-            "- `<pin_file>filename.py</pin_file>`: Pins a file. It will be marked as [📌 Pinned] and its content will NEVER be evicted or auto-locked.\n"
-            "- `<unpin_file>filename.py</unpin_file>`: Unpins a file, returning it to normal [C] loaded state (subject to budget guards).\n"
-            "You can pin multiple files simultaneously to see them side-by-side in your context.\n"
-            "=== END STICKY CONTEXT & PINNING ===\n"
+          memory_doctrine +
+          greeting_invariant +
+          skill_mandate +
+          "\n=== CORE EXECUTION MANDATE ===\n"
+          "1. **SAME-RESPONSE ACTION EXECUTION**: Stating in prose that you will read a file, edit code, run a command, or call a tool DOES NOT execute it. You MUST emit the corresponding functional XML tag (`<unlock_file>`, `<artifact>`, `<tool>`, etc.) IN THE EXACT SAME TURN.\n"
+          "2. **NEVER SPLIT INTENT AND TAGS**: Never announce what you plan to do and stop without emitting the tag. If you do not emit the tag in the same turn, nothing happens.\n"
+          "3. **GREETINGS & CASUAL REPLIES**: If the user's message is a greeting or casual remark, reply conversationally FIRST, then append `<done/>` on a new line. NEVER emit `<done/>` as the sole token.\n"
+          "4. **TASK TERMINATION**: When all objectives are verified, summarize your achievements and conclude with `<done/>` on a new line.\n"
+          "\n=== WORKSPACE & FILE OPERATIONS ===\n"
+          "- Read files: `<unlock_file>relative/path.ext</unlock_file>` (auto-extracts text from code, docs, PDFs, etc.).\n"
+          "- Free context when done: `<lock_file>relative/path.ext</lock_file>`.\n"
+          "- Create / Full rewrite of files: `<artifact name=\"path/to/file.ext\" type=\"code\" language=\"python\">...code...</artifact>`.\n"
+          "- Surgical patches for existing files: `<artifact name=\"path/to/file.ext\" type=\"code\">\n<<<<<<< SEARCH\n...exact lines...\n=======\n...new lines...\n>>>>>>> REPLACE\n</artifact>`.\n"
+          "\n=== TOOLS & ON-DEMAND SKILLS ===\n"
+          "- Tool calling syntax: `<tool>{\"name\": \"tool_name\", \"parameters\": {...}}</tool>`.\n"
+          "- Ephemeral Scratchpad: Save working notes across rounds for the CURRENT SESSION ONLY using `<scratchpad_append>notes...</scratchpad_append>`. The scratchpad is volatile and resets between sessions.\n"
+          "- Macro plan: For multi-step work, track progress in `.lollms_code/CURRENT.md`.\n"
         )
 
         memory_instructions = ""
         if self.memory_manager:
-            memory_instructions = (
-                "\n=== PERSISTENT MEMORY SYSTEM (CRITICAL FOR CONTINUITY) ===\n"
-                "You have access to a persistent memory database. You can store and retrieve information across sessions.\n"
-                "1. **STORE FACTS**: When the user shares personal information (e.g., name, preferences, project details), you MUST save it using:\n"
-                "   <mem_new content=\"The user's name is Saif\" tags=\"identity,user_profile\" level=\"2\" />\n"
-                "2. **UPDATE FACTS**: If information changes, use:\n"
-                "   <mem_update id=\"memory_id\" content=\"New information\" />\n"
-                "3. **AUTOMATIC RECALL**: Relevant memories are automatically injected into your context. You do not need to query them manually.\n"
-                "4. **MANDATORY**: Always use memory tags for non-trivial user facts. If the user tells you their name, you MUST emit `<mem_new>` immediately.\n"
+            if hasattr(self.memory_manager, "build_system_instructions"):
+                memory_instructions = self.memory_manager.build_system_instructions()
+            else:
+                memory_instructions = (
+                    "\n=== PERSISTENT MEMORY SYSTEM (CRITICAL FOR CONTINUITY) ===\n"
+                    "You have access to a persistent memory database. You can store and retrieve information across sessions.\n"
+                    "1. **STORE FACTS**: Save using `<mem_new content=\"...\" tags=\"...\" level=\"1\" />` or `tool_save_memory`.\n"
+                    "2. **UPDATE FACTS**: If information changes, use `<mem_update id=\"memory_id\" content=\"New information\" />`.\n"
+                )
+
+            memory_instructions += (
+                "\n\n🚨 **MANDATORY MEMORY EXECUTION RULE** 🚨\n"
+                "When the user instructs you to 'remember this', 'keep in memory', defines an acronym/shortcut (e.g. 'c&p means commit and push'), "
+                "or asks you to recall facts, you MUST execute the memory action in your VERY FIRST RESPONSE.\n"
+                "- Call `tool_save_memory(content=\"...\", tags=\"...\")` OR emit `<mem_new content=\"...\" tags=\"...\" level=\"1\" />`.\n"
+                "- NEVER write 'I will remember this' or 'I have saved it' in conversational text without calling `tool_save_memory` or outputting the `<mem_new>` tag in that same response!\n"
             )
 
         skills_ctx = ""
-        if self.skills_manager:
-            skills_ctx_str = self.skills_manager.build_context()
+        # Check if skills context was already injected to prevent duplication
+        has_skills_already = "=== AVAILABLE SKILLS" in sys_prompt or "=== ACTIVE SKILLS" in sys_prompt
+        if self.skills_manager and not has_skills_already:
+            active_names = set(active_tools.keys()) if active_tools else None
+            query_hint = getattr(self, '_current_chat_prompt', None)
+            current_r = getattr(self, '_current_round_num', 1)
+            skills_ctx_str = self.skills_manager.build_context(active_tool_names=active_names, current_query=query_hint, round_count=current_r)
             if skills_ctx_str:
                 skills_ctx = "\n" + skills_ctx_str
 
@@ -4598,12 +5033,60 @@ JSON:"""
 
         tool_desc = ""
         if active_tools:
-            tool_desc = "\n=== TOOLS AVAILABLE ===\nTo use a tool, emit `<tool>{\"name\": \"...\", \"parameters\": {...}}</tool>`.\n\nAvailable tools:\n"
-            for t_name, t_spec in active_tools.items():
-                desc = t_spec.get("description", "")
-                params_list = t_spec.get("parameters", [])
-                param_desc = ", ".join([f"{p['name']}: {p['type']}" for p in params_list])
-                tool_desc += f"- {t_name}({param_desc}): {desc}\n"
+            tool_sections = [
+                "\n=== TOOLS AVAILABLE (Active Schema) ===",
+                "To execute a tool, emit the following JSON payload on its own line (do NOT wrap in markdown code blocks):",
+                '`<tool>{"name": "<tool_name>", "parameters": {<args>}}</tool>`\n',
+                "### Active Tool Registry:\n"
+            ]
+            for t_name, t_spec in sorted(active_tools.items()):
+                desc = (t_spec.get("description") or "").strip()
+                params_list = t_spec.get("parameters") or []
+
+                param_sig = ", ".join([f"{p.get('name', 'param')}: {p.get('type', 'any')}" for p in params_list]) if params_list else ""
+                param_details = []
+                for p in params_list:
+                    opt = " (optional)" if p.get("optional") else ""
+                    param_details.append(f"`{p.get('name', 'param')}: {p.get('type', 'any')}`{opt}")
+                param_desc = ", ".join(param_details) if param_details else "none"
+
+                tool_entry = (
+                    f"#### 🛠️ **`{t_name}`**\n"
+                    f"- **Signature**: `{t_name}({param_sig})`\n"
+                    f"- **Parameters**: {param_desc}\n"
+                    f"- **Description**:\n  {desc}\n"
+                )
+                tool_sections.append(tool_entry)
+
+            tool_sections.append("=== END TOOLS AVAILABLE ===\n")
+
+            # Append compact on-demand loadable tool index
+            loadable_index = getattr(self, "_loadable_tool_index", None)
+            if loadable_index:
+                tool_sections.append("=== LOADABLE TOOLS (On Demand via `tool_load_tool`) ===")
+                tool_sections.append("To save context, non-core tools are kept unloaded. Call `tool_load_tool(tool_name=\"...\")` when you need them:")
+                for l_name, l_desc in sorted(loadable_index.items()):
+                    tool_sections.append(f"- **`{l_name}`**: {l_desc}")
+                tool_sections.append("=== END LOADABLE TOOLS ===\n")
+
+            tool_desc = "\n".join(tool_sections)
+
+        dynamic_effort_prompt = ""
+        if dynamic_effort:
+            dynamic_effort_prompt = (
+                "\n=== DYNAMIC REASONING EFFORT PROTOCOL ===\n"
+                "You can dynamically adjust your reasoning effort across rounds based on task complexity.\n"
+                "Your initial effort setting is DEACTIVATED (none).\n"
+                "When a task is simple, routine, or conversational, keep effort at 'none' for speed.\n"
+                "If you face complex logic, deep refactoring, difficult bugs, or architectural decisions, you can adjust your thinking effort for the NEXT round by emitting:\n"
+                "<effort level=\"none|low|medium|high\"/>\n"
+                "- level=\"none\": Disable reasoning for fast execution, simple lookups, or final responses.\n"
+                "- level=\"low\": Light reasoning for moderate checks.\n"
+                "- level=\"medium\": Standard deep reasoning for non-trivial logic.\n"
+                "- level=\"high\": Maximum reasoning depth for complex problems, mathematical proofs, or challenging refactoring.\n"
+                "The effort level applies starting from your very next round. Emit the tag on its own line when adjusting effort.\n"
+                "=== END DYNAMIC REASONING EFFORT PROTOCOL ===\n"
+            )
 
         computer_use_workflow = ""
         _has_computer_use_tools = any(t_name.startswith("tool_computer_") for t_name in active_tools)
@@ -4638,7 +5121,7 @@ JSON:"""
                 "=== END DOCUMENT ANNOTATION WORKFLOW ===\n"
             )
 
-        return sys_prompt + "\n" + rules + skills_ctx + memory_instructions + tool_desc + computer_use_workflow + document_annotation_workflow
+        return sys_prompt + "\n" + rules + skills_ctx + memory_instructions + tool_desc + dynamic_effort_prompt + computer_use_workflow + document_annotation_workflow
     
     
     def change_file_visibility(self, targets: List[str], action: str) -> Dict[str, Any]:
@@ -4786,6 +5269,7 @@ JSON:"""
         python_autonomy_level: Optional[str] = "safe",
         auto_approve_python: bool = False,
         confirm_handler: Optional[Callable] = None,
+        dynamic_effort: bool = False,
         **kwargs
     ) -> Dict[str, Any]:
         if confirm_handler is None and "confirm_handler" in kwargs:
@@ -4793,6 +5277,13 @@ JSON:"""
         resolved_max_rounds = max_nb_rounds if max_nb_rounds is not None else max_reasoning_steps
         if resolved_max_rounds is None:
             resolved_max_rounds = 20
+
+        is_infinite_rounds = resolved_max_rounds <= 0 or resolved_max_rounds == float("inf")
+        if is_infinite_rounds:
+            ASCIIColors.warning(
+                f"[{self.name}] ⚠️ WARNING: Infinite reasoning rounds enabled (max_rounds <= 0). "
+                "The agent will continue running until <done/> is emitted or cancelled by user."
+            )
 
         event_mode = normalize_event_mode(kwargs.pop("event_mode", event_mode))
 
@@ -4831,7 +5322,7 @@ JSON:"""
         object.__setattr__(self, '_consecutive_empty_responses', 0)
         object.__setattr__(self, '_consecutive_stall_count', 0)
         object.__setattr__(self, '_consecutive_artifact_rounds', 0)
-        object.__setattr__(self, '_max_rounds', resolved_max_rounds)
+        object.__setattr__(self, '_max_rounds', "∞" if is_infinite_rounds else resolved_max_rounds)
 
         if self._sub_agent_spawner:
             self._sub_agent_spawner.reset_turn()
@@ -4886,10 +5377,11 @@ JSON:"""
                 if t_name in ("tool_create_skill", "tool_update_skill"):
                     t_spec["description"] += "\n\n**VISIBILITY CONTROL**: You can control how this skill is stored in your workspace by setting the `output_visibility` parameter.\n- `output_visibility=\"context\"` (default): Loads the skill directly into your context [C].\n- `output_visibility=\"artefact\"`: Saves the skill as a file [U] without loading it, saving context space."
 
-        stable_system_prompt = self._build_system_prompt(active_tools)
+        stable_system_prompt = self._build_system_prompt(active_tools, dynamic_effort=dynamic_effort)
         stable_system_prompt += self._build_user_profile_context()
 
         # Pre-hydrate RAG knowledge base context into prompt
+        collected_sources: List[Dict[str, Any]] = []
         if self.has_data:
             rag_sys_block = self.build_rag_system_block()
             if rag_sys_block:
@@ -4902,7 +5394,25 @@ JSON:"""
                     for src in rag_res.get("sources", []):
                         title = src.get("title") or src.get("source") or "Document"
                         ds_label = f" [{src.get('datasource_name')}]" if src.get('datasource_name') else ""
-                        sources_text.append(f"--- Document [{title}]{ds_label} ---\n{src.get('content')}")
+                        score_val = src.get("score")
+                        score_str = f" (Score: {score_val:.2f})" if isinstance(score_val, (int, float)) and score_val <= 1.0 else (f" (Score: {score_val})" if score_val is not None else "")
+
+                        src_idx = len(collected_sources) + 1
+                        raw_snippet = src.get("snippet") or (src.get("content", "")[:300] if src.get("content") else "")
+                        src_entry = {
+                            "id": src_idx,
+                            "index": src_idx,
+                            "title": title,
+                            "source": src.get("source") or title,
+                            "url": src.get("url") or src.get("link") or src.get("file_path") or "",
+                            "snippet": str(raw_snippet)[:500],
+                            "score": score_val,
+                            "type": "rag",
+                            "datasource_name": src.get("datasource_name", "")
+                        }
+                        collected_sources.append(src_entry)
+
+                        sources_text.append(f"--- Document [{src_idx}] {title}{ds_label}{score_str} ---\n{src.get('content')}")
                     if sources_text:
                         stable_system_prompt += "\n=== RETRIEVED RAG CONTEXT ===\n" + "\n\n".join(sources_text) + "\n=== END RAG CONTEXT ===\n"
             except Exception as rag_err:
@@ -4911,31 +5421,55 @@ JSON:"""
 
         dynamic_suffix_parts = []
 
+        object.__setattr__(self, '_current_chat_prompt', cleaned_prompt)
+        clean_input = cleaned_prompt.strip().lower()
+        words = set(re.findall(r'\b[a-zA-Z]+\b', clean_input))
+        GREETING_WORDS = {"hi", "hello", "hey", "salut", "bonjour", "coucou", "yo", "greetings", "sup"}
+        GREETING_PHRASES = {
+            "hi", "hello", "hey", "salut", "bonjour", "coucou", "yo", "sup",
+            "hi there", "hello there", "good morning", "good evening", "good afternoon",
+            "how are you", "ca va", "comment ca va", "thanks", "thank you", "merci"
+        }
+        # Explicitly exempt continuation commands from ever being classified as greetings
+        is_continuation = bool(re.search(r'\b(?:continue|resume|proceed|go\s+on)\b', clean_input))
+        is_greeting = (
+            not is_continuation and (
+                clean_input in GREETING_PHRASES
+                or (len(words) <= 2 and bool(words & GREETING_WORDS))
+            )
+        )
+
         ws_ctx = self._build_workspace_context_block()
         if ws_ctx:
             dynamic_suffix_parts.append(ws_ctx.strip())
 
-        scratchpad_ctx = self._build_scratchpad_context()
-        if scratchpad_ctx:
-            dynamic_suffix_parts.append(scratchpad_ctx.strip())
-            object.__setattr__(self, '_scratchpad_content', scratchpad_ctx)
+        # Suppress stale scratchpad, old CURRENT.md roadmaps, and deep memories on casual greetings
+        if not is_greeting:
+            scratchpad_ctx = self._build_scratchpad_context()
+            if scratchpad_ctx:
+                dynamic_suffix_parts.append(scratchpad_ctx.strip())
+                object.__setattr__(self, '_scratchpad_content', scratchpad_ctx)
+
+            current_plan_ctx = self._build_current_plan_context()
+            if current_plan_ctx:
+                dynamic_suffix_parts.append(current_plan_ctx.strip())
 
         if self.memory_manager:
             try:
-                if hasattr(self.memory_manager, 'auto_pull_deep_memories'):
+                if not is_greeting and hasattr(self.memory_manager, 'auto_pull_deep_memories'):
                     self.memory_manager.auto_pull_deep_memories(cleaned_prompt)
 
                 if hasattr(self.memory_manager, 'build_working_zone'):
                     mem_zone = self.memory_manager.build_working_zone()
                     if mem_zone:
-                        dynamic_suffix_parts.append("=== ACTIVE MEMORIES (PERSISTENT ACROSS SESSIONS) ===\n" + mem_zone + "\n=== END MEMORIES ===")
+                        dynamic_suffix_parts.append(mem_zone.strip())
+
+                if not is_greeting and hasattr(self.memory_manager, 'build_handles_zone'):
+                    handles_zone = self.memory_manager.build_handles_zone()
+                    if handles_zone:
+                        dynamic_suffix_parts.append(handles_zone.strip())
             except Exception as mem_ex:
                 ASCIIColors.warning(f"[{self.name}] Failed to hydrate memories: {mem_ex}")
-
-        # Task Plan Context (CURRENT.md)
-        current_plan_ctx = self._build_current_plan_context()
-        if current_plan_ctx:
-            dynamic_suffix_parts.append(current_plan_ctx.strip())
 
         # Check for objective shift / new task and compress context into pinned lessons if needed
         if use_internal_history and self._conversation:
@@ -5011,7 +5545,18 @@ JSON:"""
         consecutive_connection_errors = 0
         last_connection_error_desc = ""
 
-        while round_count < resolved_max_rounds:
+        if dynamic_effort:
+            if reasoning_effort:
+                active_reasoning_effort = str(reasoning_effort).strip().lower()
+                active_think_flag = active_reasoning_effort not in ("none", "off", "0", "disabled", "false")
+            else:
+                active_reasoning_effort = "none"
+                active_think_flag = False
+        else:
+            active_reasoning_effort = reasoning_effort
+            active_think_flag = think
+
+        while is_infinite_rounds or round_count < resolved_max_rounds:
             if self.is_generation_cancelled():
                 was_cancelled = True
                 if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
@@ -5025,6 +5570,7 @@ JSON:"""
                 break
 
             round_count += 1
+            object.__setattr__(self, '_current_round_num', round_count)
 
             if getattr(self, 'debug_mode', False):
                 ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count}/{self._max_rounds} START ===")
@@ -5259,7 +5805,11 @@ JSON:"""
                     messages[last_user_idx]["content"] = content_blocks
                 object.__setattr__(self, '_pending_vlm_images', [])
 
-            ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
+            ss = _AgentStreamState(
+                callback=streaming_callback,
+                event_mode=event_mode,
+                workspace_path=self._resolved_workspace
+            )
 
             raw_llm_output_buffer = ""
             def _inline_relay(chunk, msg_type=None, meta=None):
@@ -5279,15 +5829,41 @@ JSON:"""
 
             gen_kwargs = {k: v for k, v in kwargs.items() if k not in ("streaming_callback", "temperature", "n_predict", "stream", "think", "reasoning_effort", "reasoning_summary")}
 
-            gen_kwargs["n_predict"] = n_predict or self.max_tokens_per_turn
+            # Auto Max Generation Tokens resolution:
+            # If n_predict or max_tokens_per_turn <= 0 (Auto), calculate safe max remaining context window
+            resolved_n_predict = n_predict if (n_predict is not None and n_predict > 0) else self.max_tokens_per_turn
+            if resolved_n_predict <= 0:
+                max_ctx = 8192
+                if self.lollms_client and hasattr(self.lollms_client, "get_ctx_size"):
+                    max_ctx = self.lollms_client.get_ctx_size() or 8192
+                prompt_used = pre_gen_telemetry.get("total", 0) if "pre_gen_telemetry" in locals() else 2048
+                available_tokens = max(1024, max_ctx - prompt_used - 256)
+                resolved_n_predict = available_tokens
 
-            gen_kwargs["temperature"] = active_temperature
+            gen_kwargs["n_predict"] = resolved_n_predict
+
+            # Auto Temperature resolution:
+            # If temperature is None or auto, dynamically adapt: 0.15 for code/tools/patches, 0.7 for conversation
+            if active_temperature is None:
+                has_code_intent = bool(ss.artifact_trigger or ss.tool_trigger or "<artifact" in raw_llm_output_buffer or "<tool" in raw_llm_output_buffer)
+                gen_kwargs["temperature"] = 0.15 if has_code_intent else 0.7
+            else:
+                gen_kwargs["temperature"] = active_temperature
             if think is not None:
                 gen_kwargs["think"] = think
             if reasoning_effort is not None:
                 gen_kwargs["reasoning_effort"] = reasoning_effort
             if reasoning_summary is not None:
                 gen_kwargs["reasoning_summary"] = reasoning_summary
+
+            if dynamic_effort:
+                gen_kwargs["reasoning_effort"] = active_reasoning_effort
+                gen_kwargs["think"] = active_think_flag
+
+            ASCIIColors.info(
+                f"[LollmsPersonality.chat] Round {round_count}: think={gen_kwargs.get('think')}, "
+                f"reasoning_effort={gen_kwargs.get('reasoning_effort')}"
+            )
 
             _max_retries = 2
             _retry_delay = 1.0
@@ -5432,6 +6008,16 @@ JSON:"""
             has_truncated_artifact = False
             truncated_artifact_title = None
 
+            if is_greeting:
+                # 🛡️ GREETING IMMUNITY SHIELD: Completely discard any unprompted tool calls or file writes
+                if ss.completed_actions:
+                    ASCIIColors.warning(f"[{self.name}] 🛡️ Blocked {len(ss.completed_actions)} unprompted hallucinated action(s) on greeting '{cleaned_prompt}'.")
+                    ss.completed_actions = []
+                final_response = "Hello! How can I help you with your project today?"
+                if streaming_callback:
+                    streaming_callback(final_response, MSG_TYPE.MSG_TYPE_CHUNK, {})
+                break
+
             if ss.was_done_detected():
                 final_response = re.sub(r'(?i)</?(?:done|end)\s*/?>', '', ss.get_clean_text()).strip()
 
@@ -5571,7 +6157,15 @@ JSON:"""
                                 tool_results_this_turn.append({"round": round_count, "name": tool_name, "result": tool_res, "success": tool_success})
                                 clean_result_str = _sanitize_tool_result(tool_res, client=self.lollms_client)
 
-                                if tool_success:
+                                if tool_success and tool_name == "tool_load_skill":
+                                    report_part = (
+                                        f"=== ✅ TOOL RESULT: {tool_name} ===\n"
+                                        f"<tool_result name=\"{tool_name}\" status=\"SUCCESS\">\n{clean_result_str}\n</tool_result>\n\n"
+                                        f"[SYSTEM DIRECTIVE: The skill methodology has been loaded into your context above. "
+                                        f"You have fulfilled the Skill-First mandate. DO NOT call tool_load_skill again. "
+                                        f"You MUST now proceed directly to executing Phase 1 of the skill protocol (scan the workspace and emit `<artifact name=\"classes.md\">` and `<artifact name=\"mapping.md\">`).]"
+                                    )
+                                elif tool_success:
                                     report_part = f"=== ✅ TOOL RESULT: {tool_name} ===\n<tool_result name=\"{tool_name}\" status=\"SUCCESS\">\n{clean_result_str}\n</tool_result>"
                                 else:
                                     report_part = f"=== ❌ TOOL FAILED: {tool_name} ===\n<tool_result name=\"{tool_name}\" status=\"FAILED\">\n{clean_result_str}\n</tool_result>\n\n⚠️ **Error Analysis Guidance:** Read the error details above carefully to understand what failed. Fix the parameters or try an alternative approach."
@@ -5698,7 +6292,17 @@ JSON:"""
                                                 round_count=round_count,
                                                 extra_data={"title": title, "original_length": len(original_content), "patch_body": body_content[:500]}
                                             )
-                                        action_reports.append(f"❌ SEARCH/REPLACE FAILED for {title}. Error: {patch_err}")
+                                        fail_msg = (
+                                            f"❌ SEARCH/REPLACE FAILED for '{title}'. Error: {patch_err}\n"
+                                            f"⚠️ CRITICAL LOOP RECOVERY INSTRUCTION:\n"
+                                            f"The lines in your SEARCH block did not match the file on disk.\n"
+                                            f"DO NOT retry with another guessed SEARCH block!\n"
+                                            f"Instead, emit a FULL FILE REWRITE using standard <artifact> syntax:\n"
+                                            f'<artifact name="{title}" type="{resolved_art_type}">\n'
+                                            f"[Write the complete updated file content from line 1 to end]\n"
+                                            f"</artifact>\n"
+                                        )
+                                        action_reports.append(fail_msg)
                                         has_truncated_artifact = True
                                         truncated_artifact_title = title
                                 elif is_append:
@@ -5805,28 +6409,59 @@ JSON:"""
                                     body_content = body_match.group(1).strip() if body_match else ""
                                     action_reports.append(self._execute_user_profile_update(body_content))
                                     continue
-                                if tag_name in ("mem_new", "mem_update"):
+                                if tag_name in ("mem_new", "mem_update", "mem_load", "mem_delete", "mem_search", "mem_tag"):
                                     if not self.memory_manager:
                                         action_reports.append("[SYSTEM ERROR] Memory manager not initialized.")
                                         continue
                                     if tag_name == "mem_new":
-                                        content_match = re.search(r'content="([^"]*)"', raw_xml)
-                                        tags_match = re.search(r'tags="([^"]*)"', raw_xml)
-                                        level_match = re.search(r'level="([^"]*)"', raw_xml)
+                                        content_match = re.search(r'content="([^"]*)"', raw_xml) or re.search(r"content='([^']*)'", raw_xml)
+                                        tags_match = re.search(r'tags="([^"]*)"', raw_xml) or re.search(r"tags='([^']*)'", raw_xml)
+                                        level_match = re.search(r'level="([^"]*)"', raw_xml) or re.search(r"level='([^']*)'", raw_xml)
                                         body_match = re.search(r'<mem_new[^>]*>(.*?)</mem_new>', raw_xml, re.DOTALL | re.IGNORECASE)
                                         mem_content = content_match.group(1) if content_match else (body_match.group(1).strip() if body_match else "")
                                         mem_tags = tags_match.group(1).split(",") if tags_match else []
-                                        mem_level = int(level_match.group(1)) if level_match else 2
-                                        self.memory_manager.add(content=mem_content, tags=mem_tags, importance=0.9, level=mem_level)
-                                        action_reports.append(f"✅ Memory saved successfully: {mem_content[:50]}...")
+                                        mem_level = int(level_match.group(1)) if level_match else 1
+                                        if mem_content:
+                                            self.memory_manager.add(content=mem_content, tags=mem_tags, importance=0.85, level=mem_level)
+                                            action_reports.append(f"✅ Memory saved successfully: {mem_content[:50]}...")
+                                        else:
+                                            action_reports.append("⚠️ Memory tag had empty content.")
                                     elif tag_name == "mem_update":
-                                        id_match = re.search(r'id="([^"]*)"', raw_xml)
-                                        content_match = re.search(r'content="([^"]*)"', raw_xml)
+                                        id_match = re.search(r'id="([^"]*)"', raw_xml) or re.search(r"id='([^']*)'", raw_xml)
+                                        content_match = re.search(r'content="([^"]*)"', raw_xml) or re.search(r"content='([^']*)'", raw_xml)
                                         body_match = re.search(r'<mem_update[^>]*>(.*?)</mem_update>', raw_xml, re.DOTALL | re.IGNORECASE)
                                         mem_id = id_match.group(1) if id_match else ""
                                         mem_content = content_match.group(1) if content_match else (body_match.group(1).strip() if body_match else "")
-                                        self.memory_manager.update(memory_id=mem_id, content=mem_content)
-                                        action_reports.append(f"✅ Memory updated successfully: {mem_id}")
+                                        if mem_id and mem_content:
+                                            self.memory_manager.update(memory_id=mem_id, content=mem_content)
+                                            action_reports.append(f"✅ Memory updated successfully: [{mem_id[:8]}]")
+                                    elif tag_name == "mem_load":
+                                        id_match = re.search(r'id="([^"]*)"', raw_xml) or re.search(r"id='([^']*)'", raw_xml)
+                                        mem_id = id_match.group(1) if id_match else ""
+                                        if mem_id:
+                                            full_id = getattr(self.memory_manager, "_resolve_id", lambda x: x)(mem_id) or mem_id
+                                            res = self.memory_manager.load_to_working(full_id)
+                                            if res:
+                                                action_reports.append(f"✅ Loaded memory [{res['id'][:8]}] into Working Memory: {res.get('content', '')}")
+                                            else:
+                                                action_reports.append(f"❌ Memory [{mem_id}] not found in Deep Memory.")
+                                    elif tag_name == "mem_delete":
+                                        id_match = re.search(r'id="([^"]*)"', raw_xml) or re.search(r"id='([^']*)'", raw_xml)
+                                        mem_id = id_match.group(1) if id_match else ""
+                                        if mem_id:
+                                            full_id = getattr(self.memory_manager, "_resolve_id", lambda x: x)(mem_id) or mem_id
+                                            self.memory_manager.delete(full_id)
+                                            action_reports.append(f"✅ Archived/deleted memory [{mem_id[:8]}].")
+                                    elif tag_name == "mem_search":
+                                        q_match = re.search(r'query="([^"]*)"', raw_xml) or re.search(r"query='([^']*)'", raw_xml)
+                                        search_q = q_match.group(1) if q_match else ""
+                                        if search_q:
+                                            results = self.memory_manager.query(text=search_q, top_k=5)
+                                            if results:
+                                                hits = [f"[{r['id'][:8]}] (Imp: {r.get('importance', 0):.0%}) {r.get('content', '')}" for r in results]
+                                                action_reports.append(f"🔍 Memory Search Results for '{search_q}':\n" + "\n".join(hits))
+                                            else:
+                                                action_reports.append(f"🔍 No memories found matching '{search_q}'.")
                                     continue
 
                                 body_match = re.search(r'<(?:unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder)[^>]*>(.*?)</(?:unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder)>', raw_xml, re.DOTALL | re.IGNORECASE)
@@ -5951,30 +6586,51 @@ JSON:"""
                                 break
 
                 if not final_response.strip():
-                    if getattr(self, 'debug_mode', False):
-                        self._dump_error(
-                            error=Exception("Empty clean text after <done/>"),
-                            context_desc="Empty Response After Done",
-                            round_count=round_count,
-                            extra_data={
-                                "raw_stream_chars": len(raw_llm_output_buffer or ""),
-                                "think_buffer_chars": len(getattr(ss, '_think_buffer', '') or ""),
-                                "pending_buffer_chars": len(getattr(ss, '_pending_buffer', '') or ""),
-                                "in_think_block": bool(getattr(ss, '_in_think_block', False)),
-                                "raw_stream_tail": (raw_llm_output_buffer or "")[-2000:],
-                            }
-                        )
-                    ASCIIColors.warning(f"[{self.name}] Empty response after <done/> with no prior actions. Terminating.")
-                    final_response = "[Task terminated: The agent produced no actionable output.]"
-                    if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
-                        try:
-                            streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
-                                "round_id": round_count,
-                                "status": "text_stall"
-                            })
-                        except Exception:
-                            pass
-                    break
+                    clean_input = cleaned_prompt.strip().lower()
+                    is_greeting = clean_input in (
+                        "hi", "hello", "hey", "salut", "bonjour", "coucou", "yo",
+                        "good morning", "good evening", "good afternoon", "greetings",
+                        "how are you", "ca va", "comment ca va", "sup"
+                    ) or len(clean_input) < 4
+
+                    if is_greeting:
+                        final_response = "Hello! How can I help you with your project today?"
+                        ASCIIColors.info(f"[{self.name}] Synthesized friendly greeting for '{cleaned_prompt}'.")
+                        if streaming_callback:
+                            streaming_callback(final_response, MSG_TYPE.MSG_TYPE_CHUNK, {})
+                    elif round_count == 1:
+                        ASCIIColors.warning(f"[{self.name}] 🚫 Empty response with <done/> detected on round 1. Forcing continuation.")
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="user",
+                            content="[SYSTEM: You emitted `<done/>` without providing any answer or conversational response to the user. You MUST answer the user's message in conversational text first before emitting `<done/>`.]"
+                        ))
+                        ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
+                        continue
+                    else:
+                        if getattr(self, 'debug_mode', False):
+                            self._dump_error(
+                                error=Exception("Empty clean text after <done/>"),
+                                context_desc="Empty Response After Done",
+                                round_count=round_count,
+                                extra_data={
+                                    "raw_stream_chars": len(raw_llm_output_buffer or ""),
+                                    "think_buffer_chars": len(getattr(ss, '_think_buffer', '') or ""),
+                                    "pending_buffer_chars": len(getattr(ss, '_pending_buffer', '') or ""),
+                                    "in_think_block": bool(getattr(ss, '_in_think_block', False)),
+                                    "raw_stream_tail": (raw_llm_output_buffer or "")[-2000:],
+                                }
+                            )
+                        ASCIIColors.warning(f"[{self.name}] Empty response after <done/> with no prior actions. Terminating.")
+                        final_response = "[Task terminated: The agent produced no actionable output.]"
+                        if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                            try:
+                                streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                                    "round_id": round_count,
+                                    "status": "text_stall"
+                                })
+                            except Exception:
+                                pass
+                        break
 
                 sanitized_final_response = re.sub(r'<[^>]+>', '', final_response).strip()
 
@@ -6247,7 +6903,17 @@ JSON:"""
                                             round_count=round_count,
                                             extra_data={"title": title, "original_length": len(original_content), "patch_body": body_content[:500]}
                                         )
-                                    action_reports.append(f"❌ SEARCH/REPLACE FAILED for {title}. Error: {patch_err}")
+                                    fail_msg = (
+                                        f"❌ SEARCH/REPLACE FAILED for '{title}'. Error: {patch_err}\n"
+                                        f"⚠️ CRITICAL LOOP RECOVERY INSTRUCTION:\n"
+                                        f"The lines in your SEARCH block did not match the file on disk.\n"
+                                        f"DO NOT retry with another guessed SEARCH block!\n"
+                                        f"Instead, emit a FULL FILE REWRITE using standard <artifact> syntax:\n"
+                                        f'<artifact name="{title}" type="{resolved_art_type}">\n'
+                                        f"[Write the complete updated file content from line 1 to end]\n"
+                                        f"</artifact>\n"
+                                    )
+                                    action_reports.append(fail_msg)
                                     if (event_mode.has_callbacks or event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE)) and streaming_callback:
                                         try:
                                             streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {
@@ -6395,14 +7061,10 @@ JSON:"""
                                     action_reports.append(f"❌ TTI (Image Generation) binding is not available in current configuration.")
                                     continue
 
-                            if tag_name in ("mem_new", "mem_update"):
+                            if tag_name in ("mem_new", "mem_update", "mem_load", "mem_delete", "mem_search", "mem_tag"):
                                 if not self.memory_manager:
                                     err_msg = "Memory manager not initialized."
                                     action_reports.append(f"[SYSTEM ERROR] {err_msg}")
-                                    if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
-                                        streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "failure", "error": err_msg})
-                                    if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
-                                        streaming_callback(f'<status>failure</status>\n<error>{err_msg}</error>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                                     continue
 
                                 if tag_name == "mem_new":
@@ -6412,18 +7074,14 @@ JSON:"""
                                     body_match = re.search(r'<mem_new[^>]*>(.*?)</mem_new>', raw_xml, re.DOTALL | re.IGNORECASE)
                                     mem_content = content_match.group(1) if content_match else (body_match.group(1).strip() if body_match else "")
                                     mem_tags = tags_match.group(1).split(",") if tags_match else []
-                                    mem_level = int(level_match.group(1)) if level_match else 2
+                                    mem_level = int(level_match.group(1)) if level_match else 1
                                     if mem_content:
-                                        self.memory_manager.add(content=mem_content, tags=mem_tags, importance=0.9, level=mem_level)
+                                        self.memory_manager.add(content=mem_content, tags=mem_tags, importance=0.85, level=mem_level)
                                         res_msg = f"✅ Memory saved successfully: {mem_content[:50]}..."
                                     else:
                                         res_msg = "⚠️ Memory tag received with empty content."
                                     action_reports.append(res_msg)
                                     actions_executed_count += 1
-                                    if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
-                                        streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "success", "error": None})
-                                    if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
-                                        streaming_callback(f'<status>success</status>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                                 elif tag_name == "mem_update":
                                     id_match = re.search(r'id\s*=\s*["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
                                     content_match = re.search(r'content\s*=\s*["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
@@ -6432,15 +7090,41 @@ JSON:"""
                                     mem_content = content_match.group(1) if content_match else (body_match.group(1).strip() if body_match else "")
                                     if mem_id and mem_content:
                                         self.memory_manager.update(memory_id=mem_id, content=mem_content)
-                                        res_msg = f"✅ Memory updated successfully: {mem_id}"
+                                        res_msg = f"✅ Memory updated successfully: [{mem_id[:8]}]"
                                     else:
                                         res_msg = "⚠️ Memory update received with missing id or content."
                                     action_reports.append(res_msg)
                                     actions_executed_count += 1
-                                    if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
-                                        streaming_callback("", MSG_TYPE.MSG_TYPE_CONTEXT_UPDATE, {"action": tag_name, "files": [], "status": "success", "error": None})
-                                    if event_mode == EventMode.PROCESSING_TAG_MODE and streaming_callback:
-                                        streaming_callback(f'<status>success</status>\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                elif tag_name == "mem_load":
+                                    id_match = re.search(r'id\s*=\s*["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
+                                    mem_id = id_match.group(1) if id_match else ""
+                                    if mem_id:
+                                        full_id = getattr(self.memory_manager, "_resolve_id", lambda x: x)(mem_id) or mem_id
+                                        res = self.memory_manager.load_to_working(full_id)
+                                        if res:
+                                            action_reports.append(f"✅ Loaded memory [{res['id'][:8]}] into Working Memory: {res.get('content', '')}")
+                                        else:
+                                            action_reports.append(f"❌ Memory [{mem_id}] not found in Deep Memory.")
+                                        actions_executed_count += 1
+                                elif tag_name == "mem_delete":
+                                    id_match = re.search(r'id\s*=\s*["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
+                                    mem_id = id_match.group(1) if id_match else ""
+                                    if mem_id:
+                                        full_id = getattr(self.memory_manager, "_resolve_id", lambda x: x)(mem_id) or mem_id
+                                        self.memory_manager.delete(full_id)
+                                        action_reports.append(f"✅ Archived/deleted memory [{mem_id[:8]}].")
+                                        actions_executed_count += 1
+                                elif tag_name == "mem_search":
+                                    q_match = re.search(r'query\s*=\s*["\']([^"\']*)["\']', raw_xml, re.IGNORECASE)
+                                    search_q = q_match.group(1) if q_match else ""
+                                    if search_q:
+                                        results = self.memory_manager.query(text=search_q, top_k=5)
+                                        if results:
+                                            hits = [f"[{r['id'][:8]}] (Imp: {r.get('importance', 0):.0%}) {r.get('content', '')}" for r in results]
+                                            action_reports.append(f"🔍 Memory Search Results for '{search_q}':\n" + "\n".join(hits))
+                                        else:
+                                            action_reports.append(f"🔍 No memories found matching '{search_q}'.")
+                                        actions_executed_count += 1
                                 continue
 
                             body_match = re.search(r'<(?:unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder)[^>]*>(.*?)</(?:unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder)>', raw_xml, re.DOTALL | re.IGNORECASE)
@@ -6537,7 +7221,11 @@ JSON:"""
                 object.__setattr__(self, '_consecutive_stall_count', 0)
                 active_temperature = base_temperature
                 ss.completed_actions = []
-                ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
+                ss = _AgentStreamState(
+                    callback=streaming_callback,
+                    event_mode=event_mode,
+                    workspace_path=self._resolved_workspace
+                )
                 if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
                     try:
                         streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
@@ -6546,9 +7234,33 @@ JSON:"""
                         })
                     except Exception:
                         pass
+
+                # ── 💾 CHECKPOINT SAVE: Persist status at round end ──
+                self._save_round_checkpoint(
+                    round_count=round_count,
+                    prompt=prompt,
+                    virtual_history=virtual_history,
+                    tool_calls=tool_calls_this_turn,
+                    tool_results=tool_results_this_turn,
+                    workspace_changes=workspace_changes,
+                    status="in_progress"
+                )
+
                 if getattr(self, 'debug_mode', False):
-                    ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Actions dispatched, continuing ===")
+                    ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Actions dispatched, checkpoint saved ===")
                 continue
+
+            # ── ⚡ UPDATE DYNAMIC EFFORT FOR NEXT ROUND ──
+            if dynamic_effort and getattr(ss, "next_reasoning_effort", None) is not None:
+                new_lvl = ss.next_reasoning_effort.lower().strip()
+                if new_lvl in ("none", "off", "disabled", "false", "0"):
+                    active_reasoning_effort = "none"
+                    active_think_flag = False
+                else:
+                    active_reasoning_effort = new_lvl
+                    active_think_flag = True
+                ASCIIColors.info(f"[{self.name}] Dynamic reasoning effort set to '{active_reasoning_effort}' for next round.")
+                ss.next_reasoning_effort = None
 
             if ss.was_done_detected() and not ss.completed_actions:
                 if getattr(self, 'debug_mode', False):
@@ -6721,14 +7433,11 @@ JSON:"""
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
                     content=(
-                        "[SYSTEM DIRECTIVE: REPETITION INHIBITION ACTIVATED\n"
-                        "You repeated the exact same conversational preamble or sentence from the previous round.\n"
-                        "You are STRICTLY FORBIDDEN from outputting conversational sentences announcing what you are about to do (e.g. 'Now let me create...', 'Let me verify...').\n"
-                        "Your very next response MUST START with an XML tag as the FIRST character:\n"
-                        "- To create or edit code: `<artifact name=\"path/to/file.ext\" type=\"code\">...</artifact>`\n"
-                        "- To execute shell commands: `<tool>{\"name\": \"tool_execute_shell_command\", \"parameters\": {\"command\": \"...\"}}</tool>`\n"
-                        "- To finish your task: summarize your achievements in 1 sentence and output `<done/>`.\n"
-                        "DO NOT WRITE INTRODUCTORY PREAMBLES. OUTPUT THE FUNCTIONAL TAG NOW.]"
+                        "[SYSTEM GUIDANCE: Please proceed directly with your task.\n"
+                        "- If creating or updating files, emit a valid `<artifact name=\"filename.ext\" type=\"code\">...</artifact>` tag.\n"
+                        "- If calling a tool, use `<tool>{\"name\": \"...\", \"parameters\": {...}}</tool>`.\n"
+                        "- If awaiting user confirmation or replying conversationally, conclude your response with `<done/>`.\n"
+                        "Do not apologize or output introductory apologies.]"
                     )
                 ))
                 ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
@@ -6867,9 +7576,9 @@ JSON:"""
                 and not tool_calls_this_turn
                 and stripped_round_text
                 and not text_is_repetitive
-                and bool(re.search(r'(?im)^\s*(?:i\s+will|let\s+me|i\'?m\s+going\s+to|i\s+shall|je\s+vais)\b', stripped_round_text))
+                and bool(_INTENT_ANNOUNCEMENT_RE.search(stripped_round_text))
             ):
-                ASCIIColors.info(f"[{self.name}] Round 1 response without `<done/>` or action tag. Forcing action continuation.")
+                ASCIIColors.info(f"[{self.name}] Round 1 action intent announcement without `<done/>` or action tag. Forcing action continuation.")
                 virtual_history.append(SimpleNamespace(
                     sender_type="assistant",
                     content=ss.get_clean_text().strip()
@@ -6877,7 +7586,7 @@ JSON:"""
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
                     content=(
-                        "[SYSTEM DIRECTIVE: You stated an intent to perform an action or stopped without `<done/>`.\n"
+                        "[SYSTEM DIRECTIVE: You stated an intent to perform an action but did not execute a tag or finish with `<done/>`.\n"
                         "Conversational text DOES NOT execute actions. You MUST emit the functional XML tag as the FIRST token of your reply:\n"
                         "- To generate an image: `<generate_image>detailed prompt</generate_image>` or `<tool>{\"name\": \"tool_generate_image\", \"parameters\": {\"prompt\": \"...\"}}</tool>`\n"
                         "- To create/edit code: `<artifact name=\"filename.ext\" type=\"code\">content</artifact>`\n"
@@ -6908,9 +7617,10 @@ JSON:"""
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
                     content=(
-                        "[SYSTEM: CRITICAL FORMAT ERROR. You emitted a functional tag with the wrong syntax (e.g., using XML attributes instead of JSON). "
-                        "You MUST use the exact format: `<tool>{\"name\": \"...\", \"parameters\": {...}}</tool>`. "
-                        "Output the corrected tag NOW.]"
+                        "[SYSTEM GUIDANCE: Ensure all functional tags use standard syntax:\n"
+                        "- To call a tool: `<tool>{\"name\": \"...\", \"parameters\": {...}}</tool>`\n"
+                        "- To write a file: `<artifact name=\"...\" type=\"...\">...</artifact>`\n"
+                        "Do not apologize or explain formatting errors — output your response directly.]"
                     )
                 ))
                 if getattr(self, 'debug_mode', False):
@@ -6918,30 +7628,29 @@ JSON:"""
                 continue
 
             # ── 🛑 ENFORCE END TAG MANDATE (UNIVERSAL TERMINATION CONTRACT) ──
-            # The agentic loop MUST NOT terminate without an explicit <done/> or <end/> tag.
-            # If round 1 produced a pure conversational response with no tool calls, no actions, and no intent, finish immediately
-            if (
-                round_count == 1
-                and not tool_calls_this_turn
-                and not ss.completed_actions
-                and not ss.was_action_dispatched()
-                and not ss.tool_trigger
-                and stripped_round_text
-                and not re.search(r'(?im)^\s*(?:i\s+will|let\s+me|i\'?m\s+going\s+to|i\s+shall|je\s+vais)\b', stripped_round_text)
-            ):
-                final_response = re.sub(r'(?i)</?(?:done|end)\s*/?>', '', stripped_round_text).strip()
-                if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
-                    try:
-                        streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
-                            "round_id": round_count,
-                            "status": "done"
-                        })
-                    except Exception:
-                        pass
-                break
+            # Only when enforce_end_tag is FALSE can round 1 exit on a pure conversational greeting without intent
+            if not enforce_end_tag:
+                if (
+                    round_count == 1
+                    and not tool_calls_this_turn
+                    and not ss.completed_actions
+                    and not ss.was_action_dispatched()
+                    and not ss.tool_trigger
+                    and stripped_round_text
+                ):
+                    final_response = re.sub(r'(?i)</?(?:done|end)\s*/?>', '', stripped_round_text).strip()
+                    if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                        try:
+                            streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                                "round_id": round_count,
+                                "status": "done"
+                            })
+                        except Exception:
+                            pass
+                    break
 
             if not ss.was_done_detected() and not was_cancelled:
-                if round_count == 1 and not had_prior_actions and not has_new_actions_this_round:
+                if not enforce_end_tag and round_count == 1 and not had_prior_actions and not has_new_actions_this_round:
                     final_response = stripped_round_text
                     break
                 consecutive_stall_count = getattr(self, '_consecutive_stall_count', 0) + 1
@@ -7114,16 +7823,28 @@ JSON:"""
 
             ss.completed_actions = []
 
-        if use_internal_history and not was_cancelled:
-            # Strip thoughts and round tags completely before persisting in conversation history
-            clean_persisted = re.sub(r'<think\b[^>]*>.*?(?:</think>|$)', '', final_response, flags=re.DOTALL | re.IGNORECASE).strip()
+        if use_internal_history:
+            # Recover assistant content even if interrupted/cancelled so the turn is never lost
+            resp_to_save = final_response.strip() if final_response else ""
+            if not resp_to_save:
+                # Recover from virtual history (tool results and partial assistant responses)
+                for vh in reversed(virtual_history):
+                    if getattr(vh, "sender_type", "") == "assistant" and getattr(vh, "content", "").strip():
+                        resp_to_save = getattr(vh, "content", "").strip()
+                        break
+
+            clean_persisted = re.sub(r'<think\b[^>]*>.*?(?:</think>|$)', '', resp_to_save, flags=re.DOTALL | re.IGNORECASE).strip()
             clean_persisted = re.sub(r'<thought\b[^>]*>.*?(?:</thought>|$)', '', clean_persisted, flags=re.DOTALL | re.IGNORECASE).strip()
             clean_persisted = re.sub(r'<round\s+id=["\'][^"\']*["\']\s*/?>\n?', '', clean_persisted, flags=re.IGNORECASE).strip()
-            if _is_synthetic_agent_response(clean_persisted):
-                ASCIIColors.info(f"[{self.name}] Synthetic failure response suppressed from conversation history.")
-            else:
+
+            if was_cancelled:
+                clean_persisted = (clean_persisted + "\n\n[⏹️ Generation stopped by user]").strip() if clean_persisted else "[⏹️ Generation stopped by user]"
+
+            if clean_persisted and not _is_synthetic_agent_response(clean_persisted):
                 self._conversation.append({"role": "user", "content": prompt})
                 self._conversation.append({"role": "assistant", "content": clean_persisted})
+                if hasattr(self, "_project_history_file") and self._project_history_file:
+                    self.save_history_to_disk(self._project_history_file)
 
         object.__setattr__(self, '_compaction_triggered_this_turn', False)
 
@@ -7191,8 +7912,20 @@ JSON:"""
         if hasattr(self, '_artefact_manager') and self._artefact_manager:
             all_personality_artefacts = self._artefact_manager.list(active_only=True)
 
+        # Persist final turn checkpoint
+        self._save_round_checkpoint(
+            round_count=round_count,
+            prompt=prompt,
+            virtual_history=virtual_history,
+            tool_calls=tool_calls_this_turn,
+            tool_results=tool_results_this_turn,
+            workspace_changes=workspace_changes,
+            status="completed" if not was_cancelled else "cancelled"
+        )
+
         return {
            "response": final_response,
+           "sources": collected_sources,
            "tool_calls": tool_calls_this_turn,
            "tool_results": tool_results_this_turn,
            "rounds": round_count,
@@ -7202,6 +7935,70 @@ JSON:"""
            "context_health": context_health,
            "tti_available": _has_tti
        }
+
+    def _get_checkpoint_path(self) -> Optional[Path]:
+        if not self._resolved_workspace:
+            return None
+        return self._resolved_workspace / ".lollms_code" / "turn_checkpoint.json"
+
+    def _save_round_checkpoint(
+        self,
+        round_count: int,
+        prompt: str,
+        virtual_history: List[Any],
+        tool_calls: List[Dict[str, Any]],
+        tool_results: List[Dict[str, Any]],
+        workspace_changes: List[Dict[str, Any]],
+        status: str = "in_progress"
+    ) -> None:
+        """Saves turn checkpoint to disk at each round end."""
+        chk_path = self._get_checkpoint_path()
+        if not chk_path:
+            return
+        try:
+            chk_path.parent.mkdir(parents=True, exist_ok=True)
+            vh_data = []
+            for vh in virtual_history:
+                vh_data.append({
+                    "sender_type": getattr(vh, "sender_type", "user"),
+                    "content": getattr(vh, "content", "")
+                })
+            checkpoint = {
+                "round_count": round_count,
+                "prompt": prompt,
+                "status": status,
+                "virtual_history": vh_data,
+                "tool_calls": tool_calls,
+                "tool_results": [
+                    {"name": tr.get("name"), "success": tr.get("success")} for tr in tool_results
+                ],
+                "workspace_changes": workspace_changes,
+                "timestamp": time.time()
+            }
+            object.__setattr__(self, "_active_turn_checkpoint", checkpoint)
+            chk_path.write_text(json.dumps(checkpoint, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as ex:
+            ASCIIColors.warning(f"[{self.name}] Failed to save round checkpoint: {ex}")
+
+    def has_resumable_turn(self) -> bool:
+        """Checks if a resumable turn checkpoint exists on disk or in memory."""
+        chk_path = self._get_checkpoint_path()
+        if not chk_path or not chk_path.exists():
+            return False
+        try:
+            data = json.loads(chk_path.read_text(encoding="utf-8"))
+            return data.get("status") in ("in_progress", "cancelled")
+        except Exception:
+            return False
+
+    def load_turn_checkpoint(self) -> Optional[Dict[str, Any]]:
+        chk_path = self._get_checkpoint_path()
+        if not chk_path or not chk_path.exists():
+            return None
+        try:
+            return json.loads(chk_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
 
 Agent = LollmsPersonality
 

@@ -440,10 +440,22 @@ Both events are callback-only (never written to `ai_msg.content` or `virtual_his
 ```python
 response = discussion.chat(
     user_message="Analyze data.csv and build the quarterly report",
-    orchestrator_mode=True,   # the conversation runs as pure coordination
-    enable_code_execution=True,  # the tools are inherited by spawned workers
+    orchestrator_mode=True,        # the conversation runs as pure coordination
+    enable_code_execution=True,    # the tools are inherited by spawned workers
+    dynamic_effort=True,           # allows model to scale reasoning effort via <effort level="..."/>
+    max_nb_rounds=0,               # ⚠️ Infinite rounds (runs until <done/> is emitted or cancelled)
 )
 ```
+
+---
+
+## ⚡ Dynamic Reasoning Effort & `<effort>` Protocol
+
+`LollmsDiscussion.chat()` supports dynamic reasoning effort scaling across turns via `dynamic_effort=True`.
+
+1. **Initial Deactivated Baseline**: When `dynamic_effort=True`, the turn starts with reasoning effort set to `"none"` (`think=False`) for maximum responsiveness, unless an initial `reasoning_effort` was explicitly passed.
+2. **Autonomous Escalation**: The model is instructed on the `<effort level="none|low|medium|high"/>` tag. When faced with complex logic or algorithmic obstacles, it can emit this tag to adjust its reasoning depth starting on the very next round.
+3. **Infinite Rounds Support (`max_nb_rounds=0`)**: Passing `max_nb_rounds=0` (or `-1`) enables unbounded loop execution. A console warning is logged reminding the developer to monitor token consumption.
 
 ## 🧬 2. The Chat Loop & Tool Orchestration (`ChatMixin`)
 

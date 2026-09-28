@@ -43,7 +43,7 @@ class BarkClientBinding(LollmsTTSBinding):
         self.binding_root = Path(__file__).parent
         self.server_dir = self.binding_root / "server"
 
-        self.cache_dir = Path(kwargs.get("cache_dir", "./data/tts_models/bark")).resolve()
+        self.cache_dir = self.resolve_system_path(kwargs.get("cache_dir", "data/tts_models/bark"))
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.token_file = self.cache_dir / "bark_server.token"
 

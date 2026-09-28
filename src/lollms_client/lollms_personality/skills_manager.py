@@ -24,15 +24,18 @@ class SkillsManager:
     def __init__(
         self,
         skills_dirs: Optional[List[Union[str, Path]]] = None,
-        mode: str = "mixed",
-        max_visible_skills: int = 10,
-        max_visible_tokens: int = 4000,
+        mode: str = "loadable",
+        max_visible_skills: int = 3,
+        max_visible_tokens: int = 1200,
         allow_llm_skill_writing: bool = True,
     ):
         self.mode = mode
         self.max_visible_skills = max_visible_skills
         self.max_visible_tokens = max_visible_tokens
         self.allow_llm_skill_writing = allow_llm_skill_writing
+        self.active_tool_names: Optional[set] = None
+        self.tool_availability_checker: Optional[Callable[[str], bool]] = None
+        self.tool_loader: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None
         self._skills_dirs: List[Path] = []
         if skills_dirs:
             for d in skills_dirs:
@@ -50,34 +53,44 @@ class SkillsManager:
     # ─────────────────────────────────────────────────────────── tier helpers
 
     def _resolve_visibility(self, skill: Skill) -> str:
-        if not skill.has_metadata:
-            return "visible" if self.mode != "searchable" else "searchable"
-
-        if skill.visibility == "visible":
-            return "visible"
-        if skill.visibility == "searchable":
+        # By doctrine, all skills start as unloaded ("loadable") so context is not bloated.
+        # Skills are loaded and unloaded on-demand by the LLM as needed.
+        if self.mode == "loadable":
+            return "loadable"
+        if self.mode == "searchable":
             return "searchable"
         if self.mode == "visible":
             return "visible"
-        if self.mode == "searchable":
+        if skill.visibility == "searchable":
             return "searchable"
         return "loadable"
+
+    def get_unique_skills(self) -> List[Skill]:
+        """Returns unique Skill instances, eliminating duplicates from dual-key title/slug indexing."""
+        seen = set()
+        unique = []
+        for s in self.skills.values():
+            key = str(s.file_path.resolve()) if s.file_path else s.title.lower().strip()
+            if key not in seen:
+                seen.add(key)
+                unique.append(s)
+        return unique
 
     def get_skills_by_visibility(self, tier: str) -> List[Skill]:
         if tier not in self.VALID_VISIBILITIES:
             raise ValueError(
                 f"Invalid visibility tier '{tier}'. Must be one of {self.VALID_VISIBILITIES}."
             )
-        return [s for s in self.skills.values() if s.visibility == tier]
+        return [s for s in self.get_unique_skills() if s.visibility == tier]
 
     def has_loadable_skills(self) -> bool:
-        return any(s.visibility == "loadable" for s in self.skills.values())
+        return any(s.visibility == "loadable" for s in self.get_unique_skills())
 
     def has_searchable_skills(self) -> bool:
-        return any(s.visibility == "searchable" for s in self.skills.values())
+        return any(s.visibility == "searchable" for s in self.get_unique_skills())
 
     def has_visible_skills(self) -> bool:
-        return any(s.visibility == "visible" for s in self.skills.values())
+        return any(s.visibility == "visible" for s in self.get_unique_skills())
 
     # ─────────────────────────────────────────────────────────── persistence
 
@@ -109,6 +122,8 @@ class SkillsManager:
                     if skill:
                         skill.visibility = self._resolve_visibility(skill)
                         self.skills[skill.title.lower()] = skill
+                        # Also index by directory slug name (e.g. "file_organization")
+                        self.skills[item.name.lower()] = skill
             elif item.is_file() and item.suffix.lower() == ".md" and item.name != "README.md":
                 if item.resolve() not in seen_paths:
                     seen_paths.add(item.resolve())
@@ -116,6 +131,7 @@ class SkillsManager:
                     if skill:
                         skill.visibility = self._resolve_visibility(skill)
                         self.skills[skill.title.lower()] = skill
+                        self.skills[item.stem.lower()] = skill
 
     def _sanitize_title(self, title: str) -> str:
         safe_title = re.sub(r'[^\w\-]', '_', title).strip('_')
@@ -125,8 +141,8 @@ class SkillsManager:
         functional_tags = [
             r'<tool>.*?</tool>',
             r'<art(?:ifact|efact)\b[^>]*>.*?</art(?:ifact|efact)>',
-            r'<(?:unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|user_profile_update|user_profile_clear|mem_new|mem_update|done|end|processing|tool_result|refactor_history)\b[^>]*/?>',
-            r'</(?:unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|user_profile_update|user_profile_clear|mem_new|mem_update|done|end|processing|tool_result|refactor_history)>',
+            r'<(?:unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|user_profile_update|user_profile_clear|mem_new|mem_update|effort|done|end|processing|tool_result|refactor_history)\b[^>]*/?>',
+            r'</(?:unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|user_profile_update|user_profile_clear|mem_new|mem_update|effort|done|end|processing|tool_result|refactor_history)>',
         ]
         cleaned = content
         for pattern in functional_tags:
@@ -239,9 +255,66 @@ class SkillsManager:
             visibility=normalized_visibility,
         )
 
+    @staticmethod
+    def _normalize_key(text: str) -> str:
+        if not text:
+            return ""
+        t = text.lower().replace("_", " ").replace("-", " ")
+        t = re.sub(r'[^\w\s]', '', t)
+        return " ".join(t.split())
+
     def get_skill(self, title: str) -> Optional[Skill]:
-        """Retrieves a skill by exact (case-insensitive) title."""
-        return self.skills.get((title or "").strip().lower())
+        """Retrieves a skill by exact, slug, or fuzzy normalized title matching."""
+        if not title:
+            return None
+        clean_title = title.strip().lower()
+        if clean_title in self.skills:
+            return self.skills[clean_title]
+
+        norm_query = self._normalize_key(title)
+        query_words = set(norm_query.split())
+
+        best_match = None
+        best_overlap = 0
+
+        for s in self.get_unique_skills():
+            norm_s_title = self._normalize_key(s.title)
+            norm_s_slug = self._normalize_key(s.file_path.parent.name if s.file_path else "")
+            norm_s_cat = self._normalize_key(s.category)
+
+            # 1. Exact match on title, slug, or category
+            if norm_query in (norm_s_title, norm_s_slug, norm_s_cat):
+                return s
+
+            # 2. Tag match (e.g. model calls tool_load_skill("file_organization"))
+            if s.tags:
+                for t in s.tags:
+                    if norm_query == self._normalize_key(t):
+                        return s
+
+            # 3. Substring match
+            if norm_query in norm_s_title or norm_s_title in norm_query:
+                return s
+            if norm_s_slug and (norm_query in norm_s_slug or norm_s_slug in norm_query):
+                return s
+            if norm_s_cat and (norm_query in norm_s_cat or norm_s_cat in norm_query):
+                return s
+
+            # 4. Word overlap match
+            s_words = set(norm_s_title.split()) | (set(norm_s_slug.split()) if norm_s_slug else set()) | (set(norm_s_cat.split()) if norm_s_cat else set())
+            overlap = len(query_words & s_words)
+            if overlap > best_overlap and overlap >= max(1, len(query_words) - 1):
+                best_overlap = overlap
+                best_match = s
+
+        if best_match:
+            return best_match
+
+        matches = self.search_skills(title)
+        if matches:
+            return matches[0]
+
+        return None
 
     def set_skill_visibility(self, title: str, visibility: str) -> Skill:
         """
@@ -377,12 +450,41 @@ class SkillsManager:
         self.reload()
         return True
 
+    def set_active_tools(self, tool_names: Optional[Any] = None) -> None:
+        """Sets the active tool set used to condition skill availability."""
+        if isinstance(tool_names, dict):
+            self.active_tool_names = {str(k).lower().strip() for k in tool_names.keys()}
+        elif isinstance(tool_names, (list, tuple, set)):
+            self.active_tool_names = {str(k).lower().strip() for k in tool_names}
+        else:
+            self.active_tool_names = None
+
     # ─────────────────────────────────────────────────────────── prompt builders
 
-    def build_context(self) -> str:
+    def find_relevant_skills(self, query: str, top_k: int = 2) -> List[Skill]:
+        """Identifies loadable skills that have high relevance to the user's query."""
+        if not query or len(query.strip()) < 3:
+            return []
+        matches = self.search_skills(query)
+        eligible = [
+            s for s in matches
+            if s.visibility == "loadable" and s.is_available(self.active_tool_names)
+        ]
+        return eligible[:top_k]
+
+    def build_context(self, active_tool_names: Optional[Any] = None, current_query: Optional[str] = None, round_count: int = 1) -> str:
+        if active_tool_names is not None:
+            self.set_active_tools(active_tool_names)
+
         parts = []
 
-        raw_visible = [s for s in self.skills.values() if s.visibility == "visible"]
+        # Filter out skills whose required_tools are neither active nor available to load
+        eligible_skills = [
+            s for s in self.get_unique_skills()
+            if s.is_available(self.active_tool_names, self.tool_availability_checker)
+        ]
+
+        raw_visible = [s for s in eligible_skills if s.visibility == "visible"]
         active_visible = []
         overflow_loadable = []
 
@@ -411,7 +513,7 @@ class SkillsManager:
             lines.append("=== END ACTIVE SKILLS ===")
             parts.append("\n".join(lines))
 
-        loadable = [s for s in self.skills.values() if s.visibility == "loadable"] + overflow_loadable
+        loadable = [s for s in eligible_skills if s.visibility == "loadable"] + overflow_loadable
         if loadable:
             lines = ["=== AVAILABLE SKILLS (Loadable on Demand) ==="]
             lines.append(f"There are {len(loadable)} loadable skills. Use the `tool_load_skill` tool to load the full content of any skill listed below.")
@@ -424,7 +526,35 @@ class SkillsManager:
             lines.append("=== END AVAILABLE SKILLS ===")
             parts.append("\n".join(lines))
 
-        searchable = [s for s in self.skills.values() if s.visibility == "searchable"]
+        # Proactively highlight relevant skills that match the user's immediate prompt
+        if current_query:
+            relevant = self.find_relevant_skills(current_query, top_k=2)
+            if relevant:
+                if round_count <= 1:
+                    rec_lines = [
+                        "=== 🎯 RECOMMENDED SKILL FOR CURRENT TASK ===",
+                        "The user's request matches the following specialized skill(s):"
+                    ]
+                    for r_skill in relevant:
+                        rec_lines.append(
+                            f"👉 `{r_skill.title}` — MANDATORY: Call `tool_load_skill(title=\"{r_skill.title}\")` in Round 1 "
+                            f"to load its verified methodology before taking action!"
+                        )
+                    rec_lines.append("=== END RECOMMENDED SKILL ===")
+                else:
+                    # In Round 2+, switch to active execution directive so model never loops tool_load_skill
+                    rec_lines = [
+                        "=== 🎯 ACTIVE TASK SKILL (IN PROGRESS) ==="
+                    ]
+                    for r_skill in relevant:
+                        rec_lines.append(
+                            f"✅ Skill '{r_skill.title}' methodology is loaded. You have fulfilled the Skill-First mandate.\n"
+                            f"DO NOT call `tool_load_skill` again! You MUST now execute the skill protocol (Phase 1: scan and emit artifacts)."
+                        )
+                    rec_lines.append("=== END ACTIVE TASK SKILL ===")
+                parts.append("\n".join(rec_lines))
+
+        searchable = [s for s in eligible_skills if s.visibility == "searchable"]
         if searchable:
             lines = ["=== SEARCHABLE SKILLS ==="]
             lines.append(f"There are {len(searchable)} hidden skills. Use `tool_search_skills` to find them by keyword.")
@@ -443,7 +573,7 @@ class SkillsManager:
         Returns an empty string when there are no loadable skills, so callers
         can append it unconditionally.
         """
-        loadable = [s for s in self.skills.values() if s.visibility == "loadable"]
+        loadable = [s for s in self.get_unique_skills() if s.visibility == "loadable"]
         if not loadable:
             return ""
 
@@ -478,12 +608,12 @@ class SkillsManager:
         return "\n".join(lines)
 
     def _searchable_count(self) -> int:
-        return sum(1 for s in self.skills.values() if s.visibility == "searchable")
+        return sum(1 for s in self.get_unique_skills() if s.visibility == "searchable")
 
     def search_skills(self, query: str) -> List[Skill]:
         query_lower = query.lower()
         results = []
-        for skill in self.skills.values():
+        for skill in self.get_unique_skills():
             score = 0
             if query_lower in skill.title.lower():
                 score += 3
@@ -515,7 +645,7 @@ class SkillsManager:
         return None
 
     def list_skills(self) -> List[Dict[str, Any]]:
-        return [s.to_dict() for s in self.skills.values()]
+        return [s.to_dict() for s in self.get_unique_skills()]
 
     # ─────────────────────────────────────────────────────────── tool building
 
@@ -531,10 +661,11 @@ class SkillsManager:
         """
         tools: Dict[str, Dict[str, Any]] = {}
 
-        raw_visible_count = sum(1 for s in self.skills.values() if s.visibility == "visible")
-        has_loadable = any(s.visibility == "loadable" for s in self.skills.values()) or (raw_visible_count > self.max_visible_skills)
+        raw_visible_count = sum(1 for s in self.get_unique_skills() if s.visibility == "visible")
+        has_loadable = any(s.visibility == "loadable" for s in self.get_unique_skills()) or (raw_visible_count > self.max_visible_skills)
         has_searchable = self.has_searchable_skills()
-        total_skills = len(self.skills)
+        unique_skills_list = self.get_unique_skills()
+        total_skills = len(unique_skills_list)
 
         if total_skills > 0:
             def tool_list_skills() -> dict:
@@ -542,15 +673,15 @@ class SkillsManager:
                 Lists all available skills in the library, categorized by their visibility tier (visible, loadable, searchable).
                 Use this to get an overview of what knowledge is available.
                 """
-                visible = [s.to_dict() for s in self.skills.values() if s.visibility == "visible"]
-                loadable = [s.to_dict() for s in self.skills.values() if s.visibility == "loadable"]
-                searchable = [s.to_dict() for s in self.skills.values() if s.visibility == "searchable"]
+                visible = [s.to_dict() for s in self.get_unique_skills() if s.visibility == "visible"]
+                loadable = [s.to_dict() for s in self.get_unique_skills() if s.visibility == "loadable"]
+                searchable = [s.to_dict() for s in self.get_unique_skills() if s.visibility == "searchable"]
 
                 report = {
                     "visible_skills": visible,
                     "loadable_skills": loadable,
                     "searchable_skills": searchable,
-                    "total_count": total_skills
+                    "total_count": len(self.get_unique_skills())
                 }
                 return {"success": True, "output": report}
 
@@ -562,16 +693,75 @@ class SkillsManager:
             }
 
         if has_loadable or has_searchable:
-            def tool_load_skill(title: str) -> dict:
+            def tool_load_skill(title: str = "", name: str = "", skill_name: str = "", **kwargs) -> dict:
                 """
                 Load the full content of a skill by title. Use this to access detailed instructions.
 
                 Args:
-                    title (str): The title of the skill to load (case-insensitive).
+                    title (str, optional): The title of the skill to load.
+                    name (str, optional): Alias for title.
+                    skill_name (str, optional): Alias for title.
                 """
-                content = self.load_skill(title)
+                target_title = (title or name or skill_name or kwargs.get("skill") or "").strip()
+                if not target_title:
+                    return {"success": False, "error": "No skill title or name provided."}
+
+                skill = self.get_skill(target_title)
+                if not skill:
+                    return {"success": False, "error": f"Skill '{target_title}' not found."}
+
+                # ── DYNAMIC TOOL LOADING ON SKILL MOUNT ──
+                loaded_tools_now = []
+                missing_tools = []
+
+                if skill.required_tools:
+                    available_set = set(self.active_tool_names or [])
+                    for req in skill.required_tools:
+                        clean_req = str(req).strip()
+                        if not clean_req:
+                            continue
+                        if clean_req.lower() in available_set:
+                            continue
+
+                        # Attempt to dynamically load the tool
+                        loaded_spec = None
+                        if self.tool_loader:
+                            try:
+                                loaded_spec = self.tool_loader(clean_req)
+                            except Exception as ex:
+                                ASCIIColors.warning(f"[SkillsManager] Tool loader error for '{clean_req}': {ex}")
+
+                        if loaded_spec:
+                            loaded_tools_now.append(clean_req)
+                            if self.active_tool_names is not None:
+                                self.active_tool_names.add(clean_req.lower())
+                            available_set.add(clean_req.lower())
+                        else:
+                            missing_tools.append(clean_req)
+
+                if missing_tools:
+                    return {
+                        "success": False,
+                        "error": f"Skill '{skill.title}' cannot be loaded: required tool(s) ({', '.join(missing_tools)}) are missing or unavailable. The skill requires these tools to operate safely and will not be loaded until they are installed or mounted."
+                    }
+
+                skill._loaded_in_session = True
+                content = self.load_skill(skill.title)
                 if content:
-                    return {"success": True, "output": content}
+                    tool_notice = ""
+                    if loaded_tools_now or skill.required_tools:
+                        active_now = loaded_tools_now or skill.required_tools
+                        tool_notice = (
+                            f"\n\n🛠️ **Required Toolset Automatically Activated**:\n"
+                            f"The required tool(s) for this skill ({', '.join(f'`{t}`' for t in active_now)}) "
+                            f"have been verified and activated in your session.\n"
+                            f"You can now call them directly (e.g. `{active_now[0]}`)."
+                        )
+                    return {
+                        "success": True,
+                        "output": content + tool_notice,
+                        "loaded_tools": loaded_tools_now
+                    }
                 return {"success": False, "error": f"Skill '{title}' not found."}
 
             tools["tool_load_skill"] = {
@@ -581,6 +771,35 @@ class SkillsManager:
                     {"name": "title", "type": "str", "description": "The title of the skill to load."}
                 ],
                 "callable": tool_load_skill,
+            }
+
+            def tool_unload_skill(title: str = "", name: str = "", skill_name: str = "", **kwargs) -> dict:
+                """
+                Unload a previously loaded skill from context back to loadable state to free context tokens.
+
+                Args:
+                    title (str, optional): The title of the skill to unload.
+                    name (str, optional): Alias for title.
+                    skill_name (str, optional): Alias for title.
+                """
+                target_title = (title or name or skill_name or kwargs.get("skill") or "").strip()
+                if not target_title:
+                    return {"success": False, "error": "No skill title or name provided."}
+
+                skill = self.get_skill(target_title)
+                if not skill:
+                    return {"success": False, "error": f"Skill '{target_title}' not found."}
+
+                skill.visibility = "loadable"
+                return {"success": True, "output": f"Skill '{skill.title}' has been unloaded from active context to free token space."}
+
+            tools["tool_unload_skill"] = {
+                "name": "tool_unload_skill",
+                "description": "Unload a skill from active context back to loadable state to free context tokens when it is no longer needed.",
+                "parameters": [
+                    {"name": "title", "type": "str", "description": "The title of the skill to unload."}
+                ],
+                "callable": tool_unload_skill,
             }
 
         if has_searchable:

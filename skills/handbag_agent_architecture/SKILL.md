@@ -3,11 +3,16 @@ title: "Handbag Agent Architecture and Autonomous Persona Engineering"
 description: "Definitive architectural doctrine for building sovereign agent Handbags, crafting SOUL.md personalities, injecting app-level tools and skills, and inspecting agent state."
 category: "agent_engineering"
 tags: [handbag, personality, soul, agents, skills, memory, coworkers]
-visibility: visible
+visibility: loadable
 modifiable: true
 ---
 
 # Handbag Agent Architecture & Persona Engineering
+
+## 7. Round Checkpointing and Turn Resumption
+Agents support state persistence across unexpected interruptions or pauses:
+- Each round automatically saves a turn checkpoint (`.lollms_code/turn_checkpoint.json` in workspaces, or `ai_msg.metadata["turn_checkpoint"]` in discussions).
+- To resume an interrupted turn, call `agent.resume_turn()` or pass `resume_turn=True` to `agent.chat()`. Virtual history, tool calls, and round numbers will be restored without starting from scratch.
 
 The **Handbag** is the sovereign, self-contained portable directory specification in LOLLMS. It encapsulates an agent's identity, system prompt, specialized tools, persistent cognitive memories, learned skills, and coworker multi-agent teams.
 

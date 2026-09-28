@@ -133,6 +133,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
 
         # ── Network / server config ───────────────────────────────────────────
         self.host = kwargs.get("host", "localhost")
+        self.port: Optional[int] = _clean(kwargs.get("port"), int)
 
         # ── Model config ──────────────────────────────────────────────────────
         self.model_name: Optional[str] = _clean(kwargs.get("model_name", "")) or None
@@ -183,13 +184,11 @@ class LlamaCppServerBinding(LollmsLLMBinding):
 
         # ── Paths ─────────────────────────────────────────────────────────────
         self.binding_dir = Path(__file__).parent
-        # Use binaries_path from config if provided, otherwise default to relative 'bin'
-        binaries_path = kwargs.get("binaries_path", "data/bin/llm/llama_cpp_server")
-        self.bin_dir = Path(binaries_path).resolve()
-        
-        self.models_dir = Path(
-            kwargs.get("models_path", "data/models/llama_cpp_models")
-        ).resolve()
+        raw_binaries_path = kwargs.get("binaries_path") or "data/bin/llm/llama_cpp_server"
+        self.bin_dir = self.resolve_system_path(raw_binaries_path)
+
+        raw_models_path = kwargs.get("models_path") or "data/models/llama_cpp_models"
+        self.models_dir = self.resolve_system_path(raw_models_path)
         self.mm_registry_path = self.models_dir / "multimodal_bindings.yaml"
 
         # Registry directory – one JSON per running model
@@ -822,7 +821,10 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         if model_path.stat().st_size == 0:
             raise RuntimeError(f"Model file is empty (corrupted download?): {model_path}")
 
-        port = get_free_port()
+        if self.port and self.port > 0:
+            port = get_free_port(start_port=self.port, max_port=self.port + 50)
+        else:
+            port = get_free_port()
         cmd = self._build_server_cmd(model_path, port)
         base_url = f"http://{self.host}:{port}/v1"
 
@@ -932,11 +934,45 @@ class LlamaCppServerBinding(LollmsLLMBinding):
 
         raise TimeoutError(f"Server for '{model_name}' failed to become ready within 120 s.")
 
+    # ── Local Resource Management Contract Implementation ─────────────────────
+
+    def is_local(self) -> bool:
+        return True
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        target = model_name or self.model_name
+        if not target:
+            return False
+        info = self._get_server_info(target)
+        if not info:
+            return False
+        try:
+            r = requests.get(f"http://{self.host}:{info['port']}/health", timeout=1)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    def get_loaded_models(self) -> List[str]:
+        loaded = []
+        for rf in list(self.servers_dir.glob("*.json")):
+            try:
+                with open(rf, "r") as f:
+                    data = json.load(f)
+                mname = data.get("model_name")
+                if mname and self.is_model_loaded(mname):
+                    loaded.append(mname)
+            except Exception:
+                pass
+        return loaded
+
+    def has_active_resources(self) -> bool:
+        return bool(self.get_loaded_models())
+
     def load_model(self, model_name: str) -> bool:
         """
         Thread- and process-safe model loader.
         If the model is already running (in any process), updates the LRU timestamp
-        and returns immediately.  Otherwise evicts the LRU model if needed, then
+        and returns immediately. Otherwise evicts the LRU model if needed, then
         spawns a new server.
         """
         self.global_lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -945,12 +981,12 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             with lock.acquire(timeout=60):
                 info = self._get_server_info(model_name)
                 if info:
-                    # Already running – just refresh LRU timestamp
                     try:
                         self._get_registry_file(model_name).touch()
                     except Exception:
                         pass
                     self.model_name = model_name
+                    self._last_error = None
                     return True
 
                 self._ensure_capacity_locked()
@@ -967,18 +1003,32 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                     },
                 )
                 self.model_name = model_name
+                self._last_error = None
                 ASCIIColors.success(f"Model '{model_name}' loaded on port {port}.")
                 return True
         except Exception as e:
+            self._last_error = str(e)
             ASCIIColors.error(f"Failed to load model '{model_name}': {e}")
             trace_exception(e)
             return False
 
     def unload_model(self, model_name: Optional[str] = None) -> bool:
-        """Stops the server for *model_name* (defaults to the current model)."""
+        """Stops the server for *model_name* (or all running servers for this binding if None)."""
         target = model_name or self.model_name
         if not target:
-            return False
+            unloaded_any = False
+            for rf in list(self.servers_dir.glob("*.json")):
+                try:
+                    with open(rf, "r") as f:
+                        info = json.load(f)
+                    mname = info.get("model_name", rf.stem)
+                    self._kill_server(mname, info)
+                    unloaded_any = True
+                except Exception:
+                    pass
+            self.model_name = None
+            return unloaded_any
+
         info = self._get_server_info(target)
         if info:
             self._kill_server(target, info)
@@ -1104,11 +1154,23 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             body["repeat_last_n"] = kw["repeat_last_n"]
         if kw.get("n_predict") is not None:
             body["n_predict"] = kw["n_predict"]
-        # thinking / reasoning flags (supported by some llama.cpp builds)
-        if kw.get("think"):
+
+        # thinking / reasoning flags (supported by modern llama.cpp / openai builds)
+        think = kw.get("think")
+        reasoning_effort = kw.get("reasoning_effort")
+
+        if (think is False and reasoning_effort is None) or reasoning_effort in ("none", "off", "disabled", "false", "0"):
+            body["thinking"] = False
+            body.setdefault("chat_template_kwargs", {})["thinking"] = False
+        elif think is True or (reasoning_effort is not None and reasoning_effort not in ("none", "off", "disabled", "false", "0")):
             body["thinking"] = True
-        if kw.get("reasoning_effort") is not None:
-            body["reasoning_effort"] = kw["reasoning_effort"]
+            body.setdefault("chat_template_kwargs", {})["thinking"] = True
+            if reasoning_effort is not None:
+                body["reasoning_effort"] = reasoning_effort
+        elif think is False:
+            body["thinking"] = False
+            body.setdefault("chat_template_kwargs", {})["thinking"] = False
+
         if kw.get("reasoning_summary") is not None:
             body["reasoning_summary"] = kw["reasoning_summary"]
         return body
@@ -1182,8 +1244,8 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         user_keyword: Optional[str] = "!@>user:",
         ai_keyword: Optional[str] = "!@>assistant:",
         think: Optional[bool] = False,
-        reasoning_effort: Optional[str] = "low",
-        reasoning_summary: Optional[str] = "auto",
+        reasoning_effort: Optional[str] = None,
+        reasoning_summary: Optional[str] = None,
         **kwargs,
     ) -> Union[str, dict]:
         """
@@ -1203,6 +1265,10 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         seed         = self._resolve(seed,         self.default_seed)
         cb           = streaming_callback or self.default_streaming_callback
         do_stream    = self._resolve(stream, True if cb else (self.default_stream or False))
+
+        ASCIIColors.info(
+            f"[LlamaCppServerBinding.generate_text] think={think}, reasoning_effort={reasoning_effort}"
+        )
 
         try:
             client = self._get_client()
@@ -1288,8 +1354,8 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         ctx_size: Optional[int] = None,
         streaming_callback: Optional[Callable] = None,
         think: Optional[bool] = False,
-        reasoning_effort: Optional[str] = "low",
-        reasoning_summary: Optional[str] = "auto",
+        reasoning_effort: Optional[str] = None,
+        reasoning_summary: Optional[str] = None,
         **kwargs,
     ) -> Union[str, dict]:
         """
@@ -1306,6 +1372,10 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         seed        = self._resolve(seed, self.default_seed)
         cb          = streaming_callback or self.default_streaming_callback
         do_stream   = self._resolve(stream, True if cb else (self.default_stream or False))
+
+        ASCIIColors.info(
+            f"[LlamaCppServerBinding.generate_from_messages] think={think}, reasoning_effort={reasoning_effort}"
+        )
 
         try:
             return self._run_chat_messages(
@@ -1336,14 +1406,18 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         repeat_last_n: int,
         seed: Optional[int],
         cb: Optional[Callable],
-        think: bool = False,
-        reasoning_effort: str = "low",
-        reasoning_summary: str = "auto",
+        think: Optional[bool] = False,
+        reasoning_effort: Optional[str] = None,
+        reasoning_summary: Optional[str] = None,
     ) -> Union[str, dict]:
         """
         Internal helper – all public generation methods funnel through here
         when targeting /v1/chat/completions.
         """
+        ASCIIColors.info(
+            f"[LlamaCppServerBinding._run_chat_messages] think={think}, reasoning_effort={reasoning_effort}"
+        )
+
         client = self._get_client()
         alternated_messages = self.clean_and_alternate_messages(messages)
         extra_body = self._build_extra_body(
@@ -1484,12 +1558,14 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                 r = requests.get(f"{base}/props", timeout=5)
                 if r.status_code == 200:
                     props = r.json()
-                    # Different llama.cpp versions use different key names
-                    for key in ("total_slots", "n_ctx", "ctx_size", "context_size"):
-                        if key in props:
-                            if key == "total_slots":
-                                # total_slots = n_ctx / n_parallel
-                                return int(props[key]) * self.n_parallel
+                    # Check default_generation_settings first (modern llama-server)
+                    gen_settings = props.get("default_generation_settings", {})
+                    if "n_ctx" in gen_settings and int(gen_settings["n_ctx"]) > 1:
+                        return int(gen_settings["n_ctx"])
+
+                    # Check top-level context keys (never use total_slots which is slot concurrency)
+                    for key in ("n_ctx", "ctx_size", "context_size"):
+                        if key in props and int(props[key]) > 1:
                             return int(props[key])
             except Exception as e:
                 ASCIIColors.warning(f"Could not query /props for ctx size: {e}")

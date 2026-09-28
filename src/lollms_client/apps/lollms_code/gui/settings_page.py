@@ -28,6 +28,7 @@ MODALITY_ICONS = {
     "ttm": "music_note",
     "ttv": "videocam",
     "connection": "hub",
+    "rag": "auto_stories",
 }
 
 
@@ -41,7 +42,7 @@ def build_settings_page(
     SURFACE = "bg-slate-100/90 dark:bg-slate-900/90"
     SURFACE_ALT = "bg-slate-200/50 dark:bg-slate-800/50"
     CANVAS = "bg-slate-50 dark:bg-slate-950"
-    CARD_BG = "bg-white dark:bg-slate-900"
+    CARD_BG = "bg-slate-100 dark:bg-slate-900"
     BORDER = "border-slate-200 dark:border-slate-800"
     TEXT_MAIN = "text-slate-900 dark:text-slate-100"
     TEXT_MUTED = "text-slate-600 dark:text-slate-400"
@@ -254,7 +255,7 @@ def _render_modality_section(env: EnvStore, modality: str, refresh_parent: Calla
     icon_name = MODALITY_ICONS.get(modality, "cable")
 
     # Section Header Card
-    with ui.card().classes(f"w-full p-4 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-2"):
+    with ui.card().classes(f"w-full p-4 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-2").props(':dark="Quasar.Dark.isActive"'):
         with ui.row().classes("w-full items-center justify-between"):
             with ui.row().classes("items-center gap-3"):
                 ui.icon(icon_name, size="32px").classes("text-primary")
@@ -266,16 +267,63 @@ def _render_modality_section(env: EnvStore, modality: str, refresh_parent: Calla
 
     # Modality Sub-Tabs (Pill Toggle)
     view_state = {"tab": "profiles"}
+
+    def on_add_click():
+        if view_state["tab"] == "profiles":
+            _open_add_profile_dialog(env, modality, refresh_parent)
+        else:
+            _open_add_binding_dialog(env, modality, refresh_parent)
+
+    def on_top_commands_click():
+        aliases = env.configured_binding_aliases(modality)
+        if not aliases:
+            ui.notify("No bindings configured yet. Add a binding first.", type="warning")
+            return
+        # Find bindings that have commands
+        candidates = []
+        for a in aliases:
+            b_keys = env.binding_keys(modality, a)
+            b_name = b_keys.get("BINDING_NAME")
+            if b_name:
+                cmds = _get_binding_commands_schema(env, modality, b_name)
+                if cmds:
+                    candidates.append((a, b_name, len(cmds)))
+        if not candidates:
+            ui.notify(f"None of the configured {modality.upper()} bindings define extra commands.", type="info")
+            return
+        if len(candidates) == 1:
+            _open_binding_commands_dialog(env, modality, candidates[0][0], candidates[0][1])
+        else:
+            # Menu to pick which binding's commands to open
+            d_pick = ui.dialog()
+            with d_pick, ui.card().classes(f"w-[420px] p-4 gap-2 {CARD_BG} border {BORDER} rounded-xl shadow-xl"):
+                ui.label(f"Select {modality.upper()} Binding Commands").classes("font-bold text-sm")
+                for a_name, b_n, c_cnt in candidates:
+                    def _open(al=a_name, bn=b_n):
+                        d_pick.close()
+                        _open_binding_commands_dialog(env, modality, al, bn)
+                    ui.button(f"{a_name} ({b_n}) — {c_cnt} command(s)", icon="bolt", on_click=_open).props(
+                        "outline dense no-caps text-xs w-full text-left"
+                    )
+            d_pick.open()
+
     with ui.row().classes("w-full items-center justify-between"):
         sub_toggle = ui.toggle(
             {"profiles": "📋 Model Profiles", "bindings": "🔌 Server Bindings"},
             value=view_state["tab"],
         ).props("dense unelevated size=sm").classes("text-xs")
 
-        add_btn = ui.button(
-            "Add Model Profile", icon="add",
-            on_click=lambda: _open_add_profile_dialog(env, modality, refresh_parent),
-        ).props("outline dense size=sm no-caps color=primary")
+        with ui.row().classes("items-center gap-2"):
+            commands_top_btn = ui.button(
+                "Commands", icon="bolt",
+                on_click=on_top_commands_click,
+            ).props("flat dense size=sm no-caps color=amber")
+            commands_top_btn.tooltip(f"Execute special binding commands (e.g. pull model, bind mmproj, update binaries)")
+
+            add_btn = ui.button(
+                "Add Model Profile", icon="add",
+                on_click=on_add_click,
+            ).props("outline dense size=sm no-caps color=primary")
 
     panels_slot = ui.column().classes("w-full gap-3")
 
@@ -285,12 +333,12 @@ def _render_modality_section(env: EnvStore, modality: str, refresh_parent: Calla
         if tab == "profiles":
             add_btn.text = "Add Model Profile"
             add_btn._props["icon"] = "add"
-            add_btn.on("click", lambda: _open_add_profile_dialog(env, modality, refresh_parent))
+            add_btn.update()
             _render_profiles_cards(env, modality, panels_slot, refresh_parent)
         else:
             add_btn.text = "Add Server Binding"
             add_btn._props["icon"] = "add_link"
-            add_btn.on("click", lambda: _open_add_binding_dialog(env, modality, refresh_parent))
+            add_btn.update()
             _render_bindings_cards(env, modality, panels_slot, refresh_parent)
 
     def on_toggle_change(e):
@@ -323,6 +371,7 @@ def _render_bindings_cards(env: EnvStore, modality: str, container: ui.column, r
             keys = env.binding_keys(modality, alias)
             b_name = keys.get("BINDING_NAME", "unknown")
             host = keys.get("HOST_ADDRESS", "default host")
+            cmds = _get_binding_commands_schema(env, modality, b_name)
 
             with ui.card().classes(f"w-full p-4 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-2"):
                 with ui.row().classes("w-full items-center justify-between"):
@@ -332,7 +381,13 @@ def _render_bindings_cards(env: EnvStore, modality: str, container: ui.column, r
                             ui.label(alias).classes("font-mono font-bold text-sm text-slate-900 dark:text-slate-100")
                             ui.label(f"Endpoint: {host}").classes("text-xs text-slate-500 font-mono")
 
-                    with ui.row().classes("items-center gap-1"):
+                    with ui.row().classes("items-center gap-1.5"):
+                        if cmds:
+                            ui.button(
+                                f"Commands ({len(cmds)})", icon="bolt",
+                                on_click=lambda a=alias, bn=b_name: _open_binding_commands_dialog(env, modality, a, bn),
+                            ).props("outline dense size=sm no-caps color=amber font-semibold").tooltip(f"Execute special commands for {b_name}")
+
                         ui.button(
                             icon="edit",
                             on_click=lambda a=alias: _open_edit_binding_dialog(env, modality, a, refresh),
@@ -435,33 +490,109 @@ def _render_agent_section(prefs: GuiPrefs) -> None:
     BORDER = "border-slate-200 dark:border-slate-800"
 
     # Header Card
-    with ui.card().classes(f"w-full p-4 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-1"):
+    with ui.card().classes(f"w-full p-4 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-1").props(':dark="Quasar.Dark.isActive"'):
         with ui.row().classes("items-center gap-2"):
             ui.icon("smart_toy", size="24px").classes("text-primary")
             ui.label("Agent Behavior & Reasoning Controls").classes("text-base font-bold text-slate-900 dark:text-slate-100")
         ui.label("Tune cognitive sampling, token budgets, execution autonomy, and sub-agent delegation.").classes("text-xs text-slate-500")
 
     # Card 1: Reasoning & Turn Budgets
-    with ui.card().classes(f"w-full p-5 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-4"):
+    with ui.card().classes(f"w-full p-5 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-4").props(':dark="Quasar.Dark.isActive"'):
         ui.label("Reasoning & Token Budgets").classes("text-sm font-bold text-slate-800 dark:text-slate-200")
 
         with ui.column().classes("w-full gap-1"):
-            ui.label("Sampling Temperature").classes("text-xs font-semibold text-slate-700 dark:text-slate-300")
+            with ui.row().classes("w-full items-center justify-between"):
+                ui.label("Sampling Temperature").classes("text-xs font-semibold text-slate-700 dark:text-slate-300")
+                auto_temp_sw = ui.switch(
+                    "Auto Temperature (Task-adapted)",
+                    value=getattr(prefs, "auto_temperature", False)
+                ).props("dense").tooltip("When Auto is enabled, temperature is chosen automatically: 0.15 for code & Aider patches, 0.7 for creative & conversational turns.")
+                auto_temp_sw.on_value_change(lambda e: setattr(prefs, "auto_temperature", e.value))
+
             temp_slider = ui.slider(min=0.0, max=1.2, step=0.05, value=prefs.temperature).props("label-always dense")
-            ui.label().bind_text_from(temp_slider, "value", lambda v: f"Value: {v:.2f} (lower = more deterministic, higher = more creative)").classes("text-xs text-slate-500")
+            temp_desc = ui.label().bind_text_from(temp_slider, "value", lambda v: f"Value: {v:.2f} (lower = more deterministic, higher = more creative)").classes("text-xs text-slate-500")
+
+            def _sync_temp_ui():
+                is_auto = getattr(prefs, "auto_temperature", False)
+                temp_slider.set_visibility(not is_auto)
+                if is_auto:
+                    temp_desc.set_text("Auto (Deterministic for code / creative for dialogue)")
+                else:
+                    temp_desc.set_text(f"Value: {prefs.temperature:.2f} (manual)")
+
+            auto_temp_sw.on_value_change(lambda _: _sync_temp_ui())
+            _sync_temp_ui()
 
         with ui.row().classes("w-full gap-4 items-center"):
-            tokens_in = ui.number("Max Tokens / Turn", value=prefs.max_tokens_per_turn, min=512, step=512).classes("flex-1").props("outlined dense")
-            steps_in = ui.number("Max Reasoning Steps (Rounds)", value=prefs.max_reasoning_steps, min=1, max=200, step=1).classes("flex-1").props("outlined dense")
+            with ui.column().classes("flex-1 gap-1"):
+                with ui.row().classes("w-full items-center justify-between"):
+                    ui.label("Max Generation Tokens").classes("text-xs font-semibold")
+                    auto_tokens_sw = ui.switch(
+                        "Auto (Fill Remaining Ctx)",
+                        value=getattr(prefs, "auto_max_tokens", False) or prefs.max_tokens_per_turn <= 0
+                    ).props("dense").tooltip("Automatically use the model's full remaining context window per turn without artificial token cuts.")
+
+                tokens_in = ui.number(
+                    "Max Tokens / Turn",
+                    value=prefs.max_tokens_per_turn if prefs.max_tokens_per_turn > 0 else 8192,
+                    min=512, step=512
+                ).classes("w-full").props("outlined dense")
+
+                def _sync_tokens_ui(e=None):
+                    is_auto = auto_tokens_sw.value
+                    prefs.auto_max_tokens = is_auto
+                    tokens_in.set_visibility(not is_auto)
+                    if is_auto:
+                        prefs.max_tokens_per_turn = 0
+                    else:
+                        prefs.max_tokens_per_turn = int(tokens_in.value or 8192)
+
+                auto_tokens_sw.on_value_change(_sync_tokens_ui)
+                tokens_in.on_value_change(lambda e: setattr(prefs, "max_tokens_per_turn", int(e.value or 8192)))
+                tokens_in.set_visibility(not (getattr(prefs, "auto_max_tokens", False) or prefs.max_tokens_per_turn <= 0))
+
+            steps_in = ui.number("Max Reasoning Steps (0 = Infinite ⚠️)", value=prefs.max_reasoning_steps, min=0, max=500, step=1).classes("flex-1").props("outlined dense").tooltip("Number of reasoning turns allowed. Set to 0 or -1 for infinite unbounded turns.")
             compact_in = ui.number("Auto-Compaction Threshold (%)", value=int(getattr(prefs, "context_compaction_threshold", 0.85) * 100), min=50, max=95, step=5).classes("flex-1").props("outlined dense").tooltip("Context fill % at which non-essential files are locked and history compacted to prevent server disconnects")
 
+        with ui.row().classes("w-full gap-4 items-center"):
+            effort_select = ui.select(
+                {
+                    "": "Model Default",
+                    "none": "None / Deactivated",
+                    "low": "Low Effort",
+                    "medium": "Medium Effort",
+                    "high": "High Effort",
+                    "max": "Max Effort",
+                },
+                value=getattr(prefs, "reasoning_effort", "") or "",
+                label="Base Reasoning Effort"
+            ).classes("flex-1").props("outlined dense")
+            effort_select.on_value_change(lambda e: setattr(prefs, "reasoning_effort", e.value if e.value else None))
+
+            dynamic_effort_sw = ui.switch(
+                "Dynamic Effort Scaling (<effort level='...'/>)",
+                value=getattr(prefs, "dynamic_effort", False)
+            ).props("dense").tooltip("Allow the agent to dynamically scale its reasoning effort up or down based on task complexity across rounds.")
+            dynamic_effort_sw.on_value_change(lambda e: setattr(prefs, "dynamic_effort", e.value))
+
         tokens_in.on_value_change(lambda e: setattr(prefs, "max_tokens_per_turn", int(e.value)))
-        steps_in.on_value_change(lambda e: setattr(prefs, "max_reasoning_steps", int(e.value)))
+
+        def _on_steps_change(e):
+            val = int(e.value or 0)
+            setattr(prefs, "max_reasoning_steps", val)
+            if val <= 0:
+                ui.notify(
+                    "⚠️ WARNING: Infinite reasoning rounds enabled (0). The agent will run indefinitely until <done/> is emitted or stopped manually. Monitor token budget!",
+                    type="warning",
+                    timeout=7000
+                )
+
+        steps_in.on_value_change(_on_steps_change)
         compact_in.on_value_change(lambda e: setattr(prefs, "context_compaction_threshold", float(e.value) / 100.0))
         temp_slider.on_value_change(lambda e: setattr(prefs, "temperature", float(e.value)))
 
     # Card 2: Shell Autonomy & Python Execution Security Policies
-    with ui.card().classes(f"w-full p-5 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-3"):
+    with ui.card().classes(f"w-full p-5 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-3").props(':dark="Quasar.Dark.isActive"'):
         with ui.row().classes("items-center justify-between"):
             ui.label("Shell & Python Execution Security Policies").classes("text-sm font-bold text-slate-800 dark:text-slate-200")
             badge_map = {"strict": ("STRICT", "amber"), "safe": ("SAFE", "emerald"), "full_access": ("FULL ACCESS", "red")}
@@ -496,7 +627,7 @@ def _render_agent_section(prefs: GuiPrefs) -> None:
             ).classes("text-[11px] text-slate-500 dark:text-slate-400 pl-1")
 
     # Card 3: Sub-Agents & Model Switching
-    with ui.card().classes(f"w-full p-5 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-3"):
+    with ui.card().classes(f"w-full p-5 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-3").props(':dark="Quasar.Dark.isActive"'):
         ui.label("Sub-Agent Delegation").classes("text-sm font-bold text-slate-800 dark:text-slate-200")
 
         sub_switch = ui.switch("Enable Sub-Agent Spawning", value=prefs.enable_sub_agents)
@@ -513,7 +644,7 @@ def _render_agent_section(prefs: GuiPrefs) -> None:
         model_switch.on_value_change(lambda e: setattr(prefs, "enable_model_switching", e.value))
 
     # Card 4: Memory & Skills
-    with ui.card().classes(f"w-full p-5 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-3"):
+    with ui.card().classes(f"w-full p-5 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-3").props(':dark="Quasar.Dark.isActive"'):
         ui.label("Memory & Skills Engine").classes("text-sm font-bold text-slate-800 dark:text-slate-200")
 
         mem_switch = ui.switch("Enable Persistent Memory", value=prefs.enable_memory)
@@ -534,7 +665,7 @@ def _render_agent_section(prefs: GuiPrefs) -> None:
         skills_mode.on_value_change(lambda e: setattr(prefs, "skills_mode", e.value))
 
     # Card 5: Debug Mode
-    with ui.card().classes(f"w-full p-5 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-2"):
+    with ui.card().classes(f"w-full p-5 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-2").props(':dark="Quasar.Dark.isActive"'):
         ui.label("Diagnostic & Debug").classes("text-sm font-bold text-slate-800 dark:text-slate-200")
         debug_switch = ui.switch("Enable Debug Mode (Context & Prompt Dumps in .lollms_code/_debug_dumps)", value=prefs.debug)
         debug_switch.on_value_change(lambda e: setattr(prefs, "debug", e.value))
@@ -614,8 +745,8 @@ def _render_appearance_section(prefs: GuiPrefs) -> None:
             ui.dark_mode(e.value)
         dark_sw.on_value_change(on_dark_toggle)
 
-        fullscreen_sw = ui.switch("Start Application in Fullscreen", value=getattr(prefs, "start_fullscreen", True))
-        fullscreen_sw.on_value_change(lambda e: setattr(prefs, "start_fullscreen", e.value))
+        maximized_sw = ui.switch("Start Application Maximized", value=getattr(prefs, "start_maximized", True))
+        maximized_sw.on_value_change(lambda e: setattr(prefs, "start_maximized", e.value))
 
         with ui.row().classes("w-full gap-4 items-center"):
             preset_select = ui.select(
@@ -678,6 +809,61 @@ def _render_appearance_section(prefs: GuiPrefs) -> None:
 # Modal Dialogs for Adding / Editing Bindings and Profiles
 # ==============================================================================
 
+def _get_next_available_alias(base_alias: str, existing_list: List[str]) -> str:
+    """Computes a unique incremental alias by testing _2, _3, etc."""
+    upper_existing = {a.upper() for a in existing_list}
+    if base_alias.upper() not in upper_existing:
+        return base_alias
+    counter = 2
+    candidate = f"{base_alias}_{counter}"
+    while candidate.upper() in upper_existing:
+        counter += 1
+        candidate = f"{base_alias}_{counter}"
+    return candidate
+
+
+def _show_alias_collision_dialog(
+    item_type: str,
+    chosen_alias: str,
+    suggested_alias: str,
+    on_use_suffix: Callable[[str], None],
+    on_change_name: Optional[Callable[[], None]] = None,
+):
+    """Presents a confirmation dialog when an alias collision occurs."""
+    warn_dialog = ui.dialog().props("persistent")
+    with warn_dialog, ui.card().classes(
+        "w-[480px] max-w-[95vw] p-5 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 "
+        "border-2 border-amber-500 rounded-xl shadow-2xl gap-3"
+    ):
+        with ui.row().classes("items-center gap-2.5"):
+            ui.icon("warning", size="26px").classes("text-amber-500")
+            ui.label(f"{item_type.capitalize()} Name Already Exists").classes("text-base font-bold")
+
+        ui.label(
+            f'A {item_type} named "{chosen_alias}" is already configured.\n\n'
+            f'Would you like to return to edit the name, or automatically save it as "{suggested_alias}"?'
+        ).classes("text-xs text-slate-600 dark:text-slate-300 leading-relaxed whitespace-pre-line")
+
+        with ui.row().classes("w-full items-center justify-end gap-2 pt-2 border-t border-slate-200 dark:border-slate-800"):
+            def _back():
+                warn_dialog.close()
+                if on_change_name:
+                    on_change_name()
+
+            def _accept_suffix():
+                warn_dialog.close()
+                on_use_suffix(suggested_alias)
+
+            ui.button("Change Name", icon="edit", on_click=_back).props("flat dense no-caps")
+            ui.button(
+                f'Use Suffix ("{suggested_alias}")',
+                icon="auto_fix_high",
+                on_click=_accept_suffix,
+            ).props("unelevated dense color=primary no-caps font-semibold")
+
+    warn_dialog.open()
+
+
 def _open_add_binding_dialog(env: EnvStore, modality: str, refresh) -> None:
     dialog = ui.dialog()
     with dialog, ui.card().classes("w-[560px] max-w-[95vw] p-5 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 border border-slate-200 dark:border-slate-800 rounded-xl shadow-lg gap-3"):
@@ -692,9 +878,12 @@ def _open_add_binding_dialog(env: EnvStore, modality: str, refresh) -> None:
             dialog.open()
             return
 
+        existing_bindings = env.configured_binding_aliases(modality)
+        default_alias = _get_next_available_alias("MASTER", existing_bindings)
+
         with ui.row().classes("w-full gap-3 items-center"):
             binding_select = ui.select(available, value=available[0], label="Engine Type").classes("flex-1").props("outlined dense")
-            alias_input = ui.input("Alias (Unique Name)", value="MASTER").classes("flex-1").props("outlined dense")
+            alias_input = ui.input("Alias (Unique Name)", value=default_alias).classes("flex-1").props("outlined dense")
 
         form_area = ui.column().classes("w-full gap-2")
         reader_holder = {"read": lambda: {}}
@@ -712,7 +901,31 @@ def _open_add_binding_dialog(env: EnvStore, modality: str, refresh) -> None:
             if not alias_val:
                 ui.notify("Alias is required.", type="warning")
                 return
+
             params = reader_holder["read"]()
+            current_bindings = env.configured_binding_aliases(modality)
+
+            # Check for collision
+            if any(b.upper() == alias_val.upper() for b in current_bindings):
+                suggested = _get_next_available_alias(alias_val, current_bindings)
+
+                def _use_suffixed(suffixed_name: str):
+                    alias_input.value = suffixed_name
+                    env.save_binding(modality, binding_select.value, suffixed_name, params)
+                    env.save()
+                    ui.notify(f"Binding registered as '{suffixed_name.upper()}'.", type="positive")
+                    dialog.close()
+                    refresh()
+
+                _show_alias_collision_dialog(
+                    item_type="binding",
+                    chosen_alias=alias_val,
+                    suggested_alias=suggested,
+                    on_use_suffix=_use_suffixed,
+                    on_change_name=lambda: alias_input.run_method("focus")
+                )
+                return
+
             env.save_binding(modality, binding_select.value, alias_val, params)
             env.save()
             ui.notify(f"Binding '{alias_val.upper()}' registered.", type="positive")
@@ -722,6 +935,242 @@ def _open_add_binding_dialog(env: EnvStore, modality: str, refresh) -> None:
         with ui.row().classes("w-full justify-end gap-2 pt-2 border-t border-slate-200 dark:border-slate-800"):
             ui.button("Cancel", on_click=dialog.close).props("flat dense")
             ui.button("Save Binding", on_click=do_save).props("unelevated dense color=primary")
+
+    dialog.open()
+
+
+def _get_binding_commands_schema(env: EnvStore, modality: str, binding_name: str) -> List[Dict[str, Any]]:
+    """Loads description.yaml for binding_name and returns command specs."""
+    try:
+        from lollms_client.lollms_config_cli_env import _get_binding_description
+        desc = _get_binding_description(binding_name, modality)
+        if desc and isinstance(desc, dict) and "commands" in desc:
+            cmds = desc["commands"]
+            return cmds if isinstance(cmds, list) else []
+    except Exception:
+        pass
+    return []
+
+
+def _instantiate_temporary_binding(env: EnvStore, modality: str, alias: str, binding_name: str) -> Any:
+    """Instantiates a live binding object configured with the alias's parameters."""
+    keys = env.binding_keys(modality, alias)
+    b_config = {}
+    for k, v in keys.items():
+        if k == "BINDING_NAME":
+            continue
+        key_lower = k.lower()
+        if key_lower == "verify_ssl_certificate":
+            b_config[key_lower] = str(v).lower() in ("true", "1", "yes", "on")
+        else:
+            try:
+                b_config[key_lower] = int(v)
+            except (ValueError, TypeError):
+                b_config[key_lower] = v
+
+    try:
+        if modality == "llm":
+            from lollms_client.lollms_llm_binding import LollmsLLMBindingManager
+            mgr = LollmsLLMBindingManager()
+            return mgr.create_binding(binding_name=binding_name, **b_config)
+        elif modality == "tti":
+            from lollms_client.lollms_tti_binding import LollmsTTIBindingManager
+            mgr = LollmsTTIBindingManager()
+            return mgr.create_binding(binding_name=binding_name, **b_config)
+        elif modality == "ttm":
+            from lollms_client.lollms_ttm_binding import LollmsTTMBindingManager
+            mgr = LollmsTTMBindingManager()
+            return mgr.create_binding(binding_name=binding_name, **b_config)
+        elif modality == "ttv":
+            from lollms_client.lollms_ttv_binding import LollmsTTVBindingManager
+            mgr = LollmsTTVBindingManager()
+            return mgr.create_binding(binding_name=binding_name, **b_config)
+        elif modality == "tts":
+            from lollms_client.lollms_tts_binding import LollmsTTSBindingManager
+            mgr = LollmsTTSBindingManager()
+            return mgr.create_binding(binding_name=binding_name, **b_config)
+        elif modality == "stt":
+            from lollms_client.lollms_stt_binding import LollmsSTTBindingManager
+            mgr = LollmsSTTBindingManager()
+            return mgr.create_binding(binding_name=binding_name, **b_config)
+        elif modality == "rag":
+            from lollms_client.lollms_rag_binding import LollmsRAGBindingManager
+            mgr = LollmsRAGBindingManager()
+            return mgr.create_binding(binding_name=binding_name, **b_config)
+    except Exception as e:
+        ASCIIColors.warning(f"Could not instantiate temporary binding {binding_name}: {e}")
+    return None
+
+
+def _open_binding_commands_dialog(env: EnvStore, modality: str, alias: str, binding_name: str) -> None:
+    """Renders the interactive command runner dialog driven by description.yaml."""
+    commands_spec = _get_binding_commands_schema(env, modality, binding_name)
+    if not commands_spec:
+        ui.notify(f"No special commands defined in description.yaml for '{binding_name}'.", type="info")
+        return
+
+    # Instantiate binding to verify methods
+    binding_inst = _instantiate_temporary_binding(env, modality, alias, binding_name)
+
+    # Filter to commands actually implemented on the binding class
+    implemented_commands = []
+    for cmd in commands_spec:
+        c_name = cmd.get("name", "")
+        if binding_inst and hasattr(binding_inst, c_name) and callable(getattr(binding_inst, c_name)):
+            implemented_commands.append(cmd)
+        elif not binding_inst:
+            # If temporary instance couldn't be spun up, assume declared commands exist
+            implemented_commands.append(cmd)
+
+    if not implemented_commands:
+        ui.notify(f"Declared commands for '{binding_name}' are not implemented in the binding code.", type="warning")
+        return
+
+    dialog = ui.dialog().props("maximized")
+    with dialog, ui.card().classes(
+        "w-full h-full flex flex-col p-5 bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 gap-3 overflow-hidden"
+    ):
+        # Header
+        with ui.row().classes("w-full items-center justify-between pb-2 border-b border-slate-200 dark:border-slate-800 shrink-0"):
+            with ui.row().classes("items-center gap-2.5"):
+                ui.icon("bolt", size="28px").classes("text-amber-500")
+                with ui.column().classes("gap-0"):
+                    ui.label(f"Binding Commands: {alias} ({binding_name})").classes("text-base font-bold")
+                    ui.label(f"Execute special operations provided by {binding_name}.").classes("text-xs text-slate-500")
+            ui.button("Close", icon="close", on_click=dialog.close).props("flat dense round size=sm")
+
+        # Tabs for commands
+        with ui.tabs().classes("w-full bg-slate-100 dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 shrink-0").props('dense no-caps active-color="primary" indicator-color="primary"') as cmd_tabs:
+            tab_widgets = {}
+            for idx, cmd in enumerate(implemented_commands):
+                c_title = cmd.get("title") or cmd.get("name", "Command")
+                t_w = ui.tab(f"cmd_{idx}", label=c_title, icon="play_arrow").classes("text-xs py-1.5 flex-1")
+                tab_widgets[f"cmd_{idx}"] = t_w
+
+        # Tab panels
+        first_tab_name = f"cmd_0" if implemented_commands else None
+        with ui.tab_panels(cmd_tabs, value=first_tab_name).classes("w-full flex-1 min-h-0 p-2 bg-transparent flex flex-col overflow-hidden"):
+            for idx, cmd in enumerate(implemented_commands):
+                c_name = cmd.get("name", "")
+                c_title = cmd.get("title") or c_name
+                c_desc = cmd.get("description", "")
+                c_params = cmd.get("parameters", [])
+
+                with ui.tab_panel(f"cmd_{idx}").classes("w-full h-full p-2 flex flex-col overflow-hidden gap-3"):
+                    with ui.card().classes("w-full p-3 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl gap-1 shrink-0"):
+                        ui.label(c_title).classes("font-bold text-sm text-primary")
+                        ui.label(c_desc).classes("text-xs text-slate-500 dark:text-slate-400 leading-relaxed")
+
+                    # Form inputs area
+                    input_widgets = {}
+                    with ui.scroll_area().classes("w-full flex-1 p-3 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl"):
+                        with ui.column().classes("w-full gap-3"):
+                            if not c_params:
+                                ui.label("This command requires no additional parameters. Click 'Execute Command' below to run.").classes("text-xs text-slate-500 italic p-2")
+
+                            for p in c_params:
+                                p_name = p.get("name", "")
+                                p_type = p.get("type", "str")
+                                p_desc = p.get("description", "")
+                                p_req = p.get("mandatory", False)
+                                p_default = p.get("default", "")
+
+                                with ui.column().classes("w-full gap-0.5"):
+                                    lbl = f"{p_name.replace('_', ' ').title()} {'*' if p_req else ''}"
+                                    if p_type == "bool":
+                                        sw = ui.switch(lbl, value=bool(p_default)).props("dense")
+                                        input_widgets[p_name] = sw
+                                    elif p_name in ("model_name", "mmproj_name") and binding_inst and hasattr(binding_inst, "list_models"):
+                                        # Provide searchable dropdown with model suggestions from local folder
+                                        try:
+                                            raw_models = binding_inst.list_models()
+                                            model_names = [m.get("model_name", str(m)) if isinstance(m, dict) else str(m) for m in raw_models]
+                                        except Exception:
+                                            model_names = []
+                                        sel = ui.select(
+                                            options=model_names,
+                                            value=model_names[0] if model_names else None,
+                                            label=lbl,
+                                            new_value_mode="add-unique",
+                                        ).classes("w-full text-xs").props("outlined dense use-input fill-input clearable")
+                                        input_widgets[p_name] = sel
+                                    elif p_type in ("int", "float"):
+                                        try:
+                                            val_num = float(p_default) if p_type == "float" else int(p_default)
+                                        except Exception:
+                                            val_num = 0
+                                        num_in = ui.number(lbl, value=val_num, step=1 if p_type == "int" else 0.1).classes("w-full").props("outlined dense")
+                                        input_widgets[p_name] = num_in
+                                    else:
+                                        txt_in = ui.input(lbl, value=str(p_default or "")).classes("w-full text-xs").props("outlined dense clearable")
+                                        input_widgets[p_name] = txt_in
+
+                                    if p_desc:
+                                        ui.label(p_desc).classes("text-[10px] text-slate-400 pl-1")
+
+                    # Live execution and progress console
+                    with ui.card().classes("w-full p-3 bg-slate-900 border border-slate-800 rounded-xl gap-2 shrink-0"):
+                        progress_bar = ui.linear_progress(value=0.0).props("instant-feedback color=amber")
+                        progress_bar.visible = False
+                        status_label = ui.label("Ready").classes("text-xs font-mono text-slate-300")
+
+                        with ui.row().classes("w-full items-center justify-between pt-1"):
+                            exec_btn = ui.button(f"Execute {c_name}", icon="play_arrow").props("unelevated dense size=sm color=amber no-caps font-semibold")
+
+                            def _make_runner(target_cmd=c_name, widgets=input_widgets, p_bar=progress_bar, s_lbl=status_label, btn=exec_btn):
+                                async def _run_command():
+                                    if not binding_inst:
+                                        ui.notify("Binding instance could not be initialized.", type="negative")
+                                        return
+                                    fn = getattr(binding_inst, target_cmd, None)
+                                    if not callable(fn):
+                                        ui.notify(f"Method '{target_cmd}' is not implemented on binding.", type="negative")
+                                        return
+
+                                    # Gather parameters
+                                    call_kwargs = {}
+                                    for k, w in widgets.items():
+                                        val = w.value
+                                        if isinstance(val, str):
+                                            val = val.strip()
+                                        call_kwargs[k] = val
+
+                                    # Wire progress callback if method accepts it
+                                    import inspect
+                                    sig = inspect.signature(fn)
+                                    if "progress_callback" in sig.parameters:
+                                        def _prog_cb(data):
+                                            if isinstance(data, dict):
+                                                msg = data.get("message") or data.get("status") or ""
+                                                completed = data.get("completed", 0)
+                                                total = data.get("total", 100)
+                                                if total > 0:
+                                                    p_bar.value = float(completed) / float(total)
+                                                s_lbl.set_text(f"⏳ {msg}")
+                                            elif isinstance(data, str):
+                                                s_lbl.set_text(f"⏳ {data}")
+                                        call_kwargs["progress_callback"] = _prog_cb
+
+                                    btn.props(add="loading")
+                                    p_bar.visible = True
+                                    s_lbl.set_text(f"⏳ Executing {target_cmd}...")
+
+                                    try:
+                                        from nicegui import run as _ng_run
+                                        res = await _ng_run.io_bound(fn, **call_kwargs)
+                                        p_bar.value = 1.0
+                                        res_str = json.dumps(res, indent=2) if isinstance(res, (dict, list)) else str(res)
+                                        s_lbl.set_text(f"✅ Finished: {res_str[:120]}")
+                                        ui.notify(f"✓ {target_cmd} completed successfully.", type="positive")
+                                    except Exception as ex:
+                                        s_lbl.set_text(f"❌ Error: {ex}")
+                                        ui.notify(f"Command '{target_cmd}' failed: {ex}", type="negative")
+                                    finally:
+                                        btn.props(remove="loading")
+
+                                return _run_command
+
+                            exec_btn.on("click", _make_runner())
 
     dialog.open()
 
@@ -847,7 +1296,10 @@ def _open_add_profile_dialog(env: EnvStore, modality: str, refresh) -> None:
             ui.label(f"Add {MODALITY_LABELS[modality]} Model Profile").classes("text-base font-bold")
             ui.button(icon="close", on_click=dialog.close).props("flat round dense size=xs")
 
-        alias_input = ui.input("Profile Alias (e.g. fast_local, gpt4o)", value="MASTER").classes("w-full").props("outlined dense")
+        existing_profiles = env.configured_profile_aliases(modality)
+        default_alias = _get_next_available_alias("MASTER", existing_profiles)
+
+        alias_input = ui.input("Profile Alias (e.g. fast_local, gpt4o)", value=default_alias).classes("w-full").props("outlined dense")
         reader = _profile_form_body(env, modality)
 
         def do_save():
@@ -858,7 +1310,30 @@ def _open_add_profile_dialog(env: EnvStore, modality: str, refresh) -> None:
             if not alias_val:
                 ui.notify("Alias is required.", type="warning")
                 return
+
             values = reader()
+            current_profiles = env.configured_profile_aliases(modality)
+
+            if any(p.upper() == alias_val.upper() for p in current_profiles):
+                suggested = _get_next_available_alias(alias_val, current_profiles)
+
+                def _use_suffixed(suffixed_name: str):
+                    alias_input.value = suffixed_name
+                    env.save_profile(modality, suffixed_name, **values)
+                    env.save()
+                    ui.notify(f"Profile registered as '{suffixed_name.upper()}'.", type="positive")
+                    dialog.close()
+                    refresh()
+
+                _show_alias_collision_dialog(
+                    item_type="profile",
+                    chosen_alias=alias_val,
+                    suggested_alias=suggested,
+                    on_use_suffix=_use_suffixed,
+                    on_change_name=lambda: alias_input.run_method("focus")
+                )
+                return
+
             env.save_profile(modality, alias_val, **values)
             env.save()
             ui.notify(f"Profile '{alias_val.upper()}' registered and saved.", type="positive")

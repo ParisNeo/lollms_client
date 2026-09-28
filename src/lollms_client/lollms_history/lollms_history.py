@@ -82,6 +82,11 @@ class HistoryManager:
         text = re.sub(r'<think\b[^>]*>.*?(?:</think>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r'<thought\b[^>]*>.*?(?:</thought>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
 
+        # Strip model template tokens that cause server-side grammar/tool parser crashes
+        text = re.sub(r'\[TOOL_CALLS\][^\n]*\n?', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\[TOOL_CALLS[^\n]*\n?', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'=== END (?:ACTIVE )?SKILLS ===\s*', '', text, flags=re.IGNORECASE)
+
         text = re.sub(r'<!--\s*status:[^>]*-->', '', text, flags=re.IGNORECASE)
         text = re.sub(r'<lollms_artifact[^/]*/>', '', text, flags=re.IGNORECASE)
         text = re.sub(r'<artefact_image[^/]*/>', '', text, flags=re.IGNORECASE)
@@ -476,6 +481,11 @@ class HistoryManager:
             for msg in non_system_messages:
                 role = msg.get("role")
                 content = msg.get("content", "")
+
+                if isinstance(content, str):
+                    content = re.sub(r'\[TOOL_CALLS\][^\n]*\n?', '', content, flags=re.IGNORECASE)
+                    content = re.sub(r'\[TOOL_CALLS[^\n]*\n?', '', content, flags=re.IGNORECASE)
+                    msg["content"] = content
 
                 if not content and not msg.get("images"):
                     continue

@@ -490,6 +490,76 @@ class ZooManager:
 
     # ── Installation & Uninstallation ──────────────────────────────────────
 
+    def find_tool_for_requirement(self, tool_name: str) -> Optional[ZooItem]:
+        """Searches the tools zoo repository for a tool package matching tool_name."""
+        clean = tool_name.strip().lower()
+        if not self.is_repo_cloned("tools"):
+            self.sync_repo("tools")
+
+        tools_items, _ = self._discover_all("tools")
+        # 1. Exact match on item name (e.g. file_organizer)
+        for it in tools_items:
+            if it.name.lower() == clean:
+                return it
+            if clean.startswith("tool_") and it.name.lower() == clean[5:]:
+                return it
+
+        # 2. Check AST function names inside tool files in tools_items
+        for it in tools_items:
+            py_candidates = []
+            if it.path.is_file() and it.path.suffix.lower() == ".py":
+                py_candidates.append(it.path)
+            elif it.path.is_dir():
+                py_candidates.extend([f for f in it.path.glob("*.py") if f.name != "__init__.py"])
+
+            for py_f in py_candidates:
+                try:
+                    code_text = py_f.read_text(encoding="utf-8", errors="ignore")
+                    tree = ast.parse(code_text)
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.FunctionDef) and node.name.lower() == clean:
+                            return it
+                except Exception:
+                    pass
+
+        # 3. Fuzzy search fallback
+        for it in tools_items:
+            if clean in it.name.lower() or (clean.startswith("tool_") and clean[5:] in it.name.lower()):
+                return it
+
+        return None
+
+    def get_skill_required_tools(self, skill_item: ZooItem) -> List[str]:
+        """Extracts required_tools list from a skill's SKILL.md frontmatter."""
+        skill_file = skill_item.path / "SKILL.md" if skill_item.path.is_dir() else skill_item.path
+        if not skill_file.exists():
+            return []
+
+        try:
+            content = skill_file.read_text(encoding="utf-8", errors="ignore")
+            if content.startswith("---"):
+                fm_match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
+                if fm_match:
+                    fm_text = fm_match.group(1)
+                    if yaml:
+                        parsed = yaml.safe_load(fm_text)
+                        if isinstance(parsed, dict):
+                            req = parsed.get("required_tools") or parsed.get("tools_required")
+                            if not req and isinstance(parsed.get("requirements"), dict):
+                                req = parsed["requirements"].get("tools")
+                            if isinstance(req, list):
+                                return [str(t).strip() for t in req if str(t).strip()]
+                            elif isinstance(req, str):
+                                return [t.strip() for t in req.split(",") if t.strip()]
+
+                    for line in fm_text.splitlines():
+                        if line.strip().startswith("required_tools:") or line.strip().startswith("tools_required:"):
+                            raw = line.split(":", 1)[1].strip().strip("[]")
+                            return [t.strip().strip("'\"") for t in raw.split(",") if t.strip()]
+        except Exception:
+            pass
+        return []
+
     def install_item(
         self,
         item: ZooItem,
@@ -558,13 +628,24 @@ description: "{p_desc}"
                     for sub in ("coworkers", "tools", "skills", "memory", "workspace"):
                         (handbag_p / sub).mkdir(exist_ok=True)
 
+            auto_installed_tools = []
+            if item.zoo_type == "skills":
+                req_tools = self.get_skill_required_tools(item)
+                for req_tool in req_tools:
+                    tool_item = self.find_tool_for_requirement(req_tool)
+                    if tool_item:
+                        tool_ok, _ = self.install_item(tool_item, scope=scope, overwrite=False)
+                        if tool_ok:
+                            auto_installed_tools.append(tool_item.name)
+
             if scope == "project":
                 item.is_installed_project = True
             else:
                 item.is_installed_global = True
 
             scope_desc = f"Project ({self.workspace_path.name})" if scope == "project" else "Global User Directory"
-            return True, f"Installed '{item.name}' ({item.category}) to {scope_desc} successfully."
+            tool_msg = f" (also installed required tool(s): {', '.join(auto_installed_tools)})" if auto_installed_tools else ""
+            return True, f"Installed '{item.name}' ({item.category}) to {scope_desc}{tool_msg} successfully."
         except Exception as ex:
             return False, f"Failed to install '{item.name}': {ex}"
 

@@ -13,6 +13,7 @@ BINDING_TYPES = {
     "ttm": "ttm_bindings",
     "ttv": "ttv_bindings",
     "mcp": "tools_bindings",
+    "rag": "rag_bindings",
 }
 
 def list_bindings(binding_type: str = "llm", custom_bindings_dir: Union[Path, str, None] = None) -> List[str]:

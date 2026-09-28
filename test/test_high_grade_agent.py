@@ -621,7 +621,7 @@ class TestAgentChat(unittest.TestCase):
 
     def test_conversational_response_no_tools(self):
         self.client.round_scripts = [
-            ["Hello! I am doing well, thank you for asking."]
+            ["Hello! I am doing well, thank you for asking.\n<done/>"]
         ]
         result = self.agent.chat(
             prompt="Hello, how are you?",
@@ -631,6 +631,21 @@ class TestAgentChat(unittest.TestCase):
         self.assertEqual(result["rounds"], 1)
         self.assertEqual(len(result["tool_calls"]), 0)
         self.assertIn("Hello", result["response"])
+
+    def test_enforce_end_tag_spins_off_round_until_done(self):
+        self.client.round_scripts = [
+            ["Conversational thought without done tag."],
+            ["Second attempt without done tag."],
+            ["Finally done.\n<done/>"]
+        ]
+        result = self.agent.chat(
+            prompt="Hello",
+            max_reasoning_steps=5,
+            use_internal_history=False,
+            enforce_end_tag=True,
+        )
+        self.assertEqual(result["rounds"], 3)
+        self.assertIn("Finally done", result["response"])
 
     def test_done_tag_termination(self):
         self.client.round_scripts = [

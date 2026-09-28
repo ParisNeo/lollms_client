@@ -676,7 +676,7 @@ class _ToolsManager:
 
 
 class _AgentStreamState:
-    def __init__(self, callback: Optional[Callable] = None, event_mode: Any = None):
+    def __init__(self, callback: Optional[Callable] = None, event_mode: Any = None, workspace_path: Optional[Path] = None):
         try:
             from lollms_client.lollms_types import normalize_event_mode, EventMode
             self.event_mode = normalize_event_mode(event_mode) if event_mode is not None else EventMode.PROCESSING_TAG_MODE
@@ -684,6 +684,7 @@ class _AgentStreamState:
             self.event_mode = event_mode or 0
         self._event_mode = self.event_mode
         self.callback = callback
+        self.workspace_path: Optional[Path] = Path(workspace_path).resolve() if workspace_path else None
 
         self.content = ""
         self.completed_actions: List[Dict[str, Any]] = []
@@ -711,6 +712,7 @@ class _AgentStreamState:
         self.tool_trigger = False
         self.tool_json_data = ""
         self._action_dispatched: bool = False
+        self.next_reasoning_effort: Optional[str] = None
         self.live_artifact_meta: Optional[Dict[str, Any]] = None
         self._done_intercepted: bool = False
         self._seen_symbol_keys: set = set()
@@ -790,6 +792,14 @@ class _AgentStreamState:
         if not isinstance(chunk, str) or not chunk:
             return True
 
+        # Strip model template artifacts ([TOOL_CALLS] and leaked skill boundary lines)
+        if "[TOOL_CALLS]" in chunk or "[TOOL_CALLS" in chunk or "TOOL_CALLS]" in chunk or "=== END ACTIVE SKILLS ===" in chunk:
+            chunk = re.sub(r'\[TOOL_CALLS\][^\n]*\n?', '', chunk, flags=re.IGNORECASE)
+            chunk = re.sub(r'\[TOOL_CALLS[^\n]*\n?', '', chunk, flags=re.IGNORECASE)
+            chunk = re.sub(r'=== END (?:ACTIVE )?SKILLS ===\s*', '', chunk, flags=re.IGNORECASE)
+            if not chunk:
+                return True
+
         self._raw_stream_buffer += chunk
         self._pending_buffer += chunk
 
@@ -864,18 +874,47 @@ class _AgentStreamState:
                 self._try_complete_tool()
             return True
 
+        # ── ⚡ DYNAMIC EFFORT INTERCEPTION (<effort level="..."/>) ──
+        if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence and not self._in_inline_code:
+            effort_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<effort\b([^>]*)(?:/>|>.*?</effort>)', self._pending_buffer, re.IGNORECASE | re.DOTALL)
+            if effort_match:
+                tag_start_idx = effort_match.start()
+                tag_full = effort_match.group(0)
+                attrs_part = effort_match.group(1)
+
+                lvl_match = re.search(r'(?:level|value)=["\']([^"\']+)["\']', attrs_part, re.IGNORECASE)
+                effort_level = lvl_match.group(1).lower().strip() if lvl_match else "medium"
+                self.next_reasoning_effort = effort_level
+                ASCIIColors.info(f"[AgentStreamState] Intercepted <effort> tag: level='{effort_level}'.")
+
+                text_before = self._pending_buffer[:tag_start_idx]
+                if text_before:
+                    self.content += text_before
+                    self._cb(text_before)
+
+                self._pending_buffer = self._pending_buffer[tag_start_idx + len(tag_full):]
+
+                if self.is_tag_mode:
+                    self._cb(f'\n<!-- effort:{effort_level} -->\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                if self.is_callback_mode:
+                    self._cb("", MSG_TYPE.MSG_TYPE_INFO, {"type": "effort_change", "level": effort_level})
+                return True
+
         if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence and not self._in_inline_code:
             proc_match = re.search(r'(?m)^\s*<processing', self._pending_buffer, re.IGNORECASE)
             if proc_match:
                 self._pending_buffer = re.sub(r'(?m)^\s*<processing[^>]*>', '', self._pending_buffer, flags=re.IGNORECASE)
                 return False
 
-        if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence and not self._in_inline_code:
-            context_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<(unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|user_profile_update|user_profile_clear|mem_new|mem_update|generate_image|edit_image)\b', self._pending_buffer, re.IGNORECASE)
+        if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact:
+            context_match = re.search(r'(?m)^\s*(?:```(?:xml|bash|json)?\s*)?<(unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|user_profile_update|user_profile_clear|mem_new|mem_update|mem_load|mem_delete|mem_search|mem_tag|generate_image|edit_image)\b', self._pending_buffer, re.IGNORECASE)
             if context_match:
-                tag_start_idx = context_match.start()
                 tag_name = context_match.group(1).lower()
-                text_before = self._pending_buffer[:tag_start_idx]
+                tag_start_idx = self._pending_buffer.find(f"<{context_match.group(1)}")
+                if tag_start_idx == -1:
+                    tag_start_idx = context_match.start()
+
+                text_before = self._pending_buffer[:context_match.start()]
                 if text_before:
                     self.content += text_before
                     self._cb(text_before)
@@ -885,6 +924,8 @@ class _AgentStreamState:
                 self._context_tag_name = tag_name
                 self._tool_buffer = self._pending_buffer[tag_start_idx:]
                 self._pending_buffer = ""
+                self._in_code_fence = False
+                self._code_fence_hold_buffer = ""
 
                 if self.is_tag_mode:
                     self._cb(f'\n<processing type="context" title="{tag_name}">\n', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
@@ -893,7 +934,14 @@ class _AgentStreamState:
                 return True
 
         if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact:
-            if "```" in self._pending_buffer:
+            # Check if pending buffer contains functional action tags mistakenly wrapped in code fences
+            has_action_tag_in_pending = bool(re.search(r'<(?:tool|art(?:ifact|efact)|unlock_file|lock_file|generate_image|edit_image)\b', self._pending_buffer, re.IGNORECASE))
+            if has_action_tag_in_pending:
+                # Bypass code fence protection to allow immediate action tag interception
+                self._in_code_fence = False
+                self._code_fence_hold_buffer = ""
+                self._code_fence_buffer = ""
+            elif "```" in self._pending_buffer:
                 self._code_fence_buffer += self._pending_buffer
                 self._pending_buffer = ""
 
@@ -984,7 +1032,8 @@ class _AgentStreamState:
             return True
 
         if self._is_accumulating_artifact:
-            self._tool_buffer += self._pending_buffer
+            incoming_chunk = self._pending_buffer
+            self._tool_buffer += incoming_chunk
             self._pending_buffer = ""
 
             # ── DETECT NEW STRUCTURAL SYMBOLS ──
@@ -1026,9 +1075,9 @@ class _AgentStreamState:
                         })
 
             if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
-                self._cb(self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK, {"live_artifact_chunk": True, "artifact_title": art_title, "artifact_lang": art_lang})
+                self._cb(incoming_chunk, MSG_TYPE.MSG_TYPE_CHUNK, {"live_artifact_chunk": True, "artifact_title": art_title, "artifact_lang": art_lang})
             elif self._event_mode == EventMode.PROCESSING_TAG_MODE:
-                clean_chunk = self._pending_buffer
+                clean_chunk = incoming_chunk
                 if "<<<<<<< SEARCH" in clean_chunk:
                     clean_chunk = clean_chunk.replace("<<<<<<< SEARCH", "\n[🔍 SEARCH BLOCK]\n")
                 if "=======" in clean_chunk:
@@ -1045,7 +1094,6 @@ class _AgentStreamState:
                         "live_artifact_chunk": True
                     })
 
-            self._pending_buffer = ""
             self._try_complete_artifact()
 
             if self._is_accumulating_artifact and len(self._tool_buffer) > 500:
@@ -1079,11 +1127,148 @@ class _AgentStreamState:
             self._try_complete_context_tag()
             return True
 
-        if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact and not self._in_code_fence and not self._in_inline_code:
-            tool_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<tool(?:\s+name=["\'][^"\']*["\'])?\s*>', self._pending_buffer, re.IGNORECASE)
-            if tool_match:
-                tag_start_idx = tool_match.start()
+        # Intercept bare/blockquoted tool JSON calls: >{"name": "tool_..."} or `>{"name": "tool_..."}
+        if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact:
+            bare_tool_json_match = re.search(
+                r'(?m)^\s*(?:[-=]{3,}\s*)?(?:`{1,3}\s*)?(?:>\s*)?(?:`{1,3}\s*)?(?:```(?:json)?\s*)?\{"name":\s*"(tool_\w+)"',
+                self._pending_buffer,
+                re.IGNORECASE
+            )
+            if bare_tool_json_match:
+                tag_start_idx = bare_tool_json_match.start()
                 text_before = self._pending_buffer[:tag_start_idx]
+                text_before = re.sub(r'(?m)^\s*(?:[-=]{3,}|`{1,3}|>|`>|>`|\}|`\})\s*$', '', text_before)
+                text_before = re.sub(r'[`>\s]+$', '', text_before)
+                if text_before.strip():
+                    self.content += text_before
+                    self._cb(text_before)
+
+                candidate_buffer = self._pending_buffer[tag_start_idx:]
+                balanced_json = self._extract_balanced_json(candidate_buffer)
+                if balanced_json:
+                    try:
+                        parsed_call = json.loads(balanced_json)
+                        tool_nm = parsed_call.get("name", bare_tool_json_match.group(1))
+                        tool_prms = parsed_call.get("parameters", {})
+                        norm_json = json.dumps({"name": tool_nm, "parameters": tool_prms})
+
+                        self.completed_actions.append({"type": "tool", "json": norm_json})
+                        self.tool_json_data = norm_json
+                        self.tool_trigger = True
+                        self._action_dispatched = True
+
+                        end_offset = candidate_buffer.find(balanced_json) + len(balanced_json)
+                        trailing_tail = candidate_buffer[end_offset:]
+                        tail_clean = re.sub(r'^\s*(?:</tool>|`{1,3}|\}|`\}|[-=]{3,})\s*', '', trailing_tail, flags=re.IGNORECASE)
+                        self._pending_buffer = tail_clean
+
+                        if self.is_callback_mode:
+                            self._cb("", MSG_TYPE.MSG_TYPE_TOOL_START, {"tool_name": tool_nm, "parameters": tool_prms, "stream_complete": True})
+                        return True
+                    except Exception:
+                        pass
+
+        # Intercept curly-brace pseudo-tags: ```{tool}{name='...', parameters={...}} or {artifact}{name='...'}
+        if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact:
+            pseudo_tool_match = re.search(
+                r'(?m)^\s*(?:```)?\{tool\}\s*(?:\{|\(|\[)?name=[\'"]([^\'"]+)[\'"](?:,\s*parameters=(\{.*?\}))?',
+                self._pending_buffer,
+                re.DOTALL | re.IGNORECASE
+            )
+            if pseudo_tool_match:
+                tag_start_idx = pseudo_tool_match.start()
+                text_before = self._pending_buffer[:tag_start_idx]
+                if text_before.strip():
+                    self.content += text_before
+                    self._cb(text_before)
+
+                tool_nm = pseudo_tool_match.group(1).strip()
+                raw_params = pseudo_tool_match.group(2)
+                tool_prms = {}
+                if raw_params:
+                    try:
+                        tool_prms = json.loads(raw_params.replace("'", '"'))
+                    except Exception:
+                        pass
+
+                norm_json = json.dumps({"name": tool_nm, "parameters": tool_prms})
+                self.completed_actions.append({"type": "tool", "json": norm_json})
+                self.tool_json_data = norm_json
+                self.tool_trigger = True
+                self._action_dispatched = True
+
+                self._pending_buffer = self._pending_buffer[pseudo_tool_match.end():]
+                self._pending_buffer = re.sub(r'^\s*\}*\s*(?:```)?\n?', '', self._pending_buffer)
+                if self.is_callback_mode:
+                    self._cb("", MSG_TYPE.MSG_TYPE_TOOL_START, {"tool_name": tool_nm, "parameters": tool_prms, "stream_complete": True})
+                return True
+
+            pseudo_art_match = re.search(
+                r'(?m)^\s*(?:```)?\{artifact\}\s*\{name=[\'"]([^\'"]+)[\'"](?:,\s*type=[\'"]([^\'"]+)[\'"])?\}?\s*(?:```)?\s*\n?(.*?)(?=(?:```)?\{artifact\}|(?:```)?\{tool\}|\Z)',
+                self._pending_buffer,
+                re.DOTALL | re.IGNORECASE
+            )
+            if pseudo_art_match and pseudo_art_match.group(3).strip():
+                tag_start_idx = pseudo_art_match.start()
+                text_before = self._pending_buffer[:tag_start_idx]
+                if text_before.strip():
+                    self.content += text_before
+                    self._cb(text_before)
+
+                art_name = pseudo_art_match.group(1).strip()
+                art_type = pseudo_art_match.group(2) or "code"
+                art_body = pseudo_art_match.group(3).strip()
+                synthesized_xml = f'<artifact name="{art_name}" type="{art_type}">\n{art_body}\n</artifact>'
+
+                self.completed_actions.append({"type": "artifact", "xml": synthesized_xml})
+                self.artifact_trigger = True
+                self._action_dispatched = True
+
+                self._pending_buffer = self._pending_buffer[pseudo_art_match.end():]
+                return True
+
+        # Intercept direct XML tool calls (e.g. <tool_load_skill title="..." /> or `><tool_...>)
+        if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact:
+            direct_tool_match = re.search(r'(?m)^\s*(?:[-=]{3,}\s*)?(?:`{1,3}\s*)?(?:>\s*)?(?:`{1,3}\s*)?(?:```(?:xml|json)?\s*)?<(tool_\w+)\b([^>]*?)(?:>(.*?)</\1>|/?>)', self._pending_buffer, re.DOTALL | re.IGNORECASE)
+            if direct_tool_match:
+                tool_name = direct_tool_match.group(1)
+                attrs_str = direct_tool_match.group(2) or ""
+                body_str = (direct_tool_match.group(3) or "").strip()
+
+                params = {}
+                for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
+                    params[m.group(1)] = m.group(2)
+                if body_str and not params:
+                    params["title"] = body_str
+
+                normalized_json = json.dumps({"name": tool_name, "parameters": params})
+                self.completed_actions.append({"type": "tool", "json": normalized_json})
+                self.tool_json_data = normalized_json
+                self.tool_trigger = True
+                self._action_dispatched = True
+
+                text_before = self._pending_buffer[:direct_tool_match.start()]
+                text_before = re.sub(r'[`>\s]+$', '', text_before)
+                if text_before.strip():
+                    self.content += text_before
+                    self._cb(text_before)
+
+                self._pending_buffer = self._pending_buffer[direct_tool_match.end():]
+                self._in_code_fence = False
+                self._code_fence_hold_buffer = ""
+
+                if self.is_callback_mode:
+                    self._cb("", MSG_TYPE.MSG_TYPE_TOOL_START, {"tool_name": tool_name, "parameters": params, "stream_complete": True})
+                return True
+
+            tool_match = re.search(r'(?m)^\s*(?:[-=]{3,}\s*)?(?:`{1,3}\s*)?(?:>\s*)?(?:`{1,3}\s*)?(?:```(?:xml|json)?\s*)?<\s*tool(?:\s+name=["\'][^"\']*["\'])?\s*>', self._pending_buffer, re.IGNORECASE)
+            if tool_match:
+                tag_start_idx = self._pending_buffer.lower().find("<tool")
+                if tag_start_idx == -1:
+                    tag_start_idx = tool_match.start()
+
+                text_before = self._pending_buffer[:tool_match.start()]
+                text_before = re.sub(r'[`>\s]+$', '', text_before)
                 if text_before:
                     stripped_before = text_before.strip()
                     if stripped_before:
@@ -1094,6 +1279,8 @@ class _AgentStreamState:
                 self.tool_trigger = True
                 self._tool_buffer = self._pending_buffer[tag_start_idx:]
                 self._pending_buffer = ""
+                self._in_code_fence = False
+                self._code_fence_hold_buffer = ""
 
                 if self.is_callback_mode:
                     self._cb("", MSG_TYPE.MSG_TYPE_TOOL_START, {"tool_name": "pending", "parameters": {}})
@@ -1104,21 +1291,26 @@ class _AgentStreamState:
                 self._try_complete_tool()
                 return True
 
-            artifact_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<art(?:ifact|efact)\b', self._pending_buffer, re.IGNORECASE)
+            artifact_match = re.search(r'(?m)^\s*(?:[-=]{3,}\s*)?(?:`{1,3}\s*)?(?:>\s*)?(?:`{1,3}\s*)?(?:```(?:xml)?\s*)?<\s*art(?:ifact|efact)\b', self._pending_buffer, re.IGNORECASE)
             if artifact_match:
-                tag_start_idx = artifact_match.start()
+                tag_start_idx = self._pending_buffer.find("<art")
+                if tag_start_idx == -1:
+                    tag_start_idx = artifact_match.start()
+
                 partial_tag_buffer = self._pending_buffer[tag_start_idx:]
 
                 full_tag_match = re.search(r'<art(?:ifact|efact)[^>]*>', partial_tag_buffer, re.IGNORECASE)
                 if not full_tag_match:
-                    text_before = self._pending_buffer[:tag_start_idx]
+                    text_before = self._pending_buffer[:artifact_match.start()]
+                    text_before = re.sub(r'[`>\s]+$', '', text_before)
                     if text_before:
                         self.content += text_before
                         self._cb(text_before)
                     self._pending_buffer = partial_tag_buffer
                     return True
 
-                text_before = self._pending_buffer[:tag_start_idx]
+                text_before = self._pending_buffer[:artifact_match.start()]
+                text_before = re.sub(r'[`>\s]+$', '', text_before)
                 if text_before:
                     self.content += text_before
                     self._cb(text_before)
@@ -1127,6 +1319,8 @@ class _AgentStreamState:
                 self.artifact_trigger = True
                 self._tool_buffer = partial_tag_buffer
                 self._pending_buffer = ""
+                self._in_code_fence = False
+                self._code_fence_hold_buffer = ""
                 self._seen_symbol_keys.clear()
 
                 attrs_str = full_tag_match.group(0)
@@ -1157,9 +1351,9 @@ class _AgentStreamState:
                 if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
                     try:
                         self._cb("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {
-                            "title": title,
-                            "art_type": parsed_art_type,
-                            "language": lang,
+                            "title": title, 
+                            "art_type": parsed_art_type, 
+                            "language": lang, 
                             "is_patch": is_patch_start,
                             "operation": operation_type,
                             "stream_complete": False,
@@ -1168,6 +1362,14 @@ class _AgentStreamState:
                             "current_section": None,
                             "sections": []
                         })
+                        # Immediately emit any initial body content arriving with the opening tag
+                        initial_body = partial_tag_buffer[full_tag_match.end():]
+                        if initial_body:
+                            self._cb(initial_body, MSG_TYPE.MSG_TYPE_CHUNK, {
+                                "live_artifact_chunk": True,
+                                "artifact_title": title,
+                                "artifact_lang": lang
+                            })
                     except Exception:
                         pass
 
@@ -1341,9 +1543,10 @@ class _AgentStreamState:
 
         full_tool_call = self._tool_buffer[:end_idx + end_len]
 
-        tag_start_idx = full_tool_call.lower().find("<tool>")
-        if tag_start_idx != -1:
-            content_between_tags = full_tool_call[tag_start_idx + 6:end_idx]
+        open_tag_match = re.search(r'<tool\b([^>]*)>', full_tool_call, re.IGNORECASE)
+        tool_tag_attrs = open_tag_match.group(1) if open_tag_match else ""
+        if open_tag_match:
+            content_between_tags = full_tool_call[open_tag_match.end():end_idx]
         else:
             content_between_tags = full_tool_call[:end_idx]
 
@@ -1359,6 +1562,27 @@ class _AgentStreamState:
         resolved_tool_name = "malformed_tool_call"
         resolved_params = {}
 
+        # Check for attributes on <tool name="..." parameters="..."> itself
+        attr_tool_name = None
+        attr_params = {}
+        if tool_tag_attrs:
+            name_m = re.search(r'name=["\']([^"\']+)["\']', tool_tag_attrs, re.IGNORECASE)
+            if name_m:
+                attr_tool_name = name_m.group(1).strip()
+            param_m = re.search(r'parameters=["\']([^"\']*)["\']', tool_tag_attrs, re.IGNORECASE)
+            if param_m:
+                raw_param_attr = param_m.group(1).strip()
+                if "=" in raw_param_attr and not raw_param_attr.startswith("{"):
+                    for kv in raw_param_attr.split(","):
+                        if "=" in kv:
+                            k, v = kv.split("=", 1)
+                            attr_params[k.strip()] = v.strip().strip('"\'')
+                else:
+                    try:
+                        attr_params = json.loads(raw_param_attr)
+                    except Exception:
+                        pass
+
         xml_data = self._parse_xml_tool_block(content_between_tags)
         if xml_data:
             raw_data = xml_data
@@ -1366,6 +1590,19 @@ class _AgentStreamState:
             resolved_params = raw_data.get("parameters", {})
             if not isinstance(resolved_params, dict):
                 resolved_params = {}
+        elif attr_tool_name:
+            resolved_tool_name = attr_tool_name
+            json_body = self._extract_balanced_json(content_between_tags)
+            if json_body:
+                try:
+                    parsed_inner = json.loads(json_body)
+                    if isinstance(parsed_inner, dict):
+                        resolved_params = parsed_inner.get("parameters", parsed_inner)
+                except Exception:
+                    resolved_params = attr_params
+            else:
+                resolved_params = attr_params
+            raw_data = {"name": resolved_tool_name, "parameters": resolved_params}
         else:
             json_body = self._extract_balanced_json(content_between_tags)
             if json_body is None:
@@ -1497,9 +1734,42 @@ class _AgentStreamState:
 
         art_type_end = self.live_artifact_meta.get("art_type", "code") if self.live_artifact_meta else "code"
         title_end = self.live_artifact_meta.get("title", "artifact") if self.live_artifact_meta else "artifact"
+        lang_end = self.live_artifact_meta.get("language", "") if self.live_artifact_meta else ""
         is_patch_end = self.live_artifact_meta.get("is_patch", False) if self.live_artifact_meta else False
         operation_end = self.live_artifact_meta.get("operation", "full_rewrite") if self.live_artifact_meta else "full_rewrite"
 
+        content_match = re.search(r'<art(?:ifact|efact)[^>]*>(.*?)</art(?:ifact|efact)>', full_artifact_call, re.DOTALL | re.IGNORECASE)
+        body_content = content_match.group(1).strip() if content_match else ""
+
+        # ── 💾 IMMEDIATE DISK FLUSH: Save completed artifact to disk the millisecond </artifact> closes ──
+        disk_saved = False
+        if self.workspace_path and body_content and title_end:
+            try:
+                target_rel = title_end.replace("\\", "/").strip().lstrip("./")
+                file_target = (self.workspace_path / target_rel).resolve()
+
+                # Verify containment to prevent directory traversal
+                if str(file_target).startswith(str(self.workspace_path)):
+                    file_target.parent.mkdir(parents=True, exist_ok=True)
+                    if is_patch_end and file_target.exists():
+                        from lollms_client.lollms_artefact import ArtefactManager
+                        orig_text = file_target.read_text(encoding="utf-8", errors="ignore")
+                        patched_text = ArtefactManager.apply_aider_patch(orig_text, body_content)
+                        file_target.write_text(patched_text, encoding="utf-8")
+                        disk_saved = True
+                        ASCIIColors.success(f"[AgentStreamState] 💾 Real-time patched '{title_end}' to disk.")
+                    elif operation_end == "append" and file_target.exists():
+                        orig_text = file_target.read_text(encoding="utf-8", errors="ignore")
+                        sep = "" if orig_text.endswith("\n") else "\n"
+                        file_target.write_text(orig_text + sep + body_content + "\n", encoding="utf-8")
+                        disk_saved = True
+                        ASCIIColors.success(f"[AgentStreamState] 💾 Real-time appended to '{title_end}' on disk.")
+                    else:
+                        file_target.write_text(body_content, encoding="utf-8")
+                        disk_saved = True
+                        ASCIIColors.success(f"[AgentStreamState] 💾 Real-time flushed '{title_end}' to disk ({len(body_content):,} chars).")
+            except Exception as disk_err:
+                ASCIIColors.warning(f"[AgentStreamState] Real-time disk write failed for '{title_end}': {disk_err}")
 
         if self.is_tag_mode:
             self._cb('\n</processing>\n', MSG_TYPE.MSG_TYPE_CHUNK, {
@@ -1511,7 +1781,24 @@ class _AgentStreamState:
                 "operation": operation_end
             })
 
-        self.completed_actions.append({"type": "artifact", "xml": full_artifact_call})
+        if self.is_callback_mode:
+            self._cb("", getattr(MSG_TYPE, "MSG_TYPE_ARTEFACT_BUILD_END", MSG_TYPE.MSG_TYPE_CHUNK), {
+                "title": title_end,
+                "art_type": art_type_end,
+                "language": lang_end,
+                "version": 1,
+                "is_patch": is_patch_end,
+                "operation": operation_end,
+                "content": body_content,
+                "line_count": len(body_content.splitlines()),
+                "size_chars": len(body_content),
+                "success": True,
+                "stream_complete": True,
+                "execution_phase": False,
+                "disk_saved": disk_saved,
+            })
+
+        self.completed_actions.append({"type": "artifact", "xml": full_artifact_call, "disk_saved": disk_saved})
 
         if self.live_artifact_meta:
             self.live_artifact_meta = None
@@ -1629,11 +1916,58 @@ class _AgentStreamState:
                 self._is_accumulating_context = False
             return
 
+        # ── 🛑 POST-STREAM SWEEP FOR MISSED ACTIONS & CONTEXT TAGS (DEFENSE-IN-DEPTH) ──
+        # Intercepts any functional action tags that were bypassed or wrapped in code fences
+        ctx_tag_pat = re.compile(r'<(unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|user_profile_update|user_profile_clear|mem_new|mem_update|mem_load|mem_delete|mem_search|mem_tag)\b[^>]*>(.*?)</\1>', re.DOTALL | re.IGNORECASE)
+        for m in ctx_tag_pat.finditer(self.content):
+            t_name = m.group(1).lower()
+            tag_xml = m.group(0).strip()
+            self.completed_actions.append({"type": "context", "tag_name": t_name, "xml": tag_xml})
+            self._action_dispatched = True
+            self.content = self.content.replace(m.group(0), "")
+            ASCIIColors.info(f"[AgentStreamState] Post-stream sweep intercepted missed context tag: <{t_name}>.")
+
+        # ── 🛑 POST-STREAM RECOVERY SWEEP FOR MISSED ARTIFACT AND TOOL TAGS ──
+        # Intercepts any artifact tags that were emitted inside code fences or missed by streaming
+        art_tag_pat = re.compile(r'<art(?:ifact|efact)\b[^>]*>.*?</art(?:ifact|efact)>', re.DOTALL | re.IGNORECASE)
+        for m in art_tag_pat.finditer(self.content):
+            art_xml = m.group(0).strip()
+            self.completed_actions.append({"type": "artifact", "xml": art_xml})
+            self._action_dispatched = True
+            self.content = self.content.replace(m.group(0), "")
+            ASCIIColors.info("[AgentStreamState] Post-stream sweep recovered missed artifact tag.")
+
+        # Intercept missed tool tags in content
+        tool_tag_pat = re.compile(r'<tool\b[^>]*>.*?</tool>', re.DOTALL | re.IGNORECASE)
+        for m in tool_tag_pat.finditer(self.content):
+            t_xml = m.group(0).strip()
+            tag_open_m = re.search(r'<tool\b([^>]*)>', t_xml, re.IGNORECASE)
+            t_name = ""
+            if tag_open_m:
+                nm = re.search(r'name=["\']([^"\']+)["\']', tag_open_m.group(1), re.IGNORECASE)
+                if nm:
+                    t_name = nm.group(1).strip()
+            inner_json = self._extract_balanced_json(t_xml)
+            if inner_json:
+                try:
+                    pj = json.loads(inner_json)
+                    t_name = pj.get("name") or t_name
+                    params_dict = pj.get("parameters", pj)
+                    self.completed_actions.append({"type": "tool", "json": json.dumps({"name": t_name, "parameters": params_dict})})
+                    self._action_dispatched = True
+                except Exception:
+                    pass
+            elif t_name:
+                self.completed_actions.append({"type": "tool", "json": json.dumps({"name": t_name, "parameters": {}})})
+                self._action_dispatched = True
+            self.content = self.content.replace(m.group(0), "")
+
+        # Clean dangling code fence markers, pseudo-tags, and artifacts
+        self.content = re.sub(r'(?s)(?:```)?\{tool\}[^\n]*.*?\}*(?:```)?', '', self.content)
+        self.content = re.sub(r'(?s)(?:```)?\{artifact\}[^\n]*.*?\}*(?:```)?', '', self.content)
+        self.content = re.sub(r'```(?:xml|bash|json)?\s*\n?\s*```', '', self.content).strip()
+
         # ── 🛑 POST-STREAM <done/> / <end/> SWEEP (DEFENSE-IN-DEPTH) ──
-        # The streaming interceptor in feed() can miss <done/> when the parser
-        # is inside a code fence, inline code, artifact, or tool accumulation state.
-        # After all buffers are flushed, scan the ENTIRE accumulated content
-        # for any termination tag that was missed, strip it, and set the flag.
         if not self._done_intercepted:
             done_pattern = re.compile(r'(?i)</?(?:done|end)\s*/?>')
             if done_pattern.search(self.content):
@@ -1664,6 +1998,23 @@ class _AgentStreamState:
         return self.tool_json_data or None
 
     def get_clean_text(self) -> str:
-        return self.content 
+        cleaned = self.content
+        cleaned = re.sub(r'\[TOOL_CALLS\][^\n]*\n?', '', cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r'\[TOOL_CALLS[^\n]*\n?', '', cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r'=== END (?:ACTIVE )?SKILLS ===\s*', '', cleaned, flags=re.IGNORECASE)
+        # Scrub pseudo-tags
+        cleaned = re.sub(r'(?s)(?:```)?\{tool\}[^\n]*.*?\}*(?:```)?', '', cleaned)
+        cleaned = re.sub(r'(?s)(?:```)?\{artifact\}[^\n]*.*?\}*(?:```)?', '', cleaned)
+        # Scrub any residual raw tool JSON or orphan closing tags
+        cleaned = re.sub(r'(?m)^\s*>?(?:```(?:json)?\s*)?\{"name":\s*"tool_\w+.*$', '', cleaned)
+        cleaned = re.sub(r'(?s)>?\s*\{"name":\s*"tool_\w+".*?\}\s*(?:</tool>)?', '', cleaned)
+        cleaned = re.sub(r'</?tool\b[^>]*>', '', cleaned, flags=re.IGNORECASE)
+        # Remove stray delimiter lines (e.g. `}`, ` `}, `---`, ```, `>, `)
+        cleaned = re.sub(r'(?m)^\s*[`>]{1,4}\s*$', '', cleaned)
+        cleaned = re.sub(r'(?m)^\s*[`>\s]*\}\s*$', '', cleaned)
+        cleaned = re.sub(r'(?m)^\s*[-=]{3,}\s*$', '', cleaned)
+        cleaned = re.sub(r'```(?:python|bash|sh|json|xml)?\s*$', '', cleaned).strip()
+        cleaned = re.sub(r'[`>]{1,4}\s*$', '', cleaned).strip()
+        return cleaned.strip()
     
      

@@ -30,6 +30,18 @@ _MAX_PERSONA_CHARS = 4000
 _MAX_INLINE_SKILL_CHARS = 8000
 _MAX_CONTEXT_FILES = 12
 _MAX_SKILL_TITLES = 6
+_MAX_REPORT_CHARS = 12000
+
+import re
+
+def extract_worker_report(text: str) -> str:
+    """Extracts content between <report> tags or returns clean text."""
+    if not text:
+        return ""
+    m = re.search(r'<report>(.*?)</report>', text, re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return text.strip()
 
 
 @dataclass(frozen=True)
@@ -44,6 +56,8 @@ class SpinoffConfig:
     context_files: tuple = ()
     max_rounds: int = 6
     temperature: float = 0.3
+    reasoning_effort: Optional[str] = None
+    dynamic_effort: bool = False
 
 
 def build_spinoff_agent_tools(
@@ -82,6 +96,7 @@ def build_spinoff_agent_tools(
         )
         return spinoffs
 
+    callback = kwargs.get("callback") or kwargs.get("streaming_callback")
     parent_registry: Dict[str, Dict[str, Any]] = dict(tools_registry or {})
 
     # ────────────────────────────── sandbox helpers ──────────────────────────
@@ -229,11 +244,13 @@ def build_spinoff_agent_tools(
             )
 
         sections.append(
-            "=== COMPLETION CONTRACT ===\n"
-            "When your task is complete, write your final result wrapped exactly as:\n"
+            "=== SUB-AGENT OPERATING DOCTRINE (MANDATORY) ===\n"
+            "1. NO USER IN THE LOOP: You are running as a headless specialist sub-agent. Never ask questions or await confirmation from the user. Proceed autonomously.\n"
+            "2. DIRECT ACTION: Use `<tool>` and `<artifact>` tags in the same turn without hesitation.\n"
+            "3. COMPLETION CONTRACT: When your task is complete, write your final result wrapped exactly as:\n"
             "<report>\n...what was done, results, files created/modified...\n</report>\n"
             "Then emit `<done/>` on a new line.\n"
-            "=== END COMPLETION CONTRACT ==="
+            "=== END SUB-AGENT OPERATING DOCTRINE ==="
         )
 
         return "\n\n".join(sections)
@@ -259,6 +276,8 @@ def build_spinoff_agent_tools(
         context_files: str = "",
         max_rounds: int = 6,
         temperature: float = 0.3,
+        effort: str = "",
+        dynamic_effort: bool = False,
     ) -> dict:
         """
         Spawns a fully conditioned, specialized sub-agent in an isolated, focused sandbox.
@@ -319,6 +338,8 @@ def build_spinoff_agent_tools(
             resolved_files, missing_files = _resolve_context_files(file_names)
             resolved_skills, missing_skills = _resolve_skills(skill_titles)
 
+            clean_effort = effort.strip().lower() if effort and effort.strip() else None
+
             config = SpinoffConfig(
                 name=clean_name,
                 task=bounded_task,
@@ -329,6 +350,8 @@ def build_spinoff_agent_tools(
                 context_files=tuple(file_names),
                 max_rounds=bounded_rounds,
                 temperature=bounded_temp,
+                reasoning_effort=clean_effort,
+                dynamic_effort=bool(dynamic_effort),
             )
 
             system_prompt = _build_persona_system_prompt(
@@ -383,6 +406,8 @@ def build_spinoff_agent_tools(
                         orchestrator_mode=False,
                         event_mode=EventMode.SILENT_MODE,
                         streaming_callback=spinoff_stream_relay,
+                        reasoning_effort=clean_effort,
+                        dynamic_effort=config.dynamic_effort,
                     )
                 else:
                     result = discussion.chat(
@@ -394,6 +419,8 @@ def build_spinoff_agent_tools(
                         orchestrator_mode=False,
                         event_mode=EventMode.SILENT_MODE,
                         streaming_callback=spinoff_stream_relay,
+                        reasoning_effort=clean_effort,
+                        dynamic_effort=config.dynamic_effort,
                     )
             except Exception as ex:
                 trace_exception(ex)
@@ -479,6 +506,8 @@ def build_spinoff_agent_tools(
             {"name": "context_files", "type": "str", "description": "Comma-separated workspace file names the specialist may read.", "optional": True},
             {"name": "max_rounds", "type": "int", "description": "Bounded reasoning budget for the specialist (2-12).", "optional": True},
             {"name": "temperature", "type": "float", "description": "Sampling temperature for the specialist (0.0-2.0).", "optional": True},
+            {"name": "effort", "type": "str", "description": "Known reasoning effort to assign to the specialist ('none', 'low', 'medium', 'high'). Preferred: give the specialist a focused task with a known effort level.", "optional": True},
+            {"name": "dynamic_effort", "type": "bool", "description": "If true, allows the sub-agent to dynamically adjust its reasoning effort using <effort level='...'/>.", "optional": True},
         ],
         "callable": tool_spinoff_agent,
     }

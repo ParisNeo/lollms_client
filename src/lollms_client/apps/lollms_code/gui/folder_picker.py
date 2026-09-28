@@ -30,7 +30,6 @@ async def pick_file(
     """
     init_path = str(Path(initial_dir).resolve().parent if initial_dir and Path(initial_dir).is_file() else Path(initial_dir).resolve()) if initial_dir and Path(initial_dir).exists() else None
     default_types = file_types or [
-        ("Certificate Files", "*.pem;*.crt;*.cer;*.key"),
         ("All Files", "*.*")
     ]
 
@@ -49,7 +48,11 @@ async def pick_file(
                 filetypes=tk_filetypes,
             )
             root.destroy()
-            return str(Path(selected).resolve()) if selected else None
+            if selected:
+                p = Path(selected).resolve()
+                if p.is_file():
+                    return str(p)
+            return None
         except Exception:
             return None
 
@@ -64,7 +67,14 @@ async def pick_file(
     if getattr(nicegui_app, "native", None) and getattr(nicegui_app.native, "main_window", None):
         try:
             import webview
-            open_enum = getattr(webview.FileDialog, "OPEN", 0) if hasattr(webview, "FileDialog") else 0
+            open_enum = None
+            if hasattr(webview, "FileDialog") and hasattr(webview.FileDialog, "OPEN"):
+                open_enum = webview.FileDialog.OPEN
+            if open_enum is None and hasattr(webview, "OPEN_DIALOG"):
+                open_enum = webview.OPEN_DIALOG
+            if open_enum is None:
+                open_enum = 10
+
             filter_specs = tuple(f"{label} ({ext})" for label, ext in default_types)
             result = await nicegui_app.native.main_window.create_file_dialog(
                 dialog_type=open_enum,
@@ -72,10 +82,13 @@ async def pick_file(
                 file_types=filter_specs,
             )
             if result:
+                res_path = None
                 if isinstance(result, (list, tuple)) and len(result) > 0:
-                    return str(Path(result[0]).resolve())
-                if isinstance(result, str):
-                    return str(Path(result).resolve())
+                    res_path = Path(result[0]).resolve()
+                elif isinstance(result, str):
+                    res_path = Path(result).resolve()
+                if res_path and res_path.is_file():
+                    return str(res_path)
         except Exception:
             pass
 
@@ -102,7 +115,9 @@ async def pick_file(
                     capture_output=True, text=True, timeout=60, encoding="utf-8", errors="ignore"
                 )
                 if res.returncode == 0 and res.stdout.strip():
-                    return str(Path(res.stdout.strip()).resolve())
+                    p = Path(res.stdout.strip()).resolve()
+                    if p.is_file():
+                        return str(p)
             except Exception:
                 pass
             return None

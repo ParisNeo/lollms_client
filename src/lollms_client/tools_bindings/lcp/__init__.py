@@ -291,13 +291,98 @@ class LCPBinding(LollmsToolBinding):
 
         return count
 
+    def _find_library_dir(self, library_name: str) -> Optional[Path]:
+        """Resolves the directory path for a library across all configured tool folders."""
+        clean_name = library_name.strip()
+        search_dirs = list(self.tools_folders)
+        default_dir = Path(__file__).parent / "default_tools"
+        if default_dir not in search_dirs:
+            search_dirs.append(default_dir)
+
+        for folder in search_dirs:
+            if not folder.exists() or not folder.is_dir():
+                continue
+            candidate = folder / clean_name
+            if candidate.exists() and candidate.is_dir():
+                return candidate
+            if clean_name.startswith("tool_"):
+                candidate_alt = folder / clean_name[5:]
+                if candidate_alt.exists() and candidate_alt.is_dir():
+                    return candidate_alt
+        return None
+
+    def find_library_for_tool(self, tool_name: str) -> Optional[str]:
+        """Finds which library directory or file provides the specified tool or library name."""
+        clean_name = tool_name.strip()
+
+        # 1. Check if clean_name is directly an available library folder name
+        direct_dir = self._find_library_dir(clean_name)
+        if direct_dir:
+            return direct_dir.name
+
+        # 2. Check already discovered tools
+        for t in self.discovered_tools:
+            if t.get("name") == clean_name and t.get("_python_file_path"):
+                p = Path(t["_python_file_path"])
+                return p.parent.name if p.parent.name not in ("default_tools", "tools") else p.stem
+
+        # 3. Check AST function names inside all library files across all tools folders
+        search_dirs = list(self.tools_folders)
+        default_dir = Path(__file__).parent / "default_tools"
+        if default_dir not in search_dirs:
+            search_dirs.append(default_dir)
+
+        for folder in search_dirs:
+            if not folder.exists() or not folder.is_dir():
+                continue
+            for item in folder.iterdir():
+                py_files = []
+                if item.is_dir():
+                    py_files = [f for f in item.glob("*.py") if f.stem != "__init__"]
+                elif item.suffix == ".py" and item.stem != "__init__":
+                    py_files = [item]
+
+                for py_f in py_files:
+                    try:
+                        extracted = self._extract_tool_names_from_file(py_f)
+                        if clean_name in extracted:
+                            return item.name if item.is_dir() else py_f.stem
+                    except Exception:
+                        pass
+        return None
+
+    def is_tool_available(self, tool_name: str) -> bool:
+        """Checks if a tool is either already discovered or can be dynamically mounted."""
+        clean_name = tool_name.strip()
+        if any(t.get("name") == clean_name for t in self.discovered_tools):
+            return True
+        return self.find_library_for_tool(clean_name) is not None
+
+    def load_tool_by_name(self, tool_name: str) -> Optional[Dict[str, Any]]:
+        """Mounts the library containing tool_name if needed and returns its specification."""
+        clean_name = tool_name.strip()
+        match = next((t for t in self.discovered_tools if t.get("name") == clean_name), None)
+        if match:
+            return match
+
+        lib_name = self.find_library_for_tool(clean_name)
+        if lib_name:
+            self.mount_tool_library(lib_name)
+            tool_match = next((t for t in self.discovered_tools if t.get("name") == clean_name), None)
+            if tool_match:
+                return tool_match
+            for t in self.discovered_tools:
+                py_p = t.get("_python_file_path", "")
+                if lib_name in py_p:
+                    return t
+
+        return None
+
     def is_library_mounted(self, library_name: str) -> bool:
         """Checks if a tool library is already fully mounted by verifying that
         all expected tool names from the library are present in discovered_tools."""
-        base_dir = Path(__file__).parent / "default_tools"
-        lib_path = base_dir / library_name
-
-        if not lib_path.exists() or not lib_path.is_dir():
+        lib_path = self._find_library_dir(library_name)
+        if not lib_path or not lib_path.exists() or not lib_path.is_dir():
             return False
 
         expected_tool_names: set = set()
@@ -306,7 +391,11 @@ class LCPBinding(LollmsToolBinding):
             sibling_py_files: List[Path] = []
             if item.is_dir():
                 py_file = item / f"{item.name}.py"
-                sibling_py_files = [f for f in item.iterdir() if f.is_file() and f.suffix == ".py" and f.stem != "__init__" and f != py_file]
+                if not py_file.exists():
+                    sub_py_files = [f for f in item.iterdir() if f.is_file() and f.suffix == ".py" and f.stem != "__init__"]
+                    for fallback_py in sub_py_files:
+                        expected_tool_names.update(self._extract_tool_names_from_file(fallback_py))
+                    continue
             elif item.suffix == ".py" and item.stem != "__init__":
                 py_file = item
 
@@ -329,11 +418,9 @@ class LCPBinding(LollmsToolBinding):
         return self.mount_tool_library(library_name)
 
     def mount_tool_library(self, library_name: str) -> bool:
-        base_dir = Path(__file__).parent / "default_tools"
-        lib_path = base_dir / library_name
-
-        if not lib_path.exists() or not lib_path.is_dir():
-            ASCIIColors.warning(f"[LCP Mount] Library '{library_name}' not found at {lib_path}")
+        lib_path = self._find_library_dir(library_name)
+        if not lib_path or not lib_path.exists() or not lib_path.is_dir():
+            ASCIIColors.warning(f"[LCP Mount] Library '{library_name}' not found in search paths.")
             return False
 
         if self.is_library_mounted(library_name):

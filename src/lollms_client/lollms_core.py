@@ -32,7 +32,13 @@ from lollms_client.lollms_ttv_binding import LollmsTTVBinding, LollmsTTVBindingM
 from lollms_client.lollms_ttm_binding import LollmsTTMBinding, LollmsTTMBindingManager
 from lollms_client.lollms_tools_binding import LollmsToolBinding, LollmsTOOLBindingManager
 from lollms_client.lollms_connection_binding import LollmsConnectionBinding, LollmsConnectionBindingManager
+try:
+    from lollms_client.lollms_rag_binding import LollmsRAGBinding, LollmsRAGBindingManager
+except ImportError:
+    LollmsRAGBinding = None
+    LollmsRAGBindingManager = None
 from lollms_client.lollms_personality.lollms_personality import ToolsManager
+from lollms_client.lollms_base_binding import LollmsBaseBinding
 
 from lollms_client.lollms_discussion import LollmsDiscussion
 
@@ -82,6 +88,7 @@ class LollmsClient():
         ttm_binding_name: Optional[str] = None,
         tools_binding_name: Optional[str] = None,
         connection_binding_name: Optional[str] = None,
+        rag_binding_name: Optional[str] = None,
 
         # Modality Binding Directories
         llm_bindings_dir: Path = Path(__file__).parent / "llm_bindings",
@@ -92,6 +99,7 @@ class LollmsClient():
         ttm_bindings_dir: Path = Path(__file__).parent / "ttm_bindings",
         tools_bindings_dir: Path = Path(__file__).parent / "tools_bindings",
         connection_bindings_dir: Path = Path(__file__).parent / "connection_bindings",
+        rag_bindings_dir: Path = Path(__file__).parent / "rag_bindings",
 
         # Configurations
         llm_binding_config: Optional[Dict[str, any]] = None,
@@ -102,13 +110,14 @@ class LollmsClient():
         ttm_binding_config: Optional[Dict[str, any]] = None, 
         tools_binding_config: Optional[Dict[str, any]] = None,
         connection_binding_config: Optional[Dict[str, any]] = None,
+        rag_binding_config: Optional[Dict[str, any]] = None,
         user_name ="user",
         ai_name = "assistant",
         callback: Optional[Callable[[str, MSG_TYPE, Optional[Dict]], bool]] = None,
 
         debug: Optional[bool] = True,
         cooperative_vram_management: Optional[bool] = False,
-        
+
         # 🧠 Modern Lazy Profiles (Universal across all modalities)
         llm_binding_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
         tti_binding_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
@@ -117,6 +126,7 @@ class LollmsClient():
         ttv_binding_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
         ttm_binding_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
         connection_binding_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
+        rag_binding_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsBindingProfile']]] = None,
 
         llm_model_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsModelProfile']]] = None,
         tti_model_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsModelProfile']]] = None,
@@ -125,6 +135,7 @@ class LollmsClient():
         ttv_model_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsModelProfile']]] = None,
         ttm_model_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsModelProfile']]] = None,
         connection_model_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsModelProfile']]] = None,
+        rag_model_profiles: Optional[Dict[str, Union[Dict[str, Any], 'LollmsModelProfile']]] = None,
 
         **kwargs
         ):
@@ -196,6 +207,13 @@ class LollmsClient():
 
         self.debug = debug
 
+        system_dir_arg = kwargs.get("system_dir") or kwargs.get("lollms_system_path") or kwargs.get("cwd")
+        if system_dir_arg:
+            self.system_dir = Path(system_dir_arg).expanduser().resolve()
+            self.system_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            self.system_dir = None
+
         self.cooperative_vram_management = cooperative_vram_management
         if callback: callback("🚀 Initializing **Lollms Client**...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
         
@@ -207,6 +225,7 @@ class LollmsClient():
         self.ttm_binding_manager = LollmsTTMBindingManager(ttm_bindings_dir)
         self.tools_binding_manager = LollmsTOOLBindingManager(tools_bindings_dir)
         self.connection_binding_manager = LollmsConnectionBindingManager(connection_bindings_dir)
+        self.rag_binding_manager = LollmsRAGBindingManager(rag_bindings_dir) if LollmsRAGBindingManager else None
 
         self.llm: Optional[LollmsLLMBinding] = None
         self.tts: Optional[LollmsTTSBinding] = None
@@ -216,6 +235,7 @@ class LollmsClient():
         self.ttm: Optional[LollmsTTMBinding] = None
         self.tools: Optional[LollmsToolBinding] = None
         self.connection: Optional[LollmsConnectionBinding] = None
+        self.rag: Optional[LollmsRAGBinding] = None
 
         # Multi-Binding Registries (Instantiated Models)
         self.llms: Dict[str, LollmsLLMBinding] = {}
@@ -225,6 +245,7 @@ class LollmsClient():
         self.ttvs: Dict[str, LollmsTTVBinding] = {}
         self.ttms: Dict[str, LollmsTTMBinding] = {}
         self.connections: Dict[str, LollmsConnectionBinding] = {}
+        self.rags: Dict[str, LollmsRAGBinding] = {}
 
         self._active_llm_alias: Optional[str] = None
         self._active_tti_alias: Optional[str] = None
@@ -233,6 +254,7 @@ class LollmsClient():
         self._active_ttv_alias: Optional[str] = None
         self._active_ttm_alias: Optional[str] = None
         self._active_connection_alias: Optional[str] = None
+        self._active_rag_alias: Optional[str] = None
 
         # 🖼️ VLM Image Description Cache (Image Hash -> Text Description)
         self._image_description_cache: Dict[str, str] = {}
@@ -249,6 +271,7 @@ class LollmsClient():
         self.ttv_binding_profiles_registry: Dict[str, LollmsBindingProfile] = {}
         self.ttm_binding_profiles_registry: Dict[str, LollmsBindingProfile] = {}
         self.connection_binding_profiles_registry: Dict[str, LollmsBindingProfile] = {}
+        self.rag_binding_profiles_registry: Dict[str, LollmsBindingProfile] = {}
 
         self.llm_model_profiles_registry: Dict[str, LollmsModelProfile] = {}
         self.tti_model_profiles_registry: Dict[str, LollmsModelProfile] = {}
@@ -257,6 +280,7 @@ class LollmsClient():
         self.ttv_model_profiles_registry: Dict[str, LollmsModelProfile] = {}
         self.ttm_model_profiles_registry: Dict[str, LollmsModelProfile] = {}
         self.connection_model_profiles_registry: Dict[str, LollmsModelProfile] = {}
+        self.rag_model_profiles_registry: Dict[str, LollmsModelProfile] = {}
 
         # Backward compatibility: Map legacy extra_llms to llm_model_profiles
         legacy_extra_llms = kwargs.pop("extra_llms", None)
@@ -282,7 +306,7 @@ class LollmsClient():
         self.user_name = user_name
         self.ai_name = ai_name
 
-        # 1. Register Connection Layer Profiles (Bindings) — including CONNECTION
+        # 1. Register Connection Layer Profiles (Bindings) — including CONNECTION & RAG
         self._register_binding_profiles(llm_binding_profiles, self.llm_binding_profiles_registry, "LLM", llm_binding_name, llm_binding_config)
         self._register_binding_profiles(tts_binding_profiles, self.tts_binding_profiles_registry, "TTS", tts_binding_name, tts_binding_config)
         self._register_binding_profiles(tti_binding_profiles, self.tti_binding_profiles_registry, "TTI", tti_binding_name, tti_binding_config)
@@ -290,8 +314,9 @@ class LollmsClient():
         self._register_binding_profiles(ttv_binding_profiles, self.ttv_binding_profiles_registry, "TTV", ttv_binding_name, ttv_binding_config)
         self._register_binding_profiles(ttm_binding_profiles, self.ttm_binding_profiles_registry, "TTM", ttm_binding_name, ttm_binding_config)
         self._register_binding_profiles(connection_binding_profiles, self.connection_binding_profiles_registry, "CONNECTION", connection_binding_name, connection_binding_config)
+        self._register_binding_profiles(rag_binding_profiles, self.rag_binding_profiles_registry, "RAG", rag_binding_name, rag_binding_config)
 
-        # 2. Register Execution Layer Profiles (Models) — including CONNECTION
+        # 2. Register Execution Layer Profiles (Models / Stores) — including CONNECTION & RAG
         self._register_model_profiles(llm_model_profiles, self.llm_model_profiles_registry, "LLM", self.llm_binding_profiles_registry)
         self._register_model_profiles(tts_model_profiles, self.tts_model_profiles_registry, "TTS", self.tts_binding_profiles_registry)
         self._register_model_profiles(tti_model_profiles, self.tti_model_profiles_registry, "TTI", self.tti_binding_profiles_registry)
@@ -299,6 +324,7 @@ class LollmsClient():
         self._register_model_profiles(ttv_model_profiles, self.ttv_model_profiles_registry, "TTV", self.ttv_binding_profiles_registry)
         self._register_model_profiles(ttm_model_profiles, self.ttm_model_profiles_registry, "TTM", self.ttm_binding_profiles_registry)
         self._register_model_profiles(connection_model_profiles, self.connection_model_profiles_registry, "CONNECTION", self.connection_binding_profiles_registry)
+        self._register_model_profiles(rag_model_profiles, self.rag_model_profiles_registry, "RAG", self.rag_binding_profiles_registry)
 
         # 3. Tools binding remains direct (not part of the two-tier profile system yet)
         if tools_binding_name:
@@ -319,24 +345,35 @@ class LollmsClient():
         if callback: callback("✨ **Lollms Client** Initialization Complete.", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
 
         # 4. Eagerly instantiate ONLY the default models for all modalities
+        resolved_defaults_to_save: Dict[str, Tuple[str, List[str]]] = {}
+
         def _eagerly_instantiate_default(model_registry: dict, switch_method: Callable, modality_name: str):
             default_aliases = [a for a, p in model_registry.items() if p.is_default]
             if len(default_aliases) > 1:
-                ASCIIColors.warning(
+                chosen_default = default_aliases[0]
+                demoted = default_aliases[1:]
+                ASCIIColors.info(
                     f"[LollmsClient] Multiple default profiles detected for {modality_name}: {default_aliases}. "
-                    f"Using the first: '{default_aliases[0]}'. Remove is_default from the others."
+                    f"Selected '{chosen_default}' as default and demoted {demoted}."
                 )
-            default_alias = default_aliases[0] if default_aliases else None
+                for alias in demoted:
+                    model_registry[alias].is_default = False
+                resolved_defaults_to_save[modality_name.lower()] = (chosen_default, demoted)
+
+            default_alias = next((a for a, p in model_registry.items() if p.is_default), None)
             if default_alias:
                 switch_method(default_alias, callback=callback)
             elif "master" in model_registry:
                 switch_method("master", callback=callback)
             elif model_registry:
-                switch_method(next(iter(model_registry)), callback=callback)
+                first_alias = next(iter(model_registry))
+                model_registry[first_alias].is_default = True
+                resolved_defaults_to_save[modality_name.lower()] = (first_alias, [])
+                switch_method(first_alias, callback=callback)
 
         missing_model_names = [
             alias for alias, prof in self.llm_model_profiles_registry.items()
-            if not prof.model_name
+            if not prof.model_name and alias != "master"
         ]
         if missing_model_names:
             ASCIIColors.warning(
@@ -351,6 +388,11 @@ class LollmsClient():
         _eagerly_instantiate_default(self.ttv_model_profiles_registry, self.switch_ttv, "TTV")
         _eagerly_instantiate_default(self.ttm_model_profiles_registry, self.switch_ttm, "TTM")
         _eagerly_instantiate_default(self.connection_model_profiles_registry, self.switch_connection, "CONNECTION")
+        _eagerly_instantiate_default(self.rag_model_profiles_registry, self.switch_rag, "RAG")
+
+        # Automatically persist resolved single defaults to disk so warnings never repeat
+        if resolved_defaults_to_save:
+            self._save_single_default_profiles_to_disk(resolved_defaults_to_save)
 
     def _register_binding_profiles(self, profiles_dict: Optional[Dict], registry: Dict[str, LollmsBindingProfile], modality_name: str, legacy_binding_name: Optional[str] = None, legacy_binding_config: Optional[Dict] = None):
         """Registers connection layer profiles (binding engines/servers)."""
@@ -377,15 +419,21 @@ class LollmsClient():
                 name="master",
                 binding_name=legacy_binding_name,
                 binding_config=legacy_binding_config or {},
-                is_default=True
+                is_default=not bool(registry)
             )
 
     def _register_model_profiles(self, profiles_dict: Optional[Dict], registry: Dict[str, LollmsModelProfile], modality_name: str, binding_registry: Dict[str, LollmsBindingProfile]):
-        """Registers execution layer profiles (models). Auto-creates a master profile for legacy bindings."""
+        """Registers execution layer profiles (models). Auto-creates a master profile only for legacy bindings."""
+        found_default = False
         if profiles_dict:
             for alias, p_data in profiles_dict.items():
                 if isinstance(p_data, LollmsModelProfile):
                     profile = p_data
+                    if profile.is_default:
+                        if not found_default:
+                            found_default = True
+                        else:
+                            profile.is_default = False
                 else:
                     raw_efforts = p_data.get("supported_reasoning_efforts") or p_data.get("reasoning_efforts")
                     if isinstance(raw_efforts, str) and raw_efforts.strip():
@@ -395,11 +443,18 @@ class LollmsClient():
                     else:
                         parsed_efforts = None
 
+                    is_def = p_data.get("is_default", False)
+                    if is_def:
+                        if not found_default:
+                            found_default = True
+                        else:
+                            is_def = False
+
                     profile = LollmsModelProfile(
                         name=alias,
                         binding_profile_name=p_data.get("binding_profile_name") or p_data.get("binding_alias") or "master",
                         model_name=p_data.get("model_name"),
-                        is_default=p_data.get("is_default", False),
+                        is_default=is_def,
                         vision_enabled=p_data.get("vision_enabled", False),
                         forced_context_size=p_data.get("forced_context_size"),
                         routing_config=p_data.get("routing_config") or p_data.get("routing_profile"),
@@ -409,13 +464,110 @@ class LollmsClient():
                     )
                 registry[alias] = profile
 
-        # Backward compatibility: If we registered a master binding but no master model profile exists, create one.
-        if "master" in binding_registry and "master" not in registry:
+        # Backward compatibility: Only create a master model profile if the registry is completely empty
+        # and a master binding exists (legacy single-binding initialization without model profiles).
+        if "master" in binding_registry and not registry:
+            model_name = binding_registry["master"].binding_config.get("model_name")
             registry["master"] = LollmsModelProfile(
                 name="master",
                 binding_profile_name="master",
+                model_name=model_name,
                 is_default=True
             )
+
+    def _save_single_default_profiles_to_disk(self, resolved_defaults: Dict[str, Tuple[str, List[str]]]) -> None:
+        """
+        Persists resolved single default profiles to configuration files on disk
+        so multiple-default warnings do not recur on subsequent app launches.
+        """
+        if not resolved_defaults:
+            return
+
+        candidate_yamls = [
+            Path.home() / ".lollms_client" / "config.yaml",
+            Path.cwd() / ".lollms_code" / "config.yaml",
+        ]
+        if self.system_dir:
+            candidate_yamls.insert(0, Path(self.system_dir) / "config.yaml")
+
+        candidate_envs = [
+            Path.home() / ".lollms_client" / ".env",
+            Path.cwd() / ".lollms_code" / ".env",
+        ]
+        if self.system_dir:
+            candidate_envs.insert(0, Path(self.system_dir) / ".env")
+
+        # 1. Update YAML configuration files
+        for yaml_path in candidate_yamls:
+            if not yaml_path.exists():
+                continue
+            try:
+                import yaml as _yaml
+                with open(yaml_path, "r", encoding="utf-8") as f:
+                    cfg = _yaml.safe_load(f) or {}
+
+                if not isinstance(cfg, dict):
+                    continue
+
+                changed = False
+                for mod_name, (chosen_default, demoted_list) in resolved_defaults.items():
+                    mod_data = cfg.get(mod_name)
+                    if not isinstance(mod_data, dict):
+                        continue
+                    profiles_data = mod_data.get("profiles")
+                    if not isinstance(profiles_data, dict):
+                        continue
+
+                    # If a phantom 'master' profile was saved in yaml without model_name, purge it
+                    if "master" in profiles_data and not profiles_data["master"].get("model_name"):
+                        profiles_data.pop("master", None)
+                        changed = True
+
+                    for p_alias, p_info in profiles_data.items():
+                        if not isinstance(p_info, dict):
+                            continue
+                        if p_alias == chosen_default:
+                            if not p_info.get("is_default", False):
+                                p_info["is_default"] = True
+                                changed = True
+                        elif p_alias in demoted_list or p_info.get("is_default", False):
+                            p_info["is_default"] = False
+                            changed = True
+
+                if changed:
+                    with open(yaml_path, "w", encoding="utf-8") as f:
+                        _yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+                    ASCIIColors.success(f"[LollmsClient] Saved single default profiles to: {yaml_path}")
+            except Exception as e:
+                ASCIIColors.warning(f"[LollmsClient] Could not update {yaml_path}: {e}")
+
+        # 2. Update .env configuration files
+        for env_path in candidate_envs:
+            if not env_path.exists():
+                continue
+            try:
+                lines = env_path.read_text(encoding="utf-8").splitlines()
+                new_lines = []
+                changed = False
+
+                for line in lines:
+                    stripped = line.strip()
+                    updated_line = line
+                    for mod_name, (chosen_default, demoted_list) in resolved_defaults.items():
+                        mod_prefix = f"{mod_name.upper()}_PROFILES_"
+                        for demoted_alias in demoted_list:
+                            clean_alias = re.sub(r"[^A-Za-z0-9_]", "_", demoted_alias.upper())
+                            target_key = f"{mod_prefix}{clean_alias}_IS_DEFAULT"
+                            if stripped.upper().startswith(f"{target_key}=") and "=TRUE" in stripped.upper():
+                                updated_line = f"{target_key}=false"
+                                changed = True
+                    new_lines.append(updated_line)
+
+                if changed:
+                    env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+                    ASCIIColors.success(f"[LollmsClient] Saved single default profiles to: {env_path}")
+            except Exception as e:
+                ASCIIColors.warning(f"[LollmsClient] Could not update {env_path}: {e}")
 
     def _instantiate_binding_from_profile(self, alias: str, model_profile: LollmsModelProfile, manager: Any, modality: str, callback=None) -> Optional[Any]:
         """Instantiates a binding from a model profile, merging the referenced binding profile config."""
@@ -437,18 +589,51 @@ class LollmsClient():
         if "verify_ssl_certificate" in b_config and isinstance(b_config["verify_ssl_certificate"], str):
             b_config["verify_ssl_certificate"] = b_config["verify_ssl_certificate"].lower().strip() in ("true", "1", "yes", "y", "on")
 
+        # For secondary non-LLM modalities, ensure server spawning does not block the caller's main thread
+        if modality != "llm":
+            b_config.setdefault("wait_for_server", False)
+
+        if _ssl_debug:
+            ASCIIColors.yellow(f"[LollmsClient][SSL-DEBUG] b_config AFTER sanitize: {b_config}")
+            
+        # Inject model_name if specified at the model profile level        if "verify_ssl_certificate" in b_config and isinstance(b_config["verify_ssl_certificate"], str):
+            b_config["verify_ssl_certificate"] = b_config["verify_ssl_certificate"].lower().strip() in ("true", "1", "yes", "y", "on")
+
+        # For secondary non-LLM modalities, ensure server spawning does not block the caller's main thread
+        if modality != "llm":
+            b_config.setdefault("wait_for_server", False)
+
+        if _ssl_debug:
+            ASCIIColors.yellow(f"[LollmsClient][SSL-DEBUG] b_config AFTER sanitize: {b_config}")
+            
+        # Inject model_name if specified at the model profile level        if "verify_ssl_certificate" in b_config and isinstance(b_config["verify_ssl_certificate"], str):
+            b_config["verify_ssl_certificate"] = b_config["verify_ssl_certificate"].lower().strip() in ("true", "1", "yes", "y", "on")
+
+        # For secondary non-LLM modalities, ensure server spawning does not block the caller's main thread
+        if modality != "llm":
+            b_config.setdefault("wait_for_server", False)
+
         if _ssl_debug:
             ASCIIColors.yellow(f"[LollmsClient][SSL-DEBUG] b_config AFTER sanitize: {b_config}")
             
         # Inject model_name if specified at the model profile level
         if model_profile.model_name:
             b_config['model_name'] = model_profile.model_name
+            if modality == "rag":
+                b_config.setdefault('db_path', model_profile.model_name)
+                b_config.setdefault('store_name', model_profile.model_name)
 
         # Inject LLM-specific configs if applicable
         if modality == "llm":
             b_config['user_name'] = self.user_name
             b_config['ai_name'] = self.ai_name
+        elif modality == "rag":
+            b_config['lollms_client'] = self
+
         b_config['debug'] = self.debug
+        if self.system_dir:
+            b_config.setdefault('system_dir', str(self.system_dir))
+            b_config.setdefault('cwd', str(self.system_dir))
 
         try:
             binding = manager.create_binding(
@@ -500,6 +685,12 @@ class LollmsClient():
             self._remote_tokenizer_healthy = True
             if hasattr(self, "_ctx_size_cache"):
                 self._ctx_size_cache = {}
+
+        # Ensure model is ready (triggering resource reclamation if local and needed)
+        if getattr(new_binding, "is_local", lambda: False)():
+            model_name = getattr(model_profile, "model_name", None)
+            self.ensure_model_loaded(new_binding, model_name)
+
         object.__setattr__(self, active_alias_attr, alias)
         ASCIIColors.info(f"[LollmsClient] Active {modality.upper()} switched to '{alias}'.")
         return True
@@ -525,8 +716,12 @@ class LollmsClient():
     def switch_connection(self, alias: str, callback=None) -> bool:
         return self._switch_modality(alias, self.connection_model_profiles_registry, self.connection_binding_profiles_registry, self.connections, self.connection_binding_manager, "connection", "connection", "_active_connection_alias", callback)
 
+    def switch_rag(self, alias: str, callback=None) -> bool:
+        return self._switch_modality(alias, self.rag_model_profiles_registry, self.rag_binding_profiles_registry, self.rags, self.rag_binding_manager, "rag", "rag", "_active_rag_alias", callback)
+
     # Legacy aliases
     def mount_llm(self, alias: str) -> bool: return self.switch_model(alias)
+    def mount_rag(self, alias: str) -> bool: return self.switch_rag(alias)
     def mount_tti(self, alias: str) -> bool: return self.switch_tti(alias)
     def mount_tts(self, alias: str) -> bool: return self.switch_tts(alias)
     def mount_stt(self, alias: str) -> bool: return self.switch_stt(alias)
@@ -596,6 +791,9 @@ class LollmsClient():
 
     def update_connection_binding(self, binding_name: str, config: Optional[Dict[str, Any]] = None):
         return self._update_binding(binding_name, config, self.connection_binding_profiles_registry, self.connection_model_profiles_registry, self.connections, self.switch_connection, "CONNECTION")
+
+    def update_rag_binding(self, binding_name: str, config: Optional[Dict[str, Any]] = None):
+        return self._update_binding(binding_name, config, self.rag_binding_profiles_registry, self.rag_model_profiles_registry, self.rags, self.switch_rag, "RAG")
 
     # --- Core LLM Methods (Delegated) ---
     def tokenize(self, text: str) -> list:
@@ -718,6 +916,88 @@ class LollmsClient():
     def get_available_llm_bindings(self) -> List[str]: 
         return self.llm_binding_manager.get_available_bindings()
 
+    def free_local_binding_resources(self, except_binding: Optional[Any] = None) -> bool:
+        """
+        Audits all instantiated bindings across all modalities. If any local binding
+        (other than except_binding) is holding resources (active daemon/models in RAM/VRAM),
+        asks it to unload its models.
+        Returns True if any resources were successfully liberated.
+        """
+        freed = False
+        all_instances = (
+            list(self.llms.values()) + list(self.ttis.values()) +
+            list(self.ttms.values()) + list(self.tts_bindings.values()) +
+            list(self.stts.values()) + list(self.ttvs.values())
+        )
+
+        for b in all_instances:
+            if b is None or b == except_binding:
+                continue
+            is_loc = getattr(b, "is_local", lambda: False)()
+            has_res = getattr(b, "has_active_resources", lambda: False)()
+            if is_loc and has_res:
+                loaded = getattr(b, "get_loaded_models", lambda: [])()
+                b_name = getattr(b, "binding_name", "unknown")
+                ASCIIColors.warning(f"[Resource Manager] Asking {b_name} to unload models {loaded} to liberate local VRAM/RAM...")
+                try:
+                    if b.unload_model():
+                        freed = True
+                        ASCIIColors.green(f"[Resource Manager] Successfully liberated resources from {b_name}.")
+                except Exception as ex:
+                    ASCIIColors.warning(f"[Resource Manager] Failed unloading models from {b_name}: {ex}")
+
+        if freed:
+            try:
+                import gc
+                gc.collect()
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        return freed
+
+    def ensure_model_loaded(self, binding: Any, model_name: Optional[str] = None) -> bool:
+        """
+        Verifies if a model is loaded in the specified binding.
+        If it is not loaded, attempts to load it. If loading fails (due to VRAM/RAM),
+        coordinates with other local bindings to unload their resources, then retries.
+        Remote bindings (is_local() == False) pass through immediately.
+        """
+        if not binding:
+            return False
+
+        if not getattr(binding, "is_local", lambda: False)():
+            return True
+
+        target_model = model_name or getattr(binding, "model_name", None)
+        if not target_model:
+            return True
+
+        if getattr(binding, "is_model_loaded", lambda m=None: False)(target_model):
+            return True
+
+        b_name = getattr(binding, "binding_name", "binding")
+        ASCIIColors.info(f"[{b_name}] Model '{target_model}' not loaded. Attempting to load...")
+        if binding.load_model(target_model):
+            return True
+
+        # First attempt failed. Check if any other local bindings are consuming resources
+        last_err = getattr(binding, "get_last_error", lambda: "")() or ""
+        ASCIIColors.warning(f"[{b_name}] Initial load of '{target_model}' failed ({last_err}). Initiating resource reclamation...")
+
+        freed = self.free_local_binding_resources(except_binding=binding)
+        if freed:
+            ASCIIColors.info(f"[{b_name}] Resources liberated. Retrying model load for '{target_model}'...")
+            time.sleep(1.0)
+            if binding.load_model(target_model):
+                ASCIIColors.success(f"[{b_name}] Model '{target_model}' loaded successfully after resource reclamation.")
+                return True
+
+        ASCIIColors.error(f"[{b_name}] Could not load model '{target_model}'.")
+        return False
+
     def _cooperative_unload_except(self, active_modality: str):
         if not getattr(self, "cooperative_vram_management", False):
             return
@@ -730,14 +1010,8 @@ class LollmsClient():
             "ttv": self.ttv,
             "ttm": self.ttm,
         }
-
-        for name, binding in modalities.items():
-            if name != active_modality and binding:
-                ASCIIColors.info(f"[Cooperative VRAM] Unloading {name.upper()} model to free VRAM for {active_modality.upper()}...")
-                try:
-                    binding.unload_model()
-                except Exception as e:
-                    ASCIIColors.warning(f"Failed to unload {name.upper()} model: {e}")
+        active_b = modalities.get(active_modality)
+        self.free_local_binding_resources(except_binding=active_b)
 
     def _cooperative_unload_tti(self):
         self._cooperative_unload_except("llm")
@@ -962,18 +1236,51 @@ class LollmsClient():
         if not self.llm:
             raise RuntimeError("LLM binding not initialized. Cannot use generate_text.")
 
+        if getattr(self.llm, "is_local", lambda: False)():
+            self.ensure_model_loaded(self.llm)
+
+        think_arg = kwargs.get("think")
+        effort_arg = kwargs.get("reasoning_effort")
+
         if self.llm:
             reasoning_effort = self.llm.get_effective_reasoning_effort(
-                think=kwargs.get("think"),
-                reasoning_effort=kwargs.get("reasoning_effort")
+                think=think_arg,
+                reasoning_effort=effort_arg
             )
         else:
             reasoning_effort = LollmsLLMBinding.normalize_reasoning_effort(
-                kwargs.get("think"), kwargs.get("reasoning_effort")
+                think_arg, effort_arg
             )
-        kwargs.pop("think", None)
+
         kwargs.pop("reasoning_summary", None)
-        kwargs["reasoning_effort"] = reasoning_effort
+
+        is_thinking_deactivated = (
+            (think_arg is False and effort_arg is None)
+            or think_arg is False
+            or reasoning_effort in (None, "none", "off", "disabled", "false", "0")
+        )
+
+        if is_thinking_deactivated:
+            kwargs["think"] = False
+            kwargs["reasoning_effort"] = None
+            m_name = getattr(getattr(self, "llm", None), "model_name", "") or ""
+            deact = LollmsLLMBinding.get_deactivate_thinking_payload(m_name)
+            extra_body = kwargs.setdefault("extra_body", {})
+            if isinstance(extra_body, dict):
+                extra_body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
+                extra_body.setdefault("chat_template_kwargs", {})["thinking"] = False
+                if "glm" in m_name.lower():
+                    extra_body["thinking"] = {"type": "disabled"}
+                else:
+                    extra_body["thinking"] = False
+        else:
+            kwargs["think"] = True if (think_arg is True or reasoning_effort) else False
+            kwargs["reasoning_effort"] = reasoning_effort
+
+        ASCIIColors.info(
+            f"[LollmsClient.generate_text] think={kwargs.get('think')} (input: {think_arg}), "
+            f"reasoning_effort={kwargs.get('reasoning_effort')} (input: {effort_arg})"
+        )
 
         # Non-vision model image stripping and VLM substitution
         prompt = kwargs.get("prompt", args[0] if len(args) > 0 else "")
@@ -997,18 +1304,51 @@ class LollmsClient():
         if not self.llm:
             raise RuntimeError("LLM binding not initialized. Cannot use generate_from_messages.")
 
+        if getattr(self.llm, "is_local", lambda: False)():
+            self.ensure_model_loaded(self.llm)
+
+        think_arg = kwargs.get("think")
+        effort_arg = kwargs.get("reasoning_effort")
+
         if self.llm:
             reasoning_effort = self.llm.get_effective_reasoning_effort(
-                think=kwargs.get("think"),
-                reasoning_effort=kwargs.get("reasoning_effort")
+                think=think_arg,
+                reasoning_effort=effort_arg
             )
         else:
             reasoning_effort = LollmsLLMBinding.normalize_reasoning_effort(
-                kwargs.get("think"), kwargs.get("reasoning_effort")
+                think_arg, effort_arg
             )
-        kwargs.pop("think", None)
+
         kwargs.pop("reasoning_summary", None)
-        kwargs["reasoning_effort"] = reasoning_effort
+
+        is_thinking_deactivated = (
+            (think_arg is False and effort_arg is None)
+            or think_arg is False
+            or reasoning_effort in (None, "none", "off", "disabled", "false", "0")
+        )
+
+        if is_thinking_deactivated:
+            kwargs["think"] = False
+            kwargs["reasoning_effort"] = None
+            m_name = getattr(getattr(self, "llm", None), "model_name", "") or ""
+            deact = LollmsLLMBinding.get_deactivate_thinking_payload(m_name)
+            extra_body = kwargs.setdefault("extra_body", {})
+            if isinstance(extra_body, dict):
+                extra_body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
+                extra_body.setdefault("chat_template_kwargs", {})["thinking"] = False
+                if "glm" in m_name.lower():
+                    extra_body["thinking"] = {"type": "disabled"}
+                else:
+                    extra_body["thinking"] = False
+        else:
+            kwargs["think"] = True if (think_arg is True or reasoning_effort) else False
+            kwargs["reasoning_effort"] = reasoning_effort
+
+        ASCIIColors.info(
+            f"[LollmsClient.generate_from_messages] think={kwargs.get('think')} (input: {think_arg}), "
+            f"reasoning_effort={kwargs.get('reasoning_effort')} (input: {effort_arg})"
+        )
 
         # Non-vision model message sanitization and VLM substitution
         messages = kwargs.get("messages", args[0] if len(args) > 0 else [])
@@ -1100,12 +1440,21 @@ class LollmsClient():
         tool_descriptions: List[str] = []
         for name, spec in inline_tools.items():
             params = spec.get("parameters", [])
-            param_str = ", ".join(
-                f"{p['name']}: {p['type']}" + (" (optional)" if p.get("optional") else "")
-                for p in params
+            param_sig = ", ".join([f"{p.get('name', 'param')}: {p.get('type', 'any')}" for p in params]) if params else ""
+            param_details = []
+            for p in params:
+                opt = " (optional)" if p.get("optional") else ""
+                param_details.append(f"`{p.get('name', 'param')}: {p.get('type', 'any')}`{opt}")
+            param_desc = ", ".join(param_details) if param_details else "none"
+            desc = (spec.get("description") or f"Execute {name}").strip()
+
+            tool_entry = (
+                f"#### 🛠️ **`{name}`**\n"
+                f"- **Signature**: `{name}({param_sig})`\n"
+                f"- **Parameters**: {param_desc}\n"
+                f"- **Description**:\n  {desc}\n"
             )
-            desc = spec.get("description", f"Execute {name}")
-            tool_descriptions.append(f"- {name}({param_str}): {desc}")
+            tool_descriptions.append(tool_entry)
 
         tool_header = (
             "=== TOOL USE — MANDATORY FORMAT ===\n"
@@ -1121,10 +1470,10 @@ class LollmsClient():
             "7. After calling ALL needed tools, write your final answer.\n"
             "8. If the user explicitly asks you to use a tool, USE IT.\n"
             "=== END TOOL USE RULES ===\n\n"
-            "TOOLS AVAILABLE:\n"
+            "### Available Tools:\n\n"
         )
 
-        tool_block = tool_header + "\n".join(tool_descriptions)
+        tool_block = tool_header + "\n".join(tool_descriptions) + "\n=== END TOOLS AVAILABLE ===\n"
 
         # ── 3. Prepare conversation state ─────────────────────────────────
         full_system = system_prompt.rstrip()
@@ -1521,6 +1870,95 @@ class LollmsClient():
         if self.connection:
             return self.connection.list_channels()
         return []
+
+    # --- Delegated RAG Operations ---
+
+    def query_rag(
+        self,
+        query: str,
+        top_k: int = 5,
+        store_alias: Optional[str] = None,
+        hybrid: bool = True,
+        **kwargs: Any
+    ) -> List[Dict[str, Any]]:
+        """
+        Executes a query against the active or specified RAG data store.
+        """
+        if store_alias and store_alias != self._active_rag_alias:
+            self.switch_rag(store_alias)
+
+        if not self.rag:
+            raise RuntimeError("RAG binding not initialized. Configure rag_binding_name or rag_binding_profiles.")
+
+        if hybrid and hasattr(self.rag, "hybrid_query"):
+            return self.rag.hybrid_query(query, top_k=top_k, **kwargs)
+        return self.rag.query(query, top_k=top_k, **kwargs)
+
+    def add_document_to_rag(
+        self,
+        file_path: Union[str, Path],
+        store_alias: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any
+    ) -> bool:
+        """
+        Ingests a document file into the active or specified RAG data store.
+        """
+        if store_alias and store_alias != self._active_rag_alias:
+            self.switch_rag(store_alias)
+
+        if not self.rag:
+            raise RuntimeError("RAG binding not initialized. Configure rag_binding_name or rag_binding_profiles.")
+
+        return self.rag.add_document(file_path, metadata=metadata, **kwargs)
+
+    def add_text_to_rag(
+        self,
+        text: str,
+        unique_id: Optional[str] = None,
+        store_alias: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any
+    ) -> bool:
+        """
+        Ingests text into the active or specified RAG data store.
+        """
+        if store_alias and store_alias != self._active_rag_alias:
+            self.switch_rag(store_alias)
+
+        if not self.rag:
+            raise RuntimeError("RAG binding not initialized. Configure rag_binding_name or rag_binding_profiles.")
+
+        return self.rag.add_text(text, unique_id=unique_id, metadata=metadata, **kwargs)
+
+    def query_sparql(
+        self,
+        sparql_query: str,
+        store_alias: Optional[str] = None,
+        **kwargs: Any
+    ) -> Dict[str, Any]:
+        """
+        Executes a SPARQL 1.1 query on the active or specified RAG knowledge graph.
+        """
+        if store_alias and store_alias != self._active_rag_alias:
+            self.switch_rag(store_alias)
+
+        if not self.rag:
+            raise RuntimeError("RAG binding not initialized. Configure rag_binding_name or rag_binding_profiles.")
+
+        return self.rag.query_sparql(sparql_query, **kwargs)
+
+    def get_rag_info(self, store_alias: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Retrieves database diagnostic statistics and metadata from the active RAG store.
+        """
+        if store_alias and store_alias != self._active_rag_alias:
+            self.switch_rag(store_alias)
+
+        if not self.rag:
+            return {"error": "RAG binding not initialized."}
+
+        return self.rag.get_database_info()
 
     def generate_audio(self, *args, **kwargs):
         self._cooperative_unload_except("tts")

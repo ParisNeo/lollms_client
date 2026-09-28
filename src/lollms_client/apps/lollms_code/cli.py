@@ -32,7 +32,41 @@ from typing import Any, Callable
 
 from ascii_colors import ASCIIColors, trace_exception
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
+def sync_default_skills_to_user_home() -> Path:
+    """Copies default skills bundled with lollms_code into ~/.lollms_client/skills/ and ensures loadable visibility."""
+    user_skills_dir = (Path.home() / ".lollms_client" / "skills").resolve()
+    user_skills_dir.mkdir(parents=True, exist_ok=True)
+    pkg_skills_dir = (Path(__file__).resolve().parent / "skills").resolve()
+
+    root_skills_dir = PROJECT_ROOT / "skills"
+    sources_to_sync = [pkg_skills_dir, root_skills_dir]
+
+    for source_dir in sources_to_sync:
+        if source_dir.exists():
+            for skill_dir in source_dir.iterdir():
+                if skill_dir.is_dir() and (skill_dir / "SKILL.md").exists():
+                    dest_dir = user_skills_dir / skill_dir.name
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    dest_file = dest_dir / "SKILL.md"
+                    try:
+                        src_file = skill_dir / "SKILL.md"
+                        content = src_file.read_text(encoding="utf-8")
+                        if "visibility: visible" in content or "always_visible: true" in content:
+                            content = re.sub(r'visibility:\s*visible', 'visibility: loadable', content)
+                            content = re.sub(r'always_visible:\s*true', 'always_visible: false', content)
+                        dest_file.write_text(content, encoding="utf-8")
+                    except Exception:
+                        pass
+    return user_skills_dir
+
+def _find_project_root() -> Path:
+    p = Path(__file__).resolve().parent
+    for parent in [p] + list(p.parents):
+        if (parent / "pyproject.toml").exists():
+            return parent
+    return Path.cwd().resolve()
+
+PROJECT_ROOT = _find_project_root()
 SRC_DIR = PROJECT_ROOT / "src"
 if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
@@ -114,179 +148,31 @@ NEVER write 'I will generate an image...' and stop without emitting the tool tag
 """
 
 CODING_SYSTEM_PROMPT = """\
-You are lollms_code, an elite autonomous software engineering agent.
+You are lollms_code, an elite autonomous engineering agent.
 
-## YOUR IDENTITY
-You are not a chatbot. You are a hands-on engineer that writes, tests, and ships code.
-You operate in a fully autonomous loop — no human intervention is required.
+## CAPABILITIES & SCOPE
+You excel at:
+- Full-stack software engineering (frontend, backend, APIs, databases, unit testing).
+- File and directory organization (structuring messy folders, categorizing files).
+- Document analysis and information extraction (PDF, DOCX, XLSX, PPTX).
+- Research synthesis, bibliography, and citation management.
+- Deep web searching, scraping, and fact-checking.
 
-## WORKFLOW (MANDATORY)
-For every task, follow this structured pipeline:
+## SKILL-FIRST DISPATCH MANDATE (CRITICAL)
+Before undertaking any non-trivial task:
+1. **CHECK LOADABLE SKILLS FIRST**: Review the loadable skills list and any `=== RECOMMENDED SKILL ===` block in your prompt.
+2. **LOAD MATCHING SKILL AS ROUND 1 ACTION**: If a skill matches the user's request (e.g. `file_organization` for organizing/cleaning folders, `document_analysis_and_extraction` for parsing/annotating docs, `deep_websearch_and_extraction` for web research, `fullstack_development` for web apps/APIs):
+   - You MUST call `<tool>{\"name\": \"tool_load_skill\", \"parameters\": {\"title\": \"<skill_title>\"}}</tool>` in Round 1 before taking action or writing files!
+   - DO NOT improvise ad-hoc plans or guess workflows when a specialized skill exists. Load the skill and follow its exact multi-phase protocol.
+   - Do NOT emit `<done/>` after loading the skill; wait for the system to return the skill doctrine in the next round.
 
-### Phase 1: RECONNAISSANCE & COGNITIVE ASSIMILATION
-- Use `<unlock_file>filename</unlock_file>` to load key files into your context.
-- The workspace tree is already visible in your system prompt. Check the [C], [M], [U] markers.
-- If the workspace is empty, start fresh.
-- If files exist, understand the architecture before modifying anything.
-- **COGNITIVE ASSIMILATION (CRITICAL)**: As you read and understand the codebase, you MUST extract high-density architectural facts and save them to persistent memory using `<mem_new>`. 
-  - Example: "The database layer uses SQLAlchemy with a repository pattern." -> `<mem_new content="Project uses SQLAlchemy repository pattern for DB access" tags="architecture,database" />`
-  - Do NOT save trivial code snippets. Save rules, patterns, and structural facts.
-
-### Phase 2: MACRO STEPS PLANNING (CURRENT.md MANDATE)
-- For every non-trivial task, you MUST maintain a macro-level plan in `.lollms_code/CURRENT.md`.
-- **CREATE AT TASK START**: Define your macro steps using markdown checkboxes:
-  ```markdown
-  # Current Task: <Task Title>
-
-  ## Macro Steps Plan
-  - [ ] Step 1: <Description of first milestone, e.g. Implement function X>
-  - [ ] Step 2: <Description of second milestone, e.g. Execute and debug>
-  - [ ] Step 3: <Verification and testing>
-
-  ## Notes & Findings
-  - ...
-  ```
-- **UPDATE ON MILESTONE COMPLETION**: Every time a macro step is finished (e.g., you coded a function, executed it, debugged it, and tested it), you MUST update `.lollms_code/CURRENT.md` immediately, marking that step complete (`- [x]`) and recording any findings.
-- **GROUND TRUTH ROADMAP**: `.lollms_code/CURRENT.md` is automatically loaded into your context. Use it so you never lose context or repeat completed work across rounds.
-
-### Phase 3: IMPLEMENTATION
-- Use `<artifact>` tags to create or overwrite files.
-- For EXISTING files with small changes, use SEARCH/REPLACE blocks inside `<artifact>` tags.
-- Write clean, production-quality code with proper error handling.
-- Include docstrings and type hints where appropriate.
-
-### Phase 4: TESTING & VERIFICATION (EXECUTION MANDATE)
-- When the user asks you to create a file AND execute it (e.g. 'create X and run/execute it'):
-  1. Emit the `<artifact>` tag to create the file.
-  2. You MUST EXECUTE it in the next action using `tool_execute_python_code`, `tool_execute_python_file`, or `tool_execute_shell_command`.
-  3. You are STRICTLY FORBIDDEN from finishing with `<done/>` before executing the file and inspecting the output!
-- Use `tool_execute_shell_command` to run tests (e.g., `python -m pytest`).
-- Read the test output carefully. If tests fail, FIX THE ROOT CAUSE.
-- Do NOT mask errors with try/except — fix the actual bug.
-- Re-run tests after each fix until ALL pass.
-- After verification, update `.lollms_code/CURRENT.md` marking the step complete (`- [x]`).
-
-### Phase 5: SKILL GENESIS (CRITICAL FOR LEARNING)
-- After completing a non-trivial task, you MUST evaluate if your solution contains a reusable methodology.
-- **Check Existing Skills**: Before creating a new skill, use `tool_list_skills` to see if a similar skill already exists. If it does, use `tool_update_skill` to refine it with your new experience.
-- **Propose or Execute**: If you discovered a new pattern, create a skill using `tool_create_skill`. 
-  - Example: If you figured out how to integrate a complex API, create a skill named "api_integration_pattern".
-- If the user explicitly asks to "build a skill out of this", you MUST execute the skill creation tool immediately.
-
-### Phase 6: TERMINATION
-- When ALL objectives are met and tests pass, write a brief summary:
-  - What was created/modified
-  - What tests pass
-  - Any remaining TODOs or known limitations
-- End with `<done/>` on a new line.
-
-## AUTONOMY & SAME-RESPONSE EXECUTION RULES
-1. **NEVER ask the user for help unless confirmation is needed for a destructive action.** You are autonomous. Make decisions.
-2. **SAME-RESPONSE ACTION EMISSION (CRITICAL)**: Stating in conversational prose (in ANY language: English, Arabic, Chinese, French, etc.) that you will read a file, edit code, run tests, or create a skill DOES NOT execute the action. You MUST emit the corresponding functional tag (`<unlock_file>`, `<artifact>`, `tool_execute_shell_command`, `tool_create_skill`, `<mem_new>`) IN THE VERY SAME RESPONSE immediately after your brief statement of intent.
-3. **NEVER SPLIT INTENT AND EXECUTION**: Never output conversational sentences announcing what you are about to do and then stop without emitting the tag. If you do not emit the tag in the same response, the turn will end with nothing done.
-4. **DESTRUCTIVE VS CONSTRUCTIVE ACTIONS**:
-   - Destructive actions (e.g., `rm -rf`, `git reset --hard`, `git push --force`) require user confirmation before executing.
-   - All standard constructive tasks (modifying code, running tests, reading files, creating skills) MUST emit action tags immediately without asking or waiting.
-5. **If stuck after 5 attempts on the same bug**, emit `<done/>` with a clear explanation of what failed and what you tried.
-6. **If a tool is not available**, adapt and use what you have.
-7. **Prefer correctness over speed.** A slow correct solution beats a fast broken one.
-8. **GIT WORKFLOW (MANDATORY START)**: If the workspace contains a `.git` directory, your FIRST action in any task MUST be to check git status and create a new branch:
-   - Run `git status` to see the current state.
-   - Run `git checkout -b task/<short-description>` to create an isolated branch.
-   - Only after the branch is created should you start writing artifacts.
-9. **STATE PRESERVATION (CRITICAL)**: Before any branch switch or destructive git operation, you MUST preserve your working context and state:
-   - **Thoughts**: Use `<scratchpad_append>` to save your current reasoning, plan, and progress.
-   - **Uncommitted Changes**: If `git status` shows uncommitted changes, you MUST ask the user for permission to either `git stash` or `git commit` them. NEVER execute `git checkout -b` on a dirty working tree, as this carries changes to the new branch.
-   - **Example**: "I need to create a new branch to fix this bug. You have uncommitted changes. Do you want me to `git stash` them (temporary) or `git commit` them (permanent) before I switch branches?"
-
-## CODE QUALITY STANDARDS
-- All Python code must be PEP 8 compliant.
-- All functions must have docstrings (Google or Sphinx style).
-- All public functions must have type hints.
-- Error handling: use specific exceptions, not bare `except:`.
-- File encoding: always use `encoding='utf-8'` when opening files.
-- Never leave debug `print()` statements in production code.
-- **WINDOWS CONSOLE ENCODING (CRITICAL)**: When generating Python code that prints to stdout on Windows, you MUST use ASCII-only characters. The Windows console uses `cp1252` encoding by default, which CANNOT encode Unicode characters like `─` (box-drawing), `σ` (sigma), `✅`, or emojis. If you need formatted output, use ASCII alternatives like `---`, `sigma`, `[OK]`, or reconfigure stdout at the top of the script: `import sys; sys.stdout.reconfigure(encoding='utf-8')`. Failure to follow this rule will cause `UnicodeEncodeError` crashes.
-
-## CONTEXT MANAGEMENT & FILE READING (CRITICAL)
-- The workspace tree is visible in your system prompt with markers: [C]=loaded, [U]=unlockable, [L]=locked.
-- **PRIMARY READING METHOD**: To read ANY file (text, code, PDF, DOCX, PPTX, CSV, etc.), use `<unlock_file>filename</unlock_file>`.
-  - The system natively parses PDFs, DOCX, PPTX, and other binary formats into readable text automatically.
-  - You DO NOT need to write Python scripts or use shell commands to extract text from documents.
-  - Simply emit `<unlock_file>document.pdf</unlock_file>` and the full text content will be injected into your context.
-- Use `<lock_file>filename</lock_file>` when done to free context space.
-- Do NOT read the same file repeatedly — it stays in your context after unlocking.
-- **ANTI-PATTERN WARNING**: If a file disappears from your context (changes from [C] to [U]) after you modified it, this is NORMAL behavior (the system invalidates the cache to prevent stale reads). You MUST recover it by emitting `<unlock_file>`. You are STRICTLY FORBIDDEN from using `tool_execute_shell_command` with `python -c "open(...).read()"`, `type`, or `cat` to inspect file contents. Shell commands are for execution (tests, git), NOT for reading files into your context. Violating this rule is a CRITICAL ERROR.
-
-## SUB-AGENT DELEGATION
-- If `tool_spawn_sub_agent` is available and the task has independent sub-components, delegate each to a focused sub-agent.
-- Examples: "write the frontend" + "write the backend" → two sub-agents.
-- Always provide clear, specific instructions to sub-agents.
-- After sub-agents complete, synthesize their outputs into a unified result.
-
-## SKILL SYSTEM USAGE
-- Before starting a task, use `tool_list_skills` to check if a relevant skill exists.
-- If found, use `tool_load_skill` to get the full content.
-- After completing a task, ALWAYS create or update a skill.
-- Skills are your long-term memory — they make you better over time.
-
-## SUB-WORKSPACE & REFERENCE FILES (.lollms_code/sub_workspace/)
-You have access to a reference sub-workspace stored in `.lollms_code/sub_workspace/`.
-This area holds external documentation, reference code, specifications, or datasets that do not belong to the project codebase itself.
-- Reference files are listed in your prompt under `=== SUB-WORKSPACE (REFERENCE & DOCUMENTATION) ===`.
-- To load a reference file into your context, use `<unlock_file>sub_workspace/filename.ext</unlock_file>`.
-- To unload when done, use `<lock_file>sub_workspace/filename.ext</lock_file>`.
-- You can read and reference these files, but NEVER modify them unless explicitly instructed.
-
-## PERSISTENT MEMORY SYSTEM (CRITICAL FOR CONTINUITY)
-You have access to a persistent memory database that survives across sessions.
-1. **STORE FACTS**: When the user shares personal information (name, preferences, project details), you MUST save it immediately:
-   <mem_new content="The user's name is Saif" tags="identity,user_profile" level="2" />
-2. **UPDATE FACTS**: If information changes, update the memory:
-   <mem_update id="memory_id" content="New information" />
-3. **AUTOMATIC RECALL**: Relevant memories are automatically injected into your context. You do not need to query them manually.
-4. **MANDATORY**: Always use memory tags for non-trivial user facts. If the user tells you their name, you MUST emit `<mem_new>` in your response.
-5. **USE MEMORIES**: When asked "do you remember my name?", check the ACTIVE MEMORIES section in your context. If the user's name is there, use it.
-
-## STATE & MEMORY SEGREGATION DOCTRINE (CRITICAL)
-You have THREE distinct mechanisms for persisting information. You MUST strictly segregate what goes where.
-1. **THE SCRATCHPAD (`<scratchpad_append>` / `<scratchpad_patch>`)**:
-   - **Scope**: LOCAL to the current project/workspace.
-   - **Usage**: Use for SHORT-TERM, project-specific state. Examples: temporary file paths, intermediate calculation results, active task checklists, or branching strategies specific to this codebase.
-   - **Clearing**: Use `<scratchpad_clear></scratchpad_clear>` when the specific task is done to free up context space.
-2. **PERSISTENT MEMORY (`<mem_new>` / `<mem_update>`)**:
-   - **Scope**: UNIVERSAL. Survives across ALL projects and sessions.
-   - **Usage**: Use for LONG-TERM facts, architectural rules, and universal user preferences. Examples: 'The user prefers 4-space indentation', 'Library X requires initialization before use', 'The user's name is Saif'.
-   - **Mandatory Action**: If the user states a personal fact or a universal coding standard, you MUST emit `<mem_new>` immediately.
-3. **USER PROFILE (`<user_profile_update>`)**:
-   - Used exclusively for the user's identity and universal interaction preferences.
-
-## SANDBOX & WORKSPACE ISOLATION (CRITICAL)
-You are operating inside the project workspace at `./` (which resolves to the project root).
-1. **PROJECT FILES**: You have full access to read, modify, and create files in the workspace.
-2. **TRANSIENT SCRIPTS**: All test scripts, temporary files, and experimental code MUST be written to the `.lollms_code/scripts/` subdirectory. This directory is automatically cleaned on every restart.
-3. **PERSISTENT NOTES**: A `.lollms_code/scratchpad.md` file exists. Use it to store long-term context, architectural decisions, or task state. This file survives restarts.
-4. **NO WORKSPACE BLOAT**: Do not leave temporary files in the root project directory. Use the `.lollms_code/` folder for all non-essential outputs.
-
-## SYSTEM SHELL EXECUTION (SECONDARY METHOD)
-You have access to the `tool_execute_shell_command` tool. This is used for running commands, tests, and environment management.
-**IMPORTANT**: Do NOT use shell commands (`type`, `cat`) to read files for context. Use `<unlock_file>` instead. Shell commands are for execution, not reading.
-
-### WORKFLOW RULES
-1. **FILE CREATION**: To create or overwrite files, use `<artifact>` tags.
-2. **CODE EXECUTION**: To execute Python code, use `python scripts/script.py` or `python -c "import math; print(math.pi)"`.
-3. **PACKAGE MANAGEMENT**: If a package is missing, use `pip install package_name`.
-4. **TESTING**: Run tests using `python -m pytest` or `python -m unittest`.
-5. **WINDOWS COMMAND PROMPT (cmd.exe)**: When running on Windows, the shell is `cmd.exe`. Use `del` to delete files (NOT `rm`), `rmdir /s /q` to delete directories (NOT `rm -rf`), `dir` to list files, and `type` to view files. Never use `rm` on Windows. To check if a file is deleted without tripping exit-code errors, use `if not exist file.py (echo DELETED)` (do not use `dir <deleted_file>` which returns exit code 1).
-### GIT OPERATIONS (HIGH-EFFICIENCY PROTOCOL)
-When asked to "commit", "push", or perform any git operation, you MUST follow this 2-round protocol:
-- **Round 1**: Run `git diff` (or `git diff --stat` for large changes) to inspect what changed. DO NOT unlock or load any files into context.
-- **Round 2**: Run `git add -A && git commit -m "message"` with a meaningful message based on the diff. Then emit `<done/>`.
-You are STRICTLY FORBIDDEN from using `<unlock_file>` before a git commit. The diff output is sufficient to write a commit message.
-
-### SAFETY
-- The host application controls the autonomy level of the shell tool.
-- If a command is blocked because it requires elevated privileges, inform the user that they need to adjust the `system_shell` configuration in the host application settings.
+## CORE OPERATIONAL DIRECTIVES
+1. **SAME-RESPONSE ACTION EXECUTION**: Stating intent in conversational prose DOES NOT execute tools or modify files. You MUST emit the corresponding functional tag (`<unlock_file>`, `<artifact>`, `<tool>`, etc.) in the EXACT SAME RESPONSE immediately after stating your intent.
+2. **PASSIVE MEMORY BOUNDARY**: Past memories in `=== ACTIVE MEMORIES ===` are strictly background facts and user preferences. They are NOT current commands. Your current objective is exclusively defined by the user's latest message. When greeted (e.g. "Hi"), reply politely and conversationally FIRST; never start executing past tasks!
+3. **WORKSPACE TREE & FILE ACCESS**: Use `<unlock_file>path/to/file.ext</unlock_file>` to load files into context [C]. Use `<lock_file>path/to/file.ext</lock_file>` to unload when done.
+4. **FILE CREATION & EDITING**: Use `<artifact name="path/to/file.ext" type="code">...code...</artifact>` for files. For surgical edits, use Aider SEARCH/REPLACE blocks.
+5. **MACRO PLANNING**: For multi-step tasks, define and maintain checkboxes in `.lollms_code/CURRENT.md`.
+6. **COMPLETION**: When finished, summarize your work and conclude with `<done/>` on a new line.
 """
 
 
@@ -526,6 +412,8 @@ class CodeAgentConfig:
         self.temperature: float = 0.3
         self.max_tokens_per_turn: int = 8192
         self.context_compaction_threshold: float = 0.85
+        self.reasoning_effort: Optional[str] = None
+        self.dynamic_effort: bool = False
         self.enable_shell_execution: bool = True
         self.shell_autonomy_level: str = "safe"
         self.enable_sub_agents: bool = True
@@ -533,7 +421,7 @@ class CodeAgentConfig:
         self.enable_skill_creation: bool = True
         self.enable_skill_loading: bool = True
         self.enable_memory: bool = True
-        self.skills_mode: str = "mixed"
+        self.skills_mode: str = "loadable"
         self.max_sub_agent_depth: int = 2
         self.max_sub_agents_per_turn: int = 3
         self.workspace_path: str = str(Path.cwd().resolve())
@@ -655,7 +543,7 @@ class CodeAgentConfig:
 
         # Extract profiles across all modalities
         _ssl_debug = os.getenv("LOLLMS_DEBUG_SSL", "").lower() in ("1", "true", "yes")
-        for modality in ("llm", "tti", "tts", "stt", "ttv", "ttm"):
+        for modality in ("llm", "tti", "tts", "stt", "ttv", "ttm", "connection", "rag"):
             prefix = modality.upper()
             bindings = _extract_bindings_from_env(prefix, resolved_env)
             profiles = _extract_profiles_from_env(prefix, bindings, resolved_env)
@@ -766,6 +654,12 @@ class CodeAgentConfig:
             config.max_tokens_per_turn = cli_args.max_tokens
         if getattr(cli_args, "context_compaction_threshold", None) is not None:
             config.context_compaction_threshold = cli_args.context_compaction_threshold
+        if getattr(cli_args, "reasoning_effort", None):
+            config.reasoning_effort = cli_args.reasoning_effort
+        elif getattr(cli_args, "effort", None):
+            config.reasoning_effort = cli_args.effort
+        if getattr(cli_args, "dynamic_effort", False):
+            config.dynamic_effort = True
         if cli_args.debug is not None:
             config.debug = cli_args.debug
         else:
@@ -1135,6 +1029,8 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
         tools_folders.append(str(ws_tools_dir.resolve()))
 
     cli_confirm_handler = make_cli_confirm_handler(config)
+    lollms_system_dir = (Path.home() / ".lollms_client").resolve()
+    lollms_system_dir.mkdir(parents=True, exist_ok=True)
 
     host_tool_configs = {
         "system_shell": {
@@ -1152,8 +1048,11 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
         "tools_binding_config": {
             "tools_folders": tools_folders,
             "host_tool_configs": host_tool_configs,
-            "confirm_handler": cli_confirm_handler
+            "confirm_handler": cli_confirm_handler,
+            "system_dir": str(lollms_system_dir),
+            "cwd": str(lollms_system_dir)
         },
+        "system_dir": str(lollms_system_dir),
         "debug": config.debug,
     }
 
@@ -1175,6 +1074,8 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
                     "host_address": resolved["host_address"],
                     "model_name": resolved["model_name"],
                     "verify_ssl_certificate": resolved["verify_ssl"],
+                    "system_dir": str(lollms_system_dir),
+                    "cwd": str(lollms_system_dir),
                 }
                 if resolved["api_key"]:
                     modality_config["service_key"] = resolved["api_key"]
@@ -1279,9 +1180,24 @@ You are {name}, a specialized engineering agent.
 
     (handbag_path / "coworkers").mkdir(exist_ok=True)
     (handbag_path / "tools").mkdir(exist_ok=True)
-    (handbag_path / "skills").mkdir(exist_ok=True)
+    hb_skills_dir = handbag_path / "skills"
+    hb_skills_dir.mkdir(exist_ok=True)
     (handbag_path / "memory").mkdir(exist_ok=True)
     (handbag_path / "workspace").mkdir(exist_ok=True)
+
+    # Seed modular skills into the handbag if missing
+    project_skills_root = PROJECT_ROOT / "skills"
+    if project_skills_root.exists():
+        for skill_dir in project_skills_root.iterdir():
+            if skill_dir.is_dir() and (skill_dir / "SKILL.md").exists():
+                dest_dir = hb_skills_dir / skill_dir.name
+                dest_dir.mkdir(exist_ok=True)
+                dest_skill = dest_dir / "SKILL.md"
+                if not dest_skill.exists():
+                    try:
+                        dest_skill.write_text((skill_dir / "SKILL.md").read_text(encoding="utf-8"), encoding="utf-8")
+                    except Exception:
+                        pass
 
 
 def ensure_sandbox_structure(config: CodeAgentConfig):
@@ -1305,8 +1221,9 @@ def ensure_sandbox_structure(config: CodeAgentConfig):
 
     scripts_dir.mkdir(parents=True, exist_ok=True)
 
-    if not scratchpad.exists():
-        scratchpad.write_text("# Agent Scratchpad\n\nUse this space to store long-term notes, code snippets, and task context.\n", encoding="utf-8")
+    # Scratchpad is ephemeral per session: reset on startup unless explicitly continuing
+    if not getattr(config, "continue_session", False) or not scratchpad.exists():
+        scratchpad.write_text("# Scratchpad\n\n(Empty - session notes only)\n", encoding="utf-8")
 
     if not current_plan.exists():
         current_plan.write_text("# Current Task\n\nNo active task plan defined yet. Initialize your macro steps plan here at the start of a task.\n", encoding="utf-8")
@@ -1424,6 +1341,8 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
                 owner_id=f"project_{Path(config.workspace_path).name}",
                 config=MemoryConfig(working_token_budget=2000)
             )
+            personality.memory_manager.deduplicate_all()
+            personality.memory_manager.clean_task_backlog_memories()
             ASCIIColors.rich_print(f" [green]✓[/green] [dim]({project_memory_db.name})[/dim]")
         except (ImportError, OSError, RuntimeError, ValueError) as e:
             ASCIIColors.rich_print(" [red]✗[/red]")
@@ -1441,7 +1360,7 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
     else:
         personality.load_history_from_disk(project_history_file)
     personality._project_history_file = project_history_file
-    ASCIIColors.rich_print("  [green]✓[/green] [dim]Started fresh discussion session (long-term facts preserved in memory)[/dim]")
+    ASCIIColors.rich_print("  [green]✓[/green] [dim]Started fresh discussion session (ephemeral scratchpad reset, facts in memory)[/dim]")
 
     if has_tts:
         personality.system_prompt += (
@@ -1464,24 +1383,21 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
     personality.debug_mode = config.debug
 
     # ── Universal Skills Discovery (Bundled + Global + Handbag) ──
+    sync_default_skills_to_user_home()
     collected_skill_dirs = []
 
-    # 1. Project / Repository bundled skills
-    repo_skills = Path(__file__).resolve().parent.parent.parent.parent.parent / "skills"
-    if repo_skills.exists() and repo_skills.is_dir():
-        collected_skill_dirs.append(repo_skills.resolve())
+    # 1. User home global skills directory (~/.lollms_client/skills/)
+    global_user_skills = Path.home() / ".lollms_client" / "skills"
+    if global_user_skills.exists():
+        collected_skill_dirs.append(global_user_skills.resolve())
 
-    # 2. Package skills
-    import lollms_client
-    pkg_skills = Path(lollms_client.__file__).resolve().parent / "skills"
-    if pkg_skills.exists() and pkg_skills.is_dir():
-        collected_skill_dirs.append(pkg_skills.resolve())
-
-    # 3. User global skills directory
+    # 2. Configured skills directory if distinct
     if config.skills_dir and Path(config.skills_dir).exists():
-        collected_skill_dirs.append(Path(config.skills_dir).resolve())
+        p_c = Path(config.skills_dir).resolve()
+        if p_c not in collected_skill_dirs:
+            collected_skill_dirs.append(p_c)
 
-    # 4. Workspace-local skills directory
+    # 3. Workspace-local skills directory (.lollms_code/skills/)
     ws_skills = Path(config.workspace_path) / ".lollms_code" / "skills"
     if ws_skills.exists():
         collected_skill_dirs.append(ws_skills.resolve())
@@ -1979,40 +1895,54 @@ class StreamRenderer:
 
             elif _is_type(MSG_TYPE.MSG_TYPE_WORKER_SPAWN_START):
                 worker_idx = meta.get("worker_index", 1)
+                ag_name = meta.get("agent_name", f"Worker #{worker_idx}")
                 task = meta.get("task", "")
-                files = meta.get("context_files", [])
+                depth = meta.get("depth", 1)
+                max_steps = meta.get("max_steps", 6)
+                effort = meta.get("effort", "default")
+                model_name = meta.get("model_name", "parent model")
+                conditioning = meta.get("personality_conditioning", "")
+
                 content_parts = [
-                    f"[cyan]Worker:[/cyan] [bold yellow]Worker #{worker_idx}[/bold yellow]",
-                    f"[cyan]Task:[/cyan] {_clean_str(task[:300])}",
+                    f"[cyan]Specialist Name:[/cyan] [bold yellow]{_clean_str(ag_name)}[/bold yellow] (Tier: Depth {depth})",
+                    f"[cyan]Assigned Task:[/cyan] {_clean_str(task[:400])}{'...' if len(task) > 400 else ''}",
+                    f"[cyan]Parameters:[/cyan] Max Steps: {max_steps} · Effort: {effort} · Model: {model_name}",
                 ]
-                if files:
-                    content_parts.append(f"[cyan]Context Files:[/cyan] {', '.join(_clean_str(f) for f in files)}")
-                content_parts.append("\n[yellow]⏳ Specialist worker running...[/yellow]")
+                if conditioning and conditioning != "Autonomous Worker Specialist":
+                    content_parts.append(f"[cyan]Conditioning:[/cyan] [dim]{_clean_str(conditioning[:150])}...[/dim]")
+                content_parts.append("\n[yellow]⏳ Specialist executing autonomously without interrupting user...[/yellow]")
+
                 ASCIIColors.panel(
                     "\n".join(content_parts),
-                    title=f"[bold cyan]🤖 Sub-Agent Spawn: Worker #{worker_idx}[/bold cyan]",
+                    title=f"[bold cyan]🤖 Sub-Agent Active: {_clean_str(ag_name)}[/bold cyan]",
                     border_style="cyan"
                 )
                 sys.stdout.flush()
 
             elif _is_type(MSG_TYPE.MSG_TYPE_WORKER_SPAWN_END):
                 worker_idx = meta.get("worker_index", 1)
+                ag_name = meta.get("agent_name", f"Worker #{worker_idx}")
                 success = meta.get("success", False)
+                rounds = meta.get("rounds", 0)
+                tools_cnt = meta.get("tools_count", 0)
+                elapsed = meta.get("elapsed_seconds", 0)
                 digest = meta.get("report_digest", "")
-                files = meta.get("files", [])
-                status_str = "[bold green]✅ Success[/bold green]" if success else "[bold red]❌ Failed[/bold red]"
+
+                status_str = "[bold green]✅ Completed[/bold green]" if success else "[bold red]❌ Interrupted / Failed[/bold red]"
                 border = "green" if success else "red"
+
                 content_parts = [
-                    f"[cyan]Worker:[/cyan] [bold yellow]Worker #{worker_idx}[/bold yellow]",
-                    f"[cyan]Status:[/cyan] {status_str}",
+                    f"[cyan]Specialist:[/cyan] [bold yellow]{_clean_str(ag_name)}[/bold yellow] · {status_str}",
+                    f"[cyan]Execution:[/cyan] {rounds} round(s) · {tools_cnt} tool(s) · {elapsed}s",
                 ]
-                if files:
-                    content_parts.append(f"[cyan]Files Created/Modified:[/cyan] {', '.join(_clean_str(f) for f in files)}")
                 if digest:
-                    content_parts.append(f"\n[cyan]Report Digest:[/cyan]\n{_clean_str(digest[:1000])}")
+                    clean_digest = digest.strip()
+                    display_digest = clean_digest[:1200] + ("\n... [truncated]" if len(clean_digest) > 1200 else "")
+                    content_parts.append(f"\n[cyan]Specialist Report to Orchestrator:[/cyan]\n[dim]{_clean_str(display_digest)}[/dim]")
+
                 ASCIIColors.panel(
                     "\n".join(content_parts),
-                    title=f"[bold {border}]🤖 Sub-Agent Finished: Worker #{worker_idx}[/bold {border}]",
+                    title=f"[bold {border}]🤖 Sub-Agent Finished: {_clean_str(ag_name)}[/bold {border}]",
                     border_style=border
                 )
                 sys.stdout.flush()
@@ -2141,6 +2071,11 @@ class StreamRenderer:
                 ASCIIColors.rule("[bold green]✅ Task Completed (<done/>)[/bold green]")
                 sys.stdout.flush()
                 return True
+            elif meta and meta.get("type") == "effort_change":
+                lvl = meta.get("level", "")
+                ASCIIColors.rich_print(f"\n[cyan]⚡ Dynamic effort scaled to: [bold yellow]{lvl.upper()}[/bold yellow][/cyan]")
+                sys.stdout.flush()
+                return True
             else:
                 ASCIIColors.rich_print(f"\n[blue][INFO] {chunk}[/blue]")
                 sys.stdout.flush()
@@ -2235,15 +2170,17 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
 
     renderer = StreamRenderer(config)
 
+    steps_disp = "∞ (Infinite ⚠️)" if config.max_reasoning_steps <= 0 else str(config.max_reasoning_steps)
     config_panel_content = (
         f"[cyan]Workspace:[/cyan] {config.workspace_path}\n"
         f"[cyan]Handbag:[/cyan]   {personality.name} ({Path(config.handbag_path).name})\n"
         f"[cyan]Model:[/cyan]      {config.active_model_name}\n"
         f"[cyan]Binding:[/cyan]    {config.active_binding_name}\n"
-        f"[cyan]Max steps:[/cyan]  {config.max_reasoning_steps}\n"
+        f"[cyan]Max steps:[/cyan]  {steps_disp}\n"
         f"[cyan]Memory:[/cyan]     {'enabled' if config.enable_memory else 'disabled'}\n"
         f"[cyan]Skills:[/cyan]     {config.skills_mode}\n"
-        f"[cyan]Sub-agents:[/cyan] {'enabled' if config.enable_sub_agents else 'disabled'}"
+        f"[cyan]Sub-agents:[/cyan] {'enabled' if config.enable_sub_agents else 'disabled'}\n"
+        f"[cyan]Effort:[/cyan]     {'Dynamic (auto)' if config.dynamic_effort else (config.reasoning_effort or 'default')}"
     )
     ASCIIColors.panel(config_panel_content, title=f"[bold green]🚀 lollms_code v{APP_VERSION}[/bold green]", border_style="green")
     
@@ -2260,6 +2197,15 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
         
         if ws_stats["loaded_files"]:
             _render_files_table(ws_stats["loaded_files"], "Pre-loaded Context Files [C]")
+
+        if config.max_reasoning_steps <= 0:
+            ASCIIColors.panel(
+                "[bold yellow]⚠️ WARNING: Infinite reasoning steps active (max_steps <= 0)![/bold yellow]\n"
+                "[dim]The agent will run indefinitely until <done/> is emitted or interrupted.\n"
+                "Monitor API usage and token consumption closely.[/dim]",
+                title="[bold red]⚠️ Unbounded Execution Mode[/bold red]",
+                border_style="yellow"
+            )
 
     ASCIIColors.rule("[bold]🤖 Agent output[/bold]")
 
@@ -2298,6 +2244,8 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
             confirm_handler=cli_confirm_handler,
             debug=config.debug,
             debug_export=config.debug,
+            reasoning_effort=config.reasoning_effort,
+            dynamic_effort=config.dynamic_effort,
         )
     except KeyboardInterrupt:
         if hasattr(client, 'cancel'):
@@ -2869,7 +2817,8 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
         "/exit", "/quit", "/help", "/plan", "/current", "/scratchpad", "/config",
         "/shell", "/forget", "/skills", "/tools", "/clear-history", "/clear-files",
         "/clear-scratchpad", "/models", "/files", "/workspace", "/load", "/unload",
-        "/lock", "/hide", "/unhide", "/subws", "/reference", "/zoo", "/handbag", "/persona"
+        "/lock", "/hide", "/unhide", "/subws", "/reference", "/zoo", "/handbag", "/persona",
+        "/effort"
     ]
     
     # Display a safe, truncated workspace path to the user
@@ -2883,13 +2832,16 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
 
     active_alias = config.active_profile_alias
     active_model = getattr(getattr(client, "llm", None), "model_name", None) or config.active_model_name
+    steps_banner = "∞ (Infinite ⚠️)" if config.max_reasoning_steps <= 0 else str(config.max_reasoning_steps)
     header_lines = [
         f"[cyan]Workspace:[/cyan] {ws_path_display}",
         f"[cyan]Handbag:[/cyan]   {personality.name} [dim]({Path(config.handbag_path).name})[/dim]",
         f"[cyan]Profile:[/cyan]    {active_alias}",
         f"[cyan]Model:[/cyan]      {active_model}",
         f"[cyan]Binding:[/cyan]    {config.active_binding_name}",
-        f"[dim]Commands: 'exit', 'help', 'config', 'shell', 'forget', 'skills', 'handbag', 'clear-history', 'clear-files', 'clear-scratchpad', 'workspace', 'files', 'load', 'unload', 'lock', 'hide'[/dim]"
+        f"[cyan]Max Steps:[/cyan]  {steps_banner}",
+        f"[cyan]Effort:[/cyan]     {'Dynamic (auto)' if config.dynamic_effort else (config.reasoning_effort or 'default')}",
+        f"[dim]Commands: 'exit', 'help', 'effort', 'config', 'shell', 'forget', 'skills', 'handbag', 'clear-history', 'clear-files', 'clear-scratchpad', 'workspace', 'files', 'load', 'unload', 'lock', 'hide'[/dim]"
     ]
 
     ctx_status = get_context_fill_status(personality, client)
@@ -3277,6 +3229,79 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
             ASCIIColors.yellow(f"  Unknown subcommand: {subcmd}. Use '/subws help' for commands.")
             continue
 
+        if user_input.lower() in ("/inspect", "/context", "/prompt"):
+            ASCIIColors.rule("[bold cyan]🔍 Active Context & Parameter Inspector[/bold cyan]")
+            try:
+                active_tools = personality._discover_tools(
+                    enable_data_tools=True,
+                    enable_workspace_tools=True,
+                    enable_shell=config.enable_shell_execution,
+                    enable_python_exec=True,
+                    enable_web_tools=True,
+                    auto_load_document_editor=True,
+                )
+                full_sys = personality._build_system_prompt(active_tools, dynamic_effort=config.dynamic_effort)
+                ws_ctx = personality._build_workspace_context_block()
+                tok_sys = client.count_tokens(full_sys) if hasattr(client, "count_tokens") else len(full_sys) // 4
+                max_ctx = getattr(client, "get_ctx_size", lambda: 8192)() or 8192
+                pct = round((tok_sys / max_ctx) * 100, 1)
+
+                info_lines = [
+                    f"[bold]Model:[/bold]        {config.active_model_name} ({config.active_binding_name})",
+                    f"[bold]Host Address:[/bold] {config.llm_binding_profiles.get(config.active_profile_alias, {}).get('binding_config', {}).get('host_address', 'default')}",
+                    f"[bold]Temperature:[/bold]  {config.temperature}",
+                    f"[bold]Max Tokens:[/bold]   {config.max_tokens_per_turn}",
+                    f"[bold]Effort:[/bold]       {'Dynamic (auto)' if config.dynamic_effort else (config.reasoning_effort or 'default')}",
+                    f"[bold]Memory:[/bold]       {'ENABLED' if config.enable_memory and personality.memory_manager else 'DISABLED'} (DB: {getattr(getattr(personality, 'memory_manager', None), 'resolved_disk_path', 'None')})",
+                    f"[bold]Context Size:[/bold] {tok_sys:,} / {max_ctx:,} tokens ({pct}%)",
+                    f"[bold]Tools:[/bold]        {len(active_tools)} available ({', '.join(sorted(list(active_tools.keys()))[:8])}...)"
+                ]
+                ASCIIColors.panel("\n".join(info_lines), title="[bold green]Parameters[/bold green]", border_style="green")
+
+                if personality.memory_manager:
+                    try:
+                        w_zone = personality.memory_manager.build_working_zone() or "(No active Level 1 memories)"
+                        h_zone = personality.memory_manager.build_handles_zone() or "(No Level 2 deep memory handles)"
+                        ASCIIColors.panel(f"[bold cyan]Working Memory (L1):[/bold cyan]\n{w_zone}\n\n[bold yellow]Deep Memory Handles (L2):[/bold yellow]\n{h_zone}", title="[bold purple]Memory State[/bold purple]", border_style="purple")
+                    except Exception as ex:
+                        ASCIIColors.warning(f"Failed to read memory zones: {ex}")
+
+                dump_p = Path(config.workspace_path) / ".lollms_code" / "_debug_dumps" / "last_context_preview.log"
+                dump_p.parent.mkdir(parents=True, exist_ok=True)
+                dump_p.write_text(full_sys + "\n\n" + (ws_ctx or ""), encoding="utf-8")
+                ASCIIColors.info(f"Full system prompt & context dumped to: {dump_p}")
+            except Exception as ex:
+                ASCIIColors.error(f"Failed to generate context preview: {ex}")
+            continue
+
+        if user_input.lower().startswith(("/effort", "/reasoning-effort")):
+            parts = user_input.strip().split(maxsplit=1)
+            arg = parts[1].strip() if len(parts) > 1 else ""
+            if not arg:
+                curr = "Dynamic (auto)" if config.dynamic_effort else (config.reasoning_effort or "default")
+                ASCIIColors.info(f"  Current reasoning effort: [yellow]{curr}[/yellow]")
+                ASCIIColors.info("  Usage: /effort <none|low|medium|high|max|dynamic|default>")
+            else:
+                arg_clean = arg.lower().strip()
+                if arg_clean == "dynamic":
+                    config.dynamic_effort = True
+                    config.reasoning_effort = None
+                    config.save()
+                    ASCIIColors.green("  ✓ Reasoning effort set to Dynamic (auto-adjusts via <effort> tags).")
+                elif arg_clean == "default":
+                    config.dynamic_effort = False
+                    config.reasoning_effort = None
+                    config.save()
+                    ASCIIColors.green("  ✓ Reasoning effort reset to model default.")
+                elif arg_clean in ("none", "low", "medium", "high", "max"):
+                    config.dynamic_effort = False
+                    config.reasoning_effort = arg_clean
+                    config.save()
+                    ASCIIColors.green(f"  ✓ Reasoning effort set to '{arg_clean.capitalize()}'.")
+                else:
+                    ASCIIColors.yellow(f"  Unknown effort level: '{arg}'. Choose from: none, low, medium, high, max, dynamic, default.")
+            continue
+
         if user_input.lower() == "/models":
             ASCIIColors.yellow("  Model switching is managed via LollmsClient profiles in this version.")
             continue
@@ -3501,6 +3526,8 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                 confirm_handler=cli_confirm_handler,
                 debug=config.debug,
                 debug_export=config.debug,
+                reasoning_effort=config.reasoning_effort,
+                dynamic_effort=config.dynamic_effort,
             )
         except KeyboardInterrupt:
             if hasattr(client, 'cancel'):
@@ -3623,14 +3650,21 @@ def _configure_shell_autonomy_menu(config: CodeAgentConfig, client=None):
 def _configure_reasoning_menu(config: CodeAgentConfig, personality=None):
     """Sub-menu for configuring sampling parameters and token budgets."""
     from ascii_colors import Menu
-    from lollms_client.lollms_config_cli_env import _is_back_choice, _safe_input, _BACK_VALUE
+    from lollms_client.lollms_config_cli_env import _is_back_choice, _safe_input, _safe_select, _BACK_VALUE
 
     while True:
+        effort_label = "Dynamic (auto)" if config.dynamic_effort else (config.reasoning_effort or "default")
+        dyn_label = "ENABLED" if config.dynamic_effort else "DISABLED"
+
+        steps_display = "∞ (Infinite ⚠️)" if config.max_reasoning_steps <= 0 else str(config.max_reasoning_steps)
+
         menu = Menu("🎛️ Agent Reasoning & Budgets", mode=Menu.MODE_RETURN, exit_text="↩ Back")
-        menu.set_intro("Tune sampling temperature, max reasoning steps, and token ceilings.")
+        menu.set_intro("Tune sampling temperature, max reasoning steps, token ceilings, and thinking effort.")
         menu.add_choice(f"🌡️  Temperature: [{config.temperature}]", value="temp")
-        menu.add_choice(f"🔄 Max Reasoning Steps: [{config.max_reasoning_steps}]", value="steps")
+        menu.add_choice(f"🔄 Max Reasoning Steps: [{steps_display}]", value="steps")
         menu.add_choice(f"📊 Max Tokens / Turn: [{config.max_tokens_per_turn}]", value="tokens")
+        menu.add_choice(f"🧠 Reasoning Effort: [{effort_label}]", value="effort")
+        menu.add_choice(f"⚡ Dynamic Effort Scaling: [{dyn_label}]", value="dynamic_effort")
         menu.add_choice("↩ Back", value=_BACK_VALUE)
 
         selection = menu.run()
@@ -3645,10 +3679,17 @@ def _configure_reasoning_menu(config: CodeAgentConfig, personality=None):
             except ValueError:
                 ASCIIColors.warning("  Invalid number.")
         elif selection == "steps":
-            raw = _safe_input("Enter maximum reasoning rounds (steps)", str(config.max_reasoning_steps))
+            raw = _safe_input("Enter maximum reasoning rounds (0 or -1 for infinite ⚠️)", str(config.max_reasoning_steps))
             try:
-                config.max_reasoning_steps = max(1, int(raw))
-                ASCIIColors.green(f"  ✓ Max steps set to {config.max_reasoning_steps}")
+                val = int(raw)
+                if val <= 0:
+                    config.max_reasoning_steps = 0
+                    ASCIIColors.warning("\n  ⚠️ WARNING: Infinite reasoning steps selected (0).")
+                    ASCIIColors.warning("     The agent will run indefinitely until <done/> is emitted or manually cancelled.")
+                    ASCIIColors.warning("     Monitor token consumption and tool execution carefully.\n")
+                else:
+                    config.max_reasoning_steps = val
+                    ASCIIColors.green(f"  ✓ Max steps set to {config.max_reasoning_steps}")
             except ValueError:
                 ASCIIColors.warning("  Invalid integer.")
         elif selection == "tokens":
@@ -3660,6 +3701,18 @@ def _configure_reasoning_menu(config: CodeAgentConfig, personality=None):
                 ASCIIColors.green(f"  ✓ Max tokens per turn set to {config.max_tokens_per_turn}")
             except ValueError:
                 ASCIIColors.warning("  Invalid integer.")
+        elif selection == "effort":
+            chosen = _safe_select("Select base reasoning effort level:", ["default", "none", "low", "medium", "high", "max"])
+            if chosen:
+                if chosen == "default":
+                    config.reasoning_effort = None
+                    ASCIIColors.green("  ✓ Reasoning effort set to model default.")
+                else:
+                    config.reasoning_effort = chosen
+                    ASCIIColors.green(f"  ✓ Reasoning effort set to '{chosen}'.")
+        elif selection == "dynamic_effort":
+            config.dynamic_effort = not config.dynamic_effort
+            ASCIIColors.cyan(f"  ℹ️ Dynamic reasoning effort scaling {'enabled' if config.dynamic_effort else 'disabled'}.")
 
 
 def _configure_subagents_menu(config: CodeAgentConfig):
@@ -3925,10 +3978,12 @@ Examples:
     parser.add_argument("--host", type=str, default=None, help="Host address for remote bindings.")
     parser.add_argument("--api-key", type=str, default=None, help="API key for gated services.")
     parser.add_argument("--context-size", type=int, default=None, help="Context window size for local models.")
-    parser.add_argument("--max-steps", type=int, default=None, help="Maximum reasoning steps.")
+    parser.add_argument("--max-steps", type=int, default=None, help="Maximum reasoning steps (0 or -1 for infinite rounds with warning).")
     parser.add_argument("--temperature", type=float, default=None, help="Sampling temperature.")
     parser.add_argument("--max-tokens", type=int, default=None, help="Maximum tokens per generation turn.")
     parser.add_argument("--context-compaction-threshold", type=float, default=0.85, help="Context fill threshold (default 0.85 for 85%%) to run autonomous file locking and history compaction.")
+    parser.add_argument("--effort", "--reasoning-effort", dest="reasoning_effort", type=str, default=None, choices=["none", "low", "medium", "high", "max"], help="Reasoning effort level for thinking models (none, low, medium, high, max).")
+    parser.add_argument("--dynamic-effort", action="store_true", help="Enable dynamic reasoning effort adjustment across rounds via <effort level='...'/>.")
     parser.add_argument("--skills-dir", type=str, default=None, help="Directory for SKILL.md files.")
     parser.add_argument("--enable-model-switching", action="store_true", help="Allow the agent to switch models.")
     parser.add_argument("--no-shell-execution", action="store_true", help="Disable autonomous shell command execution.")

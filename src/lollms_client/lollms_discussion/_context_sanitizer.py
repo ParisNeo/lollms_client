@@ -58,6 +58,7 @@ def scrub_processing_and_status_blocks(text: str) -> str:
         return ""
     text = re.sub(r'<think\b[^>]*>.*?(?:</think>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r'<thought\b[^>]*>.*?(?:</thought>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<effort\b[^>]*(?:/>|>.*?</effort>)', '', text, flags=re.DOTALL | re.IGNORECASE)
     text = _PROCESSING_PATTERN.sub('', text)
     text = _ORPHAN_PROCESSING_PATTERN.sub('', text)
     text = re.sub(r'<!--\s*status:[^>]*-->', '', text, flags=re.IGNORECASE)

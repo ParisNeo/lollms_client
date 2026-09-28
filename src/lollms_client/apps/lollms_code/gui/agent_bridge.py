@@ -14,7 +14,7 @@ import queue
 import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
-
+import re
 from gui_prefs import GuiPrefs
 from env_config import EnvStore
 
@@ -48,7 +48,13 @@ except ImportError:
         from lollms_code_cli import CODING_SYSTEM_PROMPT, CODING_EXECUTION_HARNESS  # type: ignore
     except ImportError:
         CODING_SYSTEM_PROMPT = (
-            "You are lollms_code, an elite autonomous software engineering agent."
+            "You are lollms_code, an elite autonomous engineering agent capable of full-stack coding, "
+            "file organization, document analysis, research, and deep web searching.\n\n"
+            "## SKILL-FIRST DISPATCH MANDATE (CRITICAL)\n"
+            "Before undertaking any task, check available skills and any RECOMMENDED SKILL block.\n"
+            "If a skill matches the user's request (e.g. file_organization for organizing/cleaning folders):\n"
+            "- You MUST call <tool>{\"name\": \"tool_load_skill\", \"parameters\": {\"title\": \"<skill_title>\"}}</tool> in Round 1!\n"
+            "- DO NOT improvise ad-hoc plans or guess workflows when a specialized skill exists. Load the skill first!\n"
         )
         CODING_EXECUTION_HARNESS = ""
 
@@ -126,6 +132,42 @@ def ensure_handbag_structure(prefs: GuiPrefs) -> None:
     for sub in ("coworkers", "tools", "skills", "memory", "workspace"):
         (handbag_path / sub).mkdir(exist_ok=True)
 
+    # Seed modular skills from project root into handbag and ensure loadable visibility
+    try:
+        def _find_root() -> Path:
+            p = Path(__file__).resolve().parent
+            for parent in [p] + list(p.parents):
+                if (parent / "pyproject.toml").exists():
+                    return parent
+            return Path.cwd().resolve()
+
+        root_dir = _find_root()
+        candidate_sources = [
+            root_dir / "skills",
+            Path(__file__).resolve().parents[4] / "skills",
+            Path(__file__).resolve().parent.parent / "skills",
+            Path.home() / ".lollms_client" / "skills",
+        ]
+
+        hb_skills = handbag_path / "skills"
+        hb_skills.mkdir(parents=True, exist_ok=True)
+
+        for src_dir in candidate_sources:
+            if src_dir.exists() and src_dir.is_dir():
+                for s_dir in src_dir.iterdir():
+                    if s_dir.is_dir() and (s_dir / "SKILL.md").exists():
+                        dest_d = hb_skills / s_dir.name
+                        dest_d.mkdir(parents=True, exist_ok=True)
+                        dest_f = dest_d / "SKILL.md"
+                        content = (s_dir / "SKILL.md").read_text(encoding="utf-8")
+                        # Enforce that all seeded skills default to loadable
+                        if "visibility: visible" in content or "always_visible: true" in content:
+                            content = re.sub(r'visibility:\s*visible', 'visibility: loadable', content)
+                            content = re.sub(r'always_visible:\s*true', 'always_visible: false', content)
+                        dest_f.write_text(content, encoding="utf-8")
+    except Exception:
+        pass
+
 
 def ensure_sandbox_structure(prefs: GuiPrefs) -> None:
     sandbox_dir = Path(prefs.workspace_path) / ".lollms_code"
@@ -143,10 +185,10 @@ def ensure_sandbox_structure(prefs: GuiPrefs) -> None:
     ws_skills_dir.mkdir(parents=True, exist_ok=True)
     ws_handbags_dir.mkdir(parents=True, exist_ok=True)
     scripts_dir.mkdir(parents=True, exist_ok=True)
-    if not scratchpad.exists():
-        scratchpad.write_text(
-            "# Agent Scratchpad\n\nLong-term notes and task state.\n", encoding="utf-8"
-        )
+    # Scratchpad is strictly ephemeral per session
+    scratchpad.write_text(
+        "# Scratchpad\n\n(Empty - session notes only)\n", encoding="utf-8"
+    )
     if not current_plan.exists():
         current_plan.write_text(
             "# Current Task\n\nNo active task plan defined yet.\n", encoding="utf-8"
@@ -193,19 +235,25 @@ def create_client(env: EnvStore, prefs: GuiPrefs):
         "execute_python": {"autonomy_level": prefs.shell_autonomy_level},
     }
 
+    lollms_system_dir = (Path.home() / ".lollms_client").resolve()
+    lollms_system_dir.mkdir(parents=True, exist_ok=True)
+
     client_kwargs: Dict[str, Any] = {
+        "system_dir": str(lollms_system_dir),
         "llm_binding_profiles": llm_bindings,
         "llm_model_profiles": llm_profiles,
         "tools_binding_name": "lcp",
         "tools_binding_config": {
             "tools_folders": tools_folders,
             "host_tool_configs": host_tool_configs,
+            "system_dir": str(lollms_system_dir),
+            "cwd": str(lollms_system_dir),
         },
         "debug": prefs.debug,
     }
 
-    # ── Other Modalities (TTI, TTS, STT, TTV, TTM) using unified profiles ──
-    for modality in ("tti", "tts", "stt", "ttv", "ttm"):
+    # ── Other Modalities (TTI, TTS, STT, TTV, TTM, CONNECTION, RAG) using unified profiles ──
+    for modality in ("tti", "tts", "stt", "ttm", "ttv", "connection", "rag"):
         b_profs = env.get_binding_profiles(modality)
         m_profs = env.get_model_profiles(modality)
         if b_profs and m_profs:
@@ -233,6 +281,7 @@ def create_personality(prefs: GuiPrefs, client):
     has_tti = hasattr(client, 'tti') and client.tti is not None
     has_tts = hasattr(client, 'tts') and client.tts is not None
     has_stt = hasattr(client, 'stt') and client.stt is not None
+    has_rag = (hasattr(client, 'rag') and client.rag is not None) or bool(getattr(client, 'rag_model_profiles_registry', None))
 
     caps = CapabilityFlags(
         enable_sub_agents=prefs.enable_sub_agents,
@@ -283,6 +332,16 @@ def create_personality(prefs: GuiPrefs, client):
             "=== END SPEECH-TO-TEXT CAPABILITY ==="
         )
 
+    if has_rag:
+        personality.system_prompt += (
+            "\n\n=== RAG KNOWLEDGE BASE CAPABILITY (ACTIVE) ===\n"
+            "You have access to a persistent RAG knowledge base & semantic store via the `safe_store` binding.\n"
+            "Use `tool_query_rag` to execute dense vector + BM25 hybrid searches over indexed documents.\n"
+            "Use `tool_sparql_query` to query the knowledge graph using W3C SPARQL 1.1.\n"
+            "Use `tool_add_document_to_rag` to index workspace files into the knowledge base.\n"
+            "=== END RAG KNOWLEDGE BASE CAPABILITY ==="
+        )
+
     personality.capabilities = caps
     personality.max_tokens_per_turn = prefs.max_tokens_per_turn
     personality.debug_mode = prefs.debug
@@ -308,43 +367,36 @@ def create_personality(prefs: GuiPrefs, client):
                 owner_id=f"project_{Path(prefs.workspace_path).name}",
                 config=MemoryConfig(working_token_budget=2000)
             )
+            personality.memory_manager.deduplicate_all()
+            personality.memory_manager.clean_task_backlog_memories()
         except Exception:
             pass
+    else:
+        personality.memory_manager = None
 
-    if CODING_EXECUTION_HARNESS and "## MACRO STEPS PLANNING (CURRENT.md)" not in personality.system_prompt:
-        personality.system_prompt += "\n\n" + CODING_EXECUTION_HARNESS
-
-    sub_ws_instructions = (
-        "\n\n=== SUB-WORKSPACE (REFERENCE & DOCUMENTATION) ===\n"
-        "You have access to a reference sub-workspace stored in `.lollms_code/sub_workspace/`.\n"
-        "This area holds external documentation, reference code, specifications, or datasets that do not belong to the project codebase itself.\n"
-        "- Reference files are listed in your prompt under `=== SUB-WORKSPACE (REFERENCE & DOCUMENTATION) ===`.\n"
-        "- To load a reference file into your context, use `<unlock_file>sub_workspace/filename.ext</unlock_file>`.\n"
-        "- To unload when done, use `<lock_file>sub_workspace/filename.ext</lock_file>`.\n"
-        "- You can read and reference these files, but NEVER modify them unless explicitly instructed.\n"
-    )
-    if "=== SUB-WORKSPACE (REFERENCE & DOCUMENTATION) ===" not in personality.system_prompt:
-        personality.system_prompt += sub_ws_instructions
 
     # ── Universal Skills Discovery (Bundled + Global + Handbag) ──
     collected_skill_dirs = []
 
-    # 1. Project / Repository bundled skills
-    repo_skills = Path(__file__).resolve().parent.parent.parent.parent.parent / "skills"
-    if repo_skills.exists() and repo_skills.is_dir():
-        collected_skill_dirs.append(repo_skills.resolve())
+    # 1. Synchronize package skills into user home (~/.lollms_client/skills/)
+    try:
+        from lollms_client.apps.lollms_code.cli import sync_default_skills_to_user_home
+        sync_default_skills_to_user_home()
+    except Exception:
+        pass
 
-    # 2. Package skills
-    import lollms_client
-    pkg_skills = Path(lollms_client.__file__).resolve().parent / "skills"
-    if pkg_skills.exists() and pkg_skills.is_dir():
-        collected_skill_dirs.append(pkg_skills.resolve())
+    # 2. User home global skills directory (~/.lollms_client/skills/)
+    global_user_skills = (Path.home() / ".lollms_client" / "skills").resolve()
+    if global_user_skills.exists():
+        collected_skill_dirs.append(global_user_skills)
 
-    # 3. User global skills directory
+    # 3. Custom skills directory from prefs if distinct
     if prefs.skills_dir and Path(prefs.skills_dir).exists():
-        collected_skill_dirs.append(Path(prefs.skills_dir).resolve())
+        p_c = Path(prefs.skills_dir).resolve()
+        if p_c not in collected_skill_dirs:
+            collected_skill_dirs.append(p_c)
 
-    # 4. Workspace-local skills directory
+    # 4. Workspace-local skills directory (.lollms_code/skills/)
     ws_skills = Path(prefs.workspace_path) / ".lollms_code" / "skills"
     if ws_skills.exists():
         collected_skill_dirs.append(ws_skills.resolve())
@@ -370,6 +422,239 @@ def switch_workspace(prefs: GuiPrefs, client, new_workspace_path: str):
     prefs.workspace_path = str(new_path)
     prefs.save()
     return create_personality(prefs, client)
+
+
+def get_context_preview(*args, **kwargs) -> Dict[str, Any]:
+    """
+    Generates a full diagnostic preview of the exact messages, system prompt,
+    active tools, and generation parameters that will be sent to the LLM backend.
+
+    Supports both:
+      - get_context_preview(session, prefs, prompt_text="")
+      - get_context_preview(personality, client, prefs, prompt_text="")
+    """
+    personality = None
+    client = None
+    prefs = None
+    prompt_text = ""
+
+    if len(args) == 4:
+        personality, client, prefs, prompt_text = args
+    elif len(args) == 3:
+        if hasattr(args[0], "ensure_ready") or hasattr(args[0], "personality"):
+            session, prefs, prompt_text = args
+            session.ensure_ready()
+            personality = session.personality
+            client = session.client
+        else:
+            personality, client, prefs = args
+            prompt_text = kwargs.get("prompt_text", "")
+    elif len(args) == 2:
+        if hasattr(args[0], "ensure_ready") or hasattr(args[0], "personality"):
+            session, prefs = args
+            session.ensure_ready()
+            personality = session.personality
+            client = session.client
+        else:
+            personality, client = args
+            prefs = kwargs.get("prefs")
+    elif len(args) == 1:
+        session = args[0]
+        if hasattr(session, "ensure_ready"):
+            session.ensure_ready()
+            personality = session.personality
+            client = session.client
+            prefs = getattr(session, "prefs", None)
+        else:
+            personality = session
+
+    if personality is None and "personality" in kwargs:
+        personality = kwargs["personality"]
+    if client is None and "client" in kwargs:
+        client = kwargs["client"]
+    if prefs is None and "prefs" in kwargs:
+        prefs = kwargs["prefs"]
+    if not prompt_text and "prompt_text" in kwargs:
+        prompt_text = kwargs["prompt_text"]
+
+    if prefs is None:
+        try:
+            prefs = GuiPrefs.load()
+        except Exception:
+            prefs = GuiPrefs()
+
+    resolved_llm = {}
+    try:
+        from lollms_client.lollms_config_api import load_config_map
+        cfg_map = load_config_map()
+        alias = getattr(personality, "_active_llm_alias", None)
+        if not alias and hasattr(client, "_active_llm_alias"):
+            alias = client._active_llm_alias
+        resolved_llm["alias"] = alias or "default"
+        if hasattr(client, "llm") and client.llm:
+            resolved_llm["model_name"] = getattr(client.llm, "model_name", "unknown")
+            resolved_llm["binding_name"] = getattr(client.llm, "binding_name", "unknown")
+            resolved_llm["host_address"] = getattr(client.llm, "host_address", "http://localhost")
+    except Exception:
+        resolved_llm = {
+            "alias": "default",
+            "model_name": getattr(getattr(client, "llm", None), "model_name", "unknown"),
+            "binding_name": getattr(getattr(client, "llm", None), "binding_name", "unknown"),
+            "host_address": "unknown",
+        }
+
+    # Discover active tools
+    active_tools = personality._discover_tools(
+        enable_data_tools=True,
+        enable_workspace_tools=True,
+        enable_shell=getattr(prefs, "enable_shell_execution", True),
+        enable_python_exec=True,
+        enable_web_tools=True,
+        auto_load_document_editor=True,
+        enable_computer_use=False,
+        shell_autonomy_level=getattr(prefs, "shell_autonomy_level", "safe"),
+        python_autonomy_level=getattr(prefs, "shell_autonomy_level", "safe"),
+        auto_approve_python=getattr(prefs, "auto_approve_python", False),
+    )
+
+    stable_system_prompt = personality._build_system_prompt(active_tools, dynamic_effort=getattr(prefs, "dynamic_effort", False))
+    user_prof = personality._build_user_profile_context()
+    if user_prof:
+        stable_system_prompt += user_prof
+
+    dynamic_suffix_parts = []
+    ws_ctx = personality._build_workspace_context_block()
+    if ws_ctx:
+        dynamic_suffix_parts.append(ws_ctx.strip())
+
+    scratchpad_ctx = personality._build_scratchpad_context()
+    if scratchpad_ctx:
+        dynamic_suffix_parts.append(scratchpad_ctx.strip())
+
+    mem_working = ""
+    mem_handles = ""
+    mem_count = {"working": 0, "deep": 0, "archived": 0, "total": 0}
+    if personality.memory_manager:
+        try:
+            mem_working = personality.memory_manager.build_working_zone() or "(No active Level 1 memories yet)"
+            mem_handles = personality.memory_manager.build_handles_zone() or "(No Level 2 deep memory handles yet)"
+            all_mems = personality.memory_manager.list_all(level=None, page=1, page_size=0, ignore_owner=True)
+            mem_list = all_mems.get("memories", [])
+            mem_count["total"] = len(mem_list)
+            for m in mem_list:
+                lvl = m.get("level", 1)
+                if lvl == 1: mem_count["working"] += 1
+                elif lvl == 2: mem_count["deep"] += 1
+                elif lvl >= 3: mem_count["archived"] += 1
+        except Exception as ex:
+            mem_working = f"(Memory error: {ex})"
+            mem_handles = ""
+
+        if mem_working and "(No active Level 1 memories yet)" not in mem_working:
+            dynamic_suffix_parts.append(mem_working.strip())
+        if mem_handles and "(No Level 2 deep memory handles yet)" not in mem_handles:
+            dynamic_suffix_parts.append(mem_handles.strip())
+
+    plan_ctx = personality._build_current_plan_context()
+    if plan_ctx:
+        dynamic_suffix_parts.append(plan_ctx.strip())
+
+    dynamic_suffix = "\n\n".join(dynamic_suffix_parts)
+    if dynamic_suffix:
+        stable_system_prompt += "\n\n" + dynamic_suffix
+
+    base_conversation = list(personality._conversation)
+    if prompt_text.strip():
+        base_conversation.append({"role": "user", "content": prompt_text.strip()})
+
+    from lollms_client.lollms_personality.lollms_personality import _HistoryContextAdapter, _normalize_messages
+    from lollms_client.lollms_history import HistoryManager
+
+    context_adapter = _HistoryContextAdapter(personality, stable_system_prompt)
+    messages = HistoryManager.export(
+        context=context_adapter,
+        format_type="openai_chat",
+        branch=base_conversation,
+        virtual_history=[],
+        system_prompt_override=stable_system_prompt
+    )
+    messages = _normalize_messages(messages)
+
+    # Token counting
+    total_tokens = 0
+    tokenized_messages = []
+    for msg in messages:
+        c = msg.get("content", "")
+        c_str = c if isinstance(c, str) else json.dumps(c, default=str)
+        t_count = client.count_tokens(c_str) if hasattr(client, "count_tokens") else len(c_str) // 4
+        total_tokens += t_count
+        tokenized_messages.append({
+            "role": msg.get("role", "user"),
+            "content": c,
+            "tokens": t_count,
+        })
+
+    max_ctx = getattr(client, "get_ctx_size", lambda: 8192)() or 8192
+    fill_pct = round((total_tokens / max_ctx) * 100, 1)
+
+    effort_display = (
+        "Dynamic (Auto-scaling)"
+        if getattr(prefs, "dynamic_effort", False)
+        else (getattr(prefs, "reasoning_effort", None) or "Model Default")
+    )
+
+    # Build complete verbatim assembled context as rendered for the LLM
+    assembled_parts = [
+        f"==================== SYSTEM PROMPT ====================\n{stable_system_prompt}\n",
+    ]
+    for idx, msg in enumerate(messages):
+        r = msg.get("role", "user").upper()
+        c = msg.get("content", "")
+        if isinstance(c, list):
+            c_str = "\n".join(
+                item.get("text", "") for item in c
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+            if any(isinstance(item, dict) and item.get("type") == "image_url" for item in c):
+                c_str += "\n[IMAGE ATTACHED]"
+        else:
+            c_str = str(c)
+        assembled_parts.append(f"==================== [{idx}] ROLE: {r} ====================\n{c_str}\n")
+
+    full_assembled_context = "\n".join(assembled_parts)
+
+    return {
+        "configuration": {
+            "model_alias": resolved_llm.get("alias", "default"),
+            "model_name": resolved_llm.get("model_name", "unknown"),
+            "binding_name": resolved_llm.get("binding_name", "unknown"),
+            "host_address": resolved_llm.get("host_address", "http://localhost"),
+            "temperature": prefs.temperature,
+            "max_tokens_per_turn": prefs.max_tokens_per_turn,
+            "max_reasoning_steps": "∞ (Infinite)" if prefs.max_reasoning_steps <= 0 else prefs.max_reasoning_steps,
+            "reasoning_effort": effort_display,
+            "dynamic_effort": getattr(prefs, "dynamic_effort", False),
+            "memory_enabled": getattr(prefs, "enable_memory", True),
+            "memory_manager_attached": bool(personality.memory_manager),
+            "memory_db_path": getattr(getattr(personality, "memory_manager", None), "resolved_disk_path", "None"),
+            "memory_counts": mem_count,
+            "shell_autonomy": prefs.shell_autonomy_level,
+            "auto_approve_python": getattr(prefs, "auto_approve_python", False),
+            "workspace_path": prefs.workspace_path,
+            "handbag_name": getattr(personality, "name", "lollms_code"),
+            "handbag_path": prefs.handbag_path,
+            "total_tokens": total_tokens,
+            "max_ctx": max_ctx,
+            "fill_pct": fill_pct,
+        },
+        "full_assembled_context": full_assembled_context,
+        "messages": tokenized_messages,
+        "system_prompt": stable_system_prompt,
+        "active_tools": active_tools,
+        "memory_working_zone": mem_working,
+        "memory_handles_zone": mem_handles,
+        "workspace_tree": ws_ctx,
+    }
 
 
 def switch_persona_handbag(prefs: GuiPrefs, client, handbag_path: str):
@@ -503,20 +788,25 @@ def get_subws_tools_and_skills(personality, prefs: GuiPrefs, client=None) -> Dic
 
     seen_skill_keys = set()
     for s in raw_skills:
-        title = s.get("title", "")
+        title = s.get("title", "").strip()
         fp = s.get("file_path") or ""
+        canon_title = title.lower()
 
-        seen_skill_keys.add(title.lower())
-        if fp:
-            p_obj = Path(fp).resolve()
-            seen_skill_keys.add(p_obj.stem.lower())
-            seen_skill_keys.add(p_obj.name.lower())
-            seen_skill_keys.add(p_obj.parent.name.lower())
-            seen_skill_keys.add(str(p_obj).lower())
+        canon_path = str(Path(fp).resolve()).lower() if fp else ""
+        if canon_title in seen_skill_keys or (canon_path and canon_path in seen_skill_keys):
+            continue
 
-        if s.get("is_handbag") or (hb_root and fp and str(hb_root) in fp):
+        seen_skill_keys.add(canon_title)
+        if canon_path:
+            seen_skill_keys.add(canon_path)
+
+        resolved_fp = str(Path(fp).resolve()) if fp else ""
+        resolved_hb = str(hb_root.resolve()) if hb_root else ""
+        resolved_ws = str((ws_root / ".lollms_code" / "skills").resolve())
+
+        if s.get("is_handbag") or (resolved_hb and resolved_fp and resolved_hb in resolved_fp):
             handbag_skills.append(s)
-        elif s.get("source") == "workspace" or (fp and str(ws_root / ".lollms_code" / "skills") in fp):
+        elif s.get("source") == "workspace" or (resolved_fp and resolved_ws in resolved_fp):
             project_skills.append(s)
         else:
             other_skills.append(s)
@@ -794,19 +1084,31 @@ class QueueStreamingCallback:
             MSG_TYPE.MSG_TYPE_WORKER_SPAWN_START: "worker_spawn_start",
             MSG_TYPE.MSG_TYPE_WORKER_SPAWN_END: "worker_spawn_end",
         }
+        if meta and meta.get("type") == "effort_change":
+            self.q.put(AgentEvent("effort_change", **meta))
+            return True
         if msg_type in mapping:
             self.q.put(AgentEvent(mapping[msg_type], **(meta or {})))
             return True
         if msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
+            # If this is a live artifact streaming chunk, dispatch as a dedicated artefact_chunk event
+            if meta and meta.get("live_artifact_chunk"):
+                title = meta.get("artifact_title", "artifact")
+                lang = meta.get("artifact_lang", "")
+                self.q.put(AgentEvent("artefact_chunk", text=chunk, title=title, language=lang))
+                return True
+
             is_internal_chunk = bool(
                 meta and (
                     meta.get("was_processed")
                     or meta.get("live_tool_chunk")
-                    or meta.get("live_artifact_chunk")
                 )
             )
-            # In FULL_CALLBACK_MODE, suppress internal streaming chunks, raw tool tags, and processing tags
-            if is_internal_chunk or (chunk and ("<processing" in chunk or "</processing>" in chunk or "<!-- status:" in chunk or "<tool>" in chunk or "</tool>" in chunk)):
+            # In FULL_CALLBACK_MODE, suppress internal streaming chunks, raw tool tags, context action tags, processing tags, raw tool JSON, and orphan delimiter chunks
+            is_action_tag = bool(re.search(r'</?(?:processing|tool|unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|user_profile_update|user_profile_clear|mem_new|mem_update|mem_load|mem_delete|mem_search|mem_tag)\b', chunk or "", re.IGNORECASE))
+            is_tool_json = bool(re.search(r'^\s*>?(?:```(?:json)?\s*)?\{"name":\s*"tool_', chunk or "", re.IGNORECASE))
+            is_delimiter_chunk = bool(re.match(r'^\s*[`>]{1,4}\s*$', chunk or ""))
+            if is_internal_chunk or is_action_tag or is_tool_json or is_delimiter_chunk or (chunk and "<!-- status:" in chunk):
                 return True
             self.q.put(AgentEvent("chunk", text=chunk, was_processed=False))
         elif msg_type == MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK:
@@ -828,6 +1130,11 @@ def cancel_agent_turn(personality, client=None) -> bool:
 
     cancelled = False
     if personality is not None:
+        if hasattr(personality, "_sub_agent_spawner") and personality._sub_agent_spawner:
+            try:
+                personality._sub_agent_spawner.cancel_active_child()
+            except Exception:
+                pass
         if hasattr(personality, "cancel_generation"):
             personality.cancel_generation()
             cancelled = True
@@ -930,6 +1237,7 @@ def make_gui_python_confirm_handler(event_queue: "queue.Queue[AgentEvent]", pref
 def run_agent_turn_in_thread(
     personality, client, prompt: str, prefs: GuiPrefs,
     event_queue: "queue.Queue[AgentEvent]", use_history: bool = True,
+    resume_turn: bool = False,
 ) -> threading.Thread:
     """Runs personality.chat(...) in a background thread so the NiceGUI
     event loop never blocks, and reports completion/errors via the queue."""
@@ -954,7 +1262,26 @@ def run_agent_turn_in_thread(
     callback = QueueStreamingCallback(event_queue)
 
     def _worker():
+        nonlocal prompt
         try:
+            chat_kwargs: Dict[str, Any] = {}
+
+            # If resuming a turn from checkpoint, restore virtual history & prompt
+            if resume_turn and hasattr(personality, "load_turn_checkpoint"):
+                chk = personality.load_turn_checkpoint()
+                if chk:
+                    prompt = chk.get("prompt") or prompt
+                    vh_raw = chk.get("virtual_history", [])
+                    # Inject continuation guidance to virtual history so LLM immediately resumes
+                    if vh_raw and vh_raw[-1].get("sender_type") == "assistant":
+                        vh_raw.append({
+                            "sender_type": "user",
+                            "content": "[SYSTEM: Turn resumed from checkpoint. Continue your previous task to completion.]"
+                        })
+                    chat_kwargs["resume_virtual_history"] = vh_raw
+                    chat_kwargs["starting_round"] = chk.get("round_count", 1)
+                    ASCIIColors.success(f"[AgentBridge] Resuming turn from checkpoint (Round {chk.get('round_count', 1)}).")
+
             result = personality.chat(
                 prompt=prompt,
                 lollms_client=client,
@@ -976,6 +1303,9 @@ def run_agent_turn_in_thread(
                 confirm_handler=gui_confirm_handler,
                 debug=prefs.debug,
                 debug_export=prefs.debug,
+                reasoning_effort=getattr(prefs, "reasoning_effort", None),
+                dynamic_effort=getattr(prefs, "dynamic_effort", False),
+                **chat_kwargs
             )
             event_queue.put(AgentEvent("done", result=result))
         except Exception as e:

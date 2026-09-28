@@ -8,6 +8,7 @@ import queue
 import hashlib
 import argparse
 import tempfile
+import base64
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from concurrent.futures import Future

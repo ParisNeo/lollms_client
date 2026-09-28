@@ -31,9 +31,13 @@ ACCENT_PRESETS = {
 class GuiPrefs:
     # --- Agent behavior ---
     temperature: float = 0.3
+    auto_temperature: bool = False
     max_tokens_per_turn: int = 8192
+    auto_max_tokens: bool = False
     max_reasoning_steps: int = 100
     context_compaction_threshold: float = 0.85
+    reasoning_effort: Optional[str] = None
+    dynamic_effort: bool = False
     enable_shell_execution: bool = True
     shell_autonomy_level: str = "safe"
     auto_approve_python: bool = False
@@ -44,7 +48,7 @@ class GuiPrefs:
     enable_skill_creation: bool = True
     enable_skill_loading: bool = True
     enable_memory: bool = True
-    skills_mode: str = "mixed"
+    skills_mode: str = "loadable"
     debug: bool = False
 
     # --- Paths & Workspaces ---
@@ -59,7 +63,8 @@ class GuiPrefs:
     theme_day_start_hour: int = 7
     theme_night_start_hour: int = 19
     dark_mode: bool = True
-    start_fullscreen: bool = True
+    start_fullscreen: bool = False
+    start_maximized: bool = True
     accent_color: str = ACCENT_PRESETS["LoLLMS Blue"]
     font_family: str = "JetBrains Mono, monospace"
     window_width: int = 1440
@@ -79,6 +84,9 @@ class GuiPrefs:
                 inst = cls(**{k: v for k, v in data.items() if k in known})
                 # Ephemeral session permissions always start False on fresh app start
                 inst.auto_approve_python = False
+                inst.start_fullscreen = False
+                if not hasattr(inst, "start_maximized"):
+                    inst.start_maximized = True
                 inst._ensure_workspaces_seeded()
                 return inst
             except Exception:

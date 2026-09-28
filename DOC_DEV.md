@@ -291,6 +291,80 @@ If you want to add a new tool to be used by the existing `local_mcp` binding:
 
 The `local_mcp` binding will automatically discover and make this tool available to the LLM when `generate_with_mcp` is called.
 
+## 🔄 Turn Checkpointing & Resumption Architecture
+
+As of v1.21.0, both `LollmsDiscussion` and `LollmsPersonality` implement **Round-End State Checkpointing and Turn Resumption**. This allows applications to survive client disconnections, accidental tab closures, or user pauses during multi-round reasoning tasks.
+
+### 1. Conceptual Model
+
+In agentic mode, an agent turn often spans multiple rounds (tool executions, file writes, sub-agent delegations). Rather than waiting until the entire turn finishes to persist changes, the system saves an atomic checkpoint **at the conclusion of every single round**.
+
+```
+[Round 1 Start] ──> [Tool Execution] ──> [Round 1 End: CHECKPOINT SAVED]
+                                                      │
+[Round 2 Start] ──> [Artifact Stream] ──> [Round 2 End: CHECKPOINT SAVED]
+                                                      │
+                                          (Session cut / Stopped)
+                                                      │
+                                            [RESUME TURN TRIGGER]
+                                                      │
+[Round 3 Start: Virtual History Restored] ──> Continues to completion
+```
+
+### 2. Checkpoint Data Structure
+
+Every round checkpoint records:
+- `round_count` (int): The current zero-indexed or 1-indexed round number.
+- `turn_status` (str): `"in_progress"`, `"cancelled"`, or `"completed"`.
+- `virtual_history` (list[dict]): The full sequence of assistant thoughts, tool calls, and `<tool_result>` messages accumulated in this turn.
+- `tool_calls` (list[dict]): Tools dispatched and their execution status.
+- `workspace_changes` (list[dict]): Files created or modified during the turn.
+- `timestamp` (float/str): UTC time of the checkpoint.
+
+### 3. Upgrading Third-Party Applications
+
+#### Mode A: Using `LollmsPersonality` (Headless or Agent Apps)
+
+```python
+from lollms_client.lollms_personality import LollmsPersonality
+
+personality = LollmsPersonality(...)
+
+# 1. Check if an interrupted turn exists
+if personality.has_resumable_turn():
+    print("Incomplete turn detected. Resuming...")
+    result = personality.chat(
+        prompt="organize this folder", # Original prompt is loaded from checkpoint automatically
+        lollms_client=client,
+        resume_turn=True, # Re-hydrates virtual history and continues execution
+    )
+else:
+    result = personality.chat(prompt="organize this folder", lollms_client=client)
+```
+
+#### Mode B: Using `LollmsDiscussion` (Chat, WebUI, and Branching Apps)
+
+```python
+from lollms_client import LollmsDiscussion
+
+discussion = LollmsDiscussion(...)
+
+# 1. Inspect if the branch tip has an incomplete or paused turn
+if discussion.has_resumable_turn():
+    # 2. Resume execution from the last round checkpoint
+    result = discussion.resume_turn(
+        streaming_callback=my_streaming_callback,
+    )
+```
+
+---
+
+## 🎨 Collapsible Artifact UI Protocol
+
+When displaying live streaming code or artifact generation in a UI:
+1. **Header Discipline**: The collapsible header/subtitle MUST display only the file name and high-level structural units (`Section: <name>`, `def <function_name>()`, `class <ClassName>`). Raw content lines (table rows, assignment expressions, code statements) must NEVER be placed in the header.
+2. **Body Discipline**: The verbatim code content must stream strictly inside the collapsible box.
+
 ## 6. Running Examples & Tests
 (Content updated to reflect MCP examples and removal of TasksLibrary examples)
 *   **Examples:** The `examples/` directory contains various scripts.

@@ -7,6 +7,7 @@ import base64
 import time
 import secrets
 import subprocess
+import threading
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union, Callable
 
@@ -77,13 +78,13 @@ class DiffusersTTMBinding(LollmsTTMBinding):
         self.port = int(kwargs.get("port", 9637))
         self.model_name = kwargs.get("model_name", "MiniMaxAI/MiniMax-Music3")
         self.auto_start_server = kwargs.get("auto_start_server", True)
-        self.wait_for_server = kwargs.get("wait_for_server", True)
+        self.wait_for_server = kwargs.get("wait_for_server", False)
         self.base_url = f"http://{self.host}:{self.port}"
         self.binding_root = Path(__file__).parent
         self.server_dir = self.binding_root / "server"
 
-        self.venv_dir = Path(kwargs.get("venv_path", "./venv/ttm_diffusers_venv")).resolve()
-        self.cache_dir = Path(kwargs.get("cache_dir", "./data/ttm_models/diffusers")).resolve()
+        self.venv_dir = self.resolve_system_path(kwargs.get("venv_path", "venv/ttm_diffusers_venv"))
+        self.cache_dir = self.resolve_system_path(kwargs.get("cache_dir", "data/ttm_models/diffusers"))
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.token_file = self.cache_dir / "diffusers_ttm.token"
 
@@ -132,24 +133,24 @@ class DiffusersTTMBinding(LollmsTTMBinding):
             return False
         return False
 
-    def ensure_server_is_running(self, wait: bool = True, timeout_s: int = 120):
+    def ensure_server_is_running(self, wait: bool = False, timeout_s: int = 120):
         if self.is_server_running():
             return
 
         lock_path = self.cache_dir / "diffusers_ttm_spawn.lock"
-        lock = FileLock(lock_path, timeout=timeout_s)
-
         try:
+            lock = FileLock(lock_path, timeout=timeout_s if wait else 1.0)
             with lock:
                 if self.is_server_running():
                     ASCIIColors.green(f"Diffusers TTM shared daemon detected on {self.base_url}. Attached successfully.")
                     return
                 ASCIIColors.info(f"Spawning shared Diffusers TTM server daemon on {self.base_url}...")
                 self.start_server(wait=wait, timeout_s=timeout_s)
-        except Timeout:
+        except (Timeout, Exception) as e:
             if self.is_server_running():
                 return
-            raise RuntimeError(f"Timed out waiting for Diffusers TTM shared daemon on {self.base_url}.")
+            if wait:
+                raise RuntimeError(f"Timed out waiting for Diffusers TTM shared daemon on {self.base_url}: {e}")
 
     def install_server_dependencies(self):
         ASCIIColors.info(f"Setting up Diffusers TTM virtual environment in: {self.venv_dir}")
@@ -171,59 +172,66 @@ class DiffusersTTMBinding(LollmsTTMBinding):
         pm_v.ensure_packages(["transformers", "accelerate", "diffusers"])
         ASCIIColors.green("Diffusers TTM server dependencies are satisfied.")
 
-    def start_server(self, wait: bool = True, timeout_s: int = 120):
-        server_script = self.server_dir / "main.py"
-        venv_cfg = self.venv_dir / "pyvenv.cfg"
+    def start_server(self, wait: bool = False, timeout_s: int = 120):
+        def _launch():
+            try:
+                server_script = self.server_dir / "main.py"
+                venv_cfg = self.venv_dir / "pyvenv.cfg"
 
-        if not venv_cfg.exists():
-            self.install_server_dependencies()
+                if not venv_cfg.exists():
+                    self.install_server_dependencies()
 
-        if sys.platform == "win32":
-            python_executable = self.venv_dir / "Scripts" / "python.exe"
-        else:
-            python_executable = self.venv_dir / "bin" / "python"
+                if sys.platform == "win32":
+                    python_executable = self.venv_dir / "Scripts" / "python.exe"
+                else:
+                    python_executable = self.venv_dir / "bin" / "python"
 
-        if not python_executable.exists():
-            raise RuntimeError(f"Python executable not found in venv: {python_executable}.")
+                if not python_executable.exists():
+                    ASCIIColors.error(f"Python executable not found in venv: {python_executable}.")
+                    return
 
-        if not self.service_key:
-            if self.token_file.exists():
+                if not self.service_key:
+                    if self.token_file.exists():
+                        try:
+                            self.service_key = self.token_file.read_text(encoding="utf-8").strip()
+                        except Exception:
+                            pass
+                    if not self.service_key:
+                        self.service_key = secrets.token_hex(16)
+                        try:
+                            fd = os.open(str(self.token_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                                f.write(self.service_key)
+                        except Exception:
+                            self.token_file.write_text(self.service_key, encoding="utf-8")
+
+                command = [
+                    str(python_executable),
+                    "-u",
+                    str(server_script),
+                    "--host", str(self.host),
+                    "--port", str(self.port),
+                    "--cache-dir", str(self.cache_dir),
+                    "--token", str(self.service_key),
+                    "--model-name", str(self.model_name),
+                ]
+
+                log_file_path = self.cache_dir / "diffusers_ttm_server.log"
+                log_f = open(log_file_path, "w", encoding="utf-8")
                 try:
-                    self.service_key = self.token_file.read_text(encoding="utf-8").strip()
-                except Exception:
-                    pass
-            if not self.service_key:
-                self.service_key = secrets.token_hex(16)
-                try:
-                    fd = os.open(str(self.token_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                    with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                        f.write(self.service_key)
-                except Exception:
-                    self.token_file.write_text(self.service_key, encoding="utf-8")
-
-        command = [
-            str(python_executable),
-            str(server_script),
-            "--host", str(self.host),
-            "--port", str(self.port),
-            "--cache-dir", str(self.cache_dir),
-            "--token", str(self.service_key),
-            "--model-name", str(self.model_name),
-        ]
-
-        log_file_path = self.cache_dir / "diffusers_ttm_server.log"
-        log_f = open(log_file_path, "w", encoding="utf-8")
-        try:
-            popen_kwargs: Dict[str, Any] = {"stdout": log_f, "stderr": subprocess.STDOUT}
-            if sys.platform == "win32":
-                popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-            else:
-                popen_kwargs["start_new_session"] = True
-            self.server_process = subprocess.Popen(command, **popen_kwargs)
-        finally:
-            log_f.close()
+                    popen_kwargs: Dict[str, Any] = {"stdout": log_f, "stderr": subprocess.STDOUT}
+                    if sys.platform == "win32":
+                        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                    else:
+                        popen_kwargs["start_new_session"] = True
+                    self.server_process = subprocess.Popen(command, **popen_kwargs)
+                finally:
+                    log_f.close()
+            except Exception as ex:
+                ASCIIColors.error(f"Diffusers TTM daemon launch failed: {ex}")
 
         if wait:
+            _launch()
             start_time = time.time()
             while time.time() - start_time < timeout_s:
                 if self.is_server_running():
@@ -231,6 +239,8 @@ class DiffusersTTMBinding(LollmsTTMBinding):
                     return
                 time.sleep(1)
             raise TimeoutError(f"Diffusers TTM server failed to respond within {timeout_s}s.")
+        else:
+            threading.Thread(target=_launch, daemon=True).start()
 
     def __del__(self):
         # Do not kill the server on client destruction as it is a shared singleton daemon

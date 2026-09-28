@@ -118,7 +118,7 @@ class MockGemmaAgentClient:
 
         # ── Test Scenario A: Direct Conversation (No Tools) ──
         if "hello" in prompt_text_lower or "amazing day" in prompt_text_lower:
-            reply = "Hello! I am Lollms, your persistent engineering assistant. How can I help you today?"
+            reply = "Hello! I am Lollms, your persistent engineering assistant. How can I help you today?<done/>"
             if callback:
                 callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
             return reply
@@ -210,7 +210,7 @@ class MockGemmaAgentClient:
                 return reply
 
         # Fallback
-        reply = "Simulated response"
+        reply = "Simulated response<done/>"
         if callback:
             callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
         return reply

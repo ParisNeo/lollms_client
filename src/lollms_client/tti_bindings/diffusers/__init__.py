@@ -8,6 +8,7 @@ import subprocess
 import time
 import json
 import secrets
+import threading
 from io import BytesIO
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union, Callable
@@ -37,15 +38,15 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         self.host = kwargs.get("host", "127.0.0.1")
         self.port = int(kwargs.get("port", 9632))
         self.auto_start_server = kwargs.get("auto_start_server", True)
-        self.wait_for_server = kwargs.get("wait_for_server", True)
+        self.wait_for_server = kwargs.get("wait_for_server", False)
         self.server_process = None
         self.base_url = f"http://{self.host}:{self.port}"
         self.binding_root = Path(__file__).parent
         self.server_dir = self.binding_root / "server"
 
-        self.venv_dir = Path(kwargs.get("venv_path", "./venv/tti_diffusers_venv")).resolve()
-        self.models_path = Path(kwargs.get("models_path", "./data/tti_models/diffusers")).resolve()
-        self.extra_models_path = kwargs.get("extra_models_path")
+        self.venv_dir = self.resolve_system_path(kwargs.get("venv_path", "venv/tti_diffusers_venv"))
+        self.models_path = self.resolve_system_path(kwargs.get("models_path", "data/tti_models/diffusers"))
+        self.extra_models_path = str(self.resolve_system_path(kwargs.get("extra_models_path"))) if kwargs.get("extra_models_path") else None
         self.hf_token = kwargs.get("hf_token", "")
         self.server_log_depth = int(kwargs.get("server_log_depth", 500))
         self.models_path.mkdir(exist_ok=True, parents=True)
@@ -101,24 +102,24 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             return False
         return False
 
-    def ensure_server_is_running(self, wait: bool = True, timeout_s: int = 120):
+    def ensure_server_is_running(self, wait: bool = False, timeout_s: int = 120):
         if self.is_server_running():
             return
 
         lock_path = self.models_path / "diffusers_server_spawn.lock"
-        lock = FileLock(lock_path, timeout=timeout_s)
-
         try:
+            lock = FileLock(lock_path, timeout=timeout_s if wait else 1.0)
             with lock:
                 if self.is_server_running():
                     ASCIIColors.green("Diffusers Server is already running and responsive (Shared Singleton).")
                     return
                 ASCIIColors.info(f"Spawning shared Diffusers server daemon on {self.base_url}...")
                 self.start_server(wait=wait, timeout_s=timeout_s)
-        except Timeout:
+        except (Timeout, Exception) as e:
             if self.is_server_running():
                 return
-            raise RuntimeError(f"Timed out waiting for Diffusers server on {self.base_url}.")
+            if wait:
+                raise RuntimeError(f"Timed out waiting for Diffusers server on {self.base_url}: {e}")
 
     def install_server_dependencies(self):
         ASCIIColors.info(f"Setting up Diffusers virtual environment in: {self.venv_dir}")
@@ -140,63 +141,69 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         pm_v.ensure_packages(["transformers", "safetensors", "accelerate", "diffusers"])
         ASCIIColors.green("Diffusers server dependencies are satisfied.")
 
-    def start_server(self, wait: bool = True, timeout_s: int = 120):
-        server_script = self.server_dir / "main.py"
-        venv_cfg = self.venv_dir / "pyvenv.cfg"
+    def start_server(self, wait: bool = False, timeout_s: int = 120):
+        def _launch():
+            try:
+                server_script = self.server_dir / "main.py"
+                venv_cfg = self.venv_dir / "pyvenv.cfg"
 
-        if not venv_cfg.exists():
-            self.install_server_dependencies()
+                if not venv_cfg.exists():
+                    self.install_server_dependencies()
 
-        if sys.platform == "win32":
-            python_executable = self.venv_dir / "Scripts" / "python.exe"
-        else:
-            python_executable = self.venv_dir / "bin" / "python"
+                if sys.platform == "win32":
+                    python_executable = self.venv_dir / "Scripts" / "python.exe"
+                else:
+                    python_executable = self.venv_dir / "bin" / "python"
 
-        if not python_executable.exists():
-            raise RuntimeError(f"Python executable not found in venv: {python_executable}.")
+                if not python_executable.exists():
+                    ASCIIColors.error(f"Python executable not found in venv: {python_executable}.")
+                    return
 
-        if not self.service_key:
-            if self.token_file.exists():
+                if not self.service_key:
+                    if self.token_file.exists():
+                        try:
+                            self.service_key = self.token_file.read_text(encoding="utf-8").strip()
+                        except Exception:
+                            pass
+                    if not self.service_key:
+                        self.service_key = secrets.token_hex(16)
+                        try:
+                            fd = os.open(str(self.token_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                                f.write(self.service_key)
+                        except Exception:
+                            self.token_file.write_text(self.service_key, encoding="utf-8")
+
+                command = [
+                    str(python_executable),
+                    "-u",
+                    str(server_script),
+                    "--host", str(self.host),
+                    "--port", str(self.port),
+                    "--models-path", str(self.models_path.resolve()),
+                    "--token", str(self.service_key),
+                ]
+                if self.extra_models_path:
+                    command.extend(["--extra-models-path", str(Path(self.extra_models_path).resolve())])
+                if self.hf_token:
+                    command.extend(["--hf-token", self.hf_token])
+
+                log_file_path = self.models_path / "diffusers_server.log"
+                log_f = open(log_file_path, "w", encoding="utf-8")
                 try:
-                    self.service_key = self.token_file.read_text(encoding="utf-8").strip()
-                except Exception:
-                    pass
-            if not self.service_key:
-                self.service_key = secrets.token_hex(16)
-                try:
-                    fd = os.open(str(self.token_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                    with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                        f.write(self.service_key)
-                except Exception:
-                    self.token_file.write_text(self.service_key, encoding="utf-8")
-
-        command = [
-            str(python_executable),
-            "-u",
-            str(server_script),
-            "--host", str(self.host),
-            "--port", str(self.port),
-            "--models-path", str(self.models_path.resolve()),
-            "--token", str(self.service_key),
-        ]
-        if self.extra_models_path:
-            command.extend(["--extra-models-path", str(Path(self.extra_models_path).resolve())])
-        if self.hf_token:
-            command.extend(["--hf-token", self.hf_token])
-
-        log_file_path = self.models_path / "diffusers_server.log"
-        log_f = open(log_file_path, "w", encoding="utf-8")
-        try:
-            popen_kwargs: Dict[str, Any] = {"stdout": log_f, "stderr": subprocess.STDOUT}
-            if sys.platform == "win32":
-                popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-            else:
-                popen_kwargs["start_new_session"] = True
-            self.server_process = subprocess.Popen(command, **popen_kwargs)
-        finally:
-            log_f.close()
+                    popen_kwargs: Dict[str, Any] = {"stdout": log_f, "stderr": subprocess.STDOUT}
+                    if sys.platform == "win32":
+                        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                    else:
+                        popen_kwargs["start_new_session"] = True
+                    self.server_process = subprocess.Popen(command, **popen_kwargs)
+                finally:
+                    log_f.close()
+            except Exception as ex:
+                ASCIIColors.error(f"Diffusers daemon launch failed: {ex}")
 
         if wait:
+            _launch()
             start_time = time.time()
             while time.time() - start_time < timeout_s:
                 if self.is_server_running():
@@ -204,6 +211,8 @@ class DiffusersTTIBinding(LollmsTTIBinding):
                     return
                 time.sleep(1)
             raise TimeoutError(f"Diffusers server failed to start within {timeout_s}s.")
+        else:
+            threading.Thread(target=_launch, daemon=True).start()
 
     def __del__(self):
         # Shared singleton daemon remains running for all application worker processes
@@ -237,11 +246,29 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"Communication with Diffusers server failed: {e}") from e
 
-    def unload_model(self):
+    # ── Local Resource Management Contract Implementation ─────────────────────
+
+    def is_local(self) -> bool:
+        return True
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return self.is_server_running()
+
+    def has_active_resources(self) -> bool:
+        return self.is_server_running()
+
+    def get_loaded_models(self) -> List[str]:
+        if self.is_server_running():
+            return [self.config.get("model_name", "diffusers")]
+        return []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
         try:
             self._post_json_request("/unload_model")
+            return True
         except Exception as e:
             ASCIIColors.warning(f"Could not send unload request to server: {e}")
+            return False
 
     def install_model(self, model_name: str, **kwargs) -> dict:
         """

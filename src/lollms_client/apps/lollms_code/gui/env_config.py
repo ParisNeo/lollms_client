@@ -18,10 +18,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-MODALITIES = ["llm", "tti", "tts", "stt", "ttm", "ttv"]
+MODALITIES = ["llm", "tti", "tts", "stt", "ttm", "ttv", "connection", "rag"]
 MODALITY_LABELS = {
     "llm": "LLM (text)", "tti": "TTI (image)", "tts": "TTS (speech)",
     "stt": "STT (transcription)", "ttm": "TTM (music)", "ttv": "TTV (video)",
+    "connection": "CONNECTION (channels)", "rag": "RAG (knowledge)",
+}
+MODALITY_ICONS = {
+    "llm": "psychology", "tti": "palette", "tts": "record_voice_over",
+    "stt": "hearing", "ttm": "music_note", "ttv": "videocam",
+    "connection": "hub", "rag": "auto_stories",
 }
 
 _IMPORT_ERROR: Optional[str] = None
@@ -141,18 +147,36 @@ class EnvStore:
 
     # ---------- load / persist ----------
 
+    def clean_orphaned_binding_keys(self) -> None:
+        """Purges orphaned binding parameter keys that have no corresponding BINDING_NAME declaration."""
+        for modality in ("llm", "tti", "tts", "stt", "ttm", "ttv", "connection"):
+            prefix = f"{modality.upper()}_BINDINGS_"
+            valid_aliases = set(get_configured_aliases(modality, self.config_map, "BINDINGS"))
+            keys_to_delete = []
+            for k in self.config_map:
+                k_upper = k.upper()
+                if k_upper.startswith(prefix):
+                    remainder = k_upper[len(prefix):]
+                    is_valid = any(remainder.startswith(f"{v.upper()}_") for v in valid_aliases)
+                    if not is_valid:
+                        keys_to_delete.append(k)
+            for k in keys_to_delete:
+                del self.config_map[k]
+
     def load(self) -> None:
         try:
             from lollms_client.lollms_config_cli_env import _load_existing_env_to_map, resolve_env_file as _res_file
             self.config_map = _load_existing_env_to_map(self.env_path)
             path, _ = _res_file(self.env_path)
             self.env_path = path
+            self.clean_orphaned_binding_keys()
         except Exception:
             path, _ = resolve_env_file(self.env_path)
             self.env_path = path
             self.config_map = {}
             if path and path.exists():
                 self.config_map = load_env_file(path)
+            self.clean_orphaned_binding_keys()
 
     def clear_settings(self) -> None:
         """Wipes all in-memory configuration and deletes persisted ~/.lollms_client/ config files."""
@@ -203,6 +227,13 @@ class EnvStore:
         Returns {} when lollms_client isn't importable or nothing is configured."""
         prefix = binding_type.upper()
         return _extract_bindings_from_env(prefix, self.config_map) or {}
+
+    def set_default_profile(self, binding_type: str, alias: str) -> bool:
+        """Promotes a profile to be the exclusive default for its modality and saves to disk."""
+        from lollms_client.lollms_config_cli_env import _set_default_profile_action
+        _set_default_profile_action(binding_type, alias, self.config_map)
+        self.save()
+        return True
 
     def get_model_profiles(self, binding_type: str) -> Dict[str, Any]:
         """Extracts the full two-tier model profiles for a modality (e.g. 'llm')

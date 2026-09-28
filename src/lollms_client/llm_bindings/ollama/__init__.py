@@ -16,7 +16,7 @@ import pipmaster as pm
 import tiktoken
 from ascii_colors import ASCIIColors, trace_exception
 
-pm.ensure_packages(["ollama>=0.6.1", "pillow", "tiktoken"])
+pm.ensure_packages(["ollama>=0.6.2", "pillow", "tiktoken"])
 
 import ollama
 
@@ -147,6 +147,7 @@ class OllamaBinding(LollmsLLMBinding):
         self.verify_ssl_certificate = kwargs.get("verify_ssl_certificate", True)
         self.default_completion_format = kwargs.get("default_completion_format", ELF_COMPLETION_FORMAT.Chat)
         self.n_threads = kwargs.get("n_threads", -1)
+        self.supported_reasoning_efforts = ["low", "medium", "high"]
 
         if ollama is None:
             raise ImportError("Ollama library is not installed. Please run 'pip install ollama'.")
@@ -157,6 +158,41 @@ class OllamaBinding(LollmsLLMBinding):
 
         self._active_client: "ollama.Client | None" = None
         self._client_lock = threading.Lock()
+
+    def _resolve_think_setting(
+        self,
+        think: Optional[bool] = None,
+        reasoning_effort: Optional[str] = None
+    ) -> Union[bool, str]:
+        """
+        Resolves the Ollama thinking control.
+        Ollama's ChatRequest schema validates think as:
+          think: Optional[Union[bool, Literal['low', 'medium', 'high']]]
+        """
+        if (think is False and reasoning_effort is None) or think is False:
+            return False
+
+        if reasoning_effort is not None:
+            if isinstance(reasoning_effort, bool):
+                return reasoning_effort
+            effort_str = str(reasoning_effort).strip().lower()
+            if effort_str in ("none", "off", "disabled", "false", "0"):
+                return False
+            # Map higher/alternate effort aliases to Ollama's accepted literals ('low', 'medium', 'high')
+            if effort_str in ("max", "maximum", "extreme"):
+                return "high"
+            if effort_str in ("min", "minimal"):
+                return "low"
+            if effort_str in ("med",):
+                return "medium"
+            if effort_str in ("low", "medium", "high"):
+                return effort_str
+            return True
+
+        if think is True:
+            return True
+
+        return False
 
     def clean_message_images(self, messages: list[dict]) -> list[dict]:
         """
@@ -273,8 +309,8 @@ class OllamaBinding(LollmsLLMBinding):
         user_keyword: Optional[str] = "!@>user:",
         ai_keyword: Optional[str] = "!@>assistant:",
         think: Optional[bool] = False,
-        reasoning_effort: Optional[str] = "low",
-        reasoning_summary: Optional[str] = "auto",
+        reasoning_effort: Optional[str] = None,
+        reasoning_summary: Optional[str] = None,
         **kwargs,
     ) -> Union[str, dict]:
         """
@@ -320,8 +356,14 @@ class OllamaBinding(LollmsLLMBinding):
         options = {k: v for k, v in options.items() if v is not None}
 
         full_response_text = ""
-        think = self.normalize_reasoning_effort(think, reasoning_effort)
-        think = False if think is None else (think != "low")
+        ollama_think = self._resolve_think_setting(think, reasoning_effort)
+        if not ollama_think:
+            options["think"] = False
+
+        ASCIIColors.info(
+            f"[OllamaBinding.generate_text] think={think}, reasoning_effort={reasoning_effort} "
+            f"-> resolved think={ollama_think}"
+        )
 
         try:
             with self._client() as client:
@@ -357,74 +399,6 @@ class OllamaBinding(LollmsLLMBinding):
                                 "images": processed_images if processed_images else None,
                             }
                         )
-                    alternated_messages = self.clean_and_alternate_messages(messages)
-                    chat_kwargs = {
-                        "model": self.model_name,
-                        "messages": alternated_messages,
-                        "stream": True,
-                        "options": options if options else None,
-                    }
-                    if think is not None:
-                        chat_kwargs["think"] = think
-
-                    if stream:
-                        response_stream = client.chat(**chat_kwargs)
-                        tracker = _ThinkingStreamTracker()
-                        for chunk in response_stream:
-                            if self.is_cancelled():
-                                break
-
-                            if hasattr(chunk, "message"):
-                                msg_obj = chunk.message
-                                chunk_thinking = getattr(msg_obj, "thinking", None)
-                                chunk_content = getattr(msg_obj, "content", None)
-                            elif isinstance(chunk, dict):
-                                msg_dict = chunk.get("message", {})
-                                chunk_thinking = msg_dict.get("thinking")
-                                chunk_content = msg_dict.get("content")
-                            else:
-                                chunk_thinking = None
-                                chunk_content = None
-
-                            if chunk_thinking:
-                                emitted = tracker.feed_thinking(chunk_thinking)
-                                full_response_text += emitted
-                                if streaming_callback:
-                                    streaming_callback(emitted, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
-                                continue
-
-                            if chunk_content:
-                                emitted = tracker.feed_content(chunk_content)
-                                full_response_text += emitted
-                                if streaming_callback:
-                                    if not streaming_callback(emitted, MSG_TYPE.MSG_TYPE_CHUNK):
-                                        break
-                        closing = tracker.flush()
-                        full_response_text += closing
-                        if closing and streaming_callback:
-                            streaming_callback(closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
-                        return full_response_text
-                    else:
-                        chat_kwargs = {
-                            "model": self.model_name,
-                            "messages": alternated_messages,
-                            "stream": False,
-                            "options": options if options else None,
-                        }
-                        if think is not None:
-                            chat_kwargs["think"] = think
-
-                        if self.debug:
-                            ASCIIColors.cyan(f"[{self.binding_name}] Sending non-streaming chat request to Ollama...")
-
-                        response = client.chat(**chat_kwargs)
-                        full_response_text = response.message.content
-
-                        if self.debug:
-                            ASCIIColors.cyan(f"[{self.binding_name}] Received response: {full_response_text[:200]}...")
-                        if think:
-                            full_response_text = "\n" + response.message.thinking + "\n</think>\n" + full_response_text
-                        return full_response_text
                 else:
                     messages = [
                         {"role": "system", "content": system_prompt},
@@ -434,70 +408,99 @@ class OllamaBinding(LollmsLLMBinding):
                     else:
                         messages.append({"role": "user", "content": prompt})
 
-                    alternated_messages = self.clean_and_alternate_messages(messages)
-                    chat_kwargs = {
-                        "model": self.model_name,
-                        "messages": alternated_messages,
-                        "stream": stream,
-                        "options": options if options else None,
-                    }
-                    if think is not None:
-                        chat_kwargs["think"] = think
+                alternated_messages = self.clean_and_alternate_messages(messages)
+                chat_kwargs = {
+                    "model": self.model_name,
+                    "messages": alternated_messages,
+                    "stream": bool(stream),
+                    "think": ollama_think,
+                    "options": options if options else None,
+                }
 
-                    if self.debug:
-                        ASCIIColors.cyan(f"[{self.binding_name}] Sending chat request to Ollama:")
-                        ASCIIColors.cyan(f"  • Model: {self.model_name}")
-                        if chat_kwargs.get("options"):
-                            ASCIIColors.cyan(f"  • Options: {json.dumps(chat_kwargs['options'], indent=2)}")
+                if self.debug:
+                    ASCIIColors.cyan(f"[{self.binding_name}] Sending chat request to Ollama:")
+                    ASCIIColors.cyan(f"  • Model: {self.model_name} | Think: {ollama_think}")
 
-                    if stream:
-                        response_stream = client.chat(**chat_kwargs)
-                        tracker = _ThinkingStreamTracker()
-                        for chunk in response_stream:
-                            if self.is_cancelled():
-                                break
+                if stream:
+                    response_stream = client.chat(**chat_kwargs)
+                    tracker = _ThinkingStreamTracker()
+                    in_raw_think_content = False
 
-                            if hasattr(chunk, "message"):
-                                msg_obj = chunk.message
-                                chunk_thinking = getattr(msg_obj, "thinking", None)
-                                chunk_content = getattr(msg_obj, "content", None)
-                            elif isinstance(chunk, dict):
-                                msg_dict = chunk.get("message", {})
-                                chunk_thinking = msg_dict.get("thinking")
-                                chunk_content = msg_dict.get("content")
-                            else:
-                                chunk_thinking = None
-                                chunk_content = None
+                    for chunk in response_stream:
+                        if self.is_cancelled():
+                            break
 
+                        if hasattr(chunk, "message"):
+                            msg_obj = chunk.message
+                            chunk_thinking = getattr(msg_obj, "thinking", None)
+                            chunk_content = getattr(msg_obj, "content", None)
+                        elif isinstance(chunk, dict):
+                            msg_dict = chunk.get("message", {})
+                            chunk_thinking = msg_dict.get("thinking")
+                            chunk_content = msg_dict.get("content")
+                        else:
+                            chunk_thinking = None
+                            chunk_content = None
+
+                        # If thinking is deactivated, suppress thoughts completely
+                        if not ollama_think:
                             if chunk_thinking:
-                                full_response_text += tracker.feed_thinking(chunk_thinking)
                                 continue
 
                             if chunk_content:
-                                if self.debug:
-                                    ASCIIColors.rich_print(f"[cyan]{chunk_content}[/cyan]", end="", flush=True)
-                                emitted = tracker.feed_content(chunk_content)
-                                full_response_text += emitted
-                                if streaming_callback:
-                                    if not streaming_callback(emitted, MSG_TYPE.MSG_TYPE_CHUNK):
-                                        break
+                                if "<think>" in chunk_content:
+                                    in_raw_think_content = True
+                                    before_think, _, after_think = chunk_content.partition("<think>")
+                                    if before_think:
+                                        full_response_text += before_think
+                                        if streaming_callback:
+                                            streaming_callback(before_think, MSG_TYPE.MSG_TYPE_CHUNK)
+                                    chunk_content = after_think
+
+                                if in_raw_think_content:
+                                    if "</think>" in chunk_content:
+                                        in_raw_think_content = False
+                                        _, _, after_think = chunk_content.partition("</think>")
+                                        chunk_content = after_think
+                                    else:
+                                        continue
+
+                                if chunk_content:
+                                    full_response_text += chunk_content
+                                    if streaming_callback:
+                                        if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
+                                            break
+                            continue
+
+                        # Thinking is enabled
+                        if chunk_thinking:
+                            emitted = tracker.feed_thinking(chunk_thinking)
+                            full_response_text += emitted
+                            if streaming_callback:
+                                streaming_callback(emitted, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                            continue
+
+                        if chunk_content:
+                            emitted = tracker.feed_content(chunk_content)
+                            full_response_text += emitted
+                            if streaming_callback:
+                                if not streaming_callback(emitted, MSG_TYPE.MSG_TYPE_CHUNK):
+                                    break
+
+                    if ollama_think:
                         closing = tracker.flush()
                         full_response_text += closing
                         if closing and streaming_callback:
                             streaming_callback(closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
-                        return full_response_text
-                    else:
-                        response = client.chat(
-                            model=self.model_name,
-                            messages=alternated_messages,
-                            stream=False,
-                            think=think,
-                            options=options if options else None,
-                        )
-                        full_response_text = response.message.content
-                        if think and response.message.thinking:
-                            full_response_text = "WebResponse\n" + response.message.thinking + "\n</think>\n" + full_response_text
-                        return full_response_text
+                    return full_response_text
+                else:
+                    response = client.chat(**chat_kwargs)
+                    full_response_text = response.message.content or ""
+                    if not ollama_think:
+                        full_response_text = re.sub(r'<think>.*?</think>', '', full_response_text, flags=re.DOTALL).strip()
+                    elif response.message.thinking:
+                        full_response_text = f"\n<think>\n{response.message.thinking}\n</think>\n" + full_response_text
+                    return full_response_text
 
         except ollama.ResponseError as e:
             error_message = f"Ollama API ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code})"
@@ -525,7 +528,7 @@ class OllamaBinding(LollmsLLMBinding):
         seed: Optional[int] = None,
         streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
         think: Optional[bool] = False,
-        reasoning_effort: Optional[str] = "low",
+        reasoning_effort: Optional[str] = None,
         **kwargs,
     ) -> Union[str, dict]:
         options = {}
@@ -553,23 +556,33 @@ class OllamaBinding(LollmsLLMBinding):
         alternated_messages = self.clean_and_alternate_messages(messages)
         ollama_messages = self.clean_message_images(alternated_messages)
         full_response_text = ""
-        think = self.normalize_reasoning_effort(think, reasoning_effort)
-        think = False if think is None else (think != "low")
+        ollama_think = self._resolve_think_setting(think, reasoning_effort)
+        if not ollama_think:
+            options["think"] = False
+
+        ASCIIColors.info(
+            f"[OllamaBinding.generate_from_messages] think={think}, reasoning_effort={reasoning_effort} "
+            f"-> resolved think={ollama_think}"
+        )
 
         try:
             with self._client() as client:
                 chat_kwargs = {
                     "model": self.model_name,
                     "messages": ollama_messages,
+                    "stream": bool(stream),
+                    "think": ollama_think,
                     "options": options if options else None,
                 }
 
+                if self.debug:
+                    ASCIIColors.cyan(f"[{self.binding_name}] Sending chat request to Ollama: Model={self.model_name}, Think={ollama_think}")
+
                 if stream:
-                    chat_kwargs["stream"] = True
-                    if think is not None:
-                        chat_kwargs["think"] = think
                     response_stream = client.chat(**chat_kwargs)
                     tracker = _ThinkingStreamTracker()
+                    in_raw_think_content = False
+
                     for chunk in response_stream:
                         if self.is_cancelled():
                             break
@@ -586,6 +599,37 @@ class OllamaBinding(LollmsLLMBinding):
                             chunk_thinking = None
                             chunk_content = None
 
+                        # If thinking is deactivated, suppress thoughts completely
+                        if not ollama_think:
+                            if chunk_thinking:
+                                continue
+
+                            if chunk_content:
+                                if "<think>" in chunk_content:
+                                    in_raw_think_content = True
+                                    before_think, _, after_think = chunk_content.partition("<think>")
+                                    if before_think:
+                                        full_response_text += before_think
+                                        if streaming_callback:
+                                            streaming_callback(before_think, MSG_TYPE.MSG_TYPE_CHUNK)
+                                    chunk_content = after_think
+
+                                if in_raw_think_content:
+                                    if "</think>" in chunk_content:
+                                        in_raw_think_content = False
+                                        _, _, after_think = chunk_content.partition("</think>")
+                                        chunk_content = after_think
+                                    else:
+                                        continue
+
+                                if chunk_content:
+                                    full_response_text += chunk_content
+                                    if streaming_callback:
+                                        if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
+                                            break
+                            continue
+
+                        # Thinking is enabled
                         if chunk_thinking:
                             emitted = tracker.feed_thinking(chunk_thinking)
                             full_response_text += emitted
@@ -599,22 +643,22 @@ class OllamaBinding(LollmsLLMBinding):
                             if streaming_callback:
                                 if not streaming_callback(emitted, MSG_TYPE.MSG_TYPE_CHUNK):
                                     break
-                    closing = tracker.flush()
-                    full_response_text += closing
-                    if closing and streaming_callback:
-                        streaming_callback(closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+
+                    if ollama_think:
+                        closing = tracker.flush()
+                        full_response_text += closing
+                        if closing and streaming_callback:
+                            streaming_callback(closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
                     return full_response_text
                 else:
-                    chat_kwargs["stream"] = False
-                    eff_think = think if "gpt-oss" not in self.model_name else reasoning_effort
-                    if eff_think is not None:
-                        chat_kwargs["think"] = eff_think
                     response = client.chat(**chat_kwargs)
-                    full_response_text = response.message.content
-                    if think:
-                        full_response_text = "WebResponse\n" + response.message.thinking + "\n</think>\n" + full_response_text
+                    full_response_text = response.message.content or ""
+                    if not ollama_think:
+                        full_response_text = re.sub(r'<think>.*?</think>', '', full_response_text, flags=re.DOTALL).strip()
+                    elif response.message.thinking:
+                        full_response_text = f"\n<think>\n{response.message.thinking}\n</think>\n" + full_response_text
                     return full_response_text
-
+                
         except ollama.ResponseError as e:
             error_message = f"Ollama API ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code})"
             ASCIIColors.error(error_message)

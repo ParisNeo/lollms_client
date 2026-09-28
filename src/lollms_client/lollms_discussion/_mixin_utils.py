@@ -67,8 +67,7 @@ class UtilsMixin:
         Sanitizes assistant message content for User/Database view.
         Removes functional tags and processing blocks, leaving only the final conversational text.
         """
-        import re as _re
-        content = _re.sub(r'<processing[^>]*>.*?</processing>', '', content, flags=_re.DOTALL | _re.IGNORECASE)
+        content = re.sub(r'<processing[^>]*>.*?</processing>', '', content, flags=re.DOTALL | re.IGNORECASE)
         return content.strip()
 
     def _apply_three_view_protocol(self, msg, raw_content: str, distance_from_end: int = 0) -> str:

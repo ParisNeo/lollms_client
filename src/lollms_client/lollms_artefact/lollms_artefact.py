@@ -93,11 +93,10 @@ def sanitize_artifact_filename(title: str) -> str:
     import unicodedata
     if not title:
         return "untitled"
-    import re as _re
     title = unicodedata.normalize("NFC", title)
-    clean = _re.sub(r'^[a-zA-Z]+://', '', title)
-    clean = _re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', clean)
-    clean = _re.sub(r'_{3,}', '__', clean)
+    clean = re.sub(r'^[a-zA-Z]+://', '', title)
+    clean = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', clean)
+    clean = re.sub(r'_{3,}', '__', clean)
     if len(clean) > 200:
         clean = clean[:200]
     return clean if clean else "untitled"
@@ -2271,11 +2270,10 @@ class ArtefactManager:
 
     @staticmethod
     def apply_aider_patch(original: str, patch_block: str) -> str:
-        import re as _re
 
-        SEARCH_RE  = _re.compile(r'^<{6,8}(?:\s*\w+)?\s*$',  _re.IGNORECASE)
-        SEP_RE     = _re.compile(r'^={5,}\s*$')
-        REPLACE_RE = _re.compile(r'^>{6,8}(?:\s*\w+)?\s*$', _re.IGNORECASE)
+        SEARCH_RE  = re.compile(r'^<{6,8}(?:\s*\w+)?\s*$',  re.IGNORECASE)
+        SEP_RE     = re.compile(r'^={5,}\s*$')
+        REPLACE_RE = re.compile(r'^>{6,8}(?:\s*\w+)?\s*$', re.IGNORECASE)
 
         patch_block = patch_block.replace('\r\n', '\n').replace('\r', '\n')
         lines = patch_block.split('\n')
@@ -2357,10 +2355,10 @@ class ArtefactManager:
             return score
 
         def _strip_inline_comment(line: str) -> str:
-            s = _re.sub(r'''(?x)(?<![\'\"\\])\s*\#[^\'\"]* $''', '', line)
+            s = re.sub(r'''(?x)(?<![\'\"\\])\s*\#[^\'\"]* $''', '', line)
             if s != line:
                 return s.rstrip()
-            return _re.sub(r'\s*//.*$', '', line).rstrip()
+            return re.sub(r'\s*//.*$', '', line).rstrip()
 
         def _comment_key(line: str) -> str:
             return _strip_inline_comment(line).rstrip()

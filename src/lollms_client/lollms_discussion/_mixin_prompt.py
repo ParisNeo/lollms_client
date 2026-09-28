@@ -32,6 +32,23 @@ class PromptMixin:
 
     # ─────────────────────────────────────── instruction builders ────────────
 
+    def _build_dynamic_effort_instructions(self) -> str:
+        """Instructions for dynamic reasoning effort escalation."""
+        return """
+=== DYNAMIC REASONING EFFORT PROTOCOL ===
+You can dynamically adjust your reasoning effort across rounds based on task complexity.
+Your initial effort setting is DEACTIVATED (none).
+When a task is simple, routine, or purely conversational, remain at effort="none" for fast execution.
+If you encounter complex logic, difficult bugs, multi-step algorithmic planning, or architectural decisions, you can adjust your thinking effort for the NEXT round by emitting:
+<effort level="none|low|medium|high"/>
+- level="none": Turn off reasoning/thinking for fast execution, simple lookups, or final responses.
+- level="low": Light reasoning for moderate checks.
+- level="medium": Standard deep reasoning for non-trivial logic.
+- level="high": Maximum reasoning depth for complex problems, mathematical proofs, or challenging refactoring.
+The effort change applies starting from your very next round. Output the tag on its own line when escalating or de-escalating effort.
+=== END DYNAMIC REASONING EFFORT PROTOCOL ===
+"""
+
     def _build_book_instructions(self) -> str:
         """Instructions for creating high-quality HTML books."""
         return """

@@ -3,7 +3,7 @@ title: "LCP Tool Architecture and Human Intervention Mastery"
 description: "Complete guide for authoring LCP tools, configuring AST schema extraction, host configuration injection, and implementing human-in-the-loop validation for CLI and GUI environments."
 category: "tool_engineering"
 tags: [lcp, tools, human_in_the_loop, security, ast, safe_mode, execution]
-visibility: visible
+visibility: loadable
 modifiable: true
 ---
 

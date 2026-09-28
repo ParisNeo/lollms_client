@@ -137,8 +137,26 @@ def build_deck_page(env: EnvStore, prefs: GuiPrefs) -> None:
     BORDER = "border-slate-200 dark:border-slate-800"
     HEADER_H = 42
 
-    resolved_llm = (env.resolve_default_connection("llm") if hasattr(env, "resolve_default_connection") else {}) or {}
-    model_str = f"{resolved_llm.get('binding_name') or '?'}:{resolved_llm.get('model_name') or 'default'}"
+    # Collect configured LLM model profiles for the header selector
+    llm_profiles = env.get_model_profiles("llm") if hasattr(env, "get_model_profiles") else {}
+    model_options = {}
+    active_alias = None
+
+    for p_alias, p_data in llm_profiles.items():
+        b_name = p_data.get("binding_name") or p_data.get("binding_profile_name") or "llm"
+        m_name = p_data.get("model_name") or p_alias
+        model_options[p_alias] = f"{b_name} / {m_name}"
+        if p_data.get("is_default"):
+            active_alias = p_alias
+
+    if not active_alias and model_options:
+        active_alias = next(iter(model_options))
+
+    if not model_options:
+        resolved_llm = (env.resolve_default_connection("llm") if hasattr(env, "resolve_default_connection") else {}) or {}
+        model_str = f"{resolved_llm.get('binding_name') or '?'}:{resolved_llm.get('model_name') or 'default'}"
+        model_options["default"] = model_str
+        active_alias = "default"
 
     # ---- Top Navigation Bar ----
     with ui.row().classes(
@@ -150,7 +168,24 @@ def build_deck_page(env: EnvStore, prefs: GuiPrefs) -> None:
             ui.label("·").classes("opacity-40 text-xs")
             ui.label("Projects Deck").classes("text-xs font-semibold opacity-90")
             ui.label("·").classes("opacity-40 text-xs")
-            ui.badge(model_str, color="indigo").props("dense rounded text-color=white").classes("text-[10px] font-mono")
+
+            def on_deck_model_change(e):
+                new_alias = e.value
+                if not new_alias:
+                    return
+                if hasattr(env, "set_default_profile"):
+                    env.set_default_profile("llm", new_alias)
+                ui.notify(f"Default model set to: {model_options.get(new_alias, new_alias)}", type="positive")
+
+            deck_model_select = ui.select(
+                model_options,
+                value=active_alias,
+            ).props(
+                'dense options-dense rounded outlined dark size="sm" color="white"'
+            ).classes(
+                "text-xs font-semibold bg-white/10 text-white min-w-[180px] max-w-[300px]"
+            ).tooltip("Select default LLM model profile")
+            deck_model_select.on_value_change(on_deck_model_change)
 
         with ui.row().classes("items-center gap-2"):
             ui.button("New Project", icon="add", on_click=lambda: open_add_workspace_dialog()).props(

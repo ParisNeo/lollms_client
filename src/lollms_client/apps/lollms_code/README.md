@@ -26,8 +26,14 @@ pip install lollms_client[app]
 # Single-prompt autonomous mode
 lollms-code "Implement a REST API client with retry logic"
 
-# Interactive REPL mode
-lollms-code -i
+# Interactive REPL mode with dynamic effort scaling
+lollms-code -i --dynamic-effort
+
+# Single prompt with fixed high reasoning effort
+lollms-code --effort high "Prove the convergence of the algorithm"
+
+# Unbounded autonomous mode (Infinite reasoning steps)
+lollms-code --max-steps 0 "Perform long-horizon refactor across entire codebase"
 
 # Target a specific project
 lollms-code --workspace ./myproject "add unit tests for all modules"
@@ -157,12 +163,31 @@ lollms-code --list-skills
 | Command | Description |
 |---|---|
 | `exit` / `quit` | Exit the REPL |
+| `/effort [level]` | Inspect or switch reasoning effort (`none`, `low`, `medium`, `high`, `dynamic`, `default`) |
 | `skills` | List all learned skills |
 | `clear` | Clear conversation history |
 | `models` | List available models for switching |
 | `/shell` | Toggle shell & Python execution autonomy (`safe` vs `full_access`) |
 | `/files` | List loaded workspace context files |
 | `/clear-files` | Unload all files from active context |
+
+---
+
+## ⚡ Dynamic Reasoning Effort & Fast GUI Control
+
+`lollms_code` provides full control over reasoning/thinking effort for models that support cognitive reasoning (e.g. OpenAI o-series, DeepSeek-R1, QwQ):
+
+- **Fast Effort Selector (GUI)**: Situated directly in the top status header of the desktop UI. Switch between `Model Default`, `Off (none)`, `Low`, `Med`, `High`, and `Dynamic (Auto)` instantly without leaving the chat.
+- **Dynamic Effort Escalation (`<effort level="..."/>`)**: When `--dynamic-effort` is active (or set to `Dynamic` in the GUI), the agent always begins at `none` (fast execution) and can climb on demand to `low`, `medium`, or `high` via `<effort level="none|low|medium|high"/>`.
+- **Sub-Agent Effort Conditioning**: Master agents delegating via `tool_spinoff_agent` can pass a known effort level (`effort="high"`) or enable sub-agent dynamic effort (`dynamic_effort=True`).
+
+---
+
+## ⚠️ Infinite Reasoning Rounds Mode (`--max-steps 0`)
+
+By setting `--max-steps 0` (or `0` in GUI settings), the agent operates in **Unbounded Autonomous Mode**:
+- The reasoning loop continues indefinitely until the agent explicitly emits `<done/>` or the user presses Stop/Ctrl+C.
+- **Safety Warning**: Unbounded execution can consume substantial token and API budgets if the model loops. Always monitor execution closely when operating in infinite mode!
 
 ## Security Modes & Confirmation Architecture
 

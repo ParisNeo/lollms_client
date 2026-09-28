@@ -37,14 +37,27 @@ from gui_prefs import GuiPrefs
 from env_config import EnvStore
 try:
     from deck_page import build_deck_page
-    from chat_page import build_chat_page
+    from chat_page import build_chat_page, ChatSession
     from settings_page import build_settings_page
 except ImportError:
     from lollms_client.apps.lollms_code.gui.deck_page import build_deck_page
-    from lollms_client.apps.lollms_code.gui.chat_page import build_chat_page
+    from lollms_client.apps.lollms_code.gui.chat_page import build_chat_page, ChatSession
     from lollms_client.apps.lollms_code.gui.settings_page import build_settings_page
 
-state = {"env": EnvStore(), "prefs": GuiPrefs.load()}
+state = {"env": EnvStore(), "prefs": GuiPrefs.load(), "sessions": {}}
+
+def get_or_create_session(env: EnvStore, prefs: GuiPrefs) -> ChatSession:
+    """Preserves and reattaches to the active session per workspace instead of recreating it."""
+    ws = str(Path(prefs.workspace_path).resolve())
+    if ws in state["sessions"]:
+        s = state["sessions"][ws]
+        # Update references in case preferences were modified
+        s.env = env
+        s.prefs = prefs
+        return s
+    s = ChatSession(env, prefs)
+    state["sessions"][ws] = s
+    return s
 
 # Register global application exception listener to prevent silent drops
 @nicegui_app.on_exception
@@ -68,10 +81,32 @@ html.dark, body.dark, body.body--dark {
 
 body.body--dark .q-card,
 html.dark .q-card,
-body.dark .q-card {
+body.dark .q-card,
+.q-card.q-card--dark {
+    background: #0f172a !important;
     background-color: #0f172a !important;
     border-color: #1e293b !important;
     color: #f1f5f9 !important;
+}
+
+html:not(.dark) body:not(.body--dark) .q-card:not(.q-card--dark) {
+    background: #f8fafc !important;
+    background-color: #f8fafc !important;
+    border-color: #e2e8f0 !important;
+    color: #0f172a !important;
+}
+
+body.body--dark .q-field__control,
+html.dark .q-field__control {
+    background: #020617 !important;
+    background-color: #020617 !important;
+    color: #f1f5f9 !important;
+}
+
+html:not(.dark) body:not(.body--dark) .q-field__control {
+    background: #ffffff !important;
+    background-color: #ffffff !important;
+    color: #0f172a !important;
 }
 
 body.body--dark .q-expansion-item,
@@ -290,19 +325,19 @@ def confirm_exit_dialog():
 
 def main():
     p = state["prefs"]
-    # Configure native window for edge-to-edge full-screen startup
-    if getattr(p, "start_fullscreen", True):
-        try:
-            nicegui_app.native.window_args["fullscreen"] = True
-        except Exception:
-            pass
+    # Configure native window for maximized startup instead of fullscreen
+    try:
+        nicegui_app.native.window_args["maximized"] = getattr(p, "start_maximized", True)
+        nicegui_app.native.window_args["fullscreen"] = False
+    except Exception:
+        pass
 
     try:
         ui.run(
             title="lollms_code",
             native=True,
             window_size=(p.window_width, p.window_height),
-            fullscreen=getattr(p, "start_fullscreen", False),
+            fullscreen=False,
             reload=False,
             dark=p.is_dark(),
         )
@@ -387,7 +422,28 @@ def chat_page_route():
         )
 
         HEADER_H = 40
-        resolved = env.resolve_default_connection("llm") or {}
+        session = get_or_create_session(env, prefs)
+
+        # Collect configured LLM model profiles for the header selector
+        llm_profiles = env.get_model_profiles("llm") if hasattr(env, "get_model_profiles") else {}
+        model_options = {}
+        active_alias = None
+
+        for p_alias, p_data in llm_profiles.items():
+            b_name = p_data.get("binding_name") or p_data.get("binding_profile_name") or "llm"
+            m_name = p_data.get("model_name") or p_alias
+            model_options[p_alias] = f"{b_name} / {m_name}"
+            if p_data.get("is_default"):
+                active_alias = p_alias
+
+        if not active_alias and model_options:
+            active_alias = next(iter(model_options))
+
+        if not model_options:
+            resolved = env.resolve_default_connection("llm") or {}
+            fallback_label = f"{resolved.get('binding_name') or '?'} / {resolved.get('model_name') or '?'}"
+            model_options["default"] = fallback_label
+            active_alias = "default"
 
         with ui.column().classes("w-full h-screen max-h-screen p-0 m-0 gap-0 flex flex-col overflow-hidden bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100"):
             # Header strip
@@ -403,10 +459,38 @@ def chat_page_route():
                     ui.icon("terminal", size="18px")
                     ui.label("lollms_code").classes("text-sm font-bold shrink-0")
                     ui.label("·").classes("text-xs opacity-40 shrink-0")
-                    ui.label(prefs.workspace_path).classes("text-xs opacity-80 truncate").style("max-width: 320px;").tooltip(prefs.workspace_path)
+                    ui.label(prefs.workspace_path).classes("text-xs opacity-80 truncate").style("max-width: 240px;").tooltip(prefs.workspace_path)
                     ui.label("·").classes("text-xs opacity-40 shrink-0")
-                    profile_label = f"{resolved.get('binding_name') or '?'} / {resolved.get('model_name') or '?'}"
-                    ui.label(profile_label).classes("text-xs opacity-80 shrink-0")
+
+                    # Interactive Model Profile Selector (sets active model as default)
+                    def on_header_model_select(e):
+                        new_alias = e.value
+                        if not new_alias:
+                            return
+                        env.set_default_profile("llm", new_alias)
+                        if session:
+                            session.ensure_ready()
+                            if session.client and hasattr(session.client, "switch_model"):
+                                try:
+                                    session.client.switch_model(new_alias)
+                                except Exception as ex:
+                                    ASCIIColors.warning(f"Could not hot-switch model: {ex}")
+                            try:
+                                import agent_bridge
+                                session.personality = agent_bridge.create_personality(prefs, session.client)
+                            except Exception as ex:
+                                ASCIIColors.warning(f"Could not refresh personality with new model: {ex}")
+                        ui.notify(f"Default model set to: {model_options.get(new_alias, new_alias)}", type="positive")
+
+                    header_model_select = ui.select(
+                        model_options,
+                        value=active_alias,
+                    ).props(
+                        'dense options-dense rounded outlined dark size="sm" color="white"'
+                    ).classes(
+                        "text-xs font-semibold bg-white/10 text-white min-w-[180px] max-w-[320px]"
+                    ).tooltip("Select active LLM binding & model profile (sets as default)")
+                    header_model_select.on_value_change(on_header_model_select)
 
                 with ui.row().classes("items-center gap-1 shrink-0"):
                     ui.button("Settings", icon="settings", on_click=lambda: ui.navigate.to("/settings")).props(
@@ -426,7 +510,7 @@ def chat_page_route():
                     ).props("flat round dense size=sm color=red text-color=white").tooltip("Exit Application")
 
             with ui.element("div").classes("w-full flex-1 min-h-0 flex flex-col overflow-hidden"):
-                build_chat_page(env, prefs)
+                build_chat_page(env, prefs, session=session)
 
     except Exception as e:
         err_msg = f"Crash rendering Chat Page: {e}\n{traceback.format_exc()}"
@@ -449,11 +533,13 @@ def settings_page_route():
     env = state["env"]
     env.load()
     prefs = state["prefs"]
+    dark_mode = ui.dark_mode(value=prefs.is_dark())
     apply_theme(prefs)
 
     def on_saved(e: EnvStore, p: GuiPrefs):
         e.save()
         state["env"].load()
+        dark_mode.set_value(p.is_dark())
         apply_theme(p)
         ui.notify("Settings saved.", type="positive")
         ui.navigate.to("/chat")

@@ -13,12 +13,13 @@ from gui_prefs import GuiPrefs
 from env_config import EnvStore
 import agent_bridge
 try:
-    from folder_picker import pick_folder
+    from folder_picker import pick_folder, pick_file
 except ImportError:
     try:
-        from lollms_client.apps.lollms_code.gui.folder_picker import pick_folder
+        from lollms_client.apps.lollms_code.gui.folder_picker import pick_folder, pick_file
     except ImportError:
         pick_folder = None
+        pick_file = None
 
 try:
     from memory_explorer import open_memory_explorer_dialog
@@ -61,30 +62,38 @@ Ctrl+Shift+C copy the last agent message.
 """
 
 SLASH_COMMANDS = [
-    ("/help", "Show command list"),
-    ("/plan", "View and edit active macro plan (CURRENT.md)"),
-    ("/current", "View active macro plan (CURRENT.md)"),
-    ("/scratchpad", "View and edit agent scratchpad notes"),
-    ("/zoo", "Open Zoo Package Hub (Tools, Skills, Personas)"),
-    ("/subws", "Open Sub-Workspace Manager (Documentation & Reference files)"),
-    ("/reference", "Open Sub-Workspace Manager (Documentation & Reference files)"),
-    ("/history", "Browse and resend prompt history"),
-    ("/clear-history", "Clear the conversation"),
-    ("/clear-files", "Unload all files from context"),
-    ("/load", "Load file(s) into context (or 'all')"),
-    ("/unload", "Remove file(s) from context"),
-    ("/lock", "Lock file(s) so the agent can't unlock them"),
-    ("/hide", "Hide file(s) from the workspace tree"),
-    ("/unhide", "Restore hidden file(s) to the tree"),
-    ("/skills", "List learned skills"),
-    ("/export", "Download the session as Markdown"),
-    ("/files", "Show loaded context files"),
-    ("/memories", "Open interactive Memory Explorer"),
-    ("/memory", "Open interactive Memory Explorer"),
-    ("/forget", "Wipe persistent memory"),
-    ("/workspace", "Switch workspace directory"),
-    ("/config", "Open Settings"),
-    ("/models", "Model switching info"),
+("/help", "Show command list"),
+("/explorer", "Open the workspace folder in system file explorer"),
+("/open", "Open the workspace folder in system file explorer"),
+("/dynamic", "Toggle Dynamic Mode on/off (autonomous effort, temperature, tokens)"),
+("/resume", "Resume the current incomplete turn from its round checkpoint"),
+("/sessions", "Open Sessions Manager (switch, resume, or start new sessions)"),
+("/plan", "View and edit active macro plan (CURRENT.md)"),
+("/current", "View active macro plan (CURRENT.md)"),
+("/scratchpad", "View and edit agent scratchpad notes"),
+("/zoo", "Open Zoo Package Hub (Tools, Skills, Personas)"),
+("/subws", "Open Sub-Workspace Manager (Documentation & Reference files)"),
+("/reference", "Open Sub-Workspace Manager (Documentation & Reference files)"),
+("/history", "Browse and resend prompt history"),
+("/clear-history", "Clear the conversation"),
+("/clear-files", "Unload all files from context"),
+("/load", "Load file(s) into context (or 'all')"),
+("/unload", "Remove file(s) from context"),
+("/lock", "Lock file(s) so the agent can't unlock them"),
+("/hide", "Hide file(s) from the workspace tree"),
+("/unhide", "Restore hidden file(s) to the tree"),
+("/skills", "List learned skills"),
+("/export", "Download the session as Markdown"),
+("/files", "Show loaded context files"),
+("/inspect", "Inspect full context and generation parameters sent to LLM (Ctrl+I)"),
+("/context", "Inspect full context and generation parameters sent to LLM (Ctrl+I)"),
+("/effort", "Configure reasoning effort (none/low/medium/high/dynamic/default)"),
+("/memories", "Open interactive Memory Explorer"),
+("/memory", "Open Memory Explorer or toggle with /memory on|off|toggle"),
+("/forget", "Wipe persistent memory"),
+("/workspace", "Switch workspace directory"),
+("/config", "Open Settings"),
+("/models", "Model switching info"),
 ]
 
 SHORTCUTS = [
@@ -97,13 +106,14 @@ SHORTCUTS = [
     ("Ctrl+F", "Search the conversation"),
     ("Esc", "Close search"),
     ("Ctrl+/", "Show this shortcut list"),
+    ("Ctrl+I", "Inspect full context payload & parameters sent to LLM"),
     ("Ctrl+Shift+C", "Copy the last agent message"),
     ("Theme button", "Cycle Auto → Light → Dark (Auto follows the clock)"),
 ]
 
 
 class ChatSession:
-    def __init__(self, env: EnvStore, prefs: GuiPrefs):
+    def __init__(self, env: EnvStore, prefs: GuiPrefs, session_id: Optional[str] = None):
         self.env = env
         self.prefs = prefs
         self.client = None
@@ -117,7 +127,162 @@ class ChatSession:
         self.prompt_history: List[str] = []
         self.history_index: int = -1
         self.turn_start_ts: Optional[float] = None
+
+        # Multi-session persistence attributes
+        self.session_id: str = session_id or datetime.now().strftime("session_%Y%m%d_%H%M%S")
+        self.session_title: str = "New Discussion"
+        self.debug_log: List[Dict[str, Any]] = []
+
         self.load_prompt_history()
+        if session_id:
+            self.load_from_disk(session_id)
+
+    @classmethod
+    def get_sessions_dir(cls, workspace_path: str) -> Path:
+        s_dir = Path(workspace_path).resolve() / ".lollms_code" / "sessions"
+        s_dir.mkdir(parents=True, exist_ok=True)
+        return s_dir
+
+    @classmethod
+    def list_saved_sessions(cls, workspace_path: str) -> List[Dict[str, Any]]:
+        s_dir = cls.get_sessions_dir(workspace_path)
+        sessions_meta = []
+        for f in sorted(s_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                sessions_meta.append({
+                    "id": data.get("session_id", f.stem),
+                    "title": data.get("title") or "Untitled Session",
+                    "updated_at": data.get("updated_at") or datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+                    "created_at": data.get("created_at") or "",
+                    "message_count": len(data.get("debug_log", [])),
+                    "path": str(f)
+                })
+            except Exception:
+                pass
+        return sessions_meta
+
+    def reconstruct_conversation_from_debug_log(self) -> List[Dict[str, str]]:
+        """Synthesizes valid user/assistant conversation history from debug_log entries."""
+        reconstructed = []
+        current_user = None
+        current_assistant_parts = []
+
+        for entry in self.debug_log:
+            k = entry.get("type")
+            if k == "user":
+                if current_user is not None:
+                    asst_txt = "\n\n".join(p for p in current_assistant_parts if p.strip()).strip()
+                    if not asst_txt:
+                        asst_txt = "[Turn interrupted before final answer]"
+                    reconstructed.append({"role": "user", "content": current_user})
+                    reconstructed.append({"role": "assistant", "content": asst_txt})
+                    current_assistant_parts = []
+                current_user = entry.get("text", "")
+            elif k == "agent":
+                t = entry.get("text", "").strip()
+                if t:
+                    current_assistant_parts.append(t)
+            elif k == "event":
+                title = entry.get("title", "")
+                body = entry.get("body", "")
+                if "Saved:" in title or "Patched:" in title or "Finished:" in title:
+                    current_assistant_parts.append(f"[{title}]")
+
+        if current_user is not None:
+            asst_txt = "\n\n".join(p for p in current_assistant_parts if p.strip()).strip()
+            reconstructed.append({"role": "user", "content": current_user})
+            if asst_txt:
+                reconstructed.append({"role": "assistant", "content": asst_txt})
+
+        return reconstructed
+
+    def get_last_user_prompt(self) -> Optional[str]:
+        for entry in reversed(self.debug_log):
+            if entry.get("type") == "user":
+                t = entry.get("text", "").strip()
+                if t and not t.startswith("/"):
+                    return t
+        return None
+
+    def has_incomplete_turn(self) -> bool:
+        if self.busy or not self.debug_log:
+            return False
+        # Check if the last entry is a user message without completed agent response
+        last_user_idx = -1
+        last_agent_idx = -1
+        for idx, entry in enumerate(self.debug_log):
+            if entry.get("type") == "user":
+                last_user_idx = idx
+            elif entry.get("type") == "agent" and entry.get("text", "").strip():
+                last_agent_idx = idx
+
+        if last_user_idx != -1 and last_agent_idx < last_user_idx:
+            return True
+
+        # Check turn checkpoint on disk
+        p_chk = Path(self.prefs.workspace_path).resolve() / ".lollms_code" / "turn_checkpoint.json"
+        if p_chk.exists():
+            try:
+                c_data = json.loads(p_chk.read_text(encoding="utf-8"))
+                if c_data.get("status") in ("in_progress", "cancelled"):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def save_to_disk(self) -> None:
+        try:
+            s_dir = self.get_sessions_dir(self.prefs.workspace_path)
+            f_path = s_dir / f"{self.session_id}.json"
+            conv = []
+            if self.personality and hasattr(self.personality, "_conversation") and self.personality._conversation:
+                conv = self.personality._conversation
+            else:
+                conv = self.reconstruct_conversation_from_debug_log()
+
+            if self.session_title == "New Discussion":
+                for entry in self.debug_log:
+                    if entry.get("type") == "user":
+                        t = entry.get("text", "").strip()
+                        if t and not t.startswith("/"):
+                            self.session_title = t[:60] + ("..." if len(t) > 60 else "")
+                            break
+
+            payload = {
+                "session_id": self.session_id,
+                "title": self.session_title,
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "workspace_path": self.prefs.workspace_path,
+                "debug_log": self.debug_log,
+                "conversation": conv,
+            }
+            f_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    def load_from_disk(self, target_session_id: str) -> bool:
+        try:
+            s_dir = self.get_sessions_dir(self.prefs.workspace_path)
+            f_path = s_dir / f"{target_session_id}.json"
+            if not f_path.exists():
+                return False
+            data = json.loads(f_path.read_text(encoding="utf-8"))
+            self.session_id = data.get("session_id", target_session_id)
+            self.session_title = data.get("title", "Saved Discussion")
+            self.debug_log = data.get("debug_log", [])
+
+            self.ensure_ready()
+            conv = data.get("conversation", [])
+            if not conv:
+                conv = self.reconstruct_conversation_from_debug_log()
+
+            if self.personality:
+                self.personality._conversation = conv
+            return True
+        except Exception:
+            return False
 
     def get_prompt_history_path(self) -> Path:
         return Path(self.prefs.workspace_path).resolve() / ".lollms_code" / "prompt_history.json"
@@ -150,9 +315,11 @@ class ChatSession:
             self.personality = agent_bridge.create_personality(self.prefs, self.client)
 
 
-def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
-    session = ChatSession(env, prefs)
-    debug_log: List[Dict[str, Any]] = []
+def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: Optional[ChatSession] = None) -> None:
+    if session is None:
+        session = ChatSession(env, prefs)
+    # Sync with persistent session log
+    debug_log: List[Dict[str, Any]] = session.debug_log
     message_refs: Dict[str, Dict[str, Any]] = {}
     last_agent_state: Dict[str, Any] = {"entry": None}
     _msg_counter = 0
@@ -186,6 +353,29 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
     theme_btn = None
     thinking_indicator = None
     thinking_label = None
+
+    # Smart Scroll State: auto-follows stream ONLY when at the bottom
+    scroll_state = {"auto_follow": True}
+
+    def open_workspace_in_explorer(target_path: Optional[str] = None):
+        """Cross-platform launcher to open a directory in the OS default file explorer."""
+        import os
+        import subprocess
+        import sys
+        try:
+            p = Path(target_path or prefs.workspace_path).resolve()
+            if not p.exists():
+                ui.notify(f"Path does not exist: {p}", type="warning")
+                return
+            if sys.platform.startswith("win"):
+                os.startfile(str(p))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(p)])
+            else:
+                subprocess.Popen(["xdg-open", str(p)])
+            ui.notify(f"Opened in file explorer: {p.name}", type="info", timeout=1500)
+        except Exception as ex:
+            notify_error(f"Could not open file explorer: {ex}")
 
     # ── Core Action & Dialog Helpers (Defined First to Avoid UnboundLocalError) ─
     def set_prompt_input(text_to_set: str):
@@ -263,7 +453,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     ui.element("span").classes("w-1.5 h-1.5 rounded-full bg-primary animate-bounce").style(
                         "animation-delay: 0s; animation-duration: 1.1s;"
                     )
-        if scroll_area:
+        if scroll_area and scroll_state.get("auto_follow", True):
             scroll_area.scroll_to(percent=1.0)
 
     def hide_thinking_indicator():
@@ -367,18 +557,107 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
             with ui.row().classes("items-center gap-2"):
                 ui.button(
                     "Projects", icon="view_carousel",
-                    on_click=lambda: ui.navigate.to("/"),
+                    on_click=lambda: (session.save_to_disk(), ui.navigate.to("/")),
                 ).props("flat dense size=sm no-caps text-color=primary font-semibold").tooltip("Return to Workspace Deck")
                 tree_toggle_btn = ui.button(
                     "Tree", icon="folder",
                     on_click=lambda: toggle_tree_visibility(),
                 ).props("flat dense size=sm no-caps text-color=primary").tooltip("Toggle Workspace Tree")
+                ui.button(
+                    "Sessions", icon="history_edu",
+                    on_click=lambda: open_sessions_dialog(),
+                ).props("flat dense size=sm no-caps text-color=primary font-semibold").tooltip("Manage and resume sessions in this workspace")
+                
+                # ---- Dynamic Mode Quick Toggle ----
+                def _toggle_dynamic_mode():
+                    is_active = getattr(prefs, "dynamic_effort", False)
+                    new_state = not is_active
+                    prefs.dynamic_effort = new_state
+                    prefs.auto_temperature = new_state
+                    prefs.auto_max_tokens = new_state
+                    try:
+                        prefs.save()
+                    except Exception:
+                        pass
+
+                    if session.personality:
+                        session.personality.dynamic_effort = new_state
+
+                    effort_select.value = "dynamic" if new_state else "default"
+                    _sync_dynamic_button()
+                    ui.notify(
+                        f"⚡ Dynamic Mode {'ACTIVATED' if new_state else 'DEACTIVATED'} (Auto effort, temperature, tokens).",
+                        type="positive" if new_state else "info"
+                    )
+
+                def _sync_dynamic_button():
+                    is_active = getattr(prefs, "dynamic_effort", False)
+                    dynamic_btn.text = "⚡ Dynamic: ON" if is_active else "⚡ Dynamic: OFF"
+                    dynamic_btn._props["color"] = "amber" if is_active else "grey"
+                    dynamic_btn._props["text-color"] = "black" if is_active else "white"
+                    dynamic_btn.update()
+
+                dynamic_btn = ui.button(
+                    "⚡ Dynamic: ON" if getattr(prefs, "dynamic_effort", False) else "⚡ Dynamic: OFF",
+                    icon="bolt",
+                    on_click=_toggle_dynamic_mode,
+                ).props(
+                    f"unelevated dense size=sm no-caps font-bold "
+                    + (f"color=amber text-color=black" if getattr(prefs, "dynamic_effort", False) else "color=grey text-color=white")
+                ).tooltip("Toggle Dynamic Mode: Autonomous reasoning effort scaling, auto temperature, and auto tokens")
+
+                resume_turn_btn = ui.button(
+                    "Resume Turn", icon="play_arrow",
+                    on_click=lambda: resume_active_turn(),
+                ).props("unelevated dense size=sm no-caps color=emerald text-color=white font-bold shadow-sm")
+                resume_turn_btn.tooltip("Resume an interrupted or paused turn from its round checkpoint")
+                resume_turn_btn.set_visibility(False)
                 status_label = ui.label("Idle").classes(f"text-xs {MUTED} font-mono font-medium")
                 elapsed_label = ui.label("").classes(f"text-xs {MUTED_DIM} font-mono")
 
+            
             with ui.row().classes("items-center gap-2"):
                 rounds_label = ui.label("").classes(f"text-xs {MUTED} font-mono font-medium")
                 ctx_label = ui.label("").classes(f"text-xs {MUTED} font-mono font-medium")
+
+                # ---- Fast Effort Selector ----
+                effort_options = {
+                    "default": "⚡ Effort: Default",
+                    "none": "⚡ Effort: Off",
+                    "low": "🧠 Effort: Low",
+                    "medium": "🧠 Effort: Med",
+                    "high": "🧠 Effort: High",
+                    "dynamic": "🔄 Effort: Dynamic",
+                }
+                curr_effort_val = "dynamic" if getattr(prefs, "dynamic_effort", False) else (getattr(prefs, "reasoning_effort", None) or "default")
+
+                def _on_fast_effort_change(e):
+                    val = e.value
+                    if val == "dynamic":
+                        prefs.dynamic_effort = True
+                        prefs.reasoning_effort = None
+                        ui.notify("Reasoning effort: Dynamic (Auto-adjusting via <effort> tags).", type="positive")
+                    elif val == "default":
+                        prefs.dynamic_effort = False
+                        prefs.reasoning_effort = None
+                        ui.notify("Reasoning effort: Model Default.", type="info")
+                    else:
+                        prefs.dynamic_effort = False
+                        prefs.reasoning_effort = val
+                        ui.notify(f"Reasoning effort: {val.capitalize()}.", type="positive")
+                    try:
+                        prefs.save()
+                    except Exception:
+                        pass
+
+                effort_select = ui.select(
+                    effort_options,
+                    value=curr_effort_val,
+                ).props("dense options-dense outlined size=sm").classes(
+                    f"text-xs w-36 bg-slate-50 dark:bg-slate-900 {STRONG}"
+                ).tooltip("Fast reasoning effort selector: switch between Off, Low, Med, High, and Dynamic Auto-escalation")
+                effort_select.on_value_change(_on_fast_effort_change)
+
                 if tools_toggle is None:
                     tools_toggle = ui.switch("Tool panels", value=prefs.show_tool_calls).props("dense")
                 ui.button(
@@ -397,10 +676,24 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     icon="keyboard",
                     on_click=lambda: open_shortcuts_dialog(),
                 ).props("flat dense round size=sm").tooltip("Keyboard shortcuts (Ctrl+/)")
-                ui.button(
-                    "Memories", icon="psychology",
+                def _toggle_mem_quick():
+                    prefs.enable_memory = not prefs.enable_memory
+                    prefs.save()
+                    session.personality = agent_bridge.create_personality(prefs, session.client)
+                    mem_toggle_btn._props["text-color"] = "purple" if prefs.enable_memory else "grey"
+                    mem_toggle_btn.text = "Memories: ON" if prefs.enable_memory else "Memories: OFF"
+                    mem_toggle_btn.update()
+                    ui.notify(f"Memory is now {'ENABLED' if prefs.enable_memory else 'DISABLED'}.", type="positive" if prefs.enable_memory else "info")
+
+                mem_toggle_btn = ui.button(
+                    "Memories: ON" if prefs.enable_memory else "Memories: OFF", icon="psychology",
                     on_click=lambda: open_memory_explorer_dialog(session, prefs) if open_memory_explorer_dialog else ui.notify("Memory Explorer not available", type="warning"),
-                ).props("flat dense size=sm no-caps text-color=purple").tooltip("Open Memory Explorer (inspect, edit, dream)")
+                ).props(f"flat dense size=sm no-caps text-color={'purple' if prefs.enable_memory else 'grey'}").tooltip("Open Memory Explorer (or click to inspect; toggle via /memory on|off)")
+
+                ui.button(
+                    "Inspect Context", icon="manage_search",
+                    on_click=lambda: open_context_inspector_dialog(),
+                ).props("flat dense size=sm no-caps text-color=cyan font-semibold").tooltip("Inspect full context, prompt messages, and parameters sent to the agent (Ctrl+I)")
                 ui.button(
                     "Zoo Hub", icon="pets",
                     on_click=lambda: open_zoo_dialog(),
@@ -425,7 +718,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     "Export History", icon="download",
                     on_click=lambda: export_history(),
                 ).props("flat dense size=sm no-caps").tooltip("Download the full session as a Markdown file")
-                ui.button("Settings", icon="settings", on_click=lambda: ui.navigate.to("/settings")).props(
+                ui.button("Settings", icon="settings", on_click=lambda: (session.save_to_disk(), ui.navigate.to("/settings"))).props(
                     "flat dense size=sm no-caps"
                 )
 
@@ -461,7 +754,10 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     with ui.tab_panel('workspace').classes('w-full h-full p-0 flex flex-col overflow-hidden gap-0'):
                         with ui.row().classes(f"w-full items-center justify-between px-3 py-2 border-b {BORDER} shrink-0"):
                             ui.label("📁 Project Root").classes(f"text-xs font-bold {STRONG}")
-                            with ui.row().classes("gap-1"):
+                            with ui.row().classes("gap-1 items-center"):
+                                ui.button(icon="folder_open", on_click=lambda: open_workspace_in_explorer()).props(
+                                    "flat round dense size=xs text-color=primary"
+                                ).tooltip("Open workspace in system file explorer (Explorer / Finder)")
                                 ui.button(icon="upload_file", on_click=lambda: upload_dialog.open()).props(
                                     "flat round dense size=xs"
                                 ).tooltip("Upload a file into the workspace root")
@@ -481,18 +777,30 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     # --- Tab 2: Sub-Workspace Reference Tree (.lollms_code/sub_workspace/) ---
                     with ui.tab_panel('subws').classes('w-full h-full p-0 flex flex-col overflow-hidden gap-0'):
                         with ui.row().classes(f"w-full items-center justify-between px-3 py-2 border-b {BORDER} shrink-0"):
-                            ui.label("📚 Sub-Workspace").classes(f"text-xs font-bold {STRONG}")
+                            with ui.row().classes("items-center gap-1.5"):
+                                ui.label("📚 Sub-Workspace").classes(f"text-xs font-bold {STRONG}")
+                                ui.button(icon="folder_open", on_click=lambda: open_workspace_in_explorer(str(Path(prefs.workspace_path).resolve() / ".lollms_code" / "sub_workspace"))).props(
+                                    "flat round dense size=xs text-color=emerald"
+                                ).tooltip("Open sub_workspace in system file explorer")
                             with ui.row().classes("gap-0.5"):
                                 async def _import_subws_file_sidebar():
-                                    _picker = pick_folder
+                                    _picker = pick_file
                                     if _picker:
-                                        chosen = await _picker(title="Select File to Import into Sub-Workspace")
+                                        chosen = await _picker(
+                                            title="Select Reference File to Import",
+                                            file_types=[("All Files", "*.*")]
+                                        )
                                         if chosen:
                                             try:
+                                                p = Path(chosen)
                                                 from lollms_client.apps.lollms_code.sub_workspace import SubWorkspaceManager
                                                 sub_ws = SubWorkspaceManager(prefs.workspace_path)
-                                                dest = sub_ws.import_file(chosen)
-                                                ui.notify(f"Imported reference: {dest.name}", type="positive")
+                                                if p.is_dir():
+                                                    imported = sub_ws.import_folder(p)
+                                                    ui.notify(f"Imported folder with {len(imported)} reference file(s).", type="positive")
+                                                else:
+                                                    dest = sub_ws.import_file(p)
+                                                    ui.notify(f"Imported reference: {dest.name}", type="positive")
                                                 refresh_subws_tree()
                                             except Exception as ex:
                                                 notify_error(f"Import failed: {ex}")
@@ -553,10 +861,29 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                         with subws_tree_scroll:
                             subws_tree_container = ui.column().classes("w-full gap-0 p-0")
 
-            # ---- Transcript ----
-            scroll_area = ui.scroll_area().classes(f"flex-1 h-full min-w-0 {CANVAS}")
+            # ---- Transcript with Smart Auto-Scroll ----
+            scroll_area = ui.scroll_area().classes(f"flex-1 h-full min-w-0 {CANVAS} relative")
+
+            def handle_transcript_scroll(e):
+                """Tracks whether user has manually scrolled away from bottom."""
+                try:
+                    v_pos = getattr(e, "vertical_position", None)
+                    v_size = getattr(e, "vertical_size", None)
+                    c_size = getattr(e, "vertical_container_size", None)
+
+                    if v_pos is not None and v_size is not None and c_size is not None:
+                        # User is at bottom if viewport position + container height is near total content height
+                        at_bottom = (v_pos + c_size) >= (v_size - 60)
+                        scroll_state["auto_follow"] = at_bottom
+                    elif hasattr(e, "vertical_percentage") and e.vertical_percentage is not None:
+                        scroll_state["auto_follow"] = e.vertical_percentage >= 0.95
+                except Exception:
+                    pass
+
+            scroll_area.on_scroll(handle_transcript_scroll)
+
             with scroll_area:
-                transcript = ui.column().classes("w-full gap-3 p-4")
+                transcript = ui.column().classes("w-full gap-3 p-4 pb-16")
 
             # ---- Right-hand live panels ----
             live_sidebar = ui.column().classes(
@@ -591,6 +918,24 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     scratchpad_badge = ui.badge("0", color="blue").props("floating").bind_visibility_from(
                         session, "current_round", backward=lambda r: session.busy and r > 0
                     )
+
+        # ---- Incomplete Turn / Resume Task Banner ----
+        resume_banner = ui.row().classes(
+            f"w-full items-center justify-between px-4 py-2 shrink-0 bg-amber-500/10 dark:bg-amber-400/10 "
+            f"border-t border-b border-amber-500/30 text-xs text-amber-800 dark:text-amber-200 transition-all"
+        )
+        resume_banner.visible = False
+        with resume_banner:
+            with ui.row().classes("items-center gap-2 flex-1 min-w-0"):
+                ui.icon("pending_actions", size="18px").classes("text-amber-500 shrink-0 animate-pulse")
+                resume_banner_label = ui.label("Incomplete turn detected.").classes("truncate font-semibold")
+
+            with ui.row().classes("items-center gap-2 shrink-0"):
+                ui.button(
+                    "Resume Task", icon="play_arrow",
+                    on_click=lambda: resume_active_turn(),
+                ).props("unelevated dense size=sm color=primary no-caps font-bold").tooltip("Resume the interrupted task directly")
+                ui.button(icon="close", on_click=lambda: resume_banner.set_visibility(False)).props("flat dense round size=xs color=grey")
 
         # ---- Slash-command suggestions (shown above the input, hidden by default) ----
         suggestions_row = ui.row().classes(
@@ -641,35 +986,38 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         with ui.row().classes("w-full justify-end mt-2"):
             ui.button("Close", on_click=upload_dialog.close).props("flat")
 
-    def add_user_bubble(text: str) -> str:
+    def add_user_bubble(text: str, persist: bool = True) -> str:
         msg_id = f"msg_{next_message_id()}"
         entry = {"type": "user", "text": text, "id": msg_id}
         debug_log.append(entry)
+        if persist:
+            session.save_to_disk()
         with transcript:
             outer_row = ui.row().classes("w-full justify-end items-start gap-1")
             with outer_row:
-                actions = ui.row().classes("opacity-40 hover:opacity-100 transition-opacity gap-0")
+                actions = ui.row().classes("opacity-50 hover:opacity-100 transition-opacity gap-0.5 items-center")
                 with actions:
-                    use_btn = ui.button(icon="edit_note", on_click=lambda t=text: set_prompt_input(t)).props(
+                    edit_btn = ui.button(icon="edit", on_click=lambda m=msg_id: open_edit_dialog(m)).props(
                         "flat round dense size=xs text-color=primary"
-                    )
-                    use_btn.tooltip("Copy prompt into input box to edit")
-                    edit_btn = ui.button(icon="edit", on_click=lambda: open_edit_dialog(msg_id)).props(
-                        "flat round dense size=xs"
-                    )
-                    edit_btn.tooltip("Edit this prompt in place")
-                    rerun_btn = ui.button(icon="replay", on_click=lambda: rerun_prompt(msg_id)).props(
-                        "flat round dense size=xs"
-                    )
-                    rerun_btn.tooltip("Rerun this prompt")
-                    del_btn = ui.button(icon="delete", on_click=lambda: delete_message(msg_id)).props(
+                    ).tooltip("Edit and resend from this point (truncates following history)")
+
+                    resend_btn = ui.button(icon="replay", on_click=lambda m=msg_id: resend_from_point(m)).props(
+                        "flat round dense size=xs text-color=amber"
+                    ).tooltip("Resend from this point (truncates following history)")
+
+                    use_btn = ui.button(icon="edit_note", on_click=lambda t=text: set_prompt_input(t)).props(
+                        "flat round dense size=xs color=grey"
+                    ).tooltip("Copy to input box")
+
+                    del_btn = ui.button(icon="delete", on_click=lambda m=msg_id: delete_message(m)).props(
                         "flat round dense size=xs color=red"
-                    )
-                    del_btn.tooltip("Delete message")
+                    ).tooltip("Delete message")
+
                 bubble = ui.markdown(text).classes(
                     "bg-primary text-white rounded-lg px-3 py-1.5 max-w-[75%]"
                 )
         message_refs[msg_id] = {"entry": entry, "row": outer_row, "bubble": bubble, "text": text}
+        scroll_state["auto_follow"] = True
         scroll_area.scroll_to(percent=1.0)
         return msg_id
 
@@ -753,32 +1101,126 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     on_click=lambda entry_ref=entry: copy_system_notice(entry_ref),
                 ).props("flat round dense size=xs")
                 copy_btn.tooltip("Copy this notice" + (" (error)" if is_error else ""))
-        scroll_area.scroll_to(percent=1.0)
+        if scroll_state.get("auto_follow", True):
+            scroll_area.scroll_to(percent=1.0)
 
-    def add_event_panel(title: str, subtitle: str, body: str, color: str, icon: str) -> ui.expansion:
+    def update_code_box(cb, text: str):
+        if not cb:
+            return
+        clean_text = text if text else "(waiting for output...)"
+        try:
+            if hasattr(cb, "set_text"):
+                cb.set_text(clean_text)
+            else:
+                cb.text = clean_text
+            cb.update()
+        except Exception:
+            try:
+                cb.text = clean_text
+                cb.update()
+            except Exception:
+                pass
+
+    def add_event_panel(
+        title: str,
+        subtitle: str,
+        body: str,
+        color: str,
+        icon: str,
+        with_spinner: bool = False,
+        expanded: bool = False,
+        record: bool = True
+    ) -> ui.expansion:
         entry = {"type": "event", "title": title, "subtitle": subtitle, "body": body}
-        debug_log.append(entry)
+        if record:
+            debug_log.append(entry)
         border_color_class = f"border-{color}" if color.startswith("red") or color.startswith("green") or color.startswith("blue") or color.startswith("amber") or color.startswith("purple") else "border-primary"
+
         with transcript:
-            panel = ui.expansion(title, icon=icon).classes(
+            panel = ui.expansion("", value=expanded).classes(
                 f"w-full max-w-[90%] border-l-4 {border_color_class} bg-slate-100/90 dark:bg-slate-900/80 "
                 f"border border-slate-300 dark:border-slate-800 text-slate-900 dark:text-slate-100 rounded-r-md text-xs shadow-sm"
-            ).props('header-class="text-slate-900 dark:text-slate-100 font-semibold text-xs py-1.5"')
+            ).props(':dark="Quasar.Dark.isActive" header-class="py-1 px-2.5 text-xs text-slate-900 dark:text-slate-100"')
             panel.bind_visibility_from(tools_toggle, "value")
+
+            with panel.add_slot("header"):
+                with ui.row().classes("w-full items-center justify-between gap-2 flex-nowrap"):
+                    with ui.row().classes("items-center gap-2 min-w-0 flex-1"):
+                        header_icon = ui.icon(icon, size="16px").classes(f"text-{color} shrink-0")
+                        spinner = ui.spinner(size="14px", color="primary").classes("shrink-0")
+                        spinner.set_visibility(with_spinner)
+                        title_label = ui.label(title).classes("font-semibold text-xs truncate")
+                        sub_label = ui.label(subtitle).classes(f"text-[11px] {MUTED_DIM} font-mono truncate flex-1")
+                        if not subtitle:
+                            sub_label.set_visibility(False)
+
             with panel:
-                with ui.row().classes("w-full items-center justify-between mb-1"):
-                    if subtitle:
-                        ui.label(subtitle).classes("text-xs text-slate-600 dark:text-slate-400 font-mono")
+                with ui.row().classes("w-full items-center justify-end mb-1"):
                     copy_btn = ui.button(
                         icon="content_copy",
                         on_click=lambda e_ref=entry: copy_event_body(e_ref),
                     ).props("flat round dense size=xs color=grey")
                     copy_btn.tooltip("Copy panel content")
-                ui.code(body or "(no output)").classes(
-                    "w-full text-xs bg-slate-900 dark:bg-slate-950 text-slate-100 p-2.5 rounded border border-slate-700 dark:border-slate-800"
+
+                # High-contrast reactive code box adapting to light/dark themes
+                code_box = ui.label(body or "(waiting for output...)").classes(
+                    "w-full text-xs p-3 rounded-lg border font-mono whitespace-pre-wrap select-all leading-relaxed max-h-96 overflow-auto block "
+                    "bg-slate-900 text-slate-100 border-slate-700 dark:bg-slate-950 dark:text-slate-200 dark:border-slate-800"
                 )
+
+        panel._title_label = title_label
+        panel._sub_label = sub_label
+        panel._header_icon = header_icon
+        panel._spinner = spinner
+        panel._code_box = code_box
         panel._debug_entry = entry
+        panel._user_toggled = False
+
+        panel.on("click", lambda: setattr(panel, "_user_toggled", True))
         return panel
+
+    def _extract_structural_header_title(text_buffer: str) -> Optional[str]:
+        """
+        Extracts ONLY structural symbols (Markdown headers, function names, class definitions).
+        Never returns raw content lines, table rows, or variable statements.
+        """
+        if not text_buffer:
+            return None
+        lines = text_buffer.splitlines()
+        for line in reversed(lines):
+            st = line.strip()
+            if not st:
+                continue
+
+            # Markdown headings
+            m_h = re.match(r'^(#{1,6})\s+(.+)$', st)
+            if m_h:
+                lvl = len(m_h.group(1))
+                h_name = m_h.group(2).strip()
+                prefix = "Section" if lvl <= 2 else "Subsection"
+                return f"{prefix}: {h_name}"
+
+            # Python function/class
+            m_py = re.match(r'^(?:async\s+)?(def|class)\s+([a-zA-Z_][a-zA-Z0-9_]*)', st)
+            if m_py:
+                return f"{m_py.group(1)} {m_py.group(2)}()"
+
+            # JS/TS/Rust functions & components
+            m_js = re.match(r'^(?:export\s+)?(?:async\s+)?(function|class|interface|type)\s+([a-zA-Z_][a-zA-Z0-9_]*)', st)
+            if m_js:
+                return f"{m_js.group(1)} {m_js.group(2)}"
+
+        return None
+
+    def find_active_artefact_item(target_title: str) -> Optional[Dict[str, Any]]:
+        if target_title in active_artefact_panels:
+            return active_artefact_panels[target_title]
+        clean_target = target_title.replace("\\", "/").strip().lstrip("./")
+        for k, v in active_artefact_panels.items():
+            clean_k = k.replace("\\", "/").strip().lstrip("./")
+            if clean_k == clean_target or Path(k).name == Path(target_title).name:
+                return v
+        return None
 
     def copy_event_body(entry: Dict[str, Any]):
         try:
@@ -844,23 +1286,166 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         _update_input_counter()
         ui.notify("Copied to prompt input.", type="info", timeout=1200)
 
-    async def rerun_prompt(msg_id: str):
-        """Re-sends a previously sent prompt as a fresh agent turn (history preserved)."""
-        entry = find_message_entry(msg_id)
+    def truncate_history_from_user_msg(target_msg_id: str) -> Optional[str]:
+        """
+        Enforces linear history by discarding all messages, events, and conversation turns
+        occurring AFTER the specified user message. Returns the prompt text of the target message.
+        """
+        entry = find_message_entry(target_msg_id)
         if entry is None or entry.get("type") != "user":
-            ui.notify("Cannot rerun this message.", type="warning")
-            return
-        prompt_text = re.sub(r"^🔁 _Rerun:_\s*", "", entry.get("text", "").strip())
-        if not prompt_text:
-            ui.notify("Nothing to rerun.", type="warning")
-            return
+            return None
+
+        # 1. Truncate debug_log
+        try:
+            target_idx = session.debug_log.index(entry)
+        except ValueError:
+            target_idx = -1
+            for idx, e in enumerate(session.debug_log):
+                if e.get("id") == target_msg_id:
+                    target_idx = idx
+                    break
+
+        if target_idx == -1:
+            return None
+
+        # Count how many user messages preceded this one
+        user_turn_index = 0
+        for i in range(target_idx):
+            if session.debug_log[i].get("type") == "user":
+                user_turn_index += 1
+
+        # Keep debug_log up to target_idx
+        session.debug_log[:] = session.debug_log[:target_idx + 1]
+
+        # 2. Truncate personality._conversation to match linear history
+        if session.personality and hasattr(session.personality, "_conversation"):
+            conv = session.personality._conversation
+            # Each turn has 1 user + 1 assistant message. Keep only prior user turns.
+            keep_conv_len = user_turn_index * 2
+            if keep_conv_len < len(conv):
+                session.personality._conversation = conv[:keep_conv_len]
+
+        # 3. Clean turn checkpoints on disk
+        if session.personality and hasattr(session.personality, "_get_checkpoint_path"):
+            chk_p = session.personality._get_checkpoint_path()
+            if chk_p and chk_p.exists():
+                try:
+                    chk_p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        session.save_to_disk()
+        return entry.get("text", "")
+
+    async def resend_from_point(msg_id: str):
+        """Discards all subsequent turns and re-executes the agent from this user prompt."""
         if session.busy:
-            ui.notify("Agent is busy — wait for the current turn to finish.", type="warning")
+            ui.notify("Agent is busy — stop or wait for current turn to finish.", type="warning")
             return
-        await send_prompt_with_text(prompt_text, rerun_marker=True)
+
+        prompt_text = truncate_history_from_user_msg(msg_id)
+        if not prompt_text:
+            ui.notify("Message could not be found to resend.", type="warning")
+            return
+
+        # Repaint transcript to reflect truncated linear history
+        replay_transcript_from_log()
+        ui.notify("Discarded subsequent history. Continuing from this point...", type="info")
+
+        # Launch fresh turn from this linear point
+        session.busy = True
+        session.turn_start_ts = time.time()
+        send_button.props("loading")
+        status_label.set_text("Thinking…")
+        show_thinking_indicator("Thinking…")
+
+        try:
+            session.ensure_ready()
+        except Exception as e:
+            notify_error(f"Could not start agent: {e}")
+            session.busy = False
+            session.turn_start_ts = None
+            send_button.props(remove="loading")
+            return
+
+        agent_bridge.run_agent_turn_in_thread(
+            session.personality, session.client, effective_prompt, prefs, session.event_queue, use_history=True
+        )
+
+    def open_edit_dialog(msg_id: str):
+        ref = message_refs.get(msg_id)
+        entry = find_message_entry(msg_id)
+        if ref is None or entry is None:
+            ui.notify("Message not found.", type="warning")
+            return
+
+        with ui.dialog() as dialog, ui.card().classes(
+            f"w-[640px] max-w-[95vw] p-5 {CANVAS} text-slate-900 dark:text-slate-100 rounded-xl border {BORDER} shadow-2xl gap-3"
+        ):
+            with ui.row().classes(f"w-full items-center justify-between pb-2 border-b {BORDER}"):
+                with ui.row().classes("items-center gap-2"):
+                    ui.icon("edit", size="22px").classes("text-primary")
+                    ui.label("Edit Prompt & Resend (Linear History)").classes("text-base font-bold")
+                ui.button(icon="close", on_click=dialog.close).props("flat round dense size=xs")
+
+            ui.label(
+                "Editing this prompt will discard all subsequent discussion turns and continue execution linearly from this point."
+            ).classes(f"text-xs {MUTED_DIM}")
+
+            editor = ui.textarea(value=entry.get("text", "")).classes(
+                f"w-full text-xs font-mono {SURFACE} rounded border {BORDER} p-2"
+            ).props(':dark="Quasar.Dark.isActive" outlined autogrow rows=4')
+
+            with ui.row().classes(f"w-full items-center justify-between pt-2 border-t {BORDER}"):
+                ui.button("Cancel", on_click=dialog.close).props("flat dense no-caps")
+
+                async def save_and_resend():
+                    new_text = (editor.value or "").strip()
+                    if not new_text:
+                        ui.notify("Prompt cannot be empty.", type="warning")
+                        return
+
+                    dialog.close()
+                    if session.busy:
+                        ui.notify("Agent is busy — wait for current turn to finish.", type="warning")
+                        return
+
+                    # Update entry text, truncate history after this point
+                    entry["text"] = new_text
+                    truncate_history_from_user_msg(msg_id)
+
+                    # Repaint transcript
+                    replay_transcript_from_log()
+                    ui.notify("History truncated. Executing from edited prompt...", type="info")
+
+                    # Launch fresh turn
+                    session.busy = True
+                    session.turn_start_ts = time.time()
+                    send_button.props("loading")
+                    status_label.set_text("Thinking…")
+                    show_thinking_indicator("Thinking…")
+
+                    try:
+                        session.ensure_ready()
+                    except Exception as e:
+                        notify_error(f"Could not start agent: {e}")
+                        session.busy = False
+                        session.turn_start_ts = None
+                        send_button.props(remove="loading")
+                        return
+
+                    agent_bridge.run_agent_turn_in_thread(
+                        session.personality, session.client, new_text, prefs, session.event_queue, use_history=True
+                    )
+
+                ui.button("Save & Resend from Here", icon="send", on_click=save_and_resend).props(
+                    "unelevated dense color=primary no-caps font-semibold"
+                )
+
+        dialog.open()
 
     def regenerate_last():
-        """Re-sends the most recent user prompt (skips /slash commands)."""
+        """Regenerates the most recent user prompt by truncating back to it."""
         last_user = None
         for entry in reversed(debug_log):
             if entry.get("type") == "user":
@@ -872,20 +1457,17 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         if session.busy:
             ui.notify("Agent is busy — wait for the current turn to finish.", type="warning")
             return
-        prompt_text = re.sub(r"^🔁 _Rerun:_\s*", "", last_user.get("text", "").strip())
-        if not prompt_text or prompt_text.startswith("/"):
-            ui.notify("Nothing to regenerate.", type="warning")
-            return
-
-        async def _go():
-            await send_prompt_with_text(prompt_text, rerun_marker=True)
-
-        ui.timer(0.05, _go, once=True)
+        msg_id = last_user.get("id")
+        if msg_id:
+            async def _go():
+                await resend_from_point(msg_id)
+            ui.timer(0.05, _go, once=True)
 
     def stop_generation():
         hide_thinking_indicator()
         if not session.busy:
             return
+
         # Clean up any active approval modal dialog if open
         if active_approval_dialog_holder.get("dialog") is not None:
             try:
@@ -929,6 +1511,10 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     except Exception:
                         pass
 
+            # Seal any active text block and immediately save live state to disk
+            seal_current_text_block()
+            session.save_to_disk()
+
             if cancelled:
                 add_system_notice("⏹️ Stop requested — cancelling generation...")
                 ui.notify("Stopping generation...", type="info")
@@ -939,19 +1525,50 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
 
     async def send_prompt_with_text(prompt_text: str, rerun_marker: bool = False):
         """Shared send pipeline used by both the input box and rerun/edit actions."""
-        if not prompt_text.strip() or session.busy:
+        raw_prompt = prompt_text.strip()
+        if not raw_prompt or session.busy:
             return
-        display_text = f"🔁 _Rerun:_ {prompt_text}" if rerun_marker else prompt_text
+
+        scroll_state["auto_follow"] = True
+        display_text = f"🔁 _Rerun:_ {raw_prompt}" if rerun_marker else raw_prompt
         add_user_bubble(display_text)
-        if prompt_text.strip().startswith("/"):
-            await handle_slash_command(prompt_text.strip())
+
+        if raw_prompt.startswith("/"):
+            await handle_slash_command(raw_prompt)
             return
-        _remember_prompt(prompt_text.strip())
+
+        _remember_prompt(raw_prompt)
         session.busy = True
         session.turn_start_ts = time.time()
+        resume_banner.set_visibility(False)
+        resume_turn_btn.set_visibility(False)
         send_button.props("loading")
         status_label.set_text("Thinking…")
         show_thinking_indicator("Thinking…")
+
+        # ── 🔄 MULTI-WORD CONTINUATION HYDRATION ("continue with the rest", "next batch", etc.) ──
+        effective_prompt = raw_prompt
+        is_continuation_request = bool(re.search(
+            r'\b(?:continue|resume|proceed|go\s+on|keep\s+going|next\s+batch|the\s+rest|remaining|organize\s+(?:the\s+)?rest)\b',
+            raw_prompt,
+            re.IGNORECASE
+        ))
+
+        if is_continuation_request:
+            last_task = session.get_last_user_prompt()
+            plan_content = agent_bridge.get_current_plan_content(workspace_path=prefs.workspace_path)
+            task_hint = last_task or "file organization task"
+            effective_prompt = (
+                f"[SYSTEM DIRECTIVE: User requested to continue with the rest of the task]\n"
+                f"Original Task: '{task_hint}'\n"
+                f"User Instruction: '{raw_prompt}'\n\n"
+                "1. If files were already moved in the previous batch: Call `tool_list_files(directory=\".\")` to scan the remaining items in the workspace root.\n"
+                "2. Select the next batch of up to 50 items and create `<artifact name=\"mapping.yaml\">` (or call `tool_organize_files_from_plan` if a plan is ready).\n"
+                "3. DO NOT claim in text that files were moved without executing the tool! Proceed with the real execution now."
+            )
+            if plan_content and "No active task plan" not in plan_content:
+                effective_prompt += f"\nActive Roadmap in CURRENT.md:\n{plan_content[:600]}\n"
+            ASCIIColors.info(f"[ChatPage] Hydrated multi-word continuation prompt: '{raw_prompt}'")
         try:
             session.ensure_ready()
         except Exception as e:
@@ -1014,12 +1631,15 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 debug_log.remove(entry)
             except ValueError:
                 pass
+        try:
+            ui.notify("Message deleted.", type="positive")
+        except Exception:
+            pass
         if ref is not None and ref.get("row") is not None:
             try:
                 ref["row"].delete()
             except Exception:
                 pass
-        ui.notify("Message deleted.", type="positive")
 
     def confirm_new_session():
         confirm = ui.dialog()
@@ -1051,9 +1671,26 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         transcript.clear()
         debug_log.clear()
         message_refs.clear()
+        ws_root = Path(prefs.workspace_path).resolve()
+        current_md = ws_root / ".lollms_code" / "CURRENT.md"
+        if current_md.exists():
+            try:
+                current_md.write_text("# Current Task\n\nNo active task plan defined yet.\n", encoding="utf-8")
+            except Exception:
+                pass
+
+        # Wipe ephemeral scratchpad on new session
+        scratchpad_md = ws_root / ".lollms_code" / "scratchpad.md"
+        if scratchpad_md.exists():
+            try:
+                scratchpad_md.write_text("# Scratchpad\n\n(Empty - session notes only)\n", encoding="utf-8")
+            except Exception:
+                pass
+
         if session.personality is not None:
             try:
                 session.personality._conversation = []
+                object.__setattr__(session.personality, '_scratchpad_content', '')
             except Exception:
                 pass
         session.prompt_history.clear()
@@ -1282,6 +1919,35 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         cleaned = re.sub(r"</?processing[^>]*>", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"<!--\s*status:[^>]*-->", "", cleaned, flags=re.IGNORECASE)
 
+        # 4. Strip model tool call template tokens and leaked skill headers
+        cleaned = re.sub(r'\[TOOL_CALLS\][^\n]*\n?', '', cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r'=== END (?:ACTIVE )?SKILLS ===\s*', '', cleaned, flags=re.IGNORECASE)
+
+        # 5. Strip leaked blockquoted raw tool JSON fragments and pseudo-code tags
+        cleaned = re.sub(r'(?m)^\s*>?(?:```(?:json)?\s*)?\{"name":\s*"tool_\w+.*$', '', cleaned)
+        cleaned = re.sub(r'(?s)>?\s*\{"name":\s*"tool_\w+".*?\}\s*(?:</tool>)?', '', cleaned)
+        cleaned = re.sub(r'</?tool\b[^>]*>', '', cleaned, flags=re.IGNORECASE)
+        # Strip pseudo-tag syntax (e.g. ```{tool}{name=...} and ```{artifact}{name=...})
+        cleaned = re.sub(r'(?s)(?:```)?\{tool\}[^\n]*.*?\}*(?:```)?', '', cleaned)
+        cleaned = re.sub(r'(?s)(?:```)?\{artifact\}[^\n]*.*?\}*(?:```)?', '', cleaned)
+        cleaned = re.sub(r'scratchpad_append(?:\[ARGS\])?[^\n]*\n?', '', cleaned)
+        cleaned = re.sub(r'```(?:python)?\s*```', '', cleaned)
+        cleaned = re.sub(r'`{4,}', '```', cleaned)
+        # Strip unclosed broken backtick markers and stray delimiters (e.g. `}`, ` `}, `---`, `>, `)
+        cleaned = re.sub(r'(?m)^\s*[`>]{1,4}\s*$', '', cleaned)
+        cleaned = re.sub(r'(?m)^\s*[`>\s]*\}\s*$', '', cleaned)
+        cleaned = re.sub(r'(?m)^\s*[-=]{3,}\s*$', '', cleaned)
+        cleaned = re.sub(r'```(?:python|bash|sh|json|xml)?\s*$', '', cleaned).strip()
+        cleaned = re.sub(r'[`>]{1,4}\s*$', '', cleaned).strip()
+
+        # Strip unexecuted or raw functional action tags from displaying inside speech bubbles
+        cleaned = re.sub(
+            r"<(?:unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|user_profile_update|user_profile_clear|mem_new|mem_update|mem_load|mem_delete|mem_search|mem_tag).*?(?:/>|</(?:unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|user_profile_update|user_profile_clear|mem_new|mem_update|mem_load|mem_delete|mem_search|mem_tag)>)",
+            "",
+            cleaned,
+            flags=re.DOTALL | re.IGNORECASE
+        )
+
         # 4. Comprehensive de-duplication (exact halving, duplicate paragraphs, repeated sentences)
         cleaned_text = cleaned.strip()
         if not cleaned_text:
@@ -1461,23 +2127,37 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         dialog.open()
 
     def seal_current_text_block():
-        """Seals the current conversational agent bubble so that the next action
-        or response text is inserted chronologically below the preceding event."""
+        """Seals the current conversational agent bubble, deduplicating identical repeat bubbles."""
         nonlocal current_agent_md, agent_text_buffer
         if current_agent_md is not None:
-            clean_text = _strip_processing_tags(agent_text_buffer)
+            clean_text = _strip_processing_tags(agent_text_buffer).strip()
             entry = getattr(current_agent_md, "_debug_entry", None)
-            if clean_text:
+
+            # Check for duplicate bubble with identical content to previous agent entry
+            is_duplicate = False
+            if clean_text and len(debug_log) > 1:
+                for prev in reversed(debug_log[:-1]):
+                    if prev.get("type") == "agent":
+                        prev_text = prev.get("text", "").strip()
+                        if prev_text and prev_text == clean_text:
+                            is_duplicate = True
+                        break
+
+            if clean_text and not is_duplicate:
                 current_agent_md.set_content(clean_text)
                 if entry is not None:
                     entry["text"] = clean_text
             else:
                 try:
                     current_agent_md.delete()
+                    if entry in debug_log:
+                        debug_log.remove(entry)
                 except Exception:
                     pass
+
             current_agent_md = None
             agent_text_buffer = ""
+            session.save_to_disk()
 
     def drain_queue():
         nonlocal current_agent_md, agent_text_buffer
@@ -1521,13 +2201,84 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 resp_queue = ev.data.get("response_queue")
                 open_python_approval_dialog(source, script_label, argv, resp_queue)
 
+            elif ev.kind == "effort_change":
+                lvl = ev.data.get("level", "")
+                ui.notify(f"⚡ Reasoning effort scaled to: {lvl.upper()}", type="info", timeout=2500)
+                add_event_panel(f"⚡ Dynamic Effort: {lvl.upper()}", "Reasoning tier updated for next round", f"The agent adjusted its reasoning effort to '{lvl}' using <effort level='{lvl}'/>.", "amber-500", "psychology")
+
             elif ev.kind == "thought":
                 hide_thinking_indicator()
                 seal_current_text_block()
-                add_event_panel("💭 Thinking", "", ev.data.get("text", ""), "gray-400", "psychology")
+                sub_agent_tag = f"[{ev.data.get('sub_agent')}] " if ev.data.get("sub_agent") else ""
+                add_event_panel(f"💭 {sub_agent_tag}Thinking", "", ev.data.get("text", ""), "gray-400", "psychology")
+
+            elif ev.kind == "worker_spawn_start":
+                seal_current_text_block()
+                ag_name = ev.data.get("agent_name", "Specialist")
+                task_txt = ev.data.get("task", "")
+                depth = ev.data.get("depth", 1)
+                max_steps = ev.data.get("max_steps", 6)
+                effort = ev.data.get("effort", "default")
+                model_name = ev.data.get("model_name", "parent model")
+                conditioning = ev.data.get("personality_conditioning", "")
+
+                info_lines = [
+                    f"**Task Directive:**\n```\n{task_txt}\n```",
+                    f"- **Delegation Tier**: Depth {depth}",
+                    f"- **Reasoning Budget**: Up to {max_steps} rounds",
+                    f"- **Effort Tier**: `{effort}`",
+                    f"- **Assigned Model**: `{model_name}`",
+                ]
+                if conditioning and conditioning != "Autonomous Worker Specialist":
+                    info_lines.append(f"- **Specialization Conditioning**:\n  _{conditioning[:200]}..._")
+
+                body = "\n".join(info_lines)
+                add_event_panel(f"🤖 Sub-Agent Active: {ag_name}", f"depth {depth} · max {max_steps} rounds · effort {effort}", body, "purple-500", "smart_toy")
+                status_label.set_text(f"Sub-agent '{ag_name}' executing autonomously…")
+
+            elif ev.kind == "worker_spawn_end":
+                seal_current_text_block()
+                ag_name = ev.data.get("agent_name", "Specialist")
+                rounds = ev.data.get("rounds", 0)
+                tools_cnt = ev.data.get("tools_count", 0)
+                elapsed = ev.data.get("elapsed_seconds", 0)
+                success = ev.data.get("success", True)
+                digest = ev.data.get("report_digest", "")
+
+                status_color = "emerald-500" if success else "red-500"
+                status_icon = "task_alt" if success else "error"
+                status_badge = "COMPLETED" if success else "INTERRUPTED/FAILED"
+
+                body_lines = [
+                    f"**Execution Summary:**",
+                    f"- **Status**: {status_badge}",
+                    f"- **Duration**: {elapsed}s",
+                    f"- **Rounds Taken**: {rounds}",
+                    f"- **Tools Executed**: {tools_cnt}",
+                    "",
+                    f"**Specialist Report to Orchestrator:**\n```\n{digest or '(No text reported)'}\n```",
+                ]
+
+                add_event_panel(
+                    f"{'✅' if success else '❌'} Sub-Agent Report: {ag_name}",
+                    f"{rounds} round(s) · {tools_cnt} tool(s) · {elapsed}s",
+                    "\n".join(body_lines),
+                    status_color,
+                    status_icon
+                )
+                status_label.set_text("Idle")
+                session.save_to_disk()
 
             elif ev.kind == "info":
-                status_label.set_text(ev.data.get("text", "")[:80])
+                inf_type = ev.data.get("type")
+                if inf_type == "memory_consolidated":
+                    seal_current_text_block()
+                    mem_content = ev.data.get("content", "")
+                    tags_str = ", ".join(ev.data.get("tags", []))
+                    add_event_panel(f"💾 Memory Consolidated", f"tags: {tags_str}", mem_content, "purple-500", "psychology")
+                    ui.notify(f"💾 Memory Saved: {mem_content[:60]}...", type="info")
+                else:
+                    status_label.set_text(ev.data.get("text", "")[:80])
 
             elif ev.kind == "tool_start":
                 name = ev.data.get("tool_name", "tool")
@@ -1613,6 +2364,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     timeline_slots, session.current_round,
                     "bg-green-500" if success else "bg-red-500"
                 )
+                session.save_to_disk()
 
             elif ev.kind == "context_update":
                 files = ev.data.get("files", [])
@@ -1637,6 +2389,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     color,
                     "folder_open",
                 )
+                session.save_to_disk()
 
             elif ev.kind == "scratchpad_update":
                 seal_current_text_block()
@@ -1651,37 +2404,87 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 lang = ev.data.get("language", "")
                 op = ev.data.get("operation", "write")
                 sec = ev.data.get("current_section") or ""
-                subtitle = f"{op} · {lang}" if lang else op
+                subtitle = f"writing {op} · {lang}..." if lang else f"writing {op}..."
                 if sec:
-                    subtitle += f" · {sec}"
+                    subtitle = f"{sec}..."
                 seal_current_text_block()
 
-                # If a writing panel for this artifact already exists, delete it and remove from debug_log
-                if title in active_artefact_panels:
-                    old_art_item = active_artefact_panels.pop(title)
+                existing_item = find_active_artefact_item(title)
+                if existing_item:
+                    old_panel = existing_item["panel"]
                     try:
-                        old_art_item["panel"].delete()
-                        if hasattr(old_art_item["panel"], "_debug_entry") and old_art_item["panel"]._debug_entry in debug_log:
-                            debug_log.remove(old_art_item["panel"]._debug_entry)
+                        old_panel.delete()
+                        if hasattr(old_panel, "_debug_entry") and old_panel._debug_entry in debug_log:
+                            debug_log.remove(old_panel._debug_entry)
                     except Exception:
                         pass
+                    for k in list(active_artefact_panels.keys()):
+                        if active_artefact_panels[k] is existing_item:
+                            del active_artefact_panels[k]
 
-                panel = add_event_panel(f"📝 Writing: {title}", subtitle, "", "purple-500", "description")
-                active_artefact_panels[title] = {"panel": panel, "op": op, "lang": lang}
+                panel = add_event_panel(
+                    title=f"📝 Writing: {title}",
+                    subtitle=subtitle,
+                    body="",
+                    color="purple-500",
+                    icon="description",
+                    with_spinner=True,
+                    expanded=True
+                )
+                active_artefact_panels[title] = {
+                    "panel": panel,
+                    "title": title,
+                    "op": op,
+                    "lang": lang,
+                    "buffer": "",
+                    "last_line": "",
+                    "entry": getattr(panel, "_debug_entry", {})
+                }
+                status_label.set_text(f"Writing {title}…")
                 _paint_round(timeline_slots, session.current_round, "bg-purple-500 animate-pulse")
+
+            elif ev.kind == "artefact_chunk":
+                title = ev.data.get("title", "artifact")
+                chunk_txt = ev.data.get("text", "")
+                item = find_active_artefact_item(title)
+                if item and chunk_txt:
+                    item["buffer"] += chunk_txt
+                    panel = item["panel"]
+
+                    # Extract ONLY structural headings or function titles for header display
+                    structural_title = _extract_structural_header_title(item["buffer"])
+                    if structural_title:
+                        item["last_symbol"] = structural_title
+                        if hasattr(panel, "_sub_label"):
+                            panel._sub_label.set_text(f"• {structural_title}")
+                            panel._sub_label.set_visibility(True)
+                        status_label.set_text(f"Writing {title}: {structural_title[:40]}")
+                    elif not item.get("last_symbol") and hasattr(panel, "_sub_label"):
+                        panel._sub_label.set_text(f"• writing content...")
+                        panel._sub_label.set_visibility(True)
+
+                    # Stream ALL verbatim content strictly INSIDE the code box
+                    buf = item["buffer"]
+                    disp_buf = f"... [{len(buf) - 3500:,} chars earlier] ...\n" + buf[-3500:] if len(buf) > 4000 else buf
+                    if hasattr(panel, "_code_box"):
+                        update_code_box(panel._code_box, disp_buf)
+                    if item.get("entry"):
+                        item["entry"]["body"] = buf
 
             elif ev.kind == "artefact_symbol":
                 sym = ev.data.get("symbol", {})
                 detail = sym.get("detail") or ev.data.get("detail", "")
                 title = ev.data.get("title", "artifact")
                 status_label.set_text(f"Writing {title}: {detail}")
+                item = find_active_artefact_item(title)
+                if item:
+                    panel = item["panel"]
+                    if hasattr(panel, "_sub_label"):
+                        panel._sub_label.set_text(f"• {detail}")
+                        panel._sub_label.set_visibility(True)
 
             elif ev.kind == "artefact_end":
                 title = ev.data.get("title", "artifact")
-                # Discard pre-execution parser stream_complete signals to prevent duplicate panels
-                if ev.data.get("stream_complete") and not ev.data.get("execution_phase") and "error" not in ev.data:
-                    continue
-
                 seal_current_text_block()
                 success = bool(ev.data.get("success", False))
                 version = ev.data.get("version", 1)
@@ -1689,54 +2492,70 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 chars = ev.data.get("size_chars", 0)
                 is_patch = ev.data.get("is_patch", False)
 
-                # Remove the in-flight 'Writing...' panel from UI and debug_log so it's cleanly replaced
-                had_active_panel = title in active_artefact_panels
-                if had_active_panel:
-                    active_art_item = active_artefact_panels.pop(title)
-                    try:
-                        active_art_item["panel"].delete()
-                        if hasattr(active_art_item["panel"], "_debug_entry") and active_art_item["panel"]._debug_entry in debug_log:
-                            debug_log.remove(active_art_item["panel"]._debug_entry)
-                    except Exception:
-                        pass
+                meta_details = []
+                if version: meta_details.append(f"v{version}")
+                if lines: meta_details.append(f"{lines} lines")
+                if chars: meta_details.append(f"{chars:,} chars")
+                final_sub = " · ".join(meta_details) if success else str(ev.data.get("error", "failed"))
+
+                item = find_active_artefact_item(title)
+                if item:
+                    for k in list(active_artefact_panels.keys()):
+                        if active_artefact_panels[k] is item:
+                            del active_artefact_panels[k]
+
+                    panel = item["panel"]
+                    if hasattr(panel, "_spinner"):
+                        panel._spinner.set_visibility(False)
+                    if hasattr(panel, "_header_icon"):
+                        panel._header_icon._props["name"] = "task_alt" if success else "error"
+                        panel._header_icon.classes(replace=f"text-{'green-500' if success else 'red-500'} shrink-0")
+                    if hasattr(panel, "_title_label"):
+                        panel._title_label.set_text(f"{'✅' if success else '❌'} {'Patched' if is_patch else 'Saved'}: {title}")
+                    if hasattr(panel, "_sub_label"):
+                        panel._sub_label.set_text(final_sub)
+                        panel._sub_label.set_visibility(True)
+
+                    full_c = ev.data.get("content") or item["buffer"]
+                    if full_c and hasattr(panel, "_code_box"):
+                        c_lines = full_c.strip().splitlines()
+                        preview_slice = full_c if len(c_lines) <= 60 else "\n".join(c_lines[:30] + [f"\n... [{len(c_lines)-50:,} lines hidden] ...\n"] + c_lines[-20:])
+                        update_code_box(panel._code_box, preview_slice)
+                    if item.get("entry"):
+                        item["entry"]["body"] = full_c
                 else:
-                    # Suppress duplicate completion panels if already processed for this artifact version in this turn
                     end_sig = (title, version, is_patch, success, session.current_round)
                     if getattr(session, "_last_rendered_artefact_end", None) == end_sig:
                         continue
                     session._last_rendered_artefact_end = end_sig
 
-                meta_details = []
-                if version: meta_details.append(f"v{version}")
-                if lines: meta_details.append(f"{lines} lines")
-                if chars: meta_details.append(f"{chars:,} chars")
-                subtitle = " · ".join(meta_details) if success else str(ev.data.get("error", "failed"))
+                    body_lines = []
+                    sections = ev.data.get("sections", [])
+                    if sections:
+                        body_lines.append("Sections/Symbols:")
+                        for s in sections[:10]:
+                            body_lines.append(f"  • {s.get('type', 'item')}: {s.get('name', '')} (line {s.get('line', '?')})")
+                    if not body_lines and ev.data.get("content"):
+                        raw_c = str(ev.data["content"]).strip()
+                        c_lines = raw_c.splitlines()
+                        body_lines.append("\n".join(c_lines[:25] if len(c_lines) <= 30 else c_lines[:15] + [f"\n... (+{len(c_lines)-25} more lines)\n"] + c_lines[-10:]))
 
-                body_lines = []
-                sections = ev.data.get("sections", [])
-                if sections:
-                    body_lines.append("Sections/Symbols:")
-                    for s in sections[:10]:
-                        body_lines.append(f"  • {s.get('type', 'item')}: {s.get('name', '')} (line {s.get('line', '?')})")
-                    if len(sections) > 10:
-                        body_lines.append(f"  ... (+{len(sections) - 10} more)")
-
-                patch_stats = ev.data.get("patch_stats")
-                if patch_stats:
-                    body_lines.append(f"\nPatch Hunks: {patch_stats.get('hunks_count', 1)}")
-
-                add_event_panel(
-                    f"{'✅' if success else '❌'} {'Patched' if is_patch else 'Saved'}: {title}",
-                    subtitle,
-                    "\n".join(body_lines),
-                    "green-500" if success else "red-500",
-                    "task_alt",
-                )
+                    add_event_panel(
+                        f"{'✅' if success else '❌'} {'Patched' if is_patch else 'Saved'}: {title}",
+                        final_sub,
+                        "\n".join(body_lines) if body_lines else "(Document saved)",
+                        "green-500" if success else "red-500",
+                        "task_alt",
+                        with_spinner=False,
+                        expanded=False
+                    )
+                session.save_to_disk()
 
             elif ev.kind == "round_start":
                 seal_current_text_block()
                 r = ev.data.get("round_id", 1)
-                m = ev.data.get("max_rounds", prefs.max_reasoning_steps)
+                max_cfg = getattr(prefs, "max_reasoning_steps", 100)
+                m = "∞ ⚠️" if max_cfg <= 0 else ev.data.get("max_rounds", max_cfg)
                 status_label.set_text(f"Round {r}/{m}")
                 try:
                     r_int = int(r)
@@ -1755,6 +2574,13 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 m = ev.data.get("max_rounds", "?")
                 status_label.set_text(f"Round {r}/{m}")
 
+            elif ev.kind == "round_end":
+                r_status = ev.data.get("status")
+                r_id = ev.data.get("round_id", session.current_round)
+                if r_id in timeline_slots and r_status == "done":
+                    _paint_round(timeline_slots, r_id, "bg-green-500")
+                refresh_workspace_tree()
+
             elif ev.kind == "done":
                 hide_thinking_indicator()
                 seal_current_text_block()
@@ -1767,6 +2593,9 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 session.turn_start_ts = None
                 send_button.props(remove="loading")
                 status_label.set_text("Idle")
+
+                # Auto-save session state to disk immediately
+                session.save_to_disk()
 
                 # Fallback display guarantee: if no agent text was rendered, display result response
                 final_resp = (result.get("response") or "").strip()
@@ -1830,6 +2659,8 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                 elif prefs.__dict__.get("notify_on_done", True):
                     ui.notify("✅ Agent turn finished.", type="positive", timeout=2000)
 
+                refresh_workspace_tree()
+
             elif ev.kind == "error":
                 hide_thinking_indicator()
                 seal_current_text_block()
@@ -1843,13 +2674,23 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         if drained_any:
             if apply_search.__closure__ is not None and (search_input.value or "").strip():
                 apply_search()
-            scroll_area.scroll_to(percent=1.0)
+            # Smart auto-scroll: ONLY scroll if the user is already at the bottom
+            if scroll_state.get("auto_follow", True):
+                scroll_area.scroll_to(percent=1.0)
 
     ui.timer(0.15, drain_queue)
 
+    _last_periodic_save = 0.0
+
     def _tick_elapsed():
+        nonlocal _last_periodic_save
+        now = time.time()
         if session.busy and session.turn_start_ts is not None:
-            elapsed_label.set_text(f"{time.time() - session.turn_start_ts:.1f}s")
+            elapsed_label.set_text(f"{now - session.turn_start_ts:.1f}s")
+            # Continuous live auto-save every 2.5s while actively generating
+            if now - _last_periodic_save > 2.5:
+                _last_periodic_save = now
+                session.save_to_disk()
 
     ui.timer(0.2, _tick_elapsed)
 
@@ -2079,6 +2920,10 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
             open_current_plan_dialog()
             return True
 
+        if cmd in ("/inspect", "/context", "/prompt"):
+            open_context_inspector_dialog()
+            return True
+
         if cmd in ("/subws", "/reference", "/sub-workspace", "/ref"):
             if arg.lower() in ("paste", "new", "add-text"):
                 open_paste_reference_dialog()
@@ -2094,7 +2939,47 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
             open_scratchpad_dialog()
             return True
 
+        if cmd in ("/dynamic", "/dynamic-mode"):
+            arg_clean = arg.lower().strip()
+            if arg_clean in ("on", "1", "enable", "true"):
+                prefs.dynamic_effort = True
+                prefs.auto_temperature = True
+                prefs.auto_max_tokens = True
+            elif arg_clean in ("off", "0", "disable", "false"):
+                prefs.dynamic_effort = False
+                prefs.auto_temperature = False
+                prefs.auto_max_tokens = False
+            else:
+                prefs.dynamic_effort = not getattr(prefs, "dynamic_effort", False)
+                prefs.auto_temperature = prefs.dynamic_effort
+                prefs.auto_max_tokens = prefs.dynamic_effort
+
+            prefs.save()
+            if session.personality:
+                session.personality.dynamic_effort = prefs.dynamic_effort
+
+            _sync_dynamic_button()
+            effort_select.value = "dynamic" if prefs.dynamic_effort else "default"
+            add_system_notice(
+                f"⚡ Dynamic Mode is now **{'ACTIVATED' if prefs.dynamic_effort else 'DEACTIVATED'}** "
+                f"(Auto effort scaling, task-adapted temperature, auto tokens)."
+            )
+            return True
+
+        if cmd in ("/resume", "/continue"):
+            await resume_active_turn()
+            return True
+
+        if cmd in ("/explorer", "/open", "/reveal"):
+            open_workspace_in_explorer()
+            return True
+
+        if cmd in ("/sessions", "/session"):
+            open_sessions_dialog()
+            return True
+
         if cmd == "/config":
+            session.save_to_disk()
             ui.navigate.to("/settings")
             return True
 
@@ -2135,9 +3020,26 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
             transcript.clear()
             debug_log.clear()
             message_refs.clear()
+            ws_root = Path(prefs.workspace_path).resolve()
+            current_md = ws_root / ".lollms_code" / "CURRENT.md"
+            if current_md.exists():
+                try:
+                    current_md.write_text("# Current Task\n\nNo active task plan defined yet.\n", encoding="utf-8")
+                except Exception:
+                    pass
+
+            # Wipe ephemeral scratchpad on clear
+            scratchpad_md = ws_root / ".lollms_code" / "scratchpad.md"
+            if scratchpad_md.exists():
+                try:
+                    scratchpad_md.write_text("# Scratchpad\n\n(Empty - session notes only)\n", encoding="utf-8")
+                except Exception:
+                    pass
+
             if session.personality is not None:
                 session.personality._conversation = []
-            add_system_notice("Conversation cleared.")
+                object.__setattr__(session.personality, '_scratchpad_content', '')
+            add_system_notice("Conversation cleared, task roadmap reset, and ephemeral scratchpad wiped.")
             return True
 
         if cmd in ("/clear-files", "/unload-all"):
@@ -2165,11 +3067,32 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
             return True
 
         if cmd in ("/memories", "/memory"):
-            if open_memory_explorer_dialog is not None:
-                open_memory_explorer_dialog(session, prefs)
+            sub_arg = arg.lower().strip()
+            if sub_arg in ("toggle", "switch"):
+                prefs.enable_memory = not prefs.enable_memory
+                prefs.save()
+                state_str = "ENABLED" if prefs.enable_memory else "DISABLED"
+                session.personality = agent_bridge.create_personality(prefs, session.client)
+                add_system_notice(f"🧠 Cognitive Memory is now **{state_str}**.")
+                return True
+            elif sub_arg in ("on", "enable", "1", "true"):
+                prefs.enable_memory = True
+                prefs.save()
+                session.personality = agent_bridge.create_personality(prefs, session.client)
+                add_system_notice("🧠 Cognitive Memory is now **ENABLED**.")
+                return True
+            elif sub_arg in ("off", "disable", "0", "false"):
+                prefs.enable_memory = False
+                prefs.save()
+                session.personality = agent_bridge.create_personality(prefs, session.client)
+                add_system_notice("🧠 Cognitive Memory is now **DISABLED**.")
+                return True
             else:
-                add_system_notice("Memory Explorer component could not be loaded.", is_error=True)
-            return True
+                if open_memory_explorer_dialog is not None:
+                    open_memory_explorer_dialog(session, prefs)
+                else:
+                    add_system_notice("Memory Explorer component could not be loaded.", is_error=True)
+                return True
 
         if cmd == "/forget":
             confirm_dialog = ui.dialog()
@@ -2208,6 +3131,43 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
             else:
                 lines = "\n".join(f"- **{s['title']}** ({s.get('category', '')}) — {s.get('description', '')}" for s in skills)
                 add_system_notice(f"**Learned skills**\n\n{lines}")
+            return True
+
+        if cmd in ("/effort", "/reasoning-effort"):
+            if not arg:
+                curr = "dynamic" if getattr(prefs, "dynamic_effort", False) else (getattr(prefs, "reasoning_effort", None) or "default")
+                add_system_notice(
+                    f"**Current Reasoning Effort**: `{curr}`\n\n"
+                    "Usage: `/effort <none|low|medium|high|dynamic|default>`\n"
+                    "- `none`: Turn off thinking/reasoning (fastest)\n"
+                    "- `low`: Light reasoning\n"
+                    "- `medium`: Standard deep thinking\n"
+                    "- `high`: Maximum reasoning depth\n"
+                    "- `dynamic`: Autonomous effort scaling via `<effort>` tags\n"
+                    "- `default`: Revert to model profile default"
+                )
+            else:
+                arg_clean = arg.lower().strip()
+                if arg_clean == "dynamic":
+                    prefs.dynamic_effort = True
+                    prefs.reasoning_effort = None
+                    prefs.save()
+                    effort_select.value = "dynamic"
+                    add_system_notice("🔄 Reasoning effort updated to **Dynamic** (auto-escalates via `<effort>` tags).")
+                elif arg_clean == "default":
+                    prefs.dynamic_effort = False
+                    prefs.reasoning_effort = None
+                    prefs.save()
+                    effort_select.value = "default"
+                    add_system_notice("⚡ Reasoning effort reset to **Model Default**.")
+                elif arg_clean in ("none", "low", "medium", "high", "max"):
+                    prefs.dynamic_effort = False
+                    prefs.reasoning_effort = arg_clean
+                    prefs.save()
+                    effort_select.value = arg_clean if arg_clean in effort_options else "high"
+                    add_system_notice(f"🧠 Reasoning effort set to **{arg_clean.capitalize()}**.")
+                else:
+                    add_system_notice(f"Unknown effort level: '{arg}'. Choose from: `none`, `low`, `medium`, `high`, `dynamic`, `default`.", is_error=True)
             return True
 
         if cmd == "/files":
@@ -2278,6 +3238,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         text = prompt_input.value.strip()
         if not text or session.busy:
             return
+        scroll_state["auto_follow"] = True
         prompt_input.value = ""
         suggestions_row.visible = False
         _update_input_counter()
@@ -2430,6 +3391,8 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
     tree_expanded: set = set()
     tree_loaded_set: set = set()
     tree_loading: set = set()   # rel paths currently being scanned in the background
+    _refreshing_tree: bool = False
+    _pending_refresh: bool = False
 
     def toggle_tree_visibility():
         nonlocal show_tree_sidebar
@@ -2881,27 +3844,56 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
 
     def refresh_workspace_tree():
         """Re-reads the loaded-file set from agent_bridge, drops the directory
-        cache so on-disk changes show up, and repaints. The root listing is
-        fetched in the background so this never blocks the caller."""
-        nonlocal tree_loaded_set
-        tree_loaded_set = _get_loaded_files_set()
-        tree_children.clear()
-        tree_expanded.clear()
+        cache so on-disk changes show up, and repaints. Only root and
+        currently expanded folders are re-scanned (off the event loop),
+        preserving lazy loading and avoiding full-tree traversal bloat."""
+        nonlocal _refreshing_tree, _pending_refresh, tree_loaded_set
+        if _refreshing_tree:
+            _pending_refresh = True
+            return
+        _refreshing_tree = True
 
-        async def _load_root():
-            tree_loading.add("")
-            _paint_tree()
+        async def _do_refresh():
+            nonlocal tree_loaded_set, _refreshing_tree, _pending_refresh
             try:
-                await _children_of_async("")
-            finally:
-                tree_loading.discard("")
-            _paint_tree()
+                tree_loaded_set = _get_loaded_files_set()
+                tree_children.clear()
 
-        ui.timer(0.01, _load_root, once=True)
-        try:
-            refresh_subws_tree()
-        except Exception:
-            pass
+                ws_root = Path(prefs.workspace_path).resolve()
+                still_expanded = {
+                    rel for rel in tree_expanded
+                    if (ws_root / rel).is_dir()
+                }
+                tree_expanded.clear()
+                tree_expanded.update(still_expanded)
+
+                tree_loading.add("")
+                try:
+                    await _children_of_async("")
+                finally:
+                    tree_loading.discard("")
+
+                sorted_expanded = sorted(list(tree_expanded), key=lambda x: x.count('/'))
+                for rel in sorted_expanded:
+                    tree_loading.add(rel)
+                    try:
+                        await _children_of_async(rel)
+                    finally:
+                        tree_loading.discard(rel)
+
+                _paint_tree()
+
+                try:
+                    refresh_subws_tree()
+                except Exception:
+                    pass
+            finally:
+                _refreshing_tree = False
+                if _pending_refresh:
+                    _pending_refresh = False
+                    refresh_workspace_tree()
+
+        ui.timer(0.01, _do_refresh, once=True)
 
     def apply_tree_filter():
         _paint_tree()
@@ -2926,41 +3918,39 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                         ui.label("Reference documentation and external files in .lollms_code/sub_workspace/").classes(f"text-xs {MUTED_DIM}")
 
                 with ui.row().classes("items-center gap-1.5"):
-                    def do_import_file():
-                        _picker = pick_folder
+                    async def do_import_file():
+                        _picker = pick_file
                         if _picker:
-                            async def _pick():
-                                chosen = await _picker(title="Select Reference File to Import")
-                                if chosen:
-                                    try:
-                                        dest = sub_ws.import_file(chosen)
+                            chosen = await _picker(
+                                title="Select Reference File to Import",
+                                file_types=[("All Files", "*.*")]
+                            )
+                            if chosen:
+                                try:
+                                    p = Path(chosen)
+                                    if p.is_dir():
+                                        imported = sub_ws.import_folder(p)
+                                        ui.notify(f"Imported folder with {len(imported)} reference file(s).", type="positive")
+                                    else:
+                                        dest = sub_ws.import_file(p)
                                         ui.notify(f"Imported reference: {dest.name}", type="positive")
-                                        refresh_sub_ws_items()
-                                        refresh_workspace_tree()
-                                    except Exception as ex:
-                                        notify_error(f"Import file failed: {ex}")
-                            _pick()
+                                    refresh_sub_ws_items()
+                                    refresh_workspace_tree()
+                                except Exception as ex:
+                                    notify_error(f"Import file failed: {ex}")
 
-                    def do_import_folder():
+                    async def do_import_folder():
                         _picker = pick_folder
                         if _picker:
-                            async def _pick_f():
-                                chosen = await _picker(title="Select Folder to Import as Reference")
-                                if chosen:
-                                    try:
-                                        imported = sub_ws.import_folder(chosen)
-                                        ui.notify(f"Imported {len(imported)} files into sub-workspace.", type="positive")
-                                        refresh_sub_ws_items()
-                                        refresh_workspace_tree()
-                                    except Exception as ex:
-                                        notify_error(f"Import folder failed: {ex}")
-                            _pick_f()
-
-                    ui.button("Paste Text", icon="note_add", on_click=lambda: open_paste_reference_dialog()).props(
-                        "unelevated dense size=xs color=primary no-caps"
-                    ).tooltip("Paste text directly as a new reference file")
-                    ui.button("Import File", icon="upload_file", on_click=do_import_file).props("outline dense size=xs color=primary no-caps")
-                    ui.button("Import Folder", icon="drive_folder_upload", on_click=do_import_folder).props("outline dense size=xs color=primary no-caps")
+                            chosen = await _picker(title="Select Folder to Import as Reference")
+                            if chosen:
+                                try:
+                                    imported = sub_ws.import_folder(chosen)
+                                    ui.notify(f"Imported {len(imported)} files into sub-workspace.", type="positive")
+                                    refresh_sub_ws_items()
+                                    refresh_workspace_tree()
+                                except Exception as ex:
+                                    notify_error(f"Import folder failed: {ex}")
 
                     def do_load_all():
                         cnt = sub_ws.load_all()
@@ -2974,8 +3964,11 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                         refresh_sub_ws_items()
                         refresh_workspace_tree()
 
-                    ui.button("Import File", icon="upload_file", on_click=do_import_file).props("unelevated dense size=xs color=primary no-caps")
-                    ui.button("Import Folder", icon="drive_folder_upload", on_click=do_import_folder).props("outline dense size=xs color=primary no-caps")
+                    ui.button("Paste Text", icon="note_add", on_click=lambda: open_paste_reference_dialog()).props(
+                        "unelevated dense size=xs color=primary no-caps"
+                    ).tooltip("Paste text directly as a new reference file")
+                    ui.button("Import File", icon="upload_file", on_click=do_import_file).props("outline dense size=xs color=primary no-caps").tooltip("Import a reference file")
+                    ui.button("Import Folder", icon="drive_folder_upload", on_click=do_import_folder).props("outline dense size=xs color=primary no-caps").tooltip("Import a folder into sub-workspace")
                     ui.button("Load All [C]", icon="download", on_click=do_load_all).props("flat dense size=xs color=emerald no-caps")
                     ui.button("Unload All", icon="clear_all", on_click=do_unload_all).props("flat dense size=xs color=amber no-caps")
                     ui.button(icon="close", on_click=dialog.close).props("flat round dense size=xs")
@@ -3663,9 +4656,36 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     with ui.row().classes("w-full justify-end pt-1"):
                         ui.button("+ Add Tool from Zoo", icon="add", on_click=lambda: open_zoo_dialog()).props("flat dense size=xs color=primary no-caps")
 
-            # ── 3. SKILLS SECTION (Handbag vs Project Extra) ──
+            # ── 3. SKILLS SECTION (Handbag vs Project Extra vs Global) ──
             h_skills = data["skills"]["handbag"]
             p_skills = data["skills"]["project"]
+            o_skills = data["skills"].get("other", [])
+            total_skills_count = len(h_skills) + len(p_skills) + len(o_skills)
+
+            def _parse_skill_markdown(raw_text: str) -> tuple[Dict[str, str], str]:
+                """Extracts YAML frontmatter cleanly and returns (metadata_dict, stripped_body_text)."""
+                meta: Dict[str, str] = {}
+                body = (raw_text or "").strip()
+
+                if body.startswith("---"):
+                    parts = body.split("---", 2)
+                    if len(parts) >= 3:
+                        yaml_text = parts[1].strip()
+                        body = parts[2].strip()
+
+                        try:
+                            import yaml
+                            parsed = yaml.safe_load(yaml_text)
+                            if isinstance(parsed, dict):
+                                for k, v in parsed.items():
+                                    meta[str(k).lower().strip()] = str(v).strip()
+                        except Exception:
+                            for line in yaml_text.splitlines():
+                                if ":" in line:
+                                    k, _, v = line.partition(":")
+                                    meta[k.strip().lower()] = v.strip().strip("'\"")
+
+                return meta, body
 
             def _view_skill_content(s_item: Dict[str, Any]):
                 title = s_item.get("title", "Skill")
@@ -3678,20 +4698,51 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     except Exception:
                         pass
 
+                meta, clean_body = _parse_skill_markdown(content)
+
+                # Consolidate metadata
+                display_title = meta.get("title") or meta.get("name") or title
+                display_desc = meta.get("description") or desc
+                author = meta.get("author")
+                category = meta.get("category") or s_item.get("category")
+                version = meta.get("version")
+                created = meta.get("created")
+                tags_str = meta.get("tags") or ""
+                tags = [t.strip().strip("'\"[]") for t in re.split(r"[,;]+", tags_str) if t.strip().strip("'\"[]")]
+
                 d = ui.dialog()
-                with d, ui.card().classes(f"w-[760px] max-w-[95vw] h-[550px] flex flex-col p-4 {CANVAS} rounded-xl border {BORDER} gap-2"):
+                with d, ui.card().classes(f"w-[780px] max-w-[95vw] h-[600px] flex flex-col p-4 {CANVAS} rounded-xl border {BORDER} gap-2.5"):
                     with ui.row().classes(f"w-full items-center justify-between pb-2 border-b {BORDER} shrink-0"):
                         with ui.row().classes("items-center gap-2"):
                             ui.icon("school", size="22px").classes("text-primary")
-                            ui.label(f"Skill: {title}").classes("text-sm font-bold text-slate-900 dark:text-slate-100")
+                            ui.label(f"Skill: {display_title}").classes("text-sm font-bold text-slate-900 dark:text-slate-100")
                         ui.button(icon="close", on_click=d.close).props("flat dense round size=xs")
-                    if desc:
-                        ui.label(desc).classes(f"text-xs {MUTED} italic mb-1 shrink-0 px-1")
-                    with ui.scroll_area().classes(f"w-full flex-1 p-3 {SURFACE} rounded border {BORDER}"):
-                        ui.markdown(content or "No skill content.").classes("text-xs leading-relaxed text-slate-900 dark:text-slate-100")
+
+                    # Structured Metadata Header Card
+                    with ui.card().classes(f"w-full p-2.5 rounded-lg border {BORDER} {SURFACE} gap-1.5 shadow-none shrink-0"):
+                        if display_desc:
+                            ui.label(display_desc).classes(f"text-xs {MUTED} italic leading-relaxed")
+
+                        with ui.row().classes("w-full items-center gap-2 pt-1 border-t border-slate-200 dark:border-slate-800 flex-wrap text-xs"):
+                            if category:
+                                ui.badge(category, color="indigo").props("dense rounded text-[10px]")
+                            if version:
+                                ui.badge(f"v{version}", color="slate").props("dense rounded text-[10px]")
+                            if author:
+                                ui.label(f"👤 {author}").classes(f"text-[11px] {MUTED_DIM} font-mono")
+                            if created:
+                                ui.label(f"📅 {created}").classes(f"text-[11px] {MUTED_DIM} font-mono")
+                            if tags:
+                                with ui.row().classes("items-center gap-1"):
+                                    for t in tags[:6]:
+                                        ui.badge(f"#{t}", color="grey").props("dense rounded text-[9px]")
+
+                    # Clean documentation body without frontmatter artifacts
+                    with ui.scroll_area().classes(f"w-full flex-1 p-3.5 {SURFACE} rounded-lg border {BORDER}"):
+                        ui.markdown(clean_body or "No documentation content.").classes("text-xs leading-relaxed text-slate-900 dark:text-slate-100")
                 d.open()
 
-            with ui.expansion(f"🧠 Skills (H:{len(h_skills)} | P:{len(p_skills)})", icon="psychology").classes(
+            with ui.expansion(f"🧠 Skills ({total_skills_count})", icon="psychology").classes(
                 f"w-full border {BORDER} rounded-lg {SURFACE} mb-1"
             ).props('header-class="py-1 px-2 text-xs font-bold text-slate-900 dark:text-slate-100 flex-nowrap"'):
                 with ui.column().classes("w-full gap-2 p-1.5"):
@@ -3759,7 +4810,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
 
                                     ui.button(icon="delete", on_click=_confirm_delete_skill).props("flat dense round size=xs color=red").tooltip("Remove skill from project (.lollms_code/skills/)")
 
-                    # 2. Handbag Skills (PROTECTED - VIEW ONLY, NO DELETE BUTTON)
+                    # 2. Handbag Skills
                     with ui.column().classes("w-full gap-1 pt-1 border-t border-slate-200 dark:border-slate-800"):
                         ui.label(f"👜 HANDBAG SKILLS ({len(h_skills)})").classes("text-[10px] font-bold text-purple-600 dark:text-purple-400")
                         if not h_skills:
@@ -3771,10 +4822,56 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                                     ui.label(s["title"]).classes("text-xs font-semibold truncate text-slate-900 dark:text-slate-100 max-w-[130px]").tooltip(f"{s['title']}\n{s.get('description', '')}")
                                 with ui.row().classes("items-center gap-1 shrink-0 flex-nowrap"):
                                     vis = s.get("visibility", "loadable")
-                                    v_badge = "[C]" if vis == "visible" else "[U]"
-                                    ui.badge(v_badge, color="emerald" if vis == "visible" else "grey").props("dense rounded text-[9px]")
-                                    ui.badge("Handbag", color="purple").props("dense rounded text-[9px]").tooltip("Handbag native skill (read-only, cannot be removed from project)")
+                                    is_vis = (vis == "visible")
+
+                                    def _toggle_h_skill_vis(s_item=s, curr_vis=is_vis):
+                                        if session.personality and session.personality.skills_manager:
+                                            new_v = "loadable" if curr_vis else "visible"
+                                            try:
+                                                session.personality.skills_manager.set_skill_visibility(s_item["title"], new_v)
+                                                ui.notify(f"Skill '{s_item['title']}' set to {new_v.upper()}", type="positive")
+                                                refresh_subws_panel()
+                                            except Exception as ex:
+                                                notify_error(f"Failed to change visibility: {ex}")
+
+                                    ui.button(
+                                        "[C]" if is_vis else "[U]",
+                                        on_click=_toggle_h_skill_vis,
+                                    ).props(f"flat dense size=xs color={'emerald' if is_vis else 'grey'} no-caps").tooltip("Toggle in-context: [C]=Loaded, [U]=Loadable")
+
+                                    ui.badge("Handbag", color="purple").props("dense rounded text-[9px]").tooltip("Handbag native skill")
                                     ui.button(icon="visibility", on_click=lambda item=s: _view_skill_content(item)).props("flat dense round size=xs color=purple").tooltip("View Skill Content")
+
+                    # 3. Global & Bundled Skills
+                    if o_skills:
+                        with ui.column().classes("w-full gap-1 pt-1 border-t border-slate-200 dark:border-slate-800"):
+                            ui.label(f"🌐 GLOBAL & BUNDLED SKILLS ({len(o_skills)})").classes("text-[10px] font-bold text-indigo-600 dark:text-indigo-400")
+                            for s in o_skills:
+                                with ui.row().classes("w-full items-center justify-between p-1 rounded hover:bg-slate-200/50 dark:hover:bg-slate-800/50 flex-nowrap"):
+                                    with ui.row().classes("items-center gap-1.5 flex-1 min-w-0 flex-nowrap"):
+                                        ui.icon("psychology", size="14px").classes("text-indigo-500 shrink-0")
+                                        ui.label(s["title"]).classes("text-xs font-semibold truncate text-slate-900 dark:text-slate-100 max-w-[130px]").tooltip(f"{s['title']}\n{s.get('description', '')}")
+                                    with ui.row().classes("items-center gap-1 shrink-0 flex-nowrap"):
+                                        vis = s.get("visibility", "loadable")
+                                        is_vis = (vis == "visible")
+
+                                        def _toggle_o_skill_vis(s_item=s, curr_vis=is_vis):
+                                            if session.personality and session.personality.skills_manager:
+                                                new_v = "loadable" if curr_vis else "visible"
+                                                try:
+                                                    session.personality.skills_manager.set_skill_visibility(s_item["title"], new_v)
+                                                    ui.notify(f"Skill '{s_item['title']}' set to {new_v.upper()}", type="positive")
+                                                    refresh_subws_panel()
+                                                except Exception as ex:
+                                                    notify_error(f"Failed to change visibility: {ex}")
+
+                                        ui.button(
+                                            "[C]" if is_vis else "[U]",
+                                            on_click=_toggle_o_skill_vis,
+                                        ).props(f"flat dense size=xs color={'emerald' if is_vis else 'grey'} no-caps").tooltip("Toggle in-context: [C]=Loaded, [U]=Loadable")
+
+                                        ui.badge(s.get("source", "global").capitalize(), color="indigo").props("dense rounded text-[9px]")
+                                        ui.button(icon="visibility", on_click=lambda item=s: _view_skill_content(item)).props("flat dense round size=xs color=primary").tooltip("View Skill Content")
 
                     # Add skills from zoo shortcut
                     with ui.row().classes("w-full justify-end pt-1"):
@@ -3789,13 +4886,24 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
                     # Toolbar
                     with ui.row().classes("w-full items-center justify-between pb-1 border-b border-slate-200 dark:border-slate-800"):
                         async def _import_f():
-                            _picker = pick_folder
+                            _picker = pick_file
                             if _picker:
-                                chosen = await _picker(title="Select File to Import into Sub-Workspace")
+                                chosen = await _picker(
+                                    title="Select Reference File to Import",
+                                    file_types=[("All Files", "*.*")]
+                                )
                                 if chosen:
-                                    sub_ws.import_file(chosen)
-                                    ui.notify("Imported reference file.", type="positive")
-                                    refresh_subws_panel()
+                                    try:
+                                        p = Path(chosen)
+                                        if p.is_dir():
+                                            imported = sub_ws.import_folder(p)
+                                            ui.notify(f"Imported folder with {len(imported)} reference file(s).", type="positive")
+                                        else:
+                                            dest = sub_ws.import_file(p)
+                                            ui.notify(f"Imported reference file: {dest.name}", type="positive")
+                                        refresh_subws_panel()
+                                    except Exception as ex:
+                                        notify_error(f"Import failed: {ex}")
 
                         async def _import_d():
                             _picker = pick_folder
@@ -3875,6 +4983,247 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
     def refresh_subws_tree():
         """Refreshes the Sub-Workspace panel and all subscribed assets."""
         refresh_subws_panel()
+
+    # ── Sessions Dialog (Browse, Resume, Switch, Delete) ─────────────────
+    def open_sessions_dialog():
+        dialog = ui.dialog().props("maximized")
+        with dialog, ui.card().classes(
+            f"w-full h-full flex flex-col p-4 {CANVAS} text-slate-900 dark:text-slate-100 gap-3"
+        ):
+            with ui.row().classes(f"w-full items-center justify-between pb-2 border-b {BORDER} shrink-0"):
+                with ui.row().classes("items-center gap-2.5"):
+                    ui.icon("history_edu", size="28px").classes("text-primary")
+                    with ui.column().classes("gap-0"):
+                        ui.label("Saved Sessions & Discussions").classes("text-base font-bold")
+                        ui.label(f"Resume previous sessions in workspace: {prefs.workspace_path}").classes(f"text-xs {MUTED_DIM}")
+
+                with ui.row().classes("items-center gap-2"):
+                    def _start_fresh_session():
+                        dialog.close()
+                        session.save_to_disk()
+                        new_session()
+                        ui.notify("Started fresh session.", type="positive")
+
+                    ui.button("New Session", icon="add", on_click=_start_fresh_session).props(
+                        "unelevated dense size=sm color=primary no-caps font-semibold"
+                    )
+                    ui.button("Close", icon="close", on_click=dialog.close).props("flat dense round size=sm")
+
+            sessions_scroll = ui.scroll_area().classes("w-full flex-1 p-2")
+            with sessions_scroll:
+                sessions_container = ui.column().classes("w-full gap-2.5")
+
+            def refresh_sessions_list():
+                sessions_container.clear()
+                saved_list = session.list_saved_sessions(prefs.workspace_path)
+                with sessions_container:
+                    if not saved_list:
+                        ui.label("No saved sessions found in this workspace.").classes(
+                            f"text-xs {MUTED_DIM} p-4 italic text-center w-full"
+                        )
+                        return
+
+                    for item in saved_list:
+                        s_id = item["id"]
+                        is_active = (s_id == session.session_id)
+                        with ui.card().classes(
+                            f"w-full p-3 rounded-lg border {BORDER} {SURFACE} "
+                            + ("border-l-4 border-l-primary shadow-sm" if is_active else "hover:border-primary/50")
+                        ):
+                            with ui.row().classes("w-full items-center justify-between"):
+                                with ui.column().classes("gap-0.5 flex-1 min-w-0"):
+                                    with ui.row().classes("items-center gap-2"):
+                                        ui.icon("chat", size="18px").classes("text-primary shrink-0")
+                                        ui.label(item["title"]).classes("text-sm font-bold truncate text-slate-900 dark:text-slate-100")
+                                        if is_active:
+                                            ui.badge("ACTIVE", color="primary").props("dense rounded text-[9px]")
+                                    ui.label(f"ID: {s_id} · Updated: {item['updated_at']} · {item['message_count']} messages").classes(
+                                        f"text-[10px] {MUTED_DIM} font-mono"
+                                    )
+
+                                with ui.row().classes("items-center gap-2 shrink-0"):
+                                    if not is_active:
+                                        def _do_resume(target_id=s_id):
+                                            dialog.close()
+                                            resume_session(target_id)
+
+                                        ui.button("Resume", icon="play_arrow", on_click=_do_resume).props(
+                                            "unelevated dense size=xs color=primary no-caps font-semibold"
+                                        )
+
+                                    def _delete_sess(target_id=s_id, p_str=item["path"]):
+                                        try:
+                                            Path(p_str).unlink(missing_ok=True)
+                                            ui.notify(f"Deleted session '{target_id}'", type="info")
+                                            refresh_sessions_list()
+                                        except Exception as ex:
+                                            notify_error(f"Failed to delete session: {ex}")
+
+                                    ui.button(icon="delete", on_click=_delete_sess).props("flat dense round size=xs color=red")
+
+            refresh_sessions_list()
+
+        dialog.open()
+
+    def resume_session(target_session_id: str):
+        """Loads a session from disk and replays all messages onto the transcript."""
+        nonlocal current_agent_md, agent_text_buffer
+        if session.busy:
+            ui.notify("Cannot switch sessions while the agent is busy.", type="warning")
+            return
+
+        session.save_to_disk()
+        ok = session.load_from_disk(target_session_id)
+        if not ok:
+            notify_error(f"Failed to load session '{target_session_id}'.")
+            return
+
+        # Clear active UI elements and replay
+        transcript.clear()
+        message_refs.clear()
+        active_tool_panels.clear()
+        active_artefact_panels.clear()
+        current_agent_md = None
+        agent_text_buffer = ""
+
+        replay_transcript_from_log()
+        ui.notify(f"Resumed session: {session.session_title}", type="positive")
+
+    def replay_transcript_from_log():
+        """Reconstructs the conversation view from a safe snapshot of the session's debug_log."""
+        entries_to_replay = list(session.debug_log)
+        for entry in entries_to_replay:
+            kind = entry.get("type")
+            if kind == "user":
+                msg_id = entry.get("id") or f"msg_{next_message_id()}"
+                text = entry.get("text", "")
+                with transcript:
+                    outer_row = ui.row().classes("w-full justify-end items-start gap-1")
+                    with outer_row:
+                        actions = ui.row().classes("opacity-50 hover:opacity-100 transition-opacity gap-0.5 items-center")
+                        with actions:
+                            ui.button(icon="edit", on_click=lambda m=msg_id: open_edit_dialog(m)).props(
+                                "flat round dense size=xs text-color=primary"
+                            ).tooltip("Edit and resend from this point (truncates following history)")
+
+                            ui.button(icon="replay", on_click=lambda m=msg_id: resend_from_point(m)).props(
+                                "flat round dense size=xs text-color=amber"
+                            ).tooltip("Resend from this point (truncates following history)")
+
+                            ui.button(icon="edit_note", on_click=lambda t=text: set_prompt_input(t)).props(
+                                "flat round dense size=xs color=grey"
+                            ).tooltip("Copy to input box")
+
+                            ui.button(icon="delete", on_click=lambda m=msg_id: delete_message(m)).props(
+                                "flat round dense size=xs color=red"
+                            ).tooltip("Delete message")
+
+                        bubble = ui.markdown(text).classes(
+                            "bg-primary text-white rounded-lg px-3 py-1.5 max-w-[75%]"
+                        )
+                message_refs[msg_id] = {"entry": entry, "row": outer_row, "bubble": bubble, "text": text}
+
+            elif kind == "agent":
+                msg_id = entry.get("id") or f"agent_{next_message_id()}"
+                text = entry.get("text", "")
+                with transcript:
+                    outer_row = ui.row().classes("w-full justify-start items-start gap-1")
+                    with outer_row:
+                        md = ui.markdown(text).classes(
+                            "bg-slate-100 dark:bg-slate-800/90 text-slate-900 dark:text-slate-100 rounded-lg px-4 py-2.5 max-w-[85%] text-sm break-words leading-relaxed border border-slate-300 dark:border-slate-700 shadow-sm"
+                        )
+                        ui.button(icon="content_copy", on_click=lambda e=entry: copy_agent_message(e)).props(
+                            "flat round dense size=xs"
+                        )
+                md._debug_entry = entry
+                message_refs[msg_id] = {"entry": entry, "row": outer_row, "bubble": md}
+
+            elif kind == "system":
+                text = entry.get("text", "")
+                is_error = entry.get("error", False)
+                with transcript:
+                    with ui.row().classes("w-full justify-start items-start gap-1"):
+                        ui.markdown(text).classes(
+                            ("bg-red-50 dark:bg-red-950 text-red-800 dark:text-red-200 border border-red-300 dark:border-red-800" if is_error
+                             else "bg-amber-50 dark:bg-amber-950 text-amber-900 dark:text-amber-200 border border-amber-300 dark:border-amber-800")
+                            + " rounded-lg px-3 py-1.5 max-w-[90%] text-sm shadow-sm font-medium"
+                        )
+
+            elif kind == "event":
+                title = entry.get("title", "")
+                subtitle = entry.get("subtitle", "")
+                body = entry.get("body", "")
+                panel = add_event_panel(title, subtitle, body, "blue-500", "task_alt", record=False)
+                panel._debug_entry = entry
+
+        scroll_area.scroll_to(percent=1.0)
+
+    async def resume_active_turn():
+        """Resumes an incomplete or interrupted turn from its checkpoint or last prompt."""
+        if session.busy:
+            ui.notify("Agent is already running.", type="warning")
+            return
+
+        session.ensure_ready()
+        resume_banner.set_visibility(False)
+        resume_turn_btn.set_visibility(False)
+
+        chk = None
+        if hasattr(session.personality, "load_turn_checkpoint"):
+            chk = session.personality.load_turn_checkpoint()
+
+        last_prompt = session.get_last_user_prompt()
+        prompt_to_resume = (chk.get("prompt") if chk else None) or last_prompt
+
+        if not prompt_to_resume:
+            ui.notify("No incomplete turn found to resume.", type="info")
+            return
+
+        # Hydrate resume prompt so the model continues execution
+        plan_content = agent_bridge.get_current_plan_content(workspace_path=prefs.workspace_path)
+        effective_resume_prompt = (
+            f"[SYSTEM DIRECTIVE: Turn Resumed from Checkpoint]\n"
+            f"Resume the task: '{prompt_to_resume}'.\n"
+        )
+        if plan_content and "No active task plan" not in plan_content:
+            effective_resume_prompt += f"\nActive Roadmap:\n{plan_content[:600]}\n"
+        effective_resume_prompt += (
+            "Continue directly with the remaining actions. "
+            "Do NOT ask what to do and do NOT output conversational pleasantries. Execute the next step now."
+        )
+
+        session.busy = True
+        session.turn_start_ts = time.time()
+        send_button.props("loading")
+        status_label.set_text("Resuming task…")
+        show_thinking_indicator("Resuming task execution…")
+
+        agent_bridge.run_agent_turn_in_thread(
+            session.personality, session.client, effective_resume_prompt, prefs, session.event_queue,
+            use_history=True, resume_turn=True
+        )
+
+    def _sync_resume_button_visibility():
+        """Synchronizes visibility of both the top-bar button and the inline prompt banner."""
+        if session.busy:
+            resume_turn_btn.set_visibility(False)
+            resume_banner.set_visibility(False)
+            return
+
+        is_incomplete = session.has_incomplete_turn()
+        resume_turn_btn.set_visibility(is_incomplete)
+        resume_banner.set_visibility(is_incomplete)
+
+        if is_incomplete:
+            last_p = session.get_last_user_prompt() or "Previous task"
+            display_hint = last_p[:60] + ("..." if len(last_p) > 60 else "")
+            resume_banner_label.set_text(f'Incomplete task: "{display_hint}" — click to continue from checkpoint')
+
+    # Replay existing transcript if resuming or returning from Settings!
+    if session.debug_log:
+        replay_transcript_from_log()
+
+    _sync_resume_button_visibility()
 
     # Initial tree population
     refresh_workspace_tree()
@@ -3956,3 +5305,224 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None) -> None:
         if e.action.keydown and e.modifiers.ctrl and e.key == "/" else None,
         ignore=[],
     )
+
+    ui.keyboard(
+        on_key=lambda e: open_context_inspector_dialog()
+        if e.action.keydown and e.modifiers.ctrl and e.key == "i" else None,
+        ignore=[],
+    )
+
+    # ── Context & Generation Parameters Inspector Modal Dialog ──
+    def open_context_inspector_dialog():
+        current_input_text = (prompt_input.value or "").strip()
+        dialog = ui.dialog().props("maximized")
+
+        with dialog, ui.card().classes(
+            f"w-full h-full flex flex-col p-4 {CANVAS} text-slate-900 dark:text-slate-100 gap-3 overflow-hidden"
+        ):
+            # Header
+            with ui.row().classes(f"w-full items-center justify-between pb-2 border-b {BORDER} shrink-0"):
+                with ui.row().classes("items-center gap-2.5"):
+                    ui.icon("manage_search", size="28px").classes("text-cyan-500")
+                    with ui.column().classes("gap-0"):
+                        ui.label("Agent Context & Configuration Inspector").classes("text-base font-bold")
+                        ui.label("Examine the verbatim messages payload, system prompt, and parameters sent to the LLM.").classes(
+                            f"text-xs {MUTED_DIM}"
+                        )
+
+                with ui.row().classes("items-center gap-2"):
+                    def _copy_full_report():
+                        try:
+                            diag = agent_bridge.get_context_preview(session, prefs, current_input_text)
+                            lines = [
+                                "# Agent Context & Parameter Inspection Report",
+                                f"- Generated: {datetime.now().isoformat()}",
+                                f"- Model: {diag['configuration']['model_name']} ({diag['configuration']['binding_name']})",
+                                f"- Context Tokens: {diag['configuration']['total_tokens']:,} / {diag['configuration']['max_ctx']:,} ({diag['configuration']['fill_pct']}%)",
+                                f"- Memory Active: {diag['configuration']['memory_enabled']} (DB: {diag['configuration']['memory_db_path']})",
+                                "",
+                                "## Active Configuration",
+                                "```json",
+                                json.dumps(diag['configuration'], indent=2),
+                                "```",
+                                "",
+                                "## Verbatim Messages Payload",
+                                "```json",
+                                json.dumps(diag['messages'], indent=2),
+                                "```",
+                                "",
+                                "## Complete System Prompt",
+                                "```markdown",
+                                diag['system_prompt'],
+                                "```"
+                            ]
+                            ui.clipboard.write("\n".join(lines))
+                            ui.notify("Complete context & config report copied to clipboard.", type="positive")
+                        except Exception as ex:
+                            notify_error(f"Failed to copy report: {ex}")
+
+                    ui.button("Copy All (Markdown)", icon="content_copy", on_click=_copy_full_report).props(
+                        "unelevated dense size=sm color=primary no-caps font-semibold"
+                    )
+                    ui.button("Refresh", icon="refresh", on_click=lambda: _refresh_inspector()).props("flat dense size=sm no-caps")
+                    ui.button("Close", icon="close", on_click=dialog.close).props("flat dense round size=sm")
+
+            # Main content area with tabs
+            with ui.tabs().classes(f"w-full {SURFACE} border-b {BORDER} shrink-0").props('dense no-caps active-color="primary" indicator-color="primary"') as insp_tabs:
+                tab_full = ui.tab('full_context', label='📜 Assembled Context (LLM View)', icon='terminal').classes('text-xs py-1.5 flex-1 font-bold')
+                tab_msgs = ui.tab('messages', label='📨 Messages Payload', icon='chat').classes('text-xs py-1.5 flex-1')
+                tab_sys = ui.tab('system', label='🧠 Complete System Prompt', icon='psychology').classes('text-xs py-1.5 flex-1')
+                tab_mem = ui.tab('memory', label='💾 Active Memories & Handles', icon='memory').classes('text-xs py-1.5 flex-1')
+                tab_tools = ui.tab('tools', label='🛠️ Active Tools Schema', icon='build').classes('text-xs py-1.5 flex-1')
+                tab_config = ui.tab('config', label='⚙️ Generation Parameters', icon='tune').classes('text-xs py-1.5 flex-1')
+
+            inspector_slot = ui.column().classes("w-full flex-1 min-h-0 overflow-hidden p-0 m-0")
+
+            def _refresh_inspector():
+                inspector_slot.clear()
+                try:
+                    diag = agent_bridge.get_context_preview(session, prefs, current_input_text)
+                except Exception as ex:
+                    with inspector_slot:
+                        ui.label(f"Failed to compile context preview: {ex}").classes("text-sm text-red-500 p-4")
+                    return
+
+                cfg = diag["configuration"]
+
+                with inspector_slot:
+                    # Metrics Banner
+                    with ui.row().classes(f"w-full items-center justify-between px-3 py-2 {SURFACE} border-b {BORDER} shrink-0 text-xs flex-wrap gap-2"):
+                        with ui.row().classes("items-center gap-2"):
+                            ui.badge(f"Model: {cfg['model_name']}", color="indigo").props("rounded dense")
+                            ui.badge(f"Binding: {cfg['binding_name']}", color="blue").props("rounded dense")
+                            mem_badge_col = "purple" if cfg["memory_enabled"] and cfg["memory_manager_attached"] else "grey"
+                            mem_badge_txt = f"Memory: {'ACTIVE' if cfg['memory_enabled'] and cfg['memory_manager_attached'] else 'OFF'}"
+                            ui.badge(mem_badge_txt, color=mem_badge_col).props("rounded dense")
+                            ui.badge(f"Effort: {cfg['reasoning_effort']}", color="amber").props("rounded dense")
+
+                        with ui.row().classes("items-center gap-2 font-mono"):
+                            pct_col = "text-green-500" if cfg["fill_pct"] < 65 else ("text-yellow-500" if cfg["fill_pct"] < 85 else "text-red-500 font-bold")
+                            ui.label(f"Context: {cfg['total_tokens']:,} / {cfg['max_ctx']:,} tokens").classes(f"font-semibold {pct_col}")
+                            ui.label(f"({cfg['fill_pct']}%)")
+                            ui.label(f"| {len(diag['messages'])} Messages")
+
+                    with ui.tab_panels(insp_tabs, value='full_context').classes('w-full flex-1 min-h-0 p-2 bg-transparent flex flex-col overflow-hidden'):
+                        # --- Tab 0: Full Assembled Context (Exact LLM View) ---
+                        with ui.tab_panel('full_context').classes('w-full h-full p-0 flex flex-col overflow-hidden gap-2'):
+                            with ui.row().classes("w-full items-center justify-between pb-1"):
+                                full_ctx_str = diag.get("full_assembled_context", "")
+                                est_tok = session.client.count_tokens(full_ctx_str) if hasattr(session.client, "count_tokens") else len(full_ctx_str) // 4
+                                ui.label(f"Verbatim Assembled Context for Next Turn ({len(full_ctx_str):,} chars · ~{est_tok:,} tokens):").classes(f"text-xs font-semibold {STRONG}")
+
+                                def _copy_full_ctx():
+                                    ui.clipboard.write(full_ctx_str)
+                                    ui.notify("Verbatim LLM context copied to clipboard.", type="positive")
+
+                                ui.button("Copy Verbatim Context", icon="content_copy", on_click=_copy_full_ctx).props(
+                                    "unelevated dense size=xs color=primary no-caps font-semibold"
+                                )
+
+                            with ui.scroll_area().classes(f"w-full flex-1 border {BORDER} rounded p-3 bg-slate-950 text-slate-100 shadow-inner"):
+                                ui.label(full_ctx_str).classes("w-full text-xs font-mono whitespace-pre-wrap select-all m-0 leading-relaxed text-slate-200 block")
+
+                        # --- Tab 1: Messages Payload ---
+                        with ui.tab_panel('messages').classes('w-full h-full p-0 flex flex-col overflow-hidden gap-2'):
+                            with ui.row().classes("w-full items-center justify-between pb-1"):
+                                ui.label(f"Exact messages list passed to generate_from_messages ({len(diag['messages'])} message(s)):").classes(f"text-xs {MUTED_DIM}")
+                                def _copy_msgs():
+                                    ui.clipboard.write(json.dumps(diag["messages"], indent=2))
+                                    ui.notify("Messages JSON copied to clipboard.", type="positive")
+                                ui.button("Copy JSON", icon="content_copy", on_click=_copy_msgs).props("flat dense size=xs no-caps text-color=primary")
+
+                            with ui.scroll_area().classes(f"w-full flex-1 border {BORDER} rounded p-2 {SURFACE}"):
+                                with ui.column().classes("w-full gap-3"):
+                                    for idx, msg in enumerate(diag["messages"]):
+                                        role = msg.get("role", "unknown")
+                                        content = msg.get("content", "")
+                                        toks = msg.get("tokens", 0)
+
+                                        role_colors = {
+                                            "system": ("bg-purple-900/30 text-purple-300 border-purple-800", "purple"),
+                                            "user": ("bg-blue-900/30 text-blue-300 border-blue-800", "blue"),
+                                            "assistant": ("bg-emerald-900/30 text-emerald-300 border-emerald-800", "emerald"),
+                                        }
+                                        box_css, badge_col = role_colors.get(role, ("bg-slate-800 text-slate-300 border-slate-700", "slate"))
+
+                                        with ui.card().classes(f"w-full p-2.5 rounded-lg border {box_css} gap-1 shadow-none"):
+                                            with ui.row().classes("w-full items-center justify-between"):
+                                                with ui.row().classes("items-center gap-2"):
+                                                    ui.badge(f"[{idx}] {role.upper()}", color=badge_col).props("dense rounded text-[10px]")
+                                                    ui.label(f"~{toks:,} tokens").classes(f"text-[10px] {MUTED_DIM} font-mono")
+                                                def _copy_single_msg(text_to_copy=content):
+                                                    txt = text_to_copy if isinstance(text_to_copy, str) else json.dumps(text_to_copy, indent=2)
+                                                    ui.clipboard.write(txt)
+                                                    ui.notify(f"Message {idx} copied.", type="positive")
+                                                ui.button(icon="content_copy", on_click=lambda c=content: _copy_single_msg(c)).props("flat dense round size=xs color=grey")
+
+                                            with ui.scroll_area().classes("w-full max-h-64 p-2 bg-slate-950/80 rounded border border-slate-800/60"):
+                                                if isinstance(content, str):
+                                                    ui.label(content).classes("w-full text-xs font-mono whitespace-pre-wrap select-all m-0 leading-relaxed text-slate-200 block")
+                                                else:
+                                                    ui.code(json.dumps(content, indent=2), language="json").classes("w-full text-xs")
+
+                        # --- Tab 2: Complete System Prompt ---
+                        with ui.tab_panel('system').classes('w-full h-full p-0 flex flex-col overflow-hidden gap-2'):
+                            with ui.row().classes("w-full items-center justify-between pb-1"):
+                                sys_prompt_str = diag.get("system_prompt", "")
+                                sys_toks = session.client.count_tokens(sys_prompt_str) if hasattr(session.client, "count_tokens") else len(sys_prompt_str) // 4
+                                ui.label(f"Full System Prompt ({len(sys_prompt_str):,} chars · ~{sys_toks:,} tokens):").classes(f"text-xs {MUTED_DIM}")
+                                def _copy_sys():
+                                    ui.clipboard.write(sys_prompt_str)
+                                    ui.notify("System prompt copied.", type="positive")
+                                ui.button("Copy Prompt", icon="content_copy", on_click=_copy_sys).props("flat dense size=xs no-caps text-color=primary")
+
+                            with ui.scroll_area().classes(f"w-full flex-1 border {BORDER} rounded p-3 bg-slate-900 text-slate-100 shadow-inner"):
+                                ui.label(sys_prompt_str).classes("w-full text-xs font-mono whitespace-pre-wrap select-all m-0 leading-relaxed text-slate-200 block")
+
+                        # --- Tab 3: Active Memories & Deep Handles ---
+                        with ui.tab_panel('memory').classes('w-full h-full p-0 flex flex-col overflow-hidden gap-3'):
+                            with ui.card().classes(f"w-full p-3 rounded-lg border {BORDER} {SURFACE} gap-2"):
+                                ui.label("🧠 Persistent Memory Telemetry").classes("text-sm font-bold text-primary")
+                                with ui.row().classes("w-full items-center gap-3 text-xs font-mono"):
+                                    ui.label(f"Active in Prefs: {'YES' if cfg['memory_enabled'] else 'NO'}").classes("font-semibold")
+                                    ui.label(f"Manager Attached: {'YES' if cfg['memory_manager_attached'] else 'NO'}")
+                                    ui.label(f"Total Database Records: {cfg['memory_counts']['total']}")
+                                    ui.label(f"(L1 Working: {cfg['memory_counts']['working']} | L2 Deep: {cfg['memory_counts']['deep']} | L3 Archived: {cfg['memory_counts']['archived']})")
+                                ui.label(f"SQLite DB Path: {cfg['memory_db_path']}").classes(f"text-[10px] {MUTED_DIM} font-mono select-all")
+
+                            with ui.row().classes("w-full flex-1 min-h-0 gap-3 flex-nowrap"):
+                                with ui.column().classes("flex-1 h-full min-w-0 flex flex-col gap-1"):
+                                    ui.label("Level 1: Working Memory Zone (Injected Verbatim into Context)").classes("text-xs font-bold text-emerald-500")
+                                    with ui.scroll_area().classes(f"w-full flex-1 border {BORDER} rounded p-2 {SURFACE}"):
+                                        ui.code(diag["memory_working_zone"], language="markdown").classes("w-full text-xs")
+
+                                with ui.column().classes("flex-1 h-full min-w-0 flex flex-col gap-1"):
+                                    ui.label("Level 2: Deep Memory Handles Zone (Injected as Compact Handles)").classes("text-xs font-bold text-amber-500")
+                                    with ui.scroll_area().classes(f"w-full flex-1 border {BORDER} rounded p-2 {SURFACE}"):
+                                        ui.code(diag["memory_handles_zone"], language="markdown").classes("w-full text-xs")
+
+                        # --- Tab 4: Active Tools Schema ---
+                        with ui.tab_panel('tools').classes('w-full h-full p-0 flex flex-col overflow-hidden gap-2'):
+                            ui.label(f"Active Tool Registry ({len(diag['active_tools'])} tool(s) registered for this turn):").classes(f"text-xs {MUTED_DIM}")
+                            with ui.scroll_area().classes(f"w-full flex-1 border {BORDER} rounded p-2 {SURFACE}"):
+                                with ui.column().classes("w-full gap-2"):
+                                    for t_name, t_spec in sorted(diag["active_tools"].items()):
+                                        with ui.card().classes(f"w-full p-2.5 rounded border {BORDER} bg-slate-900/60 gap-1 shadow-none"):
+                                            with ui.row().classes("w-full items-center justify-between"):
+                                                ui.label(t_name).classes("text-xs font-mono font-bold text-primary")
+                                                ui.label(f"{len(t_spec.get('parameters', []))} parameter(s)").classes(f"text-[10px] {MUTED_DIM}")
+                                            ui.label(t_spec.get("description", "(No description)")).classes(f"text-[11px] {MUTED}")
+                                            if t_spec.get("parameters"):
+                                                with ui.row().classes("gap-1 pt-1 flex-wrap"):
+                                                    for p in t_spec["parameters"]:
+                                                        ui.badge(f"{p.get('name')}: {p.get('type')}", color="slate").props("dense rounded text-[9px]")
+
+                        # --- Tab 5: Generation Parameters ---
+                        with ui.tab_panel('config').classes('w-full h-full p-0 flex flex-col overflow-hidden gap-2'):
+                            ui.label("Runtime Execution Parameters:").classes(f"text-xs {MUTED_DIM}")
+                            with ui.scroll_area().classes(f"w-full flex-1 border {BORDER} rounded p-3 {SURFACE}"):
+                                ui.code(json.dumps(cfg, indent=2), language="json").classes("w-full text-xs")
+
+            _refresh_inspector()
+
+        dialog.open()

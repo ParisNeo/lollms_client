@@ -60,7 +60,7 @@ Emits a numbered checklist of atomic steps required to accomplish the user's goa
 ```
 
 ### 2. DELEGATE (`<delegate>`)
-Hands a single atomic step to a specialist worker, specifying the task and required files:
+Hands a single atomic step to a specialist worker, specifying the task, required files, and optional reasoning effort:
 ```xml
 <delegate>
 <task>
@@ -70,6 +70,19 @@ Write a Python script 'clean_data.py' that loads 'raw_data.csv', removes null va
 raw_data.csv
 </context_files>
 </delegate>
+```
+
+Specialist sub-agents can also be spawned with known reasoning effort or dynamic effort scaling using `tool_spinoff_agent`:
+```json
+<tool>{
+  "name": "tool_spinoff_agent",
+  "parameters": {
+    "agent_name": "MathSpecialist",
+    "task": "Prove convergence of the loss function",
+    "effort": "high",
+    "dynamic_effort": false
+  }
+}</tool>
 ```
 
 ### 3. VERIFY (`<verify>`)

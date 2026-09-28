@@ -95,7 +95,7 @@ def _serialize_config_map_to_yaml(config_map: Dict[str, str]) -> Dict[str, Any]:
                 return v_str
 
     known_aliases_by_modality: Dict[str, Dict[str, List[str]]] = {}
-    for mod in ("llm", "tti", "tts", "stt", "ttm", "ttv", "connection"):
+    for mod in ("llm", "tti", "tts", "stt", "ttm", "ttv", "connection", "rag"):
         known_aliases_by_modality[mod] = {
             "bindings": _get_configured_aliases(mod, config_map, "BINDINGS"),
             "profiles": _get_configured_aliases(mod, config_map, "PROFILES"),
@@ -142,11 +142,6 @@ def _serialize_config_map_to_yaml(config_map: Dict[str, str]) -> Dict[str, Any]:
                 if remainder.endswith("_BINDING_NAME"):
                     alias = remainder[:-len("_BINDING_NAME")]
                     param_name = "binding_name"
-                else:
-                    idx = _find_first_upper_param_boundary(remainder)
-                    if idx > 0:
-                        alias = remainder[:idx]
-                        param_name = remainder[idx + 1:].lower()
 
         if not alias or not param_name:
             continue
@@ -277,43 +272,62 @@ def _sanitize_alias(alias: str) -> str:
 
 def _extract_bindings_from_env(prefix: str, env_data: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
     clean_prefix = prefix.rstrip("_").upper()
-    bindings = {}
     binding_prefix = f"{clean_prefix}_BINDINGS_"
+
+    # Step 1: Discover all genuine binding aliases defined by BINDING_NAME
+    known_aliases: Dict[str, str] = {}
+    for k, v in env_data.items():
+        k_upper = k.upper()
+        if k_upper.startswith(binding_prefix) and k_upper.endswith("_BINDING_NAME"):
+            raw_alias = k_upper[len(binding_prefix):-len("_BINDING_NAME")]
+            if raw_alias:
+                known_aliases[raw_alias] = _sanitize_alias(raw_alias)
+
+    if not known_aliases:
+        return {}
+
+    bindings: Dict[str, Dict[str, Any]] = {}
+    for raw_alias, sanitized in known_aliases.items():
+        bindings[sanitized] = {}
+
+    sorted_aliases = sorted(known_aliases.keys(), key=len, reverse=True)
+
+    # Step 2: Match parameters to verified aliases
     for k, v in env_data.items():
         k_upper = k.upper()
         if not k_upper.startswith(binding_prefix):
             continue
         remainder = k_upper[len(binding_prefix):]
 
-        # The binding_prefix already ends with a trailing underscore after BINDINGS.
-        # So remainder is e.g. "GENERAL_HOST_ADDRESS" where GENERAL is the alias.
-        # Use the helper to find the boundary between alias and parameter key.
-        idx = _find_first_upper_param_boundary(remainder)
-        if idx <= 0:
+        matched_raw_alias = None
+        param_key = None
+
+        for a in sorted_aliases:
+            marker = f"{a}_"
+            if remainder.startswith(marker):
+                matched_raw_alias = a
+                param_key = remainder[len(marker):].lower()
+                break
+
+        if not matched_raw_alias or not param_key:
             continue
 
-        raw_alias = remainder[:idx]
-        raw_key = remainder[idx + 1:]  # skip the underscore separator
+        alias = known_aliases[matched_raw_alias]
 
-        alias = _sanitize_alias(raw_alias)
-        key = raw_key.lower()
-        if not alias or not key:
-            continue
-        if alias not in bindings:
-            bindings[alias] = {}
-        if key == "binding_name":
+        if param_key == "binding_name":
             bindings[alias]["binding_name"] = v
-        elif key == "verify_ssl_certificate":
+        elif param_key == "verify_ssl_certificate":
             bool_ssl = _convert_to_bool(v)
             bindings[alias]["verify_ssl_certificate"] = bool_ssl
             bindings[alias].setdefault("binding_config", {})["verify_ssl_certificate"] = bool_ssl
-        elif key == "certificate_file_path":
+        elif param_key == "certificate_file_path":
             cert_val = str(v).strip()
             bindings[alias]["certificate_file_path"] = cert_val
             bindings[alias].setdefault("binding_config", {})["certificate_file_path"] = cert_val
         else:
-            bindings[alias].setdefault("binding_config", {})[key] = v
-    return bindings
+            bindings[alias].setdefault("binding_config", {})[param_key] = v
+
+    return {a: b for a, b in bindings.items() if b.get("binding_name")}
 
 _PROFILE_KNOWN_KEYS = (
     "BINDING_ALIAS", "BINDING_NAME", "MODEL_NAME", "IS_DEFAULT",
@@ -440,39 +454,44 @@ def _get_configured_aliases(binding_type: str, config_map: Dict[str, str], categ
     cat = category.upper()
     prefix = f"{binding_type.rstrip('_').upper()}_{cat}_"
     aliases = set()
-    for k in config_map:
-        k_upper = k.upper()
-        if not k_upper.startswith(prefix):
-            continue
-        remainder = k_upper[len(prefix):]
-        if cat == "BINDINGS":
-            if remainder.endswith("_BINDING_NAME"):
-                alias = remainder[:-len("_BINDING_NAME")]
+
+    if cat == "BINDINGS":
+        # Discovered strictly from _BINDING_NAME declaration
+        for k, v in config_map.items():
+            k_upper = k.upper()
+            if k_upper.startswith(prefix) and k_upper.endswith("_BINDING_NAME"):
+                alias = k_upper[len(prefix):-len("_BINDING_NAME")]
+                if alias:
+                    aliases.add(alias)
+        return sorted(aliases)
+
+    elif cat == "PROFILES":
+        # Discovered strictly from _BINDING_ALIAS or known profile keys
+        for k, v in config_map.items():
+            k_upper = k.upper()
+            if not k_upper.startswith(prefix):
+                continue
+            remainder = k_upper[len(prefix):]
+            if remainder.endswith("_BINDING_ALIAS"):
+                alias = remainder[:-len("_BINDING_ALIAS")]
                 if alias:
                     aliases.add(alias)
             else:
-                idx = _find_first_upper_param_boundary(remainder)
-                if idx > 0:
-                    alias = remainder[:idx]
-                    if alias:
-                        aliases.add(alias)
-        elif cat == "PROFILES":
-            alias = None
-            for known_key in _PROFILE_KNOWN_KEYS:
-                marker = f"_{known_key}"
-                if remainder.endswith(marker):
-                    alias = remainder[:-len(marker)]
-                    break
-            if alias is None and "_ROUTING_" in remainder:
-                idx = remainder.find("_ROUTING_")
-                if idx > 0:
-                    alias = remainder[:idx]
-            if alias:
-                aliases.add(alias)
-        else:
-            parts = remainder.split("_", 1)
-            if len(parts) == 2 and parts[0]:
-                aliases.add(parts[0])
+                for known_key in _PROFILE_KNOWN_KEYS:
+                    marker = f"_{known_key}"
+                    if remainder.endswith(marker):
+                        alias = remainder[:-len(marker)]
+                        if alias:
+                            aliases.add(alias)
+                        break
+                if "_ROUTING_" in remainder:
+                    idx = remainder.find("_ROUTING_")
+                    if idx > 0:
+                        alias = remainder[:idx]
+                        if alias:
+                            aliases.add(alias)
+        return sorted(aliases)
+
     return sorted(aliases)
 
 def _get_binding_keys(binding_type: str, alias: str, config_map: Dict[str, str]) -> Dict[str, str]:
@@ -507,6 +526,7 @@ def get_client_from_env(
     create_ttm: bool = False,
     create_ttv: bool = False,
     create_connection: bool = False,
+    create_rag: Optional[bool] = None,
     run_wizard_if_fail: bool = True
 ) -> "LollmsClient":
     from lollms_client import LollmsClient
@@ -576,11 +596,16 @@ def get_client_from_env(
         else:
             raise ValueError("LLM configuration is missing.")
 
+    # Auto-detect RAG presence if create_rag was not explicitly set
+    if create_rag is None:
+        has_rag_configured = _is_modality_configured("rag", resolved_env)
+        create_rag = has_rag_configured
+
     kwargs = {}
     binding_types = {
         "llm": create_llm, "tti": create_tti, "tts": create_tts,
         "stt": create_stt, "ttm": create_ttm, "ttv": create_ttv,
-        "connection": create_connection,
+        "connection": create_connection, "rag": create_rag,
     }
 
     for b_type, should_create in binding_types.items():
@@ -1747,6 +1772,7 @@ def build_wizard_menu(
     menu.add_choice("🎵 Configure TTM", value=lambda: _modality_menu("ttm", config_map))
     menu.add_choice("🎬 Configure TTV", value=lambda: _modality_menu("ttv", config_map))
     menu.add_choice("🔗 Configure CONNECTION", value=lambda: _modality_menu("connection", config_map))
+    menu.add_choice("📚 Configure RAG", value=lambda: _modality_menu("rag", config_map))
 
     # In standalone mode, include direct saving options. In non-standalone mode, the calling app owns saving.
     should_include_save = include_save if include_save is not None else standalone

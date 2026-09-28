@@ -132,10 +132,10 @@ class LollmsLLMBinding(LollmsBaseBinding):
         string and the legacy boolean ``think`` flag.
 
         Precedence:
-          1. An explicit ``reasoning_effort`` string wins (validated against the
-             canonical set ``low | medium | high | max``).
-          2. A ``reasoning_effort`` that arrives as a boolean (legacy misuse) is
-             mapped: ``True`` -> ``"high"``, ``False`` -> ``None``.
+          1. An explicit ``reasoning_effort`` string wins. Literals like "none", "off", "disabled", "false", "0"
+             deactivate reasoning (return None).
+          2. A ``reasoning_effort`` that arrives as a boolean is mapped:
+             ``True`` -> ``"high"``, ``False`` -> ``None``.
           3. Otherwise the legacy ``think`` flag decides:
              ``True`` -> ``"high"``, ``False`` -> ``None``.
 
@@ -147,6 +147,8 @@ class LollmsLLMBinding(LollmsBaseBinding):
             if isinstance(reasoning_effort, bool):
                 return "high" if reasoning_effort else None
             effort = str(reasoning_effort).strip().lower()
+            if effort in ("none", "off", "disabled", "false", "0"):
+                return None
             if effort in valid:
                 return effort
             ASCIIColors.warning(
@@ -263,109 +265,30 @@ class LollmsLLMBinding(LollmsBaseBinding):
         )
 
     @staticmethod
-    def translate_reasoning_effort(
-        reasoning_effort: Optional[Union[str, bool]] = None,
-        supported_efforts: Optional[List[str]] = None,
-        think: Optional[bool] = None,
-    ) -> Optional[str]:
+    def get_deactivate_thinking_payload(model_name: Optional[str] = None) -> Dict[str, Any]:
         """
-        Translates an incoming reasoning effort setting to a level supported by the model.
-
-        Anchor score projection:
-          none/off/disabled -> 0.0
-          minimal/min       -> 0.15
-          low               -> 0.30
-          medium/default    -> 0.60
-          high              -> 0.85
-          max/maximum       -> 1.00
+        Returns parameters for OpenAI, vLLM, Ollama, Z.AI, and SGLang backends to strictly
+        deactivate thinking when think is False and reasoning_effort is None.
         """
-        if reasoning_effort is None and think is None:
-            return None
+        m_lower = (model_name or "").lower()
+        is_glm = "glm" in m_lower
+        is_qwen = "qwen" in m_lower
 
-        disabled_literals = {"none", "off", "disabled", "false", "0"}
-        raw_str = ""
-        if reasoning_effort is False or (reasoning_effort is None and think is False):
-            raw_str = "none"
-        elif reasoning_effort is True or (reasoning_effort is None and think is True):
-            raw_str = "high"
-        elif reasoning_effort is not None:
-            raw_str = str(reasoning_effort).strip().lower()
-
-        if not supported_efforts:
-            return None if raw_str in disabled_literals else LollmsLLMBinding.normalize_reasoning_effort(think, raw_str)
-
-        supported_lower_map = {s.strip().lower(): s for s in supported_efforts if s}
-        if not supported_lower_map:
-            return None if raw_str in disabled_literals else LollmsLLMBinding.normalize_reasoning_effort(think, raw_str)
-
-        if raw_str in disabled_literals:
-            for dis in ("none", "off", "disabled", "false"):
-                if dis in supported_lower_map:
-                    return supported_lower_map[dis]
-            return None
-
-        if raw_str in supported_lower_map:
-            return supported_lower_map[raw_str]
-
-        anchor_scores = {
-            "none": 0.0,
-            "off": 0.0,
-            "false": 0.0,
-            "disabled": 0.0,
-            "minimal": 0.15,
-            "min": 0.15,
-            "low": 0.30,
-            "medium": 0.60,
-            "med": 0.60,
-            "default": 0.60,
-            "high": 0.85,
-            "on": 0.85,
-            "true": 0.85,
-            "max": 1.00,
-            "maximum": 1.00,
-            "extreme": 1.00,
+        extra: Dict[str, Any] = {
+            "thinking": False,
+            "chat_template_kwargs": {
+                "thinking": False,
+                "enable_thinking": False,
+            },
         }
+        if is_glm:
+            extra["thinking"] = {"type": "disabled"}
+            extra["chat_template_kwargs"]["enable_thinking"] = False
+            extra["chat_template_kwargs"]["thinking"] = False
+        elif is_qwen:
+            extra["chat_template_kwargs"]["enable_thinking"] = False
 
-        target_score = anchor_scores.get(raw_str, 0.60)
-
-        active_candidates = [
-            s for s in supported_efforts
-            if s and s.strip().lower() not in disabled_literals
-        ]
-        if not active_candidates:
-            active_candidates = list(supported_efforts)
-
-        def score_candidate(cand: str, idx: int, total: int) -> float:
-            lowered = cand.strip().lower()
-            if lowered in anchor_scores:
-                return anchor_scores[lowered]
-            return idx / max(1, total - 1)
-
-        best_cand = active_candidates[0]
-        min_distance = float("inf")
-        best_cand_score = -1.0
-
-        total_cands = len(active_candidates)
-        for idx, cand in enumerate(active_candidates):
-            c_score = score_candidate(cand, idx, total_cands)
-            dist = abs(c_score - target_score)
-            if dist < min_distance or (abs(dist - min_distance) < 1e-5 and c_score > best_cand_score):
-                min_distance = dist
-                best_cand = cand
-                best_cand_score = c_score
-
-        return best_cand
-
-    def get_effective_reasoning_effort(
-        self,
-        think: Optional[bool] = None,
-        reasoning_effort: Optional[Union[str, bool]] = None,
-    ) -> Optional[str]:
-        return self.translate_reasoning_effort(
-            reasoning_effort=reasoning_effort,
-            supported_efforts=getattr(self, "supported_reasoning_efforts", None),
-            think=think,
-        )
+        return extra
 
     # ── Cancellation API ─────────────────────────────────────────────────────
 
@@ -439,8 +362,8 @@ class LollmsLLMBinding(LollmsBaseBinding):
                     user_keyword:Optional[str]="!@>user:",
                     ai_keyword:Optional[str]="!@>assistant:",
                     think: Optional[bool] = False,
-                    reasoning_effort: Optional[str] = "low", # low, medium, high, max
-                    reasoning_summary: Optional[str] = "auto",
+                    reasoning_effort: Optional[str] = None,
+                    reasoning_summary: Optional[str] = None,
                     **kwargs
                     ) -> Union[str, dict]:
         """
@@ -460,8 +383,8 @@ class LollmsLLMBinding(LollmsBaseBinding):
                     seed: Optional[int] = None,
                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
                     think: Optional[bool] = False,
-                    reasoning_effort: Optional[str] = "low", # low, medium, high, max
-                    reasoning_summary: Optional[str] = "auto",
+                    reasoning_effort: Optional[str] = None,
+                    reasoning_summary: Optional[str] = None,
                     **kwargs
                     ) -> Union[str, dict]:
         """
@@ -514,6 +437,12 @@ class LollmsLLMBinding(LollmsBaseBinding):
         for msg in messages[first_non_system_index:]:
             role = msg.get("role", "user")
             content = msg.get("content", "")
+
+            # Strip special tool-calling template tokens that cause llama-server parser crashes
+            if isinstance(content, str):
+                content = re.sub(r'\[TOOL_CALLS\][^\n]*\n?', '', content, flags=re.IGNORECASE)
+                content = re.sub(r'\[TOOL_CALLS[^\n]*\n?', '', content, flags=re.IGNORECASE)
+                content = re.sub(r'=== END (?:ACTIVE )?SKILLS ===\s*', '', content, flags=re.IGNORECASE).strip()
 
             # Convert any system message in the middle of the chat to user role
             if role == "system":

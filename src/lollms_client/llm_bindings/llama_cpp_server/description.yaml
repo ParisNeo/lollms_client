@@ -45,6 +45,11 @@ input_parameters:
     description: "Interface to bind the server to."
     mandatory: false
     default: "localhost"
+  - name: port
+    type: int
+    description: "Dedicated port number for this server instance (null/0 for auto-assign)."
+    mandatory: false
+    default: null
   - name: ctx_size
     type: int
     description: "Context window size (tokens)."

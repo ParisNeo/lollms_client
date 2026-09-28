@@ -3,6 +3,170 @@
 
 All notable changes to this project will be documented in this file.
 #
+- fix(openai:reasoning): wire per-call `think` and `reasoning_effort` parameters in `_run_chat_messages` to explicitly deactivate thinking (`reasoning_effort="none"`, `chat_template_kwargs={"enable_thinking": False}`, `thinking={"type": "disabled"}` for GLM) when `think is False` and `reasoning_effort is None`
+- fix(ollama:reasoning): project `'max'` and extreme reasoning efforts to `'high'` to conform to Ollama's `ChatRequest` schema (`Union[bool, Literal['low', 'medium', 'high']]`), resolving Pydantic validation crashes
+- fix(discussion:chat): initialize `was_cancelled` before `_persist_round_state()` definition in `_mixin_chat.py` to prevent enclosing scope `UnboundLocalError` warnings
+- feat(ollama:reasoning): upgrade requirement to `ollama>=0.6.2`, pass `think=False` & `options["think"]=False` when disabled to instruct engine not to think, and pass exact effort level strings (`low`, `medium`, `high`, `max`) when enabled
+- fix(client:profiles): resolve duplicate default profiles across all modalities on startup by keeping the first default, demoting extras, and persisting the single-default invariant to `config.yaml` and `.env`; eliminate phantom `'master'` profile injection with missing `model_name` when real model profiles exist
+- fix(openai:reasoning): patch `OpenAIBinding` (`generate_text`, `generate_from_messages`, `_StreamThinkingHandler`) to apply `_apply_thinking_params`, instruct engines not to think (`reasoning_effort="none"`, `chat_template_kwargs={"enable_thinking": False, "thinking": False}`, `thinking={"type": "disabled"}` for GLM), and silence residual thoughts when deactivated
+- feat(openai:reasoning): explicitly instruct engines not to think (`reasoning_effort="none"`, `chat_template_kwargs={"enable_thinking": False}`, `thinking={"type": "disabled"}` for GLM) when `think is False` and `reasoning_effort is None`
+- fix(ollama:reasoning): strictly deactivate thinking in Ollama binding (`think=False`, `options["think"]=False`) when `think is False` and `reasoning_effort is None`, suppress thinking stream chunks when disabled, and filter out raw `<think>` content
+- fix(discussion:db): resolve SQLite `database or disk is full` error by setting `PRAGMA temp_store=MEMORY` on all pooled connections, auto-checkpointing WAL, adding safe rollback to `commit()`, and stripping bulky raw content from `sources` metadata
+- fix(discussion:chat): add explicit `web_search` and `internet_search` parameters to `ChatMixin.chat()` signature and guard pre-hydration evaluation to eliminate `NameError: name 'web_search' is not defined`
+- fix(discussion:sources): persist RAG and web search sources in `ai_message.metadata["sources"]` across round checkpoints and turn completions, number prompt source headers as `[1]`, `[2]`, `[3]`, and expose `LollmsMessage.sources` to guarantee references remain active after page reloads
+- fix(llm:reasoning): ensure GLM/vLLM backend thinking deactivation (`chat_template_kwargs={"enable_thinking": False}`, `thinking={"type": "disabled"}`) and fix multi-chunk `_in_think_block` state tracking in `_mixin_chat.py` so thoughts never leak into conversational chat bubbles
+- fix(llm:reasoning): ensure all LLM bindings and core client generation pipelines explicitly deactivate thinking (`thinking=False`, `chat_template_kwargs={"thinking": False}`) when `think is False` and `reasoning_effort is None`
+- fix(rag:import): ensure `LollmsRAGBinding` and `LollmsRAGBindingManager` are completely defined and exported in `lollms_rag_binding.py`, with graceful fallback in `lollms_core.py` and top-level export in `__init__.py`
+- feat(client:profile_management): add first-class runtime profile management methods (`list_binding_profiles`, `list_model_profiles`, `add_binding_profile`, `add_model_profile`, `remove_binding_profile`, `remove_model_profile`, `get_active_profile`, `switch_profile`) to `LollmsClient`
+- feat(client:from_config): add `LollmsClient.from_config()` classmethod factory to instantiate clients directly from `.yaml`, `.json`, `.env` files, dictionaries, or the active environment
+- feat(config:universal_modalities): add `BindingType.RAG` and `BindingType.CONNECTION` to `lollms_config.py` and register `"rag"` across `lollms_config_api.py` and profile builder workflows
+- feat(cli:rag_profiles): wire two-tier RAG binding/model profiles and automated client creation into `lollms_code` CLI (`CodeAgentConfig`) and GUI (`agent_bridge.py`)
+- feat(rag:modality): introduce new `rag_bindings` modality category with `LollmsRAGBinding` base class and `LollmsRAGBindingManager`
+- feat(rag:safe_store): implement first-class `safe_store` RAG binding supporting dense vectors, BM25 FTS5 sparse search, RRF fusion, chunk reconstruction, W3C SPARQL 1.1 graphs, AES-128 encryption, and automated LLM generator bridging
+- feat(rag:stores_architecture): enforce two-tier profile architecture for RAG where connection layer defines engines and execution layer defines persistent data stores
+- feat(tools:rag): implement automated `tool_query_rag`, `tool_sparql_query`, `tool_add_document_to_rag`, and `tool_get_rag_info` in `BindingToolsBuilder`
+- feat(config:rag): add RAG modality support to CLI/GUI configuration menus, environment serializers, and client resolvers
+- feat(skills:tool_dependency): enforce automatic toolset loading when a skill requires specific tools, refusing to load the skill if required tools cannot be found or mounted
+- feat(zoo:skill_tools): automatically search and install missing required tools from the `lollms_tools_zoo` repository when installing a skill from the skills zoo
+- fix(personality:tool_loader): wire dynamic tool availability checking and tool loader on `skills_manager` in `lollms_personality`, enabling instant tool activation when skills load
+- fix(lcp:multi_folder): expand `mount_tool_library` and `find_library_for_tool` to search across all configured tool folders (project, global, default)
+- feat(gui:linear_history_edit): add linear history Edit and Resend actions to user speech bubbles, cleanly discarding subsequent turns from memory, transcript, and disk to continue execution from that point
+- feat(gui:dynamic_mode): add 1-click Dynamic Mode quick toggle (`⚡ Dynamic: ON/OFF`) and `/dynamic` slash command activating autonomous effort scaling, task-adapted temperature, and auto max tokens
+- feat(gui:linear_history_edit): add linear history Edit and Resend actions to user speech bubbles, cleanly discarding subsequent turns from memory, transcript, and disk to continue execution from that point
+- feat(gui:dynamic_mode): add 1-click Dynamic Mode quick toggle (`⚡ Dynamic: ON/OFF`) and `/dynamic` slash command activating autonomous effort scaling, task-adapted temperature, and auto max tokens
+- feat(turn:resumption): implement round-end state checkpointing and turn resumption across both `lollms_discussion` and `lollms_personality`, allowing interrupted turns to resume seamlessly
+- feat(gui:resume_button): add dedicated "Resume Turn" top-bar button and `/resume` slash command to resume cut turns from their exact round checkpoint
+- fix(gui:live_turn_persistence): implement live continuous auto-save during generation (on tool completion, artifact creation, sub-agent completion, and every 2.5s) to guarantee zero loss of transcript or work when interrupted midway
+- fix(personality:cancelled_turns): preserve partial turn history and assistant actions in `self._conversation` upon cancellation instead of wiping the turn, enabling seamless resume
+- feat(gui:session_persistence): resolve session loss when navigating between Settings and Chat by caching active sessions per workspace and replaying transcript history
+- feat(gui:sessions_manager): add persistent Sessions Manager (`/sessions` and top navigation bar button) allowing users to save, resume, browse, and delete previous discussions from disk
+- feat(gui:smart_scroll): implement intelligent stick-to-bottom auto-scroll allowing users to freely scroll up and inspect earlier history during generation without viewport snapping
+- feat(gui:collapsibles): prevent live stream updates from overriding user-toggled expansion states on collapsible panels during generation
+- feat(agent_state:realtime_flush): immediately flush completed artifacts to disk upon `</artifact>` tag closure, ensuring files are written to disk even during long multi-minute generation rounds
+- fix(chat_page:code_viewer): replace `ui.code` with styled `ui.element("pre")` to eliminate black/empty code boxes and render streaming artifact tokens smoothly
+- fix(agent_state:stream): eliminate empty string artifact chunk bug by capturing `incoming_chunk = self._pending_buffer` before clearing, enabling live content streaming into artifact viewports
+- feat(agent_state:stream_complete): immediately emit `MSG_TYPE_ARTEFACT_BUILD_END` with parsed body content when `</artifact>` closing tag arrives
+- fix(chat_page:live_artifacts): resolve empty collapsible artifact views by retaining `ui.expansion` object structure, adding `find_active_artefact_item()` and `update_code_box()` for real-time text rendering
+- feat(gui:live_artifacts): stream live code and text directly into collapsible artifact expansion panels in real-time with animated spinner and dynamic header displaying the latest written line
+- feat(config:auto_tuning): add Auto Temperature (task-adapted 0.15 for code/patches vs 0.7 for chat) and Auto Max Generation Tokens (auto-calculated from remaining context window)
+- feat(subagent:ui): add detailed, user-facing collapsible cards in GUI and Rich panels in CLI for sub-agent spawning and completion with task directives, depth, effort, and reports
+- feat(context:inspector): add dedicated 'Assembled Context (LLM View)' tab in Context Inspector displaying verbatim system prompt and turn history exactly as transmitted to the LLM backend
+- fix(subagent:control): resolve loss of cancellation control by propagating `cancel_generation()` to active child agents via `SubAgentSpawner.cancel_active_child()`
+- fix(subagent:doctrine): enforce headless worker doctrine forbidding sub-agents from asking human questions or awaiting confirmation, mandating immediate autonomous execution and structured `<report>` output
+- feat(workspace:tree): redesign workspace tree context generation with compact sizes (`11.7 MB`), sequence clustering (`img_dalle__1..16.png`), relative child paths, and ```` ```text ```` encapsulation, shrinking token consumption by >60% and guaranteeing vertical line returns
+- fix(chat:inspector): render Context Inspector system prompt and message tabs in preformatted `<pre>` containers to prevent markdown headers from inflating into 36px H1 headings
+- feat(workspace:tree): redesign workspace tree context generation with compact sizes (`11.7 MB`), sequence clustering (`img_dalle__1..16.png`), relative child paths, and ```` ```text ```` encapsulation, shrinking token consumption by >60% and guaranteeing vertical line returns
+- fix(chat:inspector): render Context Inspector system prompt and message tabs in preformatted `<pre>` containers to prevent markdown headers from inflating into 36px H1 headings
+- feat(memory:readability): format working memory and deep memory handles with bold backticked IDs (`• **`[ID]`**`), dates, importance percentages, clean indented content, and double line returns to eliminate unreadable run-on blocks
+- fix(agent_bridge:preview): eliminate redundant duplicate `=== ACTIVE MEMORIES ===` wrapper in context inspector
+- fix(workspace:tree): wrap directory and file paths in backticks in `_build_workspace_tree_r()` to prevent Markdown from turning underscored filenames into collapsed italics
+- feat(prompt:readability): format `=== TOOLS AVAILABLE ===` with bold backticked headers (`#### 🛠️ **`tool_name`**`), parameter lists, and clean double line returns to prevent markdown italic distortion and wall-of-text collapse
+- feat(vlm:tool): implement self-contained `tool_inspect_image` and `tool_vlm_query` LCP tool library to allow visual inspection and categorization of workspace images via active VLM
+- feat(skills:file_organization): mandate exhaustive file mapping and granular taxonomies, incorporating `tool_inspect_image` visual inspection for ambiguous images
+- feat(subagent:telemetry): stream sub-agent execution live to GUI via `child_stream_relay` and render dedicated `worker_spawn_start`/`worker_spawn_end` panels in `chat_page.py`, eliminating silent 200s+ background stalls
+- feat(memory:auditability): emit live `memory_consolidated` events with content and tags during autonomous consolidation passes, rendering dedicated audit cards in the chat transcript
+- fix(patch:recovery): inject authoritative full-file rewrite instruction upon Aider SEARCH/REPLACE failure to break infinite search guessing loops
+- fix(subagent:args): accept `effort`, `dynamic_effort`, and `**kwargs` in `SubAgentSpawner.spawn()` to resolve `TypeError: unexpected keyword argument 'effort'` crash
+- fix(chat:artefacts): render actual content preview in `artefact_end` cards when no code symbols are present instead of `(no output)`
+- docs(skills:file_organization): enforce invariant prohibiting `tool_spawn_sub_agent` invocation during Phase 3 confirmation request
+- fix(stream:delimiters): include leading backtick-blockquote sequences (`` `> ``, `` >` ``) in tool tag matching and scrub trailing delimiters from `text_before`, completely eliminating leaked `` `> `` artifacts in speech bubbles
+- feat(skills:resolver): add category (`workspace_management`) and tag matching to `SkillsManager.get_skill()`, preventing `Skill 'workspace_management' not found` errors
+- fix(chat:delimiters): scrub stray trailing braces and backtick delimiters (e.g. `` `} `` or `}`) from speech bubbles and stream buffers
+- fix(prompt:dedup): eliminate duplicate skills block injection where `=== AVAILABLE SKILLS ===` was rendered twice in the system prompt
+- fix(skills:args): accept `title`, `name`, and `skill_name` flexibly in `tool_load_skill` and `tool_unload_skill` to prevent unexpected keyword argument `TypeError` crashes
+- feat(agent:parser): intercept and parse curly-brace pseudo-tags (`{tool}{...}`, `{artifact}{...}`) into actionable executions to eliminate 16-round stall loops
+- fix(chat:render): scrub unclosed broken backtick fences and pseudo-tags in `chat_page.py` so headings do not inflate into massive H1 elements
+- fix(skills:matching): implement fuzzy and normalized title/slug resolution in `SkillsManager.get_skill()` so `"file_organization"`, `"file_and_folder_organization"`, and title variants all match
+- fix(agent:stream): intercept bare and blockquoted tool JSON calls (`>{"name": ...}`) to execute tools cleanly without leaking raw JSON into chat bubbles
+- fix(skills:lifecycle): return instant confirmation directive when a skill is already active in context to prevent repetitive loading loops across rounds
+- fix(skills:discovery): resolve project root crawling and fix key deduplication bug so all 25 skills are restored and visible in the Sub-WS panel
+- feat(skills:gui): render Global and Bundled skills alongside Handbag and Project skills in `chat_page.py` with individual `[U]`/`[C]` toggle controls
+- feat(skills): enforce unloaded-at-start doctrine (`[U]`) across all skills so no skills are loaded into active context (`[C]`) on startup without explicit request
+- feat(skills): add `tool_unload_skill` allowing LLM to dynamically unload skills from context to free tokens
+- fix(skills:sidebar): eliminate duplicate skills display in sidebar by deduplicating dual-indexed title and slug keys in `SkillsManager.get_unique_skills()` and `agent_bridge`
+- fix(chat_page): resolve NiceGUI RuntimeError in `delete_message()` by firing `ui.notify()` before deleting parent element row
+- fix(llama_cpp_server, history): scrub `[TOOL_CALLS]` and template tokens across message normalization and context export to prevent llama-server `Failed to parse input at pos 0` API errors
+- fix(agent_state): allow functional action tags (`<tool>`, `<artifact>`, `<unlock_file>`) to bypass code fence swallowing and add post-stream recovery sweep for missed action tags
+- feat(agent_state): support tool calls with attributes on the `<tool>` tag itself (e.g. `<tool name="..." parameters="...">`)
+- fix(skills:file_organization): eliminate markdown code fences wrapping `<artifact>` and `<tool>` examples in `SKILL.md` to prevent models from generating fenced XML and empty mapping tables
+- fix(history): eliminate duplicate scratchpad and memory injection in user messages by setting `scratchpad=""` and `memory_manager=None` in `_HistoryContextAdapter`
+- fix(memory): format working memory entries as clean newline-separated bullet points (`• [ID] (Date) Content [tags: ...]`) and purge corrupted boundary tokens and backticks
+- fix(llama_cpp_server): correct context size detection in `/props` to query `n_ctx` rather than concurrency `total_slots` which reported 1 token
+- refactor(scratchpad): redefine scratchpad as strictly ephemeral per-session working buffer (maintained across rounds and turns, purged between sessions)
+- fix(scratchpad): prevent injection of empty or boilerplate scratchpads into system prompts
+- fix(chat_page, cli): automatically wipe `.lollms_code/scratchpad.md` on new session launch, `/clear-history`, and `clear_conversation()`
+- fix(agent): implement Greeting Immunity Shield to programmatically intercept and discard unprompted file writes and tool calls on conversational greetings like 'HI THERE'
+- fix(agent): suppress stale `CURRENT.md` roadmaps and historical `scratchpad.md` injections on greeting turns
+- fix(chat_page): automatically reset `.lollms_code/CURRENT.md` on `new_session()` and `/clear-history` to prevent previous session plans from haunting new sessions
+- fix(skills:gui): parse YAML frontmatter cleanly in `_view_skill_content()` to display structured metadata chips (Author, Version, Category, Date, Tags) and strip raw frontmatter from the markdown viewer
+- fix(agent_state): enable functional tag execution (`<unlock_file>`, `<tool>`, `<artifact>`) even when enclosed in markdown backticks or code fences
+- fix(agent_state): add post-stream sweep to intercept and execute missed action tags and prevent raw XML leakage into speech bubbles
+- feat(skills): bundle default skills inside `lollms_code/skills/` and auto-sync on launch to `~/.lollms_client/skills/` to guarantee global availability regardless of active workspace
+- feat(agent_state): parse and execute direct XML tool calls (e.g. `<tool_load_skill title="..." />`) preventing unhandled tag loops
+- feat(skills): support dual-key indexing by both human-readable title and directory slug in `SkillsManager`
+- fix(skills): add round-aware skill context injection to transition from Round 1 loading mandate to Round 2+ active execution directive, eliminating repetitive `tool_load_skill` apology loops
+- fix(agent_state): support blockquoted tool calls (`(?:>\s*)?<\s*tool`) to intercept tools emitted inside markdown blockquotes
+- fix(personality): inject explicit directive after `tool_load_skill` confirming doctrine receipt and commanding immediate execution of Phase 1
+- fix(personality): resolve false greeting detection where words containing 'hi' (e.g. 'this' in 'organize this folder') falsely triggered greeting mode
+- fix(agent_state, chat_page): strip model `[TOOL_CALLS]` tokens and leaked `=== END ACTIVE SKILLS ===` lines from visible speech bubbles
+- fix(skills): add critical execution mandate to `file_organization` to execute Phase 1 and Phase 2 immediately without asking permission to start
+- feat(skills): add Phase 3.5 Iterative Refinement protocol to `file_organization` so user inquiries and folder adjustments update `classes.md`/`mapping.md` without triggering migration prematurely
+- fix(personality): de-escalate error recovery prompts to calm guidance to prevent 8B model panic loops and backtick cascades
+- fix(agent_state): support divider-prefixed functional tags (`---<tool>`, `---<artifact>`)
+- feat(skills): add Skill-First Dispatch Mandate requiring the agent to call `tool_load_skill` in Round 1 before taking action when a specialized skill exists
+- feat(skills): add proactive recommendation engine in `SkillsManager` highlighting matching skills for the user's prompt (e.g. `file_organization` on "organize this folder")
+- fix(skills:paths): implement dynamic root crawler `_find_project_root()` in `cli.py` and `agent_bridge.py` ensuring `skills/` is discovered reliably
+- feat(spinoff): activate spinoff sub-agent factory (`tool_spinoff_agent`) by default across agent and discussion sessions
+- feat(skills): add comprehensive `file_organization` skill implementing 4-phase taxonomy generation (`classes.md` & `mapping.md`), sub-agent ambiguity inspection, mandatory user confirmation gate, and delegated migration execution
+- perf(skills): enforce loadable-by-default visibility across all skills, shrinking prompt overhead from ~11,000 tokens to under ~900 tokens (91% context reduction)
+- fix(skill): prevent unflagged skills from defaulting to 'visible' in mixed mode
+- refactor(personality, lollms_code): massively streamline monolithic system prompt from 63k chars (~11k tokens) down to ~1.2k tokens
+- feat(skills): modularize specialized agent instructions into on-demand loadable skills (`file_organization`, `document_analysis_and_extraction`, `bibliography_and_research`, `deep_websearch_and_extraction`, `fullstack_development`, `git_workflow_mastery`, `desktop_automation`)
+- feat(handbag): auto-seed modular skills into the default coder handbag on initialization
+- fix(personality): resolve empty response stall on greetings like 'hi' by synthesizing conversational greeting fallback and reprompting on empty Round 1 <done/> emissions
+- fix(personality): clarify Rule 5 mandate to write conversational response text before emitting <done/>, strictly forbidding solitary <done/> emissions
+- fix(memory): prevent memory task contamination by adding strict MEMORY DOCTRINE asserting memories are passive background facts, not current task instructions
+- feat(memory): add automatic startup deduplication (`deduplicate_all()`) and task backlog demotion (`clean_task_backlog_memories()`) to eliminate redundant memories and merged notes
+- fix(memory): guard `auto_pull_deep_memories` against firing on greetings and trivial messages like 'Hi' or 'Hello'
+- fix(memory): filter ephemeral task requests from `_autonomous_memory_consolidation()`
+- fix(lollms_code:gui): resolve argument mismatch in `get_context_preview()` allowing flexible 2, 3, or 4 argument invocation for Context Inspector
+- feat(llama_cpp_server): add `port` parameter to `description.yaml` and support custom port assignment for concurrent instances with separate models folders
+- feat(bindings): establish local resource management contract (`is_local()`, `is_model_loaded()`, `has_active_resources()`, `get_loaded_models()`, `unload_model()`) in `LollmsBaseBinding`
+- feat(core): add `free_local_binding_resources()` and `ensure_model_loaded()` to coordinate VRAM/RAM reclamation across bindings on OOM before retrying
+- refactor(bindings): retain current working directory (`Path(".")`) as the universal default path for standalone apps while supporting `system_dir` / `cwd` override
+- feat(lollms_code): configure CLI and GUI to explicitly pass `~/.lollms_client` as the `system_dir`/`cwd` override to prevent binary downloads and venv creation inside project workspaces
+- feat(settings): add dynamic binding commands interface driven by `description.yaml` with live progress bars and model download/update support
+- feat(settings): warn on duplicate binding/profile aliases with choice to return and edit name or auto-save with incrementing suffix
+- fix(config): eliminate phantom binding generation by discovering binding aliases strictly through `_BINDING_NAME` declarations
+- fix(env_config): auto-purge orphaned ghost binding keys on environment reload
+- fix(settings_page): eliminate stacked dialog bug when adding server bindings by replacing multi-listener registration with a tab-aware dispatcher
+- feat(lollms_code:gui): replace static model label in header bar with interactive dropdown to select and persist default LLM binding/model profiles
+- feat(lollms_code): add "Inspect Context" dialog and `/inspect` command to visualize exact prompt messages, memory blocks, and runtime parameters sent to the LLM
+- fix(memory): ensure `=== ACTIVE MEMORIES ===` and `=== DEEP MEMORY HANDLES ===` zones are always rendered in prompt context even when empty to prevent model amnesia
+- fix(sub_workspace): delegate directory inputs in `import_file` to `import_folder` instead of raising FileNotFoundError
+- fix(folder_picker): strictly enforce `p.is_file()` validation across `pick_file` tiers
+- fix(chat_page): wrap all reference import operations in exception handlers and support directory fallback
+- fix(lollms_code:gui): use `pick_file` instead of `pick_folder` for reference file import buttons
+- feat(lollms_code:gui): launch application as a maximized desktop window with native titlebar rather than borderless fullscreen
+- feat(memory): mount callable memory tools (`tool_save_memory`, `tool_search_memory`, `tool_load_memory`) in LollmsPersonality
+- feat(memory): hydrate both Working Memory and Deep Memory Handles zones into context in LollmsPersonality
+- fix(memory): add `<mem_load>`, `<mem_search>`, `<mem_delete>`, and `<mem_tag>` interception to `_AgentStreamState`
+- feat(lollms_code): add `/memory on|off|toggle` slash commands and quick memory status toggle in GUI header
+- docs(memory): enforce strict same-response memory saving mandate when users instruct the agent to remember facts/rules
+- feat(lollms_code:gui): refresh workspace tree on every round end using lazy loading and preserving expanded directory state
+- fix(chat): define `had_prior_actions` in `_mixin_chat.py` and eliminate intent heuristics when `enforce_end_tag=True`
+- fix(test_high_grade_agent): ensure tests requiring `<done/>` include `<done/>` in scripted completions and test multi-round continuation until `<done/>`
+- fix(lollms_code): ensure `enforce_end_tag=True` strictly requires `<done/>` to stop and intercepts action intent statements like `"I'll copy..."` to force execution
+- fix(chat): resolve UnboundLocalError for is_inside_thoughts in _StreamState.feed() by positioning <effort> interception after thought bounds calculation
+- fix(chat): correct delta text extraction and round tag handling in empty response guard to terminate on round 1
+- fix(gui): resolve main-thread hang in NiceGUI by preventing secondary modality daemons from synchronously blocking client startup
+- fix(ttm, tti): default `wait_for_server` to `False` and spawn daemons in background threads to avoid freezing caller event loops
+- fix(lollms_code): restrict GUI client modality profiles to TTI, TTS, and STT, eliminating unwanted TTM/TTV daemon launches
+- feat(chat): support infinite reasoning rounds (`max_steps=0` / `max_nb_rounds=0`) with safety warnings across CLI, GUI, and core engines
+- docs(effort): document dynamic effort scaling, sub-agent effort delegation, and infinite rounds across all guides
+- feat(lollms_code): add reasoning effort and dynamic effort configuration to CLI, GUI settings, and fast effort top-bar selector
+- feat(chat): add `dynamic_effort` support to discussion and personality chat loops via `<effort level="..."/>` tags
+- feat(agentic): add known effort assignments and dynamic effort delegation to sub-agents and spinoff tools
 - feat(events): emit `<round id="N"/>` tag in chunk stream on new round start when in PROCESSING_TAG_MODE
 - fix(diffusers): implement get_settings and list_services in DiffusersTTIBinding to fulfill abstract base class
 - fix(diffusers): resolve host_address attribute error and pip requirement format in DiffusersTTVBinding
@@ -51,6 +215,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+
+## [2026-09-27 23:51]
+
+- feat(llm): add GLM/vLLM backend thinking deactivation support via chat_template_kwargs
 
 ## [2026-09-25 14:20]
 

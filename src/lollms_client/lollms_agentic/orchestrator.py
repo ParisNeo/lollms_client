@@ -335,8 +335,14 @@ class OrchestratorAgent:
         """
         worker_turn_info: List[Dict[str, Any]] = []
         round_count = 0
+        is_infinite = max_rounds <= 0 or max_rounds == float("inf")
+        if is_infinite:
+            ASCIIColors.warning(
+                "[Orchestrator] ⚠️ WARNING: Infinite reasoning rounds enabled (max_rounds <= 0). "
+                "The orchestrator will continue running until all steps are [x] in progress.md or <done/>."
+            )
 
-        while round_count < max_rounds:
+        while is_infinite or round_count < max_rounds:
             round_count += 1
 
             system_prompt = ORCHESTRATOR_SYSTEM_PROMPT.format(
