@@ -30,6 +30,7 @@ except ImportError:
         open_memory_explorer_dialog = None
 from pathlib import Path
 import json
+from ascii_colors import ASCIIColors
 
 
 HELP_TEXT = """\
@@ -68,6 +69,8 @@ SLASH_COMMANDS = [
 ("/dynamic", "Toggle Dynamic Mode on/off (autonomous effort, temperature, tokens)"),
 ("/resume", "Resume the current incomplete turn from its round checkpoint"),
 ("/sessions", "Open Sessions Manager (switch, resume, or start new sessions)"),
+("/workflow", "Open Workflow Studio (deterministic graph state-machine with hard guards)"),
+("/studio", "Open Workflow Studio (deterministic graph state-machine with hard guards)"),
 ("/plan", "View and edit active macro plan (CURRENT.md)"),
 ("/current", "View active macro plan (CURRENT.md)"),
 ("/scratchpad", "View and edit agent scratchpad notes"),
@@ -690,6 +693,10 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                     on_click=lambda: open_memory_explorer_dialog(session, prefs) if open_memory_explorer_dialog else ui.notify("Memory Explorer not available", type="warning"),
                 ).props(f"flat dense size=sm no-caps text-color={'purple' if prefs.enable_memory else 'grey'}").tooltip("Open Memory Explorer (or click to inspect; toggle via /memory on|off)")
 
+                ui.button(
+                    "Workflows", icon="account_tree",
+                    on_click=lambda: open_workflow_studio_dialog(),
+                ).props("flat dense size=sm no-caps text-color=indigo font-semibold").tooltip("Open Workflow Studio: Graph-based execution harness with hard constraints and per-subtask model selection")
                 ui.button(
                     "Inspect Context", icon="manage_search",
                     on_click=lambda: open_context_inspector_dialog(),
@@ -1325,6 +1332,13 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
             if keep_conv_len < len(conv):
                 session.personality._conversation = conv[:keep_conv_len]
 
+            # Synchronize truncated history with project conversation file on disk
+            if hasattr(session.personality, "_project_history_file") and session.personality._project_history_file:
+                try:
+                    session.personality.save_history_to_disk(session.personality._project_history_file)
+                except Exception:
+                    pass
+
         # 3. Clean turn checkpoints on disk
         if session.personality and hasattr(session.personality, "_get_checkpoint_path"):
             chk_p = session.personality._get_checkpoint_path()
@@ -1369,7 +1383,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
             return
 
         agent_bridge.run_agent_turn_in_thread(
-            session.personality, session.client, effective_prompt, prefs, session.event_queue, use_history=True
+            session.personality, session.client, prompt_text, prefs, session.event_queue, use_history=True
         )
 
     def open_edit_dialog(msg_id: str):
@@ -1553,8 +1567,23 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
             raw_prompt,
             re.IGNORECASE
         ))
+        is_approval_request = raw_prompt.lower().strip() in ("yes", "y", "oui", "proceed", "approved", "ok", "do it", "sure", "go ahead")
 
-        if is_continuation_request:
+        ws_dir = Path(prefs.workspace_path).resolve()
+        has_pending_migration_plan = any((ws_dir / p).exists() for p in ("mapping.yaml", "mapping.json"))
+
+        if is_approval_request and has_pending_migration_plan:
+            plan_file = "mapping.yaml" if (ws_dir / "mapping.yaml").exists() else "mapping.json"
+            effective_prompt = (
+                f"{raw_prompt}\n\n"
+                f"[SYSTEM DIRECTIVE: USER CONFIRMED PLAN APPROVAL]\n"
+                f"The user approved the migration plan '{plan_file}'.\n"
+                f"You MUST now execute Phase 4 immediately:\n"
+                f"Call `<tool>{{\"name\": \"tool_organize_files_from_plan\", \"parameters\": {{\"plan_file\": \"{plan_file}\", \"move_files\": true}}}}</tool>` as your very first token now!\n"
+                f"Do NOT output conversational preambles or step lists without the tool call tag."
+            )
+            ASCIIColors.info(f"[ChatPage] Hydrated approval prompt with migration execution directive for '{plan_file}'.")
+        elif is_continuation_request:
             last_task = session.get_last_user_prompt()
             plan_content = agent_bridge.get_current_plan_content(workspace_path=prefs.workspace_path)
             task_hint = last_task or "file organization task"
@@ -1578,7 +1607,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
             send_button.props(remove="loading")
             return
         agent_bridge.run_agent_turn_in_thread(
-            session.personality, session.client, prompt_text.strip(), prefs, session.event_queue, use_history=True
+            session.personality, session.client, effective_prompt, prefs, session.event_queue, use_history=True
         )
 
     def open_edit_dialog(msg_id: str):
@@ -1628,9 +1657,10 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
         ref = message_refs.pop(msg_id, None)
         if entry is not None:
             try:
-                debug_log.remove(entry)
+                session.debug_log.remove(entry)
             except ValueError:
                 pass
+            session.save_to_disk()
         try:
             ui.notify("Message deleted.", type="positive")
         except Exception:
@@ -2920,6 +2950,10 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
 
         if cmd in ("/exit", "/quit"):
             add_system_notice("Nothing to exit to in the GUI — just close the window.")
+            return True
+
+        if cmd in ("/workflow", "/workflows", "/studio", "/graph"):
+            open_workflow_studio_dialog()
             return True
 
         if cmd == "/export":
@@ -5109,6 +5143,14 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
 
     def replay_transcript_from_log():
         """Reconstructs the conversation view from a safe snapshot of the session's debug_log."""
+        nonlocal current_agent_md, agent_text_buffer
+        transcript.clear()
+        message_refs.clear()
+        active_tool_panels.clear()
+        active_artefact_panels.clear()
+        current_agent_md = None
+        agent_text_buffer = ""
+
         entries_to_replay = list(session.debug_log)
         for entry in entries_to_replay:
             kind = entry.get("type")
@@ -5330,6 +5372,1005 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
         ignore=[],
     )
 
+    # ── 🕸️ WORKFLOW STUDIO IDE (GRAPH-BASED HARNESS WITH HARD CONSTRAINTS) ──
+    def open_workflow_studio_dialog():
+        dialog = ui.dialog().props("maximized")
+
+        try:
+            from lollms_client.lollms_workflow.workflow_types import (
+                Workflow,
+                WorkflowNode,
+                WorkflowEdge,
+                NodeType,
+                WorkflowStatus,
+                GuardType,
+                WorkflowContext,
+            )
+            from lollms_client.lollms_workflow.workflow_engine import (
+                WorkflowEngine,
+                GuardViolationError,
+                create_file_organizer_workflow,
+                create_dual_model_review_workflow,
+                list_project_workflows,
+                save_project_workflow,
+                delete_project_workflow,
+                load_project_workflow,
+            )
+        except ImportError:
+            from lollms_client.lollms_workflow import (
+                Workflow,
+                WorkflowNode,
+                WorkflowEdge,
+                NodeType,
+                WorkflowStatus,
+                GuardType,
+                WorkflowContext,
+                WorkflowEngine,
+                GuardViolationError,
+                create_file_organizer_workflow,
+                create_dual_model_review_workflow,
+                list_project_workflows,
+                save_project_workflow,
+                delete_project_workflow,
+                load_project_workflow,
+            )
+
+        with dialog, ui.card().classes(
+            f"w-full h-full flex flex-col p-4 {CANVAS} text-slate-900 dark:text-slate-100 gap-3 overflow-hidden"
+        ):
+            # Top Header Bar
+            with ui.row().classes(f"w-full items-center justify-between pb-2 border-b {BORDER} shrink-0"):
+                with ui.row().classes("items-center gap-2.5"):
+                    ui.icon("account_tree", size="28px").classes("text-indigo-500")
+                    with ui.column().classes("gap-0"):
+                        ui.label("Workflow Studio — Project Graph Automation").classes("text-base font-bold")
+                        ui.label("Build, configure, save, and execute deterministic workflow graphs in your project.").classes(
+                            f"text-xs {MUTED_DIM}"
+                        )
+
+                with ui.row().classes("items-center gap-1.5"):
+                    def _do_new_wf():
+                        nw_dlg = ui.dialog()
+                        with nw_dlg, ui.card().classes(f"w-[460px] p-4 gap-3 bg-white dark:bg-slate-900 border {BORDER} rounded-xl shadow-xl"):
+                            ui.label("Create New Workflow").classes("font-bold text-sm text-slate-900 dark:text-slate-100")
+                            nw_name = ui.input("Workflow Name", value="New Custom Workflow").classes("w-full text-xs").props("outlined dense")
+                            nw_id = ui.input("Workflow ID (Slug)", value="new_custom_workflow").classes("w-full text-xs font-mono").props("outlined dense")
+                            nw_desc = ui.textarea("Description", value="Custom automated pipeline.").classes("w-full text-xs").props("outlined dense rows=2")
+
+                            with ui.row().classes("w-full justify-end gap-2 pt-2 border-t border-slate-200 dark:border-slate-800"):
+                                ui.button("Cancel", on_click=nw_dlg.close).props("flat dense no-caps")
+                                def _create_and_load():
+                                    name_val = nw_name.value.strip() or "Untitled Workflow"
+                                    id_val = re.sub(r"[^a-zA-Z0-9_-]", "_", nw_id.value.strip().lower()) or "custom_wf"
+                                    new_wf = Workflow(id=id_val, name=name_val, description=nw_desc.value.strip())
+                                    new_wf.add_node(WorkflowNode(
+                                        id="step_start",
+                                        name="Start Task",
+                                        node_type=NodeType.LLM,
+                                        config={"prompt": "Begin task: {{task_prompt}}", "output_variable": "step_output"}
+                                    ))
+                                    new_wf.add_node(WorkflowNode(
+                                        id="step_finish",
+                                        name="Finish Workflow",
+                                        node_type=NodeType.TERMINAL,
+                                        config={"summary": "Workflow completed.\n{{step_output}}"}
+                                    ))
+                                    new_wf.add_edge("step_start", "step_finish")
+                                    save_project_workflow(prefs.workspace_path, new_wf)
+                                    nw_dlg.close()
+                                    _reload_workflows_list(select_id=new_wf.id)
+                                    ui.notify(f"Created project workflow: {new_wf.name}", type="positive")
+
+                                ui.button("Create", icon="add", on_click=_create_and_load).props("unelevated dense color=primary no-caps")
+                        nw_dlg.open()
+
+                    def _save_current_wf():
+                        wf = active_state["wf"]
+                        wf.name = wf_name_input.value.strip() or wf.name
+                        wf.description = wf_desc_input.value.strip() or wf.description
+                        saved_path = save_project_workflow(prefs.workspace_path, wf)
+                        _reload_workflows_list(select_id=wf.id)
+                        ui.notify(f"Saved workflow '{wf.name}' to project ({saved_path.name})", type="positive")
+
+                    def _delete_current_wf():
+                        wf = active_state["wf"]
+                        del_ok = delete_project_workflow(prefs.workspace_path, wf.id)
+                        if del_ok:
+                            ui.notify(f"Deleted workflow '{wf.name}'", type="info")
+                            _reload_workflows_list()
+                        else:
+                            ui.notify(f"Cannot delete built-in template workflow.", type="warning")
+
+                    ui.button("New Workflow", icon="add", on_click=_do_new_wf).props("unelevated dense size=xs color=primary no-caps")
+                    ui.button("Save to Project", icon="save", on_click=_save_current_wf).props("outline dense size=xs color=emerald no-caps")
+                    ui.button("Delete", icon="delete", on_click=_delete_current_wf).props("flat dense size=xs color=red no-caps")
+                    ui.button("Close", icon="close", on_click=dialog.close).props("flat dense round size=sm")
+
+            # Workflow Switcher Bar
+            all_wfs_init = list_project_workflows(prefs.workspace_path)
+            wf_options_init = {}
+            for w in all_wfs_init:
+                badge = "[Project]" if w["source"] == "project" else "[Template]"
+                wf_options_init[w["id"]] = f"{badge} {w['name']}"
+
+            init_wf = create_file_organizer_workflow()
+            if all_wfs_init:
+                init_wf = all_wfs_init[0]["workflow"]
+
+            active_state = {
+                "wf": init_wf,
+                "engine": None,
+                "context": None,
+                "running": False,
+            }
+
+            initial_wf_id = active_state["wf"].id if active_state["wf"].id in wf_options_init else (next(iter(wf_options_init)) if wf_options_init else None)
+
+            with ui.row().classes(f"w-full items-center justify-between gap-3 p-2 {SURFACE} rounded border {BORDER} shrink-0"):
+                with ui.row().classes("items-center gap-2 flex-1"):
+                    ui.label("Active Workflow:").classes(f"text-xs font-bold {STRONG}")
+                    wf_select = ui.select(
+                        wf_options_init,
+                        value=initial_wf_id
+                    ).props("dense outlined size=sm options-dense").classes("text-xs min-w-[340px]")
+
+                with ui.row().classes("items-center gap-1.5"):
+                    ui.badge("Project Workflows (.lollms_code/workflows/)", color="indigo").props("dense rounded text-[10px]")
+
+            # Workflow Metadata Header Card
+            initial_node_options = {nid: f"{n.name} ({nid})" for nid, n in active_state["wf"].nodes.items()}
+            initial_start_id = active_state["wf"].start_node_id
+            if initial_start_id not in initial_node_options and initial_node_options:
+                initial_start_id = next(iter(initial_node_options))
+
+            with ui.card().classes(f"w-full p-2.5 rounded-lg border {BORDER} {SURFACE} gap-2 shadow-none shrink-0"):
+                with ui.row().classes("w-full items-center gap-3"):
+                    wf_name_input = ui.input("Workflow Name", value=active_state["wf"].name).classes("flex-1 text-xs").props("outlined dense")
+                    start_node_select = ui.select(
+                        initial_node_options,
+                        value=initial_start_id,
+                        label="Start Step"
+                    ).classes("w-56 text-xs").props("outlined dense options-dense")
+                    wf_desc_input = ui.input("Description", value=active_state["wf"].description).classes("flex-1 text-xs").props("outlined dense")
+
+            # Studio Canvas Controls & Mode Switcher Bar
+            studio_mode = {"view": "graph"}  # "graph" or "pipeline"
+
+            with ui.row().classes(f"w-full items-center justify-between px-2 py-1 {SURFACE} rounded border {BORDER} shrink-0 text-xs"):
+                with ui.row().classes("items-center gap-1.5"):
+                    view_toggle = ui.toggle(
+                        {"graph": "🕸️ 2D Graph Canvas (Elements & Links)", "pipeline": "📋 Step List"},
+                        value=studio_mode["view"]
+                    ).props("dense unelevated size=xs").classes("text-xs font-semibold")
+
+                    ui.button("Auto-Layout Graph", icon="auto_awesome", on_click=lambda: _do_auto_layout()).props(
+                        "outline dense size=xs color=indigo no-caps"
+                    ).tooltip("Arrange elements and bezier links into neat topological DAG columns")
+
+                    ui.button("Reset View", icon="center_focus_strong", on_click=lambda: _reset_graph_view()).props(
+                        "flat dense size=xs no-caps color=grey"
+                    ).tooltip("Center canvas and reset zoom")
+
+                with ui.row().classes("items-center gap-1.5"):
+                    # Add Step Menu
+                    with ui.button("➕ Add Element", icon="add").props("unelevated dense size=xs color=primary no-caps font-bold"):
+                        with ui.menu():
+                            def _add_step(ntype: NodeType):
+                                wf = active_state["wf"]
+                                idx = len(wf.nodes) + 1
+                                nid = f"step_{idx}_{ntype.value}"
+                                default_cfg = {
+                                    NodeType.LLM: {"prompt": "Analyze: {{task_prompt}}", "output_variable": f"output_{idx}"},
+                                    NodeType.AGENT: {"instruction": "Execute: {{task_prompt}}", "max_steps": 6, "output_variable": f"agent_out_{idx}"},
+                                    NodeType.TOOL: {"tool_name": "tool_list_files", "tool_params": {"directory": "."}, "output_variable": f"tool_res_{idx}"},
+                                    NodeType.GUARD: {"guard_type": "file_exists", "guard_target": "mapping.yaml"},
+                                    NodeType.GATE: {"prompt": "Confirm execution of step?"},
+                                    NodeType.CONDITION: {"condition_expr": "bool(state.get('task_prompt'))"},
+                                    NodeType.TERMINAL: {"summary": "Done: {{task_prompt}}"},
+                                }.get(ntype, {})
+
+                                pos_x = 80 + (len(wf.nodes) * 320)
+                                pos_y = 160 + (len(wf.nodes) % 3 * 80)
+                                default_cfg["ui_pos"] = {"x": pos_x, "y": pos_y}
+
+                                new_node = WorkflowNode(id=nid, name=f"Step {idx}: {ntype.name.title()}", node_type=ntype, config=default_cfg)
+                                wf.add_node(new_node)
+                                refresh_studio_canvas()
+                                _open_node_editor(new_node)
+
+                            ui.menu_item("🧠 LLM Step (Prompt + Model Override)", lambda: _add_step(NodeType.LLM))
+                            ui.menu_item("🤖 Sub-Agent Step (Specialist Sandbox)", lambda: _add_step(NodeType.AGENT))
+                            ui.menu_item("🛠️ Tool Execution (Deterministic Tool)", lambda: _add_step(NodeType.TOOL))
+                            ui.menu_item("🛡️ Hard Guard Wall (Invariant Wall)", lambda: _add_step(NodeType.GUARD))
+                            ui.menu_item("✋ Operator Approval Gate (Human Pause)", lambda: _add_step(NodeType.GATE))
+                            ui.menu_item("🔀 Branch Condition (If / Else)", lambda: _add_step(NodeType.CONDITION))
+                            ui.menu_item("🏁 Terminal Conclusion", lambda: _add_step(NodeType.TERMINAL))
+
+            # Main Two-Pane IDE: Left: Interactive 2D Graph Canvas; Right: Execution Console & Live State
+            with ui.row().classes("w-full flex-1 min-h-0 items-stretch overflow-hidden flex-nowrap gap-3 pt-1"):
+                # ── Left Column: Interactive 2D Graph Canvas & Links ──
+                with ui.column().classes("w-3/5 h-full shrink-0 border-r " + BORDER + " p-0 flex flex-col gap-0 overflow-hidden relative"):
+                    # 2D Graph Canvas Viewport
+                    graph_canvas_slot = ui.element("div").classes(
+                        "w-full h-full relative overflow-hidden select-none bg-slate-950"
+                    ).style(
+                        "background-image: radial-gradient(rgba(255, 255, 255, 0.08) 1px, transparent 1px); "
+                        "background-size: 20px 20px;"
+                    )
+
+                    # Linear Fallback Pipeline View (when toggled)
+                    pipeline_scroll = ui.scroll_area().classes("w-full h-full p-2 " + SURFACE + " rounded border " + BORDER)
+                    pipeline_scroll.visible = False
+                    with pipeline_scroll:
+                        pipeline_container = ui.column().classes("w-full gap-2")
+
+                # ── Right Column: Execution Console & Live State ──
+                with ui.column().classes("flex-1 h-full min-w-0 flex flex-col gap-2 overflow-hidden p-2"):
+                    with ui.tabs().classes(f"w-full {SURFACE} border-b {BORDER} shrink-0").props('dense no-caps active-color="primary" indicator-color="primary"') as run_tabs:
+                        tab_console = ui.tab('console', label='📺 Execution Console', icon='terminal').classes('text-xs py-1 flex-1')
+                        tab_state = ui.tab('state', label='📊 Live Variables (context.state)', icon='data_object').classes('text-xs py-1 flex-1')
+
+                    # Initial State Configuration Strip
+                    with ui.row().classes(f"w-full items-center justify-between gap-2 p-2 rounded border {BORDER} {SURFACE} shrink-0"):
+                        task_input = ui.input("Initial {{task_prompt}}", value="Organize and structure all files in the workspace.").classes("flex-1 text-xs").props("outlined dense")
+                        run_btn = ui.button("▶ Run Workflow", icon="play_arrow").props("unelevated dense size=sm color=primary no-caps font-bold")
+                        cancel_btn = ui.button(icon="stop").props("unelevated dense round size=sm color=red")
+                        cancel_btn.visible = False
+
+                    # Interactive Gate Approval Banner (Appears when WAITING_APPROVAL)
+                    gate_card = ui.card().classes("w-full p-3 rounded-lg border-2 border-amber-500 bg-amber-50 dark:bg-amber-950/60 gap-2 shrink-0")
+                    gate_card.visible = False
+                    with gate_card:
+                        with ui.row().classes("w-full items-center justify-between"):
+                            with ui.row().classes("items-center gap-2"):
+                                ui.icon("pan_tool", size="20px").classes("text-amber-500 animate-pulse")
+                                ui.label("Operator Approval Gate Reached").classes("text-xs font-bold text-amber-800 dark:text-amber-200")
+                            ui.badge("HUMAN IN THE LOOP", color="amber").props("dense rounded text-[9px]")
+
+                        gate_prompt_label = ui.label("").classes("text-xs text-slate-800 dark:text-slate-200 font-semibold px-1")
+
+                        with ui.row().classes("w-full items-center justify-end gap-2 pt-1 border-t border-amber-200 dark:border-amber-800/80"):
+                            def _approve_gate():
+                                if active_state["engine"] and active_state["context"]:
+                                    gate_card.visible = False
+                                    run_btn.props(add="loading")
+                                    status_bar.visible = True
+                                    _log("✅ Operator approved gate. Resuming workflow execution...", "text-green-400 font-bold")
+
+                                    async def _do_resume():
+                                        try:
+                                            from nicegui import run as _ng_run
+                                            ctx = await _ng_run.io_bound(
+                                                active_state["engine"].resume,
+                                                active_state["wf"],
+                                                active_state["context"],
+                                                True,
+                                                _wf_event_listener
+                                            )
+                                            _finish_run(ctx)
+                                        except Exception as ex:
+                                            _log(f"Resume crash: {ex}", "text-red-500 font-bold")
+                                        finally:
+                                            run_btn.props(remove="loading")
+
+                                    ui.timer(0.05, _do_resume, once=True)
+
+                            def _reject_gate():
+                                if active_state["engine"] and active_state["context"]:
+                                    gate_card.visible = False
+                                    _log("❌ Operator rejected approval gate. Halting workflow.", "text-red-400 font-bold")
+                                    active_state["engine"].resume(active_state["wf"], active_state["context"], False, _wf_event_listener)
+                                    status_lbl.set_text("Halted: REJECTED")
+                                    run_btn.props(remove="loading")
+                                    status_bar.visible = False
+
+                            ui.button("Reject & Halt", icon="close", on_click=_reject_gate).props("flat dense size=sm color=red no-caps")
+                            ui.button("Approve & Resume", icon="check", on_click=_approve_gate).props("unelevated dense size=sm color=primary no-caps font-bold")
+
+                    # Live Status & Progress
+                    status_bar = ui.linear_progress(value=0.0).props("instant-feedback color=indigo")
+                    status_bar.visible = False
+                    status_lbl = ui.label("Ready to run.").classes("text-xs font-mono font-semibold text-slate-500 px-1")
+
+                    with ui.tab_panels(run_tabs, value='console').classes('w-full flex-1 min-h-0 p-0 bg-transparent flex flex-col overflow-hidden'):
+                        with ui.tab_panel('console').classes('w-full h-full p-2 flex flex-col overflow-hidden'):
+                            with ui.scroll_area().classes(f"w-full flex-1 p-3 bg-slate-950 text-slate-100 rounded border {BORDER} font-mono text-xs"):
+                                log_container = ui.column().classes("w-full gap-1")
+
+                        with ui.tab_panel('state').classes('w-full h-full p-2 flex flex-col overflow-hidden'):
+                            with ui.scroll_area().classes(f"w-full flex-1 p-3 bg-slate-950 text-slate-100 rounded border {BORDER} font-mono text-xs"):
+                                state_display = ui.label("{}").classes("whitespace-pre-wrap select-all text-emerald-400 leading-relaxed")
+
+            def _do_auto_layout():
+                wf = active_state["wf"]
+                wf.compute_auto_layout()
+                refresh_studio_canvas()
+                ui.notify("Arranged elements into topological DAG layout.", type="positive")
+
+            def _reset_graph_view():
+                ui.run_javascript("""
+                    if (window._wfGraph) {
+                        window._wfGraph.panX = 0;
+                        window._wfGraph.panY = 0;
+                        window._wfGraph.zoom = 1.0;
+                        window._wfGraph.applyTransform();
+                    }
+                """)
+
+            # Hidden input to bridge node configure/edit events from client-side JS into Python
+            node_edit_trigger = ui.input().classes("hidden").props("id=wf-node-edit-trigger")
+
+            def _on_node_edit_signal(val: str):
+                if not val:
+                    return
+                node_edit_trigger.value = ""
+                target_node = active_state["wf"].nodes.get(val)
+                if target_node:
+                    _open_node_editor(target_node)
+
+            node_edit_trigger.on_value_change(lambda e: _on_node_edit_signal(e.value))
+
+            def _render_interactive_graph_parts(wf: Workflow, active_node_id: Optional[str] = None) -> Tuple[str, str]:
+                """Generates clean SVG canvas markup and separate executable JS to avoid NiceGUI <script> validation errors."""
+                if not getattr(wf, "nodes", None):
+                    return (
+                        "<div style='color:#64748b;padding:24px;text-align:center;'>No elements in workflow. Click 'Add Element' to begin.</div>",
+                        ""
+                    )
+
+                nodes_dict = wf.nodes
+                auto_pos = wf.compute_auto_layout()
+
+                type_colors = {
+                    NodeType.LLM: ("#3b82f6", "🧠", "LLM GENERATION"),
+                    NodeType.AGENT: ("#a855f7", "🤖", "SPECIALIST AGENT"),
+                    NodeType.TOOL: ("#10b981", "🛠️", "DETERMINISTIC TOOL"),
+                    NodeType.GUARD: ("#ef4444", "🛡️", "HARD GUARD WALL"),
+                    NodeType.GATE: ("#f59e0b", "✋", "OPERATOR GATE"),
+                    NodeType.CONDITION: ("#06b6d4", "🔀", "BRANCH CONDITION"),
+                    NodeType.TERMINAL: ("#64748b", "🏁", "TERMINAL FINISH"),
+                }
+
+                nodes_data = []
+                for nid, n in nodes_dict.items():
+                    pos = n.config.get("ui_pos") or auto_pos.get(nid, (100, 100))
+                    color, icon, badge = type_colors.get(n.node_type, ("#64748b", "📦", "STEP"))
+                    assigned_m = n.config.get("model_name") or n.config.get("model") or ""
+                    model_tag = f"🤖 {assigned_m}" if assigned_m else ""
+                    desc = n.description or n.config.get("guard_target") or n.config.get("tool_name") or n.config.get("prompt", "")[:36] or ""
+
+                    nodes_data.append({
+                        "id": nid,
+                        "name": n.name,
+                        "type": n.node_type.value,
+                        "color": color,
+                        "icon": icon,
+                        "badge": badge,
+                        "model": model_tag,
+                        "desc": desc,
+                        "x": pos[0] if isinstance(pos, (tuple, list)) else pos.get("x", 100),
+                        "y": pos[1] if isinstance(pos, (tuple, list)) else pos.get("y", 100),
+                        "is_start": nid == wf.start_node_id,
+                        "is_active": nid == active_node_id,
+                        "on_success": n.on_success or "",
+                        "on_failure": n.on_failure or "",
+                    })
+
+                links_data = []
+                for edge in wf.edges:
+                    links_data.append({
+                        "source": edge.source_id,
+                        "target": edge.target_id,
+                        "label": edge.label or str(edge.condition_value or ""),
+                        "type": "default",
+                        "color": "#3b82f6"
+                    })
+
+                for n in nodes_dict.values():
+                    if n.on_success and not any(e.source_id == n.id and e.target_id == n.on_success for e in wf.edges):
+                        links_data.append({
+                            "source": n.id,
+                            "target": n.on_success,
+                            "label": "next",
+                            "type": "success",
+                            "color": "#3b82f6"
+                        })
+                    if n.on_failure and not any(e.source_id == n.id and e.target_id == n.on_failure for e in wf.edges):
+                        links_data.append({
+                            "source": n.id,
+                            "target": n.on_failure,
+                            "label": "loopback",
+                            "type": "failure",
+                            "color": "#ef4444"
+                        })
+
+                payload_json = json.dumps({"nodes": nodes_data, "links": links_data, "active_id": active_node_id})
+
+                html_markup = """
+                <div id="wf-graph-root" style="width:100%; height:100%; position:relative; overflow:hidden; user-select:none;">
+                    <svg id="wf-graph-svg" style="width:100%; height:100%; position:absolute; inset:0; cursor:grab;">
+                        <defs>
+                            <marker id="arrow-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                                <path d="M 0 1 L 10 5 L 0 9 z" fill="#3b82f6" />
+                            </marker>
+                            <marker id="arrow-red" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                                <path d="M 0 1 L 10 5 L 0 9 z" fill="#ef4444" />
+                            </marker>
+                            <marker id="arrow-cyan" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                                <path d="M 0 1 L 10 5 L 0 9 z" fill="#06b6d4" />
+                            </marker>
+                            <filter id="glow-active" x="-20%" y="-20%" width="140%" height="140%">
+                                <feGaussianBlur stdDeviation="6" result="blur" />
+                                <feComposite in="SourceGraphic" in2="blur" operator="over" />
+                            </filter>
+                        </defs>
+                        <g id="wf-graph-viewport">
+                            <g id="wf-links-group"></g>
+                            <g id="wf-nodes-group"></g>
+                        </g>
+                    </svg>
+                </div>
+                """
+
+                js_code = f"""
+                (function() {{
+                    let attempts = 0;
+                    function initWfGraph() {{
+                        const data = {payload_json};
+                        const root = document.getElementById('wf-graph-root');
+                        const svg = document.getElementById('wf-graph-svg');
+                        const viewport = document.getElementById('wf-graph-viewport');
+                        const linksGroup = document.getElementById('wf-links-group');
+                        const nodesGroup = document.getElementById('wf-nodes-group');
+
+                        if (!svg || !viewport || !linksGroup || !nodesGroup) {{
+                            if (attempts++ < 30) {{
+                                setTimeout(initWfGraph, 35);
+                            }}
+                            return;
+                        }}
+
+                        window._wfGraph = window._wfGraph || {{
+                            panX: 40,
+                            panY: 40,
+                            zoom: 1.0,
+                            isPanning: false,
+                            startPanX: 0,
+                            startPanY: 0,
+                            dragNode: null,
+                            dragOffsetX: 0,
+                            dragOffsetY: 0,
+                        }};
+                        const state = window._wfGraph;
+
+                        function applyTransform() {{
+                            viewport.setAttribute('transform', `translate(${{state.panX}}, ${{state.panY}}) scale(${{state.zoom}})`);
+                        }}
+                        window._wfGraph.applyTransform = applyTransform;
+                        applyTransform();
+
+                        svg.onmousedown = (e) => {{
+                            if (e.target === svg || e.target.id === 'wf-graph-viewport' || e.target.tagName === 'path') {{
+                                state.isPanning = true;
+                                state.startPanX = e.clientX - state.panX;
+                                state.startPanY = e.clientY - state.panY;
+                                svg.style.cursor = 'grabbing';
+                            }}
+                        }};
+
+                        window.onmousemove = (e) => {{
+                            if (state.isPanning) {{
+                                state.panX = e.clientX - state.startPanX;
+                                state.panY = e.clientY - state.startPanY;
+                                applyTransform();
+                            }} else if (state.dragNode) {{
+                                const mouseX = (e.clientX - state.panX) / state.zoom;
+                                const mouseY = (e.clientY - state.panY) / state.zoom;
+                                state.dragNode.x = mouseX - state.dragOffsetX;
+                                state.dragNode.y = mouseY - state.dragOffsetY;
+                                renderNodes();
+                                renderLinks();
+                            }}
+                        }};
+
+                        window.onmouseup = () => {{
+                            if (state.isPanning) {{
+                                state.isPanning = false;
+                                if (svg) svg.style.cursor = 'grab';
+                            }}
+                            if (state.dragNode) {{
+                                state.dragNode = null;
+                            }}
+                        }};
+
+                        svg.onwheel = (e) => {{
+                            e.preventDefault();
+                            const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
+                            state.zoom = Math.max(0.3, Math.min(2.5, state.zoom * zoomFactor));
+                            applyTransform();
+                        }};
+
+                        function renderLinks() {{
+                            linksGroup.innerHTML = '';
+                            const NODE_W = 260;
+                            const NODE_H = 110;
+
+                            data.links.forEach(link => {{
+                                const src = data.nodes.find(n => n.id === link.source);
+                                const tgt = data.nodes.find(n => n.id === link.target);
+                                if (!src || !tgt) return;
+
+                                const x1 = src.x + NODE_W;
+                                const y1 = src.y + (NODE_H / 2);
+                                const x2 = tgt.x;
+                                const y2 = tgt.y + (NODE_H / 2);
+
+                                let d = '';
+                                if (x2 >= x1 - 20) {{
+                                    const dx = Math.max(60, (x2 - x1) * 0.5);
+                                    d = `M ${{x1}} ${{y1}} C ${{x1 + dx}} ${{y1}}, ${{x2 - dx}} ${{y2}}, ${{x2}} ${{y2}}`;
+                                }} else {{
+                                    const loopOffsetY = 90;
+                                    d = `M ${{x1}} ${{y1}} C ${{x1 + 100}} ${{y1 + loopOffsetY}}, ${{x2 - 100}} ${{y2 + loopOffsetY}}, ${{x2}} ${{y2}}`;
+                                }}
+
+                                const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+                                path.setAttribute('d', d);
+                                path.setAttribute('fill', 'none');
+                                path.setAttribute('stroke', link.color || '#3b82f6');
+                                path.setAttribute('stroke-width', link.type === 'failure' ? '2.5' : '3');
+                                if (link.type === 'failure') {{
+                                    path.setAttribute('stroke-dasharray', '6,4');
+                                    path.setAttribute('marker-end', 'url(#arrow-red)');
+                                }} else {{
+                                    path.setAttribute('marker-end', 'url(#arrow-blue)');
+                                }}
+                                path.style.transition = 'stroke-width 0.2s';
+                                path.addEventListener('mouseenter', () => path.setAttribute('stroke-width', '5'));
+                                path.addEventListener('mouseleave', () => path.setAttribute('stroke-width', link.type === 'failure' ? '2.5' : '3'));
+                                linksGroup.appendChild(path);
+                            }});
+                        }}
+
+                        function renderNodes() {{
+                            nodesGroup.innerHTML = '';
+                            const NODE_W = 260;
+                            const NODE_H = 110;
+
+                            data.nodes.forEach(node => {{
+                                const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+                                g.setAttribute('transform', `translate(${{node.x}}, ${{node.y}})`);
+                                g.style.cursor = 'move';
+
+                                const fo = document.createElementNS('http://www.w3.org/2000/svg', 'foreignObject');
+                                fo.setAttribute('width', NODE_W);
+                                fo.setAttribute('height', NODE_H);
+
+                                const isActive = node.id === data.active_id;
+                                const glowClass = isActive ? 'box-shadow: 0 0 16px #06b6d4; border-color: #06b6d4 !important;' : '';
+
+                                fo.innerHTML = `
+                                    <div xmlns="http://www.w3.org/1999/xhtml" style="width:100%; height:100%; background:#0f172a; border-radius:10px; border:2px solid ${{node.color}}; border-left: 6px solid ${{node.color}}; padding:8px 10px; display:flex; flex-direction:column; justify-content:space-between; box-shadow:0 6px 16px rgba(0,0,0,0.5); font-family:ui-monospace, monospace; ${{glowClass}}">
+                                        <div style="display:flex; align-items:center; justify-content:space-between;">
+                                            <div style="display:flex; align-items:center; gap:6px;">
+                                                <span style="font-size:14px;">${{node.icon}}</span>
+                                                <span style="font-size:11px; font-weight:bold; color:#f1f5f9; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:130px;">${{node.name}}</span>
+                                            </div>
+                                            <div style="display:flex; align-items:center; gap:4px;">
+                                                <span style="font-size:8px; font-weight:bold; background:${{node.color}}33; color:${{node.color}}; padding:2px 5px; border-radius:4px; text-transform:uppercase;">${{node.badge}}</span>
+                                                <button onclick="event.stopPropagation(); const tr = document.getElementById('wf-node-edit-trigger'); if (tr) {{ tr.value = '${{node.id}}'; tr.dispatchEvent(new Event('input')); }}" style="background:none; border:none; color:#94a3b8; cursor:pointer; font-size:12px; padding:0 2px;" title="Configure Node">⚙️</button>
+                                            </div>
+                                        </div>
+                                        <div style="font-size:10px; color:#94a3b8; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+                                            ${{node.desc || '(no description)'}}
+                                        </div>
+                                        <div style="display:flex; align-items:center; justify-content:space-between; border-top:1px solid #1e293b; padding-top:4px; font-size:9px;">
+                                            <span style="color:#38bdf8;">${{node.model || ''}}</span>
+                                            <span style="color:#64748b;">${{node.is_start ? '🚩 START' : ''}}</span>
+                                        </div>
+                                        <div style="position:absolute; left:-7px; top:46px; width:12px; height:12px; border-radius:50%; background:#0284c7; border:2px solid #fff;" title="Inflow"></div>
+                                        <div style="position:absolute; right:-7px; top:46px; width:12px; height:12px; border-radius:50%; background:${{node.color}}; border:2px solid #fff;" title="Outflow"></div>
+                                    </div>
+                                `;
+
+                                fo.addEventListener('mousedown', (e) => {{
+                                    e.stopPropagation();
+                                    state.dragNode = node;
+                                    const mouseX = (e.clientX - state.panX) / state.zoom;
+                                    const mouseY = (e.clientY - state.panY) / state.zoom;
+                                    state.dragOffsetX = mouseX - node.x;
+                                    state.dragOffsetY = mouseY - node.y;
+                                }});
+
+                                fo.addEventListener('dblclick', (e) => {{
+                                    e.stopPropagation();
+                                    const trigger = document.getElementById('wf-node-edit-trigger');
+                                    if (trigger) {{
+                                        trigger.value = node.id;
+                                        trigger.dispatchEvent(new Event('input'));
+                                    }}
+                                }});
+
+                                g.appendChild(fo);
+                                nodesGroup.appendChild(g);
+                            }});
+                        }}
+
+                        renderNodes();
+                        renderLinks();
+                    }}
+
+                    initWfGraph();
+                }})();
+                """
+
+                return html_markup, js_code
+
+            def refresh_studio_canvas():
+                wf = active_state["wf"]
+                if studio_mode["view"] == "graph":
+                    pipeline_scroll.visible = False
+                    graph_canvas_slot.visible = True
+                    graph_canvas_slot.clear()
+                    with graph_canvas_slot:
+                        curr_id = active_state["context"].current_node_id if active_state["context"] else None
+                        html_markup, js_code = _render_interactive_graph_parts(wf, active_node_id=curr_id)
+                        ui.html(html_markup).classes("w-full h-full")
+                        if js_code:
+                            ui.run_javascript(js_code)
+                else:
+                    graph_canvas_slot.visible = False
+                    pipeline_scroll.visible = True
+                    refresh_pipeline_ui()
+
+            def _on_view_toggle(e):
+                studio_mode["view"] = e.value
+                refresh_studio_canvas()
+
+            view_toggle.on_value_change(_on_view_toggle)
+
+            def _log(msg: str, color="text-slate-300"):
+                with log_container:
+                    ui.label(msg).classes(f"leading-relaxed {color}")
+
+            def _wf_event_listener(kind: str, node_id: str, data: Dict[str, Any]):
+                if kind == "node_start":
+                    status_lbl.set_text(f"Executing: {data.get('name')} (Model: {data.get('model')})")
+                    _log(f"▶ [{data.get('type')}] Entering {data.get('name')} (Model: {data.get('model')})...", "text-cyan-400 font-bold")
+                elif kind == "guard_passed":
+                    _log(f"  ✓ Wall verified: {data.get('explanation')}", "text-green-400")
+                elif kind == "guard_failed":
+                    _log(f"  🛑 WALL VIOLATION: {data.get('explanation')}", "text-red-400 font-bold")
+                elif kind == "gate_reached":
+                    status_lbl.set_text("Paused at Operator Gate")
+                    gate_prompt_label.set_text(data.get("prompt", "Please confirm step execution."))
+                    gate_card.visible = True
+                    _log(f"✋ [gate] Human Approval Required: {data.get('prompt')}", "text-amber-400 font-bold")
+                elif kind == "workflow_end":
+                    status_lbl.set_text(f"Finished: {data.get('status').upper()}")
+                    st_col = "text-green-400" if data.get("status") == "completed" else "text-red-400"
+                    _log(f"🏁 Workflow completed: {data.get('status').upper()} in {data.get('steps')} steps.", f"{st_col} font-bold")
+
+            def _finish_run(ctx: WorkflowContext):
+                status_bar.value = 1.0
+                state_display.set_text(json.dumps(ctx.state, indent=2, default=str))
+                if ctx.status == WorkflowStatus.WAITING_APPROVAL:
+                    gate_prompt_label.set_text(ctx.pending_gate_prompt or "Operator approval needed.")
+                    gate_card.visible = True
+                    status_lbl.set_text("Waiting Operator Approval")
+                elif ctx.status == WorkflowStatus.COMPLETED:
+                    status_lbl.set_text("Completed Successfully")
+                    ui.notify(f"✓ Workflow finished successfully!", type="positive")
+                elif ctx.status == WorkflowStatus.GUARD_BLOCKED:
+                    status_lbl.set_text("Halted: Guard Wall Blocked")
+                    ui.notify(f"🛑 Workflow Wall Hit: {ctx.last_error}", type="negative")
+                else:
+                    status_lbl.set_text(f"Halted: {ctx.last_error or 'Error'}")
+                    ui.notify(f"Workflow halted: {ctx.last_error}", type="warning")
+
+            async def _run_current_workflow():
+                session.ensure_ready()
+                wf = active_state["wf"]
+                wf.name = wf_name_input.value.strip() or wf.name
+                wf.description = wf_desc_input.value.strip() or wf.description
+                wf.start_node_id = start_node_select.value or wf.start_node_id
+
+                engine = WorkflowEngine(
+                    client=session.client,
+                    personality=session.personality,
+                    workspace_path=prefs.workspace_path,
+                    debug=True,
+                )
+                active_state["engine"] = engine
+
+                run_btn.props(add="loading")
+                status_bar.visible = True
+                status_bar.value = 0.1
+                log_container.clear()
+                gate_card.visible = False
+
+                init_state = {"task_prompt": task_input.value.strip() or "Process project tasks."}
+
+                try:
+                    from nicegui import run as _ng_run
+                    ctx = await _ng_run.io_bound(engine.run, wf, init_state, None, None, _wf_event_listener)
+                    active_state["context"] = ctx
+                    _finish_run(ctx)
+                except Exception as ex:
+                    _log(f"Crash: {ex}", "text-red-500 font-bold")
+                    ui.notify(f"Execution failed: {ex}", type="negative")
+                finally:
+                    if not (active_state["context"] and active_state["context"].status == WorkflowStatus.WAITING_APPROVAL):
+                        run_btn.props(remove="loading")
+
+            run_btn.on("click", _run_current_workflow)
+
+            # Node Editor Modal Dialog
+            def _open_node_editor(node: WorkflowNode):
+                e_dlg = ui.dialog().props("maximized")
+                wf = active_state["wf"]
+
+                # Extract model choices
+                llm_profiles = env.get_model_profiles("llm") if hasattr(env, "get_model_profiles") else {}
+                model_choices = {"": "Default (Parent Model)"}
+                for m_alias in llm_profiles:
+                    model_choices[m_alias] = f"🤖 {m_alias}"
+
+                # Extract available tools
+                tool_choices = ["tool_organize_files_from_plan", "tool_read_file", "tool_write_file", "tool_list_files", "tool_execute_shell_command", "tool_execute_python_code", "tool_inspect_image"]
+                if session.personality and hasattr(session.personality, "list_tools_structured"):
+                    try:
+                        for t in session.personality.list_tools_structured():
+                            if t["name"] not in tool_choices:
+                                tool_choices.append(t["name"])
+                    except Exception:
+                        pass
+
+                with e_dlg, ui.card().classes(f"w-full h-full flex flex-col p-4 {CANVAS} rounded-xl border {BORDER} gap-3"):
+                    with ui.row().classes(f"w-full items-center justify-between pb-2 border-b {BORDER} shrink-0"):
+                        with ui.row().classes("items-center gap-2"):
+                            ui.icon("settings", size="22px").classes("text-primary")
+                            ui.label(f"Configure Step: {node.name} ({node.node_type.name})").classes("text-sm font-bold")
+                        ui.button(icon="close", on_click=e_dlg.close).props("flat dense round size=xs")
+
+                    with ui.scroll_area().classes("w-full flex-1 p-2"):
+                        with ui.column().classes("w-full max-w-3xl mx-auto gap-3"):
+                            # General Settings
+                            with ui.card().classes(f"w-full p-3 rounded border {BORDER} {SURFACE} gap-2"):
+                                ui.label("GENERAL SETTINGS").classes("text-[10px] font-bold text-slate-500")
+                                with ui.row().classes("w-full gap-2"):
+                                    n_name_in = ui.input("Step Name", value=node.name).classes("flex-1 text-xs").props("outlined dense")
+                                    n_id_in = ui.input("Step ID", value=node.id).classes("w-48 text-xs font-mono").props("outlined dense")
+                                n_desc_in = ui.input("Description", value=node.description).classes("w-full text-xs").props("outlined dense")
+
+                            # Subtask Model Override
+                            with ui.card().classes(f"w-full p-3 rounded border {BORDER} {SURFACE} gap-2"):
+                                ui.label("SUBTASK MODEL ROUTING").classes("text-[10px] font-bold text-slate-500")
+                                ui.label("You can route this specific subtask to a different model (e.g. fast model for planning, coder model for implementation).").classes(f"text-[10px] {MUTED_DIM}")
+                                curr_model = node.config.get("model_name") or node.config.get("model") or ""
+                                if curr_model not in model_choices:
+                                    model_choices[curr_model] = f"🤖 {curr_model}"
+                                n_model_sel = ui.select(model_choices, value=curr_model, label="Assigned Model Profile").classes("w-full text-xs").props("outlined dense")
+
+                            # Type-Specific Configuration
+                            cfg_inputs = {}
+                            with ui.card().classes(f"w-full p-3 rounded border {BORDER} {SURFACE} gap-2"):
+                                ui.label(f"{node.node_type.name} PARAMETERS").classes("text-[10px] font-bold text-slate-500")
+
+                                if node.node_type == NodeType.LLM:
+                                    ui.label("Tip: Use {{variable_name}} to substitute state variables from prior steps.").classes(f"text-[10px] text-primary italic")
+                                    cfg_inputs["prompt"] = ui.textarea("Prompt Template", value=node.config.get("prompt", "")).classes("w-full text-xs font-mono").props("outlined dense rows=4")
+                                    cfg_inputs["system_prompt"] = ui.textarea("System Prompt Override", value=node.config.get("system_prompt", "")).classes("w-full text-xs").props("outlined dense rows=2")
+                                    with ui.row().classes("w-full gap-2"):
+                                        cfg_inputs["temperature"] = ui.number("Temperature", value=float(node.config.get("temperature", 0.3)), step=0.05).classes("flex-1 text-xs").props("outlined dense")
+                                        cfg_inputs["output_variable"] = ui.input("Output Variable Key", value=node.config.get("output_variable", "llm_output")).classes("flex-1 text-xs font-mono").props("outlined dense")
+
+                                elif node.node_type == NodeType.AGENT:
+                                    cfg_inputs["instruction"] = ui.textarea("Task Directive (Headless Worker)", value=node.config.get("instruction", node.config.get("task", ""))).classes("w-full text-xs font-mono").props("outlined dense rows=4")
+                                    cfg_inputs["personality_conditioning"] = ui.textarea("Specialist Persona Conditioning", value=node.config.get("personality_conditioning", node.config.get("persona", ""))).classes("w-full text-xs").props("outlined dense rows=2")
+                                    with ui.row().classes("w-full gap-2"):
+                                        cfg_inputs["max_steps"] = ui.number("Max Reasoning Budget", value=int(node.config.get("max_steps", 6)), step=1).classes("flex-1 text-xs").props("outlined dense")
+                                        cfg_inputs["output_variable"] = ui.input("Output Variable Key", value=node.config.get("output_variable", "agent_output")).classes("flex-1 text-xs font-mono").props("outlined dense")
+
+                                elif node.node_type == NodeType.TOOL:
+                                    curr_tool = node.config.get("tool_name", "tool_organize_files_from_plan")
+                                    if curr_tool not in tool_choices:
+                                        tool_choices.insert(0, curr_tool)
+                                    cfg_inputs["tool_name"] = ui.select(tool_choices, value=curr_tool, label="Tool to Execute", new_value_mode="add-unique").classes("w-full text-xs font-mono").props("outlined dense")
+                                    raw_p = node.config.get("tool_params", {})
+                                    params_str = json.dumps(raw_p, indent=2) if isinstance(raw_p, dict) else str(raw_p)
+                                    cfg_inputs["tool_params_str"] = ui.textarea("Tool Parameters (JSON with {{var}})", value=params_str).classes("w-full text-xs font-mono").props("outlined dense rows=4")
+                                    cfg_inputs["output_variable"] = ui.input("Output Variable Key", value=node.config.get("output_variable", "tool_output")).classes("w-full text-xs font-mono").props("outlined dense")
+
+                                elif node.node_type == NodeType.GUARD:
+                                    g_types = [g.value for g in GuardType]
+                                    curr_gt = node.config.get("guard_type", "file_exists")
+                                    if curr_gt not in g_types:
+                                        g_types.insert(0, curr_gt)
+                                    cfg_inputs["guard_type"] = ui.select(g_types, value=curr_gt, label="Guard Invariant Type").classes("w-full text-xs").props("outlined dense")
+                                    cfg_inputs["guard_target"] = ui.input("Guard Target (File or State Key)", value=node.config.get("guard_target", "")).classes("w-full text-xs font-mono").props("outlined dense")
+                                    cfg_inputs["guard_pattern"] = ui.input("Regex Pattern / Expression (Optional)", value=node.config.get("guard_pattern", "")).classes("w-full text-xs font-mono").props("outlined dense")
+
+                                elif node.node_type == NodeType.GATE:
+                                    cfg_inputs["prompt"] = ui.input("Confirmation Prompt to Operator", value=node.config.get("prompt", "Do you approve proceeding with the next step?")).classes("w-full text-xs").props("outlined dense")
+
+                                elif node.node_type == NodeType.CONDITION:
+                                    cfg_inputs["condition_expr"] = ui.input("Python Expression (e.g. bool(state.get('task_prompt')))", value=node.config.get("condition_expr", "")).classes("w-full text-xs font-mono").props("outlined dense")
+
+                                elif node.node_type == NodeType.TERMINAL:
+                                    cfg_inputs["summary"] = ui.textarea("Summary Output Template", value=node.config.get("summary", "Workflow completed.\n{{output}}")).classes("w-full text-xs font-mono").props("outlined dense rows=4")
+
+                            # Transitions & Edge Connections
+                            with ui.card().classes(f"w-full p-3 rounded border {BORDER} {SURFACE} gap-2"):
+                                ui.label("TRANSITIONS & NEXT STEPS").classes("text-[10px] font-bold text-slate-500")
+                                other_node_ids = {n_id: f"{n.name} ({n_id})" for n_id, n in wf.nodes.items() if n_id != node.id}
+                                other_node_ids[""] = "(None / End)"
+                                succ_val = node.on_success if node.on_success in other_node_ids else ""
+                                fail_val = node.on_failure if node.on_failure in other_node_ids else ""
+
+                                with ui.row().classes("w-full gap-2"):
+                                    n_succ_in = ui.select(other_node_ids, value=succ_val, label="Next Step on Success / Default").classes("flex-1 text-xs").props("outlined dense")
+                                    n_fail_in = ui.select(other_node_ids, value=fail_val, label="Target on Failure / Rejection").classes("flex-1 text-xs").props("outlined dense")
+                                    
+                    # Modal Footer
+                    with ui.row().classes(f"w-full items-center justify-end gap-2 pt-2 border-t {BORDER} shrink-0"):
+                        ui.button("Cancel", on_click=e_dlg.close).props("flat dense no-caps")
+                        def _save_node_changes():
+                            node.name = n_name_in.value.strip() or node.name
+                            node.description = n_desc_in.value.strip()
+                            node.on_success = n_succ_in.value or None
+                            node.on_failure = n_fail_in.value or None
+
+                            if n_model_sel.value:
+                                node.config["model_name"] = n_model_sel.value
+                            else:
+                                node.config.pop("model_name", None)
+
+                            for k, widget in cfg_inputs.items():
+                                if k == "tool_params_str":
+                                    try:
+                                        node.config["tool_params"] = json.loads(widget.value)
+                                    except Exception:
+                                        node.config["tool_params"] = {}
+                                else:
+                                    node.config[k] = widget.value
+
+                            e_dlg.close()
+                            refresh_pipeline_ui()
+                            ui.notify(f"Updated step '{node.name}'", type="positive")
+
+                        ui.button("Save Step Config", icon="check", on_click=_save_node_changes).props("unelevated dense color=primary no-caps font-bold")
+
+                e_dlg.open()
+
+            def refresh_pipeline_ui():
+                pipeline_container.clear()
+                wf = active_state["wf"]
+
+                # Update Start Node dropdown options
+                node_keys = {nid: f"{n.name} ({nid})" for nid, n in wf.nodes.items()}
+                start_node_select.options = node_keys
+                if wf.start_node_id not in node_keys and node_keys:
+                    wf.start_node_id = next(iter(node_keys))
+                start_node_select.value = wf.start_node_id
+
+                node_items = list(wf.nodes.items())
+
+                with pipeline_container:
+                    if not node_items:
+                        ui.label("No steps in pipeline. Click 'Add Step' above.").classes(f"text-xs {MUTED_DIM} p-4 italic text-center w-full")
+                        return
+
+                    for idx, (nid, node) in enumerate(node_items, 1):
+                        type_styles = {
+                            NodeType.LLM: ("border-l-blue-500", "psychology", "LLM GENERATION", "blue"),
+                            NodeType.AGENT: ("border-l-purple-500", "smart_toy", "SPECIALIST AGENT", "purple"),
+                            NodeType.TOOL: ("border-l-emerald-500", "build", "DETERMINISTIC TOOL", "emerald"),
+                            NodeType.GUARD: ("border-l-red-500", "shield", "HARD GUARD WALL", "red"),
+                            NodeType.GATE: ("border-l-amber-500", "pan_tool", "OPERATOR GATE", "amber"),
+                            NodeType.CONDITION: ("border-l-cyan-500", "call_split", "BRANCH CONDITION", "cyan"),
+                            NodeType.TERMINAL: ("border-l-slate-500", "flag", "TERMINAL FINISH", "slate"),
+                        }
+                        border_cls, icon_name, badge_label, badge_col = type_styles.get(node.node_type, ("border-l-slate-700", "radio_button_checked", "STEP", "slate"))
+                        is_start = (nid == wf.start_node_id)
+
+                        with ui.card().classes(f"w-full p-2.5 rounded-lg border {BORDER} border-l-4 {border_cls} {SURFACE} gap-1 shadow-sm"):
+                            with ui.row().classes("w-full items-center justify-between flex-nowrap"):
+                                with ui.row().classes("items-center gap-1.5 flex-1 min-w-0"):
+                                    ui.icon(icon_name, size="16px").classes(f"text-{badge_col}-500 shrink-0")
+                                    ui.label(f"{idx}. {node.name}").classes("text-xs font-bold truncate text-slate-900 dark:text-slate-100")
+                                    if is_start:
+                                        ui.badge("START", color="emerald").props("dense rounded text-[9px]")
+
+                                with ui.row().classes("items-center gap-0.5 shrink-0"):
+                                    ui.badge(badge_label, color=badge_col).props("dense rounded text-[9px]")
+
+                                    # Move Step Up
+                                    if idx > 1:
+                                        def _move_up(i=idx-1):
+                                            items = list(wf.nodes.items())
+                                            items[i], items[i-1] = items[i-1], items[i]
+                                            wf.nodes = dict(items)
+                                            refresh_pipeline_ui()
+                                        ui.button(icon="arrow_upward", on_click=_move_up).props("flat dense round size=xs color=grey").tooltip("Move step up")
+
+                                    # Move Step Down
+                                    if idx < len(node_items):
+                                        def _move_down(i=idx-1):
+                                            items = list(wf.nodes.items())
+                                            items[i], items[i+1] = items[i+1], items[i]
+                                            wf.nodes = dict(items)
+                                            refresh_pipeline_ui()
+                                        ui.button(icon="arrow_downward", on_click=_move_down).props("flat dense round size=xs color=grey").tooltip("Move step down")
+
+                                    ui.button(icon="settings", on_click=lambda n=node: _open_node_editor(n)).props("flat dense round size=xs color=primary").tooltip("Configure Step")
+
+                                    def _delete_node(target_id=nid):
+                                        wf.nodes.pop(target_id, None)
+                                        wf.edges = [e for e in wf.edges if e.source_id != target_id and e.target_id != target_id]
+                                        refresh_pipeline_ui()
+                                    ui.button(icon="delete", on_click=_delete_node).props("flat dense round size=xs color=red").tooltip("Delete step")
+
+                            # Config summary line
+                            assigned_m = node.config.get("model_name") or node.config.get("model")
+                            summary_parts = []
+                            if assigned_m:
+                                summary_parts.append(f"Model: {assigned_m}")
+                            if node.node_type == NodeType.GUARD:
+                                summary_parts.append(f"Wall: [{node.config.get('guard_type', '')}] on '{node.config.get('guard_target', '')}'")
+                            elif node.node_type == NodeType.TOOL:
+                                summary_parts.append(f"Tool: {node.config.get('tool_name', '')}")
+                            elif node.node_type == NodeType.GATE:
+                                summary_parts.append(f"Prompt: {node.config.get('prompt', '')[:40]}...")
+                            elif node.node_type == NodeType.LLM:
+                                summary_parts.append(f"Prompt: {node.config.get('prompt', '')[:40]}...")
+
+                            if summary_parts:
+                                ui.label(" · ".join(summary_parts)).classes(f"text-[10px] {MUTED_DIM} font-mono truncate px-1")
+
+                            # Edge / Transition indicators
+                            with ui.row().classes("w-full items-center justify-between text-[10px] font-mono pt-1 border-t border-slate-200 dark:border-slate-800/80"):
+                                succ_tgt = node.on_success or (node_items[idx][0] if idx < len(node_items) else "Finish")
+                                ui.label(f"──> Next: {succ_tgt}").classes("text-slate-500 truncate")
+                                if node.on_failure:
+                                    ui.label(f"On Fail: ↺ {node.on_failure}").classes("text-red-400 font-bold truncate")
+
+            def _reload_workflows_list(select_id: Optional[str] = None):
+                all_wfs = list_project_workflows(prefs.workspace_path)
+                options = {}
+                for w in all_wfs:
+                    badge = "[Project]" if w["source"] == "project" else "[Template]"
+                    options[w["id"]] = f"{badge} {w['name']}"
+
+                wf_select.options = options
+                target_id = select_id or active_state["wf"].id
+                if target_id not in options and options:
+                    target_id = next(iter(options))
+
+                wf_select.value = target_id
+                _switch_active_workflow(target_id)
+
+            def _switch_active_workflow(w_id: str):
+                wf = load_project_workflow(prefs.workspace_path, w_id)
+                if wf:
+                    active_state["wf"] = wf
+                    wf_name_input.value = wf.name
+                    wf_desc_input.value = wf.description
+                    node_opts = {nid: f"{n.name} ({nid})" for nid, n in wf.nodes.items()}
+                    start_node_select.options = node_opts
+                    if wf.start_node_id in node_opts:
+                        start_node_select.value = wf.start_node_id
+                    elif node_opts:
+                        start_node_select.value = next(iter(node_opts))
+                    else:
+                        start_node_select.value = None
+                    refresh_studio_canvas()
+
+            wf_select.on_value_change(lambda e: _switch_active_workflow(e.value) if e.value else None)
+            _reload_workflows_list()
+
+        dialog.open()
+
     # ── Context & Generation Parameters Inspector Modal Dialog ──
     def open_context_inspector_dialog():
         current_input_text = (prompt_input.value or "").strip()
@@ -5398,8 +6439,9 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
 
             def _refresh_inspector():
                 inspector_slot.clear()
+                active_text = (prompt_input.value or "").strip() if prompt_input else ""
                 try:
-                    diag = agent_bridge.get_context_preview(session, prefs, current_input_text)
+                    diag = agent_bridge.get_context_preview(session, prefs, active_text)
                 except Exception as ex:
                     with inspector_slot:
                         ui.label(f"Failed to compile context preview: {ex}").classes("text-sm text-red-500 p-4")
@@ -5429,7 +6471,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                         with ui.tab_panel('full_context').classes('w-full h-full p-0 flex flex-col overflow-hidden gap-2'):
                             with ui.row().classes("w-full items-center justify-between pb-1"):
                                 full_ctx_str = diag.get("full_assembled_context", "")
-                                est_tok = session.client.count_tokens(full_ctx_str) if hasattr(session.client, "count_tokens") else len(full_ctx_str) // 4
+                                est_tok = session.client.count_tokens(full_ctx_str) if (session.client and hasattr(session.client, "count_tokens")) else len(full_ctx_str) // 4
                                 ui.label(f"Verbatim Assembled Context for Next Turn ({len(full_ctx_str):,} chars · ~{est_tok:,} tokens):").classes(f"text-xs font-semibold {STRONG}")
 
                                 def _copy_full_ctx():

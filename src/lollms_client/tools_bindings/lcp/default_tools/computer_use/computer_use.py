@@ -9,8 +9,9 @@ ACTIVE vision-capable LLM binding itself — no external OCR dependency.
 Workflow:
   1. tool_computer_desktop_info  → learn the screen geometry.
   2. tool_computer_screenshot    → see the current state of the screen.
-  3. tool_computer_click / type / key / scroll / move_cursor → act on it.
-  4. Re-screenshot to verify the effect of the action.
+  3. tool_computer_click / type / key / scroll / move_cursor / drag → act on it.
+  4. tool_computer_wait          → allow UI animations or page transitions to settle.
+  5. Re-screenshot to verify the effect of the action.
 
 Coordinate system: absolute pixels with the origin at the top-left corner of
 the PRIMARY monitor (unless the backend exposes a different one).
@@ -27,7 +28,7 @@ from ascii_colors import ASCIIColors
 TOOL_LIBRARY_NAME = "Computer Use"
 TOOL_LIBRARY_DESC = (
     "Desktop automation toolset. Take screenshots, move the mouse, click, "
-    "type text, press keys, and scroll. Requires the active model to have "
+    "drag, type text, press keys, and scroll. Requires the active model to have "
     "vision capability: element locations are grounded visually by asking "
     "the vision model to return pixel coordinates from the screenshot."
 )
@@ -38,8 +39,13 @@ _GROUNDING_MAX_RETRIES = 2
 _VLM_N_PREDICT = 600
 
 
-def init_tools_library(config: dict = None) -> None:
-    return None
+def init_tools_library(config: Optional[dict] = None) -> None:
+    """Auto-verifies that desktop automation packages are available."""
+    try:
+        import pipmaster as pm
+        pm.ensure_packages(["pyautogui", "pillow"])
+    except Exception as e:
+        ASCIIColors.warning(f"[computer_use] Could not auto-install dependencies via pipmaster: {e}")
 
 
 # ─────────────────────────── Backend abstraction ────────────────────────────
@@ -51,8 +57,7 @@ _BACKEND_ERROR: Optional[str] = None
 def _resolve_backend():
     """
     Lazily resolves the desktop automation backend.
-    Prefers pyautogui (cross-platform); falls back to mss for read-only
-    screenshot capability. Returns (backend_module, error_str).
+    Prefers pyautogui (cross-platform). Returns (backend_module, error_str).
     """
     global _BACKEND, _BACKEND_ERROR
     if _BACKEND is not None or _BACKEND_ERROR is not None:
@@ -73,7 +78,7 @@ def _resolve_backend():
     except ImportError as import_err:
         _BACKEND_ERROR = (
             f"pyautogui is not installed ({import_err}). Install it with "
-            f"`pip install pyautogui` to enable computer use tools."
+            f"`pip install pyautogui pillow` to enable computer use tools."
         )
         ASCIIColors.warning(f"[computer_use] Backend unavailable: {_BACKEND_ERROR}")
         return None, _BACKEND_ERROR
@@ -113,16 +118,18 @@ def _clamp_coordinates(x: int, y: int) -> Tuple[int, int]:
 def _resolve_vision_binding(lollms_client_instance: Any) -> Optional[Any]:
     """
     Resolves a vision-capable LLM binding from the client.
-    Handles SmartRouter-style multi-binding clients by scanning children.
+    Handles direct vision, SmartRouter-style child bindings, and fallback VLMs.
     """
     if not lollms_client_instance:
         return None
 
-    active_llm = getattr(lollms_client_instance, "llm", None)
-    if not active_llm:
-        return None
+    if hasattr(lollms_client_instance, "has_vision_capability") and lollms_client_instance.has_vision_capability():
+        active_llm = getattr(lollms_client_instance, "llm", None)
+        if active_llm:
+            return active_llm
 
-    if getattr(active_llm, "vision_enabled", False):
+    active_llm = getattr(lollms_client_instance, "llm", None)
+    if active_llm and getattr(active_llm, "vision_enabled", False):
         return active_llm
 
     child_bindings = getattr(active_llm, "child_bindings", None)
@@ -130,6 +137,11 @@ def _resolve_vision_binding(lollms_client_instance: Any) -> Optional[Any]:
         for binding in child_bindings.values():
             if getattr(binding, "vision_enabled", False):
                 return binding
+
+    if hasattr(lollms_client_instance, "find_available_vlm"):
+        vlm = lollms_client_instance.find_available_vlm()
+        if vlm:
+            return vlm
 
     return None
 
@@ -233,9 +245,7 @@ def _vision_capability_ready(lollms_client_instance: Any) -> bool:
 # ───────────────────────────── Screenshot helpers ──────────────────────────
 
 def _capture_screenshot_b64() -> str:
-    """
-    Captures the full primary screen and returns a PNG base64 string.
-    """
+    """Captures the full primary screen and returns a PNG base64 string."""
     backend = _require_backend()
     try:
         pil_image = backend.screenshot()
@@ -248,19 +258,8 @@ def _capture_screenshot_b64() -> str:
 
 
 def _sanitize_error(text: str) -> str:
-    """
-    Strips absolute host paths from error strings to preserve sandbox opacity.
-    """
+    """Strips absolute host paths from error strings to preserve sandbox opacity."""
     return re.sub(r'[A-Za-z]:\\(?:Users|home)[\\/][^\s"\']*', "<host-path>", text or "")
-
-
-def _describe_screenshots_for_history(discussion_instance: Any, count: int) -> None:
-    """
-    No-op hook kept for interface stability: screenshot ingestion into the
-    discussion artifact store is handled by the ChatMixin workspace sync when
-    the screenshot is saved to the workspace directory.
-    """
-    return None
 
 
 # ──────────────────────────────── Tools ─────────────────────────────────────
@@ -272,7 +271,7 @@ def tool_computer_desktop_info(
     """
     Returns the geometry of the primary screen (width and height in pixels).
 
-    Call this FIRST to learn the coordinate space before clicking or typing.
+    Call this FIRST to learn the coordinate space before clicking, dragging, or typing.
     Coordinates for all computer use tools are absolute pixels measured from
     the top-left corner of the screen.
     """
@@ -337,7 +336,7 @@ def tool_computer_screenshot(
             workspace_root = Path.cwd()
             file_name = f"screenshot_{int(time.time())}_{_uuid.uuid4().hex[:6]}.png"
             target_path = workspace_root / file_name
-            (target_path).write_bytes(base64.b64decode(screenshot_b64))
+            target_path.write_bytes(base64.b64decode(screenshot_b64))
             workspace_file = file_name
         except Exception as persist_err:
             ASCIIColors.warning(
@@ -353,6 +352,7 @@ def tool_computer_screenshot(
             "and plan your next action."
         ),
         "image_b64": screenshot_b64,
+        "screenshot_b64": screenshot_b64,
         "screen_width": width,
         "screen_height": height,
     }
@@ -362,8 +362,8 @@ def tool_computer_screenshot(
 
 
 def tool_computer_click(
-    x: int,
-    y: int,
+    x: int = 0,
+    y: int = 0,
     button: str = "left",
     clicks: int = 1,
     description: str = "",
@@ -382,7 +382,7 @@ def tool_computer_click(
         x (int): X pixel coordinate. Ignored when description is used. Pass 0 when unused.
         y (int): Y pixel coordinate. Ignored when description is used. Pass 0 when unused.
         button (str): Mouse button: 'left', 'right', or 'middle'. Default 'left'.
-        clicks (int): Number of clicks (1 = single, 2 = double). Default 1.
+        clicks (int): Number of clicks (1 = single, 2 = double, 3 = triple). Default 1.
         description (str): Optional natural-language description of the element to click, used for visual grounding when x/y are unknown.
     """
     button = str(button or "left").strip().lower()
@@ -445,8 +445,8 @@ def tool_computer_click(
 
 
 def tool_computer_move_cursor(
-    x: int,
-    y: int,
+    x: int = 0,
+    y: int = 0,
     description: str = "",
     discussion_instance: Optional[Any] = None,
     lollms_client_instance: Optional[Any] = None,
@@ -501,6 +501,173 @@ def tool_computer_move_cursor(
         "output": f"Moved cursor to ({x}, {y}).",
         "x": x,
         "y": y,
+    }
+
+
+def tool_computer_mouse_down(
+    button: str = "left",
+    x: int = -1,
+    y: int = -1,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Presses and holds down a mouse button without releasing it.
+    Useful for starting drag-and-drop, drawing, or text selection.
+
+    Args:
+        button (str): Mouse button to hold down: 'left', 'right', or 'middle'. Default 'left'.
+        x (int): Optional X coordinate to position before pressing down. -1 means current cursor position.
+        y (int): Optional Y coordinate to position before pressing down. -1 means current cursor position.
+    """
+    button = str(button or "left").strip().lower()
+    if button not in ("left", "right", "middle"):
+        return {"success": False, "error": f"Invalid button '{button}'. Use 'left', 'right', or 'middle'."}
+
+    try:
+        backend = _require_backend()
+        if x >= 0 and y >= 0:
+            cx, cy = _clamp_coordinates(int(x), int(y))
+            backend.mouseDown(x=cx, y=cy, button=button)
+            pos_desc = f"at ({cx}, {cy})"
+        else:
+            backend.mouseDown(button=button)
+            pos_desc = "at current position"
+    except RuntimeError as backend_err:
+        return {"success": False, "error": _sanitize_error(str(backend_err))}
+    except Exception as err:
+        return {"success": False, "error": _sanitize_error(f"Mouse down failed: {err}")}
+
+    return {
+        "success": True,
+        "output": f"Held {button} mouse button down {pos_desc}.",
+    }
+
+
+def tool_computer_mouse_up(
+    button: str = "left",
+    x: int = -1,
+    y: int = -1,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Releases a held mouse button. Completes drag-and-drop or text selection.
+
+    Args:
+        button (str): Mouse button to release: 'left', 'right', or 'middle'. Default 'left'.
+        x (int): Optional X coordinate to move to before releasing. -1 means current cursor position.
+        y (int): Optional Y coordinate to move to before releasing. -1 means current cursor position.
+    """
+    button = str(button or "left").strip().lower()
+    if button not in ("left", "right", "middle"):
+        return {"success": False, "error": f"Invalid button '{button}'. Use 'left', 'right', or 'middle'."}
+
+    try:
+        backend = _require_backend()
+        if x >= 0 and y >= 0:
+            cx, cy = _clamp_coordinates(int(x), int(y))
+            backend.mouseUp(x=cx, y=cy, button=button)
+            pos_desc = f"at ({cx}, {cy})"
+        else:
+            backend.mouseUp(button=button)
+            pos_desc = "at current position"
+    except RuntimeError as backend_err:
+        return {"success": False, "error": _sanitize_error(str(backend_err))}
+    except Exception as err:
+        return {"success": False, "error": _sanitize_error(f"Mouse up failed: {err}")}
+
+    return {
+        "success": True,
+        "output": f"Released {button} mouse button {pos_desc}.",
+    }
+
+
+def tool_computer_drag(
+    to_x: int,
+    to_y: int,
+    from_x: int = -1,
+    from_y: int = -1,
+    button: str = "left",
+    duration_ms: int = 500,
+    from_description: str = "",
+    to_description: str = "",
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Performs a click-and-drag from one point to another.
+
+    Useful for moving windows, dragging icons, sliding sliders, or selecting text.
+    Coordinates can be explicit pixels or grounded visually via descriptions.
+
+    Args:
+        to_x (int): Destination X pixel coordinate.
+        to_y (int): Destination Y pixel coordinate.
+        from_x (int): Optional start X pixel coordinate (-1 = current cursor position).
+        from_y (int): Optional start Y pixel coordinate (-1 = current cursor position).
+        button (str): Mouse button used to drag: 'left', 'right', or 'middle'. Default 'left'.
+        duration_ms (int): Duration of the drag movement in milliseconds. Default 500.
+        from_description (str): Optional description to visually ground start coordinates.
+        to_description (str): Optional description to visually ground destination coordinates.
+    """
+    button = str(button or "left").strip().lower()
+    if button not in ("left", "right", "middle"):
+        return {"success": False, "error": f"Invalid button '{button}'. Use 'left', 'right', or 'middle'."}
+
+    try:
+        duration_s = max(0.05, min(float(duration_ms) / 1000.0, 5.0))
+    except (TypeError, ValueError):
+        duration_s = 0.5
+
+    # Visual grounding if descriptions provided
+    if from_description or to_description:
+        if not _vision_capability_ready(lollms_client_instance):
+            return {
+                "success": False,
+                "error": "Visual grounding requires a vision-capable model. Provide explicit coordinates.",
+            }
+        try:
+            screenshot_b64 = _capture_screenshot_b64()
+            width, height = _screen_size()
+        except Exception as capture_err:
+            return {"success": False, "error": _sanitize_error(str(capture_err))}
+
+        if from_description:
+            f_coords, f_err = _ground_element_coordinates(
+                lollms_client_instance, screenshot_b64, from_description.strip(), width, height
+            )
+            if f_coords is None:
+                return {"success": False, "error": f"Grounding start location failed: {f_err}"}
+            from_x, from_y = f_coords
+
+        if to_description:
+            t_coords, t_err = _ground_element_coordinates(
+                lollms_client_instance, screenshot_b64, to_description.strip(), width, height
+            )
+            if t_coords is None:
+                return {"success": False, "error": f"Grounding destination location failed: {t_err}"}
+            to_x, to_y = t_coords
+
+    try:
+        backend = _require_backend()
+        target_to_x, target_to_y = _clamp_coordinates(int(to_x), int(to_y))
+
+        if from_x >= 0 and from_y >= 0:
+            target_from_x, target_from_y = _clamp_coordinates(int(from_x), int(from_y))
+            backend.moveTo(target_from_x, target_from_y)
+
+        backend.dragTo(target_to_x, target_to_y, duration=duration_s, button=button)
+    except RuntimeError as backend_err:
+        return {"success": False, "error": _sanitize_error(str(backend_err))}
+    except Exception as drag_err:
+        return {"success": False, "error": _sanitize_error(f"Drag failed: {drag_err}")}
+
+    return {
+        "success": True,
+        "output": f"Dragged {button} button to ({target_to_x}, {target_to_y}) over {duration_s:.2f}s.",
+        "to_x": target_to_x,
+        "to_y": target_to_y,
     }
 
 
@@ -563,10 +730,10 @@ def tool_computer_key(
         return {"success": False, "error": "The 'key' parameter is required."}
 
     key_normalized = key.strip().lower()
-    if len(key_normalized) > 20:
-        return {"success": False, "error": "Key combination too long (max 20 characters)."}
+    if len(key_normalized) > 30:
+        return {"success": False, "error": "Key combination too long (max 30 characters)."}
 
-    valid_token_re = re.compile(r'^[a-z0-9+]+$')
+    valid_token_re = re.compile(r'^[a-z0-9+_-]+$')
     if not valid_token_re.match(key_normalized):
         return {"success": False, "error": f"Invalid key specification '{key}'. Use tokens like 'enter', 'ctrl+c'."}
 
@@ -612,7 +779,7 @@ def tool_computer_scroll(
     Scrolls the mouse wheel at the current cursor position (or at given coordinates).
 
     Args:
-        amount (int): Number of scroll units. PyAutoGUI units: positive values scroll. Default 300.
+        amount (int): Number of scroll units. Positive integer. Default 300.
         direction (str): 'down' or 'up'. Default 'down'.
         x (int): Optional X coordinate to scroll at. -1 means current cursor position.
         y (int): Optional Y coordinate to scroll at. -1 means current cursor position.
@@ -628,7 +795,7 @@ def tool_computer_scroll(
     if not (1 <= abs(amount) <= 2000):
         return {"success": False, "error": f"Scroll amount {amount} out of range (1-2000)."}
 
-    effective_amount = amount if direction == "down" else -amount
+    effective_amount = -abs(amount) if direction == "down" else abs(amount)
 
     try:
         backend = _require_backend()
@@ -644,5 +811,53 @@ def tool_computer_scroll(
 
     return {
         "success": True,
-        "output": f"Scrolled {direction} by {amount} units.",
+        "output": f"Scrolled {direction} by {abs(amount)} units.",
     }
+
+
+def tool_computer_wait(
+    duration_s: float = 1.0,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Pauses execution briefly to allow an application to open, a webpage to load, or an animation to complete.
+
+    Args:
+        duration_s (float): Seconds to wait (clamped between 0.1 and 10.0 seconds). Default 1.0.
+    """
+    try:
+        dur = max(0.1, min(float(duration_s), 10.0))
+    except (TypeError, ValueError):
+        dur = 1.0
+
+    time.sleep(dur)
+    return {
+        "success": True,
+        "output": f"Waited {dur:.2f} seconds for the system/UI to settle.",
+        "duration_s": dur,
+    }
+
+
+def tool_computer_cursor_position(
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Returns the current pixel coordinates of the mouse cursor.
+
+    Call this to verify where the pointer is currently resting.
+    """
+    try:
+        backend = _require_backend()
+        cur_x, cur_y = backend.position()
+        return {
+            "success": True,
+            "x": int(cur_x),
+            "y": int(cur_y),
+            "output": f"Current cursor position: ({int(cur_x)}, {int(cur_y)}).",
+        }
+    except RuntimeError as backend_err:
+        return {"success": False, "error": _sanitize_error(str(backend_err))}
+    except Exception as err:
+        return {"success": False, "error": _sanitize_error(f"Position lookup failed: {err}")}

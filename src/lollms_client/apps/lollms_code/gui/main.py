@@ -82,11 +82,21 @@ html.dark, body.dark, body.body--dark {
 body.body--dark .q-card,
 html.dark .q-card,
 body.dark .q-card,
-.q-card.q-card--dark {
+.q-card.q-card--dark,
+html.dark .q-card.bg-white,
+body.dark .q-card.bg-white,
+body.body--dark .q-card.bg-white {
     background: #0f172a !important;
     background-color: #0f172a !important;
     border-color: #1e293b !important;
     color: #f1f5f9 !important;
+}
+
+html.dark .bg-white,
+body.dark .bg-white,
+body.body--dark .bg-white {
+    background: #0f172a !important;
+    background-color: #0f172a !important;
 }
 
 html:not(.dark) body:not(.body--dark) .q-card:not(.q-card--dark) {
@@ -544,7 +554,7 @@ def settings_page_route():
         ui.notify("Settings saved.", type="positive")
         ui.navigate.to("/chat")
 
-    with ui.column().classes("w-full h-screen max-h-screen p-0 m-0 gap-0 flex flex-col overflow-hidden bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100"):
+    with ui.column().classes("w-full h-screen max-h-screen p-0 m-0 gap-0 flex flex-col overflow-hidden bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100"):
         build_settings_page(
             env, prefs,
             on_saved=on_saved,

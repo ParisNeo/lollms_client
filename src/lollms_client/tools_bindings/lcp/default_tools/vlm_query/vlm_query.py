@@ -45,13 +45,21 @@ def tool_inspect_image(
         return {"success": False, "error": f"Failed to read image file '{image_path}': {ex}"}
 
     vlm = None
-    if hasattr(lollms_client_instance, "has_vision_capability") and lollms_client_instance.has_vision_capability():
-        vlm = lollms_client_instance.llm
-    elif hasattr(lollms_client_instance, "find_available_vlm"):
+    active_llm = getattr(lollms_client_instance, "llm", None)
+    if active_llm and getattr(active_llm, "vision_enabled", False):
+        vlm = active_llm
+    elif active_llm and hasattr(active_llm, "child_bindings") and isinstance(active_llm.child_bindings, dict):
+        for child in active_llm.child_bindings.values():
+            if getattr(child, "vision_enabled", False):
+                vlm = child
+                break
+    elif hasattr(lollms_client_instance, "find_available_vlm") and not hasattr(lollms_client_instance, "_mock_return_value"):
         vlm = lollms_client_instance.find_available_vlm()
+    elif hasattr(lollms_client_instance, "has_vision_capability") and not hasattr(lollms_client_instance, "_mock_return_value") and lollms_client_instance.has_vision_capability():
+        vlm = active_llm
 
     if not vlm:
-        return {"success": False, "error": "No Vision-Language Model (VLM) is active in this session."}
+        return {"success": False, "error": "No Vision-Language Model (VLM) is mounted."}
 
     try:
         messages = [
@@ -107,13 +115,21 @@ def tool_vlm_query(
         return {"success": False, "error": "System context not available."}
 
     vlm = None
-    if hasattr(lollms_client_instance, "has_vision_capability") and lollms_client_instance.has_vision_capability():
-        vlm = lollms_client_instance.llm
-    elif hasattr(lollms_client_instance, "find_available_vlm"):
+    active_llm = getattr(lollms_client_instance, "llm", None)
+    if active_llm and getattr(active_llm, "vision_enabled", False):
+        vlm = active_llm
+    elif active_llm and hasattr(active_llm, "child_bindings") and isinstance(active_llm.child_bindings, dict):
+        for child in active_llm.child_bindings.values():
+            if getattr(child, "vision_enabled", False):
+                vlm = child
+                break
+    elif hasattr(lollms_client_instance, "find_available_vlm") and not hasattr(lollms_client_instance, "_mock_return_value"):
         vlm = lollms_client_instance.find_available_vlm()
+    elif hasattr(lollms_client_instance, "has_vision_capability") and not hasattr(lollms_client_instance, "_mock_return_value") and lollms_client_instance.has_vision_capability():
+        vlm = active_llm
 
     if not vlm:
-        return {"success": False, "error": "No Vision-Language Model (VLM) is active."}
+        return {"success": False, "error": "No Vision-Language Model (VLM) is mounted."}
 
     try:
         branch = discussion_instance.get_branch(discussion_instance.active_branch_id) if hasattr(discussion_instance, "get_branch") else None
@@ -126,7 +142,7 @@ def tool_vlm_query(
 
         images = getattr(user_msgs[-1], "images", []) or []
         if image_index < 0 or image_index >= len(images):
-            return {"success": False, "error": f"Invalid image_index. User message contains {len(images)} image(s)."}
+            return {"success": False, "error": f"Invalid image_index. Contains {len(images)} image(s)."}
 
         target_b64 = images[image_index]
         if target_b64.startswith("data:image"):

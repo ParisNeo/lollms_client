@@ -92,7 +92,9 @@ def test_diffusers_ttv_install_model_command():
             binding = DiffusersTTVBinding(
                 host="127.0.0.1",
                 port=9638,
+                auto_start_server=False,
                 models_path=str(models_dir),
+                venv_path=str(tmp_path / "venv"),
             )
 
         mock_resp = MagicMock()

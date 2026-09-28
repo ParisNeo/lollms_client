@@ -3,6 +3,57 @@
 
 All notable changes to this project will be documented in this file.
 #
+- fix(gui:workflow_studio): separate SVG markup and client-side JavaScript execution in Workflow Studio 2D graph canvas to eliminate NiceGUI `ValueError: HTML elements must not contain <script> tags`
+- fix(workflow:types): remove duplicate `compute_auto_layout()` method definition in `workflow_types.py`
+- fix(gui:linear_history): ensure `replay_transcript_from_log()` clears all transcript DOM elements, panel references, and active buffers so `resend_from_point` and `open_edit_dialog` purge all subsequent messages on screen
+- fix(workspace_tools): remove binary file exclusion from `tool_list_files` so images, audio, video, documents, and archives are visible to agents during file organization tasks
+- fix(workspace_tools): improve `_resolve_safe_path` to handle root and absolute workspace path references without nested path corruption
+- fix(gui:workflow_studio): pre-seed `ui.select` options on initialization to prevent NiceGUI `ValueError: Invalid value` crashes in Workflow Studio
+- feat(gui:workflow_studio): implement interactive 2D graph canvas with draggable elements, ports, curved bezier links, auto-layout DAG alignment, and visual loopback indicators
+- feat(gui:workflow_studio): implement interactive 2D graph canvas with draggable elements, ports, curved bezier links, auto-layout DAG alignment, and visual loopback indicators
+- feat(gui:workflow_studio): overhaul Workflow Studio into a full project IDE with visual graph canvas, per-step node configuration dialogs, subtask model routing, interactive gate decision resumption, and project `.lollms_code/workflows/*.yaml` persistence
+- fix(workflow:imports): add explicit `__all__` exports across `workflow_types.py` and `workflow_engine.py`, synchronize `lollms_workflow/__init__.py`, and provide robust submodule fallback in `open_workflow_studio_dialog()`
+- fix(workflow:bootstrap): eliminate package circular import on `Workflow` and `NodeType` during `lollms-code` launch by converting workflow exports in `src/lollms_client/__init__.py` to PEP 562 lazy resolution
+- fix(agent:tool_parser): add AST literal evaluation and inline argument normalization to parse single-quoted Python dicts and function calls (`tool_name(args=...)`) into valid tools
+- fix(personality:loop_continuation): allow the reasoning loop to continue to the next round after tool execution rather than breaking prematurely
+- fix(workflow:import): resolve partially initialized package `ImportError` on `Workflow` by converting `lollms_workflow` to relative imports
+- feat(workflow:engine): introduce deterministic graph-based execution harness (`lollms_workflow`) supporting hard constraint walls, conditional if-this-then-that branching, and variable template piping
+- feat(subtask:model_selection): allow selecting a different model or profile alias for subtasks in `SubAgentSpawner.spawn()`, `tool_spawn_sub_agent`, and `tool_spinoff_agent`, automatically restoring the parent model upon turn completion
+- feat(gui:workflow_studio): add interactive NiceGUI Workflow Studio dialog with visual graph inspection, per-step model routing, and hard constraint guard verification
+- refactor(agent:done_handling): remove fragile regex-based phantom `<done/>` interception to prevent false-positive summary loops, restoring sovereign `<done/>` termination
+- feat(prompt:slm_grounding): integrate few-shot tool-calling exemplars and positive action-first syntax steering into system prompt based on SLM hallucination research
+- refactor(skills:file_organization): streamline procedural headers in `SKILL.md` to prevent 8B models from parroting prompt headers into conversational output
+- docs(enhancements): add research analysis on SLM tool-bypass hallucinations in `incremental_enhancements/`
+- feat(agent:approval_hydration): automatically hydrate user approval replies ("yes", "proceed") with explicit directives to execute pending `mapping.yaml` plans via `tool_organize_files_from_plan`
+- fix(gui:resend): resolve `NameError: name 'effective_prompt' is not defined` in `resend_from_point()`
+- fix(llama_cpp:vision): dynamically detect vision projector binding and set `vision_enabled = True` on `LlamaCppServerBinding` for VL models
+- fix(personality:prompt): resolve `NameError: name 'rules' is not defined` in `_build_system_prompt()` by integrating `operating_protocol` into safe prompt component joining
+- fix(llama_cpp:bind_multimodal): prevent NoneType path crashes in `bind_multimodal_model` and implement `list_mmproj_models()` so vision projectors appear in UI dropdowns
+- fix(gui:settings): resolve half-light/half-dark contrast issue in settings page by eliminating Quasar `bg-white` class collision, binding `:dark` props on all cards, and applying strict CSS dark overrides
+- feat(prompt:optimization): streamline system prompt, eliminate multi-block instruction redundancy, and implement progressive tool disclosure cutting baseline prompt tokens by ~60%
+- feat(tools:lean_defaults): restrict default toolset to essential workspace and execution primitives, keeping Git and rich document tools on-demand via `tool_load_tool`
+- docs(enhancements): add comprehensive documentation of prompt optimization and lean tooling in `incremental_enhancements/`
+- fix(gui:inspector): resolve empty context and 0 token count in Context Inspector by rendering system prompt and prompt placeholder when conversation is empty
+- fix(history:export): allow `HistoryManager.export()` to format and return system prompt even when branch message list is empty
+- fix(prompt:dedup): eliminate duplicate system prompt rendering in `agent_bridge.get_context_preview()` and deduplicate core mandates in `LollmsPersonality._build_system_prompt()`
+- fix(agent:stream): isolate post-stream recovery sweep to content outside markdown fences and ensure artifact body is removed from `self.content`
+- fix(core:profiles): register `"master"` model profile when `extra_llms` are supplied alongside legacy master binding
+- fix(llm:reasoning): allow `translate_reasoning_effort` to project disabled literals (e.g. `"none"`) to matching supported tiers (e.g. `"off"`)
+- fix(core:profiles): fix `UnboundLocalError` on `new_binding` in `_switch_modality` by maintaining reference to `current_binding` across cache hits and misses
+- fix(llm:reasoning): fix `translate_reasoning_effort` and `get_effective_reasoning_effort` to project effort when `think` is None or True
+- fix(tools:vlm_query): fix VLM resolution on mocks and align error messages with test assertions
+- fix(memory:working): ensure `build_working_zone` contains standard `=== WORKING MEMORY ===` marker
+- fix(tools:opt_in): honor `enable_workspace_tools=False` in `ChatMixin._resolve_active_tools` to uphold Sovereign Tool Opt-In doctrine
+- fix(agent:stream): prevent artifact body leakage into `self.content` in `_AgentStreamState` and protect inline code tags during text scrubbing
+- fix(personality:discovery): ensure multimodal bindings, sub-agents, and model switcher tools mount properly in `_discover_tools`
+- perf(test:diffusers): optimize `test/test_diffusers_install_model.py` by setting `auto_start_server=False` on TTV, eliminating multi-gigabyte pip dependency downloads and infinite thread polling
+- fix(gui:disconnect): prevent NiceGUI event-loop disconnects on workspace load by replacing retrying HTTP status checks with fast 0.5s probes and excluding TTM/TTV media daemons from `lollms_code` client startup
+- fix(bindings:paths): anchor `venv_dir` and `cache_dir` across `diffusers` TTM, `diffusers` TTV, and `whisper` STT to `~/.lollms_client/venv/` and `~/.lollms_client/data/`
+- fix(discussion:chat): repair missing `if new_symbols:` indentation block in `_mixin_chat.py` resolving collection-time `IndentationError`
+- feat(computer_use): implement conditional desktop automation toolset mounting gated strictly on `allow_computer_use=True` and active vision model verification
+- feat(computer_use): expand primitive toolset with `tool_computer_mouse_down`, `tool_computer_mouse_up`, `tool_computer_drag`, `tool_computer_wait`, and `tool_computer_cursor_position`
+- feat(computer_use:gating): integrate `allow_computer_use` across `CapabilityFlags`, `LollmsPersonality`, `LollmsDiscussion`, `lollms_code` CLI (`--allow-computer-use`), and GUI settings
+- test(computer_use): add comprehensive unit test suite in `test/test_computer_use_tools.py` verifying vision gating, rejection without vision, and safe execution with mocked backend
 - docs(dynamic_mode): document Dynamic Mode operation across README.md and DOC_DEV.md, covering autonomous reasoning effort escalation via `<effort level="..."/>`, task-adapted temperature regulation, context-fitting token budgets, sub-agent delegation, and CLI/GUI controls
 - fix(artefact:patching): resolve Aider patch conflict marker leakage into source code by stopping replace block absorption on subsequent search headers, scrubbing stray sentinel lines from replacements, and decontaminating final result strings
 - fix(artefact:guard): block raw search/replace conflict blocks from being written directly to disk as full files when targets are missing, preventing disk corruption with `=======`
@@ -221,6 +272,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+
+## [2026-09-28 18:25]
+
+- Fix(diffusers-bindings): resolve race condition in connection pool for `diffuser_instant_model` and enhance path handling
 
 ## [2026-09-28 09:23]
 

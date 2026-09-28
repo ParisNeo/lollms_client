@@ -152,9 +152,6 @@ class HistoryManager:
                     unique_images.append(img)
             return unique_images
 
-        if not branch and format_type in ["lollms_text", "openai_chat", "ollama_chat", "markdown"]:
-            return "" if format_type in ["lollms_text", "markdown"] else []
-
         if branch and branch[-1].sender_type == 'assistant':
             last_msg = branch[-1]
             is_empty_building_msg = not last_msg.content.strip()
@@ -188,6 +185,9 @@ class HistoryManager:
 
             if memory_block:
                 full_system_prompt += f"\n\n=== ACTIVE MEMORIES ===\n{memory_block}"
+
+        if not branch and not virtual_history and not full_system_prompt:
+            return "" if format_type in ["lollms_text", "markdown"] else []
 
         _scratchpad = getattr(context, "scratchpad", "") or ""
 
@@ -543,13 +543,13 @@ class HistoryManager:
                     else:
                         normalized.append({"role": current_role, "content": merged_content})
 
-        non_sys_start = 0
+        non_sys_start = -1
         for i, msg in enumerate(normalized):
             if msg.get("role") != "system":
                 non_sys_start = i
                 break
 
-        if non_sys_start < len(normalized):
+        if non_sys_start != -1 and non_sys_start < len(normalized):
             first_non_sys = normalized[non_sys_start]
             if first_non_sys.get("role") == "assistant":
                 normalized.insert(non_sys_start, {

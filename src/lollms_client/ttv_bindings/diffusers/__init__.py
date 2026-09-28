@@ -43,10 +43,18 @@ class DiffusersTTVBinding(LollmsTTVBinding):
         self.host_address = self.base_url
         self.binding_root = Path(__file__).parent
         self.server_dir = self.binding_root / "server"
-        self.venv_dir = self.resolve_system_path(kwargs.get("venv_path", "venv/ttv_diffusers_venv"))
-        self.models_path = self.resolve_system_path(kwargs.get("models_path", "data/ttv_models/diffusers"))
+        system_root = self.get_system_dir()
+        if kwargs.get("venv_path"):
+            self.venv_dir = self.resolve_system_path(kwargs["venv_path"])
+        else:
+            self.venv_dir = (system_root / "venv" / "ttv_diffusers_venv").resolve()
+
+        if kwargs.get("models_path"):
+            self.models_path = self.resolve_system_path(kwargs["models_path"])
+        else:
+            self.models_path = (system_root / "data" / "ttv_models" / "diffusers").resolve()
+
         self.hf_token = kwargs.get("hf_token", "")
-        
         self.models_path.mkdir(exist_ok=True, parents=True)
         
         if self.auto_start_server:
@@ -55,10 +63,11 @@ class DiffusersTTVBinding(LollmsTTVBinding):
     def is_server_running(self) -> bool:
         """Checks if the server is already running and responsive."""
         try:
-            response = requests.get(f"{self.base_url}/status", timeout=4)
-            if response.status_code == 200 and response.json().get("status") == "running":
-                return True
-        except requests.exceptions.RequestException:
+            response = requests.get(f"{self.base_url}/status", timeout=0.5)
+            if response.status_code == 200:
+                data = response.json() if callable(getattr(response, "json", None)) else {}
+                return data.get("status") == "running" if isinstance(data, dict) else True
+        except Exception:
             return False
         return False
 
@@ -116,7 +125,8 @@ class DiffusersTTVBinding(LollmsTTVBinding):
             with lock.acquire(timeout=0):
                 try:
                     server_script = self.server_dir / "main.py"
-                    if not self.venv_dir.exists():
+                    venv_cfg = self.venv_dir / "pyvenv.cfg"
+                    if not venv_cfg.exists():
                         self.install_server_dependencies()
 
                     if sys.platform == "win32":
@@ -139,8 +149,11 @@ class DiffusersTTVBinding(LollmsTTVBinding):
                     self.server_process = subprocess.Popen(command, creationflags=creationflags)
                     ASCIIColors.info("Diffusers TTV server process launched in the background.")
                     
-                    while not self.is_server_running():
-                        time.sleep(1)
+                    start_wait = time.time()
+                    while time.time() - start_wait < 30:
+                        if self.is_server_running():
+                            break
+                        time.sleep(0.5)
                     
                 except Exception as e:
                     ASCIIColors.error(f"Failed to start Diffusers TTV server: {e}")

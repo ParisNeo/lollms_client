@@ -33,10 +33,65 @@ from lollms_client.lollms_connection_binding import (
 from lollms_client.lollms_bindings_utils import list_bindings, get_binding_desc
 
 
+# ── Lazy-loaded workflow exports (PEP 562 to prevent circular import on package bootstrap) ──
+_WORKFLOW_EXPORTS = {
+    "Workflow",
+    "WorkflowNode",
+    "WorkflowEdge",
+    "NodeType",
+    "WorkflowStatus",
+    "GuardType",
+    "WorkflowContext",
+    "WorkflowEngine",
+    "GuardViolationError",
+    "create_file_organizer_workflow",
+    "create_dual_model_review_workflow",
+}
 
-__version__ = "1.20.5" # Connection bindings added
 
-# Optionally, you could define __all__ if you want to be explicit about exports
+def __getattr__(name: str):
+    if name in _WORKFLOW_EXPORTS:
+        from lollms_client.lollms_workflow.workflow_types import (
+            NodeType,
+            WorkflowStatus,
+            GuardType,
+            WorkflowNode,
+            WorkflowEdge,
+            WorkflowContext,
+            Workflow,
+        )
+        from lollms_client.lollms_workflow.workflow_engine import (
+            WorkflowEngine,
+            GuardViolationError,
+            create_file_organizer_workflow,
+            create_dual_model_review_workflow,
+        )
+        wf_map = {
+            "NodeType": NodeType,
+            "WorkflowStatus": WorkflowStatus,
+            "GuardType": GuardType,
+            "WorkflowNode": WorkflowNode,
+            "WorkflowEdge": WorkflowEdge,
+            "WorkflowContext": WorkflowContext,
+            "Workflow": Workflow,
+            "WorkflowEngine": WorkflowEngine,
+            "GuardViolationError": GuardViolationError,
+            "create_file_organizer_workflow": create_file_organizer_workflow,
+            "create_dual_model_review_workflow": create_dual_model_review_workflow,
+        }
+        for k, v in wf_map.items():
+            globals()[k] = v
+        if name in wf_map:
+            return wf_map[name]
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
+
+def __dir__():
+    return sorted(list(globals().keys()) + list(_WORKFLOW_EXPORTS))
+
+
+__version__ = "1.20.6"
+
 __all__ = [
     "LollmsClient",
     "LollmsBindingProfile",
@@ -71,4 +126,15 @@ __all__ = [
     "ToolsManager",
     "Skill",
     "Handbag",
+    "Workflow",
+    "WorkflowNode",
+    "WorkflowEdge",
+    "NodeType",
+    "WorkflowStatus",
+    "GuardType",
+    "WorkflowContext",
+    "WorkflowEngine",
+    "GuardViolationError",
+    "create_file_organizer_workflow",
+    "create_dual_model_review_workflow",
 ]

@@ -16,28 +16,19 @@ This skill governs the systematic classification, taxonomy generation, user vali
 
 ## 📦 Batch Sizing & Atomic Folder Invariants (MANDATORY)
 
-### 1. Atomic Directories: MOVE AS WHOLE FOLDERS (DO NOT CRAWL SUBFILES)
-- Any directory present at the root of the workspace (e.g. `presentation Line/`, `Rapper artworks/`, `projet_lollms_1/`, `regissong2/`) is an **ATOMIC UNIT**.
-- **RULE**: You MUST map and move the entire directory as a single folder unit:
-  `source: "presentation Line" -> target: "documents/presentations/presentation Line"`
-  `source: "Rapper artworks" -> target: "media/images/artworks/Rapper artworks"`
-- ❌ **STRICTLY FORBIDDEN**: NEVER crawl into subfolders (e.g. `presentation Line/originale/mc0.png`). Do NOT process or list internal subfolder files! Leave the internal contents of subfolders completely intact.
+### 1. Atomic Directories: MOVE AS WHOLE FOLDERS
+- Any directory present at the root of the workspace is an **ATOMIC UNIT**. Move the directory as a single unit without unpacking its subfiles.
 
-### 2. Meaningful Batch Sizing (40 to 50 Items per Batch)
-- When organizing a directory with hundreds of items:
-  - ❌ **STRICTLY FORBIDDEN**: Mapping only 5, 7, or 10 items when hundreds of files exist is a failure.
-  - ✅ **MANDATORY**: Each batch MUST process **between 40 and 50 items** (or all remaining items if less than 50 remain).
-  - First, map all root-level directories as atomic units.
-  - Second, fill the rest of the batch up to 50 items using the loose root files (e.g. root `.png`, `.wav`, `.mp4` files).
+### 2. Batch Sizing (40 to 50 Items per Batch)
+- Process items in batches of 40 to 50 items. Map root directories first, then loose root files.
 
 ---
 
-## 🎯 The Four-Phase Protocol Overview
-When instructed to organize, clean up, or structure a workspace or directory, you MUST follow this four-phase sequence:
-1. **Phase 1 (Scan, Taxonomy & Batch 1 Mapping)**: Scan root items, identify root directories to move as whole units, construct the taxonomy in `classes.md`, and generate `mapping.yaml` for **Batch 1 (40–50 items)**.
-2. **Phase 2 (Ambiguity Resolution)**: Inspect files in the current batch with unclear purposes via `tool_inspect_image` and update the mapping.
-3. **Phase 3 (User Confirmation Gate for Batch)**: Present the batch plan (40–50 items) to the user and halt with `<done/>` to wait for explicit approval.
-4. **Phase 4 (Execution & Next Batch Transition)**: Upon user confirmation, call `tool_organize_files_from_plan` to move Batch 1. Once verified, announce Batch 2.
+## 🎯 Four-Phase Operational Lifecycle
+1. **Phase 1 (Taxonomy & Mapping)**: Generate `classes.md` and `mapping.yaml` (40–50 items) directly via `<artifact>`.
+2. **Phase 2 (Ambiguity Inspection)**: Inspect ambiguous files using `tool_inspect_image` or `<unlock_file>`.
+3. **Phase 3 (User Approval Gate)**: Ask: *"Do you approve migrating this batch? Reply 'yes' to proceed."* and conclude with `<done/>`.
+4. **Phase 4 (Migration Execution)**: When the user confirms with 'yes', call `tool_organize_files_from_plan` immediately.
 
 ---
 

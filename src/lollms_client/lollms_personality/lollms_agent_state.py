@@ -1651,17 +1651,24 @@ class _AgentStreamState:
 
             sanitized_json_body = _fix_unescaped_backslashes(json_body)
 
+            # ── 🛠️ HYBRID TOLERANCE PARSER (JSON -> Python AST Literal -> Repair) ──
+            raw_data = None
             try:
                 raw_data = json.loads(sanitized_json_body)
-                if isinstance(raw_data, dict):
-                    resolved_tool_name = raw_data.get("name", "malformed_tool_call")
-                    if not resolved_tool_name:
-                        resolved_tool_name = "malformed_tool_call"
-                    if "parameters" in raw_data and isinstance(raw_data["parameters"], dict):
-                        resolved_params = raw_data["parameters"]
-                    else:
-                        resolved_params = {k: v for k, v in raw_data.items() if k != "name"}
-            except json.JSONDecodeError:
+            except Exception:
+                pass
+
+            if not isinstance(raw_data, dict):
+                try:
+                    # Safely evaluates Python dict syntax with single quotes and True/False/None
+                    parsed_ast = ast.literal_eval(sanitized_json_body)
+                    if isinstance(parsed_ast, dict):
+                        raw_data = parsed_ast
+                        ASCIIColors.success("[AgentStreamState] Recovered tool call payload via Python literal evaluation.")
+                except Exception:
+                    pass
+
+            if not isinstance(raw_data, dict):
                 repaired = sanitized_json_body
                 while repaired.count('{') > repaired.count('}'):
                     repaired += '}'
@@ -1669,33 +1676,50 @@ class _AgentStreamState:
                     repaired += ']'
                 try:
                     raw_data = json.loads(repaired)
-                    if isinstance(raw_data, dict):
-                        resolved_tool_name = raw_data.get("name", "malformed_tool_call")
-                        if not resolved_tool_name:
-                            resolved_tool_name = "malformed_tool_call"
-                        if "parameters" in raw_data and isinstance(raw_data["parameters"], dict):
-                            resolved_params = raw_data["parameters"]
-                        else:
-                            resolved_params = {k: v for k, v in raw_data.items() if k != "name"}
-                except json.JSONDecodeError:
-                    repaired_payload = _repair_llm_tool_json(sanitized_json_body)
+                except Exception:
                     try:
+                        repaired_payload = _repair_llm_tool_json(sanitized_json_body)
                         raw_data = json.loads(repaired_payload)
-                    except (json.JSONDecodeError, ValueError):
+                    except Exception:
                         raw_data = None
 
-                    if isinstance(raw_data, dict):
-                        resolved_tool_name = raw_data.get("name") or "malformed_tool_call"
-                        if "parameters" in raw_data and isinstance(raw_data["parameters"], dict):
-                            resolved_params = raw_data["parameters"]
-                        else:
-                            resolved_params = {k: v for k, v in raw_data.items() if k != "name"}
-                        ASCIIColors.success(f"[AgentStreamState] Salvaged malformed tool call JSON via repair pass: '{resolved_tool_name}'.")
-                    else:
-                        raw_data = None
-                        resolved_tool_name = "malformed_tool_call"
-                        resolved_params = {}
-                        ASCIIColors.warning(f"[AgentStreamState] Failed to parse tool call JSON even after repair: {sanitized_json_body[:200]}")
+            if isinstance(raw_data, dict):
+                resolved_tool_name = raw_data.get("name", "malformed_tool_call") or "malformed_tool_call"
+                if "parameters" in raw_data and isinstance(raw_data["parameters"], dict):
+                    resolved_params = raw_data["parameters"]
+                else:
+                    resolved_params = {k: v for k, v in raw_data.items() if k != "name"}
+            else:
+                resolved_tool_name = "malformed_tool_call"
+                resolved_params = {}
+                ASCIIColors.warning(f"[AgentStreamState] Failed to parse tool call payload: {sanitized_json_body[:200]}")
+
+            # ── 🧼 TOOL NAME NORMALIZATION (Extract tool_name from tool_name(args=...)) ──
+            if resolved_tool_name and "(" in resolved_tool_name and resolved_tool_name.endswith(")"):
+                call_match = re.match(r'^([a-zA-Z_]\w*)\s*\((.*)\)$', resolved_tool_name.strip())
+                if call_match:
+                    clean_fn_name = call_match.group(1).strip()
+                    inline_args_str = call_match.group(2).strip()
+                    ASCIIColors.info(f"[AgentStreamState] Normalized function call name '{resolved_tool_name}' -> '{clean_fn_name}'.")
+                    resolved_tool_name = clean_fn_name
+
+                    if inline_args_str:
+                        for arg_m in re.finditer(r'([a-zA-Z_]\w*)\s*=\s*(?:["\']([^"\']*)["\']|([^,\)]+))', inline_args_str):
+                            arg_k = arg_m.group(1).strip()
+                            arg_v = arg_m.group(2) if arg_m.group(2) is not None else arg_m.group(3).strip()
+                            if arg_k not in resolved_params:
+                                if arg_v.lower() == "true":
+                                    resolved_params[arg_k] = True
+                                elif arg_v.lower() == "false":
+                                    resolved_params[arg_k] = False
+                                else:
+                                    try:
+                                        resolved_params[arg_k] = int(arg_v)
+                                    except ValueError:
+                                        try:
+                                            resolved_params[arg_k] = float(arg_v)
+                                        except ValueError:
+                                            resolved_params[arg_k] = arg_v
 
         if self.is_callback_mode and resolved_tool_name != "malformed_tool_call":
             try:
@@ -1771,6 +1795,10 @@ class _AgentStreamState:
 
         content_match = re.search(r'<art(?:ifact|efact)[^>]*>(.*?)</art(?:ifact|efact)>', full_artifact_call, re.DOTALL | re.IGNORECASE)
         body_content = content_match.group(1).strip() if content_match else ""
+
+        # Strip any artifact content that might have leaked into self.content
+        if body_content and body_content in self.content:
+            self.content = self.content.replace(body_content, "").strip()
 
         # ── 💾 IMMEDIATE DISK FLUSH: Save completed artifact to disk the millisecond </artifact> closes ──
         disk_saved = False
@@ -1960,30 +1988,35 @@ class _AgentStreamState:
                 self._is_accumulating_context = False
             return
 
-        # ── 🛑 POST-STREAM SWEEP FOR MISSED ACTIONS & CONTEXT TAGS (DEFENSE-IN-DEPTH) ──
-        # Intercepts any functional action tags that were bypassed or wrapped in code fences
+        # ── 🛑 POST-STREAM SWEEP FOR MISSED ACTIONS (OUTSIDE MARKDOWN CODE FENCES) ──
+        # Mask code fences so tags inside documentation code blocks are never intercepted
+        fenced_blocks = {}
+        def _mask_fence(m):
+            ph = f"__FENCE_BLOCK_{len(fenced_blocks)}__"
+            fenced_blocks[ph] = m.group(0)
+            return ph
+
+        content_unfenced = re.sub(r'```[\s\S]*?```', _mask_fence, self.content)
+
         ctx_tag_pat = re.compile(r'<(unlock_file|lock_file|hide_file|pin_file|unpin_file|collapse_folder|uncollapse_folder|scratchpad_append|scratchpad_patch|scratchpad_clear|user_profile_update|user_profile_clear|mem_new|mem_update|mem_load|mem_delete|mem_search|mem_tag)\b[^>]*>(.*?)</\1>', re.DOTALL | re.IGNORECASE)
-        for m in ctx_tag_pat.finditer(self.content):
+        for m in ctx_tag_pat.finditer(content_unfenced):
             t_name = m.group(1).lower()
             tag_xml = m.group(0).strip()
             self.completed_actions.append({"type": "context", "tag_name": t_name, "xml": tag_xml})
             self._action_dispatched = True
-            self.content = self.content.replace(m.group(0), "")
+            content_unfenced = content_unfenced.replace(m.group(0), "")
             ASCIIColors.info(f"[AgentStreamState] Post-stream sweep intercepted missed context tag: <{t_name}>.")
 
-        # ── 🛑 POST-STREAM RECOVERY SWEEP FOR MISSED ARTIFACT AND TOOL TAGS ──
-        # Intercepts any artifact tags that were emitted inside code fences or missed by streaming
         art_tag_pat = re.compile(r'<art(?:ifact|efact)\b[^>]*>.*?</art(?:ifact|efact)>', re.DOTALL | re.IGNORECASE)
-        for m in art_tag_pat.finditer(self.content):
+        for m in art_tag_pat.finditer(content_unfenced):
             art_xml = m.group(0).strip()
             self.completed_actions.append({"type": "artifact", "xml": art_xml})
             self._action_dispatched = True
-            self.content = self.content.replace(m.group(0), "")
+            content_unfenced = content_unfenced.replace(m.group(0), "")
             ASCIIColors.info("[AgentStreamState] Post-stream sweep recovered missed artifact tag.")
 
-        # Intercept missed tool tags in content
         tool_tag_pat = re.compile(r'<tool\b[^>]*>.*?</tool>', re.DOTALL | re.IGNORECASE)
-        for m in tool_tag_pat.finditer(self.content):
+        for m in tool_tag_pat.finditer(content_unfenced):
             t_xml = m.group(0).strip()
             tag_open_m = re.search(r'<tool\b([^>]*)>', t_xml, re.IGNORECASE)
             t_name = ""
@@ -2004,7 +2037,13 @@ class _AgentStreamState:
             elif t_name:
                 self.completed_actions.append({"type": "tool", "json": json.dumps({"name": t_name, "parameters": {}})})
                 self._action_dispatched = True
-            self.content = self.content.replace(m.group(0), "")
+            content_unfenced = content_unfenced.replace(m.group(0), "")
+
+        # Unmask code fences
+        for ph, orig in fenced_blocks.items():
+            content_unfenced = content_unfenced.replace(ph, orig)
+
+        self.content = content_unfenced
 
         # Clean dangling code fence markers, pseudo-tags, and artifacts
         self.content = re.sub(r'(?s)(?:```)?\{tool\}[^\n]*.*?\}*(?:```)?', '', self.content)
@@ -2049,15 +2088,33 @@ class _AgentStreamState:
         # Scrub pseudo-tags
         cleaned = re.sub(r'(?s)(?:```)?\{tool\}[^\n]*.*?\}*(?:```)?', '', cleaned)
         cleaned = re.sub(r'(?s)(?:```)?\{artifact\}[^\n]*.*?\}*(?:```)?', '', cleaned)
+
+        # Mask inline code spans before scrubbing standalone tool tags
+        inline_spans = {}
+        def _mask_inline(m):
+            ph = f"__INLINE_CODE_{len(inline_spans)}__"
+            inline_spans[ph] = m.group(0)
+            return ph
+
+        cleaned = re.sub(r'`[^`]+`', _mask_inline, cleaned)
+
         # Scrub any residual raw tool JSON or orphan closing tags
         cleaned = re.sub(r'(?m)^\s*>?(?:```(?:json)?\s*)?\{"name":\s*"tool_\w+.*$', '', cleaned)
         cleaned = re.sub(r'(?s)>?\s*\{"name":\s*"tool_\w+".*?\}\s*(?:</tool>)?', '', cleaned)
         cleaned = re.sub(r'</?tool\b[^>]*>', '', cleaned, flags=re.IGNORECASE)
+        # Scrub any artifact tags that may have leaked into content
+        cleaned = re.sub(r'(?s)<art(?:ifact|efact)\b[^>]*>.*?</art(?:ifact|efact)>?', '', cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r'</?art(?:ifact|efact)\b[^>]*>', '', cleaned, flags=re.IGNORECASE)
+
         # Remove stray delimiter lines (e.g. `}`, ` `}, `---`, ```, `>, `)
         cleaned = re.sub(r'(?m)^\s*[`>]{1,4}\s*$', '', cleaned)
         cleaned = re.sub(r'(?m)^\s*[`>\s]*\}\s*$', '', cleaned)
         cleaned = re.sub(r'(?m)^\s*[-=]{3,}\s*$', '', cleaned)
         cleaned = re.sub(r'```(?:python|bash|sh|json|xml)?\s*$', '', cleaned).strip()
+
+        for ph, orig in inline_spans.items():
+            cleaned = cleaned.replace(ph, orig)
+
         cleaned = re.sub(r'[`>]{1,4}\s*$', '', cleaned).strip()
         return cleaned.strip()
     

@@ -277,6 +277,7 @@ def build_spinoff_agent_tools(
         max_rounds: int = 6,
         temperature: float = 0.3,
         effort: str = "",
+        model_name: str = "",
         dynamic_effort: bool = False,
     ) -> dict:
         """
@@ -365,11 +366,27 @@ def build_spinoff_agent_tools(
                 f"files: {len(resolved_files)}, rounds: {bounded_rounds}"
             )
 
+            # Model Profile Switching for Spinoff Specialist
+            client = discussion.lollmsClient
+            orig_alias = getattr(client, "_active_llm_alias", None)
+            orig_model = getattr(getattr(client, "llm", None), "model_name", None)
+            spinoff_model_switched = False
+
+            target_model = (model_name or "").strip()
+            if target_model and client:
+                try:
+                    if hasattr(client, "llm_model_profiles_registry") and target_model in client.llm_model_profiles_registry:
+                        spinoff_model_switched = client.switch_model(target_model)
+                    elif hasattr(client, "switch_active_model"):
+                        spinoff_model_switched = client.switch_active_model(target_model)
+                except Exception as m_sw_err:
+                    ASCIIColors.warning(f"[SpinoffTools] Model switch to '{target_model}' failed: {m_sw_err}")
+
             from lollms_client.lollms_personality.lollms_personality import LollmsPersonality
             worker_persona = LollmsPersonality(
                 name=clean_name,
                 system_prompt=system_prompt,
-                lollms_client=discussion.lollmsClient,
+                lollms_client=client,
             )
 
             pre_run_tip = getattr(discussion, "active_branch_id", None)
@@ -386,6 +403,9 @@ def build_spinoff_agent_tools(
                     return True
 
             try:
+                if spinoff_model_switched:
+                    ASCIIColors.success(f"[SpinoffTools] Spinoff '{clean_name}' running under assigned model '{target_model}'.")
+
                 is_discussion = hasattr(discussion, "add_message") and hasattr(discussion, "active_branch_id")
                 if is_discussion:
                     result = discussion.chat(
@@ -426,6 +446,16 @@ def build_spinoff_agent_tools(
                 trace_exception(ex)
                 spinoff_error = f"Spinoff runtime crashed: {ex}"
             finally:
+                if spinoff_model_switched and client:
+                    try:
+                        if orig_alias and hasattr(client, "switch_model"):
+                            client.switch_model(orig_alias)
+                        elif orig_model and hasattr(client, "switch_active_model"):
+                            client.switch_active_model(orig_model)
+                        ASCIIColors.info(f"[SpinoffTools] Restored primary model to '{orig_alias or orig_model}'.")
+                    except Exception:
+                        pass
+
                 if hasattr(discussion, "active_branch_id"):
                     try:
                         current_tip = getattr(discussion, "active_branch_id", None)
@@ -507,6 +537,7 @@ def build_spinoff_agent_tools(
             {"name": "max_rounds", "type": "int", "description": "Bounded reasoning budget for the specialist (2-12).", "optional": True},
             {"name": "temperature", "type": "float", "description": "Sampling temperature for the specialist (0.0-2.0).", "optional": True},
             {"name": "effort", "type": "str", "description": "Known reasoning effort to assign to the specialist ('none', 'low', 'medium', 'high'). Preferred: give the specialist a focused task with a known effort level.", "optional": True},
+            {"name": "model_name", "type": "str", "description": "Select a specific model or profile alias for this specialist subtask (e.g. 'gpt4o', 'qwen_coder', 'fast_local').", "optional": True},
             {"name": "dynamic_effort", "type": "bool", "description": "If true, allows the sub-agent to dynamically adjust its reasoning effort using <effort level='...'/>.", "optional": True},
         ],
         "callable": tool_spinoff_agent,

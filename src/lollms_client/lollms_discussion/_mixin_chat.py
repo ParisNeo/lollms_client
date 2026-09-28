@@ -1275,6 +1275,7 @@ class _StreamState:
                     event_meta = self.artefact_tracker.feed(chunk)
                     if event_meta:
                         new_symbols = event_meta.get("new_symbols", [])
+                        if new_symbols:
                             for sym in new_symbols:
                                 if self.event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
                                     _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACT_SYMBOL_DETECTED, {
@@ -1331,16 +1332,6 @@ class _StreamState:
                             if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
                                 detail = event_meta.get("detail")
                                 if detail and not detail.startswith("Line "):
-                                    status_tag = f'{event_meta["status"]}\n'
-                                    self.ai_message.content += status_tag
-                                    _cb(self.callback, status_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-
-                            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
-                                # ── 🎯 MEANINGFUL STATUS UPDATES ONLY ──
-                                # Only show status if it's a meaningful structural element
-                                detail = event_meta.get("detail")
-                                if detail and not detail.startswith("Line "):
-                                    # This is a real structural element (function, class, section)
                                     status_tag = f'{event_meta["status"]}\n'
                                     self.ai_message.content += status_tag
                                     _cb(self.callback, status_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
@@ -3812,6 +3803,8 @@ class ChatMixin:
         python_autonomy_level: Optional[str] = "safe",
         auto_approve_python: bool = False,
         confirm_handler: Optional[Callable] = None,
+        enable_computer_use: bool = False,
+        allow_computer_use: Optional[bool] = None,
         **kwargs: Any,
     ) -> Dict[str, Dict[str, Any]]:
         if confirm_handler is None and "confirm_handler" in kwargs:
@@ -3921,8 +3914,9 @@ class ChatMixin:
                 if auto_approve_python is not None:
                     py_cfg["auto_approve"] = auto_approve_python
 
-            # ── 1. MOUNT CORE EXECUTION & WORKSPACE TOOLS STRICT MINIMUM ──
-            lcp_binding.mount_tool_library_if_absent("workspace_tools")
+            enable_workspace_tools = kwargs.get("enable_workspace_tools", False)
+            if enable_workspace_tools:
+                lcp_binding.mount_tool_library_if_absent("workspace_tools")
             if enable_code_execution:
                 lcp_binding.mount_tool_library_if_absent("execute_python")
 
@@ -3940,8 +3934,8 @@ class ChatMixin:
                     lollms_client_instance=self.lollmsClient,
                 )
                 for t_name, t_spec in lcp_tools.items():
-                    # Core minimum search/grep/workspace tools
-                    if t_name in ("tool_find_files", "tool_grep_files", "tool_list_files", "tool_read_file", "tool_write_file"):
+                    # Core workspace tools only if explicitly enabled
+                    if t_name in ("tool_find_files", "tool_grep_files", "tool_list_files", "tool_read_file", "tool_write_file") and enable_workspace_tools:
                         active_tools[t_name] = t_spec
                     # Core execution
                     elif t_name in ("tool_execute_python_code", "tool_execute_python_file") and enable_code_execution:
@@ -4044,6 +4038,7 @@ class ChatMixin:
         debug:                        bool = False,
         enable_vlm_query:             bool = False,
         enable_computer_use:          bool = False,
+        allow_computer_use:           Optional[bool] = None,
         context_compaction_threshold: float = 0.85,
         event_mode:                   EventMode = EventMode.PROCESSING_TAG_MODE,
         think:                        Optional[bool] = None,
@@ -4157,6 +4152,8 @@ class ChatMixin:
                 python_autonomy_level=python_autonomy_level,
                 auto_approve_python=auto_approve_python,
                 confirm_handler=confirm_handler,
+                enable_computer_use=enable_computer_use,
+                allow_computer_use=allow_computer_use,
                 **kwargs,
             )
             runner = AgenticRunner(
@@ -4510,6 +4507,8 @@ class ChatMixin:
             python_autonomy_level=python_autonomy_level,
             auto_approve_python=auto_approve_python,
             confirm_handler=confirm_handler,
+            enable_computer_use=enable_computer_use,
+            allow_computer_use=allow_computer_use,
             **kwargs,
         )
 
@@ -4601,11 +4600,24 @@ class ChatMixin:
             "tool_computer_screenshot",
             "tool_computer_click",
             "tool_computer_move_cursor",
+            "tool_computer_mouse_down",
+            "tool_computer_mouse_up",
+            "tool_computer_drag",
             "tool_computer_type",
             "tool_computer_key",
             "tool_computer_scroll",
+            "tool_computer_wait",
+            "tool_computer_cursor_position",
         )
-        if enable_computer_use:
+
+        if allow_computer_use is None:
+            allow_computer_use = kwargs.get("allow_computer_use")
+        if allow_computer_use is None and personality and hasattr(personality, "capabilities"):
+            allow_computer_use = getattr(personality.capabilities, "allow_computer_use", False) or getattr(personality.capabilities, "enable_computer_use", False)
+
+        computer_use_requested = bool(enable_computer_use or allow_computer_use)
+
+        if computer_use_requested:
             _computer_use_vision_ready = False
             if self.lollmsClient and hasattr(self.lollmsClient, "has_vision_capability"):
                 try:
@@ -4636,7 +4648,7 @@ class ChatMixin:
                     trace_exception(ex)
             else:
                 ASCIIColors.warning(
-                    "[ChatMixin] enable_computer_use=True but no vision-capable "
+                    "[ChatMixin] allow_computer_use is True, but no vision-capable "
                     "model is active or no LCP binding is available — computer use "
                     "toolset NOT mounted."
                 )
@@ -5378,7 +5390,7 @@ class ChatMixin:
                     norm_thresh = context_compaction_threshold if context_compaction_threshold <= 1.0 else context_compaction_threshold / 100.0
                     thresh_pct = norm_thresh * 100.0
 
-                    if fill_pct >= thresh_pct and not was_cancelled:
+                    if fill_pct >= thresh_pct and not was_cancelled and len(virtual_history) > 4:
                         ASCIIColors.warning(
                             f"[ChatMixin] 🚨 Context fill at {fill_pct:.1f}% >= {thresh_pct:.0f}%. "
                             "Triggering Fast Compactor Agent to lock files and compact history..."

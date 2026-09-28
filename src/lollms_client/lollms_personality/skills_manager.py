@@ -53,14 +53,14 @@ class SkillsManager:
     # ─────────────────────────────────────────────────────────── tier helpers
 
     def _resolve_visibility(self, skill: Skill) -> str:
-        # By doctrine, all skills start as unloaded ("loadable") so context is not bloated.
-        # Skills are loaded and unloaded on-demand by the LLM as needed.
         if self.mode == "loadable":
             return "loadable"
         if self.mode == "searchable":
             return "searchable"
         if self.mode == "visible":
             return "visible"
+        if self.mode == "mixed":
+            return skill.visibility
         if skill.visibility == "searchable":
             return "searchable"
         return "loadable"

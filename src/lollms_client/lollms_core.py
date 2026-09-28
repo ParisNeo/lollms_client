@@ -464,15 +464,15 @@ class LollmsClient():
                     )
                 registry[alias] = profile
 
-        # Backward compatibility: Only create a master model profile if the registry is completely empty
-        # and a master binding exists (legacy single-binding initialization without model profiles).
-        if "master" in binding_registry and not registry:
+        # Backward compatibility: Create a master model profile if a master binding exists and master is not in registry
+        if "master" in binding_registry and "master" not in registry:
             model_name = binding_registry["master"].binding_config.get("model_name")
+            has_default = any(p.is_default for p in registry.values())
             registry["master"] = LollmsModelProfile(
                 name="master",
                 binding_profile_name="master",
                 model_name=model_name,
-                is_default=True
+                is_default=not has_default
             )
 
     def _save_single_default_profiles_to_disk(self, resolved_defaults: Dict[str, Tuple[str, List[str]]]) -> None:
@@ -670,14 +670,15 @@ class LollmsClient():
             return False
 
         if alias in instance_cache:
-            object.__setattr__(self, attr_name, instance_cache[alias])
+            current_binding = instance_cache[alias]
+            object.__setattr__(self, attr_name, current_binding)
         else:
             model_profile = model_registry[alias]
-            new_binding = self._instantiate_binding_from_profile(alias, model_profile, manager, modality, callback)
-            if not new_binding: return False
+            current_binding = self._instantiate_binding_from_profile(alias, model_profile, manager, modality, callback)
+            if not current_binding: return False
 
-            instance_cache[alias] = new_binding
-            object.__setattr__(self, attr_name, new_binding)
+            instance_cache[alias] = current_binding
+            object.__setattr__(self, attr_name, current_binding)
 
             if callback: callback(f"✅ Instantiated & mounted {modality.upper()}: `{alias}`", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
 
@@ -687,9 +688,9 @@ class LollmsClient():
                 self._ctx_size_cache = {}
 
         # Ensure model is ready (triggering resource reclamation if local and needed)
-        if getattr(new_binding, "is_local", lambda: False)():
-            model_name = getattr(model_profile, "model_name", None)
-            self.ensure_model_loaded(new_binding, model_name)
+        if getattr(current_binding, "is_local", lambda: False)():
+            model_name = getattr(model_registry.get(alias), "model_name", None)
+            self.ensure_model_loaded(current_binding, model_name)
 
         object.__setattr__(self, active_alias_attr, alias)
         ASCIIColors.info(f"[LollmsClient] Active {modality.upper()} switched to '{alias}'.")
@@ -1035,6 +1036,15 @@ class LollmsClient():
             return True
         if getattr(target_binding, "glm_image_embedding", False) is True:
             return True
+
+        if hasattr(target_binding, "_find_mmproj") and hasattr(target_binding, "models_dir") and hasattr(target_binding, "model_name") and target_binding.model_name:
+            try:
+                model_p = target_binding.models_dir / target_binding.model_name
+                if model_p.exists() and target_binding._find_mmproj(model_p) is not None:
+                    target_binding.vision_enabled = True
+                    return True
+            except Exception:
+                pass
 
         if hasattr(target_binding, "child_bindings") and isinstance(target_binding.child_bindings, dict):
             return any(getattr(child, "vision_enabled", False) or getattr(child, "supports_vision", False)

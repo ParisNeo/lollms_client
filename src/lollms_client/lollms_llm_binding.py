@@ -168,26 +168,29 @@ class LollmsLLMBinding(LollmsBaseBinding):
         Translates an incoming reasoning effort setting to a level supported by the model.
 
         Rule:
-          - If think is not True: thought is completely deactivated (returns None).
-          - If think is True: checks reasoning_effort. If None or disabled, returns None.
-            Otherwise projects to supported_efforts.
+          - If think is explicitly False: thought is completely deactivated (returns None).
+          - If think is False or reasoning_effort is disabled: returns None.
+          - Otherwise projects to supported_efforts.
         """
-        if think is not True:
+        if think is False:
             return None
 
-        if reasoning_effort is None:
-            return None
-
-        if reasoning_effort is False:
-            return None
-
-        if reasoning_effort is True:
+        if reasoning_effort is None or reasoning_effort is False:
+            if think is True:
+                raw_str = "high"
+            else:
+                return None
+        elif reasoning_effort is True:
             raw_str = "high"
         else:
             raw_str = str(reasoning_effort).strip().lower()
 
         disabled_literals = {"none", "off", "disabled", "false", "0", ""}
         if raw_str in disabled_literals:
+            if supported_efforts:
+                for cand in supported_efforts:
+                    if cand.strip().lower() in disabled_literals:
+                        return cand
             return None
 
         if not supported_efforts:

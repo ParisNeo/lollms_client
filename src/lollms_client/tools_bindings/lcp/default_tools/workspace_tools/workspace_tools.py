@@ -8,10 +8,15 @@ TOOL_LIBRARY_NAME = "Workspace Tools"
 TOOL_LIBRARY_DESC = "Tools for reading, writing, listing, finding, and grepping files in the agent's workspace."
 TOOL_LIBRARY_ICON = "📁"
 
-_BINARY_EXTS = {
+_COMPILED_EXTS = {
+    ".pyc", ".pyo", ".pyd", ".so", ".dll", ".dylib", ".class",
+}
+
+_GREP_BINARY_EXTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp",
     ".pdf", ".docx", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3",
-    ".zip", ".tar", ".gz", ".mp3", ".wav", ".mp4", ".avi", ".pyc", ".pyo", ".so", ".dll",
+    ".zip", ".tar", ".gz", ".7z", ".rar", ".mp3", ".wav", ".m4a",
+    ".mp4", ".avi", ".mov", ".mkv", ".pyc", ".pyo", ".so", ".dll",
 }
 
 _IGNORED_DIRS = {
@@ -32,15 +37,26 @@ def _resolve_safe_path(file_name: str) -> Path:
     Sanitizes the file name and resolves it safely within the current working directory.
     Prevents path traversal attacks (e.g., ../../etc/passwd).
     """
-    clean_name = file_name.replace("\\", "/")
+    base_path = Path.cwd().resolve()
     
+    if not file_name or file_name.strip() in (".", "./", ".\\"):
+        return base_path
+
+    raw_path = Path(file_name.strip())
+    if raw_path.is_absolute():
+        try:
+            target_path = raw_path.resolve()
+            target_path.relative_to(base_path)
+            return target_path
+        except ValueError:
+            raise PermissionError(f"Path traversal detected: '{file_name}' attempts to escape workspace.")
+
+    clean_name = file_name.replace("\\", "/")
     if len(clean_name) > 1 and clean_name[1] == ":":
         clean_name = clean_name[2:]
     clean_name = clean_name.lstrip("/")
     
-    base_path = Path.cwd()
     target_path = (base_path / clean_name).resolve()
-    
     try:
         target_path.relative_to(base_path)
     except ValueError:
@@ -82,7 +98,17 @@ def tool_read_file(file_name: str) -> Dict[str, Any]:
             return {"success": False, "error": f"File '{file_name}' not found."}
         if not target_path.is_file():
             return {"success": False, "error": f"Path '{file_name}' is not a file."}
-            
+
+        ext = target_path.suffix.lower()
+        if ext in _GREP_BINARY_EXTS:
+            size = target_path.stat().st_size
+            return {
+                "success": True,
+                "output": f"[Binary/media file: {target_path.name} ({size:,} bytes). Content cannot be displayed as plain text. Use appropriate tools to inspect or move this file.]",
+                "is_binary": True,
+                "size": size
+            }
+
         content = target_path.read_text(encoding="utf-8", errors="ignore")
         return {"success": True, "output": content}
     except PermissionError as pe:
@@ -95,6 +121,7 @@ def tool_read_file(file_name: str) -> Dict[str, Any]:
 def tool_list_files(directory: str = ".", recursive: bool = False) -> Dict[str, Any]:
     """
     List the immediate contents of a directory within the workspace (non-recursive by default).
+    Lists all files (including images, audio, video, and documents) so agents can see full directory contents.
 
     Args:
         directory (str, optional): Directory to list. Defaults to current directory ('.').
@@ -117,20 +144,24 @@ def tool_list_files(directory: str = ".", recursive: bool = False) -> Dict[str, 
                     continue
                 if item.is_dir():
                     entries.append(f"{name}/ (dir)")
-                elif item.is_file() and item.suffix.lower() not in _BINARY_EXTS:
+                elif item.is_file() and item.suffix.lower() not in _COMPILED_EXTS:
                     entries.append(name)
 
             entries.sort(key=lambda e: (not e.endswith("/ (dir)"), e.lower()))
             output_str = "\n".join(entries) if entries else "Directory is empty."
             return {"success": True, "files": entries, "output": output_str}
 
+        base_path = Path.cwd().resolve()
         for root, dirs, files in os.walk(target_path):
             dirs[:] = [d for d in dirs if d not in _IGNORED_DIRS and not d.startswith(".")]
             for filename in files:
-                if Path(filename).suffix.lower() in _BINARY_EXTS:
+                if Path(filename).suffix.lower() in _COMPILED_EXTS or filename.startswith("."):
                     continue
-                rel_path = Path(root, filename).relative_to(Path.cwd())
-                entries.append(str(rel_path).replace("\\", "/"))
+                try:
+                    rel_path = Path(root, filename).resolve().relative_to(base_path)
+                    entries.append(str(rel_path).replace("\\", "/"))
+                except ValueError:
+                    entries.append(filename)
 
         entries.sort()
         output_str = "\n".join(entries) if entries else "Directory is empty."
@@ -145,7 +176,7 @@ def tool_list_files(directory: str = ".", recursive: bool = False) -> Dict[str, 
 def tool_find_files(pattern: str, path: str = ".", max_results: int = 50) -> Dict[str, Any]:
     """
     Recursively searches for files matching a name pattern within a given directory.
-    Uses shell wildcards (e.g., '*.py', 'config.*').
+    Uses shell wildcards (e.g., '*.py', 'config.*', '*.png').
 
     Args:
         pattern (str): The file name pattern to match (supports * and ?).
@@ -163,6 +194,7 @@ def tool_find_files(pattern: str, path: str = ".", max_results: int = 50) -> Dic
         if not search_dir.is_dir():
             return {"success": False, "error": f"Directory '{path}' not found."}
 
+        base_path = Path.cwd().resolve()
         matches: List[str] = []
         for root, dirs, files in os.walk(search_dir):
             dirs[:] = [d for d in dirs if d not in _IGNORED_DIRS and not d.startswith('.')]
@@ -170,7 +202,7 @@ def tool_find_files(pattern: str, path: str = ".", max_results: int = 50) -> Dic
             for filename in files:
                 if fnmatch.fnmatch(filename, pattern):
                     try:
-                        rel_path = os.path.relpath(os.path.join(root, filename), Path.cwd())
+                        rel_path = os.path.relpath(os.path.join(root, filename), str(base_path))
                         matches.append(rel_path.replace("\\", "/"))
                     except ValueError:
                         pass
@@ -208,6 +240,7 @@ def _calculate_fuzzy_score(line: str, keywords: List[str]) -> float:
 
     return len(intersection) / len(union)
 
+
 def tool_grep_files(
     pattern: str, 
     file_extension: Optional[str] = None, 
@@ -238,42 +271,32 @@ def tool_grep_files(
             max_results = 50
 
     try:
-        cwd = Path.cwd()
+        cwd = Path.cwd().resolve()
         results: List[Dict[str, Any]] = []
         files_scanned = 0
 
-        # Prepare pattern based on mode
         mode = search_mode.lower()
         use_fuzzy_scoring = False
         regex = None
         keywords = []
 
         if mode == "exact":
-            # User provided a regex
             regex = re.compile(pattern)
         elif mode == "case_sensitive":
-            # Literal string match, escape regex chars
             regex = re.compile(re.escape(pattern))
         elif mode == "case_insensitive":
-            # Literal string match, escape regex chars, ignore case
             regex = re.compile(re.escape(pattern), re.IGNORECASE)
         elif mode == "fuzzy":
-            # Split into keywords, we will score lines that contain any of them
             keywords = re.findall(r'\b\w+\b', pattern)
             if not keywords:
                 return {"success": False, "error": "Fuzzy search requires at least one keyword."}
-            # We still need a loose regex to filter lines before scoring to maintain performance
-            # Match any of the keywords (case insensitive)
             loose_pattern = r'\b(?:' + '|'.join(re.escape(k) for k in keywords) + r')\b'
             regex = re.compile(loose_pattern, re.IGNORECASE)
             use_fuzzy_scoring = True
         elif mode == "words":
-            # All words must be present
             keywords = re.findall(r'\b\w+\b', pattern)
             if not keywords:
                 return {"success": False, "error": "Words search requires at least one keyword."}
-            # Build a regex that ensures all words are present in any order
-            # (?=.*\bword1\b)(?=.*\bword2\b)
             lookaheads = "".join(f"(?=.*\\b{re.escape(k)}\\b)" for k in keywords)
             regex = re.compile(f"^{lookaheads}.*$", re.IGNORECASE)
             use_fuzzy_scoring = True
@@ -287,7 +310,7 @@ def tool_grep_files(
             if any(part in _IGNORED_DIRS for part in file_path.relative_to(cwd).parts[:-1]):
                 continue
 
-            if file_path.suffix.lower() in _BINARY_EXTS:
+            if file_path.suffix.lower() in _GREP_BINARY_EXTS:
                 continue
 
             if file_extension and file_extension != "*":
@@ -303,11 +326,8 @@ def tool_grep_files(
                             score = 1.0
                             if use_fuzzy_scoring:
                                 score = _calculate_fuzzy_score(line, keywords)
-                                # In 'words' mode, score is technically 1.0 if all match, 
-                                # but we calculate anyway in case of partial matches being desired.
-                                # If using 'words' mode, we only want exact subset matches (score >= 1.0 conceptually)
                                 if mode == "words" and score < 1.0:
-                                    continue # Skip if not all words found
+                                    continue
 
                             results.append({
                                 "file": str(file_path.relative_to(cwd)).replace("\\", "/"),
@@ -315,7 +335,7 @@ def tool_grep_files(
                                 "text": line.strip()[:500],
                                 "score": round(score, 4)
                             })
-                            if len(results) >= max_results * 2: # Fetch a bit more if we need to sort
+                            if len(results) >= max_results * 2:
                                 break
             except Exception:
                 pass
@@ -323,11 +343,9 @@ def tool_grep_files(
             if len(results) >= max_results * 2:
                 break
 
-        # Sort by relevance if requested and applicable
         if sort_by_relevance and use_fuzzy_scoring:
             results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
 
-        # Trim to max_results
         final_results = results[:max_results]
 
         output_text = f"Found {len(final_results)} match(es) for pattern '{pattern}' (mode: {mode}) across {files_scanned} file(s).\n\n"

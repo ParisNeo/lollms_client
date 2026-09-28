@@ -49,6 +49,8 @@ def build_settings_page(
 
     HEADER_H = 42
 
+    dark_mode = ui.dark_mode(value=prefs.is_dark())
+
     # Active Navigation State
     nav_state = {"section": "llm"}
 
@@ -70,9 +72,15 @@ def build_settings_page(
 
         with ui.row().classes("items-center gap-2 shrink-0"):
             def toggle_theme():
-                prefs.dark_mode = not prefs.dark_mode
-                ui.dark_mode(prefs.dark_mode)
-                prefs.save()
+                new_dark = not prefs.is_dark()
+                prefs.theme_mode = "dark" if new_dark else "light"
+                prefs.dark_mode = new_dark
+                dark_mode.set_value(new_dark)
+                try:
+                    prefs.save()
+                except Exception:
+                    pass
+                ui.notify(f"Theme: {'Dark' if new_dark else 'Light'}", type="info", timeout=1200)
 
             def _toggle_fs():
                 try:
@@ -248,8 +256,8 @@ def build_settings_page(
 # ==============================================================================
 
 def _render_modality_section(env: EnvStore, modality: str, refresh_parent: Callable[[], None]) -> None:
-    CARD_BG = "bg-white dark:bg-slate-900"
-    BORDER = "border-slate-200 dark:border-slate-800"
+    CARD_BG = "bg-slate-100 dark:bg-slate-900"
+    BORDER = "border-slate-300 dark:border-slate-800"
 
     title_label = MODALITY_LABELS[modality]
     icon_name = MODALITY_ICONS.get(modality, "cable")
@@ -263,7 +271,7 @@ def _render_modality_section(env: EnvStore, modality: str, refresh_parent: Calla
                     ui.label(f"{title_label} Configuration").classes("text-lg font-bold text-slate-900 dark:text-slate-100")
                     ui.label(
                         f"Configure server connections (Bindings) and model targets (Profiles) for {title_label}."
-                    ).classes("text-xs text-slate-500")
+                    ).classes("text-xs text-slate-500 dark:text-slate-400")
 
     # Modality Sub-Tabs (Pill Toggle)
     view_state = {"tab": "profiles"}
@@ -350,18 +358,18 @@ def _render_modality_section(env: EnvStore, modality: str, refresh_parent: Calla
 
 
 def _render_bindings_cards(env: EnvStore, modality: str, container: ui.column, refresh) -> None:
-    CARD_BG = "bg-white dark:bg-slate-900"
-    BORDER = "border-slate-200 dark:border-slate-800"
+    CARD_BG = "bg-slate-100 dark:bg-slate-900"
+    BORDER = "border-slate-300 dark:border-slate-800"
 
     aliases = env.configured_binding_aliases(modality)
     with container:
         if not aliases:
-            with ui.card().classes(f"w-full p-8 border {BORDER} {CARD_BG} rounded-xl items-center justify-center gap-2 text-center"):
+            with ui.card().classes(f"w-full p-8 border {BORDER} {CARD_BG} rounded-xl items-center justify-center gap-2 text-center").props(':dark="Quasar.Dark.isActive"'):
                 ui.icon("cable", size="36px").classes("text-slate-400")
                 ui.label("No Server Bindings Configured").classes("font-bold text-sm text-slate-700 dark:text-slate-300")
                 ui.label(
                     "Add a binding to connect to an LLM provider (Ollama, OpenAI, vLLM, Llama.cpp server, etc.)."
-                ).classes("text-xs text-slate-500 max-w-md")
+                ).classes("text-xs text-slate-500 dark:text-slate-400 max-w-md")
                 ui.button("Add Binding Now", icon="add", on_click=lambda: _open_add_binding_dialog(env, modality, refresh)).props(
                     "unelevated size=sm color=primary no-caps mt-2"
                 )
@@ -373,13 +381,13 @@ def _render_bindings_cards(env: EnvStore, modality: str, container: ui.column, r
             host = keys.get("HOST_ADDRESS", "default host")
             cmds = _get_binding_commands_schema(env, modality, b_name)
 
-            with ui.card().classes(f"w-full p-4 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-2"):
+            with ui.card().classes(f"w-full p-4 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-2").props(':dark="Quasar.Dark.isActive"'):
                 with ui.row().classes("w-full items-center justify-between"):
                     with ui.row().classes("items-center gap-3"):
                         ui.badge(b_name.upper(), color="indigo").props("rounded dense")
                         with ui.column().classes("gap-0"):
                             ui.label(alias).classes("font-mono font-bold text-sm text-slate-900 dark:text-slate-100")
-                            ui.label(f"Endpoint: {host}").classes("text-xs text-slate-500 font-mono")
+                            ui.label(f"Endpoint: {host}").classes("text-xs text-slate-500 dark:text-slate-400 font-mono")
 
                     with ui.row().classes("items-center gap-1.5"):
                         if cmds:
@@ -402,18 +410,18 @@ def _render_bindings_cards(env: EnvStore, modality: str, container: ui.column, r
 
 
 def _render_profiles_cards(env: EnvStore, modality: str, container: ui.column, refresh) -> None:
-    CARD_BG = "bg-white dark:bg-slate-900"
-    BORDER = "border-slate-200 dark:border-slate-800"
+    CARD_BG = "bg-slate-100 dark:bg-slate-900"
+    BORDER = "border-slate-300 dark:border-slate-800"
 
     aliases = env.configured_profile_aliases(modality)
     with container:
         if not aliases:
-            with ui.card().classes(f"w-full p-8 border {BORDER} {CARD_BG} rounded-xl items-center justify-center gap-2 text-center"):
+            with ui.card().classes(f"w-full p-8 border {BORDER} {CARD_BG} rounded-xl items-center justify-center gap-2 text-center").props(':dark="Quasar.Dark.isActive"'):
                 ui.icon("badge", size="36px").classes("text-slate-400")
                 ui.label("No Model Profiles Configured").classes("font-bold text-sm text-slate-700 dark:text-slate-300")
                 ui.label(
                     "Create a model profile that links a specific model name to a configured server binding."
-                ).classes("text-xs text-slate-500 max-w-md")
+                ).classes("text-xs text-slate-500 dark:text-slate-400 max-w-md")
                 ui.button("Add Profile Now", icon="add", on_click=lambda: _open_add_profile_dialog(env, modality, refresh)).props(
                     "unelevated size=sm color=primary no-caps mt-2"
                 )
@@ -430,7 +438,7 @@ def _render_profiles_cards(env: EnvStore, modality: str, container: ui.column, r
             efforts = keys.get("SUPPORTED_REASONING_EFFORTS", "")
             forced_ctx = keys.get("FORCED_CONTEXT_SIZE")
 
-            with ui.card().classes(f"w-full p-4 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-2"):
+            with ui.card().classes(f"w-full p-4 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-2").props(':dark="Quasar.Dark.isActive"'):
                 with ui.row().classes("w-full items-center justify-between"):
                     with ui.row().classes("items-center gap-2 flex-wrap"):
                         ui.label(alias).classes("font-mono font-bold text-sm text-slate-900 dark:text-slate-100")
@@ -486,15 +494,15 @@ def _render_profiles_cards(env: EnvStore, modality: str, container: ui.column, r
 # ==============================================================================
 
 def _render_agent_section(prefs: GuiPrefs) -> None:
-    CARD_BG = "bg-white dark:bg-slate-900"
-    BORDER = "border-slate-200 dark:border-slate-800"
+    CARD_BG = "bg-slate-100 dark:bg-slate-900"
+    BORDER = "border-slate-300 dark:border-slate-800"
 
     # Header Card
     with ui.card().classes(f"w-full p-4 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-1").props(':dark="Quasar.Dark.isActive"'):
         with ui.row().classes("items-center gap-2"):
             ui.icon("smart_toy", size="24px").classes("text-primary")
             ui.label("Agent Behavior & Reasoning Controls").classes("text-base font-bold text-slate-900 dark:text-slate-100")
-        ui.label("Tune cognitive sampling, token budgets, execution autonomy, and sub-agent delegation.").classes("text-xs text-slate-500")
+        ui.label("Tune cognitive sampling, token budgets, execution autonomy, and sub-agent delegation.").classes("text-xs text-slate-500 dark:text-slate-400")
 
     # Card 1: Reasoning & Turn Budgets
     with ui.card().classes(f"w-full p-5 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-4").props(':dark="Quasar.Dark.isActive"'):
@@ -602,6 +610,12 @@ def _render_agent_section(prefs: GuiPrefs) -> None:
         shell_switch = ui.switch("Enable System Shell Tool", value=prefs.enable_shell_execution)
         shell_switch.on_value_change(lambda e: setattr(prefs, "enable_shell_execution", e.value))
 
+        computer_use_sw = ui.switch(
+            "Allow Desktop Automation / Computer Use (Requires Vision Model)",
+            value=getattr(prefs, "allow_computer_use", False)
+        ).props("dense").tooltip("Enables screenshotting, mouse clicking, moving, typing, and dragging when the active model supports vision.")
+        computer_use_sw.on_value_change(lambda e: setattr(prefs, "allow_computer_use", e.value))
+
         with ui.column().classes("w-full gap-2.5 pt-1").bind_visibility_from(shell_switch, "value"):
             autonomy_select = ui.select(
                 {
@@ -676,16 +690,16 @@ def _render_agent_section(prefs: GuiPrefs) -> None:
 # ==============================================================================
 
 def _render_paths_section(prefs: GuiPrefs) -> None:
-    CARD_BG = "bg-white dark:bg-slate-900"
-    BORDER = "border-slate-200 dark:border-slate-800"
+    CARD_BG = "bg-slate-100 dark:bg-slate-900"
+    BORDER = "border-slate-300 dark:border-slate-800"
 
-    with ui.card().classes(f"w-full p-4 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-1"):
+    with ui.card().classes(f"w-full p-4 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-1").props(':dark="Quasar.Dark.isActive"'):
         with ui.row().classes("items-center gap-2"):
             ui.icon("folder", size="24px").classes("text-primary")
             ui.label("Workspace & System Paths").classes("text-base font-bold text-slate-900 dark:text-slate-100")
-        ui.label("Manage project sandbox root, global skills library, handbag folders, and memory databases.").classes("text-xs text-slate-500")
+        ui.label("Manage project sandbox root, global skills library, handbag folders, and memory databases.").classes("text-xs text-slate-500 dark:text-slate-400")
 
-    with ui.card().classes(f"w-full p-5 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-4"):
+    with ui.card().classes(f"w-full p-5 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-4").props(':dark="Quasar.Dark.isActive"'):
         ui.label("Project Workspace Directory").classes("text-sm font-bold text-slate-800 dark:text-slate-200")
         with ui.row().classes("w-full items-center gap-2"):
             ws_input = ui.input("Active Workspace Path", value=prefs.workspace_path).classes("flex-1").props("outlined dense")
@@ -727,16 +741,16 @@ def _render_paths_section(prefs: GuiPrefs) -> None:
 # ==============================================================================
 
 def _render_appearance_section(prefs: GuiPrefs) -> None:
-    CARD_BG = "bg-white dark:bg-slate-900"
-    BORDER = "border-slate-200 dark:border-slate-800"
+    CARD_BG = "bg-slate-100 dark:bg-slate-900"
+    BORDER = "border-slate-300 dark:border-slate-800"
 
-    with ui.card().classes(f"w-full p-4 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-1"):
+    with ui.card().classes(f"w-full p-4 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-1").props(':dark="Quasar.Dark.isActive"'):
         with ui.row().classes("items-center gap-2"):
             ui.icon("palette", size="24px").classes("text-primary")
             ui.label("Theme & Visual Customization").classes("text-base font-bold text-slate-900 dark:text-slate-100")
-        ui.label("Customize color palettes, typography, UI panel visibility, and window dimensions.").classes("text-xs text-slate-500")
+        ui.label("Customize color palettes, typography, UI panel visibility, and window dimensions.").classes("text-xs text-slate-500 dark:text-slate-400")
 
-    with ui.card().classes(f"w-full p-5 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-4"):
+    with ui.card().classes(f"w-full p-5 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-4").props(':dark="Quasar.Dark.isActive"'):
         ui.label("Theme & Accents").classes("text-sm font-bold text-slate-800 dark:text-slate-200")
 
         dark_sw = ui.switch("Dark Mode Enabled", value=prefs.dark_mode)
@@ -866,7 +880,7 @@ def _show_alias_collision_dialog(
 
 def _open_add_binding_dialog(env: EnvStore, modality: str, refresh) -> None:
     dialog = ui.dialog()
-    with dialog, ui.card().classes("w-[560px] max-w-[95vw] p-5 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 border border-slate-200 dark:border-slate-800 rounded-xl shadow-lg gap-3"):
+    with dialog, ui.card().classes("w-[560px] max-w-[95vw] p-5 bg-slate-100 dark:bg-slate-900 text-slate-900 dark:text-slate-100 border border-slate-300 dark:border-slate-800 rounded-xl shadow-lg gap-3").props(':dark="Quasar.Dark.isActive"'):
         with ui.row().classes("w-full items-center justify-between pb-2 border-b border-slate-200 dark:border-slate-800"):
             ui.label(f"Add {MODALITY_LABELS[modality]} Server Binding").classes("text-base font-bold")
             ui.button(icon="close", on_click=dialog.close).props("flat round dense size=xs")
@@ -1057,13 +1071,13 @@ def _open_binding_commands_dialog(env: EnvStore, modality: str, alias: str, bind
                 c_params = cmd.get("parameters", [])
 
                 with ui.tab_panel(f"cmd_{idx}").classes("w-full h-full p-2 flex flex-col overflow-hidden gap-3"):
-                    with ui.card().classes("w-full p-3 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl gap-1 shrink-0"):
+                    with ui.card().classes("w-full p-3 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-slate-800 rounded-xl gap-1 shrink-0").props(':dark="Quasar.Dark.isActive"'):
                         ui.label(c_title).classes("font-bold text-sm text-primary")
                         ui.label(c_desc).classes("text-xs text-slate-500 dark:text-slate-400 leading-relaxed")
 
                     # Form inputs area
                     input_widgets = {}
-                    with ui.scroll_area().classes("w-full flex-1 p-3 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl"):
+                    with ui.scroll_area().classes("w-full flex-1 p-3 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-slate-800 rounded-xl"):
                         with ui.column().classes("w-full gap-3"):
                             if not c_params:
                                 ui.label("This command requires no additional parameters. Click 'Execute Command' below to run.").classes("text-xs text-slate-500 italic p-2")
@@ -1080,8 +1094,31 @@ def _open_binding_commands_dialog(env: EnvStore, modality: str, alias: str, bind
                                     if p_type == "bool":
                                         sw = ui.switch(lbl, value=bool(p_default)).props("dense")
                                         input_widgets[p_name] = sw
-                                    elif p_name in ("model_name", "mmproj_name") and binding_inst and hasattr(binding_inst, "list_models"):
-                                        # Provide searchable dropdown with model suggestions from local folder
+                                    elif p_name in ("mmproj_name", "projector_name", "mmproj_filename"):
+                                        proj_names = []
+                                        if binding_inst and hasattr(binding_inst, "list_mmproj_models"):
+                                            try:
+                                                raw_projs = binding_inst.list_mmproj_models()
+                                                proj_names = [m.get("model_name", str(m)) if isinstance(m, dict) else str(m) for m in raw_projs]
+                                            except Exception:
+                                                pass
+                                        if not proj_names and binding_inst and hasattr(binding_inst, "models_dir") and getattr(binding_inst, "models_dir", None):
+                                            try:
+                                                md = Path(binding_inst.models_dir)
+                                                if md.exists():
+                                                    for f in md.glob("*"):
+                                                        if f.is_file() and "mmproj" in f.name.lower() and f.name.lower().endswith((".gguf", ".mmproj", ".bin")):
+                                                            proj_names.append(f.name)
+                                            except Exception:
+                                                pass
+                                        sel = ui.select(
+                                            options=proj_names,
+                                            value=proj_names[0] if proj_names else None,
+                                            label=lbl,
+                                            new_value_mode="add-unique",
+                                        ).classes("w-full text-xs").props("outlined dense use-input fill-input clearable")
+                                        input_widgets[p_name] = sel
+                                    elif p_name in ("model_name", "filename") and binding_inst and hasattr(binding_inst, "list_models"):
                                         try:
                                             raw_models = binding_inst.list_models()
                                             model_names = [m.get("model_name", str(m)) if isinstance(m, dict) else str(m) for m in raw_models]
@@ -1135,6 +1172,16 @@ def _open_binding_commands_dialog(env: EnvStore, modality: str, alias: str, bind
                                             val = val.strip()
                                         call_kwargs[k] = val
 
+                                    # Validate mandatory parameters before execution
+                                    missing_mandatory = []
+                                    for p_spec in c_params:
+                                        p_key = p_spec.get("name")
+                                        if p_spec.get("mandatory") and not call_kwargs.get(p_key):
+                                            missing_mandatory.append(p_spec.get("title") or p_key)
+                                    if missing_mandatory:
+                                        ui.notify(f"Please select or enter: {', '.join(missing_mandatory)}", type="warning")
+                                        return
+
                                     # Wire progress callback if method accepts it
                                     import inspect
                                     sig = inspect.signature(fn)
@@ -1160,8 +1207,13 @@ def _open_binding_commands_dialog(env: EnvStore, modality: str, alias: str, bind
                                         res = await _ng_run.io_bound(fn, **call_kwargs)
                                         p_bar.value = 1.0
                                         res_str = json.dumps(res, indent=2) if isinstance(res, (dict, list)) else str(res)
-                                        s_lbl.set_text(f"✅ Finished: {res_str[:120]}")
-                                        ui.notify(f"✓ {target_cmd} completed successfully.", type="positive")
+                                        if isinstance(res, dict) and (res.get("status") is False or res.get("success") is False or res.get("error")):
+                                            err_txt = res.get("error") or res.get("message") or "Command execution failed."
+                                            s_lbl.set_text(f"❌ Failed: {err_txt}")
+                                            ui.notify(f"{target_cmd} error: {err_txt}", type="negative")
+                                        else:
+                                            s_lbl.set_text(f"✅ Finished: {res_str[:120]}")
+                                            ui.notify(f"✓ {target_cmd} completed successfully.", type="positive")
                                     except Exception as ex:
                                         s_lbl.set_text(f"❌ Error: {ex}")
                                         ui.notify(f"Command '{target_cmd}' failed: {ex}", type="negative")
@@ -1179,7 +1231,7 @@ def _open_edit_binding_dialog(env: EnvStore, modality: str, alias: str, refresh)
     dialog = ui.dialog()
     keys = env.binding_keys(modality, alias)
     binding_name = keys.get("BINDING_NAME", "")
-    with dialog, ui.card().classes("w-[560px] max-w-[95vw] p-5 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 border border-slate-200 dark:border-slate-800 rounded-xl shadow-lg gap-3"):
+    with dialog, ui.card().classes("w-[560px] max-w-[95vw] p-5 bg-slate-100 dark:bg-slate-900 text-slate-900 dark:text-slate-100 border border-slate-300 dark:border-slate-800 rounded-xl shadow-lg gap-3").props(':dark="Quasar.Dark.isActive"'):
         with ui.row().classes("w-full items-center justify-between pb-2 border-b border-slate-200 dark:border-slate-800"):
             with ui.column().classes("gap-0"):
                 ui.label(f"Edit Binding: {alias}").classes("text-base font-bold")
@@ -1291,7 +1343,7 @@ def _render_param_form(env: EnvStore, modality: str, binding_name: str, existing
 
 def _open_add_profile_dialog(env: EnvStore, modality: str, refresh) -> None:
     dialog = ui.dialog()
-    with dialog, ui.card().classes("w-[560px] max-w-[95vw] p-5 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 border border-slate-200 dark:border-slate-800 rounded-xl shadow-lg gap-3"):
+    with dialog, ui.card().classes("w-[560px] max-w-[95vw] p-5 bg-slate-100 dark:bg-slate-900 text-slate-900 dark:text-slate-100 border border-slate-300 dark:border-slate-800 rounded-xl shadow-lg gap-3").props(':dark="Quasar.Dark.isActive"'):
         with ui.row().classes("w-full items-center justify-between pb-2 border-b border-slate-200 dark:border-slate-800"):
             ui.label(f"Add {MODALITY_LABELS[modality]} Model Profile").classes("text-base font-bold")
             ui.button(icon="close", on_click=dialog.close).props("flat round dense size=xs")
@@ -1351,7 +1403,7 @@ def _open_add_profile_dialog(env: EnvStore, modality: str, refresh) -> None:
 def _open_edit_profile_dialog(env: EnvStore, modality: str, alias: str, refresh) -> None:
     dialog = ui.dialog()
     existing = env.profile_keys(modality, alias)
-    with dialog, ui.card().classes("w-[560px] max-w-[95vw] p-5 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 border border-slate-200 dark:border-slate-800 rounded-xl shadow-lg gap-3"):
+    with dialog, ui.card().classes("w-[560px] max-w-[95vw] p-5 bg-slate-100 dark:bg-slate-900 text-slate-900 dark:text-slate-100 border border-slate-300 dark:border-slate-800 rounded-xl shadow-lg gap-3").props(':dark="Quasar.Dark.isActive"'):
         with ui.row().classes("w-full items-center justify-between pb-2 border-b border-slate-200 dark:border-slate-800"):
             ui.label(f"Edit Profile: {alias}").classes("text-base font-bold")
             ui.button(icon="close", on_click=dialog.close).props("flat round dense size=xs")

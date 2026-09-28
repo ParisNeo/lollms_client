@@ -28,7 +28,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from ascii_colors import ASCIIColors, trace_exception
 
@@ -103,76 +103,28 @@ def get_workspace_prompt_history_file(workspace_path: str | Path) -> Path:
     return get_workspace_sandbox_dir(workspace_path) / "prompt_history.json"
 
 CODING_EXECUTION_HARNESS = """
-=== AUTONOMOUS EXECUTION & SHELL CAPABILITIES ===
-You have full access to execute code, run shell commands, and manage workspace files.
-
-## MACRO STEPS PLANNING (CURRENT.md MANDATE)
-For every non-trivial task, you MUST maintain a macro-level plan in `.lollms_code/CURRENT.md`.
-1. **DEFINE AT TASK START**: Initialize your macro steps plan in `.lollms_code/CURRENT.md` using checkbox markdown:
-   ```markdown
-   # Current Task: <Task Title>
-
-   ## Macro Steps Plan
-   - [ ] Step 1: <First milestone>
-   - [ ] Step 2: <Second milestone>
-   - [ ] Step 3: <Verification and testing>
-
-   ## Notes & Findings
-   - ...
-   ```
-2. **UPDATE ON MILESTONE COMPLETION**: Every time a macro step is finished (for example, you coded a function, executed it, debugged it, and tested it), update `.lollms_code/CURRENT.md` immediately, marking that step complete (`- [x]`) and recording any findings.
-3. **GROUND TRUTH ROADMAP**: `.lollms_code/CURRENT.md` is automatically loaded into your context. Use it so you never lose context or repeat completed work across rounds.
-
-## WORKFLOW & EXECUTION MANDATE
-1. **FILE CREATION & EDITING**: Use `<artifact>` tags with complete code or SEARCH/REPLACE blocks.
-2. **EXECUTION MANDATE**: When asked to create and execute code:
-   - Emit the `<artifact>` tag to create the file.
-   - Then execute it using `tool_execute_python_file` or `tool_execute_shell_command`.
-   - Never finish with `<done/>` before executing and inspecting the output!
-3. **SYSTEM SHELL EXECUTION**: Use `tool_execute_shell_command` to run tests, scripts, or OS commands.
-   - On Windows, the shell is `cmd.exe`. Use `del` to delete files (NOT `rm`), `rmdir /s /q` to delete directories (NOT `rm -rf`), `dir` to list, and `type` to view. Never use `rm` on Windows.
-   - To check file deletion on Windows, use `if not exist file.py (echo DELETED)`. Do not use `dir <deleted_file>` which returns exit code 1.
-4. **TERMINATION**: When all objectives are met and verified, summarize your work and end with `<done/>` on a new line.
-=== END AUTONOMOUS EXECUTION & SHELL CAPABILITIES ===
+=== WORKSPACE EXECUTION & PLANNING ===
+- **Macro Planning**: For multi-step tasks, maintain progress checkpoints in `.lollms_code/CURRENT.md`.
+- **Execution**: To run scripts, use `tool_execute_python_file` or `tool_execute_shell_command`. Verify outputs before finishing.
+=== END WORKSPACE EXECUTION ===
 """
 
 TTI_CAPABILITY_PROMPT = """
-=== IMAGE GENERATION CAPABILITY (ACTIVE) ===
-You have access to a Text-to-Image (TTI) binding. You CAN generate images.
-When a user asks you to generate, draw, create, or make an image, you MUST emit the `tool_generate_image` tool call in the VERY SAME RESPONSE:
-<tool>{"name": "tool_generate_image", "parameters": {"prompt": "detailed prompt describing image"}}</tool>
-Or using XML tag:
-<generate_image>detailed English prompt describing the image</generate_image>
-NEVER write 'I will generate an image...' and stop without emitting the tool tag!
-=== END IMAGE GENERATION CAPABILITY ===
+=== IMAGE GENERATION (ACTIVE) ===
+To generate an image, emit: `<tool>{"name": "tool_generate_image", "parameters": {"prompt": "..."}}</tool>`.
+=== END IMAGE GENERATION ===
 """
 
 CODING_SYSTEM_PROMPT = """\
-You are lollms_code, an elite autonomous engineering agent.
-
-## CAPABILITIES & SCOPE
-You excel at:
-- Full-stack software engineering (frontend, backend, APIs, databases, unit testing).
-- File and directory organization (structuring messy folders, categorizing files).
-- Document analysis and information extraction (PDF, DOCX, XLSX, PPTX).
-- Research synthesis, bibliography, and citation management.
-- Deep web searching, scraping, and fact-checking.
-
-## SKILL-FIRST DISPATCH MANDATE (CRITICAL)
-Before undertaking any non-trivial task:
-1. **CHECK LOADABLE SKILLS FIRST**: Review the loadable skills list and any `=== RECOMMENDED SKILL ===` block in your prompt.
-2. **LOAD MATCHING SKILL AS ROUND 1 ACTION**: If a skill matches the user's request (e.g. `file_organization` for organizing/cleaning folders, `document_analysis_and_extraction` for parsing/annotating docs, `deep_websearch_and_extraction` for web research, `fullstack_development` for web apps/APIs):
-   - You MUST call `<tool>{\"name\": \"tool_load_skill\", \"parameters\": {\"title\": \"<skill_title>\"}}</tool>` in Round 1 before taking action or writing files!
-   - DO NOT improvise ad-hoc plans or guess workflows when a specialized skill exists. Load the skill and follow its exact multi-phase protocol.
-   - Do NOT emit `<done/>` after loading the skill; wait for the system to return the skill doctrine in the next round.
+You are lollms_code, an elite autonomous software engineering agent.
 
 ## CORE OPERATIONAL DIRECTIVES
-1. **SAME-RESPONSE ACTION EXECUTION**: Stating intent in conversational prose DOES NOT execute tools or modify files. You MUST emit the corresponding functional tag (`<unlock_file>`, `<artifact>`, `<tool>`, etc.) in the EXACT SAME RESPONSE immediately after stating your intent.
-2. **PASSIVE MEMORY BOUNDARY**: Past memories in `=== ACTIVE MEMORIES ===` are strictly background facts and user preferences. They are NOT current commands. Your current objective is exclusively defined by the user's latest message. When greeted (e.g. "Hi"), reply politely and conversationally FIRST; never start executing past tasks!
-3. **WORKSPACE TREE & FILE ACCESS**: Use `<unlock_file>path/to/file.ext</unlock_file>` to load files into context [C]. Use `<lock_file>path/to/file.ext</lock_file>` to unload when done.
-4. **FILE CREATION & EDITING**: Use `<artifact name="path/to/file.ext" type="code">...code...</artifact>` for files. For surgical edits, use Aider SEARCH/REPLACE blocks.
-5. **MACRO PLANNING**: For multi-step tasks, define and maintain checkboxes in `.lollms_code/CURRENT.md`.
-6. **COMPLETION**: When finished, summarize your work and conclude with `<done/>` on a new line.
+1. **SAME-RESPONSE ACTION EXECUTION**: Prose does NOT execute tools or create files. Emit functional tags (`<tool>`, `<artifact>`, `<unlock_file>`) in the exact same turn immediately.
+2. **SKILL-FIRST MANDATE**: If a task matches a specialized skill (e.g. `file_organization`), call `tool_load_skill` in Round 1 before taking ad-hoc actions.
+3. **PASSIVE MEMORY BOUNDARY**: Memories provide passive background facts and preferences only. Execute ONLY what the latest user message specifies. Greet politely on greetings and conclude with `<done/>`.
+4. **FILE OPERATIONS**: Use `<unlock_file>` to inspect files into context [C], and `<lock_file>` to unload when done.
+5. **ARTIFACTS & PATCHES**: Create files with `<artifact name="..." type="code">...content...</artifact>`. For updates (< 60% changes), use Aider SEARCH/REPLACE blocks.
+6. **COMPLETION CONTRACT**: Summarize accomplishments and conclude every finished turn with `<done/>` on a new line.
 """
 
 
@@ -415,6 +367,7 @@ class CodeAgentConfig:
         self.reasoning_effort: Optional[str] = None
         self.dynamic_effort: bool = False
         self.enable_shell_execution: bool = True
+        self.allow_computer_use: bool = False
         self.shell_autonomy_level: str = "safe"
         self.enable_sub_agents: bool = True
         self.enable_model_switching: bool = False
@@ -668,6 +621,8 @@ class CodeAgentConfig:
             config.enable_model_switching = True
         if cli_args.no_shell_execution:
             config.enable_shell_execution = False
+        if getattr(cli_args, "allow_computer_use", False):
+            config.allow_computer_use = True
         if cli_args.shell_autonomy:
             config.shell_autonomy_level = cli_args.shell_autonomy
         if cli_args.no_sub_agents:
@@ -1229,15 +1184,12 @@ def ensure_sandbox_structure(config: CodeAgentConfig):
         current_plan.write_text("# Current Task\n\nNo active task plan defined yet. Initialize your macro steps plan here at the start of a task.\n", encoding="utf-8")
 
 def build_environment_context(config: CodeAgentConfig) -> str:
-    """Builds a dynamic system prompt block describing the execution environment."""
+    """Builds a compact dynamic system prompt block describing the execution environment."""
     is_windows = platform.system() == "Windows"
     os_name = platform.system()
-    os_version = platform.version()
     python_version = platform.python_version()
-
     workspace_root = Path(config.workspace_path).resolve()
-
-    shell_cmd = "cmd / powershell" if is_windows else "bash/sh"
+    shell_cmd = "cmd.exe" if is_windows else "bash/sh"
     path_sep = "\\" if is_windows else "/"
 
     git_branch_info = ""
@@ -1248,30 +1200,18 @@ def build_environment_context(config: CodeAgentConfig) -> str:
                 ["git", "branch", "--show-current"],
                 cwd=str(workspace_root),
                 capture_output=True, text=True, encoding="utf-8", errors="ignore",
-                check=False
+                check=False, timeout=1.5
             )
             if result.returncode == 0 and result.stdout.strip():
-                git_branch_info = f"\n- Git Branch: {result.stdout.strip()}"
-        except (OSError, subprocess.SubprocessError) as e:
-            ASCIIColors.warning(f"Failed to detect git branch: {e}")
+                git_branch_info = f" | Git Branch: `{result.stdout.strip()}`"
+        except Exception:
+            pass
 
     return f"""
-=== ENVIRONMENT CONTEXT (CRITICAL) ===
-You are operating in the following environment:
-- Operating System: {os_name} {os_version}
-- Python Version: {python_version}
-- Shell: {shell_cmd}
-- Path Separator: `{path_sep}`{git_branch_info}
-
-### OS-SPECIFIC RULES (MANDATORY)
-1. **FILE READING**: Use `<unlock_file>` to read ANY file (text, PDF, DOCX, etc.). Do NOT use shell commands for reading.
-2. **SHELL COMMANDS**: Use shell commands only for execution (running tests, git, pip).
-   - To execute scripts: Use `python script.py` (not `python3` on Windows)
-3. **PATHS**: Always use `{path_sep}` for file paths in shell commands. ALL paths must be relative to the Workspace Root. NEVER attempt to access absolute paths outside the workspace.
-4. **TRANSIENT SCRIPTS**: When writing test scripts or temporary files, you MUST save them to the Sandbox Directory (`.lollms_code/scripts/`).
-   - Example: `python -c "with open('.lollms_code{path_sep}scripts{path_sep}test.py', 'w') as f: f.write('print(1)')"`
-   - NEVER create `.py` or `.log` files in the Workspace Root.
-5. **SANDBOX ISOLATION**: The Workspace Root contains the user's actual project. Do not modify project files unless explicitly instructed. Use the Sandbox Directory for all experimental work.
+=== ENVIRONMENT CONTEXT ===
+- OS: {os_name} | Python: {python_version} | Shell: `{shell_cmd}` | Separator: `{path_sep}`{git_branch_info}
+- Execution: Use `python script.py` to run scripts. All relative paths resolve from workspace root '.'.
+- Transient Scripts: Place temporary experiments in `.lollms_code{path_sep}scripts{path_sep}`.
 === END ENVIRONMENT CONTEXT ===
 """
 
@@ -1297,6 +1237,7 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
         enable_skill_creation=config.enable_skill_creation,
         enable_skill_loading=config.enable_skill_loading,
         enable_workspace_tools=True,
+        allow_computer_use=getattr(config, "allow_computer_use", False),
         skills_mode=config.skills_mode,
         max_sub_agent_depth=config.max_sub_agent_depth,
         max_sub_agents_per_turn=config.max_sub_agents_per_turn,
@@ -3518,6 +3459,7 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                 enable_shell=config.enable_shell_execution,
                 enable_python_exec=True,
                 enable_workspace_tools=True,
+                allow_computer_use=getattr(config, "allow_computer_use", False),
                 event_mode=EventMode.FULL_CALLBACK_MODE,
                 enforce_end_tag=True,
                 shell_autonomy_level=config.shell_autonomy_level,
@@ -3987,6 +3929,7 @@ Examples:
     parser.add_argument("--skills-dir", type=str, default=None, help="Directory for SKILL.md files.")
     parser.add_argument("--enable-model-switching", action="store_true", help="Allow the agent to switch models.")
     parser.add_argument("--no-shell-execution", action="store_true", help="Disable autonomous shell command execution.")
+    parser.add_argument("--allow-computer-use", "--enable-computer-use", dest="allow_computer_use", action="store_true", help="Allow desktop automation and computer use tools if model supports vision.")
     parser.add_argument("--shell-autonomy", type=str, default="safe", choices=["strict", "safe", "full_access"], help="Autonomy level for shell and Python execution (strict, safe, full_access).")
     parser.add_argument("--auto-approve-python", action="store_true", help="Auto-approve Python execution in safe mode without confirmation prompts.")
     parser.add_argument("--no-sub-agents", action="store_true", help="Disable sub-agent delegation.")

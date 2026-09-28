@@ -44,8 +44,17 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         self.binding_root = Path(__file__).parent
         self.server_dir = self.binding_root / "server"
 
-        self.venv_dir = self.resolve_system_path(kwargs.get("venv_path", "venv/tti_diffusers_venv"))
-        self.models_path = self.resolve_system_path(kwargs.get("models_path", "data/tti_models/diffusers"))
+        system_root = self.get_system_dir()
+        if kwargs.get("venv_path"):
+            self.venv_dir = self.resolve_system_path(kwargs["venv_path"])
+        else:
+            self.venv_dir = (system_root / "venv" / "tti_diffusers_venv").resolve()
+
+        if kwargs.get("models_path"):
+            self.models_path = self.resolve_system_path(kwargs["models_path"])
+        else:
+            self.models_path = (system_root / "data" / "tti_models" / "diffusers").resolve()
+
         self.extra_models_path = str(self.resolve_system_path(kwargs.get("extra_models_path"))) if kwargs.get("extra_models_path") else None
         self.hf_token = kwargs.get("hf_token", "")
         self.server_log_depth = int(kwargs.get("server_log_depth", 500))
@@ -80,25 +89,19 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         return headers
 
     def is_server_running(self) -> bool:
+        """Fast non-blocking loopback probe without session retry delays."""
         try:
-            response = self._session.get(
+            response = requests.get(
                 f"{self.base_url}/status",
                 headers=self._get_headers(),
-                timeout=1.5
+                timeout=0.5
             )
             if response.status_code == 200:
-                data = response.json()
-                return data.get("status") == "running"
+                data = response.json() if callable(getattr(response, "json", None)) else {}
+                return data.get("status") == "running" if isinstance(data, dict) else True
             elif response.status_code == 401:
-                if self.token_file.exists():
-                    try:
-                        self.service_key = self.token_file.read_text(encoding="utf-8").strip()
-                        retry = self._session.get(f"{self.base_url}/status", headers=self._get_headers(), timeout=1.5)
-                        return retry.status_code == 200
-                    except Exception:
-                        pass
                 return True
-        except requests.exceptions.RequestException:
+        except Exception:
             return False
         return False
 

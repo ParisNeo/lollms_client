@@ -39,6 +39,7 @@ class GuiPrefs:
     reasoning_effort: Optional[str] = None
     dynamic_effort: bool = False
     enable_shell_execution: bool = True
+    allow_computer_use: bool = False
     shell_autonomy_level: str = "safe"
     auto_approve_python: bool = False
     enable_sub_agents: bool = True

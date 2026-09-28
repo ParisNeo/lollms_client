@@ -216,6 +216,13 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                     f"and ensure you have write permissions to: {self.bin_dir}"
                 )
 
+        # ── Vision capability detection ──────────────────────────────────────
+        self.vision_enabled = False
+        if self.model_name:
+            model_p = self.models_dir / self.model_name
+            if model_p.exists():
+                self.vision_enabled = self._find_mmproj(model_p) is not None
+
         # ── Auto-load model if provided at construction time ──────────────────
         if self.model_name:
             self.load_model(self.model_name)
@@ -643,22 +650,31 @@ class LlamaCppServerBinding(LollmsLLMBinding):
 
     def bind_multimodal_model(self, model_name: str, mmproj_name: str) -> dict:
         """Explicitly associates a GGUF model with a vision projector (.mmproj).
-        
+
         If the model is currently running, the server will be automatically 
         restarted to apply the new projector configuration.
         """
+        if not model_name or not str(model_name).strip():
+            return {"status": False, "error": "Model name is required. Please select or specify a valid model filename."}
+        if not mmproj_name or not str(mmproj_name).strip():
+            return {"status": False, "error": "Vision projector (mmproj) name is required. Please select or specify a valid mmproj filename."}
+
+        model_name = Path(str(model_name).strip()).name
+        mmproj_name = Path(str(mmproj_name).strip()).name
+
         # Validate files
         model_path = self.models_dir / model_name
         mmproj_path = self.models_dir / mmproj_name
-        
+
         if not model_path.exists():
-            return {"status": False, "error": f"Model '{model_name}' not found."}
+            return {"status": False, "error": f"Model '{model_name}' not found in {self.models_dir}."}
         if not mmproj_path.exists():
-            return {"status": False, "error": f"Projector '{mmproj_name}' not found."}
+            return {"status": False, "error": f"Projector '{mmproj_name}' not found in {self.models_dir}."}
             
         registry = self._load_mm_registry()
         registry[model_name] = mmproj_name
         self._save_mm_registry(registry)
+        self.vision_enabled = True
         ASCIIColors.success(f"Bound '{model_name}' ↔ '{mmproj_name}'")
 
         # Check if the model is currently running and restart it
@@ -1004,7 +1020,9 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                 )
                 self.model_name = model_name
                 self._last_error = None
-                ASCIIColors.success(f"Model '{model_name}' loaded on port {port}.")
+                model_p = self.models_dir / model_name
+                self.vision_enabled = self._find_mmproj(model_p) is not None
+                ASCIIColors.success(f"Model '{model_name}' loaded on port {port} (vision: {self.vision_enabled}).")
                 return True
         except Exception as e:
             self._last_error = str(e)
@@ -1615,6 +1633,31 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                 return "\n".join(line.rstrip() for line in tail_lines)
         except Exception as e:
             return f"Failed to read server logs: {e}"
+
+    def list_mmproj_models(self) -> List[Dict[str, Any]]:
+        """
+        Lists all multimodal vision projector files (.mmproj, mmproj-*.gguf) found in models_dir.
+        """
+        projectors = []
+        if not self.models_dir.exists():
+            return projectors
+
+        candidates = set()
+        for f in self.models_dir.glob("*"):
+            if not f.is_file():
+                continue
+            name_lower = f.name.lower()
+            if "mmproj" in name_lower and (name_lower.endswith(".gguf") or name_lower.endswith(".mmproj") or name_lower.endswith(".bin")):
+                candidates.add(f)
+
+        for f in sorted(candidates, key=lambda p: p.name.lower()):
+            projectors.append({
+                "model_name": f.name,
+                "name": f.name,
+                "size": f.stat().st_size,
+                "created": time.ctime(f.stat().st_ctime),
+            })
+        return projectors
 
     def list_models(self) -> List[Dict[str, Any]]:
         """

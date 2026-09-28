@@ -48,13 +48,14 @@ except ImportError:
         from lollms_code_cli import CODING_SYSTEM_PROMPT, CODING_EXECUTION_HARNESS  # type: ignore
     except ImportError:
         CODING_SYSTEM_PROMPT = (
-            "You are lollms_code, an elite autonomous engineering agent capable of full-stack coding, "
-            "file organization, document analysis, research, and deep web searching.\n\n"
-            "## SKILL-FIRST DISPATCH MANDATE (CRITICAL)\n"
-            "Before undertaking any task, check available skills and any RECOMMENDED SKILL block.\n"
-            "If a skill matches the user's request (e.g. file_organization for organizing/cleaning folders):\n"
-            "- You MUST call <tool>{\"name\": \"tool_load_skill\", \"parameters\": {\"title\": \"<skill_title>\"}}</tool> in Round 1!\n"
-            "- DO NOT improvise ad-hoc plans or guess workflows when a specialized skill exists. Load the skill first!\n"
+            "You are lollms_code, an elite autonomous software engineering agent.\n\n"
+            "## CORE OPERATIONAL DIRECTIVES\n"
+            "1. **SAME-RESPONSE ACTION EXECUTION**: Prose does NOT execute tools or modify files. Emit functional tags (`<tool>`, `<artifact>`, `<unlock_file>`) in the exact same response immediately.\n"
+            "2. **SKILL-FIRST MANDATE**: When a task matches an available skill (e.g. `file_organization`), call `tool_load_skill` in Round 1 before taking ad-hoc steps.\n"
+            "3. **PASSIVE MEMORY BOUNDARY**: Memories provide background context and user preferences only. On casual greetings, reply conversationally first, then emit `<done/>`.\n"
+            "4. **WORKSPACE FILES**: Use `<unlock_file>` to load files into context [C], and `<lock_file>` to unload when finished.\n"
+            "5. **ARTIFACTS & PATCHES**: Create files with `<artifact name=\"...\" type=\"code\">...code...</artifact>`. For updates, use Aider SEARCH/REPLACE patches.\n"
+            "6. **COMPLETION CONTRACT**: Conclude all completed tasks with `<done/>` on a new line.\n"
         )
         CODING_EXECUTION_HARNESS = ""
 
@@ -72,11 +73,9 @@ class AgentEvent:
 def build_environment_context(workspace_path: str) -> str:
     is_windows = platform.system() == "Windows"
     os_name = platform.system()
-    os_version = platform.version()
     python_version = platform.python_version()
     workspace_root = Path(workspace_path).resolve()
-
-    shell_cmd = "cmd.exe (Windows Command Prompt, NOT PowerShell or bash)" if is_windows else "bash/sh"
+    shell_cmd = "cmd.exe" if is_windows else "bash/sh"
     path_sep = "\\" if is_windows else "/"
 
     git_branch_info = ""
@@ -87,30 +86,18 @@ def build_environment_context(workspace_path: str) -> str:
             result = subprocess.run(
                 ["git", "branch", "--show-current"],
                 cwd=str(workspace_root), capture_output=True, text=True,
-                encoding="utf-8", errors="ignore",
+                encoding="utf-8", errors="ignore", timeout=1.5
             )
             if result.returncode == 0 and result.stdout.strip():
-                git_branch_info = f"\n- Git Branch: {result.stdout.strip()}"
+                git_branch_info = f" | Git Branch: `{result.stdout.strip()}`"
         except Exception:
             pass
 
     return f"""
-=== ENVIRONMENT CONTEXT (CRITICAL) ===
-You are operating in the following environment:
-- Operating System: {os_name} {os_version}
-- Python Version: {python_version}
-- Shell: {shell_cmd}
-- Path Separator: `{path_sep}`{git_branch_info}
-
-### OS-SPECIFIC RULES (MANDATORY)
-1. **FILE READING**: Use `<unlock_file>` to read ANY file (text, PDF, DOCX, etc.). Do NOT use shell commands for reading.
-2. **SHELL COMMANDS**: Use shell commands only for execution (running tests, git, pip).
-   - To execute scripts: Use `python script.py` (not `python3` on Windows)
-3. **PATHS**: Always use `{path_sep}` for file paths in shell commands. ALL paths must be relative to the Workspace Root. NEVER attempt to access absolute paths outside the workspace.
-4. **TRANSIENT SCRIPTS**: When writing test scripts or temporary files, you MUST save them to the Sandbox Directory (`.lollms_code/scripts/`).
-   - Example: `python -c "with open('.lollms_code{path_sep}scripts{path_sep}test.py', 'w') as f: f.write('print(1)')"`
-   - NEVER create `.py` or `.log` files in the Workspace Root.
-5. **SANDBOX ISOLATION**: The Workspace Root contains the user's actual project. Do not modify project files unless explicitly instructed. Use the Sandbox Directory for all experimental work.
+=== ENVIRONMENT CONTEXT ===
+- OS: {os_name} | Python: {python_version} | Shell: `{shell_cmd}` | Separator: `{path_sep}`{git_branch_info}
+- Execution: Use `python script.py` to run scripts. All relative paths resolve from workspace root '.'.
+- Transient Scripts: Place temporary experiments in `.lollms_code{path_sep}scripts{path_sep}`.
 === END ENVIRONMENT CONTEXT ===
 """
 
@@ -252,8 +239,9 @@ def create_client(env: EnvStore, prefs: GuiPrefs):
         "debug": prefs.debug,
     }
 
-    # ── Other Modalities (TTI, TTS, STT, TTV, TTM, CONNECTION, RAG) using unified profiles ──
-    for modality in ("tti", "tts", "stt", "ttm", "ttv", "connection", "rag"):
+    # ── Other Modalities (TTI, TTS, STT, CONNECTION, RAG) using unified profiles ──
+    # Exclude media synthesis modalities (TTM/TTV) to prevent unwanted background daemon spawns on workspace load
+    for modality in ("tti", "tts", "stt", "connection", "rag"):
         b_profs = env.get_binding_profiles(modality)
         m_profs = env.get_model_profiles(modality)
         if b_profs and m_profs:
@@ -289,6 +277,7 @@ def create_personality(prefs: GuiPrefs, client):
         enable_skill_creation=prefs.enable_skill_creation,
         enable_skill_loading=prefs.enable_skill_loading,
         enable_workspace_tools=True,
+        allow_computer_use=getattr(prefs, "allow_computer_use", False) or getattr(prefs, "enable_computer_use", False),
         skills_mode=prefs.skills_mode,
         max_sub_agent_depth=prefs.max_sub_agent_depth,
         max_sub_agents_per_turn=prefs.max_sub_agents_per_turn,
@@ -437,36 +426,41 @@ def get_context_preview(*args, **kwargs) -> Dict[str, Any]:
     client = None
     prefs = None
     prompt_text = ""
+    session_obj = None
 
     if len(args) == 4:
         personality, client, prefs, prompt_text = args
     elif len(args) == 3:
         if hasattr(args[0], "ensure_ready") or hasattr(args[0], "personality"):
-            session, prefs, prompt_text = args
-            session.ensure_ready()
-            personality = session.personality
-            client = session.client
+            session_obj = args[0]
+            session_obj.ensure_ready()
+            personality = session_obj.personality
+            client = session_obj.client
+            prefs = args[1]
+            prompt_text = args[2]
         else:
             personality, client, prefs = args
             prompt_text = kwargs.get("prompt_text", "")
     elif len(args) == 2:
         if hasattr(args[0], "ensure_ready") or hasattr(args[0], "personality"):
-            session, prefs = args
-            session.ensure_ready()
-            personality = session.personality
-            client = session.client
+            session_obj = args[0]
+            session_obj.ensure_ready()
+            personality = session_obj.personality
+            client = session_obj.client
+            prefs = args[1]
         else:
             personality, client = args
             prefs = kwargs.get("prefs")
     elif len(args) == 1:
-        session = args[0]
-        if hasattr(session, "ensure_ready"):
-            session.ensure_ready()
-            personality = session.personality
-            client = session.client
-            prefs = getattr(session, "prefs", None)
+        session_candidate = args[0]
+        if hasattr(session_candidate, "ensure_ready"):
+            session_obj = session_candidate
+            session_obj.ensure_ready()
+            personality = session_obj.personality
+            client = session_obj.client
+            prefs = getattr(session_obj, "prefs", None)
         else:
-            personality = session
+            personality = session_candidate
 
     if personality is None and "personality" in kwargs:
         personality = kwargs["personality"]
@@ -563,9 +557,19 @@ def get_context_preview(*args, **kwargs) -> Dict[str, Any]:
     if dynamic_suffix:
         stable_system_prompt += "\n\n" + dynamic_suffix
 
-    base_conversation = list(personality._conversation)
-    if prompt_text.strip():
-        base_conversation.append({"role": "user", "content": prompt_text.strip()})
+    base_conversation = list(personality._conversation) if personality and hasattr(personality, "_conversation") else []
+    if not base_conversation and session_obj and hasattr(session_obj, "reconstruct_conversation_from_debug_log"):
+        reconstructed = session_obj.reconstruct_conversation_from_debug_log()
+        if reconstructed:
+            if personality:
+                personality._conversation = reconstructed
+            base_conversation = list(reconstructed)
+
+    effective_prompt = prompt_text.strip() if prompt_text else ""
+    if effective_prompt:
+        base_conversation.append({"role": "user", "content": effective_prompt})
+    elif not base_conversation or base_conversation[-1].get("role") != "user":
+        base_conversation.append({"role": "user", "content": "(Awaiting user prompt in input box...)"})
 
     from lollms_client.lollms_personality.lollms_personality import _HistoryContextAdapter, _normalize_messages
     from lollms_client.lollms_history import HistoryManager
@@ -604,9 +608,7 @@ def get_context_preview(*args, **kwargs) -> Dict[str, Any]:
     )
 
     # Build complete verbatim assembled context as rendered for the LLM
-    assembled_parts = [
-        f"==================== SYSTEM PROMPT ====================\n{stable_system_prompt}\n",
-    ]
+    assembled_parts = []
     for idx, msg in enumerate(messages):
         r = msg.get("role", "user").upper()
         c = msg.get("content", "")
@@ -1295,6 +1297,7 @@ def run_agent_turn_in_thread(
                 enable_shell=getattr(prefs, "enable_shell_execution", True),
                 enable_python_exec=True,
                 enable_workspace_tools=True,
+                allow_computer_use=getattr(prefs, "allow_computer_use", False) or getattr(prefs, "enable_computer_use", False),
                 enforce_end_tag=True,
                 event_mode=EventMode.FULL_CALLBACK_MODE,
                 shell_autonomy_level=getattr(prefs, "shell_autonomy_level", "safe"),

@@ -83,8 +83,17 @@ class DiffusersTTMBinding(LollmsTTMBinding):
         self.binding_root = Path(__file__).parent
         self.server_dir = self.binding_root / "server"
 
-        self.venv_dir = self.resolve_system_path(kwargs.get("venv_path", "venv/ttm_diffusers_venv"))
-        self.cache_dir = self.resolve_system_path(kwargs.get("cache_dir", "data/ttm_models/diffusers"))
+        system_root = self.get_system_dir()
+        if kwargs.get("venv_path"):
+            self.venv_dir = self.resolve_system_path(kwargs["venv_path"])
+        else:
+            self.venv_dir = (system_root / "venv" / "ttm_diffusers_venv").resolve()
+
+        if kwargs.get("cache_dir"):
+            self.cache_dir = self.resolve_system_path(kwargs["cache_dir"])
+        else:
+            self.cache_dir = (system_root / "data" / "ttm_models" / "diffusers").resolve()
+
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.token_file = self.cache_dir / "diffusers_ttm.token"
 
@@ -111,25 +120,19 @@ class DiffusersTTMBinding(LollmsTTMBinding):
         return headers
 
     def is_server_running(self) -> bool:
+        """Fast non-blocking loopback probe without session retry delays."""
         try:
-            resp = self._session.get(
+            resp = requests.get(
                 f"{self.base_url}/status",
                 headers=self._get_headers(),
-                timeout=1.5
+                timeout=0.5
             )
             if resp.status_code == 200:
-                data = resp.json()
-                return data.get("status") == "running"
+                data = resp.json() if callable(getattr(resp, "json", None)) else {}
+                return data.get("status") == "running" if isinstance(data, dict) else True
             elif resp.status_code == 401:
-                if self.token_file.exists():
-                    try:
-                        self.service_key = self.token_file.read_text(encoding="utf-8").strip()
-                        retry = self._session.get(f"{self.base_url}/status", headers=self._get_headers(), timeout=1.5)
-                        return retry.status_code == 200
-                    except Exception:
-                        pass
                 return True
-        except requests.exceptions.RequestException:
+        except Exception:
             return False
         return False
 

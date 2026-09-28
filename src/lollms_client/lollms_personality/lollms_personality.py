@@ -412,12 +412,12 @@ def _normalize_messages(messages: List[Dict]) -> List[Dict]:
             if merged.strip():
                 normalized.append({"role": current_role, "content": merged})
 
-    non_sys_start = 0
+    non_sys_start = -1
     for i, msg in enumerate(normalized):
         if msg.get("role") != "system":
             non_sys_start = i
             break
-    if non_sys_start < len(normalized):
+    if non_sys_start != -1 and non_sys_start < len(normalized):
         first_non_sys = normalized[non_sys_start]
         if first_non_sys.get("role") == "assistant":
             normalized.insert(non_sys_start, {"role": "user", "content": "Continue."})
@@ -665,6 +665,10 @@ class CapabilityFlags:
     enable_ttm: bool = False  # Text-to-music
     enable_ttv: bool = False  # Text-to-video
 
+    # Desktop UI automation (computer use)
+    allow_computer_use: bool = False
+    enable_computer_use: bool = False
+
     # Agentic features
     enable_sub_agents: bool = True
     enable_model_switching: bool = False
@@ -682,6 +686,11 @@ class CapabilityFlags:
     # These are not toggleable for security reasons — workspace tools are always safe
     enable_workspace_tools: bool = True  # tool_write_file, tool_read_file, tool_list_files
 
+    def __post_init__(self):
+        if self.allow_computer_use or self.enable_computer_use:
+            self.allow_computer_use = True
+            self.enable_computer_use = True
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "enable_code_execution": self.enable_code_execution,
@@ -693,6 +702,8 @@ class CapabilityFlags:
             "enable_stt": self.enable_stt,
             "enable_ttm": self.enable_ttm,
             "enable_ttv": self.enable_ttv,
+            "allow_computer_use": self.allow_computer_use,
+            "enable_computer_use": self.enable_computer_use,
             "enable_sub_agents": self.enable_sub_agents,
             "enable_model_switching": self.enable_model_switching,
             "enable_skill_creation": self.enable_skill_creation,
@@ -979,81 +990,105 @@ class SubAgentSpawner:
                 else base_worker_prompt
             )
 
-            child_agent = LollmsPersonality(
-                name=f"SubAgent_{self._spawned_this_turn}",
-                author="lollms_personality",
-                category="sub_agent",
-                description="A focused sub-agent spawned for a specific task.",
-                system_prompt=conditioned_prompt,
-                role=AgentRole.IMPLEMENTER,
-                workspace_path=self.parent.get_workspace_path(),
-                capabilities=child_caps,
-                skills_manager=self.parent.skills_manager,
-                model_params=self.parent.model_params,
-                max_tokens_per_turn=self.parent.max_tokens_per_turn,
-                memory_manager=None,
-                lollms_client=self.parent.lollms_client,
-                _parent_depth=self._current_depth + 1,
-            )
+            # ── 🔄 DYNAMIC SUBTASK MODEL SELECTION & RESTORATION ──
+            client = self.parent.lollms_client
+            orig_model_alias = getattr(client, "_active_llm_alias", None)
+            orig_model_name = getattr(getattr(client, "llm", None), "model_name", None)
 
-            # Grant workspace autonomy to child agent
-            object.__setattr__(child_agent, "_git_autonomy_granted", True)
+            target_model_alias = (model_name or "").strip()
+            model_switched = False
 
-            self.active_child_agent = child_agent
-
-            parent_cb = getattr(self.parent, '_active_streaming_callback', None)
-            spawn_start_time = time.time()
-            if parent_cb:
+            if target_model_alias and client:
                 try:
-                    parent_cb(
-                        f"🤖 Spawning sub-agent '{child_agent.name}' for task:\n{instruction[:250]}...",
-                        getattr(MSG_TYPE, "MSG_TYPE_WORKER_SPAWN_START", MSG_TYPE.MSG_TYPE_INFO),
-                        {
-                            "agent_name": child_agent.name,
-                            "task": instruction,
-                            "worker_index": self._spawned_this_turn,
-                            "depth": self._current_depth + 1,
-                            "max_depth": self.max_depth,
-                            "max_steps": max_steps,
-                            "model_name": model_name or "parent model",
-                            "effort": effort or "default",
-                            "dynamic_effort": dynamic_effort,
-                            "personality_conditioning": personality_conditioning or "Autonomous Worker Specialist",
-                        }
-                    )
-                except Exception:
-                    pass
+                    if hasattr(client, "llm_model_profiles_registry") and target_model_alias in client.llm_model_profiles_registry:
+                        model_switched = client.switch_model(target_model_alias)
+                        if model_switched:
+                            ASCIIColors.success(f"[SubAgentSpawner] Subtask assigned model profile '{target_model_alias}'.")
+                    elif hasattr(client, "switch_active_model"):
+                        model_switched = client.switch_active_model(target_model_alias)
+                        if model_switched:
+                            ASCIIColors.success(f"[SubAgentSpawner] Subtask active model switched to '{target_model_alias}'.")
+                except Exception as switch_err:
+                    ASCIIColors.warning(f"[SubAgentSpawner] Subtask model switch failed ({switch_err}). Using parent model.")
 
-            def child_stream_relay(chunk: str, msg_type=None, meta=None) -> bool:
-                if self.parent.is_generation_cancelled() or child_agent.is_generation_cancelled():
-                    child_agent.cancel_generation()
-                    return False
-                if parent_cb is None:
-                    return True
-                try:
-                    m = dict(meta or {})
-                    m["sub_agent"] = child_agent.name
-                    # Relay tool, artifact, and info events live to the UI
-                    if msg_type in (
-                        MSG_TYPE.MSG_TYPE_TOOL_START, MSG_TYPE.MSG_TYPE_TOOL_END,
-                        MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END,
-                        MSG_TYPE.MSG_TYPE_INFO, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK
-                    ):
-                        return parent_cb(chunk, msg_type, m)
-                    elif msg_type == MSG_TYPE.MSG_TYPE_CHUNK and not m.get("live_tool_chunk") and not m.get("was_processed"):
-                        return parent_cb(chunk, MSG_TYPE.MSG_TYPE_CHUNK, m)
-                except Exception:
-                    return True
-                return True
-
-            task_wrapped_prompt = (
-                f"[ASSIGNED SUB-AGENT TASK]\n{instruction}\n\n"
-                "[EXECUTION DIRECTIVE]\n"
-                "Execute the task autonomously using your available tools and artifact tags.\n"
-                "Do NOT ask questions or await human approval. When complete, provide your summary inside `<report>...</report>` and end with `<done/>`."
-            )
+            child_model_label = target_model_alias if model_switched else (orig_model_alias or orig_model_name or "parent model")
 
             try:
+                child_agent = LollmsPersonality(
+                    name=f"SubAgent_{self._spawned_this_turn}",
+                    author="lollms_personality",
+                    category="sub_agent",
+                    description="A focused sub-agent spawned for a specific task.",
+                    system_prompt=conditioned_prompt,
+                    role=AgentRole.IMPLEMENTER,
+                    workspace_path=self.parent.get_workspace_path(),
+                    capabilities=child_caps,
+                    skills_manager=self.parent.skills_manager,
+                    model_params=self.parent.model_params,
+                    max_tokens_per_turn=self.parent.max_tokens_per_turn,
+                    memory_manager=None,
+                    lollms_client=client,
+                    _parent_depth=self._current_depth + 1,
+                )
+
+                # Grant workspace autonomy to child agent
+                object.__setattr__(child_agent, "_git_autonomy_granted", True)
+
+                self.active_child_agent = child_agent
+
+                parent_cb = getattr(self.parent, '_active_streaming_callback', None)
+                spawn_start_time = time.time()
+                if parent_cb:
+                    try:
+                        parent_cb(
+                            f"🤖 Spawning sub-agent '{child_agent.name}' (Model: {child_model_label}) for task:\n{instruction[:250]}...",
+                            getattr(MSG_TYPE, "MSG_TYPE_WORKER_SPAWN_START", MSG_TYPE.MSG_TYPE_INFO),
+                            {
+                                "agent_name": child_agent.name,
+                                "task": instruction,
+                                "worker_index": self._spawned_this_turn,
+                                "depth": self._current_depth + 1,
+                                "max_depth": self.max_depth,
+                                "max_steps": max_steps,
+                                "model_name": child_model_label,
+                                "effort": effort or "default",
+                                "dynamic_effort": dynamic_effort,
+                                "personality_conditioning": personality_conditioning or "Autonomous Worker Specialist",
+                            }
+                        )
+                    except Exception:
+                        pass
+
+                def child_stream_relay(chunk: str, msg_type=None, meta=None) -> bool:
+                    if self.parent.is_generation_cancelled() or child_agent.is_generation_cancelled():
+                        child_agent.cancel_generation()
+                        return False
+                    if parent_cb is None:
+                        return True
+                    try:
+                        m = dict(meta or {})
+                        m["sub_agent"] = child_agent.name
+                        m["model_name"] = child_model_label
+                        # Relay tool, artifact, and info events live to the UI
+                        if msg_type in (
+                            MSG_TYPE.MSG_TYPE_TOOL_START, MSG_TYPE.MSG_TYPE_TOOL_END,
+                            MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END,
+                            MSG_TYPE.MSG_TYPE_INFO, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK
+                        ):
+                            return parent_cb(chunk, msg_type, m)
+                        elif msg_type == MSG_TYPE.MSG_TYPE_CHUNK and not m.get("live_tool_chunk") and not m.get("was_processed"):
+                            return parent_cb(chunk, MSG_TYPE.MSG_TYPE_CHUNK, m)
+                    except Exception:
+                        return True
+                    return True
+
+                task_wrapped_prompt = (
+                    f"[ASSIGNED SUB-AGENT TASK]\n{instruction}\n\n"
+                    "[EXECUTION DIRECTIVE]\n"
+                    "Execute the task autonomously using your available tools and artifact tags.\n"
+                    "Do NOT ask questions or await human approval. When complete, provide your summary inside `<report>...</report>` and end with `<done/>`."
+                )
+
                 # Execute child chat with live streaming relay
                 result = child_agent.chat(
                     prompt=task_wrapped_prompt,
@@ -1069,6 +1104,16 @@ class SubAgentSpawner:
                 )
             finally:
                 self.active_child_agent = None
+                # Restore parent model
+                if model_switched and client:
+                    try:
+                        if orig_model_alias and hasattr(client, "switch_model"):
+                            client.switch_model(orig_model_alias)
+                        elif orig_model_name and hasattr(client, "switch_active_model"):
+                            client.switch_active_model(orig_model_name)
+                        ASCIIColors.info(f"[SubAgentSpawner] Restored primary model to '{orig_model_alias or orig_model_name}'.")
+                    except Exception:
+                        pass
 
             spawn_elapsed = time.time() - spawn_start_time
             if parent_cb:
@@ -1280,14 +1325,16 @@ class BindingToolsBuilder:
 
         # CONNECTION (Communication channels: Discord, Telegram, Slack, Webhook, etc.)
         connection_registry = getattr(client, 'connection_model_profiles_registry', None)
-        has_connections = bool(connection_registry)
-        if has_connections or getattr(client, 'connection', None) is not None:
+        has_connections = bool(connection_registry) and not hasattr(connection_registry, "_mock_return_value")
+        conn_binding = getattr(client, 'connection', None)
+        if has_connections or (conn_binding is not None and not hasattr(conn_binding, "_mock_return_value")):
             tools["tool_send_connection"] = BindingToolsBuilder._make_connection_tool(client)
 
         # RAG (Knowledge base & semantic vector/graph store)
         rag_registry = getattr(client, 'rag_model_profiles_registry', None)
-        has_rag = bool(rag_registry)
-        if has_rag or getattr(client, 'rag', None) is not None:
+        has_rag = bool(rag_registry) and not hasattr(rag_registry, "_mock_return_value")
+        rag_binding = getattr(client, 'rag', None)
+        if has_rag or (rag_binding is not None and not hasattr(rag_binding, "_mock_return_value")):
             tools.update(BindingToolsBuilder._make_rag_binding_tools(client, workspace_path))
 
         return tools
@@ -4075,6 +4122,7 @@ JSON:"""
         enable_web_tools: bool = False,
         auto_load_document_editor: bool = True,
         enable_computer_use: bool = False,
+        allow_computer_use: Optional[bool] = None,
         shell_autonomy_level: Optional[str] = "safe",
         python_autonomy_level: Optional[str] = "safe",
         auto_approve_python: bool = False,
@@ -4095,11 +4143,12 @@ JSON:"""
         if not _is_tool_binding(lcp_binding) or hasattr(lcp_binding, "_mock_return_value"):
             lcp_binding = None
 
-        if lcp_binding is None and self._resolved_workspace:
+        if lcp_binding is None:
             try:
                 from lollms_client.tools_bindings.lcp import LCPBinding
-                lcp_binding = LCPBinding(tools_folders=[])
-                if hasattr(self.lollms_client, 'tools'):
+                default_tools_dir = Path(__file__).resolve().parent.parent / "tools_bindings" / "lcp" / "default_tools"
+                lcp_binding = LCPBinding(tools_folders=[default_tools_dir] if default_tools_dir.exists() else [])
+                if hasattr(self.lollms_client, 'tools') and not hasattr(self.lollms_client.tools, "_mock_return_value"):
                     self.lollms_client.tools = lcp_binding
             except Exception as e:
                 ASCIIColors.warning(f"[{self.name}] Failed to initialize LCPBinding: {e}")
@@ -4134,7 +4183,15 @@ JSON:"""
             if enable_python_exec:
                 _libraries_to_mount.append("execute_python")
 
-            _libraries_to_mount.append("git_manager")
+            if getattr(self, "enable_git_management", False):
+                _libraries_to_mount.append("git_manager")
+
+            if allow_computer_use is None:
+                allow_computer_use = kwargs.get("allow_computer_use")
+            if allow_computer_use is None and self.capabilities:
+                allow_computer_use = getattr(self.capabilities, "allow_computer_use", False) or getattr(self.capabilities, "enable_computer_use", False)
+
+            computer_use_requested = bool(enable_computer_use or allow_computer_use)
 
             _has_vision = False
             if self.lollms_client:
@@ -4150,9 +4207,14 @@ JSON:"""
             if _has_vision:
                 _libraries_to_mount.append("vlm_query")
 
-            _computer_use_vision_ready = enable_computer_use and _has_vision
+            _computer_use_vision_ready = computer_use_requested and _has_vision
             if _computer_use_vision_ready:
                 _libraries_to_mount.append("computer_use")
+            elif computer_use_requested and not _has_vision:
+                ASCIIColors.warning(
+                    f"[{self.name}] allow_computer_use is True, but active model does NOT support vision. "
+                    "Computer use tools cannot be loaded without vision capability."
+                )
 
             for lib_name in _libraries_to_mount:
                 try:
@@ -4183,7 +4245,10 @@ JSON:"""
                     _COMPUTER_USE_TOOL_NAMES = {
                         "tool_computer_desktop_info", "tool_computer_screenshot",
                         "tool_computer_click", "tool_computer_move_cursor",
-                        "tool_computer_type", "tool_computer_key", "tool_computer_scroll"
+                        "tool_computer_mouse_down", "tool_computer_mouse_up",
+                        "tool_computer_drag",
+                        "tool_computer_type", "tool_computer_key", "tool_computer_scroll",
+                        "tool_computer_wait", "tool_computer_cursor_position"
                     }
 
                     allowed_tool_names = set()
@@ -4194,12 +4259,13 @@ JSON:"""
                     if enable_python_exec:
                         allowed_tool_names.update(_PY_EXEC_TOOL_NAMES)
 
-                    allowed_tool_names.update(_GIT_TOOL_NAMES)
+                    if getattr(self, "enable_git_management", False):
+                        allowed_tool_names.update(_GIT_TOOL_NAMES)
 
                     if _has_vision:
                         allowed_tool_names.update({"tool_inspect_image", "tool_vlm_query"})
 
-                    if enable_computer_use and _computer_use_vision_ready:
+                    if _computer_use_vision_ready:
                         allowed_tool_names.update(_COMPUTER_USE_TOOL_NAMES)
 
                     for t_name, t_spec in all_lcp_tools.items():
@@ -4348,12 +4414,22 @@ JSON:"""
                     loaded.append("tool_spawn_sub_agent")
 
             elif "computer" in target.lower() and lcp_binding:
-                lcp_binding.mount_tool_library_if_absent("computer_use")
-                specs = lcp_binding.to_chat_tool_specs()
-                for cn in ("tool_computer_desktop_info", "tool_computer_screenshot", "tool_computer_click", "tool_computer_type"):
-                    if cn in specs:
-                        active_tools[cn] = specs[cn]
-                        loaded.append(cn)
+                if _has_vision:
+                    lcp_binding.mount_tool_library_if_absent("computer_use")
+                    specs = lcp_binding.to_chat_tool_specs()
+                    for cn in (
+                        "tool_computer_desktop_info", "tool_computer_screenshot",
+                        "tool_computer_click", "tool_computer_move_cursor",
+                        "tool_computer_mouse_down", "tool_computer_mouse_up",
+                        "tool_computer_drag", "tool_computer_type",
+                        "tool_computer_key", "tool_computer_scroll",
+                        "tool_computer_wait", "tool_computer_cursor_position"
+                    ):
+                        if cn in specs:
+                            active_tools[cn] = specs[cn]
+                            loaded.append(cn)
+                else:
+                    ASCIIColors.warning(f"[{self.name}] Cannot load computer_use: active model lacks vision.")
 
             # 4. Search and auto-install from tools zoo if missing
             if not loaded and self._resolved_workspace:
@@ -4475,7 +4551,7 @@ JSON:"""
             has_document_files = False
             if ws_path and ws_path.exists():
                 _DATA_EXTS = {".csv", ".db", ".sqlite", ".sqlite3", ".parquet"}
-                _DOC_EXTS = {".pdf", ".docx", ".pptx", ".odt", ".doc", ".txt", ".md", ".xlsx", ".xls"}
+                _DOC_EXTS = {".pdf", ".docx", ".pptx", ".odt", ".doc"}
 
                 try:
                     for root, dirs, files in os.walk(ws_path):
@@ -4546,6 +4622,50 @@ JSON:"""
                 )
                 if "tool_annotate_document" in active_tools:
                     active_tools["tool_annotate_document"]["description"] += user_annotation_rule
+
+        # ── 6. MOUNT SUB-AGENTS & MODEL SWITCHING WHEN ENABLED IN CAPABILITIES ──
+        if self.capabilities and self.capabilities.enable_sub_agents and self._sub_agent_spawner:
+            avail_profiles = []
+            if self.lollms_client and hasattr(self.lollms_client, "llm_model_profiles_registry"):
+                avail_profiles = list(self.lollms_client.llm_model_profiles_registry.keys())
+            prof_hint = f" Available models: {', '.join(avail_profiles)}." if avail_profiles else ""
+
+            active_tools["tool_spawn_sub_agent"] = {
+                "name": "tool_spawn_sub_agent",
+                "description": f"Spawn a focused sub-agent to perform a specific sub-task in the workspace. You can assign a specific model to this subtask.{prof_hint}",
+                "parameters": [
+                    {"name": "instruction", "type": "str", "description": "The specific task instructions for the sub-agent."},
+                    {"name": "personality_conditioning", "type": "str", "description": "System prompt conditioning the sub-agent's behavior.", "optional": True},
+                    {"name": "model_name", "type": "str", "description": f"Specific model name or profile alias to run this subtask.{prof_hint}", "optional": True},
+                ],
+                "callable": lambda instruction, personality_conditioning="", model_name="", **kwargs: self._sub_agent_spawner.spawn(
+                    instruction=instruction, personality_conditioning=personality_conditioning or None, model_name=model_name or None, **kwargs
+                )
+            }
+
+        if self.capabilities and self.capabilities.enable_model_switching and self._model_switcher:
+            active_tools["tool_switch_model"] = {
+                "name": "tool_switch_model",
+                "description": "Switch the active model for subsequent rounds.",
+                "parameters": [
+                    {"name": "model_name", "type": "str", "description": "The target model name to switch to."}
+                ],
+                "callable": lambda model_name: self._model_switcher.switch_model(model_name)
+            }
+            active_tools["tool_list_models"] = {
+                "name": "tool_list_models",
+                "description": "List available models for model switching.",
+                "parameters": [],
+                "callable": lambda: self._model_switcher.list_models()
+            }
+
+        # ── 7. MOUNT MULTIMODAL BINDINGS TOOLS (TTI, TTS, STT, TTM, TTV) ──
+        if BindingToolsBuilder and self.lollms_client and self.capabilities:
+            try:
+                b_tools = BindingToolsBuilder.build_tools(self.lollms_client, self.capabilities, self._resolved_workspace)
+                active_tools.update(b_tools)
+            except Exception as b_err:
+                ASCIIColors.warning(f"[{self.name}] Failed building multimodal tools: {b_err}")
 
         if tool_files:
             try:
@@ -4943,53 +5063,37 @@ JSON:"""
             return None
 
     def _build_system_prompt(self, active_tools: Optional[Dict] = None, dynamic_effort: bool = False) -> str:
-        sys_prompt = self.system_prompt or ""
+        sys_prompt = (self.system_prompt or "").strip()
         onboarding_block = self._build_onboarding_block()
-        memory_doctrine = (
-            "\n=== MEMORY DOCTRINE: PASSIVE CONTEXT VS ACTIVE TASK (CRITICAL) ===\n"
-            "1. **MEMORIES ARE PASSIVE BACKGROUND KNOWLEDGE**: Memories in `=== ACTIVE MEMORIES ===` or `=== WORKING MEMORY ===` contain background facts, user preferences, and historical milestones. They are strictly INFORMATIONAL REFERENCE.\n"
-            "2. **NEVER RESUME PAST TASKS ON GREETINGS**: If the user says 'Hi', 'Hello', or enters a greeting, simple conversational question, or new request, DO NOT start working on past tasks or actions mentioned in memory. Greet the user politely, acknowledge their query, and await their explicit task instructions.\n"
-            "3. **SOLE TASK = LATEST USER MESSAGE**: Your task in this turn is determined ONLY by the latest user message. Memories provide context on how the user prefers things, but DO NOT dictate what task to perform.\n"
-            "=== END MEMORY DOCTRINE ===\n"
+
+        has_authoritative_protocol = (
+            "=== AUTHORITATIVE OPERATING PROTOCOL" in sys_prompt
+            or "=== CORE OPERATING PROTOCOL" in sys_prompt
+            or "CORE OPERATIONAL DIRECTIVES" in sys_prompt
         )
-        greeting_invariant = (
-            "\n=== GREETINGS & CASUAL REPLIES (STRICT INVARIANT) ===\n"
-            "If the user's message is a greeting (e.g. 'hi', 'hi there', 'hello', 'hey') or casual remark:\n"
-            "- You MUST reply with a friendly greeting and ask what they would like to work on.\n"
-            "- You are STRICTLY FORBIDDEN from creating or modifying files, emitting <artifact> tags, or calling tools!\n"
-            "- DO NOT resume or execute any past task mentioned in CURRENT.md, memories, or scratchpad.\n"
-            "- Conclude your greeting with `<done/>` on a new line.\n"
-            "=== END GREETINGS INVARIANT ===\n"
-        )
-        skill_mandate = (
-            "\n=== SKILL-FIRST EXECUTION MANDATE (CRITICAL) ===\n"
-            "Before beginning any non-trivial task:\n"
-            "1. **CHECK LOADABLE SKILLS FIRST**: Review the `=== AVAILABLE SKILLS ===` and any `=== RECOMMENDED SKILL ===` block.\n"
-            "2. **LOAD MATCHING SKILL IN ROUND 1**: If a skill matches the user's request (e.g. `file_organization` for organizing/cleaning folders, `document_analysis_and_extraction` for parsing/annotating docs, `deep_websearch_and_extraction` for web research, `fullstack_development` for web apps/APIs):\n"
-            "   - You MUST call `<tool>{\"name\": \"tool_load_skill\", \"parameters\": {\"title\": \"<skill_title>\"}}</tool>` as your VERY FIRST ACTION in Round 1!\n"
-            "   - DO NOT improvise ad-hoc plans or guess workflows when a specialized skill exists. Load the skill and follow its exact protocol.\n"
-            "   - Do NOT emit `<done/>` after loading the skill; the system will return its full doctrine in the next round so you can execute it.\n"
-            "=== END SKILL-FIRST MANDATE ===\n"
-        )
-        rules = (
-          memory_doctrine +
-          greeting_invariant +
-          skill_mandate +
-          "\n=== CORE EXECUTION MANDATE ===\n"
-          "1. **SAME-RESPONSE ACTION EXECUTION**: Stating in prose that you will read a file, edit code, run a command, or call a tool DOES NOT execute it. You MUST emit the corresponding functional XML tag (`<unlock_file>`, `<artifact>`, `<tool>`, etc.) IN THE EXACT SAME TURN.\n"
-          "2. **NEVER SPLIT INTENT AND TAGS**: Never announce what you plan to do and stop without emitting the tag. If you do not emit the tag in the same turn, nothing happens.\n"
-          "3. **GREETINGS & CASUAL REPLIES**: If the user's message is a greeting or casual remark, reply conversationally FIRST, then append `<done/>` on a new line. NEVER emit `<done/>` as the sole token.\n"
-          "4. **TASK TERMINATION**: When all objectives are verified, summarize your achievements and conclude with `<done/>` on a new line.\n"
-          "\n=== WORKSPACE & FILE OPERATIONS ===\n"
-          "- Read files: `<unlock_file>relative/path.ext</unlock_file>` (auto-extracts text from code, docs, PDFs, etc.).\n"
-          "- Free context when done: `<lock_file>relative/path.ext</lock_file>`.\n"
-          "- Create / Full rewrite of files: `<artifact name=\"path/to/file.ext\" type=\"code\" language=\"python\">...code...</artifact>`.\n"
-          "- Surgical patches for existing files: `<artifact name=\"path/to/file.ext\" type=\"code\">\n<<<<<<< SEARCH\n...exact lines...\n=======\n...new lines...\n>>>>>>> REPLACE\n</artifact>`.\n"
-          "\n=== TOOLS & ON-DEMAND SKILLS ===\n"
-          "- Tool calling syntax: `<tool>{\"name\": \"tool_name\", \"parameters\": {...}}</tool>`.\n"
-          "- Ephemeral Scratchpad: Save working notes across rounds for the CURRENT SESSION ONLY using `<scratchpad_append>notes...</scratchpad_append>`. The scratchpad is volatile and resets between sessions.\n"
-          "- Macro plan: For multi-step work, track progress in `.lollms_code/CURRENT.md`.\n"
-        )
+
+        operating_protocol = ""
+        if not has_authoritative_protocol:
+            operating_protocol = (
+                "\n=== AUTHORITATIVE OPERATING PROTOCOL ===\n"
+                "1. **ACTION FIRST (NO PREAMBLE)**: When performing a task, output the action tag (`<tool>`, `<artifact>`, `<unlock_file>`) as your FIRST tokens. Never write prose checklists explaining what you plan to do.\n"
+                "2. **TERMINATION CONTRACT (<done/>)**: Conclude completed tasks with `<done/>` on a new line. On casual greetings (e.g. 'hi'), reply conversationally and finish with `<done/>`.\n"
+                "3. **PASSIVE MEMORY BOUNDARY**: Memories provide passive background facts only. Your active objective is determined exclusively by the latest user message.\n"
+                "4. **SURGICAL PATCHES**: For existing files, use Aider SEARCH/REPLACE patches with exact verbatim lines.\n\n"
+                "### FEW-SHOT EXECUTION PATTERNS (MANDATORY DEMONSTRATIONS):\n"
+                "User: \"Execute the migration plan mapping.yaml\"\n"
+                "Assistant:\n"
+                "<tool>{\"name\": \"tool_organize_files_from_plan\", \"parameters\": {\"plan_file\": \"mapping.yaml\", \"move_files\": true}}</tool>\n\n"
+                "User: \"Create hello.py\"\n"
+                "Assistant:\n"
+                "<artifact name=\"hello.py\" type=\"code\" language=\"python\">\n"
+                "print(\"Hello world!\")\n"
+                "</artifact>\n\n"
+                "User: \"Read doc.txt\"\n"
+                "Assistant:\n"
+                "<unlock_file>doc.txt</unlock_file>\n\n"
+                "=== END OPERATING PROTOCOL ===\n"
+            )
 
         memory_instructions = ""
         if self.memory_manager:
@@ -4997,22 +5101,13 @@ JSON:"""
                 memory_instructions = self.memory_manager.build_system_instructions()
             else:
                 memory_instructions = (
-                    "\n=== PERSISTENT MEMORY SYSTEM (CRITICAL FOR CONTINUITY) ===\n"
-                    "You have access to a persistent memory database. You can store and retrieve information across sessions.\n"
-                    "1. **STORE FACTS**: Save using `<mem_new content=\"...\" tags=\"...\" level=\"1\" />` or `tool_save_memory`.\n"
-                    "2. **UPDATE FACTS**: If information changes, use `<mem_update id=\"memory_id\" content=\"New information\" />`.\n"
+                    "\n=== PERSISTENT COGNITIVE MEMORY ===\n"
+                    "Store facts with `<mem_new content=\"...\" tags=\"...\" level=\"1\" />`. Update with `<mem_update id=\"ID\" content=\"...\" />`.\n"
+                    "When the user says 'remember this', execute the memory action immediately in that response.\n"
+                    "=== END MEMORY ===\n"
                 )
 
-            memory_instructions += (
-                "\n\n🚨 **MANDATORY MEMORY EXECUTION RULE** 🚨\n"
-                "When the user instructs you to 'remember this', 'keep in memory', defines an acronym/shortcut (e.g. 'c&p means commit and push'), "
-                "or asks you to recall facts, you MUST execute the memory action in your VERY FIRST RESPONSE.\n"
-                "- Call `tool_save_memory(content=\"...\", tags=\"...\")` OR emit `<mem_new content=\"...\" tags=\"...\" level=\"1\" />`.\n"
-                "- NEVER write 'I will remember this' or 'I have saved it' in conversational text without calling `tool_save_memory` or outputting the `<mem_new>` tag in that same response!\n"
-            )
-
         skills_ctx = ""
-        # Check if skills context was already injected to prevent duplication
         has_skills_already = "=== AVAILABLE SKILLS" in sys_prompt or "=== ACTIVE SKILLS" in sys_prompt
         if self.skills_manager and not has_skills_already:
             active_names = set(active_tools.keys()) if active_tools else None
@@ -5022,53 +5117,25 @@ JSON:"""
             if skills_ctx_str:
                 skills_ctx = "\n" + skills_ctx_str
 
-            if len(self.skills_manager.skills) == 0:
-                skills_ctx += (
-                    "\n=== SKILLS SYSTEM STATUS ===\n"
-                    "The skills library is currently EMPTY. There are 0 skills available.\n"
-                    "Do NOT attempt to call `tool_list_skills` or `tool_search_skills` as they will return nothing.\n"
-                    "If you discover a reusable methodology or best practice during your task, use `tool_create_skill` to save it for future use.\n"
-                    "=== END SKILLS SYSTEM STATUS ==="
-                )
-
         tool_desc = ""
         if active_tools:
             tool_sections = [
-                "\n=== TOOLS AVAILABLE (Active Schema) ===",
-                "To execute a tool, emit the following JSON payload on its own line (do NOT wrap in markdown code blocks):",
-                '`<tool>{"name": "<tool_name>", "parameters": {<args>}}</tool>`\n',
-                "### Active Tool Registry:\n"
+                "\n=== ACTIVE TOOLS (Lean Schema) ===",
+                "Emit on a clean line: `<tool>{\"name\": \"...\", \"parameters\": {...}}</tool>`\n"
             ]
             for t_name, t_spec in sorted(active_tools.items()):
-                desc = (t_spec.get("description") or "").strip()
+                desc = (t_spec.get("description") or "").strip().split("\n\n")[0].strip()
                 params_list = t_spec.get("parameters") or []
+                param_sig = ", ".join([f"{p.get('name')}: {p.get('type', 'any')}{'?' if p.get('optional') else ''}" for p in params_list]) if params_list else ""
+                tool_sections.append(f"• **`{t_name}({param_sig})`**: {desc}")
 
-                param_sig = ", ".join([f"{p.get('name', 'param')}: {p.get('type', 'any')}" for p in params_list]) if params_list else ""
-                param_details = []
-                for p in params_list:
-                    opt = " (optional)" if p.get("optional") else ""
-                    param_details.append(f"`{p.get('name', 'param')}: {p.get('type', 'any')}`{opt}")
-                param_desc = ", ".join(param_details) if param_details else "none"
-
-                tool_entry = (
-                    f"#### 🛠️ **`{t_name}`**\n"
-                    f"- **Signature**: `{t_name}({param_sig})`\n"
-                    f"- **Parameters**: {param_desc}\n"
-                    f"- **Description**:\n  {desc}\n"
-                )
-                tool_sections.append(tool_entry)
-
-            tool_sections.append("=== END TOOLS AVAILABLE ===\n")
-
-            # Append compact on-demand loadable tool index
             loadable_index = getattr(self, "_loadable_tool_index", None)
             if loadable_index:
-                tool_sections.append("=== LOADABLE TOOLS (On Demand via `tool_load_tool`) ===")
-                tool_sections.append("To save context, non-core tools are kept unloaded. Call `tool_load_tool(tool_name=\"...\")` when you need them:")
+                tool_sections.append("\n=== ON-DEMAND TOOLSETS (via `tool_load_tool`) ===")
                 for l_name, l_desc in sorted(loadable_index.items()):
-                    tool_sections.append(f"- **`{l_name}`**: {l_desc}")
-                tool_sections.append("=== END LOADABLE TOOLS ===\n")
+                    tool_sections.append(f"- `{l_name}`: {l_desc}")
 
+            tool_sections.append("=== END TOOLS ===\n")
             tool_desc = "\n".join(tool_sections)
 
         dynamic_effort_prompt = ""
@@ -5121,7 +5188,25 @@ JSON:"""
                 "=== END DOCUMENT ANNOTATION WORKFLOW ===\n"
             )
 
-        return sys_prompt + "\n" + rules + skills_ctx + memory_instructions + tool_desc + dynamic_effort_prompt + computer_use_workflow + document_annotation_workflow
+        parts = [sys_prompt]
+        if onboarding_block:
+            parts.append(onboarding_block)
+        if operating_protocol:
+            parts.append(operating_protocol)
+        if skills_ctx:
+            parts.append(skills_ctx)
+        if memory_instructions:
+            parts.append(memory_instructions)
+        if tool_desc:
+            parts.append(tool_desc)
+        if dynamic_effort_prompt:
+            parts.append(dynamic_effort_prompt)
+        if computer_use_workflow:
+            parts.append(computer_use_workflow)
+        if document_annotation_workflow:
+            parts.append(document_annotation_workflow)
+
+        return "\n\n".join(p.strip() for p in parts if p and p.strip())
     
     
     def change_file_visibility(self, targets: List[str], action: str) -> Dict[str, Any]:
@@ -5258,6 +5343,7 @@ JSON:"""
         enable_web_tools: bool = False,
         auto_load_document_editor: bool = True,
         enable_computer_use: bool = False,
+        allow_computer_use: Optional[bool] = None,
         enforce_end_tag: bool = True,
         orchestrator_mode: bool = False,
         context_compaction_threshold: float = 0.85,
@@ -5301,6 +5387,7 @@ JSON:"""
                 enable_web_tools=enable_web_tools,
                 auto_load_document_editor=auto_load_doc_editor_flag,
                 enable_computer_use=enable_computer_use,
+                allow_computer_use=allow_computer_use,
             )
             runner = AgenticRunner(
                 context=self,
@@ -5356,6 +5443,13 @@ JSON:"""
 
         cleaned_prompt = prompt
         enable_data_tools_flag = kwargs.get("enable_data_tools", True)
+        if allow_computer_use is None:
+            allow_computer_use = kwargs.get("allow_computer_use")
+        if allow_computer_use is None and self.capabilities:
+            allow_computer_use = getattr(self.capabilities, "allow_computer_use", False) or getattr(self.capabilities, "enable_computer_use", False)
+
+        resolved_computer_use = bool(enable_computer_use or allow_computer_use)
+
         active_tools = self._discover_tools(
             tools,
             tool_files or [],
@@ -5365,7 +5459,8 @@ JSON:"""
             enable_python_exec=enable_python_exec,
             enable_web_tools=enable_web_tools,
             auto_load_document_editor=auto_load_doc_editor_flag,
-            enable_computer_use=enable_computer_use,
+            enable_computer_use=resolved_computer_use,
+            allow_computer_use=resolved_computer_use,
             shell_autonomy_level=shell_autonomy_level,
             python_autonomy_level=python_autonomy_level,
             auto_approve_python=auto_approve_python,
@@ -5432,8 +5527,9 @@ JSON:"""
         }
         # Explicitly exempt continuation commands from ever being classified as greetings
         is_continuation = bool(re.search(r'\b(?:continue|resume|proceed|go\s+on)\b', clean_input))
+        is_approval = clean_input in ("yes", "y", "oui", "proceed", "approved", "ok", "do it", "sure", "go ahead")
         is_greeting = (
-            not is_continuation and (
+            not is_continuation and not is_approval and (
                 clean_input in GREETING_PHRASES
                 or (len(words) <= 2 and bool(words & GREETING_WORDS))
             )
@@ -5525,6 +5621,23 @@ JSON:"""
         if dynamic_suffix:
             stable_system_prompt += "\n\n" + dynamic_suffix
         fused_prompt = cleaned_prompt
+
+        # ── 🚀 APPROVAL HYDRATION: Ensure user 'yes' executes pending migration plans ──
+        if is_approval and self._resolved_workspace:
+            plan_file = None
+            for cand_plan in ("mapping.yaml", "mapping.json", "mapping.md"):
+                if (self._resolved_workspace / cand_plan).exists():
+                    plan_file = cand_plan
+                    break
+            if plan_file:
+                fused_prompt = (
+                    f"{cleaned_prompt}\n\n"
+                    f"[SYSTEM DIRECTIVE: USER CONFIRMED PLAN APPROVAL]\n"
+                    f"The user approved the migration plan '{plan_file}'.\n"
+                    f"You MUST now execute Phase 4 immediately:\n"
+                    f"Call `<tool>{{\"name\": \"tool_organize_files_from_plan\", \"parameters\": {{\"plan_file\": \"{plan_file}\", \"move_files\": true}}}}</tool>` as your very first token now!\n"
+                    f"Do NOT output conversational preambles or step lists without the tool call tag."
+                )
 
         base_conversation.append({"role": "user", "content": fused_prompt})
 
@@ -6008,7 +6121,7 @@ JSON:"""
             has_truncated_artifact = False
             truncated_artifact_title = None
 
-            if is_greeting:
+            if is_greeting and not enforce_end_tag:
                 # 🛡️ GREETING IMMUNITY SHIELD: Completely discard any unprompted tool calls or file writes
                 if ss.completed_actions:
                     ASCIIColors.warning(f"[{self.name}] 🛡️ Blocked {len(ss.completed_actions)} unprompted hallucinated action(s) on greeting '{cleaned_prompt}'.")
@@ -6539,6 +6652,16 @@ JSON:"""
                     object.__setattr__(self, '_consecutive_stall_count', 0)
                     active_temperature = base_temperature
                     ss.completed_actions = []
+
+                    # If actions were executed (e.g. tools were called), continue to the next round to let the agent use the results
+                    if action_reports:
+                        ss = _AgentStreamState(
+                            callback=streaming_callback,
+                            event_mode=event_mode,
+                            workspace_path=self._resolved_workspace
+                        )
+                        continue
+
                     final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
                     if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
                         try:

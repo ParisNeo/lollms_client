@@ -51,8 +51,16 @@ class WhisperSTTBinding(LollmsSTTBinding):
         self.binding_root = Path(__file__).parent
         self.server_dir = self.binding_root / "server"
 
-        self.venv_dir = self.resolve_system_path(kwargs.get("venv_path", "venv/stt_whisper_venv"))
-        self.cache_dir = self.resolve_system_path(kwargs.get("cache_dir", "data/stt_models/whisper"))
+        system_root = self.get_system_dir()
+        if kwargs.get("venv_path"):
+            self.venv_dir = self.resolve_system_path(kwargs["venv_path"])
+        else:
+            self.venv_dir = (system_root / "venv" / "stt_whisper_venv").resolve()
+
+        if kwargs.get("cache_dir"):
+            self.cache_dir = self.resolve_system_path(kwargs["cache_dir"])
+        else:
+            self.cache_dir = (system_root / "data" / "stt_models" / "whisper").resolve()
 
         self.venv_dir.mkdir(exist_ok=True, parents=True)
         self.cache_dir.mkdir(exist_ok=True, parents=True)
@@ -80,31 +88,19 @@ class WhisperSTTBinding(LollmsSTTBinding):
         return headers
 
     def is_server_running(self) -> bool:
-        """Probes the server on loopback with a fast timeout (<= 1.5s)."""
+        """Probes the server on loopback with a fast timeout (<= 0.5s)."""
         try:
             resp = requests.get(
                 f"{self.base_url}/status",
                 headers=self._get_headers(),
-                timeout=1.5
+                timeout=0.5
             )
             if resp.status_code == 200:
                 data = resp.json() if callable(getattr(resp, "json", None)) else {}
-                if isinstance(data, dict) and data.get("status") == "running":
-                    return True
+                return data.get("status") == "running" if isinstance(data, dict) else True
             elif resp.status_code == 401:
-                if self.token_file.exists():
-                    try:
-                        self.service_key = self.token_file.read_text(encoding="utf-8").strip()
-                        retry_resp = requests.get(
-                            f"{self.base_url}/status",
-                            headers=self._get_headers(),
-                            timeout=1.5
-                        )
-                        return retry_resp.status_code == 200
-                    except Exception:
-                        pass
                 return True
-        except requests.exceptions.RequestException:
+        except Exception:
             return False
         return False
 
