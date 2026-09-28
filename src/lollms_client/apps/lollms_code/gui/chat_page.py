@@ -553,24 +553,54 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
         dialog.open()
 
     with ui.column().classes("w-full h-full flex-1 min-h-0 flex-nowrap gap-0 overflow-hidden flex flex-col"):
-        # ---- Slim status strip (replaces the old sidebar cards) ----
+        # Ensure tools_toggle exists early for event binding
+        if tools_toggle is None:
+            tools_toggle = ui.switch("Tool panels", value=prefs.show_tool_calls).props("dense")
+            tools_toggle.visible = False
+
+        # ---- Streamlined Single-Row Status & Tools Bar (Decluttered via Dropdown Menus) ----
         with ui.row().classes(
-            f"w-full items-center justify-between px-3 py-1.5 shrink-0 {SURFACE} border-b {BORDER}"
+            f"w-full items-center justify-between px-3 py-1.5 shrink-0 {SURFACE} border-b {BORDER} flex-nowrap"
         ):
-            with ui.row().classes("items-center gap-2"):
+            # ── Left Group: Projects, Tree, Sessions, Dynamic Mode, and Status ──
+            with ui.row().classes("items-center gap-1.5 flex-nowrap shrink-0"):
                 ui.button(
                     "Projects", icon="view_carousel",
                     on_click=lambda: (session.save_to_disk(), ui.navigate.to("/")),
                 ).props("flat dense size=sm no-caps text-color=primary font-semibold").tooltip("Return to Workspace Deck")
+
                 tree_toggle_btn = ui.button(
                     "Tree", icon="folder",
                     on_click=lambda: toggle_tree_visibility(),
                 ).props("flat dense size=sm no-caps text-color=primary").tooltip("Toggle Workspace Tree")
-                ui.button(
-                    "Sessions", icon="history_edu",
-                    on_click=lambda: open_sessions_dialog(),
-                ).props("flat dense size=sm no-caps text-color=primary font-semibold").tooltip("Manage and resume sessions in this workspace")
-                
+
+                # ── Sessions Dropdown Menu ──
+                with ui.button("Sessions", icon="forum").props(
+                    "flat dense size=sm no-caps text-color=primary font-semibold"
+                ).tooltip("Discussion sessions, prompt history, and export options"):
+                    with ui.menu().classes(f"border {BORDER} {SURFACE} {STRONG} shadow-xl rounded-xl p-1 min-w-[210px]"):
+                        with ui.menu_item(on_click=lambda: confirm_new_session()).classes("rounded py-1"):
+                            with ui.row().classes("items-center gap-2"):
+                                ui.icon("add_comment", size="16px").classes("text-primary")
+                                ui.label("New Session").classes("text-xs font-semibold")
+                        with ui.menu_item(on_click=lambda: open_sessions_dialog()).classes("rounded py-1"):
+                            with ui.row().classes("items-center gap-2"):
+                                ui.icon("history_edu", size="16px").classes("text-primary")
+                                ui.label("Saved Sessions Manager (/sessions)").classes("text-xs font-medium")
+                        ui.separator().classes(f"my-1 {BORDER}")
+                        with ui.menu_item(on_click=lambda: open_history_dialog()).classes("rounded py-1"):
+                            with ui.row().classes("items-center gap-2"):
+                                ui.icon("history", size="16px").classes("text-slate-500")
+                                ui.label("Prompt History (Ctrl+H)").classes("text-xs")
+                        with ui.menu_item(on_click=lambda: copy_debug_markdown()).classes("rounded py-1"):
+                            with ui.row().classes("items-center gap-2"):
+                                ui.icon("content_copy", size="16px").classes("text-slate-500")
+                                ui.label("Copy as Markdown").classes("text-xs")
+                        with ui.menu_item(on_click=lambda: export_history()).classes("rounded py-1"):
+                            with ui.row().classes("items-center gap-2"):
+                                ui.icon("download", size="16px").classes("text-slate-500")
+                                ui.label("Export History (.md)").classes("text-xs")
+
                 # ---- Dynamic Mode Quick Toggle ----
                 def _toggle_dynamic_mode():
                     is_active = getattr(prefs, "dynamic_effort", False)
@@ -615,13 +645,14 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                 ).props("unelevated dense size=sm no-caps color=emerald text-color=white font-bold shadow-sm")
                 resume_turn_btn.tooltip("Resume an interrupted or paused turn from its round checkpoint")
                 resume_turn_btn.set_visibility(False)
-                status_label = ui.label("Idle").classes(f"text-xs {MUTED} font-mono font-medium")
+
+                status_label = ui.label("Idle").classes(f"text-xs {MUTED} font-mono font-medium pl-1")
                 elapsed_label = ui.label("").classes(f"text-xs {MUTED_DIM} font-mono")
 
-            
-            with ui.row().classes("items-center gap-2"):
-                rounds_label = ui.label("").classes(f"text-xs {MUTED} font-mono font-medium")
-                ctx_label = ui.label("").classes(f"text-xs {MUTED} font-mono font-medium")
+            # ── Right Group: Telemetry, Effort, Grouped Workspace Hub, and Utility Icons ──
+            with ui.row().classes("items-center gap-2 flex-nowrap shrink-0"):
+                rounds_label = ui.label("").classes(f"text-xs {MUTED} font-mono font-medium truncate")
+                ctx_label = ui.label("").classes(f"text-xs {MUTED} font-mono font-medium truncate")
 
                 # ---- Fast Effort Selector ----
                 effort_options = {
@@ -657,77 +688,78 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                     effort_options,
                     value=curr_effort_val,
                 ).props("dense options-dense outlined size=sm").classes(
-                    f"text-xs w-36 bg-slate-50 dark:bg-slate-900 {STRONG}"
+                    f"text-xs w-32 bg-slate-50 dark:bg-slate-900 {STRONG}"
                 ).tooltip("Fast reasoning effort selector: switch between Off, Low, Med, High, and Dynamic Auto-escalation")
                 effort_select.on_value_change(_on_fast_effort_change)
 
-                if tools_toggle is None:
-                    tools_toggle = ui.switch("Tool panels", value=prefs.show_tool_calls).props("dense")
-                ui.button(
-                    "New", icon="add_comment",
-                    on_click=lambda: confirm_new_session(),
-                ).props("flat dense size=sm no-caps").tooltip("Start a new session (clears the visible conversation)")
+                # ── Workspace Hub Dropdown Menu ──
+                with ui.button("Workspace Hub", icon="hub").props(
+                    "unelevated dense size=sm no-caps color=primary font-semibold shadow-sm"
+                ).tooltip("Workspace tools, task roadmap, reference docs, workflows, and packages"):
+                    with ui.menu().classes(f"border {BORDER} {SURFACE} {STRONG} shadow-xl rounded-xl p-1 min-w-[240px]"):
+                        with ui.menu_item(on_click=lambda: open_current_plan_dialog()).classes("rounded py-1"):
+                            with ui.row().classes("items-center gap-2"):
+                                ui.icon("checklist", size="16px").classes("text-primary")
+                                ui.label("Task Plan (CURRENT.md)").classes("text-xs font-medium")
+                        with ui.menu_item(on_click=lambda: open_scratchpad_dialog()).classes("rounded py-1"):
+                            with ui.row().classes("items-center gap-2"):
+                                ui.icon("edit_note", size="16px").classes("text-cyan-500")
+                                ui.label("Agent Scratchpad").classes("text-xs font-medium")
+                        with ui.menu_item(on_click=lambda: open_sub_workspace_dialog()).classes("rounded py-1"):
+                            with ui.row().classes("items-center gap-2"):
+                                ui.icon("auto_stories", size="16px").classes("text-emerald-500")
+                                ui.label("Sub-Workspace Reference").classes("text-xs font-medium")
+                        ui.separator().classes(f"my-1 {BORDER}")
+                        with ui.menu_item(on_click=lambda: open_workflow_studio_dialog()).classes("rounded py-1"):
+                            with ui.row().classes("items-center gap-2"):
+                                ui.icon("account_tree", size="16px").classes("text-indigo-500")
+                                ui.label("Workflow Studio").classes("text-xs font-medium")
+                        with ui.menu_item(on_click=lambda: open_zoo_dialog()).classes("rounded py-1"):
+                            with ui.row().classes("items-center gap-2"):
+                                ui.icon("pets", size="16px").classes("text-amber-500")
+                                ui.label("Zoo Package Hub").classes("text-xs font-medium")
+                        with ui.menu_item(on_click=lambda: open_context_inspector_dialog()).classes("rounded py-1"):
+                            with ui.row().classes("items-center gap-2"):
+                                ui.icon("manage_search", size="16px").classes("text-cyan-500")
+                                ui.label("Inspect Context (Ctrl+I)").classes("text-xs font-medium")
+                        with ui.menu_item(on_click=lambda: open_memory_explorer_dialog(session, prefs) if open_memory_explorer_dialog else ui.notify("Memory Explorer not available", type="warning")).classes("rounded py-1"):
+                            with ui.row().classes("items-center gap-2"):
+                                ui.icon("psychology", size="16px").classes("text-purple-500")
+                                ui.label("Memory Explorer").classes("text-xs font-medium")
+                        with ui.menu_item(on_click=lambda: open_workspace_in_explorer()).classes("rounded py-1"):
+                            with ui.row().classes("items-center gap-2"):
+                                ui.icon("folder_open", size="16px").classes("text-slate-500")
+                                ui.label("Open in File Explorer").classes("text-xs")
+                        ui.separator().classes(f"my-1 {BORDER}")
+                        with ui.row().classes("px-3 py-1 items-center justify-between w-full"):
+                            ui.label("Show Tool Execution Panels").classes(f"text-xs {MUTED}")
+                            hub_tools_switch = ui.switch(value=prefs.show_tool_calls).props("dense size=xs")
+                            def _on_hub_tools_toggle(e):
+                                prefs.show_tool_calls = e.value
+                                prefs.save()
+                                tools_toggle.value = e.value
+                            hub_tools_switch.on_value_change(_on_hub_tools_toggle)
+
+                # ── Compact Utility Icons (Search, Theme, Shortcuts, Settings) ──
                 ui.button(
                     icon="search",
                     on_click=lambda: open_search(),
-                ).props("flat dense round size=sm").tooltip("Search this conversation (Ctrl+F)")
+                ).props("flat dense round size=sm").tooltip("Search conversation (Ctrl+F)")
+
                 theme_btn = ui.button(
                     icon=THEME_ICONS.get(getattr(prefs, "theme_mode", "auto"), "brightness_auto"),
                     on_click=lambda: toggle_theme(),
                 ).props("flat dense round size=sm").tooltip(_theme_tooltip())
+
                 ui.button(
                     icon="keyboard",
                     on_click=lambda: open_shortcuts_dialog(),
                 ).props("flat dense round size=sm").tooltip("Keyboard shortcuts (Ctrl+/)")
-                def _toggle_mem_quick():
-                    prefs.enable_memory = not prefs.enable_memory
-                    prefs.save()
-                    session.personality = agent_bridge.create_personality(prefs, session.client)
-                    mem_toggle_btn._props["text-color"] = "purple" if prefs.enable_memory else "grey"
-                    mem_toggle_btn.text = "Memories: ON" if prefs.enable_memory else "Memories: OFF"
-                    mem_toggle_btn.update()
-                    ui.notify(f"Memory is now {'ENABLED' if prefs.enable_memory else 'DISABLED'}.", type="positive" if prefs.enable_memory else "info")
-
-                mem_toggle_btn = ui.button(
-                    "Memories: ON" if prefs.enable_memory else "Memories: OFF", icon="psychology",
-                    on_click=lambda: open_memory_explorer_dialog(session, prefs) if open_memory_explorer_dialog else ui.notify("Memory Explorer not available", type="warning"),
-                ).props(f"flat dense size=sm no-caps text-color={'purple' if prefs.enable_memory else 'grey'}").tooltip("Open Memory Explorer (or click to inspect; toggle via /memory on|off)")
 
                 ui.button(
-                    "Workflows", icon="account_tree",
-                    on_click=lambda: open_workflow_studio_dialog(),
-                ).props("flat dense size=sm no-caps text-color=indigo font-semibold").tooltip("Open Workflow Studio: Graph-based execution harness with hard constraints and per-subtask model selection")
-                ui.button(
-                    "Inspect Context", icon="manage_search",
-                    on_click=lambda: open_context_inspector_dialog(),
-                ).props("flat dense size=sm no-caps text-color=cyan font-semibold").tooltip("Inspect full context, prompt messages, and parameters sent to the agent (Ctrl+I)")
-                ui.button(
-                    "Zoo Hub", icon="pets",
-                    on_click=lambda: open_zoo_dialog(),
-                ).props("flat dense size=sm no-caps text-color=amber font-semibold").tooltip("Open Zoo Hub: install & manage tools, skills, and personas from GitHub")
-                ui.button(
-                    "Reference", icon="auto_stories",
-                    on_click=lambda: open_sub_workspace_dialog(),
-                ).props("flat dense size=sm no-caps text-color=emerald font-semibold").tooltip("Open Sub-Workspace (Documentation & Reference files in .lollms_code/sub_workspace)")
-                ui.button(
-                    "Plan", icon="checklist",
-                    on_click=lambda: open_current_plan_dialog(),
-                ).props("flat dense size=sm no-caps text-color=primary font-semibold").tooltip("View and edit the active task roadmap (.lollms_code/CURRENT.md)")
-                ui.button(
-                    "Scratchpad", icon="edit_note",
-                    on_click=lambda: open_scratchpad_dialog(),
-                ).props("flat dense size=sm no-caps").tooltip("View the agent's persistent scratchpad notes")
-                ui.button(
-                    "Copy as Markdown", icon="content_copy",
-                    on_click=lambda: copy_debug_markdown(),
-                ).props("flat dense size=sm no-caps").tooltip("Copy the full discussion, including tool calls, for debugging")
-                ui.button(
-                    "Export History", icon="download",
-                    on_click=lambda: export_history(),
-                ).props("flat dense size=sm no-caps").tooltip("Download the full session as a Markdown file")
-                ui.button("Settings", icon="settings", on_click=lambda: (session.save_to_disk(), ui.navigate.to("/settings"))).props(
-                    "flat dense size=sm no-caps"
-                )
+                    icon="settings",
+                    on_click=lambda: (session.save_to_disk(), ui.navigate.to("/settings")),
+                ).props("flat dense round size=sm").tooltip("Settings & Model Configuration")
 
         # ---- Transcript search bar (hidden until Ctrl+F / search icon) ----
         search_row = ui.row().classes(

@@ -1037,10 +1037,18 @@ class LollmsClient():
         if getattr(target_binding, "glm_image_embedding", False) is True:
             return True
 
-        if hasattr(target_binding, "_find_mmproj") and hasattr(target_binding, "models_dir") and hasattr(target_binding, "model_name") and target_binding.model_name:
+        models_dir = getattr(target_binding, "models_dir", None)
+        find_mmproj_fn = getattr(target_binding, "_find_mmproj", None)
+        model_name = getattr(target_binding, "model_name", None)
+        if (
+            not hasattr(target_binding, "_mock_return_value")
+            and isinstance(models_dir, Path)
+            and isinstance(model_name, str)
+            and callable(find_mmproj_fn)
+        ):
             try:
-                model_p = target_binding.models_dir / target_binding.model_name
-                if model_p.exists() and target_binding._find_mmproj(model_p) is not None:
+                model_p = models_dir / model_name
+                if model_p.exists() and find_mmproj_fn(model_p) is not None:
                     target_binding.vision_enabled = True
                     return True
             except Exception:

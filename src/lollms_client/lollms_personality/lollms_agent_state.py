@@ -934,14 +934,7 @@ class _AgentStreamState:
                 return True
 
         if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact:
-            # Check if pending buffer contains functional action tags mistakenly wrapped in code fences
-            has_action_tag_in_pending = bool(re.search(r'<(?:tool|art(?:ifact|efact)|unlock_file|lock_file|generate_image|edit_image)\b', self._pending_buffer, re.IGNORECASE))
-            if has_action_tag_in_pending:
-                # Bypass code fence protection to allow immediate action tag interception
-                self._in_code_fence = False
-                self._code_fence_hold_buffer = ""
-                self._code_fence_buffer = ""
-            elif "```" in self._pending_buffer:
+            if "```" in self._pending_buffer:
                 self._code_fence_buffer += self._pending_buffer
                 self._pending_buffer = ""
 

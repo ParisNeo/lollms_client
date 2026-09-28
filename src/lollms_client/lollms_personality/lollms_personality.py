@@ -6651,10 +6651,12 @@ JSON:"""
                     # Reset stall tracking since concrete actions were executed
                     object.__setattr__(self, '_consecutive_stall_count', 0)
                     active_temperature = base_temperature
+
+                    has_tool_actions = any(action.get("type") == "tool" for action in ss.completed_actions)
                     ss.completed_actions = []
 
-                    # If actions were executed (e.g. tools were called), continue to the next round to let the agent use the results
-                    if action_reports:
+                    # If tool actions were executed, continue to the next round to let the agent use the results
+                    if has_tool_actions and action_reports:
                         ss = _AgentStreamState(
                             callback=streaming_callback,
                             event_mode=event_mode,
@@ -6662,7 +6664,7 @@ JSON:"""
                         )
                         continue
 
-                    final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
+                    final_response = re.sub(r'(?i)</?(?:done|end)\s*/?>', '', ss.get_clean_text()).strip()
                     if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
                         try:
                             streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {

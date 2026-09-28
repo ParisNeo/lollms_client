@@ -3,6 +3,9 @@
 
 All notable changes to this project will be documented in this file.
 #
+- fix(personality:done_termination): ensure `<done/>` with completed artifacts terminates immediately in round 1 when no tool calls are pending
+- fix(agent_state:code_fence): restore code fence protection in `_AgentStreamState` by removing `has_action_tag_in_pending` so tags inside markdown code blocks are not intercepted as live tools
+- fix(core:vision_capability): harden `has_vision_capability()` with strict type and mock checks on `models_dir`, `model_name`, and `_find_mmproj` to prevent mocks from falsely reporting vision capability
 - fix(gui:workflow_studio): separate SVG markup and client-side JavaScript execution in Workflow Studio 2D graph canvas to eliminate NiceGUI `ValueError: HTML elements must not contain <script> tags`
 - fix(workflow:types): remove duplicate `compute_auto_layout()` method definition in `workflow_types.py`
 - fix(gui:linear_history): ensure `replay_transcript_from_log()` clears all transcript DOM elements, panel references, and active buffers so `resend_from_point` and `open_edit_dialog` purge all subsequent messages on screen
