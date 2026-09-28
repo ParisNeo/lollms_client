@@ -264,6 +264,21 @@ class Workflow:
 
         return positions
 
+    def get_template_variables(self) -> List[str]:
+        """Extracts all unique {{variable}} placeholders used across the workflow."""
+        variables = set()
+        for node in self.nodes.values():
+            for val in node.config.values():
+                if isinstance(val, str):
+                    for m in re.finditer(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}", val):
+                        variables.add(m.group(1).strip())
+                elif isinstance(val, dict):
+                    for sub_v in val.values():
+                        if isinstance(sub_v, str):
+                            for m in re.finditer(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}", sub_v):
+                                variables.add(m.group(1).strip())
+        return sorted(list(variables))
+
     def to_yaml(self) -> str:
         if not yaml:
             return json.dumps(self.to_dict(), indent=2)

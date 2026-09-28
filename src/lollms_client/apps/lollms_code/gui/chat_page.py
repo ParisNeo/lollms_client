@@ -5502,19 +5502,57 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                 "engine": None,
                 "context": None,
                 "running": False,
+                "workspace_path": str(Path(prefs.workspace_path).resolve()),
+                "initial_state": {"task_prompt": "Organize and structure all files in the workspace."},
             }
 
             initial_wf_id = active_state["wf"].id if active_state["wf"].id in wf_options_init else (next(iter(wf_options_init)) if wf_options_init else None)
 
-            with ui.row().classes(f"w-full items-center justify-between gap-3 p-2 {SURFACE} rounded border {BORDER} shrink-0"):
-                with ui.row().classes("items-center gap-2 flex-1"):
+            # Workspace and Workflow Switcher Bar
+            with ui.row().classes(f"w-full items-center justify-between gap-3 p-2 {SURFACE} rounded border {BORDER} shrink-0 flex-wrap"):
+                with ui.row().classes("items-center gap-2"):
+                    ui.icon("folder", size="18px").classes("text-amber-500")
+                    ui.label("Execution Workspace:").classes(f"text-xs font-bold {STRONG}")
+
+                    ws_options = {p["path"]: f"{p['name']} ({p['path']})" for p in prefs.get_workspaces()}
+                    cur_ws = str(Path(prefs.workspace_path).resolve())
+                    if cur_ws not in ws_options:
+                        ws_options[cur_ws] = f"Active ({prefs.workspace_path})"
+
+                    def _on_wf_workspace_change(e):
+                        if e.value:
+                            _switch_workspace_context(e.value)
+
+                    ws_select = ui.select(
+                        ws_options,
+                        value=active_state["workspace_path"]
+                    ).props("dense outlined size=sm options-dense").classes("text-xs min-w-[280px]")
+                    ws_select.on_value_change(_on_wf_workspace_change)
+
+                    async def _browse_wf_ws():
+                        _picker = pick_folder
+                        if _picker:
+                            chosen = await _picker(title="Select Workflow Execution Workspace", initial_dir=active_state["workspace_path"])
+                            if chosen:
+                                p_res = str(Path(chosen).resolve())
+                                if p_res not in ws_options:
+                                    ws_options[p_res] = f"{Path(chosen).name} ({p_res})"
+                                    ws_select.options = ws_options
+                                ws_select.value = p_res
+                                _switch_workspace_context(p_res)
+
+                    ui.button(icon="folder_open", on_click=_browse_wf_ws).props(
+                        "flat dense round size=xs color=amber"
+                    ).tooltip("Browse and select execution directory")
+
+                with ui.row().classes("items-center gap-2 flex-1 min-w-[320px]"):
                     ui.label("Active Workflow:").classes(f"text-xs font-bold {STRONG}")
                     wf_select = ui.select(
                         wf_options_init,
                         value=initial_wf_id
-                    ).props("dense outlined size=sm options-dense").classes("text-xs min-w-[340px]")
+                    ).props("dense outlined size=sm options-dense").classes("text-xs flex-1")
 
-                with ui.row().classes("items-center gap-1.5"):
+                with ui.row().classes("items-center gap-1.5 shrink-0"):
                     ui.badge("Project Workflows (.lollms_code/workflows/)", color="indigo").props("dense rounded text-[10px]")
 
             # Workflow Metadata Header Card
@@ -5610,12 +5648,41 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                         tab_console = ui.tab('console', label='📺 Execution Console', icon='terminal').classes('text-xs py-1 flex-1')
                         tab_state = ui.tab('state', label='📊 Live Variables (context.state)', icon='data_object').classes('text-xs py-1 flex-1')
 
-                    # Initial State Configuration Strip
-                    with ui.row().classes(f"w-full items-center justify-between gap-2 p-2 rounded border {BORDER} {SURFACE} shrink-0"):
-                        task_input = ui.input("Initial {{task_prompt}}", value="Organize and structure all files in the workspace.").classes("flex-1 text-xs").props("outlined dense")
-                        run_btn = ui.button("▶ Run Workflow", icon="play_arrow").props("unelevated dense size=sm color=primary no-caps font-bold")
-                        cancel_btn = ui.button(icon="stop").props("unelevated dense round size=sm color=red")
-                        cancel_btn.visible = False
+                    # Dynamic Configurable Variables Inputs Panel
+                    with ui.card().classes(f"w-full p-2.5 rounded border {BORDER} {SURFACE} gap-2 shrink-0 shadow-none"):
+                        with ui.row().classes("w-full items-center justify-between"):
+                            with ui.row().classes("items-center gap-1.5"):
+                                ui.icon("tune", size="18px").classes("text-primary")
+                                ui.label("Workflow Parameters & Inputs").classes(f"text-xs font-bold {STRONG}")
+                            with ui.row().classes("items-center gap-1"):
+                                def _add_custom_input():
+                                    dlg_var = ui.dialog()
+                                    with dlg_var, ui.card().classes(f"w-[380px] p-4 gap-2 bg-white dark:bg-slate-900 rounded-xl border {BORDER}"):
+                                        ui.label("Add Input Parameter").classes("font-bold text-xs")
+                                        v_key_in = ui.input("Variable Key", placeholder="e.g. folder_name").classes("w-full text-xs").props("outlined dense")
+                                        v_val_in = ui.input("Initial Value", placeholder="Value").classes("w-full text-xs").props("outlined dense")
+                                        with ui.row().classes("w-full justify-end gap-2 pt-2"):
+                                            ui.button("Cancel", on_click=dlg_var.close).props("flat dense")
+                                            def _set_var():
+                                                k = v_key_in.value.strip()
+                                                if k:
+                                                    active_state["initial_state"][k] = v_val_in.value
+                                                    _refresh_variable_inputs()
+                                                    dlg_var.close()
+                                            ui.button("Add", on_click=_set_var).props("unelevated dense color=primary no-caps")
+                                    dlg_var.open()
+
+                                ui.button("+ Add Variable", icon="add", on_click=_add_custom_input).props("flat dense size=xs color=primary no-caps")
+
+                        variables_container = ui.column().classes("w-full gap-2")
+
+                        with ui.row().classes("w-full items-center justify-between pt-1 border-t border-slate-200 dark:border-slate-800"):
+                            with ui.row().classes("items-center gap-1 text-[11px] text-slate-500 font-mono"):
+                                ui.label(f"Target: {Path(active_state['workspace_path']).name}").classes("truncate max-w-[200px]")
+                            with ui.row().classes("items-center gap-1.5"):
+                                run_btn = ui.button("▶ Run Workflow", icon="play_arrow").props("unelevated dense size=sm color=primary no-caps font-bold")
+                                cancel_btn = ui.button(icon="stop").props("unelevated dense round size=sm color=red")
+                                cancel_btn.visible = False
 
                     # Interactive Gate Approval Banner (Appears when WAITING_APPROVAL)
                     gate_card = ui.card().classes("w-full p-3 rounded-lg border-2 border-amber-500 bg-amber-50 dark:bg-amber-950/60 gap-2 shrink-0")
@@ -5739,6 +5806,14 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                     model_tag = f"🤖 {assigned_m}" if assigned_m else ""
                     desc = n.description or n.config.get("guard_target") or n.config.get("tool_name") or n.config.get("prompt", "")[:36] or ""
 
+                    # Badges for node footer
+                    p_name = n.config.get("persona_name") or (Path(n.config["handbag_path"]).name if n.config.get("handbag_path") else "")
+                    persona_tag = f"👜 {p_name}" if p_name else ""
+                    tools_cnt = len(n.config.get("tools", []))
+                    tools_tag = f"🛠️ {tools_cnt}" if tools_cnt > 0 else ("🛠️ 1 tool" if n.node_type == NodeType.TOOL and n.config.get("tool_name") else "")
+                    skills_cnt = len(n.config.get("skills", []))
+                    skills_tag = f"🧠 {skills_cnt} skills" if skills_cnt > 0 else ""
+
                     nodes_data.append({
                         "id": nid,
                         "name": n.name,
@@ -5747,6 +5822,9 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                         "icon": icon,
                         "badge": badge,
                         "model": model_tag,
+                        "persona": persona_tag,
+                        "tools": tools_tag,
+                        "skills": skills_tag,
                         "desc": desc,
                         "x": pos[0] if isinstance(pos, (tuple, list)) else pos.get("x", 100),
                         "y": pos[1] if isinstance(pos, (tuple, list)) else pos.get("y", 100),
@@ -5964,7 +6042,12 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                                         <div style="font-size:10px; color:#94a3b8; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
                                             ${{node.desc || '(no description)'}}
                                         </div>
-                                        <div style="display:flex; align-items:center; justify-content:space-between; border-top:1px solid #1e293b; padding-top:4px; font-size:9px;">
+                                        <div style="display:flex; align-items:center; gap:6px; font-size:9px; overflow:hidden;">
+                                            ${{node.persona ? `<span style="color:#c084fc;">${{node.persona}}</span>` : ''}}
+                                            ${{node.tools ? `<span style="color:#34d399;">${{node.tools}}</span>` : ''}}
+                                            ${{node.skills ? `<span style="color:#fcd34d;">${{node.skills}}</span>` : ''}}
+                                        </div>
+                                        <div style="display:flex; align-items:center; justify-content:space-between; border-top:1px solid #1e293b; padding-top:3px; font-size:9px;">
                                             <span style="color:#38bdf8;">${{node.model || ''}}</span>
                                             <span style="color:#64748b;">${{node.is_start ? '🚩 START' : ''}}</span>
                                         </div>
@@ -6068,6 +6151,29 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                     status_lbl.set_text(f"Halted: {ctx.last_error or 'Error'}")
                     ui.notify(f"Workflow halted: {ctx.last_error}", type="warning")
 
+            def _refresh_variable_inputs():
+                variables_container.clear()
+                wf = active_state["wf"]
+                extracted_vars = wf.get_template_variables() if hasattr(wf, "get_template_variables") else []
+                if "task_prompt" not in extracted_vars and not extracted_vars:
+                    extracted_vars = ["task_prompt"]
+
+                # Merge discovered variables with initial_state
+                for v in extracted_vars:
+                    if v not in active_state["initial_state"]:
+                        active_state["initial_state"][v] = ""
+
+                with variables_container:
+                    for v_name in sorted(list(active_state["initial_state"].keys())):
+                        curr_v = active_state["initial_state"].get(v_name, "")
+                        with ui.row().classes("w-full items-center gap-2"):
+                            def _make_change(key_name=v_name):
+                                return lambda e: active_state["initial_state"].update({key_name: e.value})
+                            inp = ui.input(f"{{{{{v_name}}}}}", value=str(curr_v)).classes("flex-1 text-xs").props("outlined dense")
+                            inp.on_value_change(_make_change(v_name))
+
+            _refresh_variable_inputs()
+
             async def _run_current_workflow():
                 session.ensure_ready()
                 wf = active_state["wf"]
@@ -6075,10 +6181,11 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                 wf.description = wf_desc_input.value.strip() or wf.description
                 wf.start_node_id = start_node_select.value or wf.start_node_id
 
+                ws_target = active_state["workspace_path"]
                 engine = WorkflowEngine(
                     client=session.client,
                     personality=session.personality,
-                    workspace_path=prefs.workspace_path,
+                    workspace_path=ws_target,
                     debug=True,
                 )
                 active_state["engine"] = engine
@@ -6089,7 +6196,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                 log_container.clear()
                 gate_card.visible = False
 
-                init_state = {"task_prompt": task_input.value.strip() or "Process project tasks."}
+                init_state = dict(active_state["initial_state"])
 
                 try:
                     from nicegui import run as _ng_run
@@ -6105,6 +6212,12 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
 
             run_btn.on("click", _run_current_workflow)
 
+            def _switch_workspace_context(new_ws: str):
+                active_state["workspace_path"] = str(Path(new_ws).resolve())
+                ui.notify(f"Workflow execution workspace set to: {Path(new_ws).name}", type="info")
+                _reload_workflows_list()
+                refresh_studio_canvas()
+
             # Node Editor Modal Dialog
             def _open_node_editor(node: WorkflowNode):
                 e_dlg = ui.dialog().props("maximized")
@@ -6117,7 +6230,31 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                     model_choices[m_alias] = f"🤖 {m_alias}"
 
                 # Extract available tools
-                tool_choices = ["tool_organize_files_from_plan", "tool_read_file", "tool_write_file", "tool_list_files", "tool_execute_shell_command", "tool_execute_python_code", "tool_inspect_image"]
+                tool_choices = [
+                    "tool_organize_files_from_plan",
+                    "tool_read_file",
+                    "tool_write_file",
+                    "tool_list_files",
+                    "tool_find_files",
+                    "tool_grep_files",
+                    "tool_execute_shell_command",
+                    "tool_execute_python_code",
+                    "tool_execute_python_file",
+                    "tool_inspect_image",
+                    "tool_vlm_query",
+                    "tool_inspect_document",
+                    "tool_read_document_content",
+                    "tool_annotate_document",
+                    "tool_edit_document_text",
+                    "tool_execute_python_data_query",
+                    "tool_get_table_schema",
+                    "tool_query_database_sql",
+                    "tool_git_status",
+                    "tool_git_commit",
+                    "tool_git_diff",
+                    "tool_generate_image",
+                    "tool_load_skill",
+                ]
                 if session.personality and hasattr(session.personality, "list_tools_structured"):
                     try:
                         for t in session.personality.list_tools_structured():
@@ -6125,6 +6262,24 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                                 tool_choices.append(t["name"])
                     except Exception:
                         pass
+
+                # Extract available personas / handbags
+                subws_data = agent_bridge.get_subws_tools_and_skills(session.personality, prefs, session.client)
+                available_handbags = subws_data.get("available_handbags", [])
+                persona_choices = {"": "Default Specialist (SubAgent)"}
+                for hb in available_handbags:
+                    persona_choices[hb["path"]] = f"👜 {hb['title']} ({hb['scope']})"
+
+                # Extract available skills (from subws_data and personality)
+                all_skills = []
+                h_skills = subws_data.get("skills", {}).get("handbag", [])
+                p_skills = subws_data.get("skills", {}).get("project", [])
+                o_skills = subws_data.get("skills", {}).get("other", [])
+                for s in h_skills + p_skills + o_skills:
+                    if s.get("title") and s["title"] not in all_skills:
+                        all_skills.append(s["title"])
+                if not all_skills:
+                    all_skills = ["file_organization", "git_workflow_mastery", "document_analysis_and_extraction", "desktop_automation", "fullstack_development", "bibliography_and_research", "deep_websearch_and_extraction"]
 
                 with e_dlg, ui.card().classes(f"w-full h-full flex flex-col p-4 {CANVAS} rounded-xl border {BORDER} gap-3"):
                     with ui.row().classes(f"w-full items-center justify-between pb-2 border-b {BORDER} shrink-0"):
@@ -6166,9 +6321,66 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                                         cfg_inputs["output_variable"] = ui.input("Output Variable Key", value=node.config.get("output_variable", "llm_output")).classes("flex-1 text-xs font-mono").props("outlined dense")
 
                                 elif node.node_type == NodeType.AGENT:
-                                    cfg_inputs["instruction"] = ui.textarea("Task Directive (Headless Worker)", value=node.config.get("instruction", node.config.get("task", ""))).classes("w-full text-xs font-mono").props("outlined dense rows=4")
-                                    cfg_inputs["personality_conditioning"] = ui.textarea("Specialist Persona Conditioning", value=node.config.get("personality_conditioning", node.config.get("persona", ""))).classes("w-full text-xs").props("outlined dense rows=2")
-                                    with ui.row().classes("w-full gap-2"):
+                                    # 1. Handbag Persona Selection
+                                    curr_hb = node.config.get("handbag_path", "")
+                                    if curr_hb and curr_hb not in persona_choices:
+                                        persona_choices[curr_hb] = f"👜 {Path(curr_hb).name}"
+
+                                    with ui.row().classes("w-full items-center gap-2"):
+                                        ui.icon("face", size="20px").classes("text-purple-500")
+                                        cfg_inputs["handbag_path"] = ui.select(
+                                            persona_choices,
+                                            value=curr_hb,
+                                            label="Select Agent Persona (from Handbag)"
+                                        ).classes("flex-1 text-xs").props("outlined dense options-dense")
+
+                                    cfg_inputs["instruction"] = ui.textarea(
+                                        "Task Directive (Headless Worker)",
+                                        value=node.config.get("instruction", node.config.get("task", ""))
+                                    ).classes("w-full text-xs font-mono").props("outlined dense rows=3").tooltip("Specific task with {{variable}} interpolation support")
+
+                                    cfg_inputs["personality_conditioning"] = ui.textarea(
+                                        "Persona Conditioning / System Directives",
+                                        value=node.config.get("personality_conditioning", node.config.get("persona", ""))
+                                    ).classes("w-full text-xs").props("outlined dense rows=2")
+
+                                    # 2. Skills Multiselect Chips
+                                    curr_skills = node.config.get("skills", [])
+                                    if not isinstance(curr_skills, list):
+                                        curr_skills = [curr_skills] if curr_skills else []
+
+                                    with ui.column().classes("w-full gap-1 pt-1"):
+                                        with ui.row().classes("items-center justify-between w-full"):
+                                            ui.label("Assigned Skills (Methodologies injected into this Agent):").classes("text-xs font-semibold text-amber-500")
+                                            ui.badge(f"{len(curr_skills)} active", color="amber").props("dense rounded text-[9px]")
+
+                                        skills_select = ui.select(
+                                            all_skills,
+                                            value=curr_skills,
+                                            multiple=True,
+                                            label="Pick Skills to assign to this Agent node"
+                                        ).classes("w-full text-xs").props("outlined dense use-chips clearable")
+                                        cfg_inputs["skills"] = skills_select
+
+                                    # 3. Tools Multiselect Chips
+                                    curr_agent_tools = node.config.get("tools", [])
+                                    if not isinstance(curr_agent_tools, list):
+                                        curr_agent_tools = [curr_agent_tools] if curr_agent_tools else []
+
+                                    with ui.column().classes("w-full gap-1 pt-1"):
+                                        with ui.row().classes("items-center justify-between w-full"):
+                                            ui.label("Allowed Tools (Capabilities granted to this Agent):").classes("text-xs font-semibold text-emerald-500")
+                                            ui.badge(f"{len(curr_agent_tools)} active", color="emerald").props("dense rounded text-[9px]")
+
+                                        tools_select = ui.select(
+                                            tool_choices,
+                                            value=curr_agent_tools,
+                                            multiple=True,
+                                            label="Pick Tools granted to this Agent"
+                                        ).classes("w-full text-xs font-mono").props("outlined dense use-chips clearable")
+                                        cfg_inputs["tools"] = tools_select
+
+                                    with ui.row().classes("w-full gap-2 pt-1"):
                                         cfg_inputs["max_steps"] = ui.number("Max Reasoning Budget", value=int(node.config.get("max_steps", 6)), step=1).classes("flex-1 text-xs").props("outlined dense")
                                         cfg_inputs["output_variable"] = ui.input("Output Variable Key", value=node.config.get("output_variable", "agent_output")).classes("flex-1 text-xs font-mono").props("outlined dense")
 
@@ -6232,11 +6444,21 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                                         node.config["tool_params"] = json.loads(widget.value)
                                     except Exception:
                                         node.config["tool_params"] = {}
+                                elif k == "handbag_path":
+                                    val = widget.value
+                                    if val:
+                                        node.config["handbag_path"] = val
+                                        node.config["persona_name"] = Path(val).name
+                                    else:
+                                        node.config.pop("handbag_path", None)
+                                        node.config.pop("persona_name", None)
                                 else:
                                     node.config[k] = widget.value
 
                             e_dlg.close()
+                            refresh_studio_canvas()
                             refresh_pipeline_ui()
+                            _refresh_variable_inputs()
                             ui.notify(f"Updated step '{node.name}'", type="positive")
 
                         ui.button("Save Step Config", icon="check", on_click=_save_node_changes).props("unelevated dense color=primary no-caps font-bold")

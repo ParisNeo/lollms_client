@@ -48,6 +48,67 @@ class WorkflowEngine:
         self.max_steps = max_steps
         self.debug = debug
 
+    def _resolve_skills_context(self, skill_titles: List[str], ws_path: Path) -> str:
+        """Resolves content for assigned skill titles from personality or skills directories."""
+        if not skill_titles:
+            return ""
+
+        blocks = []
+        for title in skill_titles:
+            clean_title = str(title).strip()
+            content = None
+
+            # 1. Query Personality SkillsManager
+            if self.personality and hasattr(self.personality, "skills_manager") and self.personality.skills_manager:
+                s_obj = self.personality.skills_manager.get_skill(clean_title)
+                if s_obj:
+                    content = s_obj.content
+
+            # 2. Check workspace-local skills directory (.lollms_code/skills/)
+            if not content:
+                for cand in (ws_path / ".lollms_code" / "skills" / clean_title / "SKILL.md",
+                             ws_path / ".lollms_code" / "skills" / f"{clean_title}.md"):
+                    if cand.exists():
+                        try:
+                            content = cand.read_text(encoding="utf-8", errors="ignore")
+                            break
+                        except Exception:
+                            pass
+
+            # 3. Check global user skills directory (~/.lollms_client/skills/)
+            if not content:
+                for cand in ((Path.home() / ".lollms_client" / "skills" / clean_title / "SKILL.md"),
+                             (Path.home() / ".lollms_client" / "skills" / f"{clean_title}.md")):
+                    if cand.exists():
+                        try:
+                            content = cand.read_text(encoding="utf-8", errors="ignore")
+                            break
+                        except Exception:
+                            pass
+
+            if content:
+                blocks.append(f"--- Skill: {clean_title} ---\n{content.strip()}\n--- End Skill: {clean_title} ---")
+
+        return "\n\n".join(blocks)
+
+    def _resolve_tools_subset(self, tool_names: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Resolves an active tools dictionary filtered by the requested tool names."""
+        if not tool_names:
+            return {}
+
+        target_set = {t.strip() for t in tool_names if t.strip()}
+        all_tools = {}
+
+        if self.personality and hasattr(self.personality, "_discover_tools"):
+            all_tools = self.personality._discover_tools(enable_workspace_tools=True, enable_shell=True)
+        elif self.client and hasattr(self.client, "tools") and hasattr(self.client.tools, "to_chat_tool_specs"):
+            try:
+                all_tools = self.client.tools.to_chat_tool_specs()
+            except Exception:
+                pass
+
+        return {k: v for k, v in all_tools.items() if k in target_set}
+
     def _resolve_tool_callable(self, tool_name: str) -> Optional[Callable]:
         """Resolves a tool callable from the personality or client's tool binding."""
         if self.personality and hasattr(self.personality, "_discover_tools"):
@@ -246,7 +307,17 @@ class WorkflowEngine:
             if not tool_fn:
                 raise RuntimeError(f"Tool '{tool_name}' not available for node '{node.name}'.")
 
-            tool_result = tool_fn(**params)
+            # Execute tool with CWD pointing to the selected workspace
+            ws = context.workspace_path or self.workspace_path
+            old_cwd = Path.cwd()
+            try:
+                if ws and Path(ws).exists():
+                    import os
+                    os.chdir(str(Path(ws).resolve()))
+                tool_result = tool_fn(**params)
+            finally:
+                import os
+                os.chdir(str(old_cwd))
 
             out_var = node.config.get("output_variable")
             if out_var:
@@ -304,22 +375,65 @@ class WorkflowEngine:
             conditioning = context.render_template(node.config.get("personality_conditioning", node.config.get("persona", "")))
             max_steps = int(node.config.get("max_steps", node.config.get("max_rounds", 6)))
             temperature = float(node.config.get("temperature", 0.3))
+            handbag_path = node.config.get("handbag_path")
+            assigned_skills = node.config.get("skills", [])
+            assigned_tools = node.config.get("tools", [])
+            ws = context.workspace_path or self.workspace_path
 
             def _call_agent():
-                if hasattr(self.personality, "_sub_agent_spawner") and self.personality._sub_agent_spawner:
+                target_agent = None
+
+                # 1. Custom Handbag Persona Loading
+                if handbag_path and Path(handbag_path).exists():
+                    try:
+                        from lollms_client.lollms_personality import LollmsPersonality
+                        target_agent = LollmsPersonality.from_handbag(handbag_path, lollms_client=self.client)
+                    except Exception as hb_err:
+                        ASCIIColors.warning(f"[WorkflowEngine] Could not load handbag '{handbag_path}': {hb_err}")
+
+                if target_agent is None and self.personality:
+                    target_agent = self.personality
+
+                # 2. Inject Assigned Skills into Persona
+                full_conditioning = conditioning
+                if assigned_skills:
+                    skill_blocks = self._resolve_skills_context(assigned_skills, ws)
+                    if skill_blocks:
+                        full_conditioning = f"{full_conditioning}\n\n=== ASSIGNED WORKFLOW SKILLS ===\n{skill_blocks}\n=== END WORKFLOW SKILLS ===".strip()
+
+                # 3. Resolve Granted Tools Subset
+                granted_tools = self._resolve_tools_subset(assigned_tools) if assigned_tools else None
+
+                # 4. Execute Sub-Agent Turn
+                if target_agent and handbag_path:
+                    target_agent.workspace_path = Path(ws)
+                    return target_agent.chat(
+                        prompt=instruction,
+                        system_prompt=full_conditioning or None,
+                        max_reasoning_steps=max_steps,
+                        temperature=temperature,
+                        use_internal_history=False,
+                        tools=granted_tools,
+                        enable_workspace_tools=True,
+                    )
+                elif hasattr(self.personality, "_sub_agent_spawner") and self.personality._sub_agent_spawner:
                     return self.personality._sub_agent_spawner.spawn(
                         instruction=instruction,
-                        personality_conditioning=conditioning or None,
+                        personality_conditioning=full_conditioning or None,
                         model_name=model_override,
                         temperature=temperature,
                         max_steps=max_steps,
+                        tools=granted_tools,
                     )
                 elif self.personality:
+                    self.personality.workspace_path = Path(ws)
                     return self.personality.chat(
                         prompt=instruction,
                         max_reasoning_steps=max_steps,
                         temperature=temperature,
                         use_internal_history=False,
+                        tools=granted_tools,
+                        enable_workspace_tools=True,
                     )
                 raise RuntimeError("Personality not initialized for AGENT node.")
 
