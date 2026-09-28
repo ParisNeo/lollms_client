@@ -3803,6 +3803,7 @@ class ChatMixin:
         """
         active_tools: Dict[str, Dict[str, Any]] = {}
         _persona_active = orchestrator_mode or orchestrator_persona
+        lcp_binding = getattr(self.lollmsClient, "tools", None)
 
         if personality and hasattr(personality, "build_rag_tools") and not _persona_active:
             active_tools.update(personality.build_rag_tools())
