@@ -216,6 +216,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-28 01:31]
+
+- feat(agent): add support for per-call `think` and `reasoning_effort` parameters in OpenAI reasoning
+
 ## [2026-09-27 23:51]
 
 - feat(llm): add GLM/vLLM backend thinking deactivation support via chat_template_kwargs
