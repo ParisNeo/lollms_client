@@ -3,7 +3,13 @@
 
 All notable changes to this project will be documented in this file.
 #
-- fix(openai:reasoning): wire per-call `think` and `reasoning_effort` parameters in `_run_chat_messages` to explicitly deactivate thinking (`reasoning_effort="none"`, `chat_template_kwargs={"enable_thinking": False}`, `thinking={"type": "disabled"}` for GLM) when `think is False` and `reasoning_effort is None`
+- docs(dynamic_mode): document Dynamic Mode operation across README.md and DOC_DEV.md, covering autonomous reasoning effort escalation via `<effort level="..."/>`, task-adapted temperature regulation, context-fitting token budgets, sub-agent delegation, and CLI/GUI controls
+- fix(artefact:patching): resolve Aider patch conflict marker leakage into source code by stopping replace block absorption on subsequent search headers, scrubbing stray sentinel lines from replacements, and decontaminating final result strings
+- fix(artefact:guard): block raw search/replace conflict blocks from being written directly to disk as full files when targets are missing, preventing disk corruption with `=======`
+- fix(artefact:streaming): dynamically detect `<<<<<<< SEARCH` during chunk streaming to switch UI state from full rewrite to patch, and stream whole generated content into the processing block and UI code box
+- feat(openai:vllm): add vLLM server support to OpenAI binding, injecting `chat_template_kwargs` (`enable_thinking`, `thinking`, `reasoning_effort`) via `extra_body`, forwarding `top_k`, `repetition_penalty`, and `min_tokens`, preserving `temperature` and `top_p` sampling controls on vLLM, and adding auto-detection via `/version` probe
+- fix(bindings:reasoning): enforce thought suppression rule across `lollms`, `openai`, and `ollama` bindings: if `think is True`, inspect `reasoning_effort` and send to server, or deactivate thought completely if effort is none/None; for `ollama`, automatically deactivate thinking whenever `think` is not True independently of the effort parameter
+- fix(lollms:reasoning): fix `reasoning_effort` parameter defaults in `LollmsBinding` from `"low"` to `None`, implement `_apply_thinking_params`, add `suppress_thinking` support to `_StreamThinkingHandler`, and strip reasoning tags on thought deactivation
 - fix(ollama:reasoning): project `'max'` and extreme reasoning efforts to `'high'` to conform to Ollama's `ChatRequest` schema (`Union[bool, Literal['low', 'medium', 'high']]`), resolving Pydantic validation crashes
 - fix(discussion:chat): initialize `was_cancelled` before `_persist_round_state()` definition in `_mixin_chat.py` to prevent enclosing scope `UnboundLocalError` warnings
 - feat(ollama:reasoning): upgrade requirement to `ollama>=0.6.2`, pass `think=False` & `options["think"]=False` when disabled to instruct engine not to think, and pass exact effort level strings (`low`, `medium`, `high`, `max`) when enabled

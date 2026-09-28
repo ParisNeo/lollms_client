@@ -1255,16 +1255,15 @@ class LollmsClient():
         kwargs.pop("reasoning_summary", None)
 
         is_thinking_deactivated = (
-            (think_arg is False and effort_arg is None)
-            or think_arg is False
-            or reasoning_effort in (None, "none", "off", "disabled", "false", "0")
+            think_arg is not True
+            or reasoning_effort is None
+            or str(reasoning_effort).strip().lower() in ("none", "off", "disabled", "false", "0", "")
         )
 
         if is_thinking_deactivated:
             kwargs["think"] = False
             kwargs["reasoning_effort"] = None
             m_name = getattr(getattr(self, "llm", None), "model_name", "") or ""
-            deact = LollmsLLMBinding.get_deactivate_thinking_payload(m_name)
             extra_body = kwargs.setdefault("extra_body", {})
             if isinstance(extra_body, dict):
                 extra_body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
@@ -1274,7 +1273,7 @@ class LollmsClient():
                 else:
                     extra_body["thinking"] = False
         else:
-            kwargs["think"] = True if (think_arg is True or reasoning_effort) else False
+            kwargs["think"] = True
             kwargs["reasoning_effort"] = reasoning_effort
 
         ASCIIColors.info(
@@ -1323,16 +1322,15 @@ class LollmsClient():
         kwargs.pop("reasoning_summary", None)
 
         is_thinking_deactivated = (
-            (think_arg is False and effort_arg is None)
-            or think_arg is False
-            or reasoning_effort in (None, "none", "off", "disabled", "false", "0")
+            think_arg is not True
+            or reasoning_effort is None
+            or str(reasoning_effort).strip().lower() in ("none", "off", "disabled", "false", "0", "")
         )
 
         if is_thinking_deactivated:
             kwargs["think"] = False
             kwargs["reasoning_effort"] = None
             m_name = getattr(getattr(self, "llm", None), "model_name", "") or ""
-            deact = LollmsLLMBinding.get_deactivate_thinking_payload(m_name)
             extra_body = kwargs.setdefault("extra_body", {})
             if isinstance(extra_body, dict):
                 extra_body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
@@ -1342,7 +1340,7 @@ class LollmsClient():
                 else:
                     extra_body["thinking"] = False
         else:
-            kwargs["think"] = True if (think_arg is True or reasoning_effort) else False
+            kwargs["think"] = True
             kwargs["reasoning_effort"] = reasoning_effort
 
         ASCIIColors.info(

@@ -1036,10 +1036,34 @@ class _AgentStreamState:
             self._tool_buffer += incoming_chunk
             self._pending_buffer = ""
 
-            # ── DETECT NEW STRUCTURAL SYMBOLS ──
             art_lang = self.live_artifact_meta.get("language", "") if self.live_artifact_meta else ""
             art_type = self.live_artifact_meta.get("art_type", "code") if self.live_artifact_meta else "code"
             art_title = self.live_artifact_meta.get("title", "artifact") if self.live_artifact_meta else "artifact"
+
+            # ── 🔄 DYNAMIC PATCH DETECTION IN STREAM BUFFER ──
+            if self.live_artifact_meta and not self.live_artifact_meta.get("is_patch"):
+                if (
+                    "<<<<<<< SEARCH" in self._tool_buffer
+                    or bool(re.search(r'^\s*<{5,10}\s*SEARCH\b', self._tool_buffer, re.MULTILINE | re.IGNORECASE))
+                ):
+                    self.live_artifact_meta["is_patch"] = True
+                    self.live_artifact_meta["operation"] = "patch"
+                    if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                        self._cb("", getattr(MSG_TYPE, "MSG_TYPE_ARTEFACT_BUILD_START", MSG_TYPE.MSG_TYPE_CHUNK), {
+                            **self.live_artifact_meta,
+                            "stream_complete": False
+                        })
+                    if self._event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                        self._cb(f'\n🔧 Detected SEARCH/REPLACE patch for {art_title}...\n', MSG_TYPE.MSG_TYPE_CHUNK, {
+                            "was_processed": True,
+                            "event_type": "artifact_mode_switch",
+                            "artifact_title": art_title,
+                            "is_patch": True,
+                            "operation": "patch"
+                        })
+
+            # Stream whole generated content directly into content container
+            self.content += incoming_chunk
 
             # Parse structural symbols in active buffer
             symbols = _detect_structural_symbols(self._tool_buffer, art_lang, art_type)
@@ -1075,24 +1099,22 @@ class _AgentStreamState:
                         })
 
             if self._event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
-                self._cb(incoming_chunk, MSG_TYPE.MSG_TYPE_CHUNK, {"live_artifact_chunk": True, "artifact_title": art_title, "artifact_lang": art_lang})
+                self._cb(incoming_chunk, MSG_TYPE.MSG_TYPE_CHUNK, {
+                    "live_artifact_chunk": True,
+                    "artifact_title": art_title,
+                    "artifact_lang": art_lang,
+                    "is_patch": self.live_artifact_meta.get("is_patch", False) if self.live_artifact_meta else False,
+                    "operation": self.live_artifact_meta.get("operation", "full_rewrite") if self.live_artifact_meta else "full_rewrite"
+                })
             elif self._event_mode == EventMode.PROCESSING_TAG_MODE:
-                clean_chunk = incoming_chunk
-                if "<<<<<<< SEARCH" in clean_chunk:
-                    clean_chunk = clean_chunk.replace("<<<<<<< SEARCH", "\n[🔍 SEARCH BLOCK]\n")
-                if "=======" in clean_chunk:
-                    clean_chunk = clean_chunk.replace("=======", "\n[✏️ REPLACE BLOCK]\n")
-                if ">>>>>>> REPLACE" in clean_chunk:
-                    clean_chunk = clean_chunk.replace(">>>>>>> REPLACE", "\n[✅ END REPLACE]\n")
-
-                if not new_symbols:
-                    self._cb(clean_chunk, MSG_TYPE.MSG_TYPE_CHUNK, {
-                        "was_processed": True, 
-                        "event_type": "artifact_chunk",
-                        "artifact_title": art_title,
-                        "is_patch": self.live_artifact_meta.get("is_patch", False) if self.live_artifact_meta else False,
-                        "live_artifact_chunk": True
-                    })
+                self._cb(incoming_chunk, MSG_TYPE.MSG_TYPE_CHUNK, {
+                    "was_processed": True, 
+                    "event_type": "artifact_chunk",
+                    "artifact_title": art_title,
+                    "is_patch": self.live_artifact_meta.get("is_patch", False) if self.live_artifact_meta else False,
+                    "operation": self.live_artifact_meta.get("operation", "full_rewrite") if self.live_artifact_meta else "full_rewrite",
+                    "live_artifact_chunk": True
+                })
 
             self._try_complete_artifact()
 
@@ -1337,8 +1359,17 @@ class _AgentStreamState:
                 if type_match:
                     parsed_art_type = type_match.group(1)
 
-                is_patch_start = "<<<<<<< SEARCH" in self._tool_buffer
-                operation_type = "patch" if is_patch_start else "full_rewrite"
+                parsed_operation = None
+                for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
+                    if m.group(1).lower() == "operation":
+                        parsed_operation = m.group(2).lower()
+
+                is_patch_start = (
+                    parsed_operation == "patch"
+                    or "<<<<<<< SEARCH" in partial_tag_buffer
+                    or bool(re.search(r'^\s*<{5,10}\s*SEARCH\b', partial_tag_buffer, re.MULTILINE | re.IGNORECASE))
+                )
+                operation_type = "patch" if is_patch_start else (parsed_operation or "full_rewrite")
 
                 self.live_artifact_meta = {
                     "title": title, 
@@ -1751,13 +1782,23 @@ class _AgentStreamState:
                 # Verify containment to prevent directory traversal
                 if str(file_target).startswith(str(self.workspace_path)):
                     file_target.parent.mkdir(parents=True, exist_ok=True)
-                    if is_patch_end and file_target.exists():
-                        from lollms_client.lollms_artefact import ArtefactManager
-                        orig_text = file_target.read_text(encoding="utf-8", errors="ignore")
-                        patched_text = ArtefactManager.apply_aider_patch(orig_text, body_content)
-                        file_target.write_text(patched_text, encoding="utf-8")
-                        disk_saved = True
-                        ASCIIColors.success(f"[AgentStreamState] 💾 Real-time patched '{title_end}' to disk.")
+
+                    has_patch_markers = bool(
+                        re.search(r'^\s*<{5,10}\s*SEARCH\b', body_content, re.MULTILINE | re.IGNORECASE)
+                        or re.search(r'^\s*={5,10}\s*$', body_content, re.MULTILINE)
+                    )
+                    is_effective_patch = is_patch_end or has_patch_markers
+
+                    if is_effective_patch:
+                        if file_target.exists():
+                            from lollms_client.lollms_artefact import ArtefactManager
+                            orig_text = file_target.read_text(encoding="utf-8", errors="ignore")
+                            patched_text = ArtefactManager.apply_aider_patch(orig_text, body_content)
+                            file_target.write_text(patched_text, encoding="utf-8")
+                            disk_saved = True
+                            ASCIIColors.success(f"[AgentStreamState] 💾 Real-time patched '{title_end}' to disk.")
+                        else:
+                            ASCIIColors.error(f"[AgentStreamState] Cannot patch '{title_end}': file does not exist on disk. Refusing to write raw patch markers.")
                     elif operation_end == "append" and file_target.exists():
                         orig_text = file_target.read_text(encoding="utf-8", errors="ignore")
                         sep = "" if orig_text.endswith("\n") else "\n"
@@ -1765,9 +1806,12 @@ class _AgentStreamState:
                         disk_saved = True
                         ASCIIColors.success(f"[AgentStreamState] 💾 Real-time appended to '{title_end}' on disk.")
                     else:
-                        file_target.write_text(body_content, encoding="utf-8")
-                        disk_saved = True
-                        ASCIIColors.success(f"[AgentStreamState] 💾 Real-time flushed '{title_end}' to disk ({len(body_content):,} chars).")
+                        if not has_patch_markers:
+                            file_target.write_text(body_content, encoding="utf-8")
+                            disk_saved = True
+                            ASCIIColors.success(f"[AgentStreamState] 💾 Real-time flushed '{title_end}' to disk ({len(body_content):,} chars).")
+                        else:
+                            ASCIIColors.error(f"[AgentStreamState] Blocked writing raw patch markers into '{title_end}'.")
             except Exception as disk_err:
                 ASCIIColors.warning(f"[AgentStreamState] Real-time disk write failed for '{title_end}': {disk_err}")
 

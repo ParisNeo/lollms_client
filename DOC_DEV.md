@@ -365,6 +365,84 @@ When displaying live streaming code or artifact generation in a UI:
 1. **Header Discipline**: The collapsible header/subtitle MUST display only the file name and high-level structural units (`Section: <name>`, `def <function_name>()`, `class <ClassName>`). Raw content lines (table rows, assignment expressions, code statements) must NEVER be placed in the header.
 2. **Body Discipline**: The verbatim code content must stream strictly inside the collapsible box.
 
+---
+
+## ⚡ Dynamic Mode Architecture & Autonomous Reasoning Escalation
+
+Dynamic Mode provides real-time adaptive control over the reasoning loop across both `LollmsDiscussion` and `LollmsPersonality`.
+
+```
+[Round 1 (Initial)] ──> Starts at effort="none" (fast execution, zero latency)
+                                     │
+                 [Model encounters complex refactor / bug]
+                                     │
+           ──> Emits: <effort level="high"/> on a new line
+                                     │
+[Stream Parser] ──> Intercepts tag, scrubs from user content, sets next_reasoning_effort="high"
+                                     │
+[Round 2]       ──> Binding translates "high" -> backend parameters:
+                    • Ollama: think=True, options["think"]="high"
+                    • OpenAI / vLLM: reasoning_effort="high", chat_template_kwargs={"enable_thinking": True}
+                                     │
+                 [Task finished or simplified]
+                                     │
+           ──> Emits: <effort level="none"/> ──> Concludes with <done/>
+```
+
+### 1. Interception and State Machine
+
+In `_mixin_chat.py` (`_StreamState.feed()`) and `lollms_agent_state.py` (`_AgentStreamState.feed()`):
+```python
+effort_match = re.search(
+    r'(?m)^\s*(?!`)(?!.*\|)<effort\b([^>]*)(?:/>|>.*?</effort>)',
+    self._pending_buffer,
+    re.IGNORECASE | re.DOTALL
+)
+if effort_match:
+    tag_full = effort_match.group(0)
+    attrs_part = effort_match.group(1)
+    lvl_match = re.search(r'(?:level|value)=["\']([^"\']+)["\']', attrs_part, re.IGNORECASE)
+    self.next_reasoning_effort = lvl_match.group(1).lower().strip() if lvl_match else "medium"
+```
+
+The tag is immediately removed from the pending buffer so it never enters the visible message content or database history.
+
+### 2. Multi-Backend Projection
+
+The active LLM binding projects the requested level using `LollmsLLMBinding.translate_reasoning_effort()`:
+- Translates topological effort scores ($0.0 \to 1.0$) to the model's declared `supported_reasoning_efforts`.
+- For backends where thinking must be completely silenced (`effort="none"`), bindings inject:
+  ```python
+  extra_body = {
+      "thinking": False,
+      "chat_template_kwargs": {"enable_thinking": False, "thinking": False}
+  }
+  ```
+
+### 3. Task-Adapted Sampling Temperature
+
+During agent execution in `LollmsPersonality.chat()`:
+```python
+if active_temperature is None:
+    has_code_intent = bool(ss.artifact_trigger or ss.tool_trigger or "<artifact" in raw_llm_output_buffer or "<tool" in raw_llm_output_buffer)
+    gen_kwargs["temperature"] = 0.15 if has_code_intent else 0.70
+```
+When repetition or preambles loop consecutively, the temperature dynamically escalates:
+```python
+active_temperature = min(0.95, base_temperature + (0.15 * consecutive_stall_count))
+```
+
+### 4. Sub-Agent and Spinoff Delegation
+
+Specialist workers spawned via `SubAgentSpawner.spawn()` or `tool_spinoff_agent` inherit effort parameters:
+```python
+agent_spawner.spawn(
+    instruction="Optimize the inner database indexing routine.",
+    effort="high",
+    dynamic_effort=True  # Allows child worker to adjust its own effort
+)
+```
+
 ## 6. Running Examples & Tests
 (Content updated to reflect MCP examples and removal of TasksLibrary examples)
 *   **Examples:** The `examples/` directory contains various scripts.

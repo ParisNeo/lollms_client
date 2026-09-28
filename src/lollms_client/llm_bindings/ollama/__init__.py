@@ -166,33 +166,38 @@ class OllamaBinding(LollmsLLMBinding):
     ) -> Union[bool, str]:
         """
         Resolves the Ollama thinking control.
-        Ollama's ChatRequest schema validates think as:
-          think: Optional[Union[bool, Literal['low', 'medium', 'high']]]
+
+        Rule:
+          - If think is not True, automatically deactivates thinking (returns False),
+            independently of the effort parameter.
+          - If think is True, inspects the effort parameter:
+            - If effort is None or in ("none", "off", "disabled", "false", "0", ""),
+              thought is completely deactivated (returns False).
+            - Otherwise maps effort to Ollama's accepted literals ('low', 'medium', 'high') or True.
         """
-        if (think is False and reasoning_effort is None) or think is False:
+        if think is not True:
             return False
 
-        if reasoning_effort is not None:
-            if isinstance(reasoning_effort, bool):
-                return reasoning_effort
-            effort_str = str(reasoning_effort).strip().lower()
-            if effort_str in ("none", "off", "disabled", "false", "0"):
-                return False
-            # Map higher/alternate effort aliases to Ollama's accepted literals ('low', 'medium', 'high')
-            if effort_str in ("max", "maximum", "extreme"):
-                return "high"
-            if effort_str in ("min", "minimal"):
-                return "low"
-            if effort_str in ("med",):
-                return "medium"
-            if effort_str in ("low", "medium", "high"):
-                return effort_str
-            return True
+        if reasoning_effort is None:
+            return False
 
-        if think is True:
-            return True
+        if isinstance(reasoning_effort, bool):
+            return reasoning_effort
 
-        return False
+        effort_str = str(reasoning_effort).strip().lower()
+        if effort_str in ("none", "off", "disabled", "false", "0", ""):
+            return False
+
+        # Map higher/alternate effort aliases to Ollama's accepted literals ('low', 'medium', 'high')
+        if effort_str in ("max", "maximum", "extreme"):
+            return "high"
+        if effort_str in ("min", "minimal"):
+            return "low"
+        if effort_str in ("med",):
+            return "medium"
+        if effort_str in ("low", "medium", "high"):
+            return effort_str
+        return True
 
     def clean_message_images(self, messages: list[dict]) -> list[dict]:
         """

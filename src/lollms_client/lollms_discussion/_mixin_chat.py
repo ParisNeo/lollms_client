@@ -1248,13 +1248,33 @@ class _StreamState:
                     self._action_dispatched = True
                     return False
                 else:
-                    # Still in the middle of the artifact body. Suppress raw output from main stream.
+                    # Dynamic detection if patch sentinels arrive in chunk stream
+                    if not getattr(self.artefact_tracker, "is_patch", False):
+                        if (
+                            "<<<<<<< SEARCH" in self._artefact_buffer
+                            or bool(re.search(r'^\s*<{5,10}\s*SEARCH\b', self._artefact_buffer, re.MULTILINE | re.IGNORECASE))
+                        ):
+                            self.artefact_tracker.is_patch = True
+                            if self.event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                                _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START, {
+                                    "title": self.artefact_tracker.current_title,
+                                    "art_type": self.artefact_tracker.current_art_type,
+                                    "language": self.artefact_tracker.current_language,
+                                    "is_patch": True,
+                                    "operation": "patch",
+                                    "stream_complete": False
+                                })
+                            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                                patch_notice = f'\n🔧 Detected SEARCH/REPLACE patch for {self.artefact_tracker.current_title}...\n'
+                                self.ai_message.content += patch_notice
+                                _cb(self.callback, patch_notice, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                    # Stream whole generated content directly into ai_message.content within processing block
+                    self.ai_message.content += chunk
+
                     event_meta = self.artefact_tracker.feed(chunk)
                     if event_meta:
                         new_symbols = event_meta.get("new_symbols", [])
-
-                        # ── EMIT TARGETED SYMBOL DETECTION EVENTS ──
-                        if new_symbols:
                             for sym in new_symbols:
                                 if self.event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
                                     _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACT_SYMBOL_DETECTED, {
@@ -1325,9 +1345,16 @@ class _StreamState:
                                     self.ai_message.content += status_tag
                                     _cb(self.callback, status_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
-                        # If forward_artefact_chunks is True, also forward the raw chunk
                         if self.forward_artefact_chunks and self.event_mode.has_callbacks:
                             _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK, event_meta)
+                    else:
+                        _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_CHUNK, {
+                            "was_processed": True,
+                            "live_artifact_chunk": True,
+                            "artifact_title": self.artefact_tracker.current_title,
+                            "artifact_lang": self.artefact_tracker.current_language,
+                            "is_patch": getattr(self.artefact_tracker, "is_patch", False)
+                        })
 
                 return True
 

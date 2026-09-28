@@ -6221,7 +6221,11 @@ JSON:"""
                                     elif m.group(1).lower() == "type":
                                         resolved_art_type = m.group(2).lower()
 
-                                is_patch = "<<<<<<< SEARCH" in body_content
+                                has_patch_markers = bool(
+                                    re.search(r'^\s*<{5,10}\s*SEARCH\b', body_content, re.MULTILINE | re.IGNORECASE)
+                                    or re.search(r'^\s*={5,10}\s*$', body_content, re.MULTILINE)
+                                )
+                                is_patch = ("<<<<<<< SEARCH" in body_content) or has_patch_markers
                                 is_append = operation_type == "append"
 
                                 if was_truncated and not is_patch and not is_append:
@@ -6239,8 +6243,6 @@ JSON:"""
                                 file_path = self._resolved_workspace / title
                                 is_overwrite = file_path.exists()
 
-                                # Git safety only applies to overwrites of existing files via full_rewrite or patch.
-                                # Appending is a modification, but we bypass the strict "are you sure you want to overwrite?" block for appends.
                                 if not is_append:
                                     git_block = self._enforce_git_safety(title, is_overwrite)
                                     if git_block:
@@ -6334,6 +6336,10 @@ JSON:"""
                                     stripped_body = body_content.strip()
                                     if not stripped_body:
                                         action_reports.append(f"❌ FILE WRITE BLOCKED for {title}. Empty artifact body.")
+                                        continue
+
+                                    if has_patch_markers:
+                                        action_reports.append(f"❌ FILE WRITE BLOCKED for {title}. Content contains raw patch markers (=======).")
                                         continue
 
                                     if self._artefact_manager:

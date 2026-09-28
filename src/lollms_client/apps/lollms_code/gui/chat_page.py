@@ -2403,8 +2403,10 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                 title = ev.data.get("title", "artifact")
                 lang = ev.data.get("language", "")
                 op = ev.data.get("operation", "write")
+                is_patch = ev.data.get("is_patch", False) or (op == "patch")
                 sec = ev.data.get("current_section") or ""
-                subtitle = f"writing {op} · {lang}..." if lang else f"writing {op}..."
+                op_label = "patch" if is_patch else op
+                subtitle = f"{op_label} · {lang}..." if lang else f"{op_label}..."
                 if sec:
                     subtitle = f"{sec}..."
                 seal_current_text_block()
@@ -2422,26 +2424,30 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                         if active_artefact_panels[k] is existing_item:
                             del active_artefact_panels[k]
 
+                header_icon_name = "build" if is_patch else "description"
+                header_color = "amber-500" if is_patch else "purple-500"
+                panel_title = f"🔧 Patching: {title}" if is_patch else f"📝 Writing: {title}"
+
                 panel = add_event_panel(
-                    title=f"📝 Writing: {title}",
+                    title=panel_title,
                     subtitle=subtitle,
                     body="",
-                    color="purple-500",
-                    icon="description",
+                    color=header_color,
+                    icon=header_icon_name,
                     with_spinner=True,
                     expanded=True
                 )
                 active_artefact_panels[title] = {
                     "panel": panel,
                     "title": title,
-                    "op": op,
+                    "op": "patch" if is_patch else op,
                     "lang": lang,
                     "buffer": "",
                     "last_line": "",
                     "entry": getattr(panel, "_debug_entry", {})
                 }
-                status_label.set_text(f"Writing {title}…")
-                _paint_round(timeline_slots, session.current_round, "bg-purple-500 animate-pulse")
+                status_label.set_text(f"{'Patching' if is_patch else 'Writing'} {title}…")
+                _paint_round(timeline_slots, session.current_round, f"bg-{header_color} animate-pulse")
 
             elif ev.kind == "artefact_chunk":
                 title = ev.data.get("title", "artifact")
@@ -2451,6 +2457,19 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                     item["buffer"] += chunk_txt
                     panel = item["panel"]
 
+                    # Dynamic patch detection if chunk reveals SEARCH block
+                    if item.get("op") != "patch" and (
+                        "<<<<<<< SEARCH" in item["buffer"]
+                        or "<<<<<<<" in chunk_txt
+                    ):
+                        item["op"] = "patch"
+                        if hasattr(panel, "_title_label"):
+                            panel._title_label.set_text(f"🔧 Patching: {title}")
+                        if hasattr(panel, "_header_icon"):
+                            panel._header_icon._props["name"] = "build"
+                            panel._header_icon.classes(replace="text-amber-500 shrink-0")
+                        status_label.set_text(f"Patching {title}…")
+
                     # Extract ONLY structural headings or function titles for header display
                     structural_title = _extract_structural_header_title(item["buffer"])
                     if structural_title:
@@ -2458,16 +2477,15 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                         if hasattr(panel, "_sub_label"):
                             panel._sub_label.set_text(f"• {structural_title}")
                             panel._sub_label.set_visibility(True)
-                        status_label.set_text(f"Writing {title}: {structural_title[:40]}")
+                        status_label.set_text(f"{'Patching' if item.get('op') == 'patch' else 'Writing'} {title}: {structural_title[:40]}")
                     elif not item.get("last_symbol") and hasattr(panel, "_sub_label"):
-                        panel._sub_label.set_text(f"• writing content...")
+                        panel._sub_label.set_text("• patching content..." if item.get("op") == "patch" else "• writing content...")
                         panel._sub_label.set_visibility(True)
 
-                    # Stream ALL verbatim content strictly INSIDE the code box
+                    # Stream whole verbatim content directly into code box without clamping
                     buf = item["buffer"]
-                    disp_buf = f"... [{len(buf) - 3500:,} chars earlier] ...\n" + buf[-3500:] if len(buf) > 4000 else buf
                     if hasattr(panel, "_code_box"):
-                        update_code_box(panel._code_box, disp_buf)
+                        update_code_box(panel._code_box, buf)
                     if item.get("entry"):
                         item["entry"]["body"] = buf
 

@@ -675,6 +675,20 @@ class ArtefactManager:
             # MUST NEVER be written into active_file_path.
             is_virtual_lam = is_lam_content(content, logical_content, atype)
 
+            is_virtual_lam = is_lam_content(content, logical_content, atype)
+
+            # ── UNIVERSAL ANTI-CONTAMINATION GUARD ──
+            # Never write raw Aider patch sentinels into physical files on disk!
+            if isinstance(content, str) and not is_virtual_lam:
+                has_patch_sentinels = bool(
+                    re.search(r'^\s*<{5,10}\s*SEARCH\b', content, re.MULTILINE | re.IGNORECASE)
+                    or re.search(r'^\s*={5,10}\s*$', content, re.MULTILINE)
+                    or re.search(r'^\s*>{5,10}\s*REPLACE\b', content, re.MULTILINE | re.IGNORECASE)
+                )
+                if has_patch_sentinels:
+                    ASCIIColors.error(f"[ArtefactManager] CRITICAL SAFETY BLOCK: Refusing to write raw Aider patch markers into active file '{filename}'.")
+                    return
+
             if is_virtual_lam:
                 # If physical file already exists (even if 0 bytes), preserve it!
                 if active_file_path.exists():
@@ -2270,10 +2284,12 @@ class ArtefactManager:
 
     @staticmethod
     def apply_aider_patch(original: str, patch_block: str) -> str:
+        if original is None:
+            original = ""
 
-        SEARCH_RE  = re.compile(r'^<{6,8}(?:\s*\w+)?\s*$',  re.IGNORECASE)
-        SEP_RE     = re.compile(r'^={5,}\s*$')
-        REPLACE_RE = re.compile(r'^>{6,8}(?:\s*\w+)?\s*$', re.IGNORECASE)
+        SEARCH_RE  = re.compile(r'^\s*<{5,10}(?:\s*SEARCH\b[^\n]*)?$', re.IGNORECASE)
+        SEP_RE     = re.compile(r'^\s*={5,10}\s*$')
+        REPLACE_RE = re.compile(r'^\s*>{5,10}(?:\s*REPLACE\b[^\n]*)?$', re.IGNORECASE)
 
         patch_block = patch_block.replace('\r\n', '\n').replace('\r', '\n')
         lines = patch_block.split('\n')
@@ -2287,11 +2303,13 @@ class ArtefactManager:
         raw_lines = patch_block.split('\n')
         i = 0
         while i < len(raw_lines):
-            if SEARCH_RE.match(raw_lines[i].rstrip()):
+            line_r = raw_lines[i].rstrip()
+            if SEARCH_RE.match(line_r):
                 i += 1
                 search_lines: List[str] = []
                 while i < len(raw_lines):
-                    if SEP_RE.match(raw_lines[i].rstrip()) or REPLACE_RE.match(raw_lines[i].rstrip()):
+                    l_check = raw_lines[i].rstrip()
+                    if SEP_RE.match(l_check) or REPLACE_RE.match(l_check) or SEARCH_RE.match(l_check):
                         break
                     search_lines.append(raw_lines[i])
                     i += 1
@@ -2299,22 +2317,38 @@ class ArtefactManager:
                 if i >= len(raw_lines):
                     raise ValueError(f"Malformed aider patch: SEARCH block has no ======= separator.")
 
-                if REPLACE_RE.match(raw_lines[i].rstrip()):
+                l_curr = raw_lines[i].rstrip()
+                if REPLACE_RE.match(l_curr):
                     segments.append(('\n'.join(search_lines), ''))
                     i += 1
                     continue
+                elif SEARCH_RE.match(l_curr):
+                    raise ValueError("Malformed aider patch: new <<<<<<< SEARCH encountered before ======= separator.")
 
                 i += 1
                 replace_lines: List[str] = []
                 while i < len(raw_lines):
-                    if REPLACE_RE.match(raw_lines[i].rstrip()):
+                    l_rep = raw_lines[i].rstrip()
+                    if REPLACE_RE.match(l_rep):
+                        break
+                    if SEARCH_RE.match(l_rep):
+                        # End of current replace block — avoid swallowing subsequent SEARCH blocks
                         break
                     replace_lines.append(raw_lines[i])
                     i += 1
+
                 if i < len(raw_lines) and REPLACE_RE.match(raw_lines[i].rstrip()):
                     i += 1
 
-                segments.append(('\n'.join(search_lines), '\n'.join(replace_lines)))
+                # Clean any leaked conflict sentinels from replace_lines
+                clean_replace = []
+                for rl in replace_lines:
+                    rl_strip = rl.strip()
+                    if SEP_RE.match(rl_strip) or SEARCH_RE.match(rl_strip) or REPLACE_RE.match(rl_strip):
+                        continue
+                    clean_replace.append(rl)
+
+                segments.append(('\n'.join(search_lines), '\n'.join(clean_replace)))
             else:
                 i += 1
 
@@ -2506,6 +2540,21 @@ class ArtefactManager:
             hint = _find_closest_line(first_line, result)
             raise ValueError(f"SEARCH text not found in artifact content.")
 
+        # Post-patch decontamination: ensure no stray patch sentinels leaked into result
+        if result:
+            cleaned_lines = []
+            for line in result.split('\n'):
+                line_s = line.strip()
+                if (
+                    SEP_RE.match(line_s)
+                    or (line_s.startswith("<<<<<<<") and "search" in line_s.lower())
+                    or (line_s.startswith(">>>>>>>") and "replace" in line_s.lower())
+                ):
+                    ASCIIColors.warning(f"[apply_aider_patch] Purged leaked conflict sentinel line from patched code: '{line_s}'")
+                    continue
+                cleaned_lines.append(line)
+            result = '\n'.join(cleaned_lines)
+
         return result
 
     def _apply_artefact_xml(
@@ -2617,15 +2666,22 @@ class ArtefactManager:
             if _has_search:
                 existing = self.get(resolved_title)
                 if existing is None:
-                    result_artefact = self.add(
-                        title=resolved_title, artefact_type=atype, content=content,
-                        language=language, version=version, active=auto_activate,
-                        commit_message=commit_message, version_tags=version_tags,
-                        ephemeral=is_ephemeral, status=status,
-                        **attrs
-                    )
-                    is_new = True
-                else:
+                    try:
+                        disk_path = self._resolve_confined_path(resolved_title)
+                        if disk_path.exists() and disk_path.is_file():
+                            disk_content = disk_path.read_text(encoding="utf-8", errors="ignore")
+                            patched = ArtefactManager.apply_aider_patch(disk_content, content)
+                            result_artefact = self.add(
+                                title=resolved_title, artefact_type=atype, content=patched,
+                                language=language, version=1, active=auto_activate,
+                                commit_message=commit_message, version_tags=version_tags,
+                                ephemeral=is_ephemeral, status=status,
+                                **attrs
+                            )
+                    except Exception:
+                        pass
+
+                if existing is not None:
                     try:
                         patched = ArtefactManager.apply_aider_patch(
                             existing.get('content', ''), content
@@ -2652,31 +2708,52 @@ class ArtefactManager:
                                 event_callback(None, False, error_msg)
                             except Exception:
                                 pass
+                elif result_artefact is None:
+                    error_msg = f"[SYSTEM ERROR: Cannot apply SEARCH/REPLACE patch: file '{resolved_title}' does not exist. To create a new file, output the full content without SEARCH/REPLACE markers.]"
+                    cleaned = cleaned.replace(match.group(0), error_msg)
+                    if event_callback:
+                        try:
+                            event_callback(None, False, error_msg)
+                        except Exception:
+                            pass
             else:
-                if is_new:
-                    result_artefact = self.add(
-                        title=resolved_title, artefact_type=atype,
-                        content=content.strip(),
-                        language=language, version=version, active=auto_activate,
-                        commit_message=commit_message, version_tags=version_tags,
-                        ephemeral=is_ephemeral, status=status,
-                        **attrs
-                    )
+                has_patch_sentinels = bool(
+                    re.search(r'^\s*={5,10}\s*$', content, re.MULTILINE)
+                    or re.search(r'^\s*<{5,10}\s*SEARCH\b', content, re.MULTILINE | re.IGNORECASE)
+                )
+                if has_patch_sentinels:
+                    error_msg = f"[SYSTEM ERROR: Refusing to create '{resolved_title}' because content contains raw Aider patch markers (=======). Output clean file content without patch markers.]"
+                    cleaned = cleaned.replace(match.group(0), error_msg)
+                    if event_callback:
+                        try:
+                            event_callback(None, False, error_msg)
+                        except Exception:
+                            pass
                 else:
-                    result_artefact = self.update(
-                        title=resolved_title,
-                        new_content=content.strip(),
-                        new_title=new_name,
-                        new_type=atype,
-                        language=language,
-                        bump_version=True,
-                        active=auto_activate,
-                        commit_message=commit_message,
-                        version_tags=version_tags,
-                        ephemeral=is_ephemeral,
-                        status=status,
-                        **attrs
-                    )
+                    if is_new:
+                        result_artefact = self.add(
+                            title=resolved_title, artefact_type=atype,
+                            content=content.strip(),
+                            language=language, version=version, active=auto_activate,
+                            commit_message=commit_message, version_tags=version_tags,
+                            ephemeral=is_ephemeral, status=status,
+                            **attrs
+                        )
+                    else:
+                        result_artefact = self.update(
+                            title=resolved_title,
+                            new_content=content.strip(),
+                            new_title=new_name,
+                            new_type=atype,
+                            language=language,
+                            bump_version=True,
+                            active=auto_activate,
+                            commit_message=commit_message,
+                            version_tags=version_tags,
+                            ephemeral=is_ephemeral,
+                            status=status,
+                            **attrs
+                        )
 
             existing_titles = self._all_latest_titles()
             if result_artefact:

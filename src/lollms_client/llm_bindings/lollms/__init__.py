@@ -179,16 +179,23 @@ def extract_reasoning(obj: Any) -> Optional[str]:
 
 class _StreamThinkingHandler:
     """
-    Manages streaming chunks for OpenAI-compatible endpoints to guarantee that:
+    Manages streaming chunks for OpenAI/LoLLMs-compatible endpoints to guarantee that:
     1. Dedicated reasoning fields (reasoning_content, reasoning, etc.) are wrapped
        in visible <think>...</think> tags and dispatched as MSG_TYPE_THOUGHT_CHUNK.
     2. In-content <think>...</think> tags are detected, streaming thoughts as
        MSG_TYPE_THOUGHT_CHUNK and answer text as MSG_TYPE_CHUNK, while preserving
        the <think> and </think> tags in the final output.
+    3. When suppress_thinking=True, all thinking chunks and <think> blocks are
+       completely silenced and excluded from output.
     """
 
-    def __init__(self, streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None):
+    def __init__(
+        self,
+        streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+        suppress_thinking: bool = False,
+    ):
         self.callback = streaming_callback
+        self.suppress_thinking = suppress_thinking
         self.in_dedicated_reasoning = False
         self.dedicated_reasoning_opened = False
         self.in_content_thinking = False
@@ -197,6 +204,9 @@ class _StreamThinkingHandler:
 
     def process_reasoning(self, reasoning: str) -> bool:
         if not reasoning:
+            return True
+
+        if self.suppress_thinking:
             return True
 
         if not self.in_dedicated_reasoning:
@@ -247,10 +257,12 @@ class _StreamThinkingHandler:
                             return False
 
                     tag = m.group(0)
-                    self.output += tag
+                    if not self.suppress_thinking:
+                        self.output += tag
                     self.in_content_thinking = True
-                    if self.callback and self.callback(tag, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK) is False:
-                        return False
+                    if not self.suppress_thinking and self.callback:
+                        if self.callback(tag, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK) is False:
+                            return False
 
                     text = text[m.end():]
                 else:
@@ -270,16 +282,18 @@ class _StreamThinkingHandler:
                 m = close_tag_re.search(text)
                 if m:
                     thought_part = text[:m.start()]
-                    if thought_part:
+                    if thought_part and not self.suppress_thinking:
                         self.output += thought_part
                         if self.callback and self.callback(thought_part, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK) is False:
                             return False
 
                     tag = m.group(0)
-                    self.output += tag
+                    if not self.suppress_thinking:
+                        self.output += tag
                     self.in_content_thinking = False
-                    if self.callback and self.callback(tag, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK) is False:
-                        return False
+                    if not self.suppress_thinking and self.callback:
+                        if self.callback(tag, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK) is False:
+                            return False
 
                     text = text[m.end():]
                 else:
@@ -310,10 +324,11 @@ class _StreamThinkingHandler:
 
         if self.in_content_thinking:
             self.in_content_thinking = False
-            close_tag = "\n</think>\n"
-            self.output += close_tag
-            if self.callback:
-                self.callback(close_tag, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+            if not self.suppress_thinking:
+                close_tag = "\n</think>\n"
+                self.output += close_tag
+                if self.callback:
+                    self.callback(close_tag, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
 
         return self.output
 
@@ -439,13 +454,139 @@ class LollmsBinding(LollmsLLMBinding):
         response.raise_for_status()
         return response.json()
 
-    def _apply_vllm_thinking_kwargs(self, params: dict, effort: Optional[str]) -> dict:
-        if not self.is_vllm or not self.send_thinking_parameter or getattr(self, "glm_image_embedding", False):
-            return params
-        params.setdefault("extra_body", {}).setdefault(
-            "chat_template_kwargs", {}
-        )[self.thinking_effort_keyword] = effort is not None
+    def check_is_vllm(self) -> bool:
+        """
+        Determines whether the target server is a vLLM server.
+        """
+        if getattr(self, "is_vllm", False):
+            return True
+        if getattr(self, "_vllm_probed", False):
+            return getattr(self, "_is_vllm_detected", False)
+
+        self._vllm_probed = True
+        self._is_vllm_detected = False
+
+        probe_url = self.base_address or (
+            self.open_ai_host_address[:-3] if self.open_ai_host_address and self.open_ai_host_address.endswith("/v1") else self.open_ai_host_address
+        )
+        if probe_url:
+            try:
+                endpoint = f"{probe_url.rstrip('/')}/version"
+                r = requests.get(endpoint, timeout=1.0, verify=self.verify)
+                if r.status_code == 200:
+                    data = r.json()
+                    if isinstance(data, dict) and "version" in data:
+                        ASCIIColors.info(f"[LollmsBinding] Auto-detected vLLM server (version {data.get('version')}).")
+                        self._is_vllm_detected = True
+                        self.is_vllm = True
+                        return True
+            except Exception:
+                pass
+
+        return False
+
+    def _apply_thinking_params(
+        self,
+        params: dict,
+        effort: Optional[str],
+        is_deactivated: bool
+    ) -> dict:
+        """
+        Applies thinking / reasoning controls across LoLLMs, OpenAI, vLLM, Z.AI/GLM, and OpenAI-compatible engines.
+        """
+        model_name_lower = (self.model_name or "").lower()
+        is_glm = "glm" in model_name_lower
+        is_vllm = self.check_is_vllm()
+        extra_body = params.setdefault("extra_body", {})
+
+        if is_deactivated:
+            params["reasoning_effort"] = "none"
+            extra_body["reasoning_effort"] = "none"
+
+            if is_vllm:
+                if self.send_thinking_parameter and not getattr(self, "glm_image_embedding", False):
+                    ctk = extra_body.setdefault("chat_template_kwargs", {})
+                    if self.thinking_effort_keyword == "reasoning_effort":
+                        ctk["reasoning_effort"] = "none"
+                        ctk["enable_thinking"] = False
+                    else:
+                        ctk[self.thinking_effort_keyword] = False
+                        ctk["enable_thinking"] = False
+                        ctk["thinking"] = False
+                if is_glm:
+                    extra_body["thinking"] = {"type": "disabled"}
+                else:
+                    extra_body["thinking"] = False
+            else:
+                extra_body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
+                extra_body.setdefault("chat_template_kwargs", {})["thinking"] = False
+                if is_glm:
+                    extra_body["thinking"] = {"type": "disabled"}
+                else:
+                    extra_body["thinking"] = False
+        else:
+            if effort is not None and str(effort).strip().lower() not in ("none", "off", "disabled", "false", "0"):
+                norm_effort = effort if effort != "max" else "high"
+                params["reasoning_effort"] = norm_effort
+                extra_body["reasoning_effort"] = norm_effort
+
+                if is_vllm:
+                    if self.send_thinking_parameter and not getattr(self, "glm_image_embedding", False):
+                        ctk = extra_body.setdefault("chat_template_kwargs", {})
+                        if self.thinking_effort_keyword == "reasoning_effort":
+                            ctk["reasoning_effort"] = norm_effort
+                            ctk["enable_thinking"] = True
+                        else:
+                            ctk[self.thinking_effort_keyword] = True
+                            ctk["enable_thinking"] = True
+                            ctk["thinking"] = True
+                    if is_glm:
+                        extra_body["thinking"] = {"type": "enabled"}
+                    else:
+                        extra_body["thinking"] = True
+                else:
+                    extra_body.setdefault("chat_template_kwargs", {})["enable_thinking"] = True
+                    extra_body.setdefault("chat_template_kwargs", {})["thinking"] = True
+                    if is_glm:
+                        extra_body["thinking"] = {"type": "enabled"}
+                    else:
+                        extra_body["thinking"] = True
+
+                    restricted = ["o1", "o3", "o4", "gpt-5"]
+                    if any(r in model_name_lower for r in restricted):
+                        params.pop("temperature", None)
+                        params.pop("top_p", None)
+            else:
+                params["reasoning_effort"] = "none"
+                extra_body["reasoning_effort"] = "none"
+
+                if is_vllm:
+                    if self.send_thinking_parameter and not getattr(self, "glm_image_embedding", False):
+                        ctk = extra_body.setdefault("chat_template_kwargs", {})
+                        if self.thinking_effort_keyword == "reasoning_effort":
+                            ctk["reasoning_effort"] = "none"
+                            ctk["enable_thinking"] = False
+                        else:
+                            ctk[self.thinking_effort_keyword] = False
+                            ctk["enable_thinking"] = False
+                            ctk["thinking"] = False
+                    if is_glm:
+                        extra_body["thinking"] = {"type": "disabled"}
+                    else:
+                        extra_body["thinking"] = False
+                else:
+                    extra_body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
+                    extra_body.setdefault("chat_template_kwargs", {})["thinking"] = False
+                    if is_glm:
+                        extra_body["thinking"] = {"type": "disabled"}
+                    else:
+                        extra_body["thinking"] = False
+
         return params
+
+    def _apply_vllm_thinking_kwargs(self, params: dict, effort: Optional[str]) -> dict:
+        is_deact = effort is None or str(effort).strip().lower() in ("none", "off", "disabled", "false", "0")
+        return self._apply_thinking_params(params, effort, is_deact)
 
     def get_capabilities(self) -> Dict:
         try:
@@ -774,15 +915,29 @@ class LollmsBinding(LollmsLLMBinding):
         user_keyword: Optional[str] = "!@>user:",
         ai_keyword: Optional[str] = "!@>assistant:",
         think: Optional[bool] = False,
-        reasoning_effort: Optional[str] = "low",
-        reasoning_summary: Optional[str] = "auto",
+        reasoning_effort: Optional[str] = None,
+        reasoning_summary: Optional[str] = None,
         **kwargs,
     ) -> Union[str, dict]:
         self._ensure_client()
         count = 0
         output = ""
 
-        effort = self.get_effective_reasoning_effort(think=think, reasoning_effort=reasoning_effort)
+        if think is True:
+            effort = self.get_effective_reasoning_effort(think=True, reasoning_effort=reasoning_effort)
+            if effort is None or str(effort).strip().lower() in ("none", "off", "disabled", "false", "0", ""):
+                is_thinking_deactivated = True
+                effort = None
+            else:
+                is_thinking_deactivated = False
+        else:
+            is_thinking_deactivated = True
+            effort = None
+
+        ASCIIColors.info(
+            f"[LollmsBinding.generate_text] think={think}, reasoning_effort={reasoning_effort} "
+            f"-> effective_effort={effort}, deactivated={is_thinking_deactivated}"
+        )
 
         messages = [{"role": "system", "content": system_prompt or "You are a helpful assistant."}]
 
@@ -820,18 +975,9 @@ class LollmsBinding(LollmsLLMBinding):
                     seed=seed,
                 )
 
-                if effort is not None:
-                    if self.is_vllm:
-                        self._apply_vllm_thinking_kwargs(params, effort)
-                    else:
-                        params["reasoning_effort"] = effort
-                        if reasoning_summary and reasoning_summary != "auto":
-                            params.setdefault("extra_body", {})["reasoning_summary"] = reasoning_summary
-                        params.pop("temperature", None)
-                        params.pop("top_p", None)
-                else:
-                    if self.is_vllm:
-                        self._apply_vllm_thinking_kwargs(params, None)
+                self._apply_thinking_params(params, effort, is_thinking_deactivated)
+                if reasoning_summary and reasoning_summary != "auto" and not is_thinking_deactivated:
+                    params.setdefault("extra_body", {})["reasoning_summary"] = reasoning_summary
 
                 try:
                     chat_completion = self.client.chat.completions.create(**params)
@@ -842,14 +988,16 @@ class LollmsBinding(LollmsLLMBinding):
                     params.pop("top_p", None)
                     params.pop("frequency_penalty", None)
                     params.pop("reasoning_effort", None)
-                    if effort is None:
-                        params["temperature"] = 1
-                    if "extra_body" in params:
+                    if "extra_body" in params and isinstance(params["extra_body"], dict):
                         params["extra_body"].pop("chat_template_kwargs", None)
+                        params["extra_body"].pop("reasoning_effort", None)
+                        params["extra_body"].pop("thinking", None)
+                    if effort is None or is_thinking_deactivated:
+                        params["temperature"] = 1
                     chat_completion = self.client.chat.completions.create(**params)
 
                 if stream:
-                    handler = _StreamThinkingHandler(streaming_callback)
+                    handler = _StreamThinkingHandler(streaming_callback, suppress_thinking=is_thinking_deactivated)
                     for resp in chat_completion:
                         if self.is_cancelled():
                             break
@@ -878,7 +1026,9 @@ class LollmsBinding(LollmsLLMBinding):
                     message_obj = chat_completion.choices[0].message
                     reasoning = extract_reasoning(message_obj)
                     content = message_obj.content or ""
-                    if reasoning and not content.strip().startswith(("<think>", "<thinking>")):
+                    if is_thinking_deactivated:
+                        output = re.sub(r'<(?:think|thinking)>[\s\S]*?</(?:think|thinking)>', '', content, flags=re.IGNORECASE).strip()
+                    elif reasoning and not content.strip().startswith(("<think>", "<thinking>")):
                         output = f"<think>\n{reasoning}\n</think>\n{content}"
                     else:
                         output = content
@@ -933,13 +1083,14 @@ class LollmsBinding(LollmsLLMBinding):
         n_predict: Optional[int] = None,
         stream: Optional[bool] = None,
         temperature: Optional[float] = None,
+        top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         repeat_penalty: Optional[float] = None,
         seed: Optional[int] = None,
         streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
         think: Optional[bool] = False,
-        reasoning_effort: Optional[str] = "low",
-        reasoning_summary: Optional[str] = "auto",
+        reasoning_effort: Optional[str] = None,
+        reasoning_summary: Optional[str] = None,
         **kwargs,
     ) -> Union[str, dict]:
         self._ensure_client()
@@ -1040,21 +1191,40 @@ class LollmsBinding(LollmsLLMBinding):
             params["tools"] = sanitized_tools
             params["tool_choice"] = "auto"
 
+        if "extra_body" in kwargs and isinstance(kwargs["extra_body"], dict):
+            params.setdefault("extra_body", {}).update(kwargs["extra_body"])
+
+        if self.check_is_vllm():
+            extra_body = params.setdefault("extra_body", {})
+            effective_top_k = top_k if top_k is not None else kwargs.get("top_k")
+            if effective_top_k is not None:
+                extra_body.setdefault("top_k", effective_top_k)
+            if repeat_penalty is not None:
+                extra_body.setdefault("repetition_penalty", repeat_penalty)
+            if "min_tokens" in kwargs and kwargs["min_tokens"] is not None:
+                extra_body.setdefault("min_tokens", kwargs["min_tokens"])
+
         params = {k: v for k, v in params.items() if v is not None}
 
-        effort = self.get_effective_reasoning_effort(think=think, reasoning_effort=reasoning_effort)
-        if effort is not None:
-            if self.is_vllm:
-                self._apply_vllm_thinking_kwargs(params, effort)
+        if think is True:
+            effort = self.get_effective_reasoning_effort(think=True, reasoning_effort=reasoning_effort)
+            if effort is None or str(effort).strip().lower() in ("none", "off", "disabled", "false", "0", ""):
+                is_thinking_deactivated = True
+                effort = None
             else:
-                params["reasoning_effort"] = effort
-                if reasoning_summary and reasoning_summary != "auto":
-                    params.setdefault("extra_body", {})["reasoning_summary"] = reasoning_summary
-                params.pop("temperature", None)
-                params.pop("top_p", None)
+                is_thinking_deactivated = False
         else:
-            if self.is_vllm:
-                self._apply_vllm_thinking_kwargs(params, None)
+            is_thinking_deactivated = True
+            effort = None
+
+        ASCIIColors.info(
+            f"[LollmsBinding.generate_from_messages] think={think}, reasoning_effort={reasoning_effort} "
+            f"-> effective_effort={effort}, deactivated={is_thinking_deactivated}"
+        )
+
+        self._apply_thinking_params(params, effort, is_thinking_deactivated)
+        if reasoning_summary and reasoning_summary != "auto" and not is_thinking_deactivated:
+            params.setdefault("extra_body", {})["reasoning_summary"] = reasoning_summary
 
         output = ""
 
@@ -1081,14 +1251,16 @@ class LollmsBinding(LollmsLLMBinding):
                     params.pop("frequency_penalty", None)
                     params.pop("presence_penalty", None)
                     params.pop("reasoning_effort", None)
-                    if effort is None:
-                        params["temperature"] = 1
-                    if "extra_body" in params:
+                    if "extra_body" in params and isinstance(params["extra_body"], dict):
                         params["extra_body"].pop("chat_template_kwargs", None)
+                        params["extra_body"].pop("reasoning_effort", None)
+                        params["extra_body"].pop("thinking", None)
+                    if effort is None or is_thinking_deactivated:
+                        params["temperature"] = 1
                     completion = self.client.chat.completions.create(**params)
 
             if stream:
-                handler = _StreamThinkingHandler(streaming_callback)
+                handler = _StreamThinkingHandler(streaming_callback, suppress_thinking=is_thinking_deactivated)
                 for chunk in completion:
                     if self.is_cancelled():
                         break
@@ -1112,7 +1284,9 @@ class LollmsBinding(LollmsLLMBinding):
                 message_obj = completion.choices[0].message
                 reasoning = extract_reasoning(message_obj)
                 content = message_obj.content or ""
-                if reasoning and not content.strip().startswith(("<think>", "<thinking>")):
+                if is_thinking_deactivated:
+                    output = re.sub(r'<(?:think|thinking)>[\s\S]*?</(?:think|thinking)>', '', content, flags=re.IGNORECASE).strip()
+                elif reasoning and not content.strip().startswith(("<think>", "<thinking>")):
                     output = f"<think>\n{reasoning}\n</think>\n{content}"
                 else:
                     output = content

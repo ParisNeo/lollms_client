@@ -247,6 +247,92 @@ client.llm.cancel()  # Signals the binding to abort generation immediately
 
 ---
 
+## ⚡ Dynamic Mode: Autonomous Reasoning Effort, Temperature & Token Budgeting
+
+Dynamic Mode is a tri-fold autonomous control system available across `LollmsDiscussion`, `LollmsPersonality`, the `lollms_code` CLI, and the desktop GUI. It continuously adapts model compute, sampling temperature, and token budgets to match task complexity at runtime.
+
+### The Three Pillars of Dynamic Mode
+
+| Pillar | Default Behavior | Dynamic Mode Behavior |
+| :--- | :--- | :--- |
+| **Reasoning Effort** | Fixed tier (e.g. `medium` or `high` for all turns) | Starts deactivated (`none`) for speed; model escalates on-demand up to `high`/`max` via `<effort>` tags when tackling complex code or logic. |
+| **Temperature** | Static float (e.g. `0.3`) | Task-adapted: `0.15` for code generation and Aider patches; `0.70` for dialogue; dynamically shaken up to `0.95` to break out of repetition traps. |
+| **Token Ceilings** | Hard cut (e.g. 4096 / 8192) | Auto-calculated (`max_ctx - prompt_tokens - safety_margin`), allowing full-file generation without artificial truncation. |
+
+---
+
+### 1. In `LollmsDiscussion.chat()`
+
+To activate Dynamic Mode in discussion sessions, pass `dynamic_effort=True`. The model can adjust its thinking depth between reasoning rounds using `<effort level="..."/>`:
+
+```python
+from lollms_client import LollmsClient, LollmsDiscussion, LollmsDataManager
+
+client = LollmsClient(
+    llm_binding_name="ollama",
+    llm_binding_config={"model_name": "deepseek-r1:14b"}
+)
+db_manager = LollmsDataManager("sqlite:///discussion.db")
+discussion = LollmsDiscussion.create_new(lollms_client=client, db_manager=db_manager)
+
+# Execute chat turn with autonomous dynamic effort scaling
+response = discussion.chat(
+    user_message="Analyze this database schema and write an optimized migration script.",
+    dynamic_effort=True,
+    enable_artefacts=True,
+    max_nb_rounds=15,
+)
+```
+
+**How the Model Controls Its Effort:**
+During multi-round deliberation, the model can emit the `<effort>` tag on a new line:
+```xml
+<effort level="high"/>
+```
+The stream parser intercepts the tag, strips it from user-visible speech bubbles, and instructs the backend engine (Ollama, vLLM, OpenAI, etc.) to allocate full reasoning capacity starting from the very next round.
+
+Supported effort levels:
+- `level="none"`: Disables reasoning for fast execution, lookups, and conversational summaries.
+- `level="low"`: Light reasoning for moderate validation checks.
+- `level="medium"`: Standard deep reasoning for non-trivial logic.
+- `level="high"`: Maximum reasoning depth for complex algorithms, proofs, or difficult refactoring.
+
+---
+
+### 2. In `LollmsPersonality.chat()` (Autonomous Agents)
+
+In agentic workflows, Dynamic Mode pairs effort escalation with automatic temperature shifting and context-fitting tokens:
+
+```python
+from lollms_client.lollms_personality import LollmsPersonality
+
+agent = LollmsPersonality.from_handbag("./my_coding_agent", lollms_client=client)
+
+result = agent.chat(
+    prompt="Refactor the authentication pipeline and write unit tests.",
+    dynamic_effort=True,       # Autonomous reasoning escalation
+    temperature=None,           # Auto-temperature (0.15 for code / 0.70 for chat)
+    n_predict=0,                # Auto-token sizing based on remaining context
+    max_reasoning_steps=20,
+)
+```
+
+---
+
+### 3. In `lollms_code` CLI & GUI
+
+#### CLI Mode
+- **Launch Flag**: `lollms-code --dynamic-effort "Implement feature X"`
+- **Interactive REPL Slash Command**: Type `/dynamic` to toggle Dynamic Mode on/off at runtime.
+- **Fast Effort Level**: Use `/effort dynamic` to switch reasoning to dynamic mode, or `/effort none|low|medium|high` to pin a fixed tier.
+
+#### NiceGUI Desktop Interface
+- **1-Click Header Toggle**: Click the `⚡ Dynamic: ON / OFF` button in the top navigation strip.
+- **Fast Effort Selector**: Use the dropdown in the status strip to pick `🔄 Effort: Dynamic`.
+- **Settings Dialog**: Navigate to **Agent Behavior & Reasoning Controls** to enable `Dynamic Effort Scaling (<effort level='...'/>)`.
+
+---
+
 ## 4. Context Size Management & Measurement
 
 Understanding and managing context windows is critical for preventing truncation and optimizing performance.

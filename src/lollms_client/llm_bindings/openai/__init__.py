@@ -8,10 +8,11 @@ import os
 import re
 import ssl
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import httpx
 import openai
+import requests
 import pipmaster as pm
 import tiktoken
 from ascii_colors import ASCIIColors, trace_exception
@@ -352,8 +353,20 @@ class OpenAIBinding(LollmsLLMBinding):
         self.default_completion_format = kwargs.get(
             "default_completion_format", ELF_COMPLETION_FORMAT.Chat
         )
-        self.is_vllm = kwargs.get("is_vllm", False)
-        self.send_thinking_parameter = kwargs.get("send_thinking_parameter", True)
+        raw_is_vllm = kwargs.get("is_vllm", False)
+        if isinstance(raw_is_vllm, str):
+            self.is_vllm = raw_is_vllm.lower().strip() in ("true", "1", "yes", "on")
+        else:
+            self.is_vllm = bool(raw_is_vllm)
+        self._vllm_probed = False
+        self._is_vllm_detected = False
+
+        raw_send_thinking = kwargs.get("send_thinking_parameter", True)
+        if isinstance(raw_send_thinking, str):
+            self.send_thinking_parameter = raw_send_thinking.lower().strip() not in ("false", "0", "no", "off", "")
+        else:
+            self.send_thinking_parameter = bool(raw_send_thinking)
+
         self.thinking_effort_keyword = kwargs.get("thinking_effort_keyword", "enable_thinking")
         self.glm_image_embedding = kwargs.get("glm_image_embedding", False)
         self.video_enabled = kwargs.get("video_enabled", False)
@@ -408,14 +421,45 @@ class OpenAIBinding(LollmsLLMBinding):
         )
         self.completion_format = ELF_COMPLETION_FORMAT.Chat
 
-    def _build_openai_params(self, messages: list, **kwargs) -> dict:
+    def check_is_vllm(self) -> bool:
+        """
+        Determines whether the target server is a vLLM server.
+        Uses configured is_vllm flag, or runs a fast cached probe against /version.
+        """
+        if getattr(self, "is_vllm", False):
+            return True
+        if getattr(self, "_vllm_probed", False):
+            return getattr(self, "_is_vllm_detected", False)
+
+        self._vllm_probed = True
+        self._is_vllm_detected = False
+
+        probe_url = self.base_address or (
+            self.open_ai_host_address[:-3] if self.open_ai_host_address and self.open_ai_host_address.endswith("/v1") else self.open_ai_host_address
+        )
+        if probe_url:
+            try:
+                endpoint = f"{probe_url.rstrip('/')}/version"
+                r = requests.get(endpoint, timeout=1.0, verify=self.verify)
+                if r.status_code == 200:
+                    data = r.json()
+                    if isinstance(data, dict) and "version" in data:
+                        ASCIIColors.info(f"[OpenAIBinding] Auto-detected vLLM server (version {data.get('version')}).")
+                        self._is_vllm_detected = True
+                        self.is_vllm = True
+                        return True
+            except Exception:
+                pass
+
+        return False
+
+    def _build_openai_params(self, messages: Optional[list] = None, prompt: Optional[str] = None, **kwargs) -> dict:
         model = kwargs.get("model", self.model_name)
         if "n_predict" in kwargs:
             kwargs["max_tokens"] = kwargs.pop("n_predict")
 
         restricted_families = [
             "gpt-5",
-            "gpt-4o",
             "o1",
             "o3",
             "o4",
@@ -424,6 +468,7 @@ class OpenAIBinding(LollmsLLMBinding):
         allowed_params = {
             "model",
             "messages",
+            "prompt",
             "temperature",
             "top_p",
             "n",
@@ -436,12 +481,20 @@ class OpenAIBinding(LollmsLLMBinding):
             "user",
             "max_completion_tokens",
             "reasoning_effort",
+            "extra_body",
+            "response_format",
+            "seed",
+            "tools",
+            "tool_choice",
         }
 
-        params = {
+        params: Dict[str, Any] = {
             "model": model,
-            "messages": messages,
         }
+        if messages is not None:
+            params["messages"] = messages
+        if prompt is not None:
+            params["prompt"] = prompt
 
         for k, v in kwargs.items():
             if k in allowed_params and v is not None:
@@ -450,8 +503,18 @@ class OpenAIBinding(LollmsLLMBinding):
                 if v is not None and kwargs.get("debug", False):
                     ASCIIColors.warning(f"Removed unsupported OpenAI param '{k}'")
 
+        is_vllm = self.check_is_vllm()
+        if is_vllm:
+            extra_body = params.setdefault("extra_body", {})
+            if "top_k" in kwargs and kwargs["top_k"] is not None:
+                extra_body.setdefault("top_k", kwargs["top_k"])
+            if "repeat_penalty" in kwargs and kwargs["repeat_penalty"] is not None:
+                extra_body.setdefault("repetition_penalty", kwargs["repeat_penalty"])
+            if "min_tokens" in kwargs and kwargs["min_tokens"] is not None:
+                extra_body.setdefault("min_tokens", kwargs["min_tokens"])
+
         model_lower = model.lower() if model else ""
-        if any(fam in model_lower for fam in restricted_families):
+        if not is_vllm and any(fam in model_lower for fam in restricted_families):
             if "temperature" in params and params["temperature"] != 1:
                 ASCIIColors.warning(
                     f"{model} does not support temperature != 1. Overriding to 1."
@@ -474,38 +537,94 @@ class OpenAIBinding(LollmsLLMBinding):
         """
         model_name_lower = (self.model_name or "").lower()
         is_glm = "glm" in model_name_lower
+        is_vllm = self.check_is_vllm()
         extra_body = params.setdefault("extra_body", {})
 
         if is_deactivated:
-            # Explicitly instruct backend engine NOT to think
             params["reasoning_effort"] = "none"
             extra_body["reasoning_effort"] = "none"
-            extra_body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
-            extra_body["chat_template_kwargs"]["thinking"] = False
-            if is_glm:
-                extra_body["thinking"] = {"type": "disabled"}
+
+            if is_vllm:
+                if self.send_thinking_parameter and not getattr(self, "glm_image_embedding", False):
+                    ctk = extra_body.setdefault("chat_template_kwargs", {})
+                    if self.thinking_effort_keyword == "reasoning_effort":
+                        ctk["reasoning_effort"] = "none"
+                        ctk["enable_thinking"] = False
+                    else:
+                        ctk[self.thinking_effort_keyword] = False
+                        ctk["enable_thinking"] = False
+                        ctk["thinking"] = False
+
+                if is_glm:
+                    extra_body["thinking"] = {"type": "disabled"}
+                else:
+                    extra_body["thinking"] = False
             else:
-                extra_body["thinking"] = False
+                extra_body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
+                extra_body.setdefault("chat_template_kwargs", {})["thinking"] = False
+                if is_glm:
+                    extra_body["thinking"] = {"type": "disabled"}
+                else:
+                    extra_body["thinking"] = False
         else:
             if effort is not None and str(effort).strip().lower() not in ("none", "off", "disabled", "false", "0"):
                 norm_effort = effort if effort != "max" else "high"
                 params["reasoning_effort"] = norm_effort
                 extra_body["reasoning_effort"] = norm_effort
-                extra_body.setdefault("chat_template_kwargs", {})["enable_thinking"] = True
-                extra_body["chat_template_kwargs"]["thinking"] = True
-                if is_glm:
-                    extra_body["thinking"] = {"type": "enabled"}
+
+                if is_vllm:
+                    if self.send_thinking_parameter and not getattr(self, "glm_image_embedding", False):
+                        ctk = extra_body.setdefault("chat_template_kwargs", {})
+                        if self.thinking_effort_keyword == "reasoning_effort":
+                            ctk["reasoning_effort"] = norm_effort
+                            ctk["enable_thinking"] = True
+                        else:
+                            ctk[self.thinking_effort_keyword] = True
+                            ctk["enable_thinking"] = True
+                            ctk["thinking"] = True
+
+                    if is_glm:
+                        extra_body["thinking"] = {"type": "enabled"}
+                    else:
+                        extra_body["thinking"] = True
                 else:
-                    extra_body["thinking"] = True
-                params.pop("temperature", None)
-                params.pop("top_p", None)
-            elif params.get("think") is True:
-                extra_body.setdefault("chat_template_kwargs", {})["enable_thinking"] = True
-                extra_body["chat_template_kwargs"]["thinking"] = True
-                if is_glm:
-                    extra_body["thinking"] = {"type": "enabled"}
+                    extra_body.setdefault("chat_template_kwargs", {})["enable_thinking"] = True
+                    extra_body.setdefault("chat_template_kwargs", {})["thinking"] = True
+                    if is_glm:
+                        extra_body["thinking"] = {"type": "enabled"}
+                    else:
+                        extra_body["thinking"] = True
+
+                    restricted = ["o1", "o3", "o4", "gpt-5"]
+                    if any(r in model_name_lower for r in restricted):
+                        params.pop("temperature", None)
+                        params.pop("top_p", None)
+            else:
+                params["reasoning_effort"] = "none"
+                extra_body["reasoning_effort"] = "none"
+
+                if is_vllm:
+                    if self.send_thinking_parameter and not getattr(self, "glm_image_embedding", False):
+                        ctk = extra_body.setdefault("chat_template_kwargs", {})
+                        if self.thinking_effort_keyword == "reasoning_effort":
+                            ctk["reasoning_effort"] = "none"
+                            ctk["enable_thinking"] = False
+                        else:
+                            ctk[self.thinking_effort_keyword] = False
+                            ctk["enable_thinking"] = False
+                            ctk["thinking"] = False
+
+                    if is_glm:
+                        extra_body["thinking"] = {"type": "disabled"}
+                    else:
+                        extra_body["thinking"] = False
                 else:
-                    extra_body["thinking"] = True
+                    extra_body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
+                    extra_body.setdefault("chat_template_kwargs", {})["thinking"] = False
+                    if is_glm:
+                        extra_body["thinking"] = {"type": "disabled"}
+                    else:
+                        extra_body["thinking"] = False
 
         return params
 
@@ -539,13 +658,16 @@ class OpenAIBinding(LollmsLLMBinding):
         count = 0
         output = ""
 
-        effort = self.get_effective_reasoning_effort(think=think, reasoning_effort=reasoning_effort)
-        is_thinking_deactivated = (
-            (think is False and reasoning_effort is None)
-            or think is False
-            or (reasoning_effort is not None and str(reasoning_effort).strip().lower() in ("none", "off", "disabled", "false", "0"))
-            or (effort is None and think is False)
-        )
+        if think is True:
+            effort = self.get_effective_reasoning_effort(think=True, reasoning_effort=reasoning_effort)
+            if effort is None or str(effort).strip().lower() in ("none", "off", "disabled", "false", "0", ""):
+                is_thinking_deactivated = True
+                effort = None
+            else:
+                is_thinking_deactivated = False
+        else:
+            is_thinking_deactivated = True
+            effort = None
 
         ASCIIColors.info(
             f"[OpenAIBinding.generate_text] think={think}, reasoning_effort={reasoning_effort} "
@@ -600,14 +722,28 @@ class OpenAIBinding(LollmsLLMBinding):
                     n_predict=n_predict,
                     stream=stream,
                     temperature=temperature,
+                    top_k=top_k,
                     top_p=top_p,
                     repeat_penalty=repeat_penalty,
                     seed=seed,
+                    **kwargs,
                 )
+
+                if self.check_is_vllm():
+                    extra_body = params.setdefault("extra_body", {})
+                    if top_k is not None:
+                        extra_body.setdefault("top_k", top_k)
+                    if repeat_penalty is not None:
+                        extra_body.setdefault("repetition_penalty", repeat_penalty)
+                    if "min_tokens" in kwargs and kwargs["min_tokens"] is not None:
+                        extra_body.setdefault("min_tokens", kwargs["min_tokens"])
 
                 self._apply_thinking_params(params, effort, is_thinking_deactivated)
                 if reasoning_summary and reasoning_summary != "auto" and not is_thinking_deactivated:
                     params.setdefault("extra_body", {})["reasoning_summary"] = reasoning_summary
+
+                if "extra_body" in params and not params["extra_body"]:
+                    params.pop("extra_body", None)
 
                 try:
                     chat_completion = self.client.chat.completions.create(**params)
@@ -626,8 +762,10 @@ class OpenAIBinding(LollmsLLMBinding):
                         params["extra_body"].pop("chat_template_kwargs", None)
                         params["extra_body"].pop("reasoning_effort", None)
                         params["extra_body"].pop("thinking", None)
+                        if not params["extra_body"]:
+                            params.pop("extra_body", None)
 
-                    if effort is None or is_thinking_deactivated:
+                    if not self.check_is_vllm() and (effort is None or is_thinking_deactivated):
                         params["temperature"] = 1
 
                     chat_completion = self.client.chat.completions.create(**params)
@@ -732,6 +870,7 @@ class OpenAIBinding(LollmsLLMBinding):
         n_predict: Optional[int] = None,
         stream: Optional[bool] = None,
         temperature: Optional[float] = None,
+        top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         repeat_penalty: Optional[float] = None,
         seed: Optional[int] = None,
@@ -842,7 +981,7 @@ class OpenAIBinding(LollmsLLMBinding):
                         )
                 sanitized_tools.append(tool)
 
-        params = {
+        params: Dict[str, Any] = {
             "model": self.model_name,
             "messages": openai_messages,
             "max_tokens": n_predict,
@@ -859,15 +998,31 @@ class OpenAIBinding(LollmsLLMBinding):
             params["tools"] = sanitized_tools
             params["tool_choice"] = "auto"
 
+        if "extra_body" in kwargs and isinstance(kwargs["extra_body"], dict):
+            params.setdefault("extra_body", {}).update(kwargs["extra_body"])
+
+        if self.check_is_vllm():
+            extra_body = params.setdefault("extra_body", {})
+            effective_top_k = top_k if top_k is not None else kwargs.get("top_k")
+            if effective_top_k is not None:
+                extra_body.setdefault("top_k", effective_top_k)
+            if repeat_penalty is not None:
+                extra_body.setdefault("repetition_penalty", repeat_penalty)
+            if "min_tokens" in kwargs and kwargs["min_tokens"] is not None:
+                extra_body.setdefault("min_tokens", kwargs["min_tokens"])
+
         params = {k: v for k, v in params.items() if v is not None}
 
-        effort = self.get_effective_reasoning_effort(think=think, reasoning_effort=reasoning_effort)
-        is_thinking_deactivated = (
-            (think is False and reasoning_effort is None)
-            or think is False
-            or (reasoning_effort is not None and str(reasoning_effort).strip().lower() in ("none", "off", "disabled", "false", "0"))
-            or (effort is None and think is False)
-        )
+        if think is True:
+            effort = self.get_effective_reasoning_effort(think=True, reasoning_effort=reasoning_effort)
+            if effort is None or str(effort).strip().lower() in ("none", "off", "disabled", "false", "0", ""):
+                is_thinking_deactivated = True
+                effort = None
+            else:
+                is_thinking_deactivated = False
+        else:
+            is_thinking_deactivated = True
+            effort = None
 
         ASCIIColors.info(
             f"[OpenAIBinding.generate_from_messages] think={think}, reasoning_effort={reasoning_effort} "
@@ -877,6 +1032,9 @@ class OpenAIBinding(LollmsLLMBinding):
         self._apply_thinking_params(params, effort, is_thinking_deactivated)
         if reasoning_summary and reasoning_summary != "auto" and not is_thinking_deactivated:
             params.setdefault("extra_body", {})["reasoning_summary"] = reasoning_summary
+
+        if "extra_body" in params and not params["extra_body"]:
+            params.pop("extra_body", None)
 
         output = ""
 
@@ -911,8 +1069,10 @@ class OpenAIBinding(LollmsLLMBinding):
                         params["extra_body"].pop("chat_template_kwargs", None)
                         params["extra_body"].pop("reasoning_effort", None)
                         params["extra_body"].pop("thinking", None)
+                        if not params["extra_body"]:
+                            params.pop("extra_body", None)
 
-                    if effort is None or is_thinking_deactivated:
+                    if not self.check_is_vllm() and (effort is None or is_thinking_deactivated):
                         params["temperature"] = 1
 
                     completion = self.client.chat.completions.create(**params)

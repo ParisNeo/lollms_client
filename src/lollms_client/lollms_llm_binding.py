@@ -125,39 +125,38 @@ class LollmsLLMBinding(LollmsBaseBinding):
     @staticmethod
     def normalize_reasoning_effort(
         think: Optional[bool],
-        reasoning_effort: Optional[str],
+        reasoning_effort: Optional[Union[str, bool]],
     ) -> Optional[str]:
         """
-        Resolve the effective reasoning effort from the modern ``reasoning_effort``
-        string and the legacy boolean ``think`` flag.
+        Resolve the effective reasoning effort.
 
-        Precedence:
-          1. An explicit ``reasoning_effort`` string wins. Literals like "none", "off", "disabled", "false", "0"
-             deactivate reasoning (return None).
-          2. A ``reasoning_effort`` that arrives as a boolean is mapped:
-             ``True`` -> ``"high"``, ``False`` -> ``None``.
-          3. Otherwise the legacy ``think`` flag decides:
-             ``True`` -> ``"high"``, ``False`` -> ``None``.
-
-        Returns the normalized effort string, or ``None`` when reasoning is
-        fully disabled (no thinking output requested).
+        Rule:
+          - If think is not True: thought is completely deactivated (returns None).
+          - If think is True: inspects the effort parameter. If effort is None or
+            in ("none", "off", "disabled", "false", "0", ""), thought is completely
+            deactivated (returns None). Otherwise returns the valid normalized effort string.
         """
+        if think is not True:
+            return None
+
+        if reasoning_effort is None:
+            return None
+
+        if isinstance(reasoning_effort, bool):
+            return "high" if reasoning_effort else None
+
+        effort = str(reasoning_effort).strip().lower()
+        if effort in ("none", "off", "disabled", "false", "0", ""):
+            return None
+
         valid = {"low", "medium", "high", "max"}
-        if reasoning_effort is not None:
-            if isinstance(reasoning_effort, bool):
-                return "high" if reasoning_effort else None
-            effort = str(reasoning_effort).strip().lower()
-            if effort in ("none", "off", "disabled", "false", "0"):
-                return None
-            if effort in valid:
-                return effort
-            ASCIIColors.warning(
-                f"Unknown reasoning_effort '{reasoning_effort}'. Falling back to 'low'."
-            )
-            return "low"
-        if think is True:
-            return "high"
-        return None
+        if effort in valid:
+            return effort
+
+        ASCIIColors.warning(
+            f"Unknown reasoning_effort '{reasoning_effort}'. Falling back to 'low'."
+        )
+        return "low"
 
     @staticmethod
     def translate_reasoning_effort(
@@ -168,38 +167,35 @@ class LollmsLLMBinding(LollmsBaseBinding):
         """
         Translates an incoming reasoning effort setting to a level supported by the model.
 
-        Anchor score projection:
-          none/off/disabled -> 0.0
-          minimal/min       -> 0.15
-          low               -> 0.30
-          medium/default    -> 0.60
-          high              -> 0.85
-          max/maximum       -> 1.00
+        Rule:
+          - If think is not True: thought is completely deactivated (returns None).
+          - If think is True: checks reasoning_effort. If None or disabled, returns None.
+            Otherwise projects to supported_efforts.
         """
-        if reasoning_effort is None and think is None:
+        if think is not True:
             return None
 
-        disabled_literals = {"none", "off", "disabled", "false", "0"}
-        raw_str = ""
-        if reasoning_effort is False or (reasoning_effort is None and think is False):
-            raw_str = "none"
-        elif reasoning_effort is True or (reasoning_effort is None and think is True):
+        if reasoning_effort is None:
+            return None
+
+        if reasoning_effort is False:
+            return None
+
+        if reasoning_effort is True:
             raw_str = "high"
-        elif reasoning_effort is not None:
+        else:
             raw_str = str(reasoning_effort).strip().lower()
 
+        disabled_literals = {"none", "off", "disabled", "false", "0", ""}
+        if raw_str in disabled_literals:
+            return None
+
         if not supported_efforts:
-            return None if raw_str in disabled_literals else LollmsLLMBinding.normalize_reasoning_effort(think, raw_str)
+            return LollmsLLMBinding.normalize_reasoning_effort(think, raw_str)
 
         supported_lower_map = {s.strip().lower(): s for s in supported_efforts if s}
         if not supported_lower_map:
-            return None if raw_str in disabled_literals else LollmsLLMBinding.normalize_reasoning_effort(think, raw_str)
-
-        if raw_str in disabled_literals:
-            for dis in ("none", "off", "disabled", "false"):
-                if dis in supported_lower_map:
-                    return supported_lower_map[dis]
-            return None
+            return LollmsLLMBinding.normalize_reasoning_effort(think, raw_str)
 
         if raw_str in supported_lower_map:
             return supported_lower_map[raw_str]
