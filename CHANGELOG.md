@@ -276,6 +276,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-29 09:21]
+
+- fix(lollms): remove unsafe final disk reconciliation cleanup
+
 ## [2026-09-28 22:07]
 
 - feat(lollms): update chat_page UI and workflow_engine/process execution logic for dynamic user interactions

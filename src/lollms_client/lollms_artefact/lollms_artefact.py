@@ -1968,56 +1968,6 @@ class ArtefactManager:
             except PermissionError:
                 pass
 
-        # ── 🛡️ DEFENSE-IN-DEPTH: FINAL DISK RECONCILIATION ──────────────────
-        # After syncing all active DB artifacts to disk, we must verify that
-        # no files exist on disk that are NOT backed by an active DB record.
-        # This catches any stale re-materializations or orphaned physical twins
-        # that slipped through the sync process, guaranteeing the filesystem
-        # is the true source of truth.
-        synced_files_normalized = set()
-        for sf in synced_files:
-            try:
-                synced_files_normalized.add(str(Path(sf).resolve()))
-            except Exception:
-                pass
-
-        valid_db_filenames = set()
-        for a in self.list():
-            phys_path = a.get("physical_path") or a.get("title", "")
-            if not phys_path:
-                continue
-            clean_path = self._sanitize_path_segments(phys_path)
-            fname = self._get_filename_with_ext(
-                clean_path, a.get("type", "document"),
-                a.get("language"), a.get("file_ext")
-            )
-            valid_db_filenames.add(fname)
-
-        try:
-            for f in workspace_dir.rglob("*"):
-                if f.is_file():
-                    rel_path = f.relative_to(workspace_dir)
-                    if _is_ignored_path(rel_path):
-                        continue
-                    rel_str = str(rel_path).replace("\\", "/")
-                    try:
-                        abs_path = str(f.resolve())
-                    except Exception:
-                        continue
-                    if abs_path in synced_files_normalized:
-                        continue
-                    if rel_str not in valid_db_filenames:
-                        try:
-                            f.unlink()
-                            ASCIIColors.info(
-                                f"[ArtefactManager] Reconciliation: purged orphaned disk file '{rel_str}' "
-                                f"(no active DB record backs it)."
-                            )
-                        except Exception:
-                            pass
-        except Exception as e:
-            ASCIIColors.warning(f"[ArtefactManager] Final disk reconciliation scan failed: {e}")
-
         return workspace_dir, synced_files
 
     def deactivate(self, title: str, version: Optional[int] = None):
