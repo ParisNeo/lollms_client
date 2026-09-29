@@ -21,9 +21,10 @@ import torch
 from fastapi import FastAPI, APIRouter, HTTPException, Header
 from pydantic import BaseModel, Field
 from ascii_colors import ASCIIColors, trace_exception
-
+import pipmaster as pm
 # Ensure whisper is installed in the server environment
 try:
+    pm.ensure_packages("whisper")    
     import whisper
 except ImportError:
     ASCIIColors.error("openai-whisper is not installed in the server environment.")

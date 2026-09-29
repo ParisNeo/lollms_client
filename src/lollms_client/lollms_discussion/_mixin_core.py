@@ -67,6 +67,16 @@ class CoreMixin:
         # Resolve clean isolated directory paths
         resolved_id = discussion_id or (db_discussion_obj.id if db_discussion_obj else "viewer_session")
 
+        # ── RESTORE PERSISTED WORKSPACE PATH ──
+        # If the host didn't explicitly provide a workspace_path, check if we previously
+        # saved one in the discussion metadata. This ensures custom folders persist
+        # across application restarts and discussion reloads.
+        if not workspace_path and db_discussion_obj is not None:
+            saved_meta = getattr(db_discussion_obj, 'discussion_metadata', None) or {}
+            if isinstance(saved_meta, dict) and saved_meta.get("workspace_path"):
+                workspace_path = saved_meta["workspace_path"]
+                ASCIIColors.info(f"[CoreMixin] Restored persisted workspace path: {workspace_path}")
+
         # ── NATIVE AUTO-INGESTION & CLEAN ISOLATION DIRECTORIES ──
         # 🛡️ STRICT PATH SOVEREIGNTY PROTOCOL:
         # If workspace_path is provided by the host application, use it EXACTLY as-is.
@@ -476,6 +486,15 @@ class CoreMixin:
         metadata = (getattr(self._db_discussion, 'discussion_metadata', {}) or {}).copy()
         if self.images or "discussion_images" in metadata:
             metadata["discussion_images"] = self.images
+
+        # ── PERSIST WORKSPACE PATH ──
+        # Automatically save the current workspace path into metadata so it can be
+        # restored when the discussion is reloaded in a future session.
+        current_ws_path = getattr(self, '_workspace_path_val', None)
+        if current_ws_path and metadata.get("workspace_path") != current_ws_path:
+            metadata["workspace_path"] = current_ws_path
+
+        if self.images or "discussion_images" in metadata or "workspace_path" in metadata:
             setattr(self._db_discussion, 'discussion_metadata', metadata)
         setattr(self._db_discussion, 'updated_at', datetime.utcnow())
         if self._is_db_backed:
