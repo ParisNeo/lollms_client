@@ -276,6 +276,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-30 21:51]
+
+- fix(lollms_client): update major version to v1.20.8
+
 ## [2026-09-30 09:26]
 
 - refactor(stt): update whisper batching tests and discussion core mixin
