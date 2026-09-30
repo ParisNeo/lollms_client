@@ -963,6 +963,42 @@ When `EventMode.FULL_CALLBACK_MODE` (or `MIXED_MODE`, which emits them alongside
 
 These events are **callback-only**: they are never written into `ai_msg.content` or `virtual_history`, and they are suppressed entirely in `EventMode.SILENT_MODE`. Exactly one `MSG_TYPE_ROUND_END` fires per `MSG_TYPE_ROUND_START` under all exit paths — including cancellation, loop guards, and natural exhaustion of the round budget.
 
+### 📡 Tool Progress Streaming & Cancellation via `ToolContext`
+
+Long-running tools (Python execution, shell commands, data processing) can stream intermediate output directly to the host application's callback during execution, and can be cooperatively cancelled mid-run. This is powered by the `ToolContext` object (defined in `lollms_client.lollms_types`), which the `ChatMixin` constructs once per `chat()` turn and injects into any tool whose signature declares `tool_context`.
+
+**What the host application receives:**
+
+| EventMode | Progress event | Meta keys |
+| :--- | :--- | :--- |
+| `PROCESSING_TAG_MODE` | `MSG_TYPE_CHUNK` (renders inside the open `<processing>` block) | `{"tool_progress": True, "was_processed": True, "stream": "stdout"\|"stderr"}` |
+| `FULL_CALLBACK_MODE` | `MSG_TYPE_INFO` | `{"tool_progress": True, "stream": "stdout"\|"stderr"}` |
+| `MIXED_MODE` | Both of the above | as above |
+| `SILENT_MODE` | Nothing | — |
+
+**Cancellation contract**: if your streaming callback returns `False` while a tool is streaming progress, the tool receives that signal (`emit_progress` returns `False`) and should abort cooperatively. The built-in `execute_python` toolset honors this: a cancelled script stops at its next printed line and returns `"Execution interrupted by user cancellation"` as a clean failure result — no orphaned processes, no corrupted workspace state.
+
+**Security**: `tool_context` is host-only. The LLM never sees it in tool schemas, and any `tool_context` key it emits inside `<tool>` parameters is stripped before execution. See the LCP README ("Context Awareness") for the tool-author side of the contract.
+
+**Example: rendering live progress in a UI**
+
+```python
+from lollms_client.lollms_types import MSG_TYPE, EventMode
+
+def ui_callback(chunk: str, msg_type: MSG_TYPE, meta: dict) -> bool:
+    if msg_type == MSG_TYPE.MSG_TYPE_CHUNK and meta.get("tool_progress"):
+        append_to_processing_block(chunk + "\n", stream=meta.get("stream"))
+    elif msg_type == MSG_TYPE.MSG_TYPE_INFO and meta.get("tool_progress"):
+        append_to_processing_block(chunk + "\n", stream=meta.get("stream"))
+    return True  # return False to cancel the running tool
+
+discussion.chat(
+    user_message="Run the long analysis script and show me progress.",
+    streaming_callback=ui_callback,
+    event_mode=EventMode.PROCESSING_TAG_MODE,
+)
+```
+
 **Example: Using `FULL_CALLBACK_MODE`**
 ```python
 from lollms_client.lollms_types import MSG_TYPE, EventMode

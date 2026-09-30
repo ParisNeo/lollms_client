@@ -28,7 +28,66 @@ LCP is a lightweight, zero-dependency local tool execution framework for Lollms.
 *   **`tool_files`**: Import standalone Python tool files directly from anywhere on disk.
 
 ### 6. Context Awareness (Advanced Agentic Patterns)
-Tools can optionally receive the active `LollmsClient` instance and `LollmsDiscussion` session state directly via keyword arguments (`lollms_client_instance`, `discussion_instance`). The AST parser automatically filters these out when building the JSON schema for the LLM, ensuring the LLM never sees them.
+Tools can optionally receive host-injected context objects directly via keyword arguments. Three parameters are supported, all automatically filtered out of the LLM-facing JSON schema:
+
+*   **`tool_context`** (recommended): A unified `ToolContext` object (from `lollms_client.lollms_types`) bundling the active `LollmsClient`, `LollmsDiscussion`, `LollmsPersonality`, the live streaming callback, the `EventMode`, and the resolved workspace path. It exposes:
+    *   `emit_progress(text, meta)` — streams a progress line to the host UI, respecting the active event mode (see the matrix below). Returns `False` when the user cancelled, enabling cooperative abort.
+    *   `emit_tool_event(msg_type, text, meta)` — emits a structured `MSG_TYPE_*` event (callback modes only).
+    *   `workspace_root` — resolved workspace `Path`.
+*   **`lollms_client_instance`**: The active `LollmsClient` (legacy pattern).
+*   **`discussion_instance`**: The active `LollmsDiscussion` (legacy pattern).
+
+**Injection matrix** — a tool receives the context only if its function signature declares the parameter:
+
+| Dispatch path | Injection mechanism |
+| :--- | :--- |
+| Direct-callable tools (`chat()` signature inspection) | `ChatMixin` checks `inspect.signature` and injects `tool_context` into the call kwargs |
+| `to_chat_tool_specs` closures | The `**kwargs` closure forwards `tool_context` to `LCPBinding.execute_tool` |
+| LCP registry fallback | `ChatMixin` passes `tool_context=` to `execute_tool`, which signature-gates injection |
+
+**Security contract**: `tool_context`, `discussion_instance`, and `lollms_client_instance` are **host-only**. Any LLM-emitted value for these keys inside `<tool>` parameters is stripped before host injection — the model can never forge or overwrite them. They are also excluded from the AST schema extractor, the regex fallback extractor, and must never appear in `description.yaml` `input_parameters`.
+
+**Progress streaming & cooperative cancellation** — `emit_progress` behavior per event mode:
+
+| EventMode | Behavior |
+| :--- | :--- |
+| `PROCESSING_TAG_MODE` | Emits `MSG_TYPE_CHUNK` with meta `{"tool_progress": True, "was_processed": True}` — renders inside the open `<processing>` block |
+| `FULL_CALLBACK_MODE` | Emits `MSG_TYPE_INFO` with meta `{"tool_progress": True}` |
+| `MIXED_MODE` | Emits both the chunk and the info event |
+| `SILENT_MODE` | No-op |
+
+If the host callback returns `False` (the standard cancellation signal), `emit_progress` returns `False`. Long-running tools should treat this as a cooperative abort signal: stop work, clean up, and return a failure dict. The built-in `execute_python` toolset implements this contract — its `_ProgressStringIO` stdout/stderr hook streams every printed line live (tagged `{"stream": "stdout"|"stderr"}`) and raises `KeyboardInterrupt` on cancel, producing a clean `"Execution interrupted by user cancellation"` result.
+
+**Reference example** — a long-running tool with live progress:
+
+```python
+def tool_process_dataset(file_name: str, tool_context=None) -> dict:
+    """
+    Processes a dataset row-by-row with live progress reporting.
+
+    Args:
+        file_name (str): Name of the CSV file in the workspace.
+    """
+    import csv, time
+    from pathlib import Path
+
+    path = Path(file_name)
+    if not path.exists():
+        return {"success": False, "error": f"File '{file_name}' not found."}
+
+    with path.open(newline="", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+
+    for i, row in enumerate(rows, 1):
+        time.sleep(0.1)  # simulate work
+        if tool_context is not None:
+            if tool_context.emit_progress(f"Processed row {i}/{len(rows)}") is False:
+                return {"success": False, "error": "Cancelled by user."}
+
+    return {"success": True, "output": f"Processed {len(rows)} rows."}
+```
+
+Note that `tool_context` carries a default of `None` — the tool remains fully callable in agnostic contexts (plain LCP execution without a discussion host) where no context is injected.
 
 ### 7. Dynamic Tool Generation from Artefacts
 **LLM-Authored Tools.** LCP integrates seamlessly with the Artefact system. If the LLM generates a `type="tool"` artefact, LCP can dynamically compile and register it in memory.

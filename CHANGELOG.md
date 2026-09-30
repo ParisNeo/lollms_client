@@ -276,9 +276,9 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
-## [2026-09-30 21:51]
+## [2026-09-30 19:53]
 
-- fix(lollms_client): update major version to v1.20.8
+- feat(tools): enhance execute_python tool and tool binding capabilities
 
 ## [2026-09-30 09:26]
 

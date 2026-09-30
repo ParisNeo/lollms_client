@@ -5314,15 +5314,27 @@ JSON:"""
         return _inject_tool_images_for_vlm_core(tool_result, self.lollms_client)
 
     def _execute_tool(self, tool_name: str, tool_params: Dict[str, Any], active_tools: Dict) -> Dict[str, Any]:
+        from lollms_client.lollms_types import ToolContext
+
         ws_dir = self._resolved_workspace or Path(".")
-        return _core_execute_tool_call(
-            tool_name=tool_name,
-            tool_params=tool_params,
-            active_tools=active_tools,
-            workspace_dir=ws_dir,
-            lollms_client=self.lollms_client,
-            discussion_instance=getattr(self, '_artefact_proxy', None)
+        tool_context = ToolContext(
+            client=self.lollms_client,
+            discussion=getattr(self, '_artefact_proxy', None),
+            personality=self,
+            callback=getattr(self, '_active_streaming_callback', None),
+            event_mode=getattr(self, '_active_event_mode', EventMode.PROCESSING_TAG_MODE),
+            workspace_path=ws_dir,
         )
+        with tool_context.workspace_cwd():
+            return _core_execute_tool_call(
+                tool_name=tool_name,
+                tool_params=tool_params,
+                active_tools=active_tools,
+                workspace_dir=ws_dir,
+                lollms_client=self.lollms_client,
+                discussion_instance=getattr(self, '_artefact_proxy', None),
+                tool_context=tool_context,
+            )
 
     def chat(
         self,
@@ -6218,7 +6230,11 @@ JSON:"""
                                     except Exception as ex:
                                         ASCIIColors.warning(f"Failed to emit tool start: {ex}")
 
-                                tool_res = self._execute_tool(tool_name, tool_params, active_tools)
+                                try:
+                                    tool_res = self._execute_tool(tool_name, tool_params, active_tools)
+                                except Exception as exec_crash:
+                                    failed_tool_signatures[context_aware_sig] = failed_tool_signatures.get(context_aware_sig, 0) + 1
+                                    raise
 
                                 vlm_images = self._inject_tool_images_for_vlm(tool_res)
                                 if vlm_images:
@@ -6277,6 +6293,14 @@ JSON:"""
                                         f"[SYSTEM DIRECTIVE: The skill methodology has been loaded into your context above. "
                                         f"You have fulfilled the Skill-First mandate. DO NOT call tool_load_skill again. "
                                         f"You MUST now proceed directly to executing Phase 1 of the skill protocol (scan the workspace and emit `<artifact name=\"classes.md\">` and `<artifact name=\"mapping.md\">`).]"
+                                    )
+                                elif tool_success and tool_name in ("tool_execute_python_file", "tool_execute_python_code", "tool_execute_shell_command"):
+                                    report_part = (
+                                        f"=== ✅ TOOL RESULT: {tool_name} ===\n"
+                                        f"<tool_result name=\"{tool_name}\" status=\"SUCCESS\">\n{clean_result_str}\n</tool_result>\n\n"
+                                        f"[SYSTEM DIRECTIVE: The execution completed successfully and its full output is above. "
+                                        f"The task is DONE. Do NOT call this tool again. "
+                                        f"Write your final summary to the user and emit `<done/>` on a new line NOW.]"
                                     )
                                 elif tool_success:
                                     report_part = f"=== ✅ TOOL RESULT: {tool_name} ===\n<tool_result name=\"{tool_name}\" status=\"SUCCESS\">\n{clean_result_str}\n</tool_result>"
@@ -6850,7 +6874,11 @@ JSON:"""
                                     )
                                     continue
 
-                            tool_res = self._execute_tool(tool_name, tool_params, active_tools)
+                            try:
+                                tool_res = self._execute_tool(tool_name, tool_params, active_tools)
+                            except Exception as exec_crash:
+                                failed_tool_signatures[context_aware_sig] = failed_tool_signatures.get(context_aware_sig, 0) + 1
+                                raise
 
                             vlm_images = self._inject_tool_images_for_vlm(tool_res)
                             if vlm_images:
@@ -6920,7 +6948,15 @@ JSON:"""
                                     except Exception:
                                         pass
 
-                            if tool_success:
+                            if tool_success and tool_name in ("tool_execute_python_file", "tool_execute_python_code", "tool_execute_shell_command"):
+                                report_part = (
+                                    f"=== ✅ TOOL RESULT: {tool_name} ===\n"
+                                    f"<tool_result name=\"{tool_name}\" status=\"SUCCESS\">\n{clean_result_str}\n</tool_result>\n\n"
+                                    f"[SYSTEM DIRECTIVE: The execution completed successfully and its full output is above. "
+                                    f"The task is DONE. Do NOT call this tool again. "
+                                    f"Write your final summary to the user and emit `<done/>` on a new line NOW.]"
+                                )
+                            elif tool_success:
                                 report_part = f"=== ✅ TOOL RESULT: {tool_name} ===\n<tool_result name=\"{tool_name}\" status=\"SUCCESS\">\n{clean_result_str}\n</tool_result>"
                             else:
                                 report_part = f"=== ❌ TOOL FAILED: {tool_name} ===\n<tool_result name=\"{tool_name}\" status=\"FAILED\">\n{clean_result_str}\n</tool_result>\n\n⚠️ **Error Analysis Guidance:** Read the error details above carefully to understand what failed. Fix the parameters or try an alternative approach."
