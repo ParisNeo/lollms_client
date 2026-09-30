@@ -125,15 +125,17 @@ class LollmsToolBinding(LollmsBaseBinding):
                 def _call(**kwargs: Any) -> Dict[str, Any]:
                     try:
                         disc_inst = kwargs.get("discussion_instance")
+                        host_tool_context = kwargs.get("tool_context")
 
-                        # Strip from params dict so the clean parameters go to the tool
-                        clean_params = {k: v for k, v in kwargs.items() if k not in ("discussion_instance", "lollms_client_instance")}
+                        # Strip host-injected handles so the clean parameters go to the tool
+                        clean_params = {k: v for k, v in kwargs.items() if k not in ("discussion_instance", "lollms_client_instance", "tool_context")}
 
                         result = self.execute_tool(
                             tool_name, 
                             clean_params, 
                             discussion_instance=disc_inst,
-                            lollms_client_instance=kwargs.get("lollms_client_instance")
+                            lollms_client_instance=kwargs.get("lollms_client_instance"),
+                            tool_context=host_tool_context
                         )
                         # Normalise: always return a dict
                         if not isinstance(result, dict):

@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple, Callable, Union
 from types import SimpleNamespace
 from datetime import datetime
 from ascii_colors import ASCIIColors, trace_exception
-from lollms_client.lollms_types import MSG_TYPE, EventMode
+from lollms_client.lollms_types import MSG_TYPE, EventMode, ToolContext
 from ._message import LollmsMessage
 from lollms_client.lollms_artefact import ArtefactType, make_image_id, ArtefactVisibility, ArtefactStatus
 from lollms_client.lollms_memory import FailureMemory
@@ -1882,6 +1882,17 @@ class _StreamState:
                     })
             return True
 
+
+        # ── 🛡️ STRAY CLOSING TAG SUPPRESSION ──
+        # If the LLM emits a closing artifact tag when we are not inside an artifact,
+        # it is a stray tag and must be suppressed to prevent leaking to the UI.
+        if not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_tool and not self._is_accumulating_secondary and not self._in_code_fence:
+            stray_close_match = re.search(r'</(?:artifact|artefact)>', self._pending_buffer, re.IGNORECASE)
+            if stray_close_match:
+                # Remove the stray closing tag from the buffer
+                self._pending_buffer = self._pending_buffer[:stray_close_match.start()] + self._pending_buffer[stray_close_match.end():]
+                # Continue processing the rest of the buffer
+                return self.feed(self._pending_buffer)
 
         # ── Default Forwarding ──
         # Robust partial tag detection: Check if the buffer ends with a prefix of any known tag.
@@ -5070,6 +5081,19 @@ class ChatMixin:
         persistent_processed_tags = set()
         consecutive_connection_errors = 0
         last_connection_error_desc = ""
+        # ── 🎯 TOOL CONTEXT: Unified handle for tool execution ──
+        # Bundles client, discussion, personality, callback, and event mode into a
+        # single object that tools can introspect for progress streaming, multi-model
+        # access, memory queries, and workspace resolution.
+        _tool_context = ToolContext(
+            client=self.lollmsClient,
+            discussion=self,
+            personality=personality,
+            callback=callback,
+            event_mode=event_mode,
+            workspace_path=Path(self.workspace_data_path) if getattr(self, "workspace_data_path", None) else None,
+        )
+        object.__setattr__(self, "_active_tool_context", _tool_context)
 
         # Initialize pending memory searches list for this turn
         object.__setattr__(self, '_pending_memory_searches', [])
@@ -6736,6 +6760,7 @@ class ChatMixin:
                                        tool_params, 
                                        lollms_client_instance=self.lollmsClient, 
                                        discussion_instance=self,
+                                       tool_context=_tool_context,
                                     )
                                 except Exception as e:
                                     trace_exception(e)
@@ -6871,6 +6896,8 @@ class ChatMixin:
                                     call_kwargs["discussion_instance"] = self
                                 if "lollms_client_instance" in _tool_sig_params:
                                     call_kwargs["lollms_client_instance"] = self.lollmsClient
+                                if "tool_context" in _tool_sig_params:
+                                    call_kwargs["tool_context"] = _tool_context
 
                                 # ── Take BEFORE Snapshot ──
                                 files_before = {}

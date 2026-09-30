@@ -201,8 +201,15 @@ def _prompt_user_validation(source: str, script_label: str, argv: Optional[List[
             else:
                 ASCIIColors.yellow("  Invalid choice. Please enter 'y', 'n', 'a', or 'v'.")
 
-    # 3. Fallback for non-interactive environments without an attached handler (assume refusal, do not block)
-    return "reject", "Non-interactive environment: no user interaction channel available to authorize execution in safe mode (refusal assumed without blocking)."
+    # 3. Fallback for non-interactive environments without an attached handler.
+    # We cannot block indefinitely without a user channel, so we reject with a
+    # clear, actionable message that instructs the LLM on how to proceed.
+    return "reject", (
+        "No interactive channel available (no TTY, no confirm_handler registered). "
+        "To authorize this execution, either: "
+        "(a) pass a confirm_handler callback to LollmsDiscussion.chat(), or "
+        "(b) set python_autonomy_level='full_access' to bypass sandbox prompts."
+    )
 
 
 def _ensure_import(module_name: str, package_name: str = None):
@@ -253,7 +260,7 @@ def _window_output(text: str) -> str:
     return f"{head}{marker}{tail}"
 
 
-def _persist_full_output(text: str, script_label: str) -> Optional[str]:
+def _persist_full_output(text: str, script_label: str, tool_context: Optional[Any] = None) -> Optional[str]:
     """
     Persists the full captured output to a uniquely named .log file in the
     workspace root. Returns the file name on success, None on failure.
@@ -262,7 +269,7 @@ def _persist_full_output(text: str, script_label: str) -> Optional[str]:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_label = re.sub(r'[^A-Za-z0-9_.-]+', '_', Path(script_label).stem)[:40] or "script"
         log_name = f"exec_output_{safe_label}_{stamp}_{uuid.uuid4().hex[:6]}.log"
-        log_path = _get_workspace_root() / log_name
+        log_path = _get_workspace_root(tool_context) / log_name
         with open(log_path, "w", encoding="utf-8", errors="ignore") as f:
             f.write(text)
         return log_name
@@ -333,10 +340,13 @@ def _detect_risky_operations(source: str) -> Optional[str]:
     return None
 
 
-def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]] = None) -> Dict[str, Any]:
+def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]] = None, tool_context: Optional[Any] = None) -> Dict[str, Any]:
     """
     Executes the given Python source string in a sandboxed namespace with
     user validation, stdout/stderr capture, sys.argv override, safety enforcement, and matplotlib interception.
+    
+    If tool_context is provided, stdout lines are streamed to the UI in real-time
+    via tool_context.emit_progress() for immediate feedback on long-running scripts.
     """
     global _AUTO_APPROVE_PYTHON
 
@@ -406,11 +416,44 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
         def reconfigure(self, *args, **kwargs):
             pass
 
+    class _ProgressStringIO(io.StringIO):
+        """
+        StringIO that buffers output AND streams complete lines to the UI
+        via tool_context.emit_progress() for real-time feedback on long-running scripts.
+        """
+        def __init__(self, tool_context: Optional[Any] = None, stream_name: str = "stdout"):
+            super().__init__()
+            self._tool_context = tool_context
+            self._stream_name = stream_name
+            self._line_buffer = ""
+
+        def write(self, text: str) -> int:
+            if not text:
+                return 0
+            # Buffer the text
+            written = super().write(text)
+            # Stream complete lines to the UI
+            if self._tool_context is not None:
+                self._line_buffer += text
+                while "\n" in self._line_buffer:
+                    line, self._line_buffer = self._line_buffer.split("\n", 1)
+                    if line.strip():
+                        if self._tool_context.emit_progress(line, {"stream": self._stream_name}) is False:
+                            self.silence()
+                            raise KeyboardInterrupt
+            return written
+
+        def reconfigure(self, *args, **kwargs):
+            pass
+
+        def silence(self):
+            self._tool_context = None
+
     cwd_repr = os.path.abspath(os.getcwd())
     if cwd_repr not in sys.path:
         sys.path.insert(0, cwd_repr)
 
-    workspace_root = _get_workspace_root().resolve()
+    workspace_root = _get_workspace_root(tool_context).resolve()
 
     # ── PURGE STALE WORKSPACE MODULES FROM sys.modules ──
     # When scripts or modules inside the workspace are edited/patched between rounds,
@@ -548,8 +591,13 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
     old_argv = sys.argv[:]
     old_dunder_stdout = getattr(sys, "__stdout__", None)
     old_dunder_stderr = getattr(sys, "__stderr__", None)
-    redirected_output = _NoReconfigureStringIO()
-    redirected_error = _NoReconfigureStringIO()
+    progress_tc = tool_context if (tool_context is not None and hasattr(tool_context, "emit_progress")) else None
+    if progress_tc is not None:
+        redirected_output = _ProgressStringIO(progress_tc, "stdout")
+        redirected_error = _ProgressStringIO(progress_tc, "stderr")
+    else:
+        redirected_output = _NoReconfigureStringIO()
+        redirected_error = _NoReconfigureStringIO()
     exec_stdout_hijacked = False
     exec_stderr_hijacked = False
 
@@ -569,9 +617,16 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
         try:
             exec(compile(source, script_label, "exec"), local_vars)
         except SystemExit as se:
-            raise RuntimeError(f"User code called sys.exit() with code {se.code}. This is not permitted in sandboxed execution.") from se
+            exit_code = se.code if isinstance(se.code, int) else 1
+            redirected_output.write(f"\n[Process exited with code {exit_code}]\n")
         except KeyboardInterrupt:
-            raise RuntimeError("Execution interrupted by KeyboardInterrupt.")
+            redirected_output.write("\n[Execution interrupted by user cancellation]\n")
+            return {
+                "success": False,
+                "error": "Execution interrupted by user cancellation (KeyboardInterrupt).",
+                "output": _sanitize_host_paths(_window_output(redirected_output.getvalue())),
+                "stderr": _sanitize_host_paths(_window_output(redirected_error.getvalue()))
+            }
         except Exception:
             import traceback
             sys.stdout = old_stdout
@@ -620,6 +675,13 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
 
             _plt.close('all')
 
+    except KeyboardInterrupt:
+        return {
+            "success": False,
+            "error": "Execution interrupted by user cancellation (KeyboardInterrupt).",
+            "output": _sanitize_host_paths(_window_output(redirected_output.getvalue())),
+            "stderr": _sanitize_host_paths(_window_output(redirected_error.getvalue()))
+        }
     except BaseException as outer_err:
         import traceback
         sys.stdout = old_stdout
@@ -677,7 +739,7 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
     err_str = err_str.replace("\r\n", "\n").replace("\r", "\n")
 
     if len(out_str) > _PREVIEW_WINDOW_CHARS:
-        log_name = _persist_full_output(out_str, script_label)
+        log_name = _persist_full_output(out_str, script_label, tool_context)
         if log_name:
             stripped_chars = len(out_str) - _PREVIEW_WINDOW_CHARS
             out_str = (
@@ -699,12 +761,22 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
     }
 
 
-def _get_workspace_root() -> Path:
+def _get_workspace_root(tool_context: Optional[Any] = None) -> Path:
     """
     Resolves the workspace root.
-    The orchestrator chdirs into the sandboxed workspace before invoking this tool,
-    so process CWD is authoritative.
+    Prefers the host-injected ToolContext workspace (authoritative — it is the
+    exact root artifacts are flushed to), then falls back to CWD-based
+    resolution for agnostic contexts without a discussion host.
     """
+    if tool_context is not None:
+        ctx_ws = getattr(tool_context, "workspace_path", None)
+        if ctx_ws:
+            try:
+                ws = Path(ctx_ws).resolve()
+                if ws.exists() and ws.is_dir():
+                    return ws
+            except Exception:
+                pass
     cwd = Path.cwd().resolve()
     if (cwd / "workspace_data").exists() and (cwd / "workspace_data").is_dir():
         return (cwd / "workspace_data").resolve()
@@ -713,7 +785,7 @@ def _get_workspace_root() -> Path:
     return cwd
 
 
-def _resolve_workspace_path(file_name: str) -> Optional[Path]:
+def _resolve_workspace_path(file_name: str, tool_context: Optional[Any] = None) -> Optional[Path]:
     """
     Safely resolves a file path inside the workspace sandbox.
     Blocks path traversal ('..') and absolute paths escaping the root.
@@ -722,7 +794,7 @@ def _resolve_workspace_path(file_name: str) -> Optional[Path]:
     if not file_name or not isinstance(file_name, str):
         return None
 
-    root = _get_workspace_root()
+    root = _get_workspace_root(tool_context)
     clean = file_name.replace("\\", "/").strip().lstrip("/")
 
     if not clean or ".." in Path(clean).parts:
@@ -802,7 +874,7 @@ def _enforce_inline_code_limit(code_str: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def tool_execute_python_code(code: str = "") -> Dict[str, Any]:
+def tool_execute_python_code(code: str = "", tool_context: Optional[Any] = None) -> Dict[str, Any]:
     """
     Executes a SHORT, PUNCTUAL inline Python snippet and returns stdout, stderr, and generated plots.
 
@@ -822,6 +894,8 @@ def tool_execute_python_code(code: str = "") -> Dict[str, Any]:
 
     Args:
         code (str): The raw Python source code to execute inline. Required.
+        tool_context: Optional host-injected ToolContext. When present, stdout/stderr
+            lines are streamed live to the application callback during execution.
     """
     if isinstance(code, dict):
         ASCIIColors.warning("[execute_python] Unwrapping nested dictionary parameter.")
@@ -843,12 +917,13 @@ def tool_execute_python_code(code: str = "") -> Dict[str, Any]:
             "stderr": ""
         }
 
-    return _run_python_source(code_str, "python_code")
+    return _run_python_source(code_str, "python_code", tool_context=tool_context)
 
 
 def tool_execute_python_file(
     file_name: str = "",
     args: Optional[List[Any]] = None,
+    tool_context: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Preferred execution path: executes an existing Python file from the workspace and returns stdout, stderr, and generated plots.
@@ -864,6 +939,8 @@ def tool_execute_python_file(
     Args:
         file_name (str): Name of an existing .py file in the workspace to execute. Required. Path traversal is blocked.
         args (list): Optional command-line style arguments passed to the script via sys.argv[1:]. All values are stringified.
+        tool_context: Optional host-injected ToolContext. When present, stdout/stderr
+            lines are streamed live to the application callback during execution.
     """
     file_name_str = file_name if isinstance(file_name, str) else ("" if file_name is None else str(file_name))
     if not file_name_str.strip():
@@ -878,7 +955,7 @@ def tool_execute_python_file(
             "stderr": ""
         }
 
-    resolved = _resolve_workspace_path(file_name_str)
+    resolved = _resolve_workspace_path(file_name_str, tool_context)
     if resolved is None:
         return {
             "success": False,
@@ -912,4 +989,4 @@ def tool_execute_python_file(
         }
 
     argv = _normalize_argv(file_name_str, args)
-    return _run_python_source(source, file_name_str, argv=argv)
+    return _run_python_source(source, file_name_str, argv=argv, tool_context=tool_context)

@@ -276,6 +276,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-30 19:53]
+
+- feat(tools): enhance execute_python tool and tool binding capabilities
+
 ## [2026-09-30 09:26]
 
 - refactor(stt): update whisper batching tests and discussion core mixin

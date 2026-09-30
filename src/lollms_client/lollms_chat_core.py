@@ -1233,7 +1233,8 @@ def execute_tool_call(
     active_tools: Dict[str, Any],
     workspace_dir: Path,
     lollms_client: Any = None,
-    discussion_instance: Any = None
+    discussion_instance: Any = None,
+    tool_context: Any = None
 ) -> Dict[str, Any]:
     """
     Executes a tool call in a strictly sandboxed CWD, sanitizing path parameters
@@ -1272,6 +1273,8 @@ def execute_tool_call(
                 call_kwargs["discussion_instance"] = discussion_instance
             if "lollms_client_instance" in _sig:
                 call_kwargs["lollms_client_instance"] = lollms_client
+            if tool_context is not None and "tool_context" in _sig:
+                call_kwargs["tool_context"] = tool_context
 
             try:
                 result = tool_def["callable"](**call_kwargs)
@@ -1294,7 +1297,8 @@ def execute_tool_call(
                     tool_name,
                     sanitized_params,
                     discussion_instance=discussion_instance,
-                    lollms_client_instance=lollms_client
+                    lollms_client_instance=lollms_client,
+                    tool_context=tool_context
                 )
                 if isinstance(result, dict):
                     return result

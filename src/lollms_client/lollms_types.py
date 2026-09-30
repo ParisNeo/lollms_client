@@ -1,5 +1,6 @@
 from enum import Enum
-from typing import Optional, List, Dict, Any
+from pathlib import Path
+from typing import Optional, List, Dict, Any, Callable
 
 class MSG_TYPE(Enum):
     # Messaging
@@ -263,6 +264,125 @@ class EventMode(Enum):
         """Returns True if all progress reporting, events, and special tags are suppressed."""
         return self == EventMode.SILENT_MODE
 
+
+class ToolContext:
+    """
+    Unified context object passed to LCP tools during execution.
+
+    Replaces the legacy pattern of passing separate `lollms_client_instance`
+    and `discussion_instance` parameters. Provides a single, capability-rich
+    handle that tools can introspect for multi-model access, discussion history,
+    memory, data zones, personality, and a direct progress callback channel.
+
+    Tools that accept an optional `tool_context: Optional[ToolContext]` parameter
+    can use it to:
+      - Stream intermediate output to the UI via `emit_progress()`
+      - Access the active LLM client for multi-model operations
+      - Query discussion history, artifacts, and memory
+      - Respect the active EventMode for structured event emission
+    """
+
+    def __init__(
+        self,
+        client: Any = None,
+        discussion: Any = None,
+        personality: Any = None,
+        callback: Optional[Callable] = None,
+        event_mode: EventMode = EventMode.PROCESSING_TAG_MODE,
+        workspace_path: Optional[Path] = None,
+    ):
+        self.client = client
+        self.discussion = discussion
+        self.personality = personality
+        self.callback = callback
+        self.event_mode = event_mode
+        self.workspace_path = workspace_path
+
+    def emit_progress(self, text: str, meta: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        Emits a progress update to the UI, respecting the active EventMode.
+
+        In PROCESSING_TAG_MODE / MIXED_MODE: emits as MSG_TYPE_CHUNK with
+        was_processed=True so it renders inside the active <processing> block.
+        In FULL_CALLBACK_MODE: emits as MSG_TYPE_INFO with structured metadata.
+        In SILENT_MODE: no-op.
+
+        Returns True if the callback was invoked successfully, False otherwise.
+        """
+        if self.callback is None:
+            return True
+        if self.event_mode.is_silent:
+            return True
+
+        merged_meta = dict(meta or {})
+        merged_meta["tool_progress"] = True
+
+        if self.event_mode.has_tags:
+            merged_meta["was_processed"] = True
+            _cb(self.callback, text, MSG_TYPE.MSG_TYPE_CHUNK, merged_meta)
+        if self.event_mode.has_callbacks:
+            return _cb(self.callback, text, MSG_TYPE.MSG_TYPE_INFO, merged_meta)
+        return True
+
+    def emit_tool_event(self, msg_type: MSG_TYPE, text: str = "", meta: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        Emits a structured tool event (e.g., MSG_TYPE_TOOL_START, MSG_TYPE_TOOL_END)
+        only when the event mode supports callbacks. No-op in tag-only or silent modes.
+        """
+        if self.callback is None or not self.event_mode.has_callbacks:
+            return True
+        return _cb(self.callback, text, msg_type, meta or {})
+
+    @property
+    def workspace_root(self) -> Path:
+        """Returns the resolved workspace root path."""
+        if self.workspace_path:
+            return Path(self.workspace_path).resolve()
+        if self.discussion and getattr(self.discussion, "workspace_data_path", None):
+            return Path(self.discussion.workspace_data_path).resolve()
+        return Path.cwd().resolve()
+
+    def workspace_cwd(self):
+        """
+        Context manager that guarantees CWD == authoritative workspace root
+        for the duration of a tool execution.
+
+        Resolves the root via the workspace_root chain, ensures it exists,
+        chdirs into it on entry, and restores the original CWD on exit —
+        even on exceptions. Yields the resolved root Path so callers can
+        snapshot or resolve files against it.
+        """
+        import os
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _manager():
+            root = self.workspace_root
+            try:
+                root.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(root)
+                yield root
+            finally:
+                try:
+                    os.chdir(original_cwd)
+                except Exception:
+                    pass
+
+        return _manager()
+
+
+def _cb(callback: Optional[Callable], text: str, msg_type: MSG_TYPE, meta: Optional[Dict] = None) -> bool:
+    if callback is None:
+        return True
+    try:
+        result = callback(text, msg_type, meta or {})
+        return result is not False
+    except Exception:
+        return True
 
 def normalize_event_mode(mode: Any) -> EventMode:
     """Normalizes an EventMode enum, integer value, or string to a canonical EventMode."""

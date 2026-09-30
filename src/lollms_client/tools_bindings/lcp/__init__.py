@@ -127,7 +127,7 @@ class LCPBinding(LollmsToolBinding):
             for param_raw in params_str.split(","):
                 param = param_raw.strip()
                 if not param or param.startswith("*") or ":" not in param:
-                    if param and param.split("=")[0].strip() and param.split("=")[0].strip() not in ("args", "kwargs"):
+                    if param and param.split("=")[0].strip() and param.split("=")[0].strip() not in ("args", "kwargs", "discussion_instance", "lollms_client_instance", "tool_context"):
                         p_name = param.split("=")[0].strip()
                         properties[p_name] = {"type": "string", "description": f"Parameter '{p_name}'"}
                         if "=" not in param:
@@ -136,7 +136,7 @@ class LCPBinding(LollmsToolBinding):
 
                 p_name, p_type_raw = param.split(":", 1)
                 p_name = p_name.strip()
-                if not p_name or p_name in ("args", "kwargs"):
+                if not p_name or p_name in ("args", "kwargs", "discussion_instance", "lollms_client_instance", "tool_context"):
                     continue
 
                 p_type_raw = p_type_raw.strip().lower()
@@ -197,7 +197,7 @@ class LCPBinding(LollmsToolBinding):
 
         for idx, arg in enumerate(args_list):
             arg_name = arg.arg
-            if arg.arg in ("args", "kwargs", "discussion_instance", "lollms_client_instance"):
+            if arg.arg in ("args", "kwargs", "discussion_instance", "lollms_client_instance", "tool_context"):
                 continue
 
             arg_type = "string"
@@ -734,6 +734,20 @@ class LCPBinding(LollmsToolBinding):
             for k, v in params.items():
                 if k in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
                     clean_params[k] = v
+
+            host_tool_context = kwargs.get("tool_context")
+            clean_params.pop("tool_context", None)
+            if host_tool_context is not None and "tool_context" in sig.parameters:
+                clean_params["tool_context"] = host_tool_context
+
+            host_client = kwargs.get("lollms_client_instance")
+            clean_params.pop("lollms_client_instance", None)
+            if host_client is not None and "lollms_client_instance" in sig.parameters:
+                clean_params["lollms_client_instance"] = host_client
+
+            clean_params.pop("discussion_instance", None)
+            if discussion_instance is not None and "discussion_instance" in sig.parameters:
+                clean_params["discussion_instance"] = discussion_instance
 
             try:
                 result = execute_function(**clean_params)
