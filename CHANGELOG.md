@@ -276,6 +276,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-09-30 09:26]
+
+- refactor(stt): update whisper batching tests and discussion core mixin
+
 ## [2026-09-29 09:21]
 
 - fix(lollms): remove unsafe final disk reconciliation cleanup

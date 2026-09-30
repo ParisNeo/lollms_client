@@ -491,11 +491,21 @@ class CoreMixin:
         # Automatically save the current workspace path into metadata so it can be
         # restored when the discussion is reloaded in a future session.
         current_ws_path = getattr(self, '_workspace_path_val', None)
-        if current_ws_path and metadata.get("workspace_path") != current_ws_path:
+        ws_changed = current_ws_path is not None and metadata.get("workspace_path") != current_ws_path
+        if ws_changed:
             metadata["workspace_path"] = current_ws_path
 
+        # Persist whenever any tracked field is present or changed. The previous
+        # guard only assigned when the key already existed, silently dropping the
+        # first workspace_path write on image-less discussions.
         if self.images or "discussion_images" in metadata or "workspace_path" in metadata:
             setattr(self._db_discussion, 'discussion_metadata', metadata)
+        if self._is_db_backed:
+            from sqlalchemy.orm.attributes import flag_modified
+            try:
+                flag_modified(self._db_discussion, 'discussion_metadata')
+            except Exception:
+                pass
         setattr(self._db_discussion, 'updated_at', datetime.utcnow())
         if self._is_db_backed:
             from sqlalchemy.orm.attributes import flag_modified
@@ -847,22 +857,79 @@ class CoreMixin:
 
         return str(file_path.resolve())
 
+    # Lightweight text extensions whose content is read directly into the DB
+    # and exposed to the LLM at FULL visibility during workspace sync.
+    # Anything not in this set (PDF, DOCX, images, DBs, archives, ...) is
+    # registered as an as-is metadata entry at TREE_UNLOCKABLE visibility.
+    _LIGHTWEIGHT_TEXT_EXTS = {
+        ".txt", ".md", ".markdown", ".log", ".py", ".js", ".ts", ".tsx", ".jsx",
+        ".json", ".yaml", ".yml", ".xml", ".csv", ".tsv", ".sql", ".html", ".htm",
+        ".ini", ".toml", ".cfg", ".conf", ".rst", ".tex", ".sh", ".bash", ".bat",
+        ".ps1", ".c", ".cpp", ".h", ".java", ".go", ".rs", ".rb", ".php", ".swift",
+        ".kt", ".lua", ".css",
+    }
+
+    def _classify_artefact_type(self, file_ext: str) -> str:
+        if file_ext in (".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".sql", ".cir", ".net", ".op",
+                        ".c", ".cpp", ".h", ".java", ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".lua",
+                        ".sh", ".bash", ".bat", ".ps1"):
+            return "code"
+        if file_ext in (".csv", ".tsv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"):
+            return "data"
+        if file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
+            return "image"
+        return "document"
+
+    def _is_lightweight_text_file(self, f_path: Path, file_ext: str) -> bool:
+        """
+        Returns True when the file should be read as text and its content stored
+        in the DB at FULL visibility. A file qualifies when its extension is in
+        the lightweight text set, or when it decodes cleanly as UTF-8 without
+        null bytes (catches extensionless or unusual text files).
+        """
+        if file_ext in self._LIGHTWEIGHT_TEXT_EXTS:
+            return True
+        if file_ext in {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet",
+                        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg",
+                        ".zip", ".tar", ".gz", ".7z", ".rar", ".pdf", ".docx", ".pptx",
+                        ".odt", ".mp3", ".wav", ".ogg", ".flac", ".mp4", ".avi", ".mov",
+                        ".webm", ".bin", ".safetensors", ".gguf", ".pkl", ".onnx"}:
+            return False
+        try:
+            with open(f_path, 'rb') as f:
+                chunk = f.read(4096)
+            return b'\x00' not in chunk
+        except Exception:
+            return False
+
     def sync_workspace_to_artefacts(self) -> Dict[str, int]:
         """
-        Performs filesystem-as-source-of-truth synchronization between the physical 
+        Performs filesystem-as-source-of-truth synchronization between the physical
         workspace_data directory and the LollmsDiscussion Artefact database.
 
-        1. Purge: Deletes database records for any artefacts whose physical files 
+        Disk is the single source of truth for existence and content. Visibility
+        is a security gate, NOT a sync side-effect:
+
+        1. Purge: Deletes database records for any artefacts whose physical files
            have been deleted from disk.
-        2. Ingest: Scans the workspace folder, registering new files and updating 
-           existing artefacts whose disk content has changed.
+        2. Ingest (text files): Reads the file content into the DB so it is
+           queryable and instantly unlockable, but registers it at TREE_UNLOCKABLE
+           visibility. The content is NOT injected into the LLM context until the
+           LLM emits <unlock_file> or the user unlocks it. This prevents mass
+           context injection when a workspace contains many text files.
+        3. Ingest (binary / non-text files): Registers an as-is metadata entry at
+           TREE_UNLOCKABLE visibility (no content read), so the LLM knows the file
+           exists and can unlock it or use a tool to inspect it.
+
+        Security doctrine: anything not generated by the LLM (<artifact>) or
+        explicitly unlocked by the user defaults to TREE_UNLOCKABLE. Only at unlock
+        time is content promoted to FULL and added to the active context.
 
         Returns:
             Dict[str, int]: A report containing counts of synced items:
             {"new_artefacts": int, "updated_artefacts": int, "deleted_artefacts": int}
         """
         from lollms_client.lollms_artefact import ArtefactVisibility
-        import os
 
         ws_data_path = getattr(self, 'workspace_data_path', None)
         if not ws_data_path:
@@ -878,10 +945,6 @@ class CoreMixin:
         report["deleted_artefacts"] = len(purged_titles)
 
         # --- 2. WORKSPACE -> DB (Upsert Active Disk Files) ---
-        EXPLICIT_BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet", 
-                                ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", 
-                                ".zip", ".tar", ".gz", ".pdf", ".docx"}
-
         for f_path in workspace_dir.rglob("*"):
             if not f_path.is_file():
                 continue
@@ -891,45 +954,67 @@ class CoreMixin:
                 continue
 
             rel_str = str(rel_parts).replace("\\", "/")
-            file_name = rel_str
             file_ext = f_path.suffix.lower()
 
             if Path(rel_str).name.startswith("."):
                 continue
 
-            existing_art = self.artefacts.get(rel_str)
+            existing_art = self.artefacts.get(rel_str) or self.artefacts.get(f_path.stem)
             if existing_art and _is_ignored_path(existing_art.get("title", "")):
                 continue
 
             file_size = f_path.stat().st_size
+            atype = self._classify_artefact_type(file_ext)
 
-            # Determine artifact type
-            atype = "document"
-            if file_ext in (".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".sql", ".cir", ".net", ".op"):
-                atype = "code"
-            elif file_ext in (".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"):
-                atype = "data"
-            elif file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
-                atype = "image"
-
-            existing_art = self.artefacts.get(file_name) or self.artefacts.get(f_path.stem)
-
-            # Check if file is binary
-            is_binary = file_ext in EXPLICIT_BINARY_EXTS
-            if not is_binary:
+            if self._is_lightweight_text_file(f_path, file_ext):
+                # ── TEXT FILE: import content into DB, but keep it TREE_UNLOCKABLE ──
+                # Content is cached in the DB so <unlock_file> and SQL/grep tools work
+                # instantly, but it is NOT injected into the LLM context until explicitly
+                # unlocked. This is the security gate: disk files are never auto-promoted
+                # to FULL visibility by the sync pass.
                 try:
-                    with open(f_path, 'rb') as f:
-                        if b'\x00' in f.read(1024):
-                            is_binary = True
+                    disk_content = f_path.read_text(encoding="utf-8", errors="ignore")
                 except Exception:
-                    is_binary = True
+                    continue
 
-            if is_binary:
+                if existing_art is None:
+                    self.artefacts.add(
+                        title=rel_str,
+                        physical_path=rel_str,
+                        artefact_type=atype,
+                        content=disk_content,
+                        active=False,
+                        visibility=ArtefactVisibility.TREE_UNLOCKABLE,
+                        commit_message="Synced from disk (text content cached, unlockable)"
+                    )
+                    report["new_artefacts"] += 1
+                else:
+                    db_content = existing_art.get("content", "")
+                    if db_content != disk_content:
+                        # Preserve the current visibility: if the file was already
+                        # unlocked (FULL) by the LLM or user, keep it FULL. Otherwise
+                        # it stays TREE_UNLOCKABLE.
+                        current_visibility = existing_art.get("visibility", ArtefactVisibility.TREE_UNLOCKABLE)
+                        self.artefacts.update(
+                            title=rel_str,
+                            physical_path=rel_str,
+                            new_content=disk_content,
+                            new_type=atype,
+                            active=(current_visibility == ArtefactVisibility.FULL),
+                            visibility=current_visibility,
+                            commit_message="Updated from disk (text content modified)"
+                        )
+                        report["updated_artefacts"] += 1
+            else:
+                # ── BINARY / NON-TEXT FILE: as-is metadata entry, no content read ──
                 content_placeholder = (
-                    f"### Data File: `{rel_str}`\n\n"
-                    f"- **Type**: {file_ext.upper()} (Binary/Structured Data)\n"
+                    f"### File: `{rel_str}`\n\n"
+                    f"- **Type**: {file_ext.upper().lstrip('.') if file_ext else 'Unknown'} (As-Is / Non-Text)\n"
                     f"- **Size**: {file_size:,} bytes\n"
                     f"- **Location**: `./{rel_str}`\n\n"
+                    f"> This file is preserved on disk in its native format. "
+                    f"Use a tool (document tools, SQL query, or Python) to inspect or "
+                    f"query it, or <unlock_file> it to load a portion into context.\n"
                 )
                 if existing_art is None:
                     self.artefacts.add(
@@ -940,11 +1025,11 @@ class CoreMixin:
                         logical_content=content_placeholder,
                         active=True,
                         visibility=ArtefactVisibility.TREE_UNLOCKABLE,
-                        commit_message="Synced from disk (binary)"
+                        commit_message="Synced from disk (as-is entry)"
                     )
                     report["new_artefacts"] += 1
                 else:
-                    if existing_art.get("content", "").find(f"Size**: {file_size:,}") == -1:
+                    if f"Size**: {file_size:,}" not in existing_art.get("content", ""):
                         self.artefacts.update(
                             title=rel_str,
                             physical_path=rel_str,
@@ -953,38 +1038,7 @@ class CoreMixin:
                             new_type=atype,
                             active=True,
                             visibility=ArtefactVisibility.TREE_UNLOCKABLE,
-                            commit_message="Updated from disk (binary metadata)"
-                        )
-                        report["updated_artefacts"] += 1
-            else:
-                # Text File
-                try:
-                    disk_content = f_path.read_text(encoding="utf-8", errors="ignore")
-                except Exception:
-                    continue
-
-                if existing_art is None:
-                    self.artefacts.add(
-                        title=f_path.name,
-                        physical_path=rel_str,
-                        artefact_type=atype,
-                        content=disk_content,
-                        active=True,
-                        visibility=ArtefactVisibility.TREE_UNLOCKABLE,
-                        commit_message="Synced from disk (text)"
-                    )
-                    report["new_artefacts"] += 1
-                else:
-                    db_content = existing_art.get("content", "")
-                    if db_content != disk_content:
-                        self.artefacts.update(
-                            title=rel_str,
-                            physical_path=rel_str,
-                            new_content=disk_content,
-                            new_type=atype,
-                            active=True,
-                            visibility=ArtefactVisibility.TREE_UNLOCKABLE,
-                            commit_message="Updated from disk (text modified)"
+                            commit_message="Updated from disk (as-is metadata)"
                         )
                         report["updated_artefacts"] += 1
 
