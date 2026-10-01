@@ -1093,6 +1093,10 @@ class QueueStreamingCallback:
             self.q.put(AgentEvent(mapping[msg_type], **(meta or {})))
             return True
         if msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
+            if meta and meta.get("tool_progress"):
+                self.q.put(AgentEvent("info", text=chunk, **meta))
+                return True
+
             # If this is a live artifact streaming chunk, dispatch as a dedicated artefact_chunk event
             if meta and meta.get("live_artifact_chunk"):
                 title = meta.get("artifact_title", "artifact")
@@ -1116,7 +1120,7 @@ class QueueStreamingCallback:
         elif msg_type == MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK:
             self.q.put(AgentEvent("thought", text=chunk))
         elif msg_type == MSG_TYPE.MSG_TYPE_INFO:
-            self.q.put(AgentEvent("info", text=chunk))
+            self.q.put(AgentEvent("info", text=chunk, **(meta or {})))
         return True
 
 

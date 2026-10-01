@@ -1269,11 +1269,12 @@ def execute_tool_call(
         if "callable" in tool_def:
             call_kwargs = dict(sanitized_params)
             _sig = inspect.signature(tool_def["callable"]).parameters
-            if "discussion_instance" in _sig:
+            has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in _sig.values())
+            if "discussion_instance" in _sig or has_var_kw:
                 call_kwargs["discussion_instance"] = discussion_instance
-            if "lollms_client_instance" in _sig:
+            if "lollms_client_instance" in _sig or has_var_kw:
                 call_kwargs["lollms_client_instance"] = lollms_client
-            if tool_context is not None and "tool_context" in _sig:
+            if tool_context is not None and ("tool_context" in _sig or has_var_kw):
                 call_kwargs["tool_context"] = tool_context
 
             try:

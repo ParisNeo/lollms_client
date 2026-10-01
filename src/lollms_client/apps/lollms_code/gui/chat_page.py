@@ -135,6 +135,7 @@ class ChatSession:
         self.session_id: str = session_id or datetime.now().strftime("session_%Y%m%d_%H%M%S")
         self.session_title: str = "New Discussion"
         self.debug_log: List[Dict[str, Any]] = []
+        self._last_config_signature: Optional[str] = None
 
         self.load_prompt_history()
         if session_id:
@@ -311,16 +312,90 @@ class ChatSession:
         except Exception:
             pass
 
-    def ensure_ready(self):
-        if self.client is None:
+    def _compute_config_signature(self) -> str:
+        items = sorted(self.env.config_map.items())
+        pref_vals = (
+            self.prefs.workspace_path,
+            self.prefs.handbag_path,
+            self.prefs.temperature,
+            getattr(self.prefs, "auto_temperature", False),
+            self.prefs.max_tokens_per_turn,
+            getattr(self.prefs, "auto_max_tokens", False),
+            self.prefs.max_reasoning_steps,
+            self.prefs.shell_autonomy_level,
+            getattr(self.prefs, "auto_approve_python", False),
+            self.prefs.enable_sub_agents,
+            self.prefs.enable_model_switching,
+            self.prefs.skills_mode,
+            self.prefs.enable_memory,
+            getattr(self.prefs, "allow_computer_use", False),
+            self.prefs.debug,
+            getattr(self.prefs, "reasoning_effort", None),
+            getattr(self.prefs, "dynamic_effort", False),
+        )
+        return str(hash((tuple(items), pref_vals)))
+
+    def ensure_ready(self, force_recreate: bool = False):
+        if not self.env.is_configured():
+            return
+        curr_sig = self._compute_config_signature()
+        needs_recreate = force_recreate or self.client is None or getattr(self, "_last_config_signature", None) != curr_sig
+        if needs_recreate:
+            old_conv = None
+            if self.personality and hasattr(self.personality, "_conversation"):
+                old_conv = list(self.personality._conversation)
+
+            if self.client and hasattr(self.client, "cancel"):
+                try:
+                    self.client.cancel()
+                except Exception:
+                    pass
+
             self.client = agent_bridge.create_client(self.env, self.prefs)
-        if self.personality is None:
             self.personality = agent_bridge.create_personality(self.prefs, self.client)
+            if old_conv is not None and self.personality is not None:
+                self.personality._conversation = old_conv
+            self._last_config_signature = curr_sig
+        elif self.personality is None:
+            self.personality = agent_bridge.create_personality(self.prefs, self.client)
+
+    def reset_client(self):
+        """Recreates the LollmsClient and LollmsPersonality instances with fresh settings."""
+        old_conv = None
+        if self.personality and hasattr(self.personality, "_conversation"):
+            old_conv = list(self.personality._conversation)
+
+        if self.client and hasattr(self.client, "cancel"):
+            try:
+                self.client.cancel()
+            except Exception:
+                pass
+
+        try:
+            self.env.load()
+        except Exception:
+            pass
+
+        self.client = None
+        self.personality = None
+        try:
+            self.ensure_ready(force_recreate=True)
+            if old_conv is not None and self.personality is not None:
+                self.personality._conversation = old_conv
+            ASCIIColors.success("[ChatSession] Recreated LollmsClient and personality with updated settings.")
+        except Exception as ex:
+            ASCIIColors.warning(f"[ChatSession] Recreating client deferred: {ex}")
 
 
 def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: Optional[ChatSession] = None) -> None:
     if session is None:
         session = ChatSession(env, prefs)
+    session.env = env
+    session.prefs = prefs
+    try:
+        session.ensure_ready()
+    except Exception:
+        pass
     # Sync with persistent session log
     debug_log: List[Dict[str, Any]] = session.debug_log
     message_refs: Dict[str, Dict[str, Any]] = {}
@@ -2332,6 +2407,28 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                 session.save_to_disk()
 
             elif ev.kind == "info":
+                if ev.data.get("tool_progress"):
+                    line_txt = ev.data.get("text", "")
+                    if active_tool_panels:
+                        last_active = list(active_tool_panels.values())[-1]
+                        output_lines = last_active.setdefault("output_lines", [])
+                        output_lines.append(line_txt)
+
+                        panel = last_active.get("panel")
+                        if panel:
+                            code_box = getattr(panel, "_code_box", None)
+                            if code_box:
+                                live_display = "\n".join(output_lines)
+                                update_code_box(code_box, live_display)
+                            if hasattr(panel, "_sub_label"):
+                                panel._sub_label.set_text(f"• {line_txt[:60]}")
+                                panel._sub_label.set_visibility(True)
+
+                    status_label.set_text(f"⚡ {line_txt[:50]}")
+                    if scroll_state.get("auto_follow", True) and scroll_area:
+                        scroll_area.scroll_to(percent=1.0)
+                    continue
+
                 inf_type = ev.data.get("type")
                 if inf_type == "memory_consolidated":
                     seal_current_text_block()
@@ -2349,7 +2446,6 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                 hide_thinking_indicator()
                 seal_current_text_block()
                 params = ev.data.get("parameters", {})
-                params_str = json.dumps(params, indent=2, ensure_ascii=False) if isinstance(params, dict) else str(params)
 
                 # Remove previous running panel and debug entry for the same tool if present
                 if name in active_tool_panels:
@@ -2367,8 +2463,16 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                 elif isinstance(params, dict) and "file_name" in params:
                     subtitle = f"{params['file_name']} · executing…"
 
-                panel = add_event_panel(f"🛠️ Running: {name}", subtitle, params_str, "blue-500", "build")
-                active_tool_panels[name] = {"panel": panel, "params": params}
+                panel = add_event_panel(
+                    f"🛠️ Running: {name}",
+                    subtitle,
+                    "(waiting for output...)",
+                    "blue-500",
+                    "build",
+                    with_spinner=True,
+                    expanded=True
+                )
+                active_tool_panels[name] = {"panel": panel, "params": params, "output_lines": []}
                 status_label.set_text(f"Running {name}…")
                 _paint_round(timeline_slots, session.current_round, "bg-blue-500 animate-pulse")
 
@@ -2391,18 +2495,6 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                 if not params and name in active_tool_panels:
                     params = active_tool_panels[name].get("params", {})
 
-                # Remove the 'Running...' panel from both UI and debug_log so only the finished result is preserved
-                if name in active_tool_panels:
-                    active_item = active_tool_panels.pop(name)
-                    if not params:
-                        params = active_item.get("params", {})
-                    try:
-                        active_item["panel"].delete()
-                        if hasattr(active_item["panel"], "_debug_entry") and active_item["panel"]._debug_entry in debug_log:
-                            debug_log.remove(active_item["panel"]._debug_entry)
-                    except Exception:
-                        pass
-
                 subtitle = "success" if success else "failed"
                 body_content = output
 
@@ -2415,13 +2507,36 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                 elif name in ("tool_execute_python_file", "tool_read_document_content", "tool_inspect_document") and isinstance(params, dict) and "file_name" in params:
                     subtitle = f"{params['file_name']} · {'success' if success else 'failed'}"
 
-                add_event_panel(
-                    f"{'✅' if success else '❌'} Finished: {name}",
-                    subtitle,
-                    body_content,
-                    color,
-                    "build_circle"
-                )
+                # Update running panel in place for zero-flicker transition
+                if name in active_tool_panels:
+                    active_item = active_tool_panels.pop(name)
+                    panel = active_item.get("panel")
+                    if panel:
+                        if hasattr(panel, "_title_label"):
+                            panel._title_label.set_text(f"{'✅' if success else '❌'} Finished: {name}")
+                        if hasattr(panel, "_header_icon"):
+                            panel._header_icon._props["name"] = "build_circle" if success else "error"
+                            panel._header_icon.classes(replace=f"text-{color} shrink-0")
+                        if hasattr(panel, "_spinner"):
+                            panel._spinner.set_visibility(False)
+                        if hasattr(panel, "_sub_label"):
+                            panel._sub_label.set_text(subtitle)
+                            panel._sub_label.set_visibility(True)
+                        if hasattr(panel, "_code_box"):
+                            update_code_box(panel._code_box, body_content)
+                        if hasattr(panel, "_debug_entry"):
+                            panel._debug_entry["title"] = f"{'✅' if success else '❌'} Finished: {name}"
+                            panel._debug_entry["subtitle"] = subtitle
+                            panel._debug_entry["body"] = body_content
+                else:
+                    add_event_panel(
+                        f"{'✅' if success else '❌'} Finished: {name}",
+                        subtitle,
+                        body_content,
+                        color,
+                        "build_circle"
+                    )
+
                 _paint_round(
                     timeline_slots, session.current_round,
                     "bg-green-500" if success else "bg-red-500"

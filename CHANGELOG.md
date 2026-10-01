@@ -3,6 +3,11 @@
 
 All notable changes to this project will be documented in this file.
 #
+- fix(gui:realtime_tool_streaming): preserve `tool_progress` metadata in `QueueStreamingCallback`, expand active tool panels with live spinner, and stream execution lines into the GUI code box in real-time
+- fix(execute_python:realtime_streaming): eliminate stdout redirection recursion loop in `_ProgressStringIO`, stream unbuffered tool lines directly to the OS terminal in real-time during `time.sleep()`, and sanitize Rich markup
+- feat(tools:live_streaming): stream stdout/stderr lines in real-time during tool execution (`execute_python` and `system_shell`) to CLI terminal and GUI code boxes via `ToolContext.emit_progress`
+- fix(execute_python:workspace_resolution): remove accidental directory diversion to `data_workspace` in `_get_workspace_root()`, ensure `_resolve_workspace_path()` checks both root and CWD, and fix `tool_context` forwarding across `VAR_KEYWORD` callable signatures
+- fix(lollms_code:client_lifecycle): recreate LollmsClient and personality instances immediately after configuration changes and saves across GUI and CLI, preserving conversation history
 - fix(personality:done_termination): ensure `<done/>` with completed artifacts terminates immediately in round 1 when no tool calls are pending
 - fix(agent_state:code_fence): restore code fence protection in `_AgentStreamState` by removing `has_action_tag_in_pending` so tags inside markdown code blocks are not intercepted as live tools
 - fix(core:vision_capability): harden `has_vision_capability()` with strict type and mock checks on `models_dir`, `model_name`, and `_find_mmproj` to prevent mocks from falsely reporting vision capability
@@ -275,6 +280,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+
+## [2026-10-01 00:02]
+
+- fix(gui: deck_page): fix infinite loop in tool stack handling
 
 ## [2026-09-30 19:53]
 

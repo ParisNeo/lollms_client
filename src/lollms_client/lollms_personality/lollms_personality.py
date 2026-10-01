@@ -5451,6 +5451,7 @@ JSON:"""
 
         self._init_scratchpad()
         object.__setattr__(self, '_active_streaming_callback', streaming_callback)
+        object.__setattr__(self, '_active_event_mode', event_mode)
         auto_load_doc_editor_flag = kwargs.get("auto_load_document_editor", True)
 
         cleaned_prompt = prompt

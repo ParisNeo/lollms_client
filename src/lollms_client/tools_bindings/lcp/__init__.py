@@ -730,23 +730,24 @@ class LCPBinding(LollmsToolBinding):
 
             import inspect
             sig = inspect.signature(execute_function)
+            has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
             clean_params = {}
             for k, v in params.items():
-                if k in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                if k in sig.parameters or has_var_kw:
                     clean_params[k] = v
 
-            host_tool_context = kwargs.get("tool_context")
+            host_tool_context = kwargs.get("tool_context") or params.get("tool_context")
             clean_params.pop("tool_context", None)
-            if host_tool_context is not None and "tool_context" in sig.parameters:
+            if host_tool_context is not None and ("tool_context" in sig.parameters or has_var_kw):
                 clean_params["tool_context"] = host_tool_context
 
-            host_client = kwargs.get("lollms_client_instance")
+            host_client = kwargs.get("lollms_client_instance") or params.get("lollms_client_instance")
             clean_params.pop("lollms_client_instance", None)
-            if host_client is not None and "lollms_client_instance" in sig.parameters:
+            if host_client is not None and ("lollms_client_instance" in sig.parameters or has_var_kw):
                 clean_params["lollms_client_instance"] = host_client
 
             clean_params.pop("discussion_instance", None)
-            if discussion_instance is not None and "discussion_instance" in sig.parameters:
+            if discussion_instance is not None and ("discussion_instance" in sig.parameters or has_var_kw):
                 clean_params["discussion_instance"] = discussion_instance
 
             try:

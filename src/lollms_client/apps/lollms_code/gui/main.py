@@ -373,6 +373,11 @@ def deck_page_route():
             def on_first_save(e: EnvStore, pr: GuiPrefs):
                 e.save()
                 state["env"].load()
+                state["prefs"] = pr
+                for ws, s in state.get("sessions", {}).items():
+                    s.env = state["env"]
+                    s.prefs = state["prefs"]
+                    s.reset_client()
                 apply_theme(pr)
                 ui.navigate.to("/")
             with ui.column().classes("w-full h-screen max-h-screen p-0 m-0 gap-0 flex flex-col overflow-hidden bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100"):
@@ -479,17 +484,7 @@ def chat_page_route():
                             return
                         env.set_default_profile("llm", new_alias)
                         if session:
-                            session.ensure_ready()
-                            if session.client and hasattr(session.client, "switch_model"):
-                                try:
-                                    session.client.switch_model(new_alias)
-                                except Exception as ex:
-                                    ASCIIColors.warning(f"Could not hot-switch model: {ex}")
-                            try:
-                                import agent_bridge
-                                session.personality = agent_bridge.create_personality(prefs, session.client)
-                            except Exception as ex:
-                                ASCIIColors.warning(f"Could not refresh personality with new model: {ex}")
+                            session.reset_client()
                         ui.notify(f"Default model set to: {model_options.get(new_alias, new_alias)}", type="positive")
 
                     header_model_select = ui.select(
@@ -549,9 +544,14 @@ def settings_page_route():
     def on_saved(e: EnvStore, p: GuiPrefs):
         e.save()
         state["env"].load()
+        state["prefs"] = p
+        for ws, s in state.get("sessions", {}).items():
+            s.env = state["env"]
+            s.prefs = state["prefs"]
+            s.reset_client()
         dark_mode.set_value(p.is_dark())
         apply_theme(p)
-        ui.notify("Settings saved.", type="positive")
+        ui.notify("Settings saved. LLM client updated.", type="positive")
         ui.navigate.to("/chat")
 
     with ui.column().classes("w-full h-screen max-h-screen p-0 m-0 gap-0 flex flex-col overflow-hidden bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100"):

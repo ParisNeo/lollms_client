@@ -418,30 +418,71 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
 
     class _ProgressStringIO(io.StringIO):
         """
-        StringIO that buffers output AND streams complete lines to the UI
+        StringIO that buffers output AND streams complete lines to the UI/terminal
         via tool_context.emit_progress() for real-time feedback on long-running scripts.
+        Guards against recursive re-entry so callback prints go directly to the real terminal.
         """
-        def __init__(self, tool_context: Optional[Any] = None, stream_name: str = "stdout"):
+        def __init__(self, tool_context: Optional[Any] = None, stream_name: str = "stdout", real_stream: Optional[Any] = None):
             super().__init__()
             self._tool_context = tool_context
             self._stream_name = stream_name
+            self._real_stream = real_stream
             self._line_buffer = ""
+            self._in_emit = False
 
         def write(self, text: str) -> int:
             if not text:
                 return 0
-            # Buffer the text
+            if self._in_emit:
+                if self._real_stream is not None:
+                    try:
+                        self._real_stream.write(text)
+                        self._real_stream.flush()
+                    except Exception:
+                        pass
+                return len(text)
+
             written = super().write(text)
-            # Stream complete lines to the UI
             if self._tool_context is not None:
                 self._line_buffer += text
                 while "\n" in self._line_buffer:
                     line, self._line_buffer = self._line_buffer.split("\n", 1)
-                    if line.strip():
-                        if self._tool_context.emit_progress(line, {"stream": self._stream_name}) is False:
-                            self.silence()
-                            raise KeyboardInterrupt
+                    clean_line = line.rstrip('\r\n')
+                    if clean_line:
+                        self._in_emit = True
+                        try:
+                            orig_stdout = sys.stdout
+                            if self._real_stream is not None:
+                                sys.stdout = self._real_stream
+                            try:
+                                if self._tool_context.emit_progress(clean_line, {"stream": self._stream_name}) is False:
+                                    self.silence()
+                                    raise KeyboardInterrupt
+                            finally:
+                                sys.stdout = orig_stdout
+                        finally:
+                            self._in_emit = False
             return written
+
+        def flush(self):
+            super().flush()
+            if self._tool_context is not None and self._line_buffer.strip() and not self._in_emit:
+                clean_line = self._line_buffer.rstrip('\r\n')
+                self._line_buffer = ""
+                if clean_line:
+                    self._in_emit = True
+                    try:
+                        orig_stdout = sys.stdout
+                        if self._real_stream is not None:
+                            sys.stdout = self._real_stream
+                        try:
+                            if self._tool_context.emit_progress(clean_line, {"stream": self._stream_name}) is False:
+                                self.silence()
+                                raise KeyboardInterrupt
+                        finally:
+                            sys.stdout = orig_stdout
+                    finally:
+                        self._in_emit = False
 
         def reconfigure(self, *args, **kwargs):
             pass
@@ -589,12 +630,10 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
     old_stdout = sys.stdout
     old_stderr = sys.stderr
     old_argv = sys.argv[:]
-    old_dunder_stdout = getattr(sys, "__stdout__", None)
-    old_dunder_stderr = getattr(sys, "__stderr__", None)
     progress_tc = tool_context if (tool_context is not None and hasattr(tool_context, "emit_progress")) else None
     if progress_tc is not None:
-        redirected_output = _ProgressStringIO(progress_tc, "stdout")
-        redirected_error = _ProgressStringIO(progress_tc, "stderr")
+        redirected_output = _ProgressStringIO(progress_tc, "stdout", real_stream=old_stdout)
+        redirected_error = _ProgressStringIO(progress_tc, "stderr", real_stream=old_stderr)
     else:
         redirected_output = _NoReconfigureStringIO()
         redirected_error = _NoReconfigureStringIO()
@@ -603,8 +642,6 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
 
     sys.stdout = redirected_output
     sys.stderr = redirected_error
-    sys.__stdout__ = redirected_output
-    sys.__stderr__ = redirected_error
     if argv is not None:
         sys.argv = argv
 
@@ -699,8 +736,6 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
     finally:
         sys.stdout = old_stdout
         sys.stderr = old_stderr
-        sys.__stdout__ = old_dunder_stdout
-        sys.__stderr__ = old_dunder_stderr
         sys.argv = old_argv
 
         # Restore system functions if modified
@@ -766,7 +801,7 @@ def _get_workspace_root(tool_context: Optional[Any] = None) -> Path:
     Resolves the workspace root.
     Prefers the host-injected ToolContext workspace (authoritative — it is the
     exact root artifacts are flushed to), then falls back to CWD-based
-    resolution for agnostic contexts without a discussion host.
+    resolution for agnostic contexts.
     """
     if tool_context is not None:
         ctx_ws = getattr(tool_context, "workspace_path", None)
@@ -777,56 +812,58 @@ def _get_workspace_root(tool_context: Optional[Any] = None) -> Path:
                     return ws
             except Exception:
                 pass
-    cwd = Path.cwd().resolve()
-    if (cwd / "workspace_data").exists() and (cwd / "workspace_data").is_dir():
-        return (cwd / "workspace_data").resolve()
-    if (cwd / "data_workspace").exists() and (cwd / "data_workspace").is_dir():
-        return (cwd / "data_workspace").resolve()
-    return cwd
+    return Path.cwd().resolve()
 
 
 def _resolve_workspace_path(file_name: str, tool_context: Optional[Any] = None) -> Optional[Path]:
     """
     Safely resolves a file path inside the workspace sandbox.
     Blocks path traversal ('..') and absolute paths escaping the root.
-    Supports direct resolution as well as resolution under .lollms_code/scripts/.
+    Supports direct resolution under root and CWD as well as under .lollms_code/scripts/.
     """
     if not file_name or not isinstance(file_name, str):
         return None
 
-    root = _get_workspace_root(tool_context)
     clean = file_name.replace("\\", "/").strip().lstrip("/")
-
     if not clean or ".." in Path(clean).parts:
         return None
 
-    # 1. Direct path check under root
-    candidate = (root / clean).resolve()
-    try:
-        candidate.relative_to(root)
-        if candidate.exists() and candidate.is_file():
-            return candidate
-    except ValueError:
-        return None
+    root = _get_workspace_root(tool_context)
+    cwd = Path.cwd().resolve()
 
-    # 2. Resilient check under .lollms_code/scripts/ or scripts/
-    sub_candidates = [
-        root / ".lollms_code" / "scripts" / clean,
-        root / ".lollms_code" / clean,
-        root / "scripts" / clean,
-        root / ".lollms_code" / "scripts" / Path(clean).name,
-    ]
-    for sc in sub_candidates:
+    search_roots = [root]
+    if cwd != root:
+        search_roots.append(cwd)
+
+    for base in search_roots:
+        # 1. Direct path check under base
         try:
-            res_sc = sc.resolve()
-            res_sc.relative_to(root)
-            if res_sc.exists() and res_sc.is_file():
-                return res_sc
-        except Exception:
-            continue
+            candidate = (base / clean).resolve()
+            candidate.relative_to(base)
+            if candidate.exists() and candidate.is_file():
+                return candidate
+        except ValueError:
+            pass
 
-    # Return candidate path for error reporting
-    return candidate
+        # 2. Resilient check under subdirectories
+        sub_candidates = [
+            base / ".lollms_code" / "scripts" / clean,
+            base / ".lollms_code" / clean,
+            base / "scripts" / clean,
+            base / ".lollms_code" / "scripts" / Path(clean).name,
+            base / "workspace_data" / clean,
+            base / "data_workspace" / clean,
+        ]
+        for sc in sub_candidates:
+            try:
+                res_sc = sc.resolve()
+                res_sc.relative_to(base)
+                if res_sc.exists() and res_sc.is_file():
+                    return res_sc
+            except Exception:
+                continue
+
+    return (root / clean).resolve()
 
 
 def _normalize_argv(script_label: str, args: Optional[List[Any]]) -> List[str]:

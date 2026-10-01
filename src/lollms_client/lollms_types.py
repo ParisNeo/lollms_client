@@ -302,9 +302,9 @@ class ToolContext:
         """
         Emits a progress update to the UI, respecting the active EventMode.
 
-        In PROCESSING_TAG_MODE / MIXED_MODE: emits as MSG_TYPE_CHUNK with
-        was_processed=True so it renders inside the active <processing> block.
-        In FULL_CALLBACK_MODE: emits as MSG_TYPE_INFO with structured metadata.
+        In PROCESSING_TAG_MODE: emits as MSG_TYPE_CHUNK with was_processed=True and tool_progress=True.
+        In FULL_CALLBACK_MODE: emits as MSG_TYPE_INFO with tool_progress=True.
+        In MIXED_MODE: emits both.
         In SILENT_MODE: no-op.
 
         Returns True if the callback was invoked successfully, False otherwise.
@@ -317,11 +317,14 @@ class ToolContext:
         merged_meta = dict(meta or {})
         merged_meta["tool_progress"] = True
 
-        if self.event_mode.has_tags:
+        if self.event_mode == EventMode.PROCESSING_TAG_MODE:
             merged_meta["was_processed"] = True
-            _cb(self.callback, text, MSG_TYPE.MSG_TYPE_CHUNK, merged_meta)
-        if self.event_mode.has_callbacks:
+            return _cb(self.callback, text, MSG_TYPE.MSG_TYPE_CHUNK, merged_meta)
+        elif self.event_mode.has_callbacks:
             return _cb(self.callback, text, MSG_TYPE.MSG_TYPE_INFO, merged_meta)
+        elif self.event_mode.has_tags:
+            merged_meta["was_processed"] = True
+            return _cb(self.callback, text, MSG_TYPE.MSG_TYPE_CHUNK, merged_meta)
         return True
 
     def emit_tool_event(self, msg_type: MSG_TYPE, text: str = "", meta: Optional[Dict[str, Any]] = None) -> bool:

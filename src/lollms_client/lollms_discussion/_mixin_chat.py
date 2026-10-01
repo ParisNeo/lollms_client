@@ -6892,11 +6892,12 @@ class ChatMixin:
 
                                 call_kwargs = dict(sanitized_params)
                                 _tool_sig_params = inspect.signature(active_tools[tool_name]["callable"]).parameters
-                                if "discussion_instance" in _tool_sig_params:
+                                has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in _tool_sig_params.values())
+                                if "discussion_instance" in _tool_sig_params or has_var_kw:
                                     call_kwargs["discussion_instance"] = self
-                                if "lollms_client_instance" in _tool_sig_params:
+                                if "lollms_client_instance" in _tool_sig_params or has_var_kw:
                                     call_kwargs["lollms_client_instance"] = self.lollmsClient
-                                if "tool_context" in _tool_sig_params:
+                                if "tool_context" in _tool_sig_params or has_var_kw:
                                     call_kwargs["tool_context"] = _tool_context
 
                                 # ── Take BEFORE Snapshot ──

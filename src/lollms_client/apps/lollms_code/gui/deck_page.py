@@ -425,6 +425,13 @@ def build_deck_page(env: EnvStore, prefs: GuiPrefs) -> None:
                     dialog.close()
                     try:
                         env.clear_settings()
+                        try:
+                            from main import state
+                            for ws, s in state.get("sessions", {}).items():
+                                s.client = None
+                                s.personality = None
+                        except Exception:
+                            pass
                         ui.notify("All settings have been cleared.", type="positive")
                         ui.navigate.to("/settings")
                     except Exception as ex:

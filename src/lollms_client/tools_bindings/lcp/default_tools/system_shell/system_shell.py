@@ -321,14 +321,16 @@ Use this for environment management (pip install), running tests, or interacting
 
 
 def tool_execute_shell_command(
-    command: str
+    command: str,
+    tool_context: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
-    Executes a shell command in the current workspace directory.
+    Executes a shell command in the current workspace directory with live output streaming.
     Use this for environment management (e.g., pip install), running tests, or interacting with the OS.
 
     Args:
         command (str): The shell command to execute.
+        tool_context: Host-injected context for live streaming output lines to the terminal/UI.
     """
     global AUTONOMY_LEVEL
     is_windows = platform.system() == "Windows"
@@ -337,20 +339,62 @@ def tool_execute_shell_command(
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
+
+    def _execute_streaming(cmd_str: str, timeout_sec: int) -> Tuple[int, str, str]:
+        proc = subprocess.Popen(
+            cmd_str,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=os.getcwd(),
+            env=env,
+            bufsize=1
+        )
+        stdout_lines: List[str] = []
+        stderr_lines: List[str] = []
+
+        import threading
+
+        def _drain_stdout():
+            if proc.stdout:
+                for line in iter(proc.stdout.readline, ''):
+                    stdout_lines.append(line)
+                    clean_line = line.rstrip('\r\n')
+                    if clean_line and tool_context and hasattr(tool_context, "emit_progress"):
+                        tool_context.emit_progress(clean_line, {"stream": "stdout"})
+                proc.stdout.close()
+
+        def _drain_stderr():
+            if proc.stderr:
+                for line in iter(proc.stderr.readline, ''):
+                    stderr_lines.append(line)
+                    clean_line = line.rstrip('\r\n')
+                    if clean_line and tool_context and hasattr(tool_context, "emit_progress"):
+                        tool_context.emit_progress(clean_line, {"stream": "stderr"})
+                proc.stderr.close()
+
+        t_out = threading.Thread(target=_drain_stdout, daemon=True)
+        t_err = threading.Thread(target=_drain_stderr, daemon=True)
+        t_out.start()
+        t_err.start()
+
+        try:
+            returncode = proc.wait(timeout=timeout_sec)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise
+
+        t_out.join(timeout=2.0)
+        t_err.join(timeout=2.0)
+        return returncode, "".join(stdout_lines), "".join(stderr_lines)
 
     try:
         if autonomy_level == "full_access":
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                cwd=os.getcwd(),
-                env=env,
-                timeout=120
-            )
+            retcode, out_raw, err_raw = _execute_streaming(command, timeout_sec=120)
         else:
             if is_windows:
                 stripped_cmd = command.strip()
@@ -406,39 +450,29 @@ def tool_execute_shell_command(
                         "error": f"Blocked by sandbox ({autonomy_level} mode): {reason_msg}{hint}"
                     }
 
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                cwd=os.getcwd(),
-                env=env,
-                timeout=60
-            )
+            retcode, out_raw, err_raw = _execute_streaming(command, timeout_sec=120)
 
         error_msg = None
-        if result.returncode != 0:
-            if result.stderr and result.stderr.strip():
-                error_msg = result.stderr
+        if retcode != 0:
+            if err_raw and err_raw.strip():
+                error_msg = err_raw
             else:
                 if "2>nul" in command or "2>/dev/null" in command:
-                    error_msg = f"Command failed with exit code {result.returncode} (stderr was suppressed by 2>nul redirection; target path or file likely does not exist)."
+                    error_msg = f"Command failed with exit code {retcode} (stderr was suppressed by 2>nul redirection; target path or file likely does not exist)."
                 else:
-                    error_msg = f"Command failed with exit code {result.returncode}"
+                    error_msg = f"Command failed with exit code {retcode}"
 
         cmd_banner = f"$ {command}\n"
-        raw_stdout = result.stdout or ("(Command executed successfully with no stdout output)" if result.returncode == 0 else "")
+        raw_stdout = out_raw or ("(Command executed successfully with no stdout output)" if retcode == 0 else "")
         formatted_output = f"{cmd_banner}{raw_stdout}"
 
         return {
-            "success": result.returncode == 0,
+            "success": retcode == 0,
             "command": command,
             "output": formatted_output,
-            "stderr": result.stderr,
+            "stderr": err_raw,
             "error": error_msg,
-            "return_code": result.returncode
+            "return_code": retcode
         }
     except subprocess.TimeoutExpired:
         return {

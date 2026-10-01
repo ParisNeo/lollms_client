@@ -1965,7 +1965,13 @@ class StreamRenderer:
             return True
 
         if msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
-            if meta and meta.get("was_processed"):
+            if meta and meta.get("tool_progress"):
+                stream_name = meta.get("stream", "stdout")
+                prefix_color = "dim" if stream_name == "stdout" else "red"
+                ASCIIColors.rich_print(f"  [{prefix_color}]│[/{prefix_color}] {_clean_str(chunk)}")
+                sys.stdout.flush()
+                return True
+            elif meta and meta.get("was_processed"):
                 # In callback mode, structured events handle UI panels; discard raw processing chunks
                 return True
             elif meta and meta.get("live_tool_chunk"):
@@ -2006,7 +2012,13 @@ class StreamRenderer:
             ASCIIColors.rich_print(f"[dim]{chunk}[/dim]", end="")
             sys.stdout.flush()
         elif msg_type == MSG_TYPE.MSG_TYPE_INFO:
-            if meta and meta.get("done_intercepted"):
+            if meta and meta.get("tool_progress"):
+                stream_name = meta.get("stream", "stdout")
+                prefix_color = "dim" if stream_name == "stdout" else "red"
+                ASCIIColors.rich_print(f"  [{prefix_color}]│[/{prefix_color}] {chunk}")
+                sys.stdout.flush()
+                return True
+            elif meta and meta.get("done_intercepted"):
                 self._stop_live_artifact_panel()
                 print()
                 ASCIIColors.rule("[bold green]✅ Task Completed (<done/>)[/bold green]")
@@ -3248,7 +3260,16 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
             continue
 
         if user_input.lower() == "/config":
-            run_lollms_code_config_menu(config, client=client, personality=personality)
+            saved = run_lollms_code_config_menu(config, client=client, personality=personality)
+            if saved:
+                try:
+                    old_conv = getattr(personality, "_conversation", [])
+                    client = create_client(config)
+                    personality = create_coding_personality(config, client)
+                    personality._conversation = old_conv
+                    ASCIIColors.success("  🔄 LollmsClient and personality recreated with updated settings.")
+                except Exception as ex:
+                    ASCIIColors.error(f"  ❌ Failed to recreate client: {ex}")
             continue
 
         if user_input.lower() == "/shell":
@@ -3858,6 +3879,17 @@ def run_lollms_code_config_menu(
         elif selection == "paths_menu":
             _configure_paths_menu(config)
         elif selection == "save":
+            for modality in ("llm", "tti", "tts", "stt", "ttv", "ttm", "connection", "rag"):
+                b = _extract_bindings_from_env(modality.upper(), shared_config_map)
+                p = _extract_profiles_from_env(modality.upper(), b, shared_config_map)
+                setattr(config, f"{modality}_binding_profiles", b)
+                setattr(config, f"{modality}_model_profiles", p)
+
+            for p_name, p_data in config.llm_model_profiles.items():
+                if p_data.get("is_default"):
+                    config.active_profile = p_name
+                    break
+
             # The host application executes the unified save for both client profiles and agent parameters
             _save_and_validate(shared_config_map, test_connection=False, cli_env_path=cli_env_path)
             config.save()
@@ -3872,7 +3904,7 @@ def run_lollms_code_config_menu(
                                 "auto_approve": config.auto_approve_python,
                             })
                 ASCIIColors.info("  ℹ️ Live session tool policies updated.")
-            break
+            return True
 
 
 def list_skills(config: CodeAgentConfig):
