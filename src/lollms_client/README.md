@@ -1022,3 +1022,46 @@ class MyBinding(LollmsTTIBinding):
 - **Atomic Checkpoints**: At each round's end, tool results, artifact state, and virtual history are committed immediately to SQLite or JSON checkpoints.
 - **Turn Resumption**: Call `discussion.resume_turn()` or `personality.chat(..., resume_turn=True)` to resume an interrupted turn from its exact round without repeating previously executed tools or recreating already written files.
 - **Immediate Disk Materialization**: When an `<artifact>` closing tag arrives, the file is written to disk immediately, protecting work even during lengthy multi-minute tasks.
+
+## Binding Commands
+
+Bindings can expose management commands that are discovered and dispatched by
+the binding manager and host UIs. A command requires **three aligned pieces**:
+
+1. **YAML declaration** — in the binding's `description.yaml`, under the
+   top-level `commands` key. Each entry declares `name`, `title`,
+   `description`, `parameters` (with `mandatory` flags and defaults), and an
+   `output` schema.
+2. **Matching method** — the binding class must implement a public method with
+   **exactly the same name** as the YAML `commands[].name` entry. The manager
+   dispatches commands by calling `binding.<command_name>(**params)`.
+3. **Dict return contract** — command methods must return a
+   `{"status": bool, "message": str}` dict (optionally with extra keys such as
+   `data`). Returning a bare `bool` breaks UI rendering.
+
+Example (from the `llama_cpp_server` LLM binding):
+
+```yaml
+commands:
+  - name: update
+    title: Update llama.cpp Binaries
+    description: "Downloads and reinstalls the latest llama.cpp server binaries."
+    parameters: []
+    output:
+      - name: status
+        type: bool
+      - name: message
+        type: str
+```
+
+```python
+def update(self) -> dict:
+    try:
+        ...
+        return {"status": True, "message": "llama.cpp binaries updated."}
+    except Exception as e:
+        return {"status": False, "message": f"Update failed: {e}"}
+```
+
+The `whisper` STT binding follows the same contract with `status`, `ps`,
+`kill`, and `restart` commands for managing its shared daemon.

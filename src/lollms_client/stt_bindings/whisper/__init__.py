@@ -384,13 +384,16 @@ class WhisperSTTBinding(LollmsSTTBinding):
         except Exception:
             return False
 
-    def kill_server(self, force: bool = False) -> bool:
+    def kill(self, force: bool = False) -> dict:
         """
         Terminates the Whisper server daemon.
 
         Graceful mode sends the authenticated HTTP /shutdown command and waits
         for the port to be released. Force mode (or an unresponsive daemon)
         escalates to OS-level process termination using the persisted PID file.
+
+        Returns:
+            dict: {"status": bool, "message": str}
         """
         was_running = self.is_server_running()
         pid = self._read_pid_file()
@@ -402,7 +405,7 @@ class WhisperSTTBinding(LollmsSTTBinding):
                     if not self.is_server_running():
                         self._delete_pid_file()
                         ASCIIColors.success("Whisper server shut down gracefully.")
-                        return True
+                        return {"status": True, "message": "Whisper server shut down gracefully."}
                     time.sleep(0.3)
                 ASCIIColors.warning("Graceful shutdown timed out. Escalating to force kill.")
             else:
@@ -412,30 +415,40 @@ class WhisperSTTBinding(LollmsSTTBinding):
             if self._terminate_pid(pid):
                 self._delete_pid_file()
                 ASCIIColors.success(f"Whisper server process (PID {pid}) terminated.")
-                return True
+                return {"status": True, "message": f"Whisper server process (PID {pid}) terminated."}
             ASCIIColors.error(f"Failed to terminate Whisper server process (PID {pid}).")
-            return False
+            return {"status": False, "message": f"Failed to terminate Whisper server process (PID {pid})."}
 
         if was_running:
-            ASCIIColors.error(
+            msg = (
                 "Server is running but no valid PID file was found. "
                 "Kill it manually or restart with a fresh cache directory."
             )
-            return False
+            ASCIIColors.error(msg)
+            return {"status": False, "message": msg}
 
         self._delete_pid_file()
-        return True
+        return {"status": True, "message": "Whisper server was not running."}
 
-    def restart_server(self) -> bool:
-        """Kills the daemon (forcing if unresponsive) and starts a fresh instance."""
-        if not self.kill_server(force=True):
-            return False
+    def restart(self) -> dict:
+        """
+        Force-kills the daemon and starts a fresh instance with current code.
+
+        Returns:
+            dict: {"status": bool, "message": str}
+        """
+        kill_result = self.kill(force=True)
+        if not kill_result.get("status", False):
+            return kill_result
+
         try:
             self.ensure_server_is_running(wait=True)
-            return self.is_server_running()
+            if self.is_server_running():
+                return {"status": True, "message": "Whisper server restarted and operational."}
+            return {"status": False, "message": "Whisper server failed to become responsive after restart."}
         except Exception as e:
             trace_exception(e)
-            return False
+            return {"status": False, "message": f"Whisper server restart failed: {e}"}
 
     @staticmethod
     def list_models(**kwargs) -> List[str]:
@@ -446,6 +459,25 @@ class WhisperSTTBinding(LollmsSTTBinding):
             return self._get_request("/ps").json()
         except Exception:
             return [{"error": "Could not connect to server to get process status."}]
+
+    def status(self) -> dict:
+        """
+        Returns the daemon status and connection information.
+
+        Returns:
+            dict: {"status": bool, "message": str, "data": dict}
+        """
+        if self.is_server_running():
+            return {
+                "status": True,
+                "message": f"Whisper server is running on {self.base_url}.",
+                "data": {"running": True, "base_url": self.base_url},
+            }
+        return {
+            "status": False,
+            "message": "Whisper server is not running.",
+            "data": {"running": False, "base_url": self.base_url},
+        }
 
 
 def _build_cli_binding(args: argparse.Namespace) -> WhisperSTTBinding:
@@ -478,18 +510,19 @@ def main() -> None:
     binding = _build_cli_binding(args)
 
     if args.command == "status":
-        if binding.is_server_running():
-            print(json.dumps({"status": "running", "base_url": binding.base_url}, indent=2))
-        else:
-            print(json.dumps({"status": "stopped"}, indent=2))
+        result = binding.status()
+        print(json.dumps(result.get("data", result), indent=2))
+        sys.exit(0 if result.get("status") else 1)
     elif args.command == "ps":
         print(json.dumps(binding.ps(), indent=2))
     elif args.command == "kill":
-        ok = binding.kill_server(force=False)
-        sys.exit(0 if ok else 1)
+        result = binding.kill(force=False)
+        print(json.dumps(result, indent=2))
+        sys.exit(0 if result.get("status") else 1)
     elif args.command == "restart":
-        ok = binding.restart_server()
-        sys.exit(0 if ok else 1)
+        result = binding.restart()
+        print(json.dumps(result, indent=2))
+        sys.exit(0 if result.get("status") else 1)
 
 
 if __name__ == "__main__":

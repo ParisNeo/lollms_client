@@ -62,74 +62,51 @@ model_input_parameters:
     default: "base"
 commands:
   - name: status
+    title: Daemon Status
     description: "Show whether the shared Whisper daemon is running and on which address."
-    parameters:
-      - name: host
+    parameters: []
+    output:
+      - name: status
+        type: bool
+        description: "True if the daemon is running."
+      - name: message
         type: str
-        description: "Server host to probe."
-        mandatory: false
-        default: "127.0.0.1"
-      - name: port
-        type: int
-        description: "Server port to probe."
-        mandatory: false
-        default: 9633
-      - name: cache_dir
-        type: str
-        description: "Override the models cache directory (used to locate the PID file)."
-        mandatory: false
-        default: ""
+        description: "Human-readable status description."
+      - name: data
+        type: dict
+        description: "Structured payload with running flag and base_url."
   - name: ps
+    title: Process Status
     description: "List loaded Whisper models, their devices, queue sizes, and last-used times."
-    parameters:
-      - name: host
-        type: str
-        description: "Server host to query."
-        mandatory: false
-        default: "127.0.0.1"
-      - name: port
-        type: int
-        description: "Server port to query."
-        mandatory: false
-        default: 9633
-      - name: cache_dir
-        type: str
-        description: "Override the models cache directory (used to locate the PID file)."
-        mandatory: false
-        default: ""
+    parameters: []
+    output:
+      - name: models
+        type: list
+        description: "List of per-model manager states (model_name, device, queue_size, last_used)."
   - name: kill
+    title: Kill Daemon
     description: "Terminate the shared Whisper daemon. Attempts a graceful HTTP shutdown first, then escalates to OS-level process termination via the persisted PID file."
     parameters:
-      - name: host
+      - name: force
+        type: bool
+        description: "Skip the graceful HTTP shutdown and terminate the process immediately."
+        mandatory: false
+        default: false
+    output:
+      - name: status
+        type: bool
+        description: "True if the daemon was terminated or was not running."
+      - name: message
         type: str
-        description: "Server host to send the shutdown command to."
-        mandatory: false
-        default: "127.0.0.1"
-      - name: port
-        type: int
-        description: "Server port to send the shutdown command to."
-        mandatory: false
-        default: 9633
-      - name: cache_dir
-        type: str
-        description: "Override the models cache directory (used to locate the PID file)."
-        mandatory: false
-        default: ""
+        description: "Human-readable result description."
   - name: restart
+    title: Restart Daemon
     description: "Force-kill the shared Whisper daemon and relaunch a fresh instance with current code."
-    parameters:
-      - name: host
+    parameters: []
+    output:
+      - name: status
+        type: bool
+        description: "True if the daemon was restarted and is operational."
+      - name: message
         type: str
-        description: "Server host for the relaunched daemon."
-        mandatory: false
-        default: "127.0.0.1"
-      - name: port
-        type: int
-        description: "Server port for the relaunched daemon."
-        mandatory: false
-        default: 9633
-      - name: cache_dir
-        type: str
-        description: "Override the models cache directory (used to locate the PID file)."
-        mandatory: false
-        default: ""
+        description: "Human-readable result description."
