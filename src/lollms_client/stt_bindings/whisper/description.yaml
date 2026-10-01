@@ -60,3 +60,76 @@ model_input_parameters:
     description: "The Whisper model size to use ('tiny', 'base', 'small', 'medium', 'large', 'large-v3', 'turbo')."
     mandatory: false
     default: "base"
+commands:
+  - name: status
+    description: "Show whether the shared Whisper daemon is running and on which address."
+    parameters:
+      - name: host
+        type: str
+        description: "Server host to probe."
+        mandatory: false
+        default: "127.0.0.1"
+      - name: port
+        type: int
+        description: "Server port to probe."
+        mandatory: false
+        default: 9633
+      - name: cache_dir
+        type: str
+        description: "Override the models cache directory (used to locate the PID file)."
+        mandatory: false
+        default: ""
+  - name: ps
+    description: "List loaded Whisper models, their devices, queue sizes, and last-used times."
+    parameters:
+      - name: host
+        type: str
+        description: "Server host to query."
+        mandatory: false
+        default: "127.0.0.1"
+      - name: port
+        type: int
+        description: "Server port to query."
+        mandatory: false
+        default: 9633
+      - name: cache_dir
+        type: str
+        description: "Override the models cache directory (used to locate the PID file)."
+        mandatory: false
+        default: ""
+  - name: kill
+    description: "Terminate the shared Whisper daemon. Attempts a graceful HTTP shutdown first, then escalates to OS-level process termination via the persisted PID file."
+    parameters:
+      - name: host
+        type: str
+        description: "Server host to send the shutdown command to."
+        mandatory: false
+        default: "127.0.0.1"
+      - name: port
+        type: int
+        description: "Server port to send the shutdown command to."
+        mandatory: false
+        default: 9633
+      - name: cache_dir
+        type: str
+        description: "Override the models cache directory (used to locate the PID file)."
+        mandatory: false
+        default: ""
+  - name: restart
+    description: "Force-kill the shared Whisper daemon and relaunch a fresh instance with current code."
+    parameters:
+      - name: host
+        type: str
+        description: "Server host for the relaunched daemon."
+        mandatory: false
+        default: "127.0.0.1"
+      - name: port
+        type: int
+        description: "Server port for the relaunched daemon."
+        mandatory: false
+        default: 9633
+      - name: cache_dir
+        type: str
+        description: "Override the models cache directory (used to locate the PID file)."
+        mandatory: false
+        default: ""

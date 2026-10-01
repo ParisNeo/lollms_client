@@ -281,6 +281,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-01 12:37]
+
+- docs(discussion): document real-time tool execution streaming pipeline
+
 ## [2026-10-01 00:02]
 
 - fix(gui: deck_page): fix infinite loop in tool stack handling

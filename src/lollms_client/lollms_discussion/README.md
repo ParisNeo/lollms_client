@@ -2243,3 +2243,132 @@ The LCP Binding will automatically:
 3.  Set CWD to the discussion workspace before execution.
 4.  Sync any new files created back to the artefact system.
 5.  **Track Errors**: Capture full tracebacks for both explicit tool failures and unexpected crashes, returning them in the result dictionary.
+
+## Real-Time Execution Streaming (Live Tool Output)
+
+The discussion engine streams **live stdout/stderr lines** from long-running tools
+(`tool_execute_python_code`, `tool_execute_python_file`) to your UI while the
+script is still executing — you do not wait for the tool call to finish to see
+what it printed.
+
+This is powered by a four-layer pipeline:
+
+```
+┌─────────────────────┐     ┌──────────────────────┐     ┌─────────────────────┐     ┌──────────────────┐
+│  execute_python.py  │────▶│  ToolContext         │────▶│  ChatMixin.chat()   │────▶│  Host Renderer   │
+│  _ProgressStringIO  │     │  emit_progress()     │     │  streaming_callback │     │  (CLI / GUI)     │
+│  (line buffering)   │     │  (EventMode-aware)   │     │  (per-turn context) │     │  (live panels)   │
+└─────────────────────┘     └──────────────────────┘     └─────────────────────┘     └──────────────────┘
+```
+
+### 1. The Producer: `execute_python` tools
+
+When the host injects a `ToolContext`, the sandbox replaces `sys.stdout` and
+`sys.stderr` with a `_ProgressStringIO` wrapper. Every **complete line** is
+forwarded in real time:
+
+```python
+# Inside the sandbox, this prints live to the UI — line by line:
+import time
+for i in range(5):
+    print(f"Processing step {i}...")
+    time.sleep(1)
+print("Done!")
+```
+
+Key behaviors:
+
+| Behavior | Detail |
+|---|---|
+| **Line buffering** | Partial lines are held until `\n` arrives; `flush()` drains the remainder. |
+| **Re-entrancy guard** | If the callback itself prints, output goes to the real terminal — never back into the capture buffer (prevents infinite recursion). |
+| **Cancellation** | If your callback returns `False`, the sandbox raises `KeyboardInterrupt` inside the script, cleanly stopping execution. |
+| **Full capture preserved** | The complete stdout/stderr is still captured and returned in the tool result (windowed preview + optional `.log` persistence). |
+
+### 2. The Channel: `ToolContext.emit_progress()`
+
+`ToolContext` (from `lollms_types.py`) is the single sanctioned progress channel.
+Its `emit_progress(text, meta)` method is **EventMode-aware**:
+
+| EventMode | Emitted as | Meta flags |
+|---|---|---|
+| `PROCESSING_TAG_MODE` | `MSG_TYPE_CHUNK` | `was_processed=True`, `tool_progress=True` |
+| `FULL_CALLBACK_MODE` | `MSG_TYPE_INFO` | `tool_progress=True` |
+| `MIXED_MODE` | `MSG_TYPE_INFO` | `tool_progress=True` |
+| `SILENT_MODE` | *(nothing)* | — |
+
+Every progress event carries `meta={"stream": "stdout" | "stderr", "tool_progress": True}`
+so your renderer can color/prefix each stream differently.
+
+### 3. The Injector: `ChatMixin.chat()` does it for you
+
+You do **not** build the `ToolContext` yourself. `chat()` constructs one per turn,
+bundling your `streaming_callback` and the active `event_mode`, and injects it into
+**both** execution paths:
+
+- **LCP dispatch** — `lcp_binding.execute_tool(..., tool_context=ctx)`
+- **Direct callables** — `call_kwargs["tool_context"] = ctx`, but **only if the tool's
+  function signature declares `tool_context` (or accepts `**kwargs`)**. This is the
+  opt-in gate: agnostic tools that never ask for it are never given it.
+
+### 4. The Consumer: Rendering live output in your host
+
+Handle the `tool_progress` meta in your `streaming_callback`. This is the exact
+pattern used by the `lollms-code` CLI renderer:
+
+```python
+from lollms_client.lollms_types import MSG_TYPE, EventMode
+
+def my_streaming_callback(chunk, msg_type, meta):
+    # ── LIVE TOOL OUTPUT (fires while the script runs) ──
+    if meta and meta.get("tool_progress"):
+        stream_name = meta.get("stream", "stdout")
+        prefix = "│" if stream_name == "stdout" else "✗"
+        print(f"  {prefix} {chunk}")          # render live, line by line
+        return True
+
+    # ── Structured tool lifecycle (FULL_CALLBACK_MODE) ──
+    if msg_type == MSG_TYPE.MSG_TYPE_TOOL_START:
+        print(f"▶ Tool started: {meta.get('tool_name')}")
+        return True
+    if msg_type == MSG_TYPE.MSG_TYPE_TOOL_END:
+        status = "✅" if meta.get("success") else "❌"
+        print(f"{status} Tool finished: {meta.get('tool_name')}")
+        return True
+
+    # ── Normal conversational stream ──
+    if msg_type == MSG_TYPE.MSG_TYPE_CHUNK and not (meta and meta.get("was_processed")):
+        print(chunk, end="", flush=True)
+    return True
+
+
+discussion.chat(
+    user_message="Run a long analysis and show progress",
+    streaming_callback=my_streaming_callback,
+    event_mode=EventMode.FULL_CALLBACK_MODE,   # recommended for structured UIs
+    enable_code_execution=True,
+)
+```
+
+> **Tip:** Return `False` from your callback at any time to cancel the running
+> script — the sandbox converts it into a clean `KeyboardInterrupt`.
+
+### 5. Streaming from your OWN custom tools
+
+Any tool can adopt the same channel. Declare `tool_context` in the signature and
+call `emit_progress()`:
+
+```python
+def tool_my_long_task(duration: int = 5, tool_context=None) -> dict:
+    """Performs a long task with live progress."""
+    import time
+    for i in range(duration):
+        time.sleep(1)
+        if tool_context:
+            tool_context.emit_progress(f"Step {i+1}/{duration} completed", {"stream": "stdout"})
+    return {"success": True, "output": f"Finished {duration} steps."}
+```
+
+Because `ChatMixin` injects the context automatically, this works identically
+whether your tool is registered as a direct callable or mounted through the LCP
+binding — with zero host-side wiring.

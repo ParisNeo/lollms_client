@@ -1,6 +1,8 @@
 import os
 import sys
 import base64
+import signal
+import argparse
 import subprocess
 import threading
 import time
@@ -28,6 +30,10 @@ from urllib3.util import Retry
 from lollms_client.lollms_stt_binding import LollmsSTTBinding
 
 BindingName = "WhisperSTTBinding"
+
+_PID_FILE_NAME = "whisper_server.pid"
+_GRACEFUL_SHUTDOWN_TIMEOUT_S = 10
+_FORCE_KILL_GRACE_S = 5
 
 
 class WhisperSTTBinding(LollmsSTTBinding):
@@ -66,6 +72,7 @@ class WhisperSTTBinding(LollmsSTTBinding):
         self.cache_dir.mkdir(exist_ok=True, parents=True)
 
         self.token_file = self.cache_dir / "whisper_server.token"
+        self.pid_file = self.cache_dir / _PID_FILE_NAME
         self.service_key = kwargs.get("service_key")
         if not self.service_key and self.token_file.exists():
             try:
@@ -148,6 +155,7 @@ class WhisperSTTBinding(LollmsSTTBinding):
 
         pm_v.ensure_packages(["torch", "torchaudio"], index_url=torch_index_url)
         pm_v.ensure_packages(["openai-whisper"])
+        pm_v.ensure_packages(["psutil"])
         ASCIIColors.green("Whisper server dependencies are satisfied.")
 
     def start_server(self, wait: bool = True, timeout_s: int = 120):
@@ -208,6 +216,7 @@ class WhisperSTTBinding(LollmsSTTBinding):
         finally:
             log_f.close()
 
+        self._write_pid_file(self.server_process.pid)
         ASCIIColors.info(f"Whisper server process launched on http://{self.host}:{self.port} (PID: {self.server_process.pid})")
 
         if wait:
@@ -313,6 +322,121 @@ class WhisperSTTBinding(LollmsSTTBinding):
         except Exception:
             return False
 
+    def _write_pid_file(self, pid: int) -> None:
+        try:
+            self.pid_file.write_text(str(pid), encoding="utf-8")
+        except Exception as e:
+            ASCIIColors.warning(f"Could not write PID file {self.pid_file}: {e}")
+
+    def _read_pid_file(self) -> Optional[int]:
+        try:
+            if self.pid_file.exists():
+                return int(self.pid_file.read_text(encoding="utf-8").strip())
+        except (ValueError, OSError):
+            pass
+        return None
+
+    def _delete_pid_file(self) -> None:
+        try:
+            self.pid_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _is_our_server_process(self, pid: int) -> bool:
+        """Verifies the PID belongs to our Whisper server before any kill attempt."""
+        try:
+            import psutil
+            proc = psutil.Process(pid)
+            cmdline = " ".join(proc.cmdline()).lower()
+            return "whisper" in cmdline and "server" in cmdline and "main.py" in cmdline
+        except ImportError:
+            return True
+        except Exception:
+            return False
+
+    def _terminate_pid(self, pid: int) -> bool:
+        """Cross-platform process termination with escalation to force kill."""
+        try:
+            import psutil
+            proc = psutil.Process(pid)
+            proc.terminate()
+            try:
+                proc.wait(timeout=_FORCE_KILL_GRACE_S)
+                return True
+            except psutil.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=_FORCE_KILL_GRACE_S)
+                return True
+        except ImportError:
+            pass
+        except Exception:
+            return False
+
+        try:
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["taskkill", "/F", "/PID", str(pid)],
+                    capture_output=True, check=True
+                )
+            else:
+                os.kill(pid, signal.SIGKILL)
+            return True
+        except Exception:
+            return False
+
+    def kill_server(self, force: bool = False) -> bool:
+        """
+        Terminates the Whisper server daemon.
+
+        Graceful mode sends the authenticated HTTP /shutdown command and waits
+        for the port to be released. Force mode (or an unresponsive daemon)
+        escalates to OS-level process termination using the persisted PID file.
+        """
+        was_running = self.is_server_running()
+        pid = self._read_pid_file()
+
+        if was_running and not force:
+            if self.shutdown_server():
+                start_time = time.time()
+                while time.time() - start_time < _GRACEFUL_SHUTDOWN_TIMEOUT_S:
+                    if not self.is_server_running():
+                        self._delete_pid_file()
+                        ASCIIColors.success("Whisper server shut down gracefully.")
+                        return True
+                    time.sleep(0.3)
+                ASCIIColors.warning("Graceful shutdown timed out. Escalating to force kill.")
+            else:
+                ASCIIColors.warning("HTTP shutdown failed. Escalating to force kill.")
+
+        if pid is not None and self._is_our_server_process(pid):
+            if self._terminate_pid(pid):
+                self._delete_pid_file()
+                ASCIIColors.success(f"Whisper server process (PID {pid}) terminated.")
+                return True
+            ASCIIColors.error(f"Failed to terminate Whisper server process (PID {pid}).")
+            return False
+
+        if was_running:
+            ASCIIColors.error(
+                "Server is running but no valid PID file was found. "
+                "Kill it manually or restart with a fresh cache directory."
+            )
+            return False
+
+        self._delete_pid_file()
+        return True
+
+    def restart_server(self) -> bool:
+        """Kills the daemon (forcing if unresponsive) and starts a fresh instance."""
+        if not self.kill_server(force=True):
+            return False
+        try:
+            self.ensure_server_is_running(wait=True)
+            return self.is_server_running()
+        except Exception as e:
+            trace_exception(e)
+            return False
+
     @staticmethod
     def list_models(**kwargs) -> List[str]:
         return ["tiny", "base", "small", "medium", "large", "large-v2", "large-v3", "turbo"]
@@ -322,3 +446,51 @@ class WhisperSTTBinding(LollmsSTTBinding):
             return self._get_request("/ps").json()
         except Exception:
             return [{"error": "Could not connect to server to get process status."}]
+
+
+def _build_cli_binding(args: argparse.Namespace) -> WhisperSTTBinding:
+    return WhisperSTTBinding(
+        host=args.host,
+        port=args.port,
+        auto_start_server=False,
+        wait_for_server=False,
+        **({"cache_dir": args.cache_dir} if args.cache_dir else {}),
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="lollms-whisper",
+        description="Management CLI for the shared Whisper STT daemon.",
+    )
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Server host")
+    parser.add_argument("--port", type=int, default=9633, help="Server port")
+    parser.add_argument("--cache-dir", type=str, default=None, help="Override the models cache directory")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("status", help="Show daemon status")
+    subparsers.add_parser("ps", help="List loaded models and queue state")
+    subparsers.add_parser("kill", help="Terminate the daemon (graceful, then force)")
+    subparsers.add_parser("restart", help="Force-kill and relaunch the daemon")
+
+    args = parser.parse_args()
+
+    binding = _build_cli_binding(args)
+
+    if args.command == "status":
+        if binding.is_server_running():
+            print(json.dumps({"status": "running", "base_url": binding.base_url}, indent=2))
+        else:
+            print(json.dumps({"status": "stopped"}, indent=2))
+    elif args.command == "ps":
+        print(json.dumps(binding.ps(), indent=2))
+    elif args.command == "kill":
+        ok = binding.kill_server(force=False)
+        sys.exit(0 if ok else 1)
+    elif args.command == "restart":
+        ok = binding.restart_server()
+        sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()

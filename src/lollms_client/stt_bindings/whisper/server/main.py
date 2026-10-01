@@ -524,10 +524,17 @@ if __name__ == "__main__":
     parser.add_argument("--token", type=str, default=None)
     parser.add_argument("--batch-window", type=float, default=0.02)
     parser.add_argument("--max-batch-size", type=int, default=8)
+    parser.add_argument("--pid-file", type=str, default=None)
     args = parser.parse_args()
 
     cache_path = Path(args.cache_dir).resolve()
     cache_path.mkdir(parents=True, exist_ok=True)
+
+    pid_file_path = Path(args.pid_file).resolve() if args.pid_file else cache_path / "whisper_server.pid"
+    try:
+        pid_file_path.write_text(str(os.getpid()), encoding="utf-8")
+    except Exception as pid_err:
+        ASCIIColors.warning(f"Could not write PID file {pid_file_path}: {pid_err}")
 
     auth_token = args.token
     token_file = cache_path / "whisper_server.token"
