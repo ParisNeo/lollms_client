@@ -1587,9 +1587,13 @@ class FileImportMixin:
             lc = getattr(self, "lollmsClient", None)
             if lc is None or not getattr(lc, "stt", None):
                 raise RuntimeError("Audio file import requires a Speech-to-Text (STT) model to be configured and active in your settings.")
+            source_title = title
+            if not title.lower().endswith(".md"):
+                title = f"{title}.md"
+                _progress(f"Appended .md suffix to title for audio transcript import: '{title}'")
             try:
                 raw_transcript = lc.transcribe_audio(path)
-                text = f"# Audio Transcript: {title}\n*File source: {path.name}*\n\n{raw_transcript}"
+                text = f"# Audio Transcript: {source_title}\n*File source: {path.name}*\n\n{raw_transcript}"
                 _progress("Audio transcription complete!")
             except Exception as e:
                 raise RuntimeError(f"Audio transcription failed: {e}")

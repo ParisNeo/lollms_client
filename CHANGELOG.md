@@ -281,6 +281,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-01 14:24]
+
+- feat(artefact): append .md suffix to audio transcript import titles
+
 ## [2026-10-01 13:57]
 
 - feat(stt): add whisper binding with local transcription support
