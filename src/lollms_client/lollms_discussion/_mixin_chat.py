@@ -6755,12 +6755,23 @@ class ChatMixin:
                                                     pass
 
                                 try:
+                                    exec_kwargs = {
+                                        "lollms_client_instance": self.lollmsClient,
+                                        "discussion_instance": self,
+                                    }
+                                    sig = inspect.signature(lcp_binding.execute_tool)
+                                    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+                                    if "tool_context" in sig.parameters or has_var_kw:
+                                        exec_kwargs["tool_context"] = _tool_context
+                                    if "discussion_instance" not in sig.parameters and not has_var_kw:
+                                        exec_kwargs.pop("discussion_instance", None)
+                                    if "lollms_client_instance" not in sig.parameters and not has_var_kw:
+                                        exec_kwargs.pop("lollms_client_instance", None)
+
                                     tool_res = lcp_binding.execute_tool(
                                        tool_name, 
                                        tool_params, 
-                                       lollms_client_instance=self.lollmsClient, 
-                                       discussion_instance=self,
-                                       tool_context=_tool_context,
+                                       **exec_kwargs
                                     )
                                 except Exception as e:
                                     trace_exception(e)

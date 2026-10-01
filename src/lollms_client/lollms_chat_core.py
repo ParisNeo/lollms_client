@@ -1294,12 +1294,23 @@ def execute_tool_call(
 
         elif lcp_binding and hasattr(lcp_binding, 'execute_tool'):
             try:
+                exec_kwargs = {
+                    "discussion_instance": discussion_instance,
+                    "lollms_client_instance": lollms_client,
+                }
+                sig = inspect.signature(lcp_binding.execute_tool)
+                has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+                if "tool_context" in sig.parameters or has_var_kw:
+                    exec_kwargs["tool_context"] = tool_context
+                if "discussion_instance" not in sig.parameters and not has_var_kw:
+                    exec_kwargs.pop("discussion_instance", None)
+                if "lollms_client_instance" not in sig.parameters and not has_var_kw:
+                    exec_kwargs.pop("lollms_client_instance", None)
+
                 result = lcp_binding.execute_tool(
                     tool_name,
                     sanitized_params,
-                    discussion_instance=discussion_instance,
-                    lollms_client_instance=lollms_client,
-                    tool_context=tool_context
+                    **exec_kwargs
                 )
                 if isinstance(result, dict):
                     return result

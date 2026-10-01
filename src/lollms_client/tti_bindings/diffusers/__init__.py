@@ -74,12 +74,11 @@ class DiffusersTTIBinding(LollmsTTIBinding):
 
         if self.auto_start_server:
             self.ensure_server_is_running(self.wait_for_server)
-
-        if self.config.get("model_name"):
-            try:
-                self.set_settings(self.config)
-            except Exception as e:
-                ASCIIColors.warning(f"Could not sync initial settings to server: {e}")
+            if self.config.get("model_name"):
+                try:
+                    self.set_settings(self.config)
+                except Exception as e:
+                    ASCIIColors.warning(f"Could not sync initial settings to server: {e}")
 
     def _get_headers(self) -> Dict[str, str]:
         headers = {"Accept": "application/json"}
@@ -106,6 +105,8 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         return False
 
     def ensure_server_is_running(self, wait: bool = False, timeout_s: int = 120):
+        if not self.auto_start_server:
+            return
         if self.is_server_running():
             return
 

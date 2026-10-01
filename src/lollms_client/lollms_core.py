@@ -1986,6 +1986,17 @@ class LollmsClient():
         if self.stt: return self.stt.transcribe_audio(*args, **kwargs)
         raise RuntimeError("STT binding not initialized.")
 
+    def transcribe_audio_with_diarization(self, *args, **kwargs):
+        """
+        Transcribes audio with speaker diarization, identifying distinct speakers,
+        mapping them to ordered participants or biometric voice samples, and
+        returning a list of dialogue turns.
+        """
+        self._cooperative_unload_except("stt")
+        if self.stt:
+            return self.stt.transcribe_audio_with_diarization(*args, **kwargs)
+        raise RuntimeError("STT binding not initialized.")
+
     def generate_video(self, *args, **kwargs):
         self._cooperative_unload_except("ttv")
         if self.ttv: return self.ttv.generate_video(*args, **kwargs)

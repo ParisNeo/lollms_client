@@ -10,7 +10,7 @@ import argparse
 import tempfile
 import base64
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Set
 from concurrent.futures import Future
 
 import pipmaster as pm
@@ -34,6 +34,18 @@ except ImportError:
 
 class TranscriptionRequest(BaseModel):
     audio_b64: str = Field(..., description="Base64 encoded audio data")
+    model_name: Optional[str] = Field(default=None, description="Whisper model size to use")
+    language: Optional[str] = Field(default=None, description="Language code (e.g. 'en')")
+    task: str = Field(default="transcribe", description="'transcribe' or 'translate'")
+    fp16: Optional[bool] = Field(default=None, description="Override fp16 usage")
+    device: Optional[str] = Field(default=None, description="Compute device override: 'cuda', 'cpu', or 'auto'")
+    filename: Optional[str] = Field(default=None, description="Original filename for FFmpeg extension hint")
+
+
+class TranscriptionDiarizeRequest(BaseModel):
+    audio_b64: str = Field(..., description="Base64 encoded audio data")
+    participants: Optional[List[str]] = Field(default=None, description="Speaker names in order of appearance")
+    voice_samples: Optional[Dict[str, str]] = Field(default=None, description="Dict of speaker name to base64 audio sample")
     model_name: Optional[str] = Field(default=None, description="Whisper model size to use")
     language: Optional[str] = Field(default=None, description="Language code (e.g. 'en')")
     task: str = Field(default="transcribe", description="'transcribe' or 'translate'")
@@ -511,6 +523,314 @@ async def transcribe(
     finally:
         if temp_file is not None:
             Path(temp_file.name).unlink(missing_ok=True)
+
+
+def _extract_audio_embedding(model: Any, audio_segment: np.ndarray, device: str) -> np.ndarray:
+    """
+    Extracts an acoustic speaker representation vector from an audio segment using
+    Whisper's audio encoder.
+    """
+    try:
+        # Pad or trim to 30-second window expected by Whisper
+        padded = whisper.pad_or_trim(audio_segment)
+        mel = whisper.log_mel_spectrogram(padded, n_mels=model.dims.n_mels).unsqueeze(0).to(device)
+        with torch.no_grad():
+            encoder_output = model.encoder(mel)
+            # Pool across temporal frames to get a fixed-size acoustic vector
+            embedding = encoder_output.mean(dim=1).squeeze(0).cpu().numpy()
+            norm = np.linalg.norm(embedding)
+            if norm > 1e-8:
+                embedding = embedding / norm
+            return embedding
+    except Exception as e:
+        ASCIIColors.warning(f"Failed to extract encoder embedding: {e}")
+        # Fallback to MFCC-like spectral summary
+        spec = np.abs(np.fft.rfft(audio_segment[:16000]))
+        if len(spec) > 256:
+            spec = spec[:256]
+        norm = np.linalg.norm(spec)
+        return (spec / norm) if norm > 1e-8 else spec
+
+
+def _cluster_speaker_segments(
+    segment_embeddings: List[np.ndarray],
+    threshold: float = 0.55
+) -> List[int]:
+    """
+    Clusters acoustic speaker segment embeddings based on cosine distance.
+    Returns cluster assignments [0, 1, 0, 2...] for each segment.
+    """
+    n = len(segment_embeddings)
+    if n == 0:
+        return []
+    if n == 1:
+        return [0]
+
+    cluster_centers: List[np.ndarray] = [segment_embeddings[0]]
+    cluster_labels: List[int] = [0]
+
+    for i in range(1, n):
+        emb = segment_embeddings[i]
+        best_sim = -1.0
+        best_cluster = 0
+        for c_idx, center in enumerate(cluster_centers):
+            sim = float(np.dot(emb, center))
+            if sim > best_sim:
+                best_sim = sim
+                best_cluster = c_idx
+
+        # If similarity exceeds threshold, assign to existing cluster and update running mean
+        if best_sim >= threshold:
+            cluster_labels.append(best_cluster)
+            new_center = cluster_centers[best_cluster] + emb
+            new_norm = np.linalg.norm(new_center)
+            if new_norm > 1e-8:
+                cluster_centers[best_cluster] = new_center / new_norm
+        else:
+            # Create a new speaker cluster
+            new_cluster = len(cluster_centers)
+            cluster_centers.append(emb)
+            cluster_labels.append(new_cluster)
+
+    return cluster_labels
+
+
+@router.post("/transcribe_diarize")
+async def transcribe_diarize(
+    request: TranscriptionDiarizeRequest,
+    authorization: Optional[str] = Header(None),
+    x_server_token: Optional[str] = Header(None)
+):
+    verify_auth_token(authorization, x_server_token)
+    model_name = request.model_name or "base"
+    temp_file = None
+    voice_sample_files: List[str] = []
+
+    try:
+        requested_device = (request.device or "auto").lower().strip()
+        if requested_device in ("auto", ""):
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        elif requested_device.startswith("cuda") and not torch.cuda.is_available():
+            device = "cpu"
+        else:
+            device = requested_device
+
+        manager = state.registry.get_manager(model_name=model_name, device=device)
+
+        audio_bytes = base64.b64decode(request.audio_b64, validate=False)
+        if len(audio_bytes) == 0:
+            raise HTTPException(status_code=400, detail="Empty audio payload.")
+
+        original_ext = ""
+        if request.filename and "." in request.filename:
+            original_ext = Path(request.filename).suffix.lower()
+        allowed_exts = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".wma", ".aiff", ".aif", ".webm", ".mp4", ".mkv"}
+        safe_suffix = original_ext if original_ext in allowed_exts else ".wav"
+
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=safe_suffix)
+        try:
+            temp_file.write(audio_bytes)
+        finally:
+            temp_file.close()
+
+        with manager.lock:
+            manager.last_used_time = time.time()
+            if manager.loaded_model_name != model_name:
+                manager._load_whisper_model(model_name)
+
+        if manager.model is None:
+            raise HTTPException(status_code=500, detail=f"Model '{model_name}' failed to load.")
+
+        # 1. Perform full transcription with timestamped segments
+        transcribe_args = {
+            "language": request.language,
+            "task": request.task,
+            "fp16": request.fp16 if request.fp16 is not None else (device == "cuda"),
+            "word_timestamps": False,
+        }
+        whisper_result = manager.model.transcribe(temp_file.name, **transcribe_args)
+        raw_segments = whisper_result.get("segments", [])
+
+        if not raw_segments:
+            text = whisper_result.get("text", "").strip()
+            speaker = request.participants[0] if (request.participants and len(request.participants) > 0) else "Speaker 1"
+            return {
+                "turns": [{
+                    "speaker": speaker,
+                    "start": 0.0,
+                    "end": 0.0,
+                    "text": text
+                }],
+                "text": f"[{speaker}]: {text}" if text else ""
+            }
+
+        # 2. Load audio waveform for segment slicing
+        full_audio = whisper.load_audio(temp_file.name)
+        sr = whisper.audio.SAMPLE_RATE
+
+        # 3. Extract acoustic speaker embeddings for reference voice samples if provided
+        reference_embeddings: Dict[str, np.ndarray] = {}
+        if request.voice_samples:
+            for speaker_name, sample_b64 in request.voice_samples.items():
+                if not sample_b64:
+                    continue
+                try:
+                    sample_bytes = base64.b64decode(sample_b64, validate=False)
+                    sf = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+                    try:
+                        sf.write(sample_bytes)
+                    finally:
+                        sf.close()
+                    voice_sample_files.append(sf.name)
+
+                    sample_audio = whisper.load_audio(sf.name)
+                    if len(sample_audio) > 0:
+                        ref_emb = _extract_audio_embedding(manager.model, sample_audio, manager.device)
+                        reference_embeddings[speaker_name] = ref_emb
+                except Exception as ex:
+                    ASCIIColors.warning(f"Failed to process voice sample for '{speaker_name}': {ex}")
+
+        # 4. Extract acoustic embeddings for each transcribed segment
+        segment_embeddings = []
+        valid_segments = []
+
+        for seg in raw_segments:
+            seg_start_s = float(seg.get("start", 0.0))
+            seg_end_s = float(seg.get("end", seg_start_s + 1.0))
+            seg_text = str(seg.get("text", "")).strip()
+            if not seg_text:
+                continue
+
+            start_sample = int(seg_start_s * sr)
+            end_sample = min(len(full_audio), int(seg_end_s * sr))
+
+            # Need at least 0.25 seconds of audio to extract an acoustic embedding
+            if end_sample - start_sample < int(0.25 * sr):
+                seg_audio = full_audio[start_sample:min(len(full_audio), start_sample + int(0.5 * sr))]
+            else:
+                seg_audio = full_audio[start_sample:end_sample]
+
+            if len(seg_audio) == 0:
+                continue
+
+            emb = _extract_audio_embedding(manager.model, seg_audio, manager.device)
+            segment_embeddings.append(emb)
+            valid_segments.append(seg)
+
+        if not valid_segments:
+            text = whisper_result.get("text", "").strip()
+            speaker = request.participants[0] if (request.participants and len(request.participants) > 0) else "Speaker 1"
+            return {
+                "turns": [{
+                    "speaker": speaker,
+                    "start": 0.0,
+                    "end": 0.0,
+                    "text": text
+                }],
+                "text": f"[{speaker}]: {text}" if text else ""
+            }
+
+        # 5. Clusterize segment embeddings to identify distinct voices
+        cluster_labels = _cluster_speaker_segments(segment_embeddings, threshold=0.60)
+
+        # 6. Map clusters to speakers (matching voice samples first, then participants in order of appearance)
+        cluster_to_speaker: Dict[int, str] = {}
+        assigned_speakers: Set[str] = set()
+
+        # If reference voice samples are provided, match each cluster center to closest sample
+        if reference_embeddings:
+            # Calculate mean embedding for each cluster
+            cluster_indices: Dict[int, List[int]] = {}
+            for idx, c_lbl in enumerate(cluster_labels):
+                cluster_indices.setdefault(c_lbl, []).append(idx)
+
+            for c_lbl, indices in cluster_indices.items():
+                mean_emb = np.mean([segment_embeddings[i] for i in indices], axis=0)
+                norm = np.linalg.norm(mean_emb)
+                if norm > 1e-8:
+                    mean_emb = mean_emb / norm
+
+                best_sim = -1.0
+                best_match_speaker = None
+                for spk_name, ref_emb in reference_embeddings.items():
+                    sim = float(np.dot(mean_emb, ref_emb))
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_match_speaker = spk_name
+
+                # Match if cosine similarity is confident (>= 0.62)
+                if best_sim >= 0.62 and best_match_speaker and best_match_speaker not in assigned_speakers:
+                    cluster_to_speaker[c_lbl] = best_match_speaker
+                    assigned_speakers.add(best_match_speaker)
+
+        # Map remaining clusters to participant list in chronological order of appearance
+        participants_pool = [p for p in (request.participants or []) if p not in assigned_speakers]
+        participant_idx = 0
+        speaker_counter = 1
+
+        # Track first appearance of each cluster
+        seen_clusters: List[int] = []
+        for c_lbl in cluster_labels:
+            if c_lbl not in seen_clusters:
+                seen_clusters.append(c_lbl)
+
+        for c_lbl in seen_clusters:
+            if c_lbl in cluster_to_speaker:
+                continue
+
+            if participant_idx < len(participants_pool):
+                chosen_name = participants_pool[participant_idx]
+                participant_idx += 1
+            else:
+                chosen_name = f"Speaker {speaker_counter}"
+                speaker_counter += 1
+
+            cluster_to_speaker[c_lbl] = chosen_name
+            assigned_speakers.add(chosen_name)
+
+        # 7. Build structured turns and merge contiguous segments by the same speaker
+        turns: List[Dict[str, Any]] = []
+
+        for idx, seg in enumerate(valid_segments):
+            c_lbl = cluster_labels[idx]
+            speaker_name = cluster_to_speaker.get(c_lbl, "Speaker 1")
+            seg_start = round(float(seg.get("start", 0.0)), 2)
+            seg_end = round(float(seg.get("end", seg_start + 1.0)), 2)
+            seg_text = str(seg.get("text", "")).strip()
+
+            if not seg_text:
+                continue
+
+            # Merge with preceding turn if same speaker and gap is small (<= 2.0s)
+            if turns and turns[-1]["speaker"] == speaker_name and seg_start - turns[-1]["end"] <= 2.0:
+                turns[-1]["text"] += " " + seg_text
+                turns[-1]["end"] = seg_end
+            else:
+                turns.append({
+                    "speaker": speaker_name,
+                    "start": seg_start,
+                    "end": seg_end,
+                    "text": seg_text
+                })
+
+        # Format full dialogue script
+        formatted_script = "\n".join([f"[{t['speaker']}]: {t['text']}" for t in turns])
+
+        return {
+            "turns": turns,
+            "text": formatted_script
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        trace_exception(e)
+        raise HTTPException(status_code=500, detail=f"Whisper diarization failed: {e}")
+    finally:
+        if temp_file is not None:
+            Path(temp_file.name).unlink(missing_ok=True)
+        for vf in voice_sample_files:
+            Path(vf).unlink(missing_ok=True)
 
 
 app.include_router(router)

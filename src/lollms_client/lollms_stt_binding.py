@@ -23,16 +23,62 @@ class LollmsSTTBinding(LollmsBaseBinding):
     def transcribe_audio(self, audio_source: Union[str, Path, bytes], model: Optional[str] = None, **kwargs) -> str:
         """
         Transcribes the audio source into text.
-        
+
         Args:
             audio_source (Union[str, Path, bytes]): Path to the audio file or raw audio bytes.
             model (Optional[str]): The model to use for transcription.
             **kwargs: Additional parameters.
-            
+
         Returns:
             str: The transcribed text.
         """
         pass
+
+    def transcribe_audio_with_diarization(
+        self,
+        audio_source: Union[str, Path, bytes],
+        participants: Optional[List[str]] = None,
+        voice_samples: Optional[Dict[str, Union[str, Path, bytes]]] = None,
+        model: Optional[str] = None,
+        **kwargs
+    ) -> List[Dict[str, Any]]:
+        """
+        Transcribes the audio source with speaker diarization, identifying distinct
+        speakers and mapping them to participant names or known voice samples.
+
+        Args:
+            audio_source (Union[str, Path, bytes]): Audio path or raw bytes.
+            participants (Optional[List[str]]): List of speaker names in order of appearance.
+                If fewer names are provided than detected voices (or if omitted),
+                remaining voices are named "Speaker 1", "Speaker 2", etc.
+            voice_samples (Optional[Dict[str, Union[str, Path, bytes]]]): Reference voice
+                samples mapping speaker names to audio clips for biometric matching.
+            model (Optional[str]): The model to use.
+            **kwargs: Additional arguments.
+
+        Returns:
+            List[Dict[str, Any]]: List of dialogue turns, e.g.:
+                [
+                    {
+                        "speaker": "Alice",
+                        "start": 0.0,
+                        "end": 4.5,
+                        "text": "Hello everyone."
+                    },
+                    ...
+                ]
+        """
+        # Default fallback for bindings without native diarization
+        text = self.transcribe_audio(audio_source, model=model, **kwargs)
+        default_speaker = participants[0] if (participants and len(participants) > 0) else "Speaker 1"
+        if not text:
+            return []
+        return [{
+            "speaker": default_speaker,
+            "start": 0.0,
+            "end": 0.0,
+            "text": text.strip()
+        }]
 
     @abstractmethod
     def list_models(self, **kwargs) -> List[str]:

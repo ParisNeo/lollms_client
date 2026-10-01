@@ -3,6 +3,15 @@
 
 All notable changes to this project will be documented in this file.
 #
+- docs(discussion:forms): comprehensively document interactive `<lollms_form>` creation, grammar, events, and resume workflow in `lollms_discussion/README.md`
+- perf(diffusers:daemon): prevent long test stalls and redundant dependency downloads by adding `auto_start_server` check in `ensure_server_is_running` across TTI, TTM, and TTV diffusers bindings
+- fix(discussion:create_new): reload existing discussion record when `id` is already in database instead of raising SQLite UNIQUE constraint error
+- fix(lcp:execute_tool): dynamically inspect `lcp_binding.execute_tool` parameter signatures before forwarding `tool_context` to support mock bindings
+- fix(artefact:sync): register workspace subfolder files with `title=f_path.name` and format binary data placeholders as `(Binary/Structured Data)`
+- fix(artefact:dedup): purge stale extensionless files when an artifact is synced with `.md` extension
+- feat(stt:diarization): introduce `transcribe_audio_with_diarization` across `LollmsSTTBinding`, `WhisperSTTBinding`, and `LollmsClient`
+- feat(whisper:diarization): add speaker voice isolation, acoustic encoder embedding extraction, and clustering to Whisper server
+- feat(whisper:voice_matching): support `participants` appearance ordering and reference `voice_samples` biometric cosine matching for named turns
 - fix(gui:realtime_tool_streaming): preserve `tool_progress` metadata in `QueueStreamingCallback`, expand active tool panels with live spinner, and stream execution lines into the GUI code box in real-time
 - fix(execute_python:realtime_streaming): eliminate stdout redirection recursion loop in `_ProgressStringIO`, stream unbuffered tool lines directly to the OS terminal in real-time during `time.sleep()`, and sanitize Rich markup
 - feat(tools:live_streaming): stream stdout/stderr lines in real-time during tool execution (`execute_python` and `system_shell`) to CLI terminal and GUI code boxes via `ToolContext.emit_progress`
@@ -280,6 +289,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+
+## [2026-10-01 23:34]
+
+- feat(lollms): enhance core functionality and documentation
 
 ## [2026-10-01 14:24]
 

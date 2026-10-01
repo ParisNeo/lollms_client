@@ -211,6 +211,14 @@ class CoreMixin:
                    k: v for k, v in kwargs.items()
                    if k in valid_keys and k not in history_bearing_keys
                }
+               disc_id = db_creation_args.get('id')
+               if disc_id:
+                   existing = session.query(db_manager.DiscussionModel).filter_by(id=disc_id).first()
+                   if existing:
+                       session.expunge(existing)
+                       return cls(lollmsClient=lollms_client, db_manager=db_manager,
+                                  db_discussion_obj=existing, **init_args)
+
                if 'id' not in db_creation_args:
                    db_creation_args['id'] = str(uuid.uuid4())
                db_discussion_orm = db_manager.DiscussionModel(**db_creation_args)
@@ -959,19 +967,20 @@ class CoreMixin:
             if Path(rel_str).name.startswith("."):
                 continue
 
-            existing_art = self.artefacts.get(rel_str) or self.artefacts.get(f_path.stem)
+            existing_art = self.artefacts.get(rel_str) or self.artefacts.get(f_path.name) or self.artefacts.get(f_path.stem)
             if existing_art and _is_ignored_path(existing_art.get("title", "")):
                 continue
 
             file_size = f_path.stat().st_size
             atype = self._classify_artefact_type(file_ext)
 
+            art_title = f_path.name
+            existing_by_name = self.artefacts.get(f_path.name)
+            if existing_by_name and existing_by_name.get("physical_path") and existing_by_name.get("physical_path") != rel_str:
+                art_title = rel_str
+
             if self._is_lightweight_text_file(f_path, file_ext):
                 # ── TEXT FILE: import content into DB, but keep it TREE_UNLOCKABLE ──
-                # Content is cached in the DB so <unlock_file> and SQL/grep tools work
-                # instantly, but it is NOT injected into the LLM context until explicitly
-                # unlocked. This is the security gate: disk files are never auto-promoted
-                # to FULL visibility by the sync pass.
                 try:
                     disk_content = f_path.read_text(encoding="utf-8", errors="ignore")
                 except Exception:
@@ -979,7 +988,7 @@ class CoreMixin:
 
                 if existing_art is None:
                     self.artefacts.add(
-                        title=rel_str,
+                        title=art_title,
                         physical_path=rel_str,
                         artefact_type=atype,
                         content=disk_content,
@@ -991,12 +1000,9 @@ class CoreMixin:
                 else:
                     db_content = existing_art.get("content", "")
                     if db_content != disk_content:
-                        # Preserve the current visibility: if the file was already
-                        # unlocked (FULL) by the LLM or user, keep it FULL. Otherwise
-                        # it stays TREE_UNLOCKABLE.
                         current_visibility = existing_art.get("visibility", ArtefactVisibility.TREE_UNLOCKABLE)
                         self.artefacts.update(
-                            title=rel_str,
+                            title=existing_art.get("title", art_title),
                             physical_path=rel_str,
                             new_content=disk_content,
                             new_type=atype,
@@ -1007,9 +1013,10 @@ class CoreMixin:
                         report["updated_artefacts"] += 1
             else:
                 # ── BINARY / NON-TEXT FILE: as-is metadata entry, no content read ──
+                type_desc = "Binary/Structured Data" if atype == "data" else "As-Is / Non-Text"
                 content_placeholder = (
                     f"### File: `{rel_str}`\n\n"
-                    f"- **Type**: {file_ext.upper().lstrip('.') if file_ext else 'Unknown'} (As-Is / Non-Text)\n"
+                    f"- **Type**: {file_ext.upper().lstrip('.') if file_ext else 'Unknown'} ({type_desc})\n"
                     f"- **Size**: {file_size:,} bytes\n"
                     f"- **Location**: `./{rel_str}`\n\n"
                     f"> This file is preserved on disk in its native format. "
@@ -1018,7 +1025,7 @@ class CoreMixin:
                 )
                 if existing_art is None:
                     self.artefacts.add(
-                        title=rel_str,
+                        title=art_title,
                         physical_path=rel_str,
                         artefact_type=atype,
                         content=content_placeholder,
@@ -1031,7 +1038,7 @@ class CoreMixin:
                 else:
                     if f"Size**: {file_size:,}" not in existing_art.get("content", ""):
                         self.artefacts.update(
-                            title=rel_str,
+                            title=existing_art.get("title", art_title),
                             physical_path=rel_str,
                             new_content=content_placeholder,
                             logical_content=content_placeholder,

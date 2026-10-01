@@ -75,6 +75,9 @@ class DiffusersTTVBinding(LollmsTTVBinding):
         """
         Ensures the Diffusers TTV server is running.
         """
+        if not self.auto_start_server:
+            return
+
         self.server_dir.mkdir(exist_ok=True)
         ASCIIColors.info("Attempting to start or connect to the Diffusers TTV server...")
 

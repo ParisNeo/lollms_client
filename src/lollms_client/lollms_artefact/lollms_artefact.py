@@ -623,8 +623,28 @@ class ArtefactManager:
             # The active file in the workspace root (source of truth for tools)
             active_file_path = self._resolve_confined_path(filename, ensure_parent=True)
 
-            # Clean up any spurious duplicate file created by legacy extension appending
-            # (e.g. '.gitignore.md' when the true file is '.gitignore')
+            # Clean up stale/duplicate file variations created by extension mismatch:
+            # 1. If filename got an extension (e.g. README.md from title README), purge stale extensionless file (README)
+            if filename != clean_path:
+                try:
+                    stale_raw = self._resolve_confined_path(clean_path)
+                    if stale_raw != active_file_path and stale_raw.is_file():
+                        has_owner = any(
+                            self._get_filename_with_ext(
+                                self._sanitize_path_segments(a.get('physical_path') or a.get('title', '')),
+                                a.get('type', 'document'),
+                                a.get('language'),
+                                a.get('file_ext')
+                            ) == clean_path
+                            for a in self._get_all_raw()
+                        )
+                        if not has_owner:
+                            stale_raw.unlink()
+                            ASCIIColors.info(f"[ArtefactManager] Auto-purged stale extensionless duplicate file: '{stale_raw.name}'")
+                except Exception:
+                    pass
+
+            # 2. If filename is extensionless/dotfile (e.g. .gitignore), purge spurious duplicate file (e.g. .gitignore.md)
             if filename != f"{clean_path}.md":
                 try:
                     spurious_md = self._resolve_confined_path(f"{clean_path}.md")

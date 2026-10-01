@@ -308,6 +308,70 @@ class WhisperSTTBinding(LollmsSTTBinding):
         response = self._post_json_request("/transcribe", data=payload)
         return response.json().get("text", "")
 
+    def transcribe_audio_with_diarization(
+        self,
+        audio_source: Union[str, Path, bytes],
+        participants: Optional[List[str]] = None,
+        voice_samples: Optional[Dict[str, Union[str, Path, bytes]]] = None,
+        model: Optional[str] = None,
+        **kwargs
+    ) -> List[Dict[str, Any]]:
+        """
+        Transcribes audio with speaker diarization and voice matching.
+
+        Segments speech, extracts acoustic embeddings using Whisper's audio encoder,
+        and clusters them into distinct speakers. If voice_samples are provided,
+        clusters are matched to reference voices. Unmatched clusters are mapped
+        to participants in order of appearance, or 'Speaker 1', 'Speaker 2', etc.
+
+        Returns:
+            List[Dict[str, Any]]: List of dialogue turns with 'speaker', 'start', 'end', and 'text'.
+        """
+        self.ensure_server_is_running(wait=True)
+
+        if isinstance(audio_source, (str, Path)):
+            audio_file = Path(audio_source)
+            if not audio_file.exists():
+                raise FileNotFoundError(f"Audio file not found at: {audio_source}")
+            audio_bytes = audio_file.read_bytes()
+            filename_hint = audio_file.name
+        elif isinstance(audio_source, bytes):
+            audio_bytes = audio_source
+            filename_hint = kwargs.get("filename")
+        else:
+            raise ValueError("audio_source must be str, Path, or bytes")
+
+        audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+
+        # Encode reference voice samples to base64 if provided
+        encoded_samples: Optional[Dict[str, str]] = None
+        if voice_samples:
+            encoded_samples = {}
+            for spk_name, sample_src in voice_samples.items():
+                if isinstance(sample_src, (str, Path)):
+                    sp = Path(sample_src)
+                    if sp.exists() and sp.is_file():
+                        encoded_samples[spk_name] = base64.b64encode(sp.read_bytes()).decode('utf-8')
+                elif isinstance(sample_src, bytes):
+                    encoded_samples[spk_name] = base64.b64encode(sample_src).decode('utf-8')
+
+        payload = {
+            "audio_b64": audio_b64,
+            "participants": participants,
+            "voice_samples": encoded_samples,
+            "model_name": model or self.config.get("model_name", "base"),
+            "language": kwargs.get("language"),
+            "task": kwargs.get("task", "transcribe"),
+            "fp16": kwargs.get("fp16"),
+            "device": kwargs.get("device"),
+            "filename": filename_hint
+        }
+
+        response = self._post_json_request("/transcribe_diarize", data=payload)
+        res_json = response.json()
+        turns = res_json.get("turns", [])
+        return turns
+
     def shutdown_server(self) -> bool:
         """Sends an authenticated shutdown command to terminate the background server daemon."""
         if not self.is_server_running():

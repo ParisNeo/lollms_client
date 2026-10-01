@@ -137,6 +137,8 @@ class DiffusersTTMBinding(LollmsTTMBinding):
         return False
 
     def ensure_server_is_running(self, wait: bool = False, timeout_s: int = 120):
+        if not self.auto_start_server:
+            return
         if self.is_server_running():
             return
 
