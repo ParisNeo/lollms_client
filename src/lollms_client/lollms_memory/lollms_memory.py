@@ -346,7 +346,7 @@ class LollmsMemoryManager:
             ASCIIColors.warning(f"[MemoryManager] Startup memory cleanup warning: {e}")
 
         # Always log the memories database absolute path for user visibility & diagnostics
-        ASCIIColors.info(f"[MemoryManager] Initialised memories DB at: {self.resolved_disk_path}")
+        ASCIIColors.debug(f"[MemoryManager] Initialised memories DB at: {self.resolved_disk_path}")
 
     # ──────────────────────────────────────────────── session helper
 

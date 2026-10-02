@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-02 15:18]
+
+- feat: add reasoning/thinking support across client bindings, memory, and personality modules
+
 ## [2026-10-01 23:34]
 
 - feat(lollms): enhance core functionality and documentation

@@ -1217,7 +1217,7 @@ class LollmsBinding(LollmsLLMBinding):
             is_thinking_deactivated = True
             effort = None
 
-        ASCIIColors.info(
+        ASCIIColors.debug(
             f"[LollmsBinding.generate_from_messages] think={think}, reasoning_effort={reasoning_effort} "
             f"-> effective_effort={effort}, deactivated={is_thinking_deactivated}"
         )

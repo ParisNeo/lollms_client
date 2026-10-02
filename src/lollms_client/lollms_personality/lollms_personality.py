@@ -114,6 +114,29 @@ _INTENT_ANNOUNCEMENT_RE = re.compile(
     r')'
 )
 
+_HISTORY_HOT_ZONE = 10
+_HISTORY_DECAY_MIN_LEN = 16
+_MAX_CHRONICLE_ENTRIES = 80
+_DECAY_TAG = "HISTORY-COMPACTED"
+
+_DECAYED_TOOL_RESULT_RE = re.compile(
+    r'(<tool_result name="[^"]*" status="(?:SUCCESS|FAILED)">\n)(.*?)(\n</tool_result>)',
+    re.DOTALL,
+)
+_DECAYED_LOADED_FILE_RE = re.compile(
+    r'(<file path="[^"]*">\n)(.*?)(\n</file>)',
+    re.DOTALL,
+)
+_DECAYED_ARTIFACT_RE = re.compile(
+    r'<art(?:ifact|efact)([^>]*)>.*?</art(?:ifact|efact)>',
+    re.DOTALL | re.IGNORECASE,
+)
+
+_ASSISTANT_MARKER_PREFIXES = (
+    "[Assistant executed batched actions]",
+    "[Assistant repeated its previous preamble",
+)
+
 
 def _is_synthetic_agent_response(text: str) -> bool:
     stripped = (text or "").strip()
@@ -3197,8 +3220,8 @@ class LollmsPersonality:
                 f"[SYSTEM DIRECTIVE: You wrote conversational text without executing an action tag or emitting `<done/>`.{recent_ctx}\n"
                 "Conversational declarations and apologies DO NOT execute tools or create files.\n"
                 "MANDATORY: Output the functional XML tag (`<tool>`, `<generate_image>`, `<artifact>`, `<unlock_file>`) as the FIRST token of your reply NOW.\n"
-                "- If generating an image: `<generate_image>prompt</generate_image>` or `<tool>{\"name\": \"tool_generate_image\", \"parameters\": {\"prompt\": \"...\"}}</tool>`\n"
-                "- If running tests/commands: `<tool>{\"name\": \"tool_execute_shell_command\", \"parameters\": {\"command\": \"...\"}}</tool>`\n"
+                "- If generating an image: `<generate_image>prompt</generate_image>` or `<tool>{{\"name\": \"tool_generate_image\", \"parameters\": {{\"prompt\": \"...\"}}}}</tool>`\n"
+                "- If running tests/commands: `<tool>{{\"name\": \"tool_execute_shell_command\", \"parameters\": {{\"command\": \"...\"}}}}</tool>`\n"
                 "- If modifying code: `<artifact name=\"file.py\">...</artifact>`\n"
                 "DO NOT apologize. DO NOT write another introductory sentence. Output the XML tag NOW.]"
             )
@@ -3213,6 +3236,180 @@ class LollmsPersonality:
                 f"[SYSTEM: CRITICAL — You have stalled {stall_count} times without producing an action tag or `<done/>`.\n"
                 "Emit `<done/>` on a new line NOW to terminate the turn.]"
             )
+
+    # ------------------------------------------------------------------ Graduated History Decay & Turn Chronicle
+
+    @staticmethod
+    def _compact_param_digest(params: Dict[str, Any]) -> str:
+        if not isinstance(params, dict):
+            return str(params)[:60]
+        priority_keys = (
+            "file_name", "filename", "path", "pattern", "command", "query",
+            "title", "name", "skill_name", "instruction", "plan_file",
+        )
+        parts: List[str] = []
+        for key in priority_keys:
+            value = params.get(key)
+            if value:
+                parts.append(f"{key}={str(value)[:40]}")
+            if len(parts) >= 2:
+                break
+        if not parts:
+            for key, value in params.items():
+                if value:
+                    parts.append(f"{key}={str(value)[:40]}")
+                if len(parts) >= 2:
+                    break
+        return ", ".join(parts)
+
+    def _build_turn_chronicle_block(
+        self,
+        tool_calls: List[Dict[str, Any]],
+        tool_results: List[Dict[str, Any]],
+    ) -> str:
+        if not tool_calls:
+            return ""
+
+        entries: List[str] = []
+        for idx, call in enumerate(tool_calls):
+            result = tool_results[idx] if idx < len(tool_results) else {}
+            status = "OK" if result.get("success", True) else "FAILED"
+            name = call.get("name", "unknown")
+            digest = self._compact_param_digest(call.get("parameters", {}))
+            entries.append(f"R{call.get('round', '?')}: {name}({digest}) → {status}")
+
+        omitted_count = 0
+        if len(entries) > _MAX_CHRONICLE_ENTRIES:
+            omitted_count = len(entries) - _MAX_CHRONICLE_ENTRIES
+            entries = entries[-_MAX_CHRONICLE_ENTRIES:]
+
+        lines = [
+            "",
+            "=== TURN CHRONICLE (actions already executed this turn — do NOT re-run any of these with identical parameters) ===",
+        ]
+        if omitted_count:
+            lines.append(f"(+{omitted_count} earlier actions omitted — their key findings should be in your scratchpad)")
+        lines.extend(entries)
+        lines.append("=== END TURN CHRONICLE ===")
+        return "\n".join(lines)
+
+    def _decay_user_message(self, content: str) -> str:
+        def _truncate_tool_result(match):
+            opening, inner, closing = match.group(1), match.group(2), match.group(3)
+            if _DECAY_TAG in inner:
+                return match.group(0)
+            is_success = 'status="SUCCESS"' in opening
+            head_lines, tail_lines = (20, 5) if is_success else (30, 10)
+            lines = inner.splitlines()
+            if len(lines) <= head_lines + tail_lines + 5:
+                return match.group(0)
+            omitted = len(lines) - head_lines - tail_lines
+            head = "\n".join(lines[:head_lines])
+            tail = "\n".join(lines[-tail_lines:])
+            note = (
+                f"[{_DECAY_TAG}: {omitted} lines omitted — the full output was consumed in earlier rounds. "
+                f"Key facts should be in your scratchpad; only re-run this tool with MODIFIED parameters if you truly need more details.]"
+            )
+            return f"{opening}{head}\n{note}\n{tail}{closing}"
+
+        decayed = _DECAYED_TOOL_RESULT_RE.sub(_truncate_tool_result, content)
+
+        def _truncate_loaded_file(match):
+            opening, inner, closing = match.group(1), match.group(2), match.group(3)
+            if _DECAY_TAG in inner:
+                return match.group(0)
+            lines = inner.splitlines()
+            if len(lines) <= 25:
+                return match.group(0)
+            head = "\n".join(lines[:15])
+            omitted = len(lines) - 15
+            note = (
+                f"[{_DECAY_TAG}: {omitted} lines omitted — the file still exists on disk. "
+                f"Use tool_read_file or <unlock_file> if you need its content again.]"
+            )
+            return f"{opening}{head}\n{note}{closing}"
+
+        decayed = _DECAYED_LOADED_FILE_RE.sub(_truncate_loaded_file, decayed)
+        return decayed
+
+    def _decay_assistant_message(self, content: str) -> str:
+        def _collapse_artifact(match):
+            attrs = match.group(1) or ""
+            name_match = re.search(r'(?:name|title)\s*=\s*["\']([^"\']+)["\']', attrs)
+            title = name_match.group(1) if name_match else "file"
+            return f'<artifact name="{title}">[{_DECAY_TAG}: full content lives in the workspace file]</artifact>'
+
+        decayed = _DECAYED_ARTIFACT_RE.sub(_collapse_artifact, content)
+
+        has_functional_tags = bool(
+            re.search(r'<(?:tool|art|artifact|efact|unlock_file|lock_file|generate_image|edit_image)\b', decayed, re.IGNORECASE)
+        )
+        if not has_functional_tags and len(decayed) > 800:
+            decayed = decayed[:500] + f"\n[{_DECAY_TAG}: old conversational text truncated]"
+        return decayed
+
+    def _apply_graduated_history_decay(self, virtual_history: List) -> None:
+        if len(virtual_history) <= _HISTORY_DECAY_MIN_LEN:
+            return
+
+        total = len(virtual_history)
+        for idx, vh in enumerate(virtual_history):
+            distance_from_end = total - idx
+            if distance_from_end <= _HISTORY_HOT_ZONE:
+                continue
+            content = getattr(vh, "content", "")
+            if not content or _DECAY_TAG in content:
+                continue
+            if getattr(vh, "sender_type", "") == "assistant":
+                vh.content = self._decay_assistant_message(content)
+            else:
+                vh.content = self._decay_user_message(content)
+
+    _SHELL_PROMPT_PREFIX_RE = re.compile(r'^\s*(?:\$|>|#|%|PS>|C:\\[^>]*>)\s*')
+
+    @staticmethod
+    def _normalize_shell_command(command: str) -> str:
+        """
+        Normalizes a shell command string for signature deduplication.
+        Strips hallucinated prompt prefixes ($, >, #, %, PS>) and collapses
+        whitespace so that '$ type x.py' and 'type x.py' share one signature.
+        """
+        if not isinstance(command, str):
+            return str(command or "")
+        normalized = LollmsPersonality._SHELL_PROMPT_PREFIX_RE.sub("", command.strip())
+        return " ".join(normalized.split())
+
+    @staticmethod
+    def _texts_are_repetitive(text_a: str, text_b: str) -> bool:
+        clean_a = re.sub(r'<[^>]+>', '', (text_a or "")).strip()
+        clean_b = re.sub(r'<[^>]+>', '', (text_b or "")).strip()
+        if not clean_a or not clean_b:
+            return False
+        if clean_a == clean_b:
+            return True
+        if len(clean_a) > 80 and clean_a in clean_b:
+            return True
+        if len(clean_b) > 80 and clean_b in clean_a:
+            return True
+        if len(clean_a) > 60 or len(clean_b) > 60:
+            words_a = set(clean_a.split())
+            words_b = set(clean_b.split())
+            if words_a and words_b:
+                overlap = len(words_a & words_b) / max(len(words_a), len(words_b))
+                if overlap > 0.85:
+                    return True
+        return False
+
+    @staticmethod
+    def _last_real_assistant_text(virtual_history: List) -> str:
+        for vh in reversed(virtual_history):
+            if getattr(vh, "sender_type", "") != "assistant":
+                continue
+            content = (getattr(vh, "content", "") or "").strip()
+            if not content or content.startswith(_ASSISTANT_MARKER_PREFIXES):
+                continue
+            return content
+        return ""
 
     # ------------------------------------------------------------------ Independent Agentic Chat
 
@@ -3676,7 +3873,8 @@ JSON:"""
         summary_prompt = (
             "You are a context compaction engine. Summarize the following conversation history into a dense, factual summary.\n"
             "Focus on retaining: user goals, key data retrieved from tools, file names created/modified, and final conclusions.\n"
-            "Discard: conversational pleasantries, intermediate reasoning steps, and verbose tool outputs.\n\n"
+            "Discard: conversational pleasantries, intermediate reasoning steps, and verbose tool outputs.\n"
+            "NOTE: The sequence of executed actions is preserved separately in the TURN CHRONICLE — do not re-list every call. Focus on findings, decisions, and current state.\n\n"
             f"=== HISTORY TO COMPACT ===\n{history_text}\n=== END HISTORY ==="
         )
 
@@ -5079,7 +5277,9 @@ JSON:"""
                 "1. **ACTION FIRST (NO PREAMBLE)**: When performing a task, output the action tag (`<tool>`, `<artifact>`, `<unlock_file>`) as your FIRST tokens. Never write prose checklists explaining what you plan to do.\n"
                 "2. **TERMINATION CONTRACT (<done/>)**: Conclude completed tasks with `<done/>` on a new line. On casual greetings (e.g. 'hi'), reply conversationally and finish with `<done/>`.\n"
                 "3. **PASSIVE MEMORY BOUNDARY**: Memories provide passive background facts only. Your active objective is determined exclusively by the latest user message.\n"
-                "4. **SURGICAL PATCHES**: For existing files, use Aider SEARCH/REPLACE patches with exact verbatim lines.\n\n"
+                "4. **SURGICAL PATCHES**: For existing files, use Aider SEARCH/REPLACE patches with exact verbatim lines.\n"
+                "5. **SCRATCHPAD DISCOVERY LOGGING (MANDATORY)**: After every tool call that returns new information, append a concise 1-2 line summary of the key finding to your scratchpad using `<scratchpad_append>`. Old tool outputs are progressively compacted out of your history; the scratchpad is the only durable record of what you discovered.\n"
+                "6. **TURN CHRONICLE AWARENESS**: Your system prompt contains a TURN CHRONICLE listing every action already executed this turn. Consult it before calling any tool — never re-run an action with identical parameters.\n\n"
                 "### FEW-SHOT EXECUTION PATTERNS (MANDATORY DEMONSTRATIONS):\n"
                 "User: \"Execute the migration plan mapping.yaml\"\n"
                 "Assistant:\n"
@@ -5717,6 +5917,9 @@ JSON:"""
                 except Exception:
                     pass
 
+            if len(virtual_history) > _HISTORY_DECAY_MIN_LEN:
+                self._apply_graduated_history_decay(virtual_history)
+
             pre_gen_telemetry = self._calculate_context_telemetry(
                 stable_system_prompt, base_conversation,
                 self._build_workspace_context_block() if hasattr(self, '_build_workspace_context_block') else "",
@@ -5849,13 +6052,16 @@ JSON:"""
                 if not virtual_history or virtual_history[-1].sender_type == "assistant":
                     messages.append({"role": "user", "content": "[SYSTEM: Continue your task.]"})
 
-            context_adapter = _HistoryContextAdapter(self, stable_system_prompt)
+            chronicle_block = self._build_turn_chronicle_block(tool_calls_this_turn, tool_results_this_turn)
+            effective_system_prompt = stable_system_prompt + chronicle_block if chronicle_block else stable_system_prompt
+
+            context_adapter = _HistoryContextAdapter(self, effective_system_prompt)
             messages = HistoryManager.export(
                 context=context_adapter,
                 format_type="openai_chat",
                 branch=base_conversation,
                 virtual_history=virtual_history,
-                system_prompt_override=stable_system_prompt
+                system_prompt_override=effective_system_prompt
             )
 
             if getattr(self, 'debug_mode', False):
@@ -5986,7 +6192,7 @@ JSON:"""
                 gen_kwargs["reasoning_effort"] = active_reasoning_effort
                 gen_kwargs["think"] = active_think_flag
 
-            ASCIIColors.info(
+            ASCIIColors.debug(
                 f"[LollmsPersonality.chat] Round {round_count}: think={gen_kwargs.get('think')}, "
                 f"reasoning_effort={gen_kwargs.get('reasoning_effort')}"
             )
@@ -6170,7 +6376,7 @@ JSON:"""
                                 is_shell_tool = tool_name == "tool_execute_shell_command"
                                 file_name = ""
                                 if is_shell_tool:
-                                    command_str = str(tool_params.get("command", "")).strip()
+                                    command_str = self._normalize_shell_command(tool_params.get("command", ""))
                                     context_aware_sig = f"{tool_name}::{command_str}"
                                 else:
                                     normalized_params = dict(tool_params)
@@ -6262,6 +6468,15 @@ JSON:"""
                                         del failed_tool_signatures[context_aware_sig]
                                 else:
                                     failed_tool_signatures[context_aware_sig] = failed_tool_signatures.get(context_aware_sig, 0) + 1
+                                    if is_shell_tool:
+                                        err_lower = str(tool_res.get("error", "") if isinstance(tool_res, dict) else tool_res).lower()
+                                        if "not recognized" in err_lower or "no such file" in err_lower or "cannot find" in err_lower:
+                                            action_reports.append(
+                                                f"⚠️ SHELL SYNTAX CORRECTION: Your command '{tool_params.get('command', '')}' was rejected by the shell. "
+                                                f"The command string itself is malformed — it likely contains a hallucinated prompt prefix (e.g. a leading '$', '>' or 'PS>') "
+                                                f"or an invalid path separator. Re-emit the tool call with a CLEAN command: no '$' prefix, no prompt symbols, "
+                                                f"use forward slashes or escaped backslashes for paths."
+                                            )
                                     if self._failure_memory:
                                         try:
                                             if hasattr(self._failure_memory, "record_failure_by_signature"):
@@ -6819,7 +7034,21 @@ JSON:"""
 
             if ss.completed_actions:
                 raw_round_text = ss.get_clean_text()
-                virtual_history.append(SimpleNamespace(sender_type="assistant", content=raw_round_text))
+
+                last_real_text = self._last_real_assistant_text(virtual_history)
+                repeated_preamble = bool(
+                    raw_round_text.strip()
+                    and last_real_text
+                    and self._texts_are_repetitive(raw_round_text, last_real_text)
+                )
+                if repeated_preamble:
+                    ASCIIColors.warning(f"[{self.name}] Repetitive preamble on action round {round_count}; deduplicated from history.")
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="assistant",
+                        content="[Assistant repeated its previous preamble; actions were executed.]"
+                    ))
+                else:
+                    virtual_history.append(SimpleNamespace(sender_type="assistant", content=raw_round_text))
 
                 files_before = self._take_workspace_snapshot()
                 actions_executed_count = 0
@@ -6842,7 +7071,7 @@ JSON:"""
                             is_shell_tool = tool_name == "tool_execute_shell_command"
                             file_name = ""
                             if is_shell_tool:
-                                command_str = str(tool_params.get("command", "")).strip()
+                                command_str = self._normalize_shell_command(tool_params.get("command", ""))
                                 context_aware_sig = f"{tool_name}::{command_str}"
                             else:
                                 normalized_params = dict(tool_params)
@@ -6863,6 +7092,15 @@ JSON:"""
 
                             if context_aware_sig in successful_tool_signatures:
                                 action_reports.append(f"Repetitive call to '{tool_name}' with identical parameters blocked. Output already in context.")
+                                continue
+
+                            fail_count = failed_tool_signatures.get(context_aware_sig, 0)
+                            if fail_count >= 2:
+                                action_reports.append(
+                                    f"🛑 BLOCKED: Tool '{tool_name}' with identical parameters has already failed {fail_count} times in this turn. "
+                                    f"Execution was blocked to prevent an infinite loop. "
+                                    f"Do NOT call this tool again with the same parameters. Adapt your approach or inform the user."
+                                )
                                 continue
 
                             if file_name and tool_name in ("tool_read_document_content", "tool_inspect_document", "tool_grep_document"):
@@ -6933,6 +7171,17 @@ JSON:"""
 
                             clean_result_str = _sanitize_tool_result(tool_res, client=self.lollms_client)
                             actions_executed_count += 1
+
+                            if not tool_success and is_shell_tool:
+                                err_lower = str(tool_res.get("error", "") if isinstance(tool_res, dict) else tool_res).lower()
+                                if "not recognized" in err_lower or "no such file" in err_lower or "cannot find" in err_lower:
+                                    action_reports.append(
+                                        f"⚠️ SHELL SYNTAX CORRECTION: Your command '{tool_params.get('command', '')}' was rejected by the shell. "
+                                        f"The command string itself is malformed — it likely contains a hallucinated prompt prefix (e.g. a leading '$', '>' or 'PS>') "
+                                        f"or an invalid path separator. Re-emit the tool call with a CLEAN command: no '$' prefix, no prompt symbols, "
+                                        f"use forward slashes or escaped backslashes for paths. Example: "
+                                        f"<tool>{{\"name\": \"tool_execute_shell_command\", \"parameters\": {{\"command\": \"type backend/routers/discussion/rag.py\"}}}}</tool>"
+                                    )
 
                             if tool_success:
                                 successful_tool_signatures.add(context_aware_sig)
@@ -7378,6 +7627,12 @@ JSON:"""
 
                 if action_reports:
                     report_text = "\n\n".join(str(r) for r in action_reports) + "\n\nAnalyze these results and continue your task, or emit <done/> if finished."
+                    if repeated_preamble:
+                        report_text += (
+                            "\n\n[SYSTEM DIRECTIVE: PREAMBLE REPETITION DETECTED. Your introductory text is nearly identical to your previous round's statement. "
+                            "Do NOT re-announce your intent, repeat preambles, or apologize. "
+                            "Your next reply MUST start with the functional tag (`<tool>` or `<artifact>`) as the FIRST token, or be your final answer ending with `<done/>`.]"
+                        )
                     virtual_history.append(SimpleNamespace(sender_type="user", content=report_text))
                 elif not raw_round_text.strip():
                     virtual_history.append(SimpleNamespace(
@@ -7524,31 +7779,10 @@ JSON:"""
                 continue
 
             stripped_round_text = raw_round_text.strip()
-            if stripped_round_text and len(virtual_history) > 0:
-                last_assistant_text = None
-                for vh in reversed(virtual_history):
-                    if vh.sender_type == "assistant" and vh.content.strip():
-                        candidate = vh.content.strip()
-                        if not candidate.startswith("[Assistant executed batched actions]"):
-                            last_assistant_text = candidate
-                        break
-                if last_assistant_text:
-                    _last_clean = re.sub(r'<[^>]+>', '', last_assistant_text).strip()
-                    _current_clean = re.sub(r'<[^>]+>', '', stripped_round_text).strip()
-                    if _current_clean and _last_clean:
-                        if _current_clean == _last_clean:
-                            text_is_repetitive = True
-                        elif len(_current_clean) > 80 and _current_clean in _last_clean:
-                            text_is_repetitive = True
-                        elif len(_last_clean) > 80 and _last_clean in _current_clean:
-                            text_is_repetitive = True
-                        elif len(_current_clean) > 60:
-                            words_last = set(_last_clean.split())
-                            words_current = set(_current_clean.split())
-                            if len(words_last) > 0 and len(words_current) > 0:
-                                overlap = len(words_last & words_current) / max(len(words_last), len(words_current))
-                                if overlap > 0.85:
-                                    text_is_repetitive = True
+            if stripped_round_text:
+                last_assistant_text = self._last_real_assistant_text(virtual_history)
+                if last_assistant_text and self._texts_are_repetitive(stripped_round_text, last_assistant_text):
+                    text_is_repetitive = True
 
             if not text_is_repetitive and stripped_round_text:
                 lines_in_response = stripped_round_text.splitlines()

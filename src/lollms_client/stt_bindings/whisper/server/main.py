@@ -21,15 +21,17 @@ import torch
 from fastapi import FastAPI, APIRouter, HTTPException, Header
 from pydantic import BaseModel, Field
 from ascii_colors import ASCIIColors, trace_exception
-import pipmaster as pm
-# Ensure whisper is installed in the server environment
+_WHISPER_IMPORT_ERROR: Optional[BaseException] = None
 try:
-    pm.ensure_packages("whisper")    
     import whisper
-except ImportError:
-    ASCIIColors.error("openai-whisper is not installed in the server environment.")
-    import sys
-    sys.exit(-1)
+except Exception as _whisper_import_error:
+    whisper = None
+    _WHISPER_IMPORT_ERROR = _whisper_import_error
+    ASCIIColors.warning(
+        f"openai-whisper is not importable in this environment ({_whisper_import_error}). "
+        "The module stays importable for tests and tooling; transcription will fail at "
+        "model-load time until 'openai-whisper' is correctly installed."
+    )
 
 
 class TranscriptionRequest(BaseModel):
@@ -112,6 +114,12 @@ class ModelManager:
         self.worker_thread.join(timeout=5)
 
     def _load_whisper_model(self, model_name: str):
+        if whisper is None:
+            raise RuntimeError(
+                "openai-whisper is not available in this environment "
+                f"({_WHISPER_IMPORT_ERROR}). Install 'openai-whisper' in the server "
+                "virtual environment. Do NOT install the unrelated 'whisper' PyPI package."
+            )
         if self.model is not None and self.loaded_model_name == model_name:
             return
 
@@ -836,6 +844,17 @@ async def transcribe_diarize(
 app.include_router(router)
 
 if __name__ == "__main__":
+    if whisper is None:
+        try:
+            pm.ensure_packages("openai-whisper")
+            import whisper as _whisper_runtime
+            whisper = _whisper_runtime
+            ASCIIColors.success("openai-whisper installed and imported successfully.")
+        except Exception as _whisper_setup_error:
+            ASCIIColors.error(f"openai-whisper is required to run the Whisper server: {_whisper_setup_error}")
+            import sys
+            sys.exit(-1)
+
     import uvicorn
     parser = argparse.ArgumentParser(description="Whisper STT Shared Daemon Server")
     parser.add_argument("--host", type=str, default="127.0.0.1")

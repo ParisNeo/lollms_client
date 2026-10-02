@@ -221,6 +221,13 @@ def tool_find_files(pattern: str, path: str = ".", max_results: int = 50) -> Dic
         return {"success": False, "error": f"File search failed: {str(e)}"}
 
 
+def _normalize_search_mode(raw: str) -> str:
+    """Normalizes search mode strings: lowercases and replaces hyphens/spaces with underscores."""
+    if not raw:
+        return ""
+    return raw.strip().lower().replace("-", "_").replace(" ", "_")
+
+
 def _calculate_fuzzy_score(line: str, keywords: List[str]) -> float:
     """
     Calculates a Jaccard-like similarity score between the line and the keywords.
@@ -275,7 +282,7 @@ def tool_grep_files(
         results: List[Dict[str, Any]] = []
         files_scanned = 0
 
-        mode = search_mode.lower()
+        mode = _normalize_search_mode(search_mode)
         use_fuzzy_scoring = False
         regex = None
         keywords = []

@@ -1361,7 +1361,7 @@ class LollmsClient():
             kwargs["think"] = True
             kwargs["reasoning_effort"] = reasoning_effort
 
-        ASCIIColors.info(
+        ASCIIColors.debug(
             f"[LollmsClient.generate_from_messages] think={kwargs.get('think')} (input: {think_arg}), "
             f"reasoning_effort={kwargs.get('reasoning_effort')} (input: {effort_arg})"
         )

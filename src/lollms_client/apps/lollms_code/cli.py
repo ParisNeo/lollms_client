@@ -2065,7 +2065,9 @@ def display_result(result: dict[str, Any], config: CodeAgentConfig, elapsed: flo
         ["Total rounds", str(result.get('rounds', 0))],
         ["Tool calls", str(len(result.get('tool_calls', [])))],
         ["Was cancelled", str(result.get('was_cancelled', False))],
-        ["Elapsed time", f"{elapsed:.1f}s"]
+        ["Elapsed time", f"{elapsed:.1f}s"],
+        ["Temperature", str(config.temperature)],
+        ["Effort", 'Dynamic (auto)' if config.dynamic_effort else (config.reasoning_effort or 'default')]
     ]
 
     ctx_health = result.get("context_health")
@@ -2124,16 +2126,18 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
     renderer = StreamRenderer(config)
 
     steps_disp = "∞ (Infinite ⚠️)" if config.max_reasoning_steps <= 0 else str(config.max_reasoning_steps)
+    effort_disp = 'Dynamic (auto)' if config.dynamic_effort else (config.reasoning_effort or 'default')
     config_panel_content = (
         f"[cyan]Workspace:[/cyan] {config.workspace_path}\n"
         f"[cyan]Handbag:[/cyan]   {personality.name} ({Path(config.handbag_path).name})\n"
         f"[cyan]Model:[/cyan]      {config.active_model_name}\n"
         f"[cyan]Binding:[/cyan]    {config.active_binding_name}\n"
         f"[cyan]Max steps:[/cyan]  {steps_disp}\n"
+        f"[cyan]Temperature:[/cyan]{config.temperature}\n"
+        f"[cyan]Effort:[/cyan]     {effort_disp}\n"
         f"[cyan]Memory:[/cyan]     {'enabled' if config.enable_memory else 'disabled'}\n"
         f"[cyan]Skills:[/cyan]     {config.skills_mode}\n"
-        f"[cyan]Sub-agents:[/cyan] {'enabled' if config.enable_sub_agents else 'disabled'}\n"
-        f"[cyan]Effort:[/cyan]     {'Dynamic (auto)' if config.dynamic_effort else (config.reasoning_effort or 'default')}"
+        f"[cyan]Sub-agents:[/cyan] {'enabled' if config.enable_sub_agents else 'disabled'}"
     )
     ASCIIColors.panel(config_panel_content, title=f"[bold green]🚀 lollms_code v{APP_VERSION}[/bold green]", border_style="green")
     
@@ -2786,6 +2790,7 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
     active_alias = config.active_profile_alias
     active_model = getattr(getattr(client, "llm", None), "model_name", None) or config.active_model_name
     steps_banner = "∞ (Infinite ⚠️)" if config.max_reasoning_steps <= 0 else str(config.max_reasoning_steps)
+    effort_disp = 'Dynamic (auto)' if config.dynamic_effort else (config.reasoning_effort or 'default')
     header_lines = [
         f"[cyan]Workspace:[/cyan] {ws_path_display}",
         f"[cyan]Handbag:[/cyan]   {personality.name} [dim]({Path(config.handbag_path).name})[/dim]",
@@ -2793,7 +2798,8 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
         f"[cyan]Model:[/cyan]      {active_model}",
         f"[cyan]Binding:[/cyan]    {config.active_binding_name}",
         f"[cyan]Max Steps:[/cyan]  {steps_banner}",
-        f"[cyan]Effort:[/cyan]     {'Dynamic (auto)' if config.dynamic_effort else (config.reasoning_effort or 'default')}",
+        f"[cyan]Temperature:[/cyan]{config.temperature}",
+        f"[cyan]Effort:[/cyan]     {effort_disp}",
         f"[dim]Commands: 'exit', 'help', 'effort', 'config', 'shell', 'forget', 'skills', 'handbag', 'clear-history', 'clear-files', 'clear-scratchpad', 'workspace', 'files', 'load', 'unload', 'lock', 'hide'[/dim]"
     ]
 
@@ -3521,7 +3527,9 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
         ctx_str = ""
         if ctx_h and ctx_h.get("max_tokens", 0) > 0:
             ctx_str = f" | Ctx: {ctx_h.get('fill_percentage', 0.0):.1f}%"
-        ASCIIColors.rich_print(f"\n[dim]⏱️  {elapsed:.1f}s | Rounds: {result.get('rounds', 0)} | Tools: {len(result.get('tool_calls', []))}{ctx_str}[/dim]")
+        
+        effort_disp = 'Dynamic' if config.dynamic_effort else (config.reasoning_effort or 'default')
+        ASCIIColors.rich_print(f"\n[dim]⏱️  {elapsed:.1f}s | Rounds: {result.get('rounds', 0)} | Tools: {len(result.get('tool_calls', []))} | Temp: {config.temperature} | Effort: {effort_disp}{ctx_str}[/dim]")
 
 
 # ── HIERARCHICAL CONFIGURATION SYSTEM ─────────────────────────────────────────
