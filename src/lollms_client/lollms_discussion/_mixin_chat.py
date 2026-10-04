@@ -127,6 +127,17 @@ _SECONDARY_TAG_MAP = {
     "<hide_file":     ("context_hide",        MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</hide_file>"),
 }
 
+_NO_PROCESSING_BLOCK_TAGS = {
+    "unlock_file",
+    "lock_file",
+    "hide_file",
+    "agent",
+    "generate_image",
+    "edit_image",
+    "lollms_form",
+    "lollms_inline"
+}
+
 
 def _cb(callback: Optional[Callable], text: str, msg_type: MSG_TYPE, meta: Optional[Dict] = None) -> bool:
     if callback is None:
@@ -1705,7 +1716,7 @@ class _StreamState:
                         full_match_text
                     )
 
-                if self._secondary_tag_name not in ("unlock_file", "lock_file", "hide_file", "agent", "generate_image", "edit_image"):
+                if self._secondary_tag_name not in ("unlock_file", "lock_file", "hide_file", "agent", "generate_image", "edit_image", "lollms_form", "lollms_inline"):
                         if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
                             proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
                             self.ai_message.content += proc_close_tag
@@ -1768,7 +1779,7 @@ class _StreamState:
                             self._pending_buffer = ""
 
                             tag_name = self._secondary_tag_name
-                            if tag_name != "agent":
+                            if tag_name != "agent" and self._secondary_tag_name not in _NO_PROCESSING_BLOCK_TAGS:
                                 proc_type = self._secondary_tag_name
                                 title_val = attrs.get("title") or attrs.get("name") or self._secondary_tag_name.capitalize()
 
@@ -1847,7 +1858,7 @@ class _StreamState:
                         full_match_text
                     )
 
-                if self._secondary_tag_name not in ("agent", "generate_image", "edit_image"):
+                if self._processing_block_open:
                     if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
                         proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
                         self.ai_message.content += proc_close_tag
@@ -2873,6 +2884,26 @@ class _StreamState:
             }
             return True
 
+        # 8. Lollms Form Parsing and Injection
+        elif tag_name == "lollms_form":
+            if not self.enable_forms:
+                return True
+
+            form_descriptor = _parse_form_xml(attrs_str, body)
+            if form_descriptor:
+                form_id = form_descriptor.get("id")
+                if hasattr(self.discussion, '_get_pending_forms'):
+                    self.discussion._get_pending_forms()[form_id] = form_descriptor
+
+                _cb(self.callback, json.dumps(form_descriptor), MSG_TYPE.MSG_TYPE_FORM_READY, form_descriptor)
+
+            # Pass through the raw XML directly to the message content and UI
+            # so the frontend application can render the form natively.
+            self.ai_message.content += full_match_text
+            _cb(self.callback, full_match_text, MSG_TYPE.MSG_TYPE_CHUNK)
+            self._action_dispatched = True
+            return True
+
         return True
 
     def was_action_dispatched(self) -> bool:
@@ -3016,7 +3047,7 @@ class _StreamState:
             # Context visibility tags and image tags close their own
             # <processing> block with a status meta inside the dispatcher;
             # do not emit a duplicate close.
-            if self._secondary_tag_name not in ("unlock_file", "lock_file", "hide_file", "agent", "generate_image", "edit_image"):
+            if self._secondary_tag_name not in ("unlock_file", "lock_file", "hide_file", "agent", "generate_image", "edit_image", "lollms_form", "lollms_inline"):
                 if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
                     proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
                     self.ai_message.content += proc_close_tag
