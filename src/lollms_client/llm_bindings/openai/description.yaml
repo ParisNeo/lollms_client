@@ -1,28 +1,62 @@
 title: OpenAI
 author: ParisNeo
 creation_date: 2025-08-13
-last_update_date: 2026-07-01
+last_update_date: 2026-10-05
 description: >
-  A binding for the OpenAI Chat Completions and Completions APIs.
+  A binding for the OpenAI Chat Completions and Completions APIs, with two
+  authentication methods: an API key (default; billed per token) or
+  "Sign in with ChatGPT" OAuth (auth_method=oauth; usage is billed to your
+  ChatGPT plan, e.g. Plus, instead of API credits).
   The OpenAI API has become the de-facto industry standard for LLM
   inference, and this binding can be used against any service that
   exposes an OpenAI-compatible endpoint. This includes official OpenAI,
   local inference servers, and third-party cloud providers.
+  OAuth mode only targets the official OpenAI endpoint (Responses API) and is
+  a preview feature on OpenAI's side.
   For LoLLMS servers, it is strongly recommended to use the dedicated
   `lollms` binding instead, which exposes the full set of LoLLMS-native
   features (artefacts, discussions, personality loading, etc.) beyond
   the common OpenAI subset.
 global_input_parameters:
+  - name: auth_method
+    type: str
+    description: "How to authenticate. 'api_key' (default): use service_key / OPENAI_API_KEY (or no key for local servers). 'oauth': Sign in with ChatGPT, using your ChatGPT plan instead of API credits; requires a one-time sign-in (call the binding's oauth_login(), or set oauth_auto_login=true). 'auto': api_key if a key or host_address is configured, otherwise oauth if you are already signed in."
+    mandatory: false
+    default: "api_key"
+    options:
+      - api_key
+      - oauth
+      - auto
   - name: service_key
     type: str
-    description: "The API key for the target service. Can also be set via the OPENAI_API_KEY environment variable for official OpenAI. Leave empty for local servers that do not require authentication."
+    description: "The API key for the target service. Can also be set via the OPENAI_API_KEY environment variable for official OpenAI. Leave empty for local servers that do not require authentication, and when auth_method is 'oauth' (in oauth mode a key is only used for embeddings, which the ChatGPT plan does not cover)."
     mandatory: false
     default: ""
   - name: host_address
     type: str
-    description: "The base URL of the OpenAI-compatible endpoint. Leave empty/None to use the official OpenAI endpoint. Set to a custom URL (e.g. http://localhost:1234/v1) for third-party or local backends."
+    description: "The base URL of the OpenAI-compatible endpoint. Leave empty/None to use the official OpenAI endpoint. Set to a custom URL (e.g. http://localhost:1234/v1) for third-party or local backends. Ignored when auth_method is 'oauth' (use oauth_api_base instead)."
     mandatory: false
     default: ""
+  - name: oauth_credentials_path
+    type: str
+    description: "Only relevant when auth_method is 'oauth' or 'auto'. File where the OAuth tokens are stored (owner-only permissions, never logged). Leave empty for ~/.lollms/openai_chatgpt_oauth.json (or $LOLLMS_HOME/openai_chatgpt_oauth.json). Use one file per ChatGPT account."
+    mandatory: false
+    default: ""
+  - name: oauth_agent_name
+    type: str
+    description: "Only relevant when auth_method is 'oauth'. Application name shown on OpenAI's consent screen at first sign-in (you can still edit it there)."
+    mandatory: false
+    default: "LoLLMS"
+  - name: oauth_auto_login
+    type: bool
+    description: "Only relevant when auth_method is 'oauth'. If true, a browser sign-in is started automatically the first time a generation is requested while not signed in. Leave false for servers and headless machines, and call oauth_login(manual=True) once instead."
+    mandatory: false
+    default: false
+  - name: oauth_api_base
+    type: str
+    description: "Only relevant when auth_method is 'oauth'. Base URL of the Responses API used with the OAuth token. Keep the default unless you route through a proxy."
+    mandatory: false
+    default: "https://api.openai.com/v1"
   - name: is_vllm
     type: bool
     description: "If true, the server is a vLLM instance. Enables vLLM-specific chat_template_kwargs (e.g. enable_thinking) so reasoning/thinking models like Qwen3 are handled correctly."
@@ -53,7 +87,7 @@ global_input_parameters:
     default: null
   - name: default_completion_format
     type: str
-    description: "The default completion format to use. 'Chat' for chat.completions endpoint, 'Completion' for the legacy completions endpoint."
+    description: "The default completion format to use. 'Chat' for chat.completions endpoint, 'Completion' for the legacy completions endpoint. Not used in oauth mode (always Responses API)."
     mandatory: false
     default: "Chat"
   - name: glm_image_embedding
@@ -63,7 +97,7 @@ global_input_parameters:
     default: false
   - name: video_enabled
     type: bool
-    description: "Enable video input comprehension for multimodal video models (e.g. Qwen2.5-VL, GLM-5.3-Flash)."
+    description: "Enable video input comprehension for multimodal video models (e.g. Qwen2.5-VL, GLM-5.3-Flash). Video is not supported in oauth mode."
     mandatory: false
     default: false
   - name: supported_reasoning_efforts
@@ -74,7 +108,7 @@ global_input_parameters:
 model_input_parameters:
   - name: model_name
     type: str
-    description: "The name of the model to use, as exposed by the target service (e.g. 'gpt-4o' on OpenAI, 'llama-3.1-8b-instruct' on a local server, 'Qwen/Qwen3-32B' on vLLM)."
+    description: "The name of the model to use, as exposed by the target service (e.g. 'gpt-4o' on OpenAI, 'llama-3.1-8b-instruct' on a local server, 'Qwen/Qwen3-32B' on vLLM). In oauth mode, pick a model your ChatGPT account is eligible for: list_models() returns the catalog of the signed-in account."
     mandatory: true
     default: "gpt-4o"
   - name: glm_image_embedding
@@ -101,7 +135,7 @@ compatible_backends:
   official:
     - name: OpenAI
       url: https://platform.openai.com/
-      note: "Official OpenAI service. Supports GPT-4o, GPT-4.1, o-series reasoning models, and embeddings."
+      note: "Official OpenAI service. Supports GPT-4o, GPT-4.1, o-series reasoning models, and embeddings with an API key. With auth_method=oauth it uses your ChatGPT plan through OpenAI's 'Sign in with ChatGPT' flow (https://developers.openai.com/siwc/token-sharing-open-source)."
   local_servers:
     - name: vLLM
       url: https://github.com/vllm-project/vllm
@@ -170,3 +204,6 @@ advisory:
   - "Set is_vllm=true when connecting to a vLLM server so reasoning/thinking models (e.g. Qwen3) are handled correctly via chat_template_kwargs."
   - "If a vLLM-served model (e.g. GLM 5.3) hallucinates or produces garbled output, its chat template likely does not support enable_thinking. Set send_thinking_parameter=false to stop sending it entirely."
   - "Self-hosted servers with self-signed certificates require verify_ssl_certificate=false or a custom certificate_file_path."
+  - "OAuth mode (auth_method=oauth) first-time setup: call `binding.oauth_login()` once (opens your browser; use `oauth_login(manual=True)` on a headless machine and paste back the final 127.0.0.1 URL). Tokens are stored in oauth_credentials_path and refreshed automatically. `oauth_status()` shows the signed-in account, `oauth_logout()` deletes the local tokens (revoke the app in ChatGPT settings to cut access on OpenAI's side)."
+  - "OAuth mode limits: usage counts against your ChatGPT plan limits (see ChatGPT settings, Usage), not API credits. Sampling parameters (temperature, top_p, seed, penalties) and tools are not sent, video input and embeddings are unavailable, and only models eligible for your account work. Your ChatGPT account or workspace must allow plan usage; if the sign-in succeeds but generation returns a 'not eligible' error, that is the cause."
+  - "OAuth mode is built on OpenAI's open-source 'Sign in with ChatGPT' preview (https://developers.openai.com/siwc/token-sharing-open-source). Behaviour and eligible models may change on OpenAI's side."

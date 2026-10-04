@@ -2,11 +2,23 @@
 from __future__ import annotations
 
 import base64
+import contextlib
+import datetime
+import hashlib
+import http.server
+import json
 import math
 import mimetypes
 import os
 import re
+import secrets
 import ssl
+import sys
+import threading
+import time
+import urllib.parse
+import uuid
+import webbrowser
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -326,6 +338,657 @@ class _StreamThinkingHandler:
         return self.output
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  ChatGPT-plan OAuth  ("Sign in with ChatGPT", OpenAI's open-source
+#  token-sharing flow)
+#
+#  Official docs: https://developers.openai.com/siwc/token-sharing-open-source
+#
+#  - Authorization-code + PKCE against auth.openai.com, public client,
+#    no client secret and no partner key (dynamic client registration).
+#  - The resulting OAuth access token is used as the Bearer credential on
+#    the PUBLIC endpoint https://api.openai.com/v1/responses, billed to the
+#    user's ChatGPT plan instead of API credits.
+#  - Requirements imposed by that flow on every inference request:
+#    store=false, stream=true, no `system` role items (use `instructions`).
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class OAuthError(RuntimeError):
+    """OAuth failure (network, protocol or configuration)."""
+
+    def __init__(self, message: str, code: Optional[str] = None, status: Optional[int] = None):
+        super().__init__(message)
+        self.code = code
+        self.status = status
+
+
+class OAuthReauthRequired(OAuthError):
+    """The stored session is unusable: the user must sign in again."""
+
+
+@contextlib.contextmanager
+def _interprocess_lock(path: Path):
+    """
+    Best-effort cross-process lock around a credentials file. Refresh tokens
+    rotate, so two processes refreshing at once would invalidate each other.
+    """
+    lock_path = path.with_name(path.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, "a+")
+    try:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            pass  # degrade to in-process locking only
+        yield
+    finally:
+        fh.close()  # closing releases the lock on both platforms
+
+
+class _OAuthCallbackServer(http.server.HTTPServer):
+    callback_params: Optional[Dict[str, str]] = None
+
+
+class _OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):  # noqa: N802
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != ChatGPTOAuth.CALLBACK_PATH:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.server.callback_params = {
+            k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()
+        }
+        # Static page on purpose: never reflect callback parameters into HTML.
+        body = (
+            "<html><body style='font-family:sans-serif'>"
+            "<h3>LoLLMS</h3><p>Sign-in finished. You can close this tab and return to the application.</p>"
+            "</body></html>"
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):  # silence default stderr logging
+        pass
+
+
+class ChatGPTOAuth:
+    """
+    Credential manager for OpenAI's "Sign in with ChatGPT" plan-usage flow.
+
+    Handles first sign-in (browser + loopback callback + PKCE + dynamic client
+    registration), ID-token validation, protected local storage, and rotating
+    refresh. Tokens are never logged.
+    """
+
+    ISSUER = "https://auth.openai.com"
+    RESOURCE = "https://api.openai.com/v1"
+    DYNAMIC_CLIENT_ID = "dynamic_agent_client"
+    PLAN_SCOPE = "chatgpt.tokens.use.direct"
+    SCOPES = "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct"
+    CALLBACK_PATH = "/auth/callback"
+    DEFAULT_PORT = 1455
+    REFRESH_MARGIN_S = 300
+    TERMINAL_REFRESH_ERRORS = frozenset(
+        {
+            "invalid_grant",
+            "invalid_refresh_token",
+            "token_expired",
+            "refresh_token_expired",
+            "refresh_token_invalidated",
+            "refresh_token_reused",
+            "invalid_client",
+        }
+    )
+
+    def __init__(
+        self,
+        credentials_path: Optional[Union[str, Path]] = None,
+        agent_name: str = "LoLLMS",
+        verify: Any = True,
+        timeout: float = 30.0,
+    ):
+        self.path = Path(credentials_path).expanduser() if credentials_path else self.default_path()
+        self.agent_name = agent_name
+        self.verify = verify
+        self.timeout = timeout
+        self.issuer = self.ISSUER
+        self.authorize_url = f"{self.issuer}/api/accounts/authorize"
+        self.token_url = f"{self.issuer}/api/accounts/oauth/token"
+        self.jwks_url = f"{self.issuer}/.well-known/jwks.json"
+        self._lock = threading.RLock()
+
+    # ── storage ────────────────────────────────────────────────────────────
+    @staticmethod
+    def default_path() -> Path:
+        home = os.environ.get("LOLLMS_HOME")
+        base = Path(home).expanduser() if home else Path.home() / ".lollms"
+        return base / "openai_chatgpt_oauth.json"
+
+    def _read(self) -> Dict[str, Any]:
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _write(self, record: Dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2)
+        os.replace(tmp, self.path)
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
+
+    def status(self) -> Dict[str, Any]:
+        rec = self._read()
+        scopes = rec.get("scopes") or []
+        return {
+            "signed_in": bool(rec.get("access_token") and rec.get("refresh_token")),
+            "email": rec.get("email"),
+            "client_id": rec.get("client_id"),
+            "scopes": scopes,
+            "plan_usage_enabled": self.PLAN_SCOPE in scopes,
+            "expires_at": rec.get("expires_at"),
+            "credentials_path": str(self.path),
+        }
+
+    def is_signed_in(self) -> bool:
+        return self.status()["signed_in"]
+
+    def logout(self) -> None:
+        """
+        Delete the local credentials. This does NOT revoke the grant on
+        OpenAI's side: remove the app in ChatGPT settings to do that.
+        """
+        with self._lock, _interprocess_lock(self.path):
+            with contextlib.suppress(FileNotFoundError):
+                self.path.unlink()
+
+    def _ensure_host_id(self) -> str:
+        with _interprocess_lock(self.path):
+            rec = self._read()
+            if not rec.get("ext_agent_host_id"):
+                rec["ext_agent_host_id"] = f"urn:uuid:{uuid.uuid4()}"
+                self._write(rec)
+            return rec["ext_agent_host_id"]
+
+    # ── token endpoint ─────────────────────────────────────────────────────
+    @staticmethod
+    def _error_code(body: Any) -> Optional[str]:
+        if not isinstance(body, dict):
+            return None
+        err = body.get("error")
+        if isinstance(err, dict):
+            return err.get("code") or err.get("type")
+        if isinstance(err, str):
+            return err
+        return body.get("code")
+
+    def _token_request(self, data: Dict[str, str]) -> Dict[str, Any]:
+        try:
+            r = httpx.post(
+                self.token_url,
+                data=data,
+                headers={"Accept": "application/json"},
+                timeout=self.timeout,
+                verify=self.verify,
+            )
+        except httpx.HTTPError as e:
+            raise OAuthError(f"Network error contacting the OpenAI token endpoint: {e}") from e
+        try:
+            body = r.json()
+        except ValueError:
+            body = {}
+        if r.status_code != 200:
+            code = self._error_code(body)
+            rid = r.headers.get("openai-request-id")
+            raise OAuthError(
+                f"Token endpoint returned HTTP {r.status_code}"
+                + (f" ({code})" if code else "")
+                + (f" [request {rid}]" if rid else ""),
+                code=code,
+                status=r.status_code,
+            )
+        if not isinstance(body, dict) or not body.get("access_token"):
+            raise OAuthError("Token endpoint response did not contain an access_token")
+        return body
+
+    @staticmethod
+    def _parse_time(value: Any) -> Optional[float]:
+        """earliest_refresh_at may come as epoch seconds/ms or ISO-8601."""
+        if value in (None, ""):
+            return None
+        try:
+            num = float(value)
+            return num / 1000.0 if num > 1e12 else num
+        except (TypeError, ValueError):
+            pass
+        try:
+            return datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+
+    def _record_from_token_response(self, tok: Dict[str, Any], base: Dict[str, Any]) -> Dict[str, Any]:
+        now = time.time()
+        rec = dict(base)
+        rec["access_token"] = tok["access_token"]
+        if tok.get("refresh_token"):
+            rec["refresh_token"] = tok["refresh_token"]
+        if tok.get("id_token"):
+            rec["id_token"] = tok["id_token"]
+        rec["token_type"] = tok.get("token_type", "Bearer")
+        expires_in = int(tok.get("expires_in") or 3600)
+        rec["expires_in"] = expires_in
+        rec["saved_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        rec["expires_at"] = now + expires_in
+        rec["earliest_refresh_at"] = self._parse_time(tok.get("earliest_refresh_at"))
+        if tok.get("scope"):
+            rec["scopes"] = sorted(str(tok["scope"]).split())
+        return rec
+
+    # ── id-token validation ────────────────────────────────────────────────
+    def _validate_id_token(self, id_token: str, client_id: str, nonce: str) -> Dict[str, Any]:
+        try:
+            import jwt  # PyJWT
+        except ImportError:
+            pm.ensure_packages(["PyJWT", "cryptography"])
+            import jwt
+        try:
+            signing_key = jwt.PyJWKClient(self.jwks_url).get_signing_key_from_jwt(id_token)
+            claims = jwt.decode(
+                id_token,
+                signing_key.key,
+                algorithms=["RS256", "RS384", "RS512", "ES256", "PS256"],
+                audience=client_id,
+                issuer=self.issuer,
+                options={"require": ["exp", "iss", "aud", "sub"]},
+            )
+        except Exception as e:
+            raise OAuthError(f"ID token validation failed: {e}") from e
+        if not secrets.compare_digest(str(claims.get("nonce", "")), nonce):
+            raise OAuthError("ID token validation failed: nonce mismatch")
+        return claims
+
+    # ── sign-in ────────────────────────────────────────────────────────────
+    def _start_callback_server(self, port: Optional[int]) -> _OAuthCallbackServer:
+        for p in ([port] if port else [self.DEFAULT_PORT, 0]):
+            try:
+                srv = _OAuthCallbackServer(("127.0.0.1", p), _OAuthCallbackHandler)
+                srv.timeout = 1.0
+                return srv
+            except OSError:
+                continue
+        raise OAuthError("Could not open a loopback port for the OAuth callback")
+
+    @staticmethod
+    def _params_from_pasted(text: str) -> Dict[str, str]:
+        text = text.strip()
+        query = urllib.parse.urlparse(text).query if "?" in text or "://" in text else text
+        return {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
+
+    def login(
+        self,
+        open_browser: bool = True,
+        manual: bool = False,
+        timeout: float = 300.0,
+        port: Optional[int] = None,
+        fresh: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Interactive sign-in.
+
+        open_browser: open the system browser automatically.
+        manual: headless mode. Prints the URL and asks you to paste the final
+                redirect URL (the 127.0.0.1 page that fails to load) back.
+        fresh: ignore the saved registration and sign in as a new account.
+        """
+        with self._lock:
+            host_id = self._ensure_host_id()
+            saved = {} if fresh else self._read()
+            issued_client_id = saved.get("client_id")
+
+            verifier = secrets.token_urlsafe(64)
+            challenge = (
+                base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
+                .rstrip(b"=")
+                .decode("ascii")
+            )
+            state = secrets.token_urlsafe(32)
+            nonce = secrets.token_urlsafe(32)
+
+            server = None if manual else self._start_callback_server(port)
+            bound_port = server.server_address[1] if server else (port or self.DEFAULT_PORT)
+            redirect_uri = f"http://127.0.0.1:{bound_port}{self.CALLBACK_PATH}"
+
+            params: Dict[str, str] = {
+                "response_type": "code",
+                "client_id": issued_client_id or self.DYNAMIC_CLIENT_ID,
+                "redirect_uri": redirect_uri,
+                "scope": self.SCOPES,
+                "resource": self.RESOURCE,
+                "state": state,
+                "nonce": nonce,
+                "code_challenge_method": "S256",
+                "code_challenge": challenge,
+                "ext_agent_host_id": host_id,
+            }
+            if not issued_client_id:
+                params["agent_name_hint"] = self.agent_name  # first registration only
+            else:
+                if saved.get("email"):
+                    params["login_hint"] = saved["email"]
+
+            def _url(with_id_token_hint: bool) -> str:
+                p = dict(params)
+                if with_id_token_hint and issued_client_id and saved.get("id_token"):
+                    p["id_token_hint"] = saved["id_token"]
+                return f"{self.authorize_url}?{urllib.parse.urlencode(p, quote_via=urllib.parse.quote)}"
+
+            try:
+                cb: Optional[Dict[str, str]] = None
+                if manual:
+                    print("\nOpen this URL in a browser and approve access:\n")
+                    print(_url(False))  # never print id_token_hint
+                    print(
+                        "\nThe browser will end on a 127.0.0.1 page that fails to load. "
+                        "Copy that page's full URL and paste it below."
+                    )
+                    cb = self._params_from_pasted(input("Redirect URL: "))
+                else:
+                    opened = False
+                    if open_browser:
+                        with contextlib.suppress(Exception):
+                            opened = bool(webbrowser.open(_url(True)))
+                    if not opened:
+                        ASCIIColors.info("Open this URL in your browser to sign in with ChatGPT:")
+                        print(_url(False))
+                    deadline = time.time() + timeout
+                    while server.callback_params is None and time.time() < deadline:
+                        server.handle_request()
+                    cb = server.callback_params
+                    if cb is None:
+                        raise OAuthError(f"Timed out after {int(timeout)}s waiting for the sign-in callback")
+            finally:
+                if server is not None:
+                    server.server_close()
+
+            # ---- callback handling -----------------------------------------
+            if cb.get("error"):
+                if cb["error"] == "access_denied":
+                    raise OAuthError(
+                        "Access denied: ChatGPT plan usage was not authorised. "
+                        "Run the sign-in again and approve token sharing.",
+                        code="access_denied",
+                    )
+                raise OAuthError(f"Authorization failed: {cb['error']}", code=cb["error"])
+            if not secrets.compare_digest(cb.get("state", ""), state):
+                raise OAuthError("State mismatch in the sign-in callback; aborting")
+            code = cb.get("code")
+            if not code:
+                raise OAuthError("The sign-in callback did not contain an authorization code")
+
+            cb_client_id = cb.get("client_id")
+            if issued_client_id:
+                if cb_client_id and cb_client_id != issued_client_id:
+                    raise OAuthError("The callback returned a different client_id than the saved registration")
+                client_id = issued_client_id
+            else:
+                if not cb_client_id or cb_client_id == self.DYNAMIC_CLIENT_ID:
+                    raise OAuthError("Registration incomplete: the callback did not include an issued client_id")
+                client_id = cb_client_id
+
+            tok = self._token_request(
+                {
+                    "grant_type": "authorization_code",
+                    "client_id": client_id,
+                    "code": code,
+                    "code_verifier": verifier,
+                    "redirect_uri": redirect_uri,
+                    "resource": self.RESOURCE,
+                }
+            )
+            if not tok.get("id_token"):
+                raise OAuthError("The token response did not contain an ID token")
+            claims = self._validate_id_token(tok["id_token"], client_id, nonce)
+
+            if issued_client_id and saved.get("subject") and saved["subject"] != claims.get("sub"):
+                raise OAuthError("Signed in as a different ChatGPT account than the saved one; use fresh=True")
+            if not tok.get("refresh_token"):
+                raise OAuthError("No refresh_token was returned (offline_access not granted); cannot keep a session")
+
+            base = {
+                "issuer": self.issuer,
+                "subject": claims.get("sub"),
+                "email": claims.get("email"),
+                "client_id": client_id,
+                "ext_agent_host_id": host_id,
+            }
+            with _interprocess_lock(self.path):
+                rec = self._record_from_token_response(tok, base)
+                self._write(rec)
+
+            if self.PLAN_SCOPE not in rec.get("scopes", []):
+                raise OAuthError(
+                    "Signed in, but ChatGPT plan usage was not granted "
+                    f"(missing scope {self.PLAN_SCOPE}). Your plan/workspace may not allow it, "
+                    "or the consent was not approved.",
+                    code="plan_usage_not_granted",
+                )
+            return self.status()
+
+    # ── token access / refresh ─────────────────────────────────────────────
+    def _require_usable(self, rec: Dict[str, Any]) -> None:
+        if not (rec.get("access_token") and rec.get("refresh_token") and rec.get("client_id")):
+            raise OAuthReauthRequired(
+                "Not signed in with ChatGPT. Call oauth_login() (or set oauth_auto_login=True)."
+            )
+        if self.PLAN_SCOPE not in (rec.get("scopes") or []):
+            raise OAuthReauthRequired(
+                "This sign-in does not include ChatGPT plan usage. Run oauth_login() and approve token sharing."
+            )
+
+    def _needs_refresh(self, rec: Dict[str, Any], now: Optional[float] = None) -> bool:
+        now = time.time() if now is None else now
+        exp = rec.get("expires_at")
+        if exp is None:
+            return True
+        if now < exp - self.REFRESH_MARGIN_S:
+            return False
+        earliest = rec.get("earliest_refresh_at")
+        if earliest and now < earliest and now < exp:
+            return False  # server asked us not to refresh yet and the token is still valid
+        return True
+
+    def _do_refresh(self, rec: Dict[str, Any]) -> Dict[str, Any]:
+        last: Optional[OAuthError] = None
+        for attempt in range(3):
+            try:
+                tok = self._token_request(
+                    {
+                        "grant_type": "refresh_token",
+                        "client_id": rec["client_id"],
+                        "refresh_token": rec["refresh_token"],
+                        "resource": self.RESOURCE,
+                    }
+                )
+                return self._record_from_token_response(tok, rec)
+            except OAuthError as e:
+                transient = e.status is None or e.status >= 500 or e.status == 429
+                if transient:
+                    last = e
+                    time.sleep(2**attempt)
+                    continue
+                if e.code in self.TERMINAL_REFRESH_ERRORS or e.status in (400, 401, 403):
+                    dead = {
+                        k: v
+                        for k, v in rec.items()
+                        if k not in ("access_token", "refresh_token", "expires_at", "earliest_refresh_at")
+                    }
+                    self._write(dead)  # keep identity + id_token for a hinted re-login
+                    raise OAuthReauthRequired(
+                        f"The ChatGPT session can no longer be refreshed ({e.code or e.status}). "
+                        "Sign in again with oauth_login().",
+                        code=e.code,
+                        status=e.status,
+                    ) from e
+                raise
+        raise last  # type: ignore[misc]
+
+    def _refresh_locked(self, stale_access_token: Optional[str] = None) -> Dict[str, Any]:
+        with _interprocess_lock(self.path):
+            rec = self._read()  # another process may have refreshed meanwhile
+            self._require_usable(rec)
+            if stale_access_token is not None:
+                if rec["access_token"] != stale_access_token and not self._needs_refresh(rec):
+                    return rec
+            elif not self._needs_refresh(rec):
+                return rec
+            new = self._do_refresh(rec)
+            self._write(new)
+            return new
+
+    def get_access_token(self) -> str:
+        with self._lock:
+            rec = self._read()
+            self._require_usable(rec)
+            if self._needs_refresh(rec):
+                rec = self._refresh_locked()
+            return rec["access_token"]
+
+    def force_refresh(self, stale_access_token: Optional[str] = None) -> str:
+        """Refresh after a 401. Reuses a newer token if another process already refreshed."""
+        with self._lock:
+            return self._refresh_locked(stale_access_token=stale_access_token or "")["access_token"]
+
+
+# ── Chat-format → Responses-format translation ─────────────────────────────
+_THINK_BLOCK_RE = re.compile(r"<(think|thinking)>[\s\S]*?</\1>", re.IGNORECASE)
+
+
+def _content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(p.get("text", "")) for p in content if isinstance(p, dict) and p.get("type") in ("text", "input_text")
+        )
+    return "" if content is None else str(content)
+
+
+def chat_messages_to_responses_input(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Convert Chat-Completions-style messages to (instructions, input items).
+
+    The ChatGPT-plan flow rejects explicit `system` items, so system/developer
+    messages are folded into `instructions`. Assistant history has its
+    <think> blocks stripped before being replayed.
+    """
+    instructions_parts: List[str] = []
+    items: List[Dict[str, Any]] = []
+
+    for m in messages:
+        role = str(m.get("role") or "user").lower()
+        content = m.get("content", "")
+
+        if role in ("system", "developer"):
+            text = _content_to_text(content).strip()
+            if text:
+                instructions_parts.append(text)
+            continue
+
+        if role == "assistant":
+            text = _THINK_BLOCK_RE.sub("", _content_to_text(content)).strip()
+            if text:
+                items.append({"role": "assistant", "content": text})
+            continue
+
+        # user / anything else
+        if isinstance(content, str) or content is None:
+            text = (content or "").strip()
+            if text:
+                items.append({"role": "user", "content": text})
+            continue
+
+        parts: List[Dict[str, Any]] = []
+        for p in content:
+            if not isinstance(p, dict):
+                continue
+            ptype = p.get("type")
+            if ptype in ("text", "input_text"):
+                if p.get("text"):
+                    parts.append({"type": "input_text", "text": p["text"]})
+            elif ptype in ("image_url", "input_image"):
+                url = p.get("image_url")
+                if isinstance(url, dict):
+                    url = url.get("url")
+                if isinstance(url, str) and url:
+                    parts.append({"type": "input_image", "image_url": url})
+            elif ptype in ("video_url", "video", "input_video"):
+                ASCIIColors.warning("[OpenAIBinding] Video input is not supported with ChatGPT OAuth; dropped.")
+        if parts:
+            items.append({"role": "user", "content": parts})
+
+    if not items:
+        items.append({"role": "user", "content": " "})
+
+    instructions = "\n\n".join(instructions_parts).strip() or "You are a helpful assistant."
+    return instructions, items
+
+
+_OAUTH_ERROR_HINTS = {
+    "subscription_sharing_usage_limit_exceeded": (
+        "ChatGPT plan usage limit reached. Check ChatGPT settings → Usage and retry later."
+    ),
+    "subscription_sharing_usage_unavailable": (
+        "ChatGPT plan usage is currently unavailable. Check ChatGPT settings → Usage."
+    ),
+    "subscription_sharing_user_not_eligible": (
+        "ChatGPT plan usage is not available for this user, workspace or policy."
+    ),
+}
+
+
+def _describe_api_error(ex: Exception) -> str:
+    code = None
+    msg = str(ex)
+    body = getattr(ex, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error", body)
+        if isinstance(err, dict):
+            code = err.get("code") or err.get("type")
+            msg = err.get("message") or msg
+        elif isinstance(err, str):
+            msg = err
+        if isinstance(body.get("detail"), str):
+            msg = body["detail"]
+    out = msg + (f" [{code}]" if code else "")
+    hint = _OAUTH_ERROR_HINTS.get(str(code))
+    rid = getattr(ex, "request_id", None)
+    if hint:
+        out += f" — {hint}"
+    if rid:
+        out += f" (request {rid})"
+    return out
+
+
 class OpenAIBinding(LollmsLLMBinding):
     """OpenAI-specific binding implementation"""
 
@@ -342,6 +1005,12 @@ class OpenAIBinding(LollmsLLMBinding):
             service_key (str): Authentication key for the service. Defaults to None.
             verify_ssl_certificate (bool): Whether to verify SSL certificates. Defaults to True.
             personality (Optional[int]): Ignored parameter for compatibility with LollmsLLMBinding.
+            auth_method (str): "api_key" (default), "oauth" (Sign in with ChatGPT, billed to the
+                ChatGPT plan) or "auto" (api_key if a key/host is configured, else oauth if signed in).
+            oauth_credentials_path (str): Where OAuth tokens are stored (default ~/.lollms/openai_chatgpt_oauth.json).
+            oauth_agent_name (str): App name shown on the consent screen. Defaults to "LoLLMS".
+            oauth_auto_login (bool): Start the browser sign-in automatically when not signed in.
+            oauth_api_base (str): Responses endpoint used in oauth mode. Defaults to https://api.openai.com/v1.
         """
         super().__init__(BindingName, **kwargs)
 
@@ -391,6 +1060,8 @@ class OpenAIBinding(LollmsLLMBinding):
         else:
             self.open_ai_host_address = None
 
+        explicit_key = self.service_key or os.getenv("OPENAI_API_KEY")
+
         if not self.service_key:
             self.service_key = os.getenv("OPENAI_API_KEY", self.service_key) or "EMPTY"
 
@@ -411,15 +1082,263 @@ class OpenAIBinding(LollmsLLMBinding):
             self.verify = cert_path
             verify = ssl_context
 
-        self.client = openai.OpenAI(
-            api_key=self.service_key or "EMPTY",
-            base_url=self.open_ai_host_address,
-            http_client=httpx.Client(
-                verify=verify,
-                timeout=300.0,
-            ),
+        self._httpx_verify = verify
+
+        # ── authentication method: API key (default) or ChatGPT-plan OAuth ──
+        self._oauth = ChatGPTOAuth(
+            credentials_path=kwargs.get("oauth_credentials_path") or None,
+            agent_name=kwargs.get("oauth_agent_name") or "LoLLMS",
+            verify=verify,
         )
+        raw_auto_login = kwargs.get("oauth_auto_login", False)
+        if isinstance(raw_auto_login, str):
+            self.oauth_auto_login = raw_auto_login.lower().strip() in ("true", "1", "yes", "on")
+        else:
+            self.oauth_auto_login = bool(raw_auto_login)
+        self.oauth_api_base = (kwargs.get("oauth_api_base") or ChatGPTOAuth.RESOURCE).rstrip("/")
+        self._oauth_client_cache: Optional[Tuple[str, openai.OpenAI]] = None
+        self._oauth_warned = False
+
+        raw_method = str(kwargs.get("auth_method") or "api_key").lower().strip()
+        if raw_method in ("oauth", "chatgpt", "chatgpt_oauth", "siwc"):
+            self.auth_method = "oauth"
+        elif raw_method in ("api_key", "apikey", "key"):
+            self.auth_method = "api_key"
+        elif raw_method == "auto":
+            if explicit_key or self.host_address:
+                self.auth_method = "api_key"
+            elif self._oauth.is_signed_in():
+                self.auth_method = "oauth"
+            else:
+                self.auth_method = "api_key"
+        else:
+            raise ValueError(f"Unknown auth_method '{raw_method}'. Use 'api_key', 'oauth' or 'auto'.")
+
+        if self.auth_method == "oauth" and self.host_address:
+            ASCIIColors.warning(
+                "[OpenAIBinding] host_address is ignored in oauth mode (inference goes to "
+                f"{self.oauth_api_base}). Use oauth_api_base to override."
+            )
+
+        if self.auth_method == "oauth" and not explicit_key:
+            # No API key available: embeddings etc. are unavailable, inference uses OAuth.
+            self.client = None
+        else:
+            self.client = openai.OpenAI(
+                api_key=self.service_key or "EMPTY",
+                base_url=self.open_ai_host_address,
+                http_client=httpx.Client(
+                    verify=verify,
+                    timeout=300.0,
+                ),
+            )
         self.completion_format = ELF_COMPLETION_FORMAT.Chat
+
+    # ── OAuth public helpers ───────────────────────────────────────────────
+    def oauth_login(
+        self,
+        open_browser: bool = True,
+        manual: bool = False,
+        timeout: float = 300.0,
+        fresh: bool = False,
+    ) -> dict:
+        """Sign in with ChatGPT (browser + loopback). Use manual=True on headless machines."""
+        return self._oauth.login(open_browser=open_browser, manual=manual, timeout=timeout, fresh=fresh)
+
+    def oauth_status(self) -> dict:
+        return self._oauth.status()
+
+    def oauth_logout(self) -> None:
+        """Delete local OAuth credentials (revoke the app in ChatGPT settings to cut access)."""
+        self._oauth.logout()
+        self._oauth_client_cache = None
+
+    # ── OAuth internals ────────────────────────────────────────────────────
+    def _oauth_access_token(self) -> str:
+        try:
+            return self._oauth.get_access_token()
+        except OAuthReauthRequired:
+            if self.oauth_auto_login and not self._oauth.is_signed_in():
+                ASCIIColors.info("[OpenAIBinding] Not signed in; starting Sign in with ChatGPT...")
+                self._oauth.login()
+                return self._oauth.get_access_token()
+            raise
+
+    def _oauth_openai_client(self) -> openai.OpenAI:
+        token = self._oauth_access_token()
+        if self._oauth_client_cache is None or self._oauth_client_cache[0] != token:
+            if self._oauth_client_cache is not None:
+                with contextlib.suppress(Exception):
+                    self._oauth_client_cache[1].close()
+            client = openai.OpenAI(
+                api_key=token,
+                base_url=self.oauth_api_base,
+                max_retries=0,
+                http_client=httpx.Client(verify=self._httpx_verify, timeout=300.0),
+            )
+            self._oauth_client_cache = (token, client)
+        return self._oauth_client_cache[1]
+
+    def _stream_responses_once(
+        self,
+        client: openai.OpenAI,
+        instructions: str,
+        input_items: List[Dict[str, Any]],
+        reasoning: Optional[Dict[str, Any]],
+        n_predict: Optional[int],
+        handler: _StreamThinkingHandler,
+    ) -> None:
+        if not hasattr(client, "responses"):
+            raise RuntimeError("The installed 'openai' package is too old for the Responses API: pip install -U openai")
+
+        create_kwargs: Dict[str, Any] = {
+            "model": self.model_name,
+            "input": input_items,
+            "instructions": instructions,
+            "store": False,  # required by the ChatGPT-plan flow
+            "stream": True,  # required by the ChatGPT-plan flow
+        }
+        if reasoning:
+            create_kwargs["reasoning"] = reasoning
+
+        events = client.responses.create(**create_kwargs)
+        completed = cancelled = limited = False
+        count = 0
+        summary_parts = 0
+        try:
+            for event in events:
+                if self.is_cancelled():
+                    cancelled = True
+                    break
+                etype = getattr(event, "type", "")
+
+                if etype == "response.output_text.delta":
+                    delta = getattr(event, "delta", "") or ""
+                    if delta:
+                        if not handler.process_content(delta):
+                            cancelled = True
+                            break
+                        count += 1
+                        if n_predict and count >= n_predict:
+                            limited = True
+                            break
+
+                elif etype in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
+                    delta = getattr(event, "delta", "") or ""
+                    if delta and not handler.process_reasoning(delta):
+                        cancelled = True
+                        break
+
+                elif etype == "response.reasoning_summary_part.added":
+                    if summary_parts and not handler.process_reasoning("\n\n"):
+                        cancelled = True
+                        break
+                    summary_parts += 1
+
+                elif etype == "response.completed":
+                    completed = True
+
+                elif etype == "response.incomplete":
+                    details = getattr(getattr(event, "response", None), "incomplete_details", None)
+                    ASCIIColors.warning(f"[OpenAIBinding] Response incomplete: {details}")
+                    completed = True
+
+                elif etype == "response.failed":
+                    err = getattr(getattr(event, "response", None), "error", None)
+                    code = getattr(err, "code", None) or "unknown_error"
+                    message = getattr(err, "message", None) or ""
+                    text = f"{message} [{code}]".strip()
+                    hint = _OAUTH_ERROR_HINTS.get(str(code))
+                    raise RuntimeError(text + (f" — {hint}" if hint else ""))
+
+                elif etype == "error":
+                    code = getattr(event, "code", None)
+                    message = getattr(event, "message", None) or "stream error"
+                    raise RuntimeError(f"{message}" + (f" [{code}]" if code else ""))
+        finally:
+            close = getattr(events, "close", None)
+            if callable(close):
+                with contextlib.suppress(Exception):
+                    close()
+
+        if not (completed or cancelled or limited):
+            raise RuntimeError("The stream ended before response.completed")
+
+    def _generate_via_chatgpt_oauth(
+        self,
+        messages: List[Dict[str, Any]],
+        n_predict: Optional[int] = None,
+        stream: Optional[bool] = None,
+        streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+        effort: Optional[str] = None,
+        is_thinking_deactivated: bool = True,
+        reasoning_summary: Optional[str] = None,
+    ) -> Union[str, dict]:
+        """
+        Run one generation through the Responses API using the ChatGPT-plan OAuth token.
+
+        Notes: the flow always streams upstream (a non-streaming call just doesn't
+        invoke the callback). temperature / top_p / seed / penalties are not sent
+        (reasoning models reject them), and tools are not forwarded.
+        """
+        if not self._oauth_warned:
+            self._oauth_warned = True
+            ASCIIColors.info(
+                "[OpenAIBinding] oauth mode: sampling parameters (temperature, top_p, seed, penalties) "
+                "and tools are not sent."
+            )
+
+        handler = _StreamThinkingHandler(
+            streaming_callback if stream else None,
+            suppress_thinking=is_thinking_deactivated,
+        )
+        try:
+            instructions, input_items = chat_messages_to_responses_input(messages)
+
+            if is_thinking_deactivated:
+                reasoning: Optional[Dict[str, Any]] = {"effort": "none"}
+            else:
+                reasoning = {
+                    "effort": effort if effort != "max" else "high",
+                    "summary": reasoning_summary or "auto",
+                }
+
+            refreshed = False
+            while True:
+                client = self._oauth_openai_client()
+                try:
+                    self._stream_responses_once(client, instructions, input_items, reasoning, n_predict, handler)
+                    break
+                except openai.AuthenticationError:
+                    if refreshed:
+                        raise
+                    refreshed = True
+                    self._oauth.force_refresh(stale_access_token=client.api_key)
+                except openai.BadRequestError as ex:
+                    msg = str(ex).lower()
+                    if reasoning is not None and ("reasoning" in msg or "effort" in msg):
+                        ASCIIColors.warning(
+                            "[OpenAIBinding] Model rejected the reasoning setting; retrying without it."
+                        )
+                        reasoning = None
+                        continue
+                    raise
+            output = handler.flush()
+
+        except OAuthError as e:
+            err_msg = f"ChatGPT OAuth error: {e}"
+            if streaming_callback:
+                streaming_callback(err_msg, MSG_TYPE.MSG_TYPE_EXCEPTION)
+            return {"status": "error", "message": err_msg}
+        except Exception as e:
+            trace_exception(e)
+            detail = _describe_api_error(e) if isinstance(e, openai.APIStatusError) else str(e)
+            err_msg = f"An error occurred with the OpenAI API (ChatGPT OAuth): {detail}"
+            if streaming_callback:
+                streaming_callback(err_msg, MSG_TYPE.MSG_TYPE_EXCEPTION)
+            return {"status": "error", "message": err_msg}
+
+        return output
 
     def check_is_vllm(self) -> bool:
         """
@@ -714,6 +1633,17 @@ class OpenAIBinding(LollmsLLMBinding):
                 messages.append(
                     {"role": "user", "content": [{"type": "text", "text": prompt}]}
                 )
+
+        if self.auth_method == "oauth":
+            return self._generate_via_chatgpt_oauth(
+                messages,
+                n_predict=n_predict,
+                stream=stream,
+                streaming_callback=streaming_callback,
+                effort=effort,
+                is_thinking_deactivated=is_thinking_deactivated,
+                reasoning_summary=reasoning_summary,
+            )
 
         try:
             if self.completion_format == ELF_COMPLETION_FORMAT.Chat:
@@ -1029,6 +1959,17 @@ class OpenAIBinding(LollmsLLMBinding):
             f"-> effective_effort={effort}, deactivated={is_thinking_deactivated}"
         )
 
+        if self.auth_method == "oauth":
+            return self._generate_via_chatgpt_oauth(
+                openai_messages,
+                n_predict=n_predict,
+                stream=stream,
+                streaming_callback=streaming_callback,
+                effort=effort,
+                is_thinking_deactivated=is_thinking_deactivated,
+                reasoning_summary=reasoning_summary,
+            )
+
         self._apply_thinking_params(params, effort, is_thinking_deactivated)
         if reasoning_summary and reasoning_summary != "auto" and not is_thinking_deactivated:
             params.setdefault("extra_body", {})["reasoning_summary"] = reasoning_summary
@@ -1240,6 +2181,13 @@ class OpenAIBinding(LollmsLLMBinding):
                 or a list of embedding vectors if input is list[str].
                 Returns empty list on failure.
         """
+        if self.client is None:
+            ASCIIColors.warning(
+                "Embeddings are not available through ChatGPT OAuth (plan usage only covers eligible "
+                "Responses requests). Set service_key / OPENAI_API_KEY to use an API key for embeddings."
+            )
+            return []
+
         embedding_model = kwargs.get("model", self.model_name)
         if not embedding_model.startswith("text-embedding"):
             embedding_model = "text-embedding-3-small"
@@ -1335,9 +2283,52 @@ class OpenAIBinding(LollmsLLMBinding):
             "version": "2.0",
             "host_address": self.host_address,
             "model_name": self.model_name,
+            "auth_method": self.auth_method,
         }
 
+    def _list_models_oauth(self) -> List[Dict]:
+        """
+        Model catalog for the signed-in ChatGPT account. The plan-usage flow returns a
+        `models` array (slug / display_name / visibility), not the classic `data` array.
+        """
+        models_info: List[Dict] = []
+        try:
+            token = self._oauth_access_token()
+            r = httpx.get(
+                f"{self.oauth_api_base}/models",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=30.0,
+                verify=self._httpx_verify,
+            )
+            r.raise_for_status()
+            body = r.json()
+            entries = body.get("models") or body.get("data") or []
+            for m in entries:
+                if not isinstance(m, dict):
+                    continue
+                slug = m.get("slug") or m.get("id")
+                if not slug:
+                    continue
+                if m.get("visibility") not in (None, "list"):
+                    continue  # hidden catalog entries
+                models_info.append(
+                    {
+                        "model_name": slug,
+                        "display_name": m.get("display_name", slug),
+                        "owned_by": m.get("owned_by", "openai"),
+                        "created": m.get("created", "N/A"),
+                        "context_length": m.get("context_window") or m.get("context_length"),
+                        "max_generation": None,
+                    }
+                )
+        except Exception as e:
+            print(f"Failed to list models (ChatGPT OAuth): {e}")
+        return models_info
+
     def list_models(self) -> List[Dict]:
+        if self.auth_method == "oauth":
+            return self._list_models_oauth()
+
         known_context_lengths = {
             "gpt-4o": 128000,
             "gpt-4": 8192,

@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-04 22:42]
+
+- docs(api): update OpenAI bindings for client initialization and enable API documentation export
+
 ## [2026-10-04 22:37]
 
 - fix(lollms_form): extend processing block handling to inject lollms_forms into UI
