@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-04 23:32]
+
+- `fix(lollms_client): update version to "1.20.10"`
+
 ## [2026-10-04 22:42]
 
 - docs(api): update OpenAI bindings for client initialization and enable API documentation export
