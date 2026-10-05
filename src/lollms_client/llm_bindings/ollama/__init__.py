@@ -475,7 +475,6 @@ class OllamaBinding(LollmsLLMBinding):
                                     if streaming_callback:
                                         if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
                                             break
-                            continue
 
                         # Thinking is enabled
                         if chunk_thinking:

@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-05 09:02]
+
+- fix(llm): remove unnecessary `continue` and streaming callback validation logic in OllamaBinding.
+
 ## [2026-10-04 23:32]
 
 - `fix(lollms_client): update version to "1.20.10"`
