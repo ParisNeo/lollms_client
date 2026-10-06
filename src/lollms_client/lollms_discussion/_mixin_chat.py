@@ -3829,6 +3829,104 @@ class ChatMixin:
             ASCIIColors.error(f"[ChatMixin] Failed to wipe memories: {e}")
             return False
 
+    def _resolve_mixed_tools_list(self, tools: List[Any], personality=None) -> Dict[str, Dict[str, Any]]:
+        """
+        Resolves a mixed tools list containing any combination of:
+          - Python file paths (str ending in .py that exists on disk)
+          - Structured tool definitions (dict with 'name' key)
+          - Classic tool names (str matching a registered LCP tool)
+
+        Returns a dict of tool_name -> tool_spec for all resolvable entries.
+        """
+        resolved: Dict[str, Dict[str, Any]] = {}
+        lcp_binding = getattr(self.lollmsClient, "tools", None)
+        if lcp_binding is None and personality is not None:
+            from lollms_client.lollms_chat_core import _is_tool_binding
+            if _is_tool_binding(getattr(personality, "tools", None)):
+                lcp_binding = personality.tools
+
+        lcp_tools_cache: Optional[Dict[str, Dict[str, Any]]] = None
+
+        for entry in tools:
+            # Normalize Path or other objects to string
+            if not isinstance(entry, str) and not isinstance(entry, dict):
+                try:
+                    entry = str(entry)
+                except Exception:
+                    continue
+            
+            # ── Case 1: Structured tool definition (dict with 'name') ──
+            if isinstance(entry, dict):
+                tool_name = entry.get("name")
+                if not tool_name:
+                    ASCIIColors.warning("[ChatMixin] Structured tool definition missing 'name' key, skipping.")
+                    continue
+
+                spec = {
+                    "name": tool_name,
+                    "description": entry.get("description", ""),
+                    "parameters": entry.get("parameters", []),
+                }
+
+                if "callable" in entry:
+                    spec["callable"] = entry["callable"]
+
+                resolved[tool_name] = spec
+                continue
+
+            # ── Case 2: Non-string entry — skip ──
+            if not isinstance(entry, str):
+                continue
+
+            # ── Case 3: Python file path ──
+            if entry.endswith(".py"):
+                py_path = Path(entry).resolve()
+                if py_path.exists() and py_path.is_file() and lcp_binding:
+                    try:
+                        loaded_count = lcp_binding._load_tool_file(py_path)
+                        if loaded_count > 0:
+                            ASCIIColors.success(f"[ChatMixin] Loaded {loaded_count} tool(s) from file: {py_path.name}")
+                            # Fetch the newly loaded tool specs and add them to resolved
+                            lcp_specs = lcp_binding.to_chat_tool_specs(
+                                discussion_instance=self,
+                                lollms_client_instance=self.lollmsClient,
+                            )
+                            for t_name, t_spec in lcp_specs.items():
+                                # Only add tools that came from this specific file
+                                tool_def = next((t for t in lcp_binding.discovered_tools if t.get("name") == t_name), None)
+                                if tool_def and tool_def.get("_python_file_path") == str(py_path):
+                                    resolved[t_name] = t_spec
+                        else:
+                            ASCIIColors.warning(f"[ChatMixin] No tools found in file: {py_path.name}")
+                    except Exception as ex:
+                        ASCIIColors.error(f"[ChatMixin] Failed to load tool file '{entry}': {ex}")
+                        trace_exception(ex)
+                else:
+                    if not (py_path.exists() and py_path.is_file()):
+                        ASCIIColors.warning(f"[ChatMixin] Tool file '{entry}' does not exist or is not a file.")
+                    elif not lcp_binding:
+                        ASCIIColors.warning(f"[ChatMixin] No LCP binding available to load tool file '{entry}'.")
+                continue
+
+            # ── Case 4: Classic tool name lookup ──
+            if lcp_binding and hasattr(lcp_binding, "to_chat_tool_specs"):
+                if lcp_tools_cache is None:
+                    try:
+                        lcp_tools_cache = lcp_binding.to_chat_tool_specs(
+                            discussion_instance=self,
+                            lollms_client_instance=self.lollmsClient,
+                        )
+                    except Exception as ex:
+                        ASCIIColors.warning(f"[ChatMixin] Failed to fetch LCP tool specs: {ex}")
+                        lcp_tools_cache = {}
+
+                if entry in lcp_tools_cache:
+                    resolved[entry] = lcp_tools_cache[entry]
+                else:
+                    ASCIIColors.warning(f"[ChatMixin] Requested tool '{entry}' not found in LCP registry.")
+
+        return resolved
+
     def _resolve_active_tools(
         self,
         personality,
@@ -3904,22 +4002,8 @@ class ChatMixin:
         if isinstance(tools, dict):
             active_tools.update(tools)
         elif isinstance(tools, list):
-            lcp_binding = getattr(self.lollmsClient, "tools", None)
-            if lcp_binding and hasattr(lcp_binding, "to_chat_tool_specs"):
-                try:
-                    lcp_tools = lcp_binding.to_chat_tool_specs(
-                        discussion_instance=self,
-                        lollms_client_instance=self.lollmsClient,
-                    )
-                    for tool_name in tools:
-                        if tool_name in lcp_tools:
-                            active_tools[tool_name] = lcp_tools[tool_name]
-                        else:
-                            ASCIIColors.warning(
-                                f"[ChatMixin] Requested default tool '{tool_name}' not found in LCP registry."
-                            )
-                except Exception as ex:
-                    trace_exception(ex)
+            resolved = self._resolve_mixed_tools_list(tools, personality=personality)
+            active_tools.update(resolved)
 
         lcp_binding = getattr(self.lollmsClient, "tools", None)
 
@@ -4575,21 +4659,12 @@ class ChatMixin:
         elif personality and hasattr(personality, "tools") and isinstance(personality.tools, dict) and not orchestrator_persona:
             active_tools.update(personality.tools)
 
-        # 2. Explicit User-Supplied Tools (Callables or Default Tool Names)
+        # 2. Explicit User-Supplied Tools (Callables, file paths, or structured definitions)
         if isinstance(tools, dict):
             active_tools.update(tools)
         elif isinstance(tools, list):
-            lcp_binding = getattr(self.lollmsClient, "tools", None)
-            if lcp_binding and hasattr(lcp_binding, "to_chat_tool_specs"):
-                try:
-                    lcp_tools = lcp_binding.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
-                    for tool_name in tools:
-                        if tool_name in lcp_tools:
-                            active_tools[tool_name] = lcp_tools[tool_name]
-                        else:
-                            ASCIIColors.warning(f"[ChatMixin] Requested default tool '{tool_name}' not found in LCP registry.")
-                except Exception as ex:
-                    trace_exception(ex)
+            resolved = self._resolve_mixed_tools_list(tools, personality=personality)
+            active_tools.update(resolved)
 
         lcp_binding = getattr(self.lollmsClient, "tools", None)
 

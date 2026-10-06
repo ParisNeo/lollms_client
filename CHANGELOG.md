@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-06 05:59]
+
+- feat(client): add new chat and personality functionalities
+
 ## [2026-10-05 09:02]
 
 - fix(llm): remove unnecessary `continue` and streaming callback validation logic in OllamaBinding.

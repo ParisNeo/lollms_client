@@ -4873,6 +4873,21 @@ JSON:"""
             except Exception:
                 pass
 
+        # ── MERGE PERSONALITY-SPECIFIC TOOLS (e.g., from Handbag) ──
+        # This ensures tools attached directly to the personality (self._tool_binding)
+        # are available even if they are not in the client's global LCPBinding.
+        if self._tool_binding and hasattr(self._tool_binding, "to_chat_tool_specs"):
+            try:
+                personality_specs = self._tool_binding.to_chat_tool_specs(
+                    discussion_instance=getattr(self, '_artefact_proxy', None),
+                    lollms_client_instance=self.lollms_client
+                )
+                for t_name, t_spec in personality_specs.items():
+                    if t_name not in active_tools:
+                        active_tools[t_name] = t_spec
+            except Exception as e:
+                ASCIIColors.warning(f"[{self.name}] Failed to merge personality-specific tools: {e}")
+
         if explicit_tools:
             active_tools.update(explicit_tools)
 
