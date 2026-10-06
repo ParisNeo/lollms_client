@@ -103,6 +103,40 @@ crew_pers = LollmsPersonality.from_handbag("./my_crew_handbag")
 response = discussion.chat(user_message="Build a Python script.", personality=crew_pers)
 ```
 
+#### Extending Handbag with Extra Tools & Skills
+You can augment a handbag personality with additional tool files or skill directories that live outside the handbag folder. This is useful for sharing common tools across multiple personas or injecting project-specific skills.
+
+*   `extra_tools`: A list of paths to Python files containing tool definitions.
+*   `extra_skills_dirs`: A list of directories containing `SKILL.md` files.
+
+```python
+from lollms_client.lollms_personality import LollmsPersonality
+from pathlib import Path
+
+# Define extra resources
+extra_tools = [Path("./shared_tools/web_search.py")]
+extra_skills = [Path("./project_skills/deep_research")]
+
+# Load personality with extensions
+pers = LollmsPersonality.from_handbag(
+    path="./my_handbag",
+    lollms_client=client,
+    extra_tools=extra_tools,
+    extra_skills_dirs=extra_skills
+)
+```
+
+#### Runtime Refresh (Hot-Reloading Tools & Skills)
+If you add new tool files or skills to the handbag folder (or to your extra resources) after the personality has been created, you can trigger an inline refresh to pick them up without restarting the agent.
+
+```python
+# ... agent runs for a while ...
+
+# Add a new tool file to the handbag's tools/ directory or update an extra tool file
+# Then refresh:
+pers.refresh_tools_and_skills()
+```
+
 ### Using Custom Handbags in `lollms_code` CLI (`--handbag`)
 
 You can point the autonomous coding agent directly to any custom Handbag:
@@ -455,10 +489,16 @@ Now I will read it.
 
 ### `LollmsPersonality`
 
-#### `LollmsPersonality.from_handbag(path: Union[str, Path]) -> 'LollmsPersonality'`
+#### `LollmsPersonality.from_handbag(path: Union[str, Path], lollms_client: Optional[Any] = None, extra_tools: Optional[List[Union[str, Path]]] = None, extra_skills_dirs: Optional[List[Union[str, Path]]] = None) -> 'LollmsPersonality'`
 Factory to construct a personality from a Handbag folder.
 - **`path`**: Path to the Handbag directory.
+- **`lollms_client`**: The LollmsClient instance (optional).
+- **`extra_tools`**: A list of paths to additional Python tool files to merge into the handbag's tool set.
+- **`extra_skills_dirs`**: A list of directories containing `SKILL.md` files to merge into the handbag's skills.
 - **Returns**: A configured `LollmsPersonality` instance with lazily instantiated stateful components.
+
+#### `refresh_tools_and_skills() -> None`
+Re-scans the handbag's tools and skills directories, as well as any registered extra tools/skills, and updates the active tool binding and skills manager. This allows hot-swapping or adding new tools/skills without restarting the agent.
 
 #### `list_tools_structured() -> List[Dict[str, Any]]`
 Returns a structured list of all tools registered with this personality, categorized by provenance:

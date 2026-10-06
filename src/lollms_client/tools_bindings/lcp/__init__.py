@@ -766,30 +766,78 @@ class LCPBinding(LollmsToolBinding):
 
             ASCIIColors.debug(f"[LCP execute_tool] Tool '{tool_name}' returned: {str(result)[:500] if result is not None else 'None'}")
 
+            # ── UNIFIED RESULT NORMALIZATION ──
+            # The harness must be flexible to different tool conventions.
+            # We define a result as "Failed" if any of these are true:
+            # 1. Explicit success=False
+            # 2. Explicit status="error" or "failure"
+            # 3. return_code is not None and != 0
+            # 4. An "error" key exists with a truthy value
+            # Otherwise, it is "Success". We ensure "output" is always present.
+            
+            is_failure = False
+            error_msg = None
+            
             if not isinstance(result, dict):
+                # Primitive or List: Always success, wrap in output
                 result = {"success": True, "output": result}
+            else:
+                # Check Failure Signals
+                if result.get("success") is False:
+                    is_failure = True
+                    error_msg = result.get("error") or result.get("message") or "Tool reported failure."
+                
+                status_val = str(result.get("status", "")).lower()
+                if status_val in ("error", "failure", "failed"):
+                    is_failure = True
+                    error_msg = result.get("error") or result.get("message") or f"Tool status was '{status_val}'."
+                
+                rc = result.get("return_code")
+                if rc is not None and rc != 0:
+                    is_failure = True
+                    error_msg = result.get("error") or result.get("stderr") or f"Non-zero return code: {rc}"
+                
+                if "error" in result and result["error"]:
+                    if not is_failure:
+                        # If we haven't failed yet, but there's an error key, it might be a soft error
+                        # But usually "error" implies failure. Let's treat presence of truthy error as failure 
+                        # unless success is explicitly True (which is a conflict, but success=True is stronger).
+                        if result.get("success") is not True:
+                            is_failure = True
+                            error_msg = result["error"]
 
-            if result.get("success") is False:
-                if not result.get("error"):
-                    result["error"] = (
-                        f"Tool '{tool_name}' returned success=False with no error message. "
-                        f"Raw keys: {list(result.keys())}. "
-                        f"This may indicate a sandbox block, a missing dependency, or an initialization failure."
-                    )
-                    ASCIIColors.error(f"[LCP Error Tracking] Tool '{tool_name}' returned bare success=False. Synthesized error: {result['error']}")
-                else:
-                    ASCIIColors.error(f"[LCP Error Tracking] Tool '{tool_name}' reported failure: {result['error']}")
+                # Ensure "output" exists for the LLM
+                if "output" not in result:
+                    # Look for common payload keys
+                    payload = None
+                    for key in ("result", "data", "response", "papers", "content", "text"):
+                        if key in result:
+                            payload = result[key]
+                            break
+                    if payload is None:
+                        # If no specific payload key, dump the whole dict minus meta keys
+                        meta_keys = {"success", "status", "error", "message", "return_code", "stderr"}
+                        clean_dict = {k: v for k, v in result.items() if k not in meta_keys}
+                        if clean_dict:
+                            payload = clean_dict
+                        else:
+                            payload = result.get("output", "Tool executed successfully.")
+                    result["output"] = payload
 
+            if is_failure:
+                # Standardize failure output
                 if not result.get("output"):
-                    result["output"] = result.get("error", "Tool failed with no output.")
-
+                    result["output"] = result.get("error", "Tool failed.")
+                
+                ASCIIColors.error(f"[LCP Error Tracking] Tool '{tool_name}' reported failure: {error_msg}")
                 return {
-                    "output": result.get("output", result.get("error")),
-                    "error": result.get("error"),
+                    "output": result.get("output"),
+                    "error": error_msg,
                     "success": False,
                     "status_code": 500
                 }
-
+            
+            # Success Path
             if not result.get("output"):
                 result["output"] = "Tool executed successfully (no output)."
 

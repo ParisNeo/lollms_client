@@ -2541,7 +2541,12 @@ class LollmsPersonality:
         return res.get("response", "")
 
     @staticmethod
-    def from_handbag(path: Union[str, Path], lollms_client: Optional[Any] = None) -> 'LollmsPersonality':
+    def from_handbag(
+        path: Union[str, Path],
+        lollms_client: Optional[Any] = None,
+        extra_tools: Optional[List[Union[str, Path]]] = None,
+        extra_skills_dirs: Optional[List[Union[str, Path]]] = None
+    ) -> 'LollmsPersonality':
         """Factory to construct a personality from a Handbag folder."""
         hb = Handbag(path)
 
@@ -2556,11 +2561,18 @@ class LollmsPersonality:
 
         # Initialize Skills
         skills_mode = meta.get("skills_mode") or hb.manifest.get("skills_mode", "loadable")
-        # CRITICAL: Explicitly pass the handbag's skills directory as the primary target.
-        # This ensures tool_create_skill and tool_update_skill route file writes to the
-        # correct physical handbag folder, even if external dirs are merged later.
-        handbag_skills_dir = [hb.skills_dir.resolve()] if hb.skills_dir.exists() else []
-        sm = SkillsManager(skills_dirs=handbag_skills_dir, mode=skills_mode) if handbag_skills_dir else None
+        
+        # Merge handbag skills and extra skills directories
+        all_skills_dirs = []
+        if hb.skills_dir.exists():
+            all_skills_dirs.append(hb.skills_dir.resolve())
+        if extra_skills_dirs:
+            for d in extra_skills_dirs:
+                resolved = Path(d).resolve()
+                if resolved.exists() and resolved not in all_skills_dirs:
+                    all_skills_dirs.append(resolved)
+            
+        sm = SkillsManager(skills_dirs=all_skills_dirs, mode=skills_mode) if all_skills_dirs else None
 
         # Initialize RAG data sources from handbag rag/ folder
         rag_data_sources: List[RAGDataSource] = []
@@ -2585,15 +2597,22 @@ class LollmsPersonality:
 
         # Load Tools
         tool_binding = None
-        if hb.tool_files:
+        all_tool_files = list(hb.tool_files)
+        if extra_tools:
+            for t in extra_tools:
+                resolved_t = Path(t).resolve()
+                if resolved_t.exists() and resolved_t not in all_tool_files:
+                    all_tool_files.append(resolved_t)
+        
+        if all_tool_files:
             try:
                 from lollms_client.tools_bindings.lcp import LCPBinding
-                tool_binding = LCPBinding(tool_files=[str(f) for f in hb.tool_files])
+                tool_binding = LCPBinding(tool_files=[str(f) for f in all_tool_files])
                 discovered_count = len(tool_binding.discovered_tools) if tool_binding else 0
                 if discovered_count == 0:
                     ASCIIColors.error(
-                        f"[Handbag] Tool binding created but discovered 0 tools from {len(hb.tool_files)} "
-                        f"file(s): {[f.name for f in hb.tool_files]}. Check for syntax errors or missing "
+                        f"[Handbag] Tool binding created but discovered 0 tools from {len(all_tool_files)} "
+                        f"file(s): {[f.name for f in all_tool_files]}. Check for syntax errors or missing "
                         f"'tool_' function definitions in each file."
                     )
                 else:
@@ -2602,7 +2621,7 @@ class LollmsPersonality:
                         f"{[t.get('name') for t in tool_binding.discovered_tools]}"
                     )
             except Exception as tool_load_err:
-                ASCIIColors.error(f"[Handbag] FAILED to create tool binding from {len(hb.tool_files)} file(s): {tool_load_err}")
+                ASCIIColors.error(f"[Handbag] FAILED to create tool binding from {len(all_tool_files)} file(s): {tool_load_err}")
                 trace_exception(tool_load_err)
 
         pers = LollmsPersonality(
@@ -2614,7 +2633,7 @@ class LollmsPersonality:
             metadata=meta,
             tools=tool_binding,
             skills_manager=sm,
-            skills_dirs=handbag_skills_dir,
+            skills_dirs=all_skills_dirs,
             memory_manager=mm,
             handbag_path=hb.path,
             data_sources=rag_data_sources if rag_data_sources else None,
@@ -2626,6 +2645,10 @@ class LollmsPersonality:
         # This guarantees that downstream systems (like _StreamState in _mixin_chat.py)
         # can access the physical handbag directory for tool/skill file updates.
         object.__setattr__(pers, 'handbag_path', hb.path.resolve())
+
+        # Persist extra tools and skills for inline refresh capability
+        object.__setattr__(pers, '_extra_tool_files', [Path(t).resolve() for t in (extra_tools or []) if Path(t).resolve().exists()])
+        object.__setattr__(pers, '_extra_skills_dirs', [Path(d).resolve() for d in (extra_skills_dirs or []) if Path(d).resolve().exists()])
 
         # Parse Coworkers (Crew Handbag)
         if hb.coworkers_dir.exists():
@@ -4308,6 +4331,70 @@ JSON:"""
     def get_tools_structured(self) -> List[Dict[str, Any]]:
         """Alias for list_tools_structured()."""
         return self.list_tools_structured()
+
+    def refresh_tools_and_skills(self) -> None:
+        """
+        Re-scans the handbag's tools and skills directories, as well as any registered
+        extra tools/skills, and updates the active tool binding and skills manager.
+        This allows hot-swapping or adding new tools/skills without restarting the agent.
+        """
+        if not self.handbag_path or not self.handbag_path.exists():
+            ASCIIColors.warning(f"[{self.name}] Cannot refresh tools/skills: handbag path not found.")
+            return
+
+        # 1. Refresh Tools
+        hb = Handbag(self.handbag_path)
+        native_tool_files = hb.tool_files
+        
+        # Filter existing extra tool files (in case some were deleted)
+        extra_tool_files = []
+        for f in getattr(self, '_extra_tool_files', []):
+            if f.exists():
+                extra_tool_files.append(f)
+        
+        all_tool_files = native_tool_files + extra_tool_files
+
+        if all_tool_files:
+            try:
+                from lollms_client.tools_bindings.lcp import LCPBinding
+                new_binding = LCPBinding(tool_files=[str(f) for f in all_tool_files])
+                self._tool_binding = new_binding
+                discovered_count = len(new_binding.discovered_tools)
+                ASCIIColors.success(f"[{self.name}] 🔧 Refreshed tools: {discovered_count} tool(s) active.")
+            except Exception as e:
+                ASCIIColors.error(f"[{self.name}] Failed to refresh tool binding: {e}")
+        else:
+            self._tool_binding = _NULL_TOOL_BINDING
+            ASCIIColors.info(f"[{self.name}] 🔧 No handbag or extra tools found. Reset to null binding.")
+
+        # 2. Refresh Skills
+        native_skills_dirs = hb.skills_dirs
+        # Filter existing extra skills dirs
+        extra_skills_dirs = []
+        for d in getattr(self, '_extra_skills_dirs', []):
+            if d.exists():
+                extra_skills_dirs.append(d)
+        
+        all_skills_dirs = native_skills_dirs + extra_skills_dirs
+
+        if all_skills_dirs:
+            if self.skills_manager:
+                # Update the internal list of directories in the existing manager
+                self.skills_manager._skills_dirs = all_skills_dirs
+                self.skills_manager.reload()
+                ASCIIColors.success(f"[{self.name}] 📚 Refreshed skills from: {', '.join(str(d) for d in all_skills_dirs)}")
+            else:
+                mode = "loadable"
+                if hasattr(self, 'capabilities') and self.capabilities:
+                    mode = getattr(self.capabilities, 'skills_mode', "loadable")
+                self.skills_manager = SkillsManager(skills_dirs=all_skills_dirs, mode=mode)
+                ASCIIColors.success(f"[{self.name}] 📚 Initialized skills manager from: {', '.join(str(d) for d in all_skills_dirs)}")
+        else:
+            # No skills anywhere
+            if self.skills_manager:
+                self.skills_manager._skills_dirs = []
+                self.skills_manager.reload()
+            ASCIIColors.info(f"[{self.name}] 📚 No handbag or extra skills found.")
 
     def _discover_tools(
         self,

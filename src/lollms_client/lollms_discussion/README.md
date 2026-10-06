@@ -1319,6 +1319,231 @@ discussion._debug_mode = False  # disable when done (zero overhead when off)
 
 ---
 
+## 🔄 Dynamic Tool & Skill Hot-Reloading (Runtime Evolution)
+
+The `LollmsDiscussion` engine supports **Runtime Evolution**, allowing the LLM (or the host application) to modify tool definitions on disk and immediately make them available to the agent without restarting the Python process.
+
+### The Mechanism
+
+1.  **Persistence**: When `LollmsPersonality.from_handbag()` is called with `extra_tools`, the paths to these files are stored in `personality._extra_tool_files`.
+2.  **Refresh**: Calling `personality.refresh_tools_and_skills()` re-scans the handbag's `tools/` directory AND the `extra_tools` paths. It validates file existence and re-instantiates the `LCPBinding`.
+3.  **Synchronization**: Since `discussion.chat()` resolves `personality.tool_specs()` at the start of every turn, the next chat turn automatically reflects the new tools.
+
+### Example: The Self-Modifying Agent
+
+In this example, the agent is given a simple tool. The host application simulates a scenario where the tool is "upgraded" on disk, and then the agent is refreshed to use the new version.
+
+```python
+import json
+import shutil
+from pathlib import Path
+from lollms_client import LollmsClient, LollmsDiscussion
+from lollms_client.lollms_personality import LollmsPersonality
+
+# 1. Setup: Create a temporary handbag with an extra tool file
+handbag_path = Path("./temp_handbag")
+extra_tool_file = Path("./temp_extra_tool.py")
+
+# Clean up
+if handbag_path.exists():
+    shutil.rmtree(handbag_path)
+
+# Create Handbag
+(handbag_path / "tools").mkdir(parents=True, exist_ok=True)
+(handbag_path / "SOUL.md").write_text("You are a test agent.", encoding="utf-8")
+
+# Create Extra Tool (v1)
+extra_tool_file.write_text("""
+def tool_calculate(x: int, y: int):
+    '''Adds two numbers.'''
+    return {'success': True, 'output': f'{x} + {y} = {x + y}'}
+""", encoding="utf-8")
+
+# 2. Load Personality with Extra Tools
+client = LollmsClient(llm_binding_name="ollama", llm_binding_config={"model_name": "llama3"})
+discussion = LollmsDiscussion.create_new(lollms_client=client)
+
+personality = LollmsPersonality.from_handbag(
+    path=handbag_path,
+    lollms_client=client,
+    extra_tools=[extra_tool_file]
+)
+
+# 3. Initial Chat (Use v1 tool)
+discussion.chat(
+    user_message="Use tool_calculate to add 10 and 20.",
+    personality=personality
+)
+
+# 4. Modify Tool on Disk (v2: now multiplies)
+extra_tool_file.write_text("""
+def tool_calculate(x: int, y: int):
+    '''Multiplies two numbers (UPGRADED).'''
+    return {'success': True, 'output': f'{x} * {y} = {x * y}'}
+""", encoding="utf-8")
+
+# 5. Refresh Tools
+print("🔄 Refreshing tools to pick up disk changes...")
+personality.refresh_tools_and_skills()
+
+# 6. Subsequent Chat (Use v2 tool)
+# The agent now sees the 'Multiplies' description and returns the product.
+discussion.chat(
+    user_message="Use tool_calculate to calculate 10 and 20 again. (Note: the tool was updated)",
+    personality=personality
+)
+```
+
+### Best Practices
+
+*   **Atomic Writes**: When modifying tool files, ensure the write is atomic (write to temp file, then rename) to prevent the `LCPBinding` from reading a partially written file.
+*   **Validation**: `refresh_tools_and_skills()` will log errors if a tool file contains syntax errors. The agent will fall back to the previous valid state (or null) and log a warning.
+*   **Skills**: The same logic applies to `extra_skills_dirs`. Adding a new `SKILL.md` file to an extra directory and calling `refresh_tools_and_skills()` will make it discoverable via `tool_search_skills` or `tool_load_skill` immediately.
+
+---
+
+## 🧬 Self-Evolving Agents: The Test-Driven Tool Workflow
+
+The `LollmsDiscussion` architecture supports **Self-Evolving Agents**. In this pattern, a **Main Agent** is responsible for analyzing requirements, writing or updating tool code, and validating its work by spawning a **Child Agent** (a fresh discussion session) that attempts to use the newly updated tools.
+
+### The Workflow
+
+1.  **Analyze**: The Main Agent receives a task (e.g., "Add multiplication to the calculator tool").
+2.  **Write**: The Main Agent uses `tool_execute_python_code` (or a custom `tool_update_tool`) to write the new tool definition to disk.
+3.  **Refresh**: The Main Agent calls a custom `tool_refresh_tools` (which invokes `personality.refresh_tools_and_skills()`).
+4.  **Test**: The Main Agent calls a custom `tool_spawn_test_agent`. This tool:
+    *   Creates a *new* `LollmsDiscussion` instance.
+    *   Uses the *same* `LollmsPersonality` (which now sees the refreshed tools).
+    *   Executes a specific "Test Task" (e.g., "Calculate 5 * 5 using the calculator tool").
+    *   Returns the Child Agent's response.
+5.  **Judge**: The Main Agent reviews the Child Agent's response. If it's incorrect, the loop repeats (steps 2-4). If it's correct, the Main Agent emits `<done/>`.
+
+### Example: The Self-Modifying Calculator
+
+This example demonstrates a Main Agent that iteratively improves a `tool_calculator` until it can handle multiplication, verified by a Child Agent.
+
+```python
+import shutil
+from pathlib import Path
+from lollms_client import LollmsClient, LollmsDiscussion
+from lollms_client.lollms_personality import LollmsPersonality
+from lollms_client.lollms_types import MSG_TYPE
+
+# ── 1. SETUP ─────────────────────────────────────────────────────────────────
+
+handbag_path = Path("./self_evolve_handbag")
+if handbag_path.exists():
+    shutil.rmtree(handbag_path)
+
+(handbag_path / "tools").mkdir(parents=True, exist_ok=True)
+(handbag_path / "SOUL.md").write_text(
+    "You are a Software Architect. You improve tools by writing Python code. "
+    "When you update a tool, you MUST call tool_refresh_tools to load the changes. "
+    "Then you MUST call tool_spawn_test_agent to verify the fix with a child agent. "
+    "Only emit <done/> when the child agent confirms the tool works correctly.",
+    encoding="utf-8"
+)
+
+# Initial "broken" tool (only does addition)
+tool_file = handbag_path / "tools" / "calculator.py"
+tool_file.write_text(
+    "def tool_calculator(a: int, b: int):\n"
+    "    '''Adds two numbers.'''\n"
+    "    return {'success': True, 'output': f'{a} + {b} = {a + b}'}\n",
+    encoding="utf-8"
+)
+
+client = LollmsClient(llm_binding_name="ollama", llm_binding_config={"model_name": "llama3"})
+discussion = LollmsDiscussion.create_new(lollms_client=client)
+
+personality = LollmsPersonality.from_handbag(
+    path=handbag_path,
+    lollms_client=client,
+    enable_git_management=False
+)
+
+# ── 2. CUSTOM TEST TOOL ──────────────────────────────────────────────────────
+
+def tool_spawn_test_agent(task: str) -> dict:
+    """
+    Spawns a child agent to test a specific task using the current personality's tools.
+    
+    Args:
+        task (str): The specific test task to run (e.g., "Calculate 5 * 5").
+    """
+    ASCIIColors.info(f"🧪 Spawning Child Agent for test: {task}")
+    
+    # Create a fresh discussion for the child
+    child_discussion = LollmsDiscussion.create_new(lollms_client=client)
+    
+    try:
+        # The child agent uses the SAME personality, so it sees the refreshed tools
+        result = child_discussion.chat(
+            user_message=f"Test Task: {task}. Use the available tools to perform this task. "
+                         "If you cannot do it, say 'TEST FAILED'.",
+            personality=personality,
+            max_nb_rounds=5,
+            temperature=0.1,
+            enable_code_execution=False # Child agent should ONLY use the tools being tested
+        )
+        
+        child_response = result.get("ai_message", {}).get("content", "No response")
+        return {"success": True, "output": child_response}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        child_discussion.close()
+
+# Custom refresh tool
+def tool_refresh_tools() -> dict:
+    """Refreshes the tools and skills for the current personality."""
+    personality.refresh_tools_and_skills()
+    return {"success": True, "output": "Tools refreshed."}
+
+# ── 3. RUN THE EVOLUTION LOOP ────────────────────────────────────────────────
+
+test_tools = {
+    "tool_spawn_test_agent": {
+        "name": "tool_spawn_test_agent",
+        "description": "Spawns a child agent to test a specific task with the current tools. Use this to verify your code changes.",
+        "parameters": [{"name": "task", "type": "str", "description": "The specific test task to run."}],
+        "callable": tool_spawn_test_agent
+    },
+    "tool_refresh_tools": {
+        "name": "tool_refresh_tools",
+        "description": "Reloads tools from disk. Call this after writing new tool code.",
+        "parameters": [],
+        "callable": tool_refresh_tools
+    }
+}
+
+# The Main Agent
+response = discussion.chat(
+    user_message="The tool_calculator currently only adds. I need it to support multiplication. "
+                 "Update the tool file, refresh the tools, and use tool_spawn_test_agent to verify that '5 * 5' returns '25'. "
+                 "Keep iterating until the test passes.",
+    personality=personality,
+    tools=test_tools,
+    enable_code_execution=True, # Allow Main Agent to write the tool file
+    max_nb_rounds=15,
+    streaming_callback=lambda c, t, m: print(c, end="", flush=True) if t == MSG_TYPE.MSG_TYPE_CHUNK else None
+)
+
+print("\n\n📝 Final Main Agent Response:")
+print(response["ai_message"].content)
+
+# Cleanup
+shutil.rmtree(handbag_path, ignore_errors=True)
+```
+
+### Best Practices
+
+*   **Isolation**: The Child Agent should have `enable_code_execution=False` to prevent it from modifying the tool files during the test. It should only *use* them.
+*   **Round Budgets**: Keep the Child Agent's `max_nb_rounds` low (e.g., 3-5) to ensure it focuses on the single test task.
+*   **Feedback Loop**: The Main Agent's prompt must explicitly instruct it to *read* the child agent's output and judge correctness before terminating.
+
+---
+
 ## 🌊 5. The Complete `chat()` Agentic Loop Workflow
 
 The following diagram describes the **entire control flow** of the `chat()` method, including every exit path, interception gate, and continuation branch. It is the authoritative map of the agentic state machine implemented in `ChatMixin`.
