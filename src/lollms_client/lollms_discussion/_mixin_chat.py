@@ -170,6 +170,60 @@ def _resolve_tool_workspace_root(discussion) -> "Path":
     base_ws = Path(discussion.workspace_path) if getattr(discussion, "workspace_path", None) else Path("./data_workspace")
     return (base_ws / discussion.id / "workspace_data").resolve()
 
+def _vision_capability_diagnostics(client: Any, context_label: str) -> None:
+    """Dumps the full vision-capability resolution state of the active client binding."""
+    if client is None:
+        ASCIIColors.warning(f"[VisionDiag:{context_label}] No lollmsClient attached.")
+        return
+    active_binding = getattr(client, "llm", None)
+    alias = getattr(client, "_active_llm_alias", "<missing>")
+    if active_binding is None:
+        ASCIIColors.warning(f"[VisionDiag:{context_label}] client.llm is None (alias={alias}).")
+        return
+    binding_type = type(active_binding).__name__
+    model_name = getattr(active_binding, "model_name", "<missing>")
+    children = getattr(active_binding, "child_bindings", None)
+    if isinstance(children, dict) and children:
+        children_desc = ", ".join(
+            f"{name}({type(child).__name__}:"
+            f"ve={bool(getattr(child, 'vision_enabled', False))},"
+            f"sv={bool(getattr(child, 'supports_vision', False))})"
+            for name, child in children.items()
+        )
+    else:
+        children_desc = "<absent>"
+    profile_registry = getattr(client, "llm_model_profiles_registry", None)
+    active_profile = profile_registry.get(alias) if isinstance(profile_registry, dict) else None
+    if active_profile is not None:
+        profile_vision = str(bool(getattr(active_profile, "vision_enabled", False)))
+    else:
+        profile_vision = "<no profile for alias>"
+    method_exists = hasattr(client, "has_vision_capability")
+    raw_result = "<method missing>"
+    method_error = None
+    if method_exists:
+        try:
+            raw_result = str(bool(client.has_vision_capability()))
+        except Exception as diag_ex:
+            method_error = _sanitize_host_paths(str(diag_ex))
+    diag_line = (
+        f"[VisionDiag:{context_label}] alias={alias} binding={binding_type} model={model_name} | "
+        f"binding.vision_enabled={getattr(active_binding, 'vision_enabled', '<missing>')} "
+        f"supports_vision={getattr(active_binding, 'supports_vision', '<missing>')} "
+        f"video_enabled={getattr(active_binding, 'video_enabled', '<missing>')} "
+        f"glm_image_embedding={getattr(active_binding, 'glm_image_embedding', '<missing>')} | "
+        f"child_bindings=[{children_desc}] | "
+        f"active_profile.vision_enabled={profile_vision} | "
+        f"has_vision_capability()={raw_result}"
+    )
+    if method_error is not None:
+        diag_line += f" (raised: {method_error})"
+        ASCIIColors.error(diag_line)
+    elif raw_result == "False":
+        ASCIIColors.warning(diag_line)
+    else:
+        ASCIIColors.info(diag_line)
+
 
 def _hash_workspace_file_refs(discussion, params: Dict[str, Any]) -> Dict[str, str]:
     """
@@ -242,6 +296,14 @@ _EXPLICIT_BINARY_EXTS = {
     ".h5", ".hdf5", ".gguf", ".pkl", ".pickle", ".joblib",
     ".npy", ".npz", ".msgpack", ".pb", ".tflite", ".mlmodel",
 }
+
+_IMAGE_EXT_MIME = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".bmp": "image/bmp", ".webp": "image/webp",
+    ".svg": "image/svg+xml",
+}
+
+_MAX_IMAGE_HYDRATION_BYTES = 10 * 1024 * 1024
 
 _ML_WEIGHT_EXTS = {
     ".pt", ".pth", ".ckpt", ".bin", ".safetensors", ".onnx",
@@ -719,6 +781,8 @@ class _StreamState:
         # Track context unlock requests to force continuation round
         self.context_unlock_requested = False
         self.context_unlocked_files: List[str] = []
+        self.image_unlock_guidance: List[str] = []
+        self.noop_context_unlock = False
         self.processed_tags = processed_tags if processed_tags is not None else set()
 
         # Orchestrator→Worker delegation payload captured this round.
@@ -2496,7 +2560,7 @@ class _StreamState:
                     self._processing_block_open = False
                 return True
 
-            self._register_scratchpad_write()
+            self._register_scratchpad_write(title, body)
 
             if is_patch:
                 existing = self.discussion.artefacts.get(title)
@@ -2772,6 +2836,10 @@ class _StreamState:
                 art = self.discussion.artefacts.get(t_file)
                 if not art:
                     not_found.append(t_file)
+                elif tag_name == "unlock_file" and (
+                    art.get("type") == "image" or Path(t_file).suffix.lower() in _IMAGE_EXT_MIME
+                ):
+                    self._hydrate_image_unlock(t_file, art, Path(t_file).suffix.lower(), processed_files)
                 elif art.get("visibility") == target_visibility:
                     already_in_state.append(t_file)
                 elif target_visibility == ArtefactVisibility.FULL:
@@ -3084,6 +3152,82 @@ class _StreamState:
         """Returns True if a <tool> dispatch was refused for a tool-less agent tier."""
         return self._tool_refusal_detected
 
+    def _hydrate_image_unlock(self, t_file: str, art: Dict[str, Any], file_ext: str, processed_files: List[str]) -> None:
+        """Self-heals pixel hydration for an image artifact targeted by <unlock_file>."""
+        images = list(art.get("images") or [])
+        hydrated = False
+        if not images:
+            ws_root = _resolve_tool_workspace_root(self.discussion)
+            try:
+                candidate = (ws_root / t_file).resolve()
+                inside_root = str(candidate).startswith(str(ws_root))
+                if inside_root and candidate.is_file() and candidate.stat().st_size <= _MAX_IMAGE_HYDRATION_BYTES:
+                    img_b64 = base64.b64encode(candidate.read_bytes()).decode("utf-8")
+                    mime = _IMAGE_EXT_MIME.get(file_ext, "image/png")
+                    self.discussion.artefacts.update(
+                        title=t_file,
+                        new_images=[img_b64],
+                        new_image_media_types=[mime],
+                    )
+                    self.discussion.commit()
+                    images = [img_b64]
+                    hydrated = True
+                    ASCIIColors.success(
+                        f"[StreamState] Hydrated image pixels for '{t_file}' from its workspace physical twin."
+                    )
+            except Exception as hydrate_ex:
+                ASCIIColors.warning(
+                    f"[StreamState] Image hydration failed for '{t_file}': "
+                    f"{_sanitize_host_paths(str(hydrate_ex))}"
+                )
+
+        state_changed = False
+        if art.get("visibility") != ArtefactVisibility.FULL:
+            self.discussion.artefacts.set_visibility(t_file, ArtefactVisibility.FULL)
+            processed_files.append(t_file)
+            state_changed = True
+
+        client = getattr(self.discussion, "lollmsClient", None)
+        has_vision = True
+        if client is not None and hasattr(client, "has_vision_capability"):
+            try:
+                has_vision = bool(client.has_vision_capability())
+            except Exception as vision_ex:
+                ASCIIColors.error(
+                    f"[StreamState] has_vision_capability() raised while unlocking '{t_file}': "
+                    f"{_sanitize_host_paths(str(vision_ex))}"
+                )
+                has_vision = False
+        _vision_capability_diagnostics(client, f"unlock:{t_file}")
+        ASCIIColors.info(
+            f"[VisionDiag:unlock:{t_file}] pixel_entries={len(images)} has_vision={has_vision} "
+            f"state_changed={state_changed} hydrated={hydrated} visibility={art.get('visibility')}"
+        )
+
+        if not images:
+            guidance = (
+                f"The image '{t_file}' has no loadable pixel data (no readable physical twin was found "
+                f"in the workspace). <unlock_file> can never make you see it. Do NOT unlock it again. "
+                f"Inform the user that the pixel data for this image is unavailable in this session."
+            )
+        elif not has_vision:
+            guidance = (
+                f"The image '{t_file}' is marked visible, but your active model has NO vision capability: "
+                f"image pixels are never transmitted to you, and <unlock_file> cannot change that. "
+                f"Do NOT unlock it again. If the tool_vlm_query tool is available, use it to analyze the image; "
+                f"otherwise tell the user you cannot view images with the current model."
+            )
+        else:
+            guidance = (
+                f"The image '{t_file}' is attached to your context as an ACTUAL image — its pixels are "
+                f"directly visible to you in this conversation. Do NOT unlock it again and do NOT call any tool "
+                f"to read it. Look at the image, answer the user's question about it, and finish with `<done/>`."
+            )
+
+        self.context_unlock_requested = True
+        self.image_unlock_guidance.append(guidance)
+        self.noop_context_unlock = not (state_changed or hydrated)
+
     def _is_identical_scratchpad_retry(self, title: str, body: str) -> bool:
         """True when this dispatch is byte-identical to the immediately preceding scratchpad write."""
         last_write = getattr(self.discussion, "_last_scratchpad_write", None)
@@ -3093,9 +3237,20 @@ class _StreamState:
         return last_write == (title, body_hash)
 
     def _register_scratchpad_write(self, title: str, body: str) -> None:
-        """Records the last scratchpad dispatch so only byte-identical retries are blocked."""
+        """Records the last scratchpad dispatch and bumps the consecutive-write streak."""
         body_hash = hashlib.sha256(body.strip().encode("utf-8", errors="ignore")).hexdigest()
         object.__setattr__(self.discussion, "_last_scratchpad_write", (title, body_hash))
+        object.__setattr__(
+            self.discussion, "_scratchpad_write_streak", self._scratchpad_write_streak() + 1
+        )
+
+    def _scratchpad_write_streak(self) -> int:
+        """Consecutive scratchpad writes with no intervening informational step (tool call, context change)."""
+        return int(getattr(self.discussion, "_scratchpad_write_streak", 0) or 0)
+
+    def _note_informational_step(self) -> None:
+        """Records an informational step that legitimizes a subsequent scratchpad write."""
+        object.__setattr__(self.discussion, "_scratchpad_write_streak", 0)
 
     def passthrough(self, chunk, msg_type=None, meta=None) -> bool:
         if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
@@ -4663,6 +4818,30 @@ class ChatMixin:
         if (enable_image_generation or enable_image_editing) and _has_tti and not orchestrator_persona:
             extra_instructions += self._build_image_generation_instructions()
 
+        # Vision Capability Instructions (only when the active model profile is vision-capable)
+        _turn_has_vision = False
+        if not suppress_images and self.lollmsClient and hasattr(self.lollmsClient, "has_vision_capability"):
+            try:
+                _turn_has_vision = bool(self.lollmsClient.has_vision_capability())
+            except Exception:
+                _turn_has_vision = False
+
+        if _turn_has_vision and enable_artefacts and not orchestrator_persona:
+            extra_instructions += (
+                "\n=== VISION CAPABILITY PROTOCOL ===\n"
+                "Your active model has NATIVE VISION: image pixels are transmitted to you as actual images "
+                "attached to this conversation — never as text.\n"
+                "1. Image files marked [C] in the Workspace Directory Tree already have their REAL pixels "
+                "attached to your context. Look at them directly. Do NOT call tool_read_file, grep, or any "
+                "text tool on an image you can already see.\n"
+                "2. To view any other image file in the workspace tree ([U] or locked), emit "
+                "`<unlock_file>filename.ext</unlock_file>`: the system will attach its real pixels to your "
+                "next round. Then answer the user's question about it.\n"
+                "3. Never re-unlock an image that is already visible, never output base64 data, and never "
+                "attempt to read image binaries as text.\n"
+                "=== END VISION CAPABILITY PROTOCOL ===\n"
+            )
+
         # Combine core sections (feature rules will be added later after active_tools is built)
         full_system_prompt = sys_prompt + "\n" + core_rules + "\n" + extra_instructions
 
@@ -5389,6 +5568,7 @@ class ChatMixin:
         # Initialize pending memory searches list for this turn
         object.__setattr__(self, '_pending_memory_searches', [])
         object.__setattr__(self, "_last_scratchpad_write", None)
+        object.__setattr__(self, "_scratchpad_write_streak", 0)
 
         def _bump_environment_epoch() -> None:
             nonlocal environment_epoch
@@ -5594,6 +5774,13 @@ class ChatMixin:
                 has_vision = self.lollmsClient.has_vision_capability()
             elif hasattr(self, "lollmsClient") and self.lollmsClient and hasattr(self.lollmsClient, "llm"):
                 has_vision = getattr(self.lollmsClient.llm, "vision_enabled", True)
+
+            if suppress_images:
+                ASCIIColors.info(
+                    f"[VisionDiag:round:{round_count}] suppress_images=True — all image pixels withheld this round."
+                )
+            if not has_vision:
+                _vision_capability_diagnostics(self.lollmsClient, f"round:{round_count}")
 
             if suppress_images or not has_vision:
                 round_images = None
@@ -6328,7 +6515,7 @@ class ChatMixin:
             # _StreamState skips dispatching it (affected_artefacts remains empty).
             # HOWEVER, a failed SEARCH/REPLACE patch ALSO results in empty affected_artefacts.
             # We must only force-final-answer for TRUE duplicates, not failed patches.
-            if ss.was_action_dispatched() and not ss.tool_trigger and not ss.affected_artefacts:
+            if ss.was_action_dispatched() and not ss.tool_trigger and not ss.affected_artefacts and not ss.context_unlock_requested:
                 if ss.was_last_dispatch_failed():
                     noncompliance_streak += 1
                     correction_body = ""
@@ -6508,7 +6695,7 @@ class ChatMixin:
             # ── 🛑 ONE-ACTION-PER-TURN PROTOCOL ──
             # If the StreamState dispatched an artifact, note, skill, or context update
             # (but NOT a tool), we must halt generation, hydrate virtual_history, and re-prompt.
-            if ss.was_action_dispatched() and not ss.tool_trigger:
+            if ss.was_action_dispatched() and not ss.tool_trigger and not ss.context_unlock_requested:
                 last_executed_action_key = f"artifact_dispatch:{round_count}"
                 noncompliance_streak = 0
                 if ss.affected_artefacts:
@@ -7771,6 +7958,42 @@ class ChatMixin:
                             )
                             ASCIIColors.info(f"[ChatMixin] Injected {len(new_files_this_run)} new artifacts into virtual_history context.")
 
+                        image_files_this_run = [
+                            a.get("title") for a in self._affected_artefacts_this_turn
+                            if a.get("type") == "image" and a.get("title")
+                        ]
+                        if image_files_this_run:
+                            image_files_str = ", ".join(f"`{f}`" for f in image_files_this_run)
+                            if _turn_has_vision:
+                                virtual_history[-1].content += (
+                                    f"\n\n[IMAGE VERIFICATION MANDATE]\n"
+                                    f"The tool generated the following image artifact(s): {image_files_str}.\n"
+                                    f"Their actual pixels are attached to your context as real images — you can SEE them.\n"
+                                    f"Before finishing, visually inspect each image and verify:\n"
+                                    f"- For plots/charts: the title is present and NOT cropped, axis labels are "
+                                    f"readable, a legend is present when multiple series exist, no text overlaps, "
+                                    f"and the rendered data matches what you intended to plot.\n"
+                                    f"- For generated/edited images: the content matches the prompt, with no "
+                                    f"truncation, distortion, or garbled regions.\n"
+                                    f"If any problem is found, fix the generating script or parameters and "
+                                    f"regenerate the image. Do NOT claim the image is correct without looking at it.\n"
+                                    f"[END IMAGE VERIFICATION MANDATE]"
+                                )
+                            else:
+                                virtual_history[-1].content += (
+                                    f"\n\n[IMAGE ARTIFACT NOTICE]\n"
+                                    f"The tool generated the following image artifact(s): {image_files_str}.\n"
+                                    f"Your active model has NO vision capability: you cannot see these images, and "
+                                    f"you must NOT claim to have verified their visual content. If the "
+                                    f"tool_vlm_query tool is available, use it to inspect them; otherwise tell the "
+                                    f"user you cannot visually verify the image in this session.\n"
+                                    f"[END IMAGE ARTIFACT NOTICE]"
+                                )
+                            ASCIIColors.info(
+                                f"[ChatMixin] Injected image verification guidance for "
+                                f"{len(image_files_this_run)} image artifact(s) (has_vision={_turn_has_vision})."
+                            )
+
                         # Inject a summary of what has been accomplished so far to prevent
                         # the LLM from re-starting its analysis from scratch each round.
                         tools_so_far = [tc["name"] for tc in tool_calls_this_turn]
@@ -7818,6 +8041,26 @@ class ChatMixin:
                 # must get a continuation round to actually use the content.
                 if ss.context_unlock_requested and not was_cancelled:
                     unlock_files_str = ', '.join(ss.context_unlocked_files)
+                    envelope_lines = []
+                    if unlock_files_str:
+                        envelope_lines.append(
+                            f"The following files are now fully loaded in your context: {unlock_files_str}."
+                        )
+                    for image_guidance in getattr(ss, "image_unlock_guidance", None) or []:
+                        envelope_lines.append(f"[IMAGE CONTEXT]\n{image_guidance}")
+                    for blocked_guidance in getattr(ss, "_blocked_files_guidance", None) or []:
+                        envelope_lines.append(f"[CONTEXT BUDGET]\n{blocked_guidance}")
+                    if not envelope_lines:
+                        envelope_lines.append(
+                            "The requested context update completed without any visible content change."
+                        )
+                    envelope_lines.append(
+                        "Proceed with your task using the loaded content. Do NOT emit the same context tag again."
+                    )
+                    if getattr(ss, "noop_context_unlock", False):
+                        noncompliance_streak += 1
+                    else:
+                        noncompliance_streak = 0
                     clean_unlock_text = scrub_processing_and_status_blocks(raw_round_text)
                     virtual_history.append(SimpleNamespace(
                         sender_type="assistant",
@@ -7826,10 +8069,9 @@ class ChatMixin:
                     virtual_history.append(SimpleNamespace(
                         sender_type="user",
                         content=(
-                            f'<action_result type="context_unlock" status="SUCCESS">\n'
-                            f"The following files are now fully loaded in your context: {unlock_files_str}.\n"
-                            f"Proceed with your task using the loaded content.\n"
-                            f"</action_result>"
+                            '<action_result type="context_unlock" status="SUCCESS">\n'
+                            + "\n".join(envelope_lines)
+                            + "\n</action_result>"
                         )
                     ))
                     ss.context_unlock_requested = False
