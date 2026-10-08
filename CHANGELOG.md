@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-08 00:22]
+
+- feat(personality): add handbag personality and update discussion mixins
+
 ## [2026-10-06 19:11]
 
 - docs: add usage examples and update personality and LCP bindings

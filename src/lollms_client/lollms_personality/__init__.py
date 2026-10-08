@@ -14,6 +14,13 @@ from .lollms_personality import (
 )
 from .skill import Skill, parse_skill_md
 from .handbag import Handbag
+from .doc_navigator import (
+    DocIngestor,
+    DocNavigator,
+    build_doc_tools,
+    build_docs_scope_block,
+)
+from .personality_studio import PersonalityStudio
 
 __all__ = [
     "LollmsPersonality",
@@ -30,5 +37,10 @@ __all__ = [
     "ToolsManager",
     "Skill",
     "parse_skill_md",
-    "Handbag"
+    "Handbag",
+    "DocIngestor",
+    "DocNavigator",
+    "build_doc_tools",
+    "build_docs_scope_block",
+    "PersonalityStudio",
 ]

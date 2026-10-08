@@ -2119,11 +2119,11 @@ function renderWidgetInChat(title, rawWidgetHtml) {
 3. **No External Storage**: Widgets should not read/write cookies, `localStorage`, or `sessionStorage`. They are ephemeral.
 4. **Relative Fetches Only**: If a widget needs to load a dataset, it should perform relative fetches to `/api/workspace_files/filename.csv`. The host application must ensure this endpoint is accessible from the iframe's origin.
 
-### 💡 PixiJS Integration
-The LLM is mandated to use **PixiJS** for any animations or physics simulations. The host application does not need to pre-install PixiJS, as the LLM's code dynamically loads it via CDN:
+### 💡 D3.js Integration
+The LLM is mandated to use **D3.js** for any animations, data visualizations, or interactive graphics (never PixiJS). The host application does not need to pre-install D3.js, as the LLM's code dynamically loads it via CDN:
 ```javascript
 var s = document.createElement('script');
-s.src = 'https://cdn.jsdelivr.net/npm/pixi.js@7/dist/pixi.min.js';
+s.src = 'https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js';
 document.head.appendChild(s);
 ```
 Ensure your Content Security Policy (CSP) allows scripts from `cdn.jsdelivr.net` if you are using one.
@@ -2597,3 +2597,205 @@ def tool_my_long_task(duration: int = 5, tool_context=None) -> dict:
 Because `ChatMixin` injects the context automatically, this works identically
 whether your tool is registered as a direct callable or mounted through the LCP
 binding — with zero host-side wiring.
+
+
+# Handbags, the Personality Studio, and Index-Based Navigation
+
+This section explains the personality resource stack that plugs into a discussion: what a **handbag** is, how to import **documents, skills, tools, and soul** into a personality, how the personality is **configured**, and how the system uses the **vector index** to navigate personality data without blowing up the context window.
+
+## What Is a Handbag?
+
+A `Handbag` (from `lollms_client.lollms_personality.handbag`) is the **resource container** of a personality. Think of it as the agent's bag of stuff it carries around:
+
+- a **workspace** on disk (files the agent creates and edits),
+- a **documents directory** (knowledge imported by the user),
+- **skills directories** (folders containing `SKILL.md` skill definitions),
+- the ingestion pipeline entry point for documents.
+
+Crucially, the handbag is a *pure container*. It holds paths and registers resources; it contains **no chat logic, no anti-loop logic, no generation logic**. All intelligence lives in the discussion loop and the personality; the handbag only ensures resources are in the right place and indexed.
+
+```python
+from lollms_client.lollms_personality import Handbag
+
+handbag = Handbag(root_path="my_agent_workspace")
+print(handbag.workspace_path)   # where the agent works
+print(handbag.docs_path)        # where imported documents live
+print(handbag.skills_dirs)      # registered skill folders
+```
+
+Because it is decoupled, you can use a handbag standalone (see `examples/handbag_docs_example.py`, `examples/handbag_agent_example.py`, `examples/handbag_rag_skills_example.py`, `examples/handbag_extra_tools_example.py`) or as part of a full personality.
+
+## Using Documents in a Handbag
+
+Documents are the primary way to give an agent domain knowledge. The flow is always the same:
+
+```python
+handbag.add_document("path/to/handbook.pdf")
+```
+
+`add_document()` does three things:
+
+1. **Registers** the document in the handbag's document registry (path, title, type).
+2. **Ingests** it through the ingestion pipeline (`DocIngestor`): the file is parsed (text, PDF, Office documents, CSV...), split into semantic chunks, and embedded.
+3. **Indexes** the chunks into the personality's vector index so the content becomes *searchable and navigable* instead of a opaque blob.
+
+Key properties of this pipeline:
+
+- **Original files are preserved.** The handbag keeps the source document; the index is a derived structure. You can always re-ingest or delete a document.
+- **Chunking is semantic.** Documents are split at natural boundaries (headings, paragraphs, code blocks) so retrieved chunks are self-contained.
+- **Indexing is incremental.** Adding a new document does not force a rebuild of the whole index.
+- **Any format the ingestor supports works the same way.** Markdown, PDF, DOCX, XLSX, CSV... — after ingestion they are all just indexed chunks with metadata pointing back at the source.
+
+```python
+handbag.add_document("specs/product_spec.md")
+handbag.add_document("data/user_salaries.csv")
+handbag.add_document("reports/annual_report.pdf")
+```
+
+## Building a Personality with the Studio
+
+The **Personality Studio** (`lollms_client.lollms_personality.personality_studio`) is the authoring tool that assembles a complete personality without writing boilerplate. It walks you through importing every kind of resource a personality can own:
+
+### Studio workflow
+
+1. **Create or open a personality** — the studio manages a personality folder on disk (see the layout below).
+2. **Import the soul** — the soul is the personality's core identity: values, mission, tone, and behavioral contract. The studio lets you write or import a soul document that becomes the top of every prompt.
+3. **Define the persona** — name, avatar, description, and presentation details used when the personality introduces itself.
+4. **Import documents** — feed files into the handbag (`add_document`); the studio shows ingestion progress and the resulting index statistics.
+5. **Import skills** — point the studio at skill folders (each containing a `SKILL.md`). Skills are registered with the `SkillsManager` and loaded **on demand**, not eagerly.
+6. **Register tools** — attach tool bindings (e.g. LCP tool servers: Python execution, SQL, document editing, web tools...) that the personality is allowed to call.
+7. **Configure generation parameters** — model binding, personality temperature, effort, and anti-loop settings.
+8. **Save** — everything is persisted to the personality folder so the personality can be reloaded, shared, or version-controlled.
+
+The studio can also be driven programmatically when you want reproducible personality builds (useful in CI or for shipping "personality packs"):
+
+```python
+from lollms_client.lollms_personality import PersonalityStudio
+
+studio = PersonalityStudio(personality_path="my_personality")
+studio.import_soul("souls/researcher.md")
+studio.handbag.add_document("docs/knowledge_base.md")
+studio.register_skills_dir("skills")
+studio.register_tools(["execute_python", "execute_sql_query"])
+studio.save()
+```
+
+> The interactive studio is the recommended path for humans; the programmatic path is the recommended path for scripts and tests.
+
+## How Everything Is Configured
+
+A personality is a **folder, not a database blob**. This makes personalities portable, git-friendly, and inspectable. A fully built personality looks like this:
+
+```text
+my_personality/
+├── config.json              # personality settings: identity, generation params, tool allowlist
+├── soul/
+│   └── soul.md              # core identity, values, behavioral contract
+├── persona.md               # presentation: name, description, tone
+├── docs/                    # imported documents (sources of truth)
+│   ├── handbook.pdf
+│   └── knowledge_base.md
+├── index/                   # vector index of ingested document chunks
+├── skills/                  # skill folders, each with a SKILL.md
+│   └── bibliography_and_research/
+│       └── SKILL.md
+├── scratchpad/              # the agent's persistent working notes
+└── workspace/               # files the agent creates and edits
+```
+
+What each part controls:
+
+| Resource | File/Dir | Role in the system |
+|---|---|---|
+| **Configuration** | `config.json` | Identity, generation parameters (model, temperature, effort), allowed tools, paths. Loaded at personality construction. |
+| **Soul** | `soul/soul.md` | Injected at the *top* of every prompt. Never evicted by the context budget. Defines *who the agent is*. |
+| **Persona** | `persona.md` | Presentation-level identity; used for introductions and delegation descriptions. |
+| **Documents** | `docs/` | Knowledge sources. Never injected wholesale — accessed through the index. |
+| **Index** | `index/` | Chunk embeddings + document map. The *only* gateway to document content. |
+| **Skills** | `skills/` | `SKILL.md` folders. Metadata (title, description, triggers) is loaded eagerly; full skill content is loaded on demand. |
+| **Tools** | config allowlist | Tool bindings the personality may call during the agentic loop. |
+| **Scratchpad** | `scratchpad/` | The agent's own persistent memory-of-work. The personality owns the scratchpad state (`_scratchpad_content` / `_scratchpad_path`); the history adapter deliberately keeps its scratchpad field empty so notes are never duplicated in the message history. |
+
+## How the System Uses the Index to Navigate Personality Data
+
+This is the heart of the architecture. A personality can hold megabytes of documents, yet the context window stays small. The trick: **the agent never reads documents directly — it navigates them through the index.**
+
+### The navigation pipeline
+
+```text
+documents (docs/)
+     │  add_document()
+     ▼
+DocIngestor ── parse ──► chunk ──► embed
+     │
+     ▼
+vector index (index/)  +  document map
+     │
+     ▼
+DocNavigator  ◄── queries from the chat loop
+     │
+     ▼
+targeted chunks injected into the prompt (within the token budget)
+```
+
+1. **At ingestion time**, each document is chunked and embedded. Alongside the embeddings, the system builds a **document map**: which documents exist, their sections, and where each chunk came from. The map is a table of contents of the whole personality knowledge base.
+
+2. **At prompt-building time**, the `DocNavigator` (from `lollms_client.lollms_personality.doc_navigator`) exposes two levels of access:
+   - **Map level**: "What documents do I have, and what is in them?" — cheap, structured, no embeddings needed.
+   - **Semantic level**: "Which chunks answer this question?" — a vector similarity query against the index returns the top matching chunks *with their source location*.
+
+3. **During the agentic loop**, when the user's request touches personality knowledge:
+   - the discussion queries the navigator with the current intent,
+   - the navigator returns a small set of relevant chunks,
+   - only those chunks enter the prompt,
+   - if a chunk is promising but truncated, the agent can request the *neighborhood* of that chunk (surrounding chunks of the same document) — deep reading without full loading.
+
+4. **The context budget guard** (`_mixin_prompt.py`) enforces the token ceiling: soul first, then scratchpad, then recent messages, then retrieved chunks, then memory recalls. Index-based access is what makes this ordering viable — bulky document content simply never competes for prompt space.
+
+### Why index-first navigation matters
+
+- **Stable context cost**: whether the handbag holds 10 KB or 500 MB of documents, prompt size depends on the *question*, not the corpus.
+- **Provenance**: every retrieved chunk knows its source document and position, so the agent can cite where knowledge came from.
+- **Freshness without rebuild pain**: adding a document only indexes the new document; navigation immediately sees it.
+- **Skills follow the same philosophy**: only `SKILL.md` metadata is resident in context; the full skill body is fetched when the agent decides to use that skill.
+
+## End-to-End Example
+
+```python
+from lollms_client.lollms_discussion import LollmsDiscussion
+from lollms_client.lollms_llm_binding import LollmsLLMBinding
+from lollms_client.lollms_personality import Handbag, LollmsPersonality
+
+llm = LollmsLLMBinding.from_config("config.json")
+
+handbag = Handbag(root_path="my_agent_workspace")
+handbag.add_document("docs/company_handbook.pdf")
+handbag.add_document("docs/api_reference.md")
+handbag.register_skills_dir("skills")
+
+personality = LollmsPersonality(
+    personality_path="my_personality",
+    llm=llm,
+    handbag=handbag,
+)
+
+discussion = LollmsDiscussion(db_path="discussion.db", llm=llm)
+discussion.personality = personality
+
+discussion.create_message(
+    "user",
+    "What is our policy on remote work? Cite the handbook.",
+)
+discussion.build_prompt()
+```
+
+When this prompt is built, the handbook is *not* dumped into context. The DocNavigator retrieves only the policy-related chunks from the index, injects them, and the agent answers with provenance.
+
+## Tips and Pitfalls
+
+- **Do not bypass `add_document()`** by copying files into `docs/` manually — they will exist on disk but remain invisible to the navigator until ingested.
+- **The scratchpad is not a document.** It is always resident in the prompt (it is the agent's working memory). Keep it lean; documents are for bulk knowledge.
+- **Re-ingest after heavy edits.** If a source document changes, re-run ingestion for that document so the index stays consistent with the source.
+- **One concern per document.** Retrieval quality depends on chunk coherence; a single mega-document mixing unrelated topics degrades semantic queries.
+- **Skill folders must contain a `SKILL.md`** at their root to be discovered by the `SkillsManager`.
+- **Personality folders are portable.** Zip a personality folder (with its index) and it works anywhere — no database export needed.

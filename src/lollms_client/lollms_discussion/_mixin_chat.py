@@ -83,6 +83,17 @@ _DEFAULT_FAST_REPLICAS = [
     "* Done in a flash! The artifact was created too quickly to capture content.\n",
 ]
 
+_SHAKE_MESSAGES = [
+    "🎲 Let's break the loop: take a completely different path than your last two attempts.",
+    "🧭 Detour time: the road you keep choosing is closed. Pick another action entirely.",
+    "🔧 New tactic required: if a patch or call keeps failing, try a different tool, a different file section, or a different decomposition of the task.",
+    "🌀 Pattern interrupt: pause, re-read the user's original request, and respond to what they actually asked for.",
+    "🎨 Creative pivot: your previous approach is exhausted. Improvise a fresh solution.",
+    "🧩 Puzzle shuffle: swap the order of your steps or split the task into smaller pieces you can verify one by one.",
+    "⚖️ Reality check: maybe the task is already done, or genuinely impossible as stated — verify, then either finish with `<done/>` or ask the user one precise clarifying question.",
+    "🚦 Route change: the system has flagged your repetition. Demonstrate a NEW plan in this very response, not the old one reworded.",
+]
+
 _TAG_STARTS = [
     "<tool>",
     "</arg_key>", "<think ",
@@ -240,14 +251,70 @@ _ML_WEIGHT_EXTS = {
 
 _MAX_TOOL_RESULT_CHARS = 24000
 
+_INERT_TOOL_PARAM_KEYS = {
+    "force", "raw", "verbose", "vbose", "full", "no_summary", "include_metadata",
+    "max_tokens", "window", "offset", "instrumentation", "injected",
+}
+
+
+def _canonicalize_tool_params(params: Any) -> str:
+    """
+    Stable JSON fingerprint of tool parameters with inert cosmetic options removed.
+
+    The repetitive-call loop guard uses this fingerprint so that calls differing
+    only by noise options ('force', 'raw', 'verbose', 'window', 'max_tokens', ...)
+    hash identically to the bare call and cannot bypass interception.
+    """
+    def _clean(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {k: _clean(v) for k, v in value.items() if k not in _INERT_TOOL_PARAM_KEYS}
+        if isinstance(value, list):
+            return [_clean(item) for item in value]
+        return value
+
+    try:
+        return json.dumps(_clean(params), sort_keys=True, default=str)
+    except Exception:
+        cleaned = _clean(params)
+        return str(sorted(cleaned.items())) if isinstance(cleaned, dict) else str(cleaned)
+
+
+_DOC_SOURCE_BANNER_RE = re.compile(
+    r"=== SOURCE(?: GROUP)?: (docs/\S+?) \(Document: \"([^\"]*)\" \u2014 ([^)]*?)\) ==="
+)
+
 
 def _extract_sources_from_tool_result(tool_name: str, tool_params: Dict[str, Any], tool_res: Any) -> List[Dict[str, Any]]:
     """
-    Extracts web search hits and RAG document sources from tool execution outputs.
+    Extracts web search hits, RAG document sources, and handbag doc-navigator
+    provenance banners from tool execution outputs.
     """
     sources: List[Dict[str, Any]] = []
     if not tool_res:
         return sources
+
+    if tool_name.startswith("tool_doc_"):
+        output_text = (
+            tool_res.get("output", "") if isinstance(tool_res, dict)
+            else (tool_res if isinstance(tool_res, str) else "")
+        )
+        for banner_match in _DOC_SOURCE_BANNER_RE.finditer(str(output_text)):
+            rel_path = banner_match.group(1)
+            doc_title = banner_match.group(2).strip()
+            doc_authors = banner_match.group(3).strip()
+            if any(existing.get("url") == rel_path for existing in sources):
+                continue
+            sources.append({
+                "title": doc_title or rel_path,
+                "url": rel_path,
+                "link": rel_path,
+                "snippet": "",
+                "source": doc_authors or doc_title,
+                "score": None,
+                "type": "doc",
+            })
+        if sources:
+            return sources
 
     candidate_items: List[Any] = []
 
@@ -1989,6 +2056,28 @@ class _StreamState:
 
             is_new = self.discussion.artefacts.get(title) is None
             is_patch = "<<<<<<< SEARCH" in body
+            is_scratchpad_target = atype.lower() == "scratchpad" or "scratchpad" in title.lower()
+
+            if is_scratchpad_target and self._is_identical_scratchpad_retry(title, body):
+                self._last_dispatch_failed = True
+                self._last_failure_kind = "scratchpad_duplicate"
+                ASCIIColors.warning(
+                    f"[StreamState] Identical consecutive scratchpad write blocked: '{title}' "
+                    f"(content unchanged from the previous dispatch)."
+                )
+                if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                    proc_close = (
+                        f"\n* ⚠️ Scratchpad write blocked: '{title}' was already written with EXACTLY this content "
+                        f"on the previous round. Re-emitting identical content is a loop error. Change the content "
+                        f"(fix the SEARCH block, add new findings, or alter the update), or move on to another action.\n"
+                        f"<!-- status:failure -->\n</processing>\n"
+                    )
+                    self.ai_message.content += proc_close
+                    _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                return True
+
+            if is_scratchpad_target:
+                self._register_scratchpad_write(title, body)
 
             if is_new is False and is_patch is False:
                 existing_art = self.discussion.artefacts.get(title)
@@ -2185,6 +2274,7 @@ class _StreamState:
                     })
                 return True
             self.tool_trigger = True
+            self._note_informational_step()
 
             # ── ROBUST JSON PARSING & NORMALIZATION (CRITICAL FIX) ──
             # LLMs often hallucinate flat structures: {"name": "tool", "arg": "val"}
@@ -2338,6 +2428,76 @@ class _StreamState:
             title = attrs.get("title") or attrs.get("name") or "scratchpad"
 
             is_patch = "<<<<<<< SEARCH" in body
+            existing_scratchpad = self.discussion.artefacts.get(title)
+
+            if self._is_identical_scratchpad_retry(title, body):
+                self._last_dispatch_failed = True
+                self._last_failure_kind = "scratchpad_duplicate"
+                ASCIIColors.warning(
+                    f"[StreamState] Identical consecutive scratchpad write blocked: '{title}' "
+                    f"(content unchanged from the previous dispatch)."
+                )
+                if self._processing_block_open:
+                    proc_close = (
+                        f"* ⚠️ Scratchpad write blocked: '{title}' was already written with EXACTLY this content "
+                        f"on the previous round. Re-emitting identical content is a loop error. Change the content "
+                        f"(fix the SEARCH block, add new findings, or alter the update), or move on to another action.\n"
+                        f"<!-- status:failure -->\n</processing>\n"
+                    )
+                    self.ai_message.content += proc_close
+                    _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    self._processing_block_open = False
+                return True
+
+            if not is_patch and existing_scratchpad is not None:
+                existing_raw = existing_scratchpad.get("content") if isinstance(existing_scratchpad, dict) else None
+                if isinstance(existing_raw, (bytes, bytearray)):
+                    existing_content = existing_raw.decode("utf-8", errors="ignore")
+                elif isinstance(existing_raw, str):
+                    existing_content = existing_raw
+                else:
+                    existing_content = ""
+                new_body_hash = hashlib.sha256(body.strip().encode("utf-8", errors="ignore")).hexdigest()
+                existing_hash = hashlib.sha256(existing_content.strip().encode("utf-8", errors="ignore")).hexdigest()
+                if new_body_hash == existing_hash:
+                    self._last_dispatch_failed = True
+                    self._last_failure_kind = "scratchpad_duplicate"
+                    ASCIIColors.warning(
+                        f"[StreamState] Redundant scratchpad rewrite rejected: '{title}' already "
+                        f"contains exactly this content."
+                    )
+                    if self._processing_block_open:
+                        proc_close = (
+                            f"* ⚠️ Redundant rewrite rejected: scratchpad '{title}' already contains "
+                            f"exactly this content.\n"
+                            f"<!-- status:failure -->\n</processing>\n"
+                        )
+                        self.ai_message.content += proc_close
+                        _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        self._processing_block_open = False
+                    return True
+
+            if self._scratchpad_write_streak() >= 1:
+                self._last_dispatch_failed = True
+                self._last_failure_kind = "scratchpad_streak"
+                ASCIIColors.warning(
+                    "[StreamState] Consecutive scratchpad write blocked "
+                    "(no intervening informational step)."
+                )
+                if self._processing_block_open:
+                    proc_close = (
+                        f"* ⚠️ Scratchpad write blocked: the scratchpad was already written on the previous round "
+                        f"without any intervening informational step. Perform a tool call, document read, or memory "
+                        f"search first, then patch the scratchpad.\n"
+                        f"<!-- status:failure -->\n</processing>\n"
+                    )
+                    self.ai_message.content += proc_close
+                    _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    self._processing_block_open = False
+                return True
+
+            self._register_scratchpad_write()
+
             if is_patch:
                 existing = self.discussion.artefacts.get(title)
                 if existing:
@@ -2582,6 +2742,8 @@ class _StreamState:
         # 5. Multi-tier Context Visibility Management
         elif tag_name in ("unlock_file", "lock_file", "hide_file"):
             from lollms_client.lollms_artefact import ArtefactVisibility
+
+            self._note_informational_step()
 
             # ── CONTEXT BUDGET GUARD ──
             # Maximum tokens allowed for a single file to be unlocked into context.
@@ -2921,6 +3083,19 @@ class _StreamState:
     def was_tool_refusal_detected(self) -> bool:
         """Returns True if a <tool> dispatch was refused for a tool-less agent tier."""
         return self._tool_refusal_detected
+
+    def _is_identical_scratchpad_retry(self, title: str, body: str) -> bool:
+        """True when this dispatch is byte-identical to the immediately preceding scratchpad write."""
+        last_write = getattr(self.discussion, "_last_scratchpad_write", None)
+        if last_write is None:
+            return False
+        body_hash = hashlib.sha256(body.strip().encode("utf-8", errors="ignore")).hexdigest()
+        return last_write == (title, body_hash)
+
+    def _register_scratchpad_write(self, title: str, body: str) -> None:
+        """Records the last scratchpad dispatch so only byte-identical retries are blocked."""
+        body_hash = hashlib.sha256(body.strip().encode("utf-8", errors="ignore")).hexdigest()
+        object.__setattr__(self.discussion, "_last_scratchpad_write", (title, body_hash))
 
     def passthrough(self, chunk, msg_type=None, meta=None) -> bool:
         if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
@@ -4820,6 +4995,13 @@ class ChatMixin:
                 "again with the same parameters to regenerate it. Instead, reference the produced "
                 "file URL in your final answer (e.g. <img src=\"/api/workspace_files/filename.png\" /> "
                 "for images) and STOP generating.\n"
+                "5. **NO VERBATIM RETRIES OF FAILED CALLS**: If a tool fails or its output contains a non-zero "
+                "return code (e.g. 'RC: 1'), re-running the SAME tool with the SAME parameters is a LOOP ERROR and "
+                "WILL be blocked — cosmetic options ('force', 'raw', 'verbose', 'full', 'window', 'max_tokens') are "
+                "ignored by the loop guard. Escalate instead: (a) MUTATE the inputs (fix the offending SOURCE FILE "
+                "with a SEARCH/REPLACE patch — a compiler error lives in the source, not the compiler), (b) SWITCH "
+                "tools (grep/read the error log to locate the defect), or (c) STOP and report the failure to the "
+                "user with the suggested fix.\n"
             )
 
         # Sub-Agent Delegation Grammar (single canonical teacher)
@@ -5005,6 +5187,9 @@ class ChatMixin:
         environment_epoch = 0
         _last_failure_epoch = -1
         successful_tool_signatures: set = set()
+        consecutive_identical_calls: Dict[str, int] = {}
+        last_executed_action_key: Optional[str] = None
+        noncompliance_streak = 0
 
         def _current_workspace_revision() -> int:
             return int(getattr(self, "_workspace_write_revision", 0))
@@ -5203,6 +5388,7 @@ class ChatMixin:
 
         # Initialize pending memory searches list for this turn
         object.__setattr__(self, '_pending_memory_searches', [])
+        object.__setattr__(self, "_last_scratchpad_write", None)
 
         def _bump_environment_epoch() -> None:
             nonlocal environment_epoch
@@ -5251,6 +5437,21 @@ class ChatMixin:
                 break
 
             _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_START)
+
+            shake_active = noncompliance_streak >= 2
+            if shake_active:
+                base_temp = kwargs.get("temperature")
+                if isinstance(base_temp, (int, float)):
+                    bumped = float(base_temp) + 0.2
+                    round_temperature = bumped if float(base_temp) >= 1.2 else min(bumped, 1.2)
+                else:
+                    round_temperature = 0.9
+                ASCIIColors.warning(
+                    f"[ChatLoop] Shake triggered: {noncompliance_streak} consecutive "
+                    f"non-compliant round(s). Bumping temperature to {round_temperature}."
+                )
+            else:
+                round_temperature = temperature
 
             # Make round count accessible to _StreamState for logging
             object.__setattr__(self, '_current_round', round_count)
@@ -5313,6 +5514,18 @@ class ChatMixin:
                 digest_block += "\n".join(turn_digest_log)
                 digest_block += "\n[END COMPLETED ACTIONS DIGEST]\n"
                 current_system_prompt += "\n" + digest_block
+
+            if shake_active:
+                shake_line = random.choice(_SHAKE_MESSAGES)
+                current_system_prompt += (
+                    f"\n[SYSTEM PERTURBATION — APPROACH CHANGE REQUIRED]\n"
+                    f"You have produced {noncompliance_streak} consecutive NON-COMPLIANT rounds "
+                    f"(actions announced without functional tags, rejected dispatches, or "
+                    f"repeated blocked calls).\n"
+                    f"{shake_line}\n"
+                    f"Choose a materially different action now, or write your best final answer "
+                    f"to the user and emit `<done/>`. Repeating your previous pattern WILL fail again.\n"
+                )
 
             messages_list = self.export(
                 format_type="openai_chat",
@@ -5602,7 +5815,7 @@ class ChatMixin:
                     messages=messages_list,
                     images=round_images if round_images else None,
                     stream=True,
-                    temperature=temperature,
+                    temperature=round_temperature,
                     streaming_callback=_inline_relay,
                     **gen_kwargs
                 )
@@ -6001,6 +6214,9 @@ class ChatMixin:
 
                         ASCIIColors.success(f"[ChatMixin] Injected {len(results)} memory search results into virtual history")
 
+                last_executed_action_key = f"memory_search:{round_count}"
+                noncompliance_streak = 0
+
                 # Clear the pending searches
                 self._pending_memory_searches = []
 
@@ -6053,6 +6269,7 @@ class ChatMixin:
 
                 object.__setattr__(self, "_worker_counter", payload["worker_index"])
                 _bump_environment_epoch()
+                noncompliance_streak = 0
 
                 if sealed_run is not None:
                     runs = getattr(ai_msg, "metadata", None)
@@ -6113,6 +6330,7 @@ class ChatMixin:
             # We must only force-final-answer for TRUE duplicates, not failed patches.
             if ss.was_action_dispatched() and not ss.tool_trigger and not ss.affected_artefacts:
                 if ss.was_last_dispatch_failed():
+                    noncompliance_streak += 1
                     correction_body = ""
                     if getattr(ss, "_last_failure_kind", None) == "agent_tag":
                         ASCIIColors.warning("[ChatMixin] <agent> tag malformed. Injecting agent-syntax correction.")
@@ -6127,6 +6345,18 @@ class ChatMixin:
                             "MANDATORY: the instructions MUST be wrapped in literal <task> and </task> tags. "
                             "Plain-text markers like '=== TASK ===' are NOT parsed. "
                             "Do not wrap the delegation in code fences or any other tags.]"
+                        )
+                    elif getattr(ss, "_last_failure_kind", None) == "scratchpad_duplicate":
+                        ASCIIColors.warning("[ChatMixin] Identical consecutive scratchpad write blocked. Injecting variation correction.")
+                        correction_body = (
+                            "[SYSTEM: Your scratchpad write was BLOCKED — its content is EXACTLY identical to your previous dispatch.\n"
+                            "Re-emitting byte-identical content is a loop error: it reproduces the same result (or the same failure).\n"
+                            "Choose one:\n"
+                            "1. If the previous patch FAILED, fix it: re-copy the SEARCH block EXACTLY from the scratchpad's current "
+                            "content (see the Active Artifacts zone), correct the REPLACE block, and re-emit the modified patch.\n"
+                            "2. If the previous write SUCCEEDED, do not write again — perform a different action (tool call, document "
+                            "read) or finish with `<done/>`.\n"
+                            "3. To record NEW findings, write genuinely NEW content — never re-send the same body.]"
                         )
                     else:
                         ASCIIColors.warning("[ChatMixin] Artifact patch failed. Injecting correction context.")
@@ -6247,6 +6477,7 @@ class ChatMixin:
                 )
                 object.__setattr__(self, "_worker_counter", worker_index)
                 _bump_environment_epoch()
+                noncompliance_streak = 0
 
                 full_round_text = ss.get_clean_text_so_far()
                 raw_delegate_text = full_round_text[current_content_length:]
@@ -6278,6 +6509,8 @@ class ChatMixin:
             # If the StreamState dispatched an artifact, note, skill, or context update
             # (but NOT a tool), we must halt generation, hydrate virtual_history, and re-prompt.
             if ss.was_action_dispatched() and not ss.tool_trigger:
+                last_executed_action_key = f"artifact_dispatch:{round_count}"
+                noncompliance_streak = 0
                 if ss.affected_artefacts:
                     _bump_environment_epoch()
                     ASCIIColors.info(
@@ -6707,6 +6940,66 @@ class ChatMixin:
                         f"success_set_size={len(successful_tool_signatures)}"
                     )
 
+                    canonical_call_key = f"{tool_name}::{_canonicalize_tool_params(tool_params)}"
+                    if last_executed_action_key is not None and last_executed_action_key != canonical_call_key:
+                        consecutive_identical_calls.clear()
+                    last_executed_action_key = canonical_call_key
+                    consecutive_identical_calls[canonical_call_key] = (
+                        consecutive_identical_calls.get(canonical_call_key, 0) + 1
+                    )
+
+                    if consecutive_identical_calls[canonical_call_key] >= 2:
+                        noncompliance_streak += 1
+                        ASCIIColors.warning(
+                            f"[ChatMixin] Repetitive identical tool call blocked: '{tool_name}' "
+                            f"(attempt {consecutive_identical_calls[canonical_call_key]}, "
+                            f"no intervening action)."
+                        )
+                        status_err_line = f"* Tool call blocked to prevent loop.\n"
+                        details_block = (
+                            f"Loop Intercepted:\n"
+                            f"You re-issued the identical call to '{tool_name}' with the same effective "
+                            f"parameters. Cosmetic option noise ('force', 'raw', 'verbose', 'full', 'window', "
+                            f"'max_tokens', ...) is ignored by the loop guard. Re-running an unchanged command "
+                            f"on an unchanged workspace deterministically reproduces the previous result.\n"
+                        )
+                        if event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                            tool_close_tag = f"{status_err_line}{details_block}<!-- status:failure -->\n</processing>\n\n"
+                            ai_msg.content += tool_close_tag
+                            _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                            _cb(callback, "", MSG_TYPE.MSG_TYPE_TOOL_END, {
+                                "tool_name": tool_name,
+                                "success": False,
+                                "output": "",
+                                "error": "Repetitive identical tool call blocked (no intervening action).",
+                            })
+
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="user",
+                            content=(
+                                f'<tool_result name="{tool_name}" status="FAILED">\n'
+                                f"Repetitive identical call blocked. The previous execution's output is already in your context.\n"
+                                f"</tool_result>\n\n"
+                                "⚠️ **Identical Tool Call Blocked — Escalation Ladder (MANDATORY).**\n"
+                                "Re-running a tool with unchanged parameters on unchanged inputs is a LOOP ERROR: "
+                                "it deterministically reproduces the same failure. Adding cosmetic options does NOT "
+                                "change the outcome and will be blocked again. Choose exactly ONE next move:\n"
+                                "1. **MUTATE THE INPUTS**: fix the actual error. If a compiler or build tool returned "
+                                "a non-zero code (e.g. pdflatex 'RC: 1', 'Bibliography not compatible with author-year "
+                                "citations'), the defect is in the SOURCE FILE, not the compiler. Patch the artifact "
+                                "(for the natbib example: replace \\usepackage{natbib} with \\usepackage[numbers]{natbib} "
+                                "or remove the package) using a SEARCH/REPLACE block, THEN re-run the tool.\n"
+                                "2. **SWITCH TOOLS**: inspect the failure instead of re-running it — grep or read the "
+                                "build log (e.g. the .log file) to locate the exact offending line.\n"
+                                "3. **STOP AND REPORT**: if you cannot fix it, write your final answer to the user "
+                                "describing the error, what you tried, and the suggested fix, then emit `<done/>`.\n"
+                                "Never repeat a failed action verbatim."
+                            )
+                        ))
+                        _persist_round_state()
+                        continue
+
                     if failure_memory and hasattr(failure_memory, "_signatures"):
                         has_prev_failure = context_aware_signature in failure_memory._signatures
                     else:
@@ -6726,6 +7019,7 @@ class ChatMixin:
                         # build, context unlock, tool that wrote files) bumps
                         # the epoch and re-enables the retry.
                         if environment_epoch == _last_failure_epoch:
+                            noncompliance_streak += 1
                             result_str = (
                                 f"Error executing tool '{tool_name}': this exact call (identical parameters "
                                 f"AND no environment change since the last failure) already failed on the "
@@ -6770,6 +7064,7 @@ class ChatMixin:
                         continue
 
                     if context_aware_signature in successful_tool_signatures:
+                        noncompliance_streak += 1
                         ASCIIColors.warning(
                             f"[ChatMixin] Repetitive SUCCESS loop blocked for '{tool_name}'. "
                             f"Signature recorded and workspace state unchanged since last success."
@@ -7016,6 +7311,16 @@ class ChatMixin:
                                     call_kwargs["lollms_client_instance"] = self.lollmsClient
                                 if "tool_context" in _tool_sig_params or has_var_kw:
                                     call_kwargs["tool_context"] = _tool_context
+                                if not has_var_kw:
+                                    accepted_params = set(_tool_sig_params.keys())
+                                    unexpected_keys = [k for k in call_kwargs if k not in accepted_params]
+                                    for unexpected_key in unexpected_keys:
+                                        call_kwargs.pop(unexpected_key, None)
+                                    if unexpected_keys:
+                                        ASCIIColors.warning(
+                                            f"[ChatMixin] Dropped unexpected parameter(s) {unexpected_keys} "
+                                            f"not accepted by tool '{tool_name}'."
+                                        )
 
                                 # ── Take BEFORE Snapshot ──
                                 files_before = {}
@@ -7168,7 +7473,7 @@ class ChatMixin:
                                 else:
                                     tool_output_tokens = len(clean_result_str) // 4
 
-                                if tool_output_tokens > 1500:
+                                if tool_output_tokens > 1500 and not tool_name.startswith("tool_doc_"):
                                     is_structured = (
                                         tool_name.startswith("tool_query") or 
                                         tool_name.startswith("tool_execute_python_data") or
@@ -7303,6 +7608,17 @@ class ChatMixin:
                             "error": cb_error,
                         })
 
+                    if not is_failure:
+                        nonzero_rc = re.search(
+                            r'(?im)^\s*(?:RC|return[_\s]?code)\s*[:=]\s*([1-9]\d*)\s*$',
+                            clean_result_str,
+                        )
+                        if nonzero_rc:
+                            ASCIIColors.warning(
+                                f"[ChatMixin] Tool '{tool_name}' reported success but its output contains "
+                                f"non-zero return code {nonzero_rc.group(1)}. Treating as failure."
+                            )
+                            is_failure = True
                     tool_success = not is_failure
                     if not tool_success:
                         clean_result_str = re.sub(
@@ -7360,6 +7676,7 @@ class ChatMixin:
                         "success": tool_success,
                         "round": round_count,
                     })
+                    noncompliance_streak = 0
 
                     # ── 🔄 ACTION-WINDOW RECOLLECTION COMPRESSION ──
                     # Expired action rounds are digested into the system-zone
@@ -7528,6 +7845,11 @@ class ChatMixin:
                     break
 
                 ASCIIColors.info("[ChatMixin] Text-only round without <done/>. Continuing loop until explicit termination.")
+                noncompliance_streak += 1
+                if _detect_intent_only_round(raw_round_text):
+                    ASCIIColors.warning(
+                        "[ChatLoop] Intent-only round detected: action announced without any functional tag."
+                    )
                 clean_history_text = scrub_processing_and_status_blocks(raw_round_text)
                 if clean_history_text.strip():
                     virtual_history.append(SimpleNamespace(

@@ -34,6 +34,7 @@ from ascii_colors import ASCIIColors, trace_exception
 
 from .skills_manager import SkillsManager
 from .handbag import Handbag
+from .doc_navigator import DocNavigator, build_doc_tools, build_docs_scope_block
 from .lollms_agent_state import _AgentStreamState, _sanitize_tool_result, _ToolsManager
 
 from lollms_client.lollms_chat_core import (
@@ -4294,6 +4295,10 @@ JSON:"""
                 source = "model_switcher"
                 category = "model_management"
                 is_handbag = False
+            elif name.startswith("tool_doc_"):
+                source = "handbag_docs"
+                category = "knowledge_retrieval"
+                is_handbag = True
             elif name == "tool_query_rag":
                 source = "rag"
                 category = "knowledge_retrieval"
@@ -4395,6 +4400,32 @@ JSON:"""
                 self.skills_manager._skills_dirs = []
                 self.skills_manager.reload()
             ASCIIColors.info(f"[{self.name}] 📚 No handbag or extra skills found.")
+
+    def _get_doc_navigator(self) -> Optional[DocNavigator]:
+        """Returns a DocNavigator over the handbag's docs/ library, or None when absent/empty."""
+        if not self.handbag_path:
+            return None
+        try:
+            navigator = DocNavigator(Path(self.handbag_path) / "docs")
+        except Exception:
+            return None
+        return navigator if navigator.has_documents() else None
+
+    def add_document(
+        self,
+        file_path: Union[str, Path],
+        use_llm: bool = False,
+    ) -> Optional[Path]:
+        """
+        Ingests a document (txt/md/pdf/docx/pptx) into the handbag's docs/ library.
+        Requires a handbag-backed personality; returns the created document directory
+        or None when no handbag is bound.
+        """
+        if not self.handbag_path or not Path(self.handbag_path).exists():
+            ASCIIColors.warning(f"[{self.name}] add_document requires a handbag-backed personality.")
+            return None
+        hb = Handbag(self.handbag_path)
+        return hb.add_document(file_path, use_llm=use_llm, lollms_client=self.lollms_client)
 
     def _discover_tools(
         self,
@@ -4975,6 +5006,26 @@ JSON:"""
             except Exception as e:
                 ASCIIColors.warning(f"[{self.name}] Failed to merge personality-specific tools: {e}")
 
+        doc_navigator = self._get_doc_navigator()
+        if doc_navigator is not None:
+            try:
+                def _doc_scratchpad_appender(block: str) -> str:
+                    return self._execute_scratchpad_update("scratchpad_append", block)
+
+                doc_tools = build_doc_tools(
+                    doc_navigator,
+                    scratchpad_appender=_doc_scratchpad_appender,
+                    max_chars_provider=lambda: _calculate_dynamic_tool_char_limit(self.lollms_client),
+                )
+                active_tools.update(doc_tools)
+                ASCIIColors.info(
+                    f"[{self.name}] 📚 Mounted handbag documentation tools ({len(doc_tools)} tool(s))."
+                )
+            except Exception as doc_tools_ex:
+                ASCIIColors.warning(
+                    f"[{self.name}] Failed to mount handbag documentation tools: {doc_tools_ex}"
+                )
+
         if explicit_tools:
             active_tools.update(explicit_tools)
 
@@ -5490,6 +5541,14 @@ JSON:"""
                 "=== END DOCUMENT ANNOTATION WORKFLOW ===\n"
             )
 
+        docs_scope = ""
+        doc_navigator = self._get_doc_navigator()
+        if doc_navigator is not None:
+            try:
+                docs_scope = build_docs_scope_block(doc_navigator)
+            except Exception:
+                docs_scope = ""
+
         parts = [sys_prompt]
         if onboarding_block:
             parts.append(onboarding_block)
@@ -5507,6 +5566,8 @@ JSON:"""
             parts.append(computer_use_workflow)
         if document_annotation_workflow:
             parts.append(document_annotation_workflow)
+        if docs_scope:
+            parts.append(docs_scope)
 
         return "\n\n".join(p.strip() for p in parts if p and p.strip())
     

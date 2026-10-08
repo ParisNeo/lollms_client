@@ -90,7 +90,7 @@ def __dir__():
     return sorted(list(globals().keys()) + list(_WORKFLOW_EXPORTS))
 
 
-__version__ = "1.20.14"
+__version__ = "1.20.15"
 
 __all__ = [
     "LollmsClient",

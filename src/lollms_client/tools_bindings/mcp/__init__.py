@@ -12,7 +12,7 @@ from lollms_client.lollms_tools_binding import LollmsToolBinding
 from ascii_colors import ASCIIColors, trace_exception
 
 try:
-    pm.ensure_packages(["mcp", "httpx"])
+    pm.ensure_packages(["mcp", "httpx", "pywintypes"])
     from mcp import ClientSession, StdioServerParameters, types
     from mcp.client.stdio import stdio_client
     from mcp.client.streamable_http import streamablehttp_client

@@ -22,6 +22,7 @@ class Handbag:
         self.assets_dir = self.path / "assets"
         self.memory_dir = self.path / "memory"
         self.rag_dir = self.path / "rag"
+        self.docs_dir = self.path / "docs"
         self.workspace_dir = self.path / "workspace"
 
         self.manifest = self._load_manifest()
@@ -94,6 +95,34 @@ class Handbag:
                 files.append(f.resolve())
         return files
 
+    def has_documents(self) -> bool:
+        """Returns True when the handbag carries a non-empty docs/ library."""
+        if not self.docs_dir.exists() or not self.docs_dir.is_dir():
+            return False
+        try:
+            return any(item.name != ".gitkeep" for item in self.docs_dir.iterdir())
+        except Exception:
+            return False
+
+    def add_document(
+        self,
+        file_path: Union[str, Path],
+        use_llm: bool = False,
+        lollms_client: Optional[Any] = None,
+    ) -> Path:
+        """
+        Ingests a document (txt/md/pdf/docx/pptx) into the handbag's docs/ library
+        as a heading-chunked tree with an INDEX.md (title, authors, abstract,
+        ordered section map with token estimates).
+
+        The LLM is only consulted for metadata when use_llm=True AND the
+        deterministic heuristics failed.
+        """
+        from .doc_navigator import DocIngestor
+        return DocIngestor().add_document(
+            file_path, self.path, use_llm=use_llm, lollms_client=lollms_client
+        )
+
     @staticmethod
     def create_structure(target_path: Union[str, Path], name: str = "My Handbag") -> Path:
         p = Path(target_path).resolve()
@@ -102,6 +131,7 @@ class Handbag:
         (p / "tools").mkdir(exist_ok=True)
         (p / "skills").mkdir(exist_ok=True)
         (p / "rag").mkdir(exist_ok=True)
+        (p / "docs").mkdir(exist_ok=True)
         (p / "memory").mkdir(exist_ok=True)
         (p / "assets").mkdir(exist_ok=True)
         (p / "workspace").mkdir(exist_ok=True)
