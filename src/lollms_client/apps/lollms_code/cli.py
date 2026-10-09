@@ -80,6 +80,10 @@ from lollms_client.lollms_personality import LollmsPersonality
 from lollms_client.lollms_personality.lollms_personality import CapabilityFlags
 from lollms_client.lollms_personality.skills_manager import SkillsManager
 from lollms_client.lollms_types import EventMode, MSG_TYPE
+from lollms_client.apps.lollms_code.user_profile import (
+    build_user_profile_context,
+    seed_user_profile,
+)
 
 
 APP_NAME = "lollms_code"
@@ -1183,6 +1187,9 @@ def ensure_sandbox_structure(config: CodeAgentConfig):
     if not current_plan.exists():
         current_plan.write_text("# Current Task\n\nNo active task plan defined yet. Initialize your macro steps plan here at the start of a task.\n", encoding="utf-8")
 
+    seed_user_profile(config.workspace_path)
+
+
 def build_environment_context(config: CodeAgentConfig) -> str:
     """Builds a compact dynamic system prompt block describing the execution environment."""
     is_windows = platform.system() == "Windows"
@@ -1266,6 +1273,10 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
 
     if "## MACRO STEPS PLANNING (CURRENT.md)" not in personality.system_prompt:
         personality.system_prompt += "\n\n" + CODING_EXECUTION_HARNESS
+
+    user_profile_ctx = build_user_profile_context(config.workspace_path)
+    if user_profile_ctx:
+        personality.system_prompt += user_profile_ctx
 
     ASCIIColors.rich_print(f" [green]✓[/green] [dim]({personality.name})[/dim]")
 
@@ -3854,6 +3865,17 @@ def run_lollms_code_config_menu(
 
         selection = menu.run()
         if _is_back_choice(selection):
+            # Prompt or auto-save before exiting config menu
+            ASCIIColors.cyan("\n  💾 Saving configuration changes...")
+            
+            # 1. Save Agent Config (CodeAgentConfig -> config.json)
+            config.save()
+            
+            # 2. Save LLM/Binding Profiles (shared_config_map -> .env/config.yaml)
+            # This ensures changes made in the Client Wizard are persisted
+            _save_and_validate(shared_config_map, test_connection=False, cli_env_path=cli_env_path)
+            
+            ASCIIColors.green("  ✅ Configuration saved successfully.")
             break
 
         if selection == "client_wizard":

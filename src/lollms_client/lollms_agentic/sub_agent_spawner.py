@@ -21,7 +21,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ascii_colors import ASCIIColors, trace_exception
 
-from lollms_client.lollms_types import MSG_TYPE
+from lollms_client.lollms_types import MSG_TYPE, EventMode
 
 _AGENT_ATTR_RE = re.compile(r'(\w+)=["\']([^"\']*)["\']')
 _TASK_RE = re.compile(r'<task>(.*?)</task>', re.DOTALL | re.IGNORECASE)

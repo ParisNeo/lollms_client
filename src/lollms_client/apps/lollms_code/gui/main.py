@@ -29,7 +29,8 @@ logger = logging.getLogger("lollms_code.gui")
 logger.info("Starting lollms_code GUI session...")
 
 import pipmaster as pm
-pm.ensure_packages(["nicegui", "pywebview"])
+pm.ensure_packages(["wheel", "setuptools"], always_update=True)
+pm.ensure_packages(["click", "nicegui", "pywebview"])
 from nicegui import ui, app as nicegui_app
 from ascii_colors import ASCIIColors, trace_exception
 

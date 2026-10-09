@@ -6,6 +6,10 @@ from typing import Optional, List, Dict, Any, Union, Callable
 from ascii_colors import trace_exception
 from lollms_client.lollms_base_binding import LollmsBaseBinding
 
+# A media input is either a filesystem path or the raw bytes of the file.
+MediaInput = Union[str, Path, bytes]
+
+
 class LollmsTTVBinding(LollmsBaseBinding):
     """Abstract base class for all LOLLMS Text-to-Video bindings."""
 
@@ -24,6 +28,37 @@ class LollmsTTVBinding(LollmsBaseBinding):
         Generates video data from the provided text prompt.
         """
         pass
+
+    # ── Optional capabilities ─────────────────────────────────────────────────
+    # Bindings opt in by overriding supports_*() AND the matching generate_*().
+    # Callers must check supports_*() first; the default generate_*() raises.
+
+    def supports_lipsync(self) -> bool:
+        """
+        True if this binding can generate a talking video from a portrait image and an
+        audio track (mouth movements synchronized to the audio). Default: False.
+        Implementations may return False at runtime when the current backend/hardware
+        tier cannot do it.
+        """
+        return False
+
+    def generate_lipsync_video(self, image: MediaInput, audio: MediaInput, prompt: str = "", **kwargs) -> bytes:
+        """
+        Generates a lip-synced video: `image` (path or bytes) is animated so that the
+        subject speaks `audio` (path or bytes). `prompt` optionally guides the scene.
+        Returns the encoded video (mp4) as bytes.
+
+        Optional kwargs a binding may honor: negative_prompt, seed, fps, width, height,
+        num_frames, num_inference_steps, guidance_scale, image_ext / audio_ext (when
+        passing raw bytes). Unknown kwargs must be ignored, not rejected.
+
+        Unimplemented by default: bindings without this ability raise NotImplementedError.
+        """
+        raise NotImplementedError(f"{self.binding_name} does not support lip-sync video generation")
+
+    def get_capabilities(self) -> Dict[str, bool]:
+        """Capability flags for UIs/agents. Extend as new optional abilities are added."""
+        return {"text_to_video": True, "lipsync": bool(self.supports_lipsync())}
 
     @abstractmethod
     def list_models(self, **kwargs) -> List[str]:

@@ -30,6 +30,10 @@ try:
     from lollms_client.lollms_personality import LollmsPersonality
     from lollms_client.lollms_personality.lollms_personality import CapabilityFlags
     from lollms_client.lollms_types import MSG_TYPE, EventMode
+    from lollms_client.apps.lollms_code.user_profile import (
+        build_user_profile_context,
+        seed_user_profile,
+    )
 except ImportError:
     # Allows the GUI to at least launch (Settings page) before lollms_client
     # is on the path, so users get a friendly error instead of a crash.
@@ -38,6 +42,8 @@ except ImportError:
     CapabilityFlags = None
     MSG_TYPE = None
     EventMode = None
+    build_user_profile_context = None
+    seed_user_profile = None
 
 # Point this at wherever CODING_SYSTEM_PROMPT actually lives in your project.
 # Simplest fix: `from lollms_code.cli import CODING_SYSTEM_PROMPT`
@@ -68,6 +74,23 @@ class AgentEvent:
                            # "artefact_start" | "artefact_end" | "context_update" |
                            # "info" | "done" | "error"
         self.data = data
+
+
+def build_user_profile_context(workspace_path: str) -> str:
+    user_md_path = Path(workspace_path) / ".lollms_code" / "USER.md"
+    if not user_md_path.exists():
+        return ""
+    try:
+        content = user_md_path.read_text(encoding="utf-8", errors="ignore").strip()
+        if not content:
+            return ""
+        return f"""
+=== USER PROFILE (From .lollms_code/USER.md) ===
+{content}
+=== END USER PROFILE ===
+"""
+    except Exception:
+        return ""
 
 
 def build_environment_context(workspace_path: str) -> str:
@@ -181,6 +204,9 @@ def ensure_sandbox_structure(prefs: GuiPrefs) -> None:
             "# Current Task\n\nNo active task plan defined yet.\n", encoding="utf-8"
         )
 
+    if seed_user_profile is not None:
+        seed_user_profile(prefs.workspace_path)
+
 
 def _to_bool(v: Any) -> bool:
     return v.lower().strip() in ("true", "1", "yes", "y") if isinstance(v, str) else bool(v)
@@ -293,6 +319,11 @@ def create_personality(prefs: GuiPrefs, client):
     personality.system_prompt = (
         personality.system_prompt + "\n" + build_environment_context(prefs.workspace_path)
     )
+
+    if build_user_profile_context is not None:
+        user_ctx = build_user_profile_context(prefs.workspace_path)
+        if user_ctx:
+            personality.system_prompt += user_ctx
 
     if has_tti:
         personality.system_prompt += (

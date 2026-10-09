@@ -1,0 +1,84 @@
+title: "stable-diffusion.cpp TTV"
+author: "ParisNeo"
+version: 0.1.0
+binding_name: "sd_cpp"
+description: |
+  Text/image-to-video and lip-sync through stable-diffusion.cpp (sd-cli). No server, no ComfyUI:
+  one sd-cli process per generation. MiniMax-H3 (video + stereo audio) is the built-in preset, with
+  quant/offload chosen from your VRAM. Other sd.cpp video models can be downloaded from Hugging Face
+  and registered as profiles. The runtime and weights install themselves on first use.
+
+global_input_parameters:
+  - {name: model_name, type: str, default: "minimax_h3", description: "Default model: minimax_h3 or a registered profile."}
+  - {name: sd_cli_path, type: str, default: "", description: "Use this sd-cli instead of the auto-installed one."}
+  - {name: accelerator, type: str, default: "auto", description: "auto | cuda | vulkan | cpu | metal (runtime install)."}
+  - {name: auto_install, type: bool, default: true, description: "Install sd-cli on first use."}
+  - {name: auto_download, type: bool, default: true, description: "Download missing weights on first use."}
+  - {name: hf_token, type: str, default: "", description: "Hugging Face token.", is_secret: true}
+  - {name: models_path, type: str, default: "./data/ttv_models/sd_cpp", description: "Where weights are stored."}
+  - {name: tier, type: str, default: "auto", description: "auto | t12 | t16 | t24 | t42 (H3 quant/offload preset)."}
+  - {name: max_frames, type: int, default: 0, description: "Override the tier frame cap (0 = default)."}
+  - {name: max_side, type: int, default: 0, description: "Override the tier resolution cap (0 = default)."}
+  - {name: h3_repo, type: str, default: "unsloth/MiniMax-H3-GGUF", description: "HF repo for H3 diffusion/text-encoder GGUFs."}
+  - {name: extra_args, type: str, default: "", description: "Extra sd-cli flags appended to every run."}
+  - {name: timeout_s, type: int, default: 3600, description: "Kill a generation after this many seconds."}
+
+model_input_parameters:
+  - {name: model, type: str, default: "minimax_h3", description: "Model or profile name."}
+  - {name: width, type: int, default: 864, description: "Width (multiple of 32; clamped to the tier)."}
+  - {name: height, type: int, default: 480, description: "Height (multiple of 32; clamped to the tier)."}
+  - {name: num_frames, type: int, default: 56, description: "Frames (H3 grid is 17k+5: 5, 22, 39, 56, 73...; clamped to the tier)."}
+  - {name: steps, type: int, default: 0, description: "Sampling steps (0 = sd.cpp default)."}
+  - {name: cfg_scale, type: float, default: 1.0, description: "CFG scale (the H3 examples use 1.0)."}
+  - {name: seed, type: int, default: -1, description: "-1 = random."}
+  - {name: no_audio, type: bool, default: false, description: "Skip audio decoding (video only)."}
+
+commands:
+  - name: install_runtime
+    title: Install / update sd-cli
+    description: "Downloads a prebuilt sd-cli (or builds the CUDA binary on Linux) and checks it supports MiniMax-H3."
+    parameters:
+      - {name: force, type: bool, description: "Reinstall even if present.", mandatory: false}
+      - {name: accelerator, type: str, description: "auto | cuda | vulkan | cpu | metal", mandatory: false}
+    output:
+      - {name: status, type: bool, description: "true on success"}
+      - {name: message, type: str, description: "Result"}
+  - name: download_model
+    title: Download a model file from Hugging Face
+    description: "Downloads one file (filename) or several (pattern, e.g. '*Q4_K*.gguf') from any HF repo into the models folder."
+    parameters:
+      - {name: repo_id, type: str, description: "e.g. 'unsloth/MiniMax-H3-GGUF'.", mandatory: true}
+      - {name: filename, type: str, description: "Exact file name or path in the repo.", mandatory: false}
+      - {name: pattern, type: str, description: "Glob over the repo files.", mandatory: false}
+      - {name: subfolder, type: str, description: "diffusion_models | vae | text_encoders | other", mandatory: false}
+      - {name: revision, type: str, description: "Branch / tag / commit.", mandatory: false}
+    output:
+      - {name: status, type: bool, description: "true on success"}
+      - {name: paths, type: list, description: "Downloaded files"}
+      - {name: message, type: str, description: "Result"}
+  - name: list_repo_files
+    title: List files of a Hugging Face repo
+    description: "Lists repo files, optionally filtered by glob, so you can pick what to download."
+    parameters:
+      - {name: repo_id, type: str, description: "HF repo id.", mandatory: true}
+      - {name: pattern, type: str, description: "Glob filter.", mandatory: false}
+    output:
+      - {name: files, type: list, description: "Matching files"}
+  - name: register_model
+    title: Register a downloaded model as a profile
+    description: "Maps roles (diffusion_model, vae, audio_vae, llm, llm_vision) to files, plus extra sd-cli flags, so the model can be used by name."
+    parameters:
+      - {name: name, type: str, description: "Profile name.", mandatory: true}
+      - {name: files, type: dict, description: "{role: path}", mandatory: true}
+      - {name: args, type: list, description: "Extra sd-cli flags for this model.", mandatory: false}
+    output:
+      - {name: status, type: bool, description: "true on success"}
+      - {name: message, type: str, description: "Result"}
+  - name: install_model
+    title: Install a model
+    description: "'minimax_h3' (tier-appropriate bundle) or an HF 'owner/repo' / 'owner/repo::file'."
+    parameters:
+      - {name: model_name, type: str, description: "minimax_h3 or HF repo.", mandatory: true}
+    output:
+      - {name: status, type: bool, description: "true on success"}
+      - {name: message, type: str, description: "Result"}

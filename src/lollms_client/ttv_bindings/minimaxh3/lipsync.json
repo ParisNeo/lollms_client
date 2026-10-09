@@ -1,0 +1,1 @@
+{"_README": "Replace with the API-format export of the official Ref2VA Talking Digital Human graph. Placeholders: {{prompt}}, {{negative_prompt}}, {{image_name}}, {{audio_name}}, {{duration}}, {{width}}, {{height}}, {{num_frames}}, {{num_inference_steps}}, {{guidance_scale}}, {{seed}}, {{fps}}, {{unet_name}}, {{clip_name}}, {{vae_video_name}}, {{vae_audio_name}}."}

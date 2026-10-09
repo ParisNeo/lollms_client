@@ -1,0 +1,36 @@
+title: "MiniMax H3 TTV"
+author: "ParisNeo"
+version: 0.1.0
+binding_name: "minimax_h3"
+description: |
+  Text/image-to-video with MiniMax-H3 through a shared local server.
+  The server detects total VRAM and picks a tier (12/16/24/42 GB): GGUF via ComfyUI for
+  the small tiers, Diffusers modular pipeline for the big one. Out-of-cap requests are clamped, not failed.
+
+global_input_parameters:
+  - {name: host, type: str, default: "localhost", description: "Server host."}
+  - {name: port, type: int, default: 9635, description: "Server port."}
+  - {name: hf_token, type: str, default: "", description: "Hugging Face token.", is_secret: true}
+  - {name: models_path, type: str, default: "./data/ttv_models/minimax_h3", description: "Model/cache directory."}
+  - {name: tier, type: str, default: "auto", description: "auto | t12 | t16 | t24 | t42 (force a tier, e.g. to test a bigger tier's code path)."}
+  - {name: comfy_url, type: str, default: "http://127.0.0.1:8188", description: "Running ComfyUI (small tiers)."}
+  - {name: workflow_path, type: str, default: "", description: "ComfyUI API-format workflow JSON (default: workflows/<workflow>.json)."}
+  - {name: torch_index_url, type: str, default: "https://download.pytorch.org/whl/cu128", description: "PyTorch wheel index for the private ComfyUI venv."}
+  - {name: gguf_node_repo, type: str, default: "https://github.com/molbal/ComfyUI-GGUF.git", description: "ComfyUI-GGUF custom node repo (H3-capable)."}
+  - {name: unet_repo, type: str, default: "Abiray/MiniMax-H3-Pruned-GGUF", description: "HF repo of the pruned UNet GGUFs."}
+  - {name: te_repo, type: str, default: "joeygambino/MiniMax-H3-encoder-GGUF", description: "HF repo of the text-encoder GGUFs."}
+  - {name: install_timeout_s, type: int, default: 7200, description: "Max wait for first-run install on the first generation."}
+  - {name: max_frames, type: int, default: 0, description: "Override the tier's frame cap (0 = tier default)."}
+  - {name: max_side, type: int, default: 0, description: "Override the tier's resolution cap (0 = tier default)."}
+
+model_input_parameters:
+  - {name: workflow, type: str, default: "fl2va", description: "fl2va (text / first-last frame) or ref2va (references)."}
+  - {name: width, type: int, default: 768, description: "Width (clamped to tier)."}
+  - {name: height, type: int, default: 512, description: "Height (clamped to tier)."}
+  - {name: num_frames, type: int, default: 25, description: "Frames (clamped to tier)."}
+  - {name: num_inference_steps, type: int, default: 30, description: "Denoising steps."}
+  - {name: guidance_scale, type: float, default: 5.0, description: "CFG scale."}
+  - {name: seed, type: int, default: -1, description: "-1 = random."}
+  - {name: fps, type: int, default: 24, description: "Output fps."}
+
+commands: []
