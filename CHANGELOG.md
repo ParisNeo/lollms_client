@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-10 13:53]
+
+- `fix(lollms_client): bump version to v1.20.16`
+
 ## [2026-10-08 14:04]
 
 - feat(discussion): add tool resolution helper to chat mixin
