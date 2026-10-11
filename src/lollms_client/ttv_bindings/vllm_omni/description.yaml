@@ -98,6 +98,23 @@ commands:
     description: "Query the running server for its currently loaded model(s) via the OpenAI-compatible /v1/models endpoint."
     params: []
 
+  - name: "generate_video"
+    description: >
+      Text-to-video generation for T2V models (e.g., Wan2.2-T2V-A14B, HunyuanVideo).
+      Includes negative_prompt to satisfy backend requirements for models like Qwen-Image-Edit.
+    params:
+      - name: "prompt"
+        type: "str"
+        description: "Text description of the desired video."
+      - name: "negative_prompt"
+        type: "str"
+        default: ""
+        description: "Negative guidance text. Recommended to be an empty string or specific negative terms for Qwen models."
+      - name: "seed"
+        type: "int"
+        default: -1
+        description: "RNG seed for reproducible generation. Use -1 for random."
+
   - name: "generate_video_from_image"
     description: >
       Image-to-video generation for I2V and TI2V models (e.g., Wan2.2-I2V-A14B, Wan2.2-TI2V-5B).

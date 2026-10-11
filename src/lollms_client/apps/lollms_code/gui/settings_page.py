@@ -375,19 +375,38 @@ def _render_bindings_cards(env: EnvStore, modality: str, container: ui.column, r
                 )
             return
 
+        # Determine which binding is currently active (linked to default profile)
+        active_binding_alias = None
+        default_profile_keys = env.profile_keys(modality, env.configured_profile_aliases(modality)[0]) if env.configured_profile_aliases(modality) else {}
+        if default_profile_keys.get("IS_DEFAULT", "").lower() == "true":
+            active_binding_alias = default_profile_keys.get("BINDING_ALIAS")
+
         for alias in aliases:
             keys = env.binding_keys(modality, alias)
             b_name = keys.get("BINDING_NAME", "unknown")
             host = keys.get("HOST_ADDRESS", "default host")
+            ssl_raw = keys.get("VERIFY_SSL_CERTIFICATE", "false")
+            ssl_enabled = str(ssl_raw).lower() in ("true", "1", "yes", "y", "on")
             cmds = _get_binding_commands_schema(env, modality, b_name)
+
+            is_active = (alias.upper() == (active_binding_alias or "").upper())
 
             with ui.card().classes(f"w-full p-4 border {BORDER} {CARD_BG} rounded-xl shadow-sm gap-2").props(':dark="Quasar.Dark.isActive"'):
                 with ui.row().classes("w-full items-center justify-between"):
                     with ui.row().classes("items-center gap-3"):
                         ui.badge(b_name.upper(), color="indigo").props("rounded dense")
+                        if is_active:
+                            ui.badge("ACTIVE", color="emerald").props("rounded dense")
                         with ui.column().classes("gap-0"):
                             ui.label(alias).classes("font-mono font-bold text-sm text-slate-900 dark:text-slate-100")
                             ui.label(f"Endpoint: {host}").classes("text-xs text-slate-500 dark:text-slate-400 font-mono")
+                        
+                        # SSL State Indicator
+                        ssl_color = "red" if not ssl_enabled else "emerald"
+                        ssl_text = "SSL OFF" if not ssl_enabled else "SSL ON"
+                        ui.badge(ssl_text, color=ssl_color).props("rounded dense").tooltip(
+                            "SSL Verification is disabled for this binding" if not ssl_enabled else "SSL Verification is enabled for this binding"
+                        )
 
                     with ui.row().classes("items-center gap-1.5"):
                         if cmds:

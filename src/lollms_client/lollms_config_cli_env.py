@@ -5,9 +5,13 @@ Supports Multi-Source Ingestion (env, json, yaml, ini) and the Two-Tier Profile 
 """
 import os
 import re
+import sys
 import json
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple, Union
+from typing import Dict, Any, List, Optional, Tuple, Union, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from lollms_client import LollmsClient
 
 from ascii_colors import ASCIIColors, Menu
 
@@ -658,6 +662,14 @@ def get_client_from_env(
 
             if model_name and "model_name" not in binding_config:
                 binding_config["model_name"] = model_name
+            elif not model_name and b_type == "llm":
+                # Fallback: check resolved_env for MODEL_NAME or LLM_MODEL_NAME
+                fallback_model = resolved_env.get("MODEL_NAME") or resolved_env.get(f"{prefix}_MODEL_NAME")
+                if fallback_model:
+                    binding_config["model_name"] = fallback_model
+                    ASCIIColors.warning(f"⚠️ No default profile found for LLM. Using MODEL_NAME from environment: {fallback_model}")
+                else:
+                    ASCIIColors.warning(f"⚠️ No model_name found for LLM binding '{binding_name}'. Please configure a profile or set MODEL_NAME env var.")
 
             if "host_address" not in binding_config:
                 host = resolved_env.get("HOST_ADDRESS") or resolved_env.get(f"{prefix}_HOST_ADDRESS")
@@ -815,10 +827,20 @@ def _configure_binding_instance(b_type: str, b_name: str, alias: str, config_map
 
     desc = _get_binding_description(b_name, b_type)
     if desc:
-        params = desc.get("global_input_parameters", []) + desc.get("model_input_parameters", [])
+        raw_params = desc.get("global_input_parameters", []) + desc.get("model_input_parameters", [])
+        seen_names = set()
+        params = []
+        for p in raw_params:
+            pname = p.get("name", "")
+            if not pname or pname == "model_name":
+                continue
+            name_key = pname.lower()
+            if name_key in seen_names:
+                continue
+            seen_names.add(name_key)
+            params.append(p)
         for p in params:
             pname = p.get("name", "")
-            if not pname or pname == "model_name": continue
             val = _prompt_param(pname, p.get("description", ""), p.get("type", "str"), p.get("mandatory", False), p.get("default"))
             if val is _BACK_SENTINEL:
                 ASCIIColors.yellow("\n  ⚠️ Binding configuration cancelled.")
@@ -1604,6 +1626,38 @@ def build_client_with_connection() -> "LollmsClient":
         debug=True,
     )
 
+def _deduplicate_binding_keys(config_map: Dict[str, str]) -> None:
+    """
+    Removes duplicate keys in config_map that differ only by case (e.g., VERIFY_SSL_CERTIFICATE vs verify_ssl_certificate).
+    Prefers the UPPERCASE version as the canonical key.
+    """
+    upper_map = {}
+    for k in config_map.keys():
+        k_upper = k.upper()
+        if k_upper not in upper_map:
+            upper_map[k_upper] = k
+        else:
+            # If we already have a key with this upper name, check if the current one is UPPERCASE
+            existing_key = upper_map[k_upper]
+            if k == k_upper and existing_key != k_upper:
+                # Current key is UPPERCASE, existing is not. Prefer current.
+                upper_map[k_upper] = k
+
+    # Delete keys that are not the preferred (UPPERCASE or first) one
+    for k in list(config_map.keys()):
+        k_upper = k.upper()
+        preferred = upper_map.get(k_upper)
+        if preferred != k:
+            del config_map[k]
+
+def _normalize_config_map_keys(config_map: Dict[str, str]) -> None:
+    """Normalizes all keys in config_map to UPPERCASE, resolving casing conflicts."""
+    new_map = {}
+    for k, v in config_map.items():
+        new_map[k.upper()] = v
+    config_map.clear()
+    config_map.update(new_map)
+
 def _load_existing_env_to_map(cli_env_path: Optional[Union[str, Path]] = None) -> Dict[str, str]:
     config_map = {}
 
@@ -1617,6 +1671,7 @@ def _load_existing_env_to_map(cli_env_path: Optional[Union[str, Path]] = None) -
                     config_map.update(load_env_file(p))
             except Exception as e:
                 ASCIIColors.warning(f"Failed to load configuration file {p}: {e}")
+        _normalize_config_map_keys(config_map)
         return config_map
 
     home_dir = Path.home() / ".lollms_client"
@@ -1641,6 +1696,7 @@ def _load_existing_env_to_map(cli_env_path: Optional[Union[str, Path]] = None) -
             except Exception as e:
                 ASCIIColors.warning(f"Failed to load local configuration {local_env}: {e}")
 
+    _normalize_config_map_keys(config_map)
     return config_map
 
 def _save_and_validate(

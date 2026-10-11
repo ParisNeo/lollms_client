@@ -256,9 +256,20 @@ class EnvStore:
             target_env = target_dir / ".env"
             with open(target_env, "w", encoding="utf-8") as f:
                 f.write("# Lollms Client Configuration\n# Written by lollms_code GUI settings\n\n")
-                for k, v in self.config_map.items():
-                    if v:
+                for k, v in sorted(self.config_map.items()):
+                    if v is not None and str(v).strip() != "":
                         f.write(f"{k}={v}\n")
+            try:
+                from lollms_client.lollms_config_cli_env import _serialize_config_map_to_yaml
+                import yaml as _yaml
+                yaml_data = _serialize_config_map_to_yaml(self.config_map)
+                with open(target_file, "w", encoding="utf-8") as f:
+                    _yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False)
+            except Exception:
+                with open(target_file, "w", encoding="utf-8") as f:
+                    for k, v in sorted(self.config_map.items()):
+                        if v is not None and str(v).strip() != "":
+                            f.write(f"{k}: {v}\n")
             self.env_path = target_file
         return self.env_path
 
@@ -310,7 +321,18 @@ class EnvStore:
             return []
         params = (desc.get("global_input_parameters") or desc.get("input_parameters") or []) + \
                  (desc.get("model_input_parameters") or [])
-        return [p for p in params if p.get("name") and p.get("name") != "model_name"]
+        
+        seen_names = set()
+        deduped_params = []
+        for p in params:
+            name = p.get("name")
+            if not name or name == "model_name":
+                continue
+            name_key = name.lower()
+            if name_key not in seen_names:
+                seen_names.add(name_key)
+                deduped_params.append(p)
+        return deduped_params
 
     def configured_binding_aliases(self, binding_type: str) -> List[str]:
         return get_configured_aliases(binding_type, self.config_map, "BINDINGS")
@@ -471,7 +493,7 @@ class EnvStore:
         b_name = None
         host_addr = ""
         service_key = ""
-        verify_ssl = "false"
+        verify_ssl_raw = "false"
         certificate_file_path = ""
 
         b_prefix = f"{prefix}_BINDINGS_{binding_alias.upper()}_"
@@ -483,15 +505,17 @@ class EnvStore:
             elif k.upper() in (f"{b_prefix}SERVICE_KEY", f"{b_prefix}API_KEY"):
                 service_key = v
             elif k.upper() == f"{b_prefix}VERIFY_SSL_CERTIFICATE":
-                verify_ssl = v
+                verify_ssl_raw = v
             elif k.upper() == f"{b_prefix}CERTIFICATE_FILE_PATH":
                 certificate_file_path = v
+
+        verify_ssl_bool = str(verify_ssl_raw).lower().strip() in ("true", "1", "yes", "y", "on")
 
         return dict(
             binding_name=b_name or "",
             model_name=model_name or "",
             host_address=host_addr,
             api_key=service_key,
-            verify_ssl=verify_ssl,
+            verify_ssl=verify_ssl_bool,
             certificate_file_path=certificate_file_path,
         )

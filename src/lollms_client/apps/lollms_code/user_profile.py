@@ -64,4 +64,3 @@ def build_user_profile_context(workspace_path: str | Path) -> str:
         f"{content}\n"
         "=== END USER PROFILE ===\n"
     )
-</file>

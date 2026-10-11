@@ -67,4 +67,57 @@ model_input_parameters:
     default: ["image"]
     description: "Output modalities requested from the server, e.g. ['image'], ['text','image']."
 
-commands: []
+commands:
+  - name: "generate_image"
+    title: "Generate Image"
+    description: "Generates an image from a text prompt."
+    parameters:
+      - name: "prompt"
+        type: "str"
+        description: "Text description of the image to generate."
+      - name: "negative_prompt"
+        type: "str"
+        default: ""
+        description: "Negative guidance text. Recommended to be an empty string for Qwen-Image-Edit models."
+      - name: "width"
+        type: "int"
+        default: 1024
+        description: "Image width in pixels."
+      - name: "height"
+        type: "int"
+        default: 1024
+        description: "Image height in pixels."
+
+  - name: "edit_image"
+    title: "Edit Image"
+    description: "Edits an existing image based on a text prompt."
+    parameters:
+      - name: "images"
+        type: "list"
+        description: "List of image sources (file paths or URLs) to edit."
+      - name: "prompt"
+        type: "str"
+        description: "Text description of the edits to make."
+      - name: "negative_prompt"
+        type: "str"
+        default: ""
+        description: "Negative guidance text. Recommended to be an empty string for Qwen-Image-Edit models."
+
+  - name: "generate"
+    title: "Omni Generate"
+    description: "Generates images (and optionally text) from a prompt using the omni interface."
+    parameters:
+      - name: "prompt"
+        type: "str"
+        description: "Text description of the content to generate."
+      - name: "negative_prompt"
+        type: "str"
+        default: ""
+        description: "Negative guidance text. Recommended to be an empty string for Qwen-Image-Edit models."
+      - name: "images"
+        type: "list"
+        description: "Optional list of input images for conditioning (I2V/Editing)."
+      - name: "modalities"
+        type: "list"
+        default: ["image"]
+        description: "Output modalities requested (e.g., ['image'], ['text', 'image'])."

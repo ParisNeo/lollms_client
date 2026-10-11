@@ -347,7 +347,14 @@ class LollmsBinding(LollmsLLMBinding):
         self.open_ai_host_address = f"{self.base_address}/v1"
         self.lollms_host_address = f"{self.base_address}/lollms/v1"
 
-        self.model_name = kwargs.get("model_name")
+        raw_model_name = kwargs.get("model_name")
+        if raw_model_name:
+            self.model_name = raw_model_name
+        else:
+            self.model_name = self._auto_detect_model_name()
+            if not self.model_name:
+                raise ValueError(f"[LollmsBinding] No model_name provided and auto-detection failed for host: {self.open_ai_host_address}")
+
         self.service_key = kwargs.get("service_key") or os.getenv("LOLLMS_API_KEY")
         raw_verify_ssl = kwargs.get("verify_ssl_certificate", True)
         if isinstance(raw_verify_ssl, str):
@@ -392,6 +399,21 @@ class LollmsBinding(LollmsLLMBinding):
         self._verify_obj = verify
         self._init_client()
         self.completion_format = ELF_COMPLETION_FORMAT.Chat
+
+    def _auto_detect_model_name(self) -> Optional[str]:
+        """Attempts to discover the first available model from the server."""
+        try:
+            self._init_client()
+            models = self.list_models()
+            if models:
+                # Prefer models that don't look like embeddings or system models
+                generation_models = [m for m in models if not m["model_name"].startswith("text-embedding")]
+                if generation_models:
+                    return generation_models[0]["model_name"]
+                return models[0]["model_name"]
+        except Exception as e:
+            ASCIIColors.warning(f"[LollmsBinding] Failed to auto-detect model: {e}")
+        return None
 
     def _init_client(self) -> None:
         try:
@@ -919,6 +941,9 @@ class LollmsBinding(LollmsLLMBinding):
         reasoning_summary: Optional[str] = None,
         **kwargs,
     ) -> Union[str, dict]:
+        if not self.model_name:
+            return {"status": "error", "message": "[LollmsBinding] No model_name resolved. Please configure a model profile or set model_name in binding config."}
+
         self._ensure_client()
         count = 0
         output = ""
@@ -1093,6 +1118,9 @@ class LollmsBinding(LollmsLLMBinding):
         reasoning_summary: Optional[str] = None,
         **kwargs,
     ) -> Union[str, dict]:
+        if not self.model_name:
+            return {"status": "error", "message": "[LollmsBinding] No model_name resolved. Please configure a model profile or set model_name in binding config."}
+
         self._ensure_client()
         _OPENAI_ROLE_MAP = {
             "system": "system", "developer": "developer", "user": "user",

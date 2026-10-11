@@ -208,8 +208,8 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
         }
         if self.model:
             payload["model"] = self.model
-        if negative_prompt:
-            payload["negative_prompt"] = negative_prompt
+        # Qwen-Image-Edit and other models may require negative_prompt to be present (even if empty)
+        payload["negative_prompt"] = negative_prompt if negative_prompt is not None else ""
         if seed is not None:
             payload["seed"] = seed
         payload.update(extra)
