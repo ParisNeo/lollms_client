@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-11 20:05]
+
+- feat(ttv_bindings): enhance model listing and loading
+
 ## [2026-10-09 08:21]
 
 - fix(lollms_code): persist configuration changes before exiting menu

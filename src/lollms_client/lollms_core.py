@@ -1765,6 +1765,8 @@ class LollmsClient():
         if self.tti: models +=  self.tti.list_models()
         if self.tts: models +=  self.tts.list_models()
         if self.stt: models +=  self.stt.list_models()
+        if self.ttm: models +=  self.ttm.list_models()
+        if self.ttv: models +=  self.ttv.list_models()
         return models
 
     def listMountedPersonalities(self) -> Union[List[Dict], Dict]:

@@ -2096,6 +2096,12 @@ class _StreamState:
         _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
         self._pending_buffer = ""
         return True
+    
+    
+    def _note_informational_step(self) -> None:
+        """Records an informational step that legitimizes a subsequent scratchpad write."""
+        object.__setattr__(self.discussion, "_scratchpad_write_streak", 0)    
+    
     def _dispatch_closed_tag(self, tag_name: str, attrs_str: str, body: str, full_match_text: str) -> bool:
         # If attrs_str starts with '<', it's the full opening tag. Extract attrs from it.
         if attrs_str.startswith('<'):
@@ -3247,10 +3253,6 @@ class _StreamState:
     def _scratchpad_write_streak(self) -> int:
         """Consecutive scratchpad writes with no intervening informational step (tool call, context change)."""
         return int(getattr(self.discussion, "_scratchpad_write_streak", 0) or 0)
-
-    def _note_informational_step(self) -> None:
-        """Records an informational step that legitimizes a subsequent scratchpad write."""
-        object.__setattr__(self.discussion, "_scratchpad_write_streak", 0)
 
     def passthrough(self, chunk, msg_type=None, meta=None) -> bool:
         if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:

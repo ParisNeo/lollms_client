@@ -11,15 +11,13 @@ from typing import Optional, List, Dict, Any, Union, Callable
 try:
     import pipmaster as pm
 except ImportError:
-    print("FATAL: pipmaster is not installed. Please install it using: pip install pipmaster")
-    sys.exit(1)
+    raise ImportError("pipmaster is required for the Diffusers TTV binding. Please install it using: pip install pipmaster")
 
 # Ensure filelock is available for process-safe server startup.
 try:
     from filelock import FileLock, Timeout
 except ImportError:
-    print("FATAL: The 'filelock' library is required. Please install it by running: pip install filelock")
-    sys.exit(1)
+    raise ImportError("The 'filelock' library is required for the Diffusers TTV binding. Please install it by running: pip install filelock")
 
 from lollms_client.lollms_ttv_binding import LollmsTTVBinding
 from ascii_colors import ASCIIColors

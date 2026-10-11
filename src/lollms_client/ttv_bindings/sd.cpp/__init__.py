@@ -14,10 +14,18 @@ except Exception:
     pass
 
 from ascii_colors import ASCIIColors
-from filelock import FileLock
 from lollms_client.lollms_ttv_binding import LollmsTTVBinding, MediaInput
+from . import media, presets, runtime
 
-from . import hub, media, presets, runtime
+try:
+    from filelock import FileLock
+except ImportError:
+    raise RuntimeError("The 'filelock' package is required for the sd.cpp TTV binding. Please install it with: pip install filelock")
+
+try:
+    from . import hub
+except ImportError as e:
+    raise RuntimeError(f"The 'huggingface_hub' package (imported by hub) is required for the sd.cpp TTV binding. Please install it with: pip install huggingface_hub. Error: {e}")
 
 BindingName = "SdCppTTVBinding"
 VIDEO_EXT = (".mp4", ".avi", ".webm", ".mkv", ".mov")
@@ -35,17 +43,24 @@ class SdCppTTVBinding(LollmsTTVBinding):
         super().__init__(binding_name="sd_cpp", debug=debug, **kw)
         c = self.config
         sysroot = self.get_system_dir()
-        self.root = self.resolve_system_path(c["root_path"]) if c.get("root_path") else sysroot / "sd_cpp"
-        self.models_path = self.resolve_system_path(c["models_path"]) if c.get("models_path") else sysroot / "data" / "ttv_models" / "sd_cpp"
-        self.root.mkdir(parents=True, exist_ok=True); self.models_path.mkdir(parents=True, exist_ok=True)
-        self.hf_token = c.get("hf_token") or None
-        self.auto_install = bool(c.get("auto_install", True))
-        self.auto_download = bool(c.get("auto_download", True))
-        self.timeout_s = float(c.get("timeout_s", 3600))
-        self.h3_repo = c.get("h3_repo") or presets.GGUF_REPO
-        self.profiles = hub.Profiles(self.models_path)
-        self._cli_path: Optional[Path] = None
-        self._gpu_lock = FileLock(str(self.root / "gpu.lock"), timeout=float(c.get("lock_timeout_s", 7200)))
+        self.root = self.resolve_system_path(c.get("root_path", "")) if c.get("root_path") else sysroot / "sd_cpp"
+        self.models_path = self.resolve_system_path(c.get("models_path", "")) if c.get("models_path") else sysroot / "data" / "ttv_models" / "sd_cpp"
+
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            self.models_path.mkdir(parents=True, exist_ok=True)
+            self.hf_token = c.get("hf_token") or None
+            self.auto_install = bool(c.get("auto_install", True))
+            self.auto_download = bool(c.get("auto_download", True))
+            self.timeout_s = float(c.get("timeout_s", 3600))
+            self.h3_repo = c.get("h3_repo") or presets.GGUF_REPO
+            self.profiles = hub.Profiles(self.models_path)
+            self._cli_path: Optional[Path] = None
+            self._gpu_lock = FileLock(str(self.root / "gpu.lock"), timeout=float(c.get("lock_timeout_s", 7200)))
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize sd.cpp TTV binding at {self.root}: {e}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize sd.cpp TTV binding directories or resources at {self.root}: {e}")
         vram = presets.detect_vram_gb()
         self.tier = presets.select_tier(vram, c.get("tier"), int(c.get("max_frames") or 0), int(c.get("max_side") or 0))
         if vram == 0:

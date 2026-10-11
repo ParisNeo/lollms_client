@@ -107,10 +107,18 @@ class LollmsTTVBindingManager:
     def _load_binding(self, binding_name: str):
         """Dynamically load a specific TTV binding implementation."""
         binding_dir = self.ttv_bindings_dir / binding_name
-        if binding_dir.is_dir() and (binding_dir / "__init__.py").exists():
+        init_file = binding_dir / "__init__.py"
+        if binding_dir.is_dir() and init_file.exists():
             try:
-                module = importlib.import_module(f"lollms_client.ttv_bindings.{binding_name}")
-                binding_class = getattr(module, module.BindingName) # Assumes BindingName is defined
+                import importlib.util
+                # Use file-based loading to support directory names with dots (e.g. sd.cpp)
+                module_name = f"lollms_ttv_binding_{binding_name.replace('.', '_')}"
+                spec = importlib.util.spec_from_file_location(module_name, init_file)
+                if spec is None:
+                    raise ImportError(f"Cannot find spec for {init_file}")
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                binding_class = getattr(module, module.BindingName)
                 self.available_bindings[binding_name] = binding_class
             except Exception as e:
                 trace_exception(e)
@@ -131,7 +139,8 @@ class LollmsTTVBindingManager:
                 return binding_class(**kwargs)
             except Exception as e:
                 trace_exception(e)
-                print(f"Failed to instantiate TTV binding {binding_name}: {str(e)}")
+                from ascii_colors import ASCIIColors
+                ASCIIColors.error(f"Failed to instantiate TTV binding {binding_name}: {str(e)}")
                 return None
         return None
 
