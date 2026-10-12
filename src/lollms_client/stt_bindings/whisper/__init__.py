@@ -246,7 +246,7 @@ class WhisperSTTBinding(LollmsSTTBinding):
     def _post_json_request(self, endpoint: str, data: Optional[dict] = None) -> requests.Response:
         url = f"{self.base_url}{endpoint}"
         try:
-            response = requests.post(
+            response = self._session.post(
                 url,
                 json=data,
                 headers=self._get_headers(),
@@ -267,7 +267,7 @@ class WhisperSTTBinding(LollmsSTTBinding):
     def _get_request(self, endpoint: str, params: Optional[dict] = None) -> requests.Response:
         url = f"{self.base_url}{endpoint}"
         try:
-            response = requests.get(
+            response = self._session.get(
                 url,
                 params=params,
                 headers=self._get_headers(),

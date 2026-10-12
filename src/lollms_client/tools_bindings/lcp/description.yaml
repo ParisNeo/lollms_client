@@ -1,33 +1,52 @@
-title: 'LCP (LollmsCommunicationProtocol)'
-author: 'ParisNeo'
-version: 1.2.0
-binding_name: 'lcp'
-creation_date: 2024-08-13
-last_update_date: 2026-05-25
-description: >
-  This binding discovers and executes tools defined locally in a specified folder.
-  Each tool is defined by a standalone Python file (.py). The LCP engine automatically
-  parses function names, arguments, type annotations, and docstrings using Abstract
-  Syntax Trees (AST) to build the schema on-the-fly, completely eliminating the need for
-  duplicate JSON files. Backwards compatibility with legacy .mcp.json schemas is also supported.
-creation_date: 2024-08-13
-last_update_date: 2024-08-13
-description: >
-  This binding discovers and executes tools defined locally in a specified folder.
-  Each tool is defined by a Python file and a corresponding MCP JSON file.
-  It's a simple way to add custom, local functionalities to the agent without needing a separate server.
-input_parameters:
+name: LCP
+binding_name: LCPBinding
+author: ParisNeo
+description: The Local LollmsCommunicationProtocol (LCP) binding
+version: "1.0"
+icon: 🛠️
+commands:
+  cleanup:
+    function_name: cleanup
+    description: Cleans up dynamically generated tools.
+    parameters:
+      - name: status
+        type: str
+        description: Status description to return
+        default: ""
+global_input_parameters:
+  - name: enable_auto_model_selection
+    type: bool
+    description: "If true, load the models_tools toolset (list models with routing settings, switch models, spawn child agents on other models)."
+    value: true
+    mandatory: false
   - name: tools_folders
-    type: list
-    description: "List of folder paths containing local LCP tool definitions. If not provided, falls back to tools_folder_path or default tools."
+    type: str
+    description: "Path(s) to tool libraries. Accepts a single path or a list of paths."
+    value: ""
     mandatory: false
-
-  - name: tool_files
-    type: list
-    description: "List of direct file paths to standalone Python tool libraries (.py)."
-    mandatory: false
-
   - name: tools_folder_path
     type: str
-    description: "Path to a single folder containing local LCP tool definitions (Legacy fallback)."
+    description: "Legacy alias for tools_folders. Accepts a full path to a folder of tool libraries."
+    value: ""
     mandatory: false
+  - name: tool_files
+    type: str
+    description: "Path(s) to individual .py tool files. Providing tool_files implies an empty folder scan."
+    value: ""
+    mandatory: false
+  - name: host_tool_configs
+    type: str
+    description: "Host-provided configurations for tool libraries, keyed by library stem."
+    value: ""
+    mandatory: false
+  - name: confirm_handler
+    type: str
+    description: "Host callback for authorizing sensitive actions."
+    value: ""
+    mandatory: false
+  - name: user_interaction_handler
+    type: str
+    description: "Host callback for collecting user input (text, secret, select)."
+    value: ""
+    mandatory: false
+model_input_parameters: []

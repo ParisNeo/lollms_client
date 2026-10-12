@@ -375,6 +375,7 @@ class CodeAgentConfig:
         self.shell_autonomy_level: str = "safe"
         self.enable_sub_agents: bool = True
         self.enable_model_switching: bool = False
+        self.enable_auto_model_selection: bool = True
         self.enable_skill_creation: bool = True
         self.enable_skill_loading: bool = True
         self.enable_memory: bool = True
@@ -930,6 +931,52 @@ def make_cli_confirm_handler(config: CodeAgentConfig) -> Callable:
     return _handler
 
 
+def cli_user_interaction_handler(request: Optional[dict]) -> Optional[str]:
+    """Terminal user-interaction callback for LCP tools (text, secret, select)."""
+    if not isinstance(request, dict):
+        return None
+
+    kind = request.get("type", "text")
+    title = request.get("title", "Input required")
+    prompt = request.get("prompt", "")
+    options = [str(o) for o in request.get("options", [])]
+    default = request.get("default")
+
+    if not sys.stdin or not hasattr(sys.stdin, "isatty") or not sys.stdin.isatty():
+        return default if kind != "secret" else None
+
+    panel_body = prompt or "(no prompt provided)"
+    if default:
+        panel_body += f"\n[dim]Default: {default}[/dim]"
+    ASCIIColors.panel(panel_body, title=f"[bold cyan]🙋 {title}[/bold cyan]", border_style="cyan")
+
+    try:
+        if kind == "select" and options:
+            for i, opt in enumerate(options, start=1):
+                ASCIIColors.rich_print(f"  [cyan]{i}.[/cyan] {opt}")
+            while True:
+                raw = input("  Choice> ").strip()
+                if raw.isdigit() and 1 <= int(raw) <= len(options):
+                    return options[int(raw) - 1]
+                if raw in options:
+                    return raw
+                ASCIIColors.yellow("  Invalid selection.")
+
+        if kind == "secret":
+            import getpass
+            value = getpass.getpass("  Secret> ")
+        else:
+            value = input("  > ")
+
+        value = value.strip()
+        if value:
+            return value
+        return default if kind != "secret" else None
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+
+
 def create_client(config: CodeAgentConfig) -> LollmsClient:
     """Creates a LollmsClient instance from the CodeAgentConfig using the Two-Tier Profile System."""
 
@@ -1007,7 +1054,9 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
         "tools_binding_config": {
             "tools_folders": tools_folders,
             "host_tool_configs": host_tool_configs,
+            "enable_auto_model_selection": config.enable_auto_model_selection,
             "confirm_handler": cli_confirm_handler,
+            "user_interaction_handler": cli_user_interaction_handler,
             "system_dir": str(lollms_system_dir),
             "cwd": str(lollms_system_dir)
         },
@@ -1094,6 +1143,25 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
         except (AttributeError, OSError, RuntimeError) as e:
             if config.debug:
                 ASCIIColors.warning(f"Failed to pre-mount git_manager library: {e}")
+
+    if client.tools:
+        try:
+            if config.enable_auto_model_selection:
+                if hasattr(client.tools, 'mount_tool_library_if_absent'):
+                    client.tools.mount_tool_library_if_absent('models_tools')
+                else:
+                    client.tools.mount_tool_library('models_tools')
+                ASCIIColors.success(
+                    "[CLI] ✅ Models Switcher (models_tools) active: model listing, "
+                    "switching, and child-agent tools are directly available."
+                )
+            else:
+                ASCIIColors.info(
+                    "[CLI] Models Switcher (models_tools) disabled "
+                    "(enable_auto_model_selection=False)."
+                )
+        except (AttributeError, OSError, RuntimeError) as e:
+            ASCIIColors.warning(f"Failed to pre-mount models_tools library: {e}")
 
     return client
 

@@ -347,15 +347,19 @@ class LollmsBinding(LollmsLLMBinding):
         self.open_ai_host_address = f"{self.base_address}/v1"
         self.lollms_host_address = f"{self.base_address}/lollms/v1"
 
+        self.service_key = kwargs.get("service_key") or os.getenv("LOLLMS_API_KEY")
+
         raw_model_name = kwargs.get("model_name")
         if raw_model_name:
             self.model_name = raw_model_name
         else:
             self.model_name = self._auto_detect_model_name()
             if not self.model_name:
-                raise ValueError(f"[LollmsBinding] No model_name provided and auto-detection failed for host: {self.open_ai_host_address}")
-
-        self.service_key = kwargs.get("service_key") or os.getenv("LOLLMS_API_KEY")
+                ASCIIColors.warning(
+                    "[LollmsBinding] No model_name provided and auto-detection failed for "
+                    f"host: {self.open_ai_host_address}. Generation methods will return an "
+                    "error until a model is configured or the server becomes reachable."
+                )
         raw_verify_ssl = kwargs.get("verify_ssl_certificate", True)
         if isinstance(raw_verify_ssl, str):
             self.verify_ssl_certificate = raw_verify_ssl.lower().strip() not in ("false", "0", "no", "off", "")

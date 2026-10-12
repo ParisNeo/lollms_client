@@ -259,6 +259,7 @@ def create_client(env: EnvStore, prefs: GuiPrefs):
         "tools_binding_config": {
             "tools_folders": tools_folders,
             "host_tool_configs": host_tool_configs,
+            "enable_auto_model_selection": getattr(prefs, "enable_auto_model_selection", True),
             "system_dir": str(lollms_system_dir),
             "cwd": str(lollms_system_dir),
         },
@@ -279,6 +280,18 @@ def create_client(env: EnvStore, prefs: GuiPrefs):
     if prefs.enable_shell_execution and client.tools:
         try:
             client.tools.mount_tool_library("system_shell")
+        except Exception:
+            pass
+
+    if client.tools:
+        try:
+            if _to_bool(getattr(prefs, "enable_auto_model_selection", True)):
+                client.tools.mount_tool_library("models_tools")
+            else:
+                ASCIIColors.info(
+                    "[AgentBridge] Models Switcher (models_tools) disabled "
+                    "(enable_auto_model_selection=False)."
+                )
         except Exception:
             pass
 
@@ -1165,6 +1178,22 @@ def cancel_agent_turn(personality, client=None) -> bool:
             pass
         _CURRENT_RESP_QUEUE = None
 
+    global _CURRENT_INTERACTION_QUEUE
+    if _CURRENT_INTERACTION_QUEUE is not None:
+        try:
+            _CURRENT_INTERACTION_QUEUE.put(None)
+        except Exception:
+            pass
+        _CURRENT_INTERACTION_QUEUE = None
+
+    global _CURRENT_INTERACTION_QUEUE
+    if _CURRENT_INTERACTION_QUEUE is not None:
+        try:
+            _CURRENT_INTERACTION_QUEUE.put(None)
+        except Exception:
+            pass
+        _CURRENT_INTERACTION_QUEUE = None
+
     cancelled = False
     if personality is not None:
         if hasattr(personality, "_sub_agent_spawner") and personality._sub_agent_spawner:
@@ -1211,6 +1240,8 @@ def cancel_agent_turn(personality, client=None) -> bool:
 
 
 _CURRENT_RESP_QUEUE: Optional[queue.Queue] = None
+_CURRENT_INTERACTION_QUEUE: Optional[queue.Queue] = None
+_CURRENT_INTERACTION_QUEUE: Optional[queue.Queue] = None
 
 
 def make_gui_python_confirm_handler(event_queue: "queue.Queue[AgentEvent]", prefs: GuiPrefs):
@@ -1271,6 +1302,40 @@ def make_gui_python_confirm_handler(event_queue: "queue.Queue[AgentEvent]", pref
     return _handler
 
 
+def make_gui_user_interaction_handler(event_queue: "queue.Queue[AgentEvent]"):
+    """
+    Creates a user-interaction handler for LCP tools that dispatches input
+    requests (text, secret, select) to the NiceGUI layer and blocks the
+    worker thread until the user answers or cancels.
+    """
+    def _handler(request: dict) -> Optional[str]:
+        global _CURRENT_INTERACTION_QUEUE
+        if not isinstance(request, dict):
+            return None
+
+        response_queue: queue.Queue = queue.Queue(maxsize=1)
+        _CURRENT_INTERACTION_QUEUE = response_queue
+
+        event_queue.put(AgentEvent(
+            "user_interaction_request",
+            request=request,
+            response_queue=response_queue,
+        ))
+
+        try:
+            answer = response_queue.get(timeout=600.0)
+            _CURRENT_INTERACTION_QUEUE = None
+            return answer
+        except queue.Empty:
+            _CURRENT_INTERACTION_QUEUE = None
+            return None
+        except Exception:
+            _CURRENT_INTERACTION_QUEUE = None
+            return None
+
+    return _handler
+
+
 def run_agent_turn_in_thread(
     personality, client, prompt: str, prefs: GuiPrefs,
     event_queue: "queue.Queue[AgentEvent]", use_history: bool = True,
@@ -1280,11 +1345,18 @@ def run_agent_turn_in_thread(
     event loop never blocks, and reports completion/errors via the queue."""
 
     gui_confirm_handler = make_gui_python_confirm_handler(event_queue, prefs)
+    gui_user_interaction_handler = make_gui_user_interaction_handler(event_queue)
 
     # Register GUI validation handler with execute_python and system_shell across all tool modules
+    gui_user_interaction_handler = make_gui_user_interaction_handler(event_queue)
+
     if client and hasattr(client, "tools") and client.tools:
         if hasattr(client.tools, "set_confirm_handler"):
             client.tools.set_confirm_handler(gui_confirm_handler)
+        if hasattr(client.tools, "set_user_interaction_handler"):
+            client.tools.set_user_interaction_handler(gui_user_interaction_handler)
+        if hasattr(client.tools, "set_user_interaction_handler"):
+            client.tools.set_user_interaction_handler(gui_user_interaction_handler)
         if hasattr(client.tools, "host_tool_configs") and isinstance(client.tools.host_tool_configs, dict):
             client.tools.host_tool_configs.setdefault("execute_python", {})["confirm_handler"] = gui_confirm_handler
             client.tools.host_tool_configs.setdefault("system_shell", {})["confirm_handler"] = gui_confirm_handler

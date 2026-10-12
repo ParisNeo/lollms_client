@@ -89,6 +89,15 @@ def test_whisper_multi_process_probing_and_no_port_drift():
 
 
 def test_model_manager_micro_batching_loop():
+    import unittest
+
+    try:
+        import whisper  # noqa: F401
+    except Exception as ex:
+        raise unittest.SkipTest(
+            f"whisper module not importable in this environment: {ex}"
+        )
+
     with tempfile.TemporaryDirectory() as tmp_dir:
         cache_dir = Path(tmp_dir)
         manager = ModelManager(

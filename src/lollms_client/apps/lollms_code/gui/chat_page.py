@@ -1604,6 +1604,20 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
             active_approval_dialog_holder["dialog"] = None
             active_approval_dialog_holder["resp_queue"] = None
 
+        if active_interaction_dialog_holder.get("dialog") is not None:
+            try:
+                active_interaction_dialog_holder["dialog"].close()
+            except Exception:
+                pass
+            irq = active_interaction_dialog_holder.get("resp_queue")
+            if irq:
+                try:
+                    irq.put(None)
+                except Exception:
+                    pass
+            active_interaction_dialog_holder["dialog"] = None
+            active_interaction_dialog_holder["resp_queue"] = None
+
         try:
             session.ensure_ready()
             cancelled = False
@@ -1804,6 +1818,14 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                 pass
             active_approval_dialog_holder["dialog"] = None
             active_approval_dialog_holder["resp_queue"] = None
+
+        if active_interaction_dialog_holder.get("dialog") is not None:
+            try:
+                active_interaction_dialog_holder["dialog"].close()
+            except Exception:
+                pass
+            active_interaction_dialog_holder["dialog"] = None
+            active_interaction_dialog_holder["resp_queue"] = None
 
         transcript.clear()
         debug_log.clear()
@@ -2142,6 +2164,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
     active_tool_panels: Dict[str, Dict[str, Any]] = {}
     active_artefact_panels: Dict[str, Dict[str, Any]] = {}
     active_approval_dialog_holder: Dict[str, Any] = {"dialog": None, "resp_queue": None}
+    active_interaction_dialog_holder: Dict[str, Any] = {"dialog": None, "resp_queue": None}
     thinking_indicator: Optional[ui.element] = None
     thinking_label: Optional[ui.label] = None
 
@@ -2261,9 +2284,91 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                         "unelevated color=primary size=sm no-caps"
                     ).tooltip("Authorize this execution only")
 
-        dialog.open()
+            dialog.open()
 
-    def seal_current_text_block():
+        def open_user_interaction_dialog(request: Dict[str, Any], resp_queue: Any):
+            """Displays an in-app modal input dialog for LCP tool user-interaction requests."""
+            dialog = ui.dialog().props("persistent")
+            active_interaction_dialog_holder["dialog"] = dialog
+            active_interaction_dialog_holder["resp_queue"] = resp_queue
+
+            kind = request.get("type", "text")
+            title = request.get("title", "Input required")
+            prompt = request.get("prompt", "")
+            options = [str(o) for o in request.get("options", [])]
+            default = request.get("default")
+
+            with dialog, ui.card().classes(
+                "w-[520px] max-w-[95vw] p-4 gap-3 bg-white dark:bg-slate-900 "
+                "text-slate-900 dark:text-slate-100 rounded-xl border-2 border-primary/70 shadow-2xl"
+            ):
+                with ui.row().classes("w-full items-center gap-2.5 pb-2 border-b border-slate-200 dark:border-slate-800"):
+                    ui.icon("contact_support", size="24px").classes("text-primary")
+                    ui.label(title).classes("text-base font-bold")
+                if prompt:
+                    ui.label(prompt).classes("text-xs text-slate-600 dark:text-slate-300")
+
+                value_holder: Dict[str, Any] = {"input": None}
+
+                if kind == "select" and options:
+                    sel = ui.select(
+                        options,
+                        value=default if default in options else None,
+                    ).classes("w-full text-xs").props("outlined dense")
+                    value_holder["input"] = sel
+                elif kind == "secret":
+                    secret_input = ui.input(
+                        placeholder="Enter secret value...",
+                        password=True,
+                        password_toggle_button=True,
+                    ).classes("w-full text-xs").props("outlined dense")
+                    if default:
+                        secret_input.value = str(default)
+                    value_holder["input"] = secret_input
+                else:
+                    text_input = ui.input(placeholder="Enter value...").classes("w-full text-xs").props("outlined dense")
+                    if default:
+                        text_input.value = str(default)
+                    value_holder["input"] = text_input
+
+                def _close_and_clear():
+                    dialog.close()
+                    active_interaction_dialog_holder["dialog"] = None
+                    active_interaction_dialog_holder["resp_queue"] = None
+
+                def _submit():
+                    widget = value_holder.get("input")
+                    answer = None
+                    if widget is not None:
+                        raw_val = widget.value
+                        if raw_val is None and kind == "select":
+                            raw_val = default
+                        if isinstance(raw_val, str) and raw_val.strip():
+                            answer = raw_val.strip()
+                        elif raw_val is not None:
+                            answer = str(raw_val)
+                    _close_and_clear()
+                    if resp_queue:
+                        resp_queue.put(answer)
+
+                def _cancel():
+                    _close_and_clear()
+                    if resp_queue:
+                        resp_queue.put(None)
+
+                with ui.row().classes("w-full justify-end gap-2 pt-2 border-t border-slate-200 dark:border-slate-800"):
+                    ui.button("Cancel", icon="close", on_click=_cancel).props("flat dense no-caps")
+                    ui.button("Submit", icon="send", on_click=_submit).props(
+                        "unelevated dense color=primary no-caps"
+                    )
+
+                first_widget = value_holder.get("input")
+                if hasattr(first_widget, "run_method"):
+                    first_widget.run_method("focus")
+
+            dialog.open()
+
+        def seal_current_text_block():
         """Seals the current conversational agent bubble, deduplicating identical repeat bubbles."""
         nonlocal current_agent_md, agent_text_buffer
         if current_agent_md is not None:
@@ -2337,6 +2442,9 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                 argv = ev.data.get("argv")
                 resp_queue = ev.data.get("response_queue")
                 open_python_approval_dialog(source, script_label, argv, resp_queue)
+
+            elif ev.kind == "user_interaction_request":
+                open_user_interaction_dialog(ev.data.get("request", {}), ev.data.get("response_queue"))
 
             elif ev.kind == "effort_change":
                 lvl = ev.data.get("level", "")

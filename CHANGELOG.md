@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-12 21:07]
+
+- feat(code): enhance LCP tool orchestration and STT whisper batching support
+
 ## [2026-10-12 00:35]
 
 - `fix(lollms_client): bump version to v1.20.17`

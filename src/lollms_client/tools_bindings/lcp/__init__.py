@@ -5,6 +5,7 @@ import types
 import uuid
 import importlib.util
 import ast
+import difflib
 import re
 import traceback
 from pathlib import Path
@@ -35,6 +36,8 @@ class LCPBinding(LollmsToolBinding):
         # Host-provided configurations for tools (e.g., {"system_shell": {"autonomy_level": "safe"}})
         self.host_tool_configs: Dict[str, Dict[str, Any]] = host_tool_configs or {}
         self.confirm_handler: Optional[Callable] = kwargs.get("confirm_handler")
+        self.user_interaction_handler: Optional[Callable] = kwargs.get("user_interaction_handler")
+        self.user_interaction_handler: Optional[Callable] = kwargs.get("user_interaction_handler")
 
         # Resolve Direct Tool Files (must resolve first: explicit tool_files implies an empty folder scan)
         self.tool_files: List[Path] = []
@@ -57,6 +60,8 @@ class LCPBinding(LollmsToolBinding):
                     self.tools_folders.append(Path(f))
         elif not self.tool_files:
             self.tools_folders.append(Path(__file__).parent / "default_tools")
+
+        self._load_flag_kwargs: Dict[str, Any] = kwargs
 
         self.discovered_tools: List[Dict[str, Any]] = []
         self._dynamic_tool_modules: Dict[str, types.ModuleType] = {}
@@ -127,7 +132,7 @@ class LCPBinding(LollmsToolBinding):
             for param_raw in params_str.split(","):
                 param = param_raw.strip()
                 if not param or param.startswith("*") or ":" not in param:
-                    if param and param.split("=")[0].strip() and param.split("=")[0].strip() not in ("args", "kwargs", "discussion_instance", "lollms_client_instance", "tool_context"):
+                    if param and param.split("=")[0].strip() and param.split("=")[0].strip() not in ("args", "kwargs", "discussion_instance", "lollms_client_instance", "tool_context", "user_interaction_handler"):
                         p_name = param.split("=")[0].strip()
                         properties[p_name] = {"type": "string", "description": f"Parameter '{p_name}'"}
                         if "=" not in param:
@@ -136,7 +141,7 @@ class LCPBinding(LollmsToolBinding):
 
                 p_name, p_type_raw = param.split(":", 1)
                 p_name = p_name.strip()
-                if not p_name or p_name in ("args", "kwargs", "discussion_instance", "lollms_client_instance", "tool_context"):
+                if not p_name or p_name in ("args", "kwargs", "discussion_instance", "lollms_client_instance", "tool_context", "user_interaction_handler"):
                     continue
 
                 p_type_raw = p_type_raw.strip().lower()
@@ -197,7 +202,7 @@ class LCPBinding(LollmsToolBinding):
 
         for idx, arg in enumerate(args_list):
             arg_name = arg.arg
-            if arg.arg in ("args", "kwargs", "discussion_instance", "lollms_client_instance", "tool_context"):
+            if arg.arg in ("args", "kwargs", "discussion_instance", "lollms_client_instance", "tool_context", "user_interaction_handler"):
                 continue
 
             arg_type = "string"
@@ -254,8 +259,134 @@ class LCPBinding(LollmsToolBinding):
             "_python_file_path": str(Path(__file__).parent / "default_tools" / file_stem / f"{file_stem}.py")
         }
 
+    def _library_load_flag(self, py_file: Path) -> Optional[str]:
+        """
+        Returns the TOOL_LIBRARY_LOAD_FLAG name declared by a library file,
+        or None when the library is not gated.
+        """
+        try:
+            code_text = py_file.read_text(encoding="utf-8")
+        except Exception:
+            return None
+
+        match = re.search(
+            r'^TOOL_LIBRARY_LOAD_FLAG\s*=\s*["\']([A-Za-z0-9_]+)["\']',
+            code_text,
+            re.MULTILINE,
+        )
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _normalize_name(raw: str) -> str:
+        normalized = re.sub(r"[\s\-]+", "_", (raw or "").strip().lower())
+        if normalized.startswith("tool_"):
+            normalized = normalized[5:]
+        return normalized
+
+    def _library_aliases(self, py_file: Path) -> List[str]:
+        try:
+            code_text = py_file.read_text(encoding="utf-8")
+        except Exception:
+            return []
+        match = re.search(
+            r'^TOOL_LIBRARY_ALIASES\s*=\s*[\[(](.*?)[\])]',
+            code_text,
+            re.MULTILINE | re.DOTALL,
+        )
+        if not match:
+            return []
+        return [
+            self._normalize_name(alias)
+            for alias in re.findall(r'["\']([^"\']+)["\']', match.group(1))
+        ]
+
+    def _library_display_name(self, py_file: Path) -> str:
+        try:
+            code_text = py_file.read_text(encoding="utf-8")
+        except Exception:
+            return ""
+        match = re.search(
+            r'^TOOL_LIBRARY_NAME\s*=\s*["\']([^"\']+)["\']',
+            code_text,
+            re.MULTILINE,
+        )
+        return match.group(1) if match else ""
+
+    def _iter_library_files(self):
+        search_dirs = list(self.tools_folders)
+        default_dir = Path(__file__).parent / "default_tools"
+        if default_dir not in search_dirs:
+            search_dirs.append(default_dir)
+        for folder in search_dirs:
+            if not folder.exists() or not folder.is_dir():
+                continue
+            for item in folder.iterdir():
+                if item.is_dir():
+                    primary = item / f"{item.name}.py"
+                    if primary.exists():
+                        yield item.name, primary
+                    else:
+                        for fallback in item.glob("*.py"):
+                            if fallback.stem != "__init__":
+                                yield item.name, fallback
+                elif item.suffix == ".py" and item.stem != "__init__":
+                    yield item.stem, item
+
+    def _resolve_library_name(self, raw: str) -> Optional[str]:
+        """Resolves a user/LLM-provided toolkit name to a library stem,
+        tolerating casing, separators, display names, declared aliases,
+        and close misspellings."""
+        clean = (raw or "").strip()
+        if not clean:
+            return None
+
+        direct_dir = self._find_library_dir(clean)
+        if direct_dir:
+            return direct_dir.name
+
+        normalized = self._normalize_name(clean)
+        candidates: Dict[str, List[str]] = {}
+        for stem, py_file in self._iter_library_files():
+            variants = [self._normalize_name(stem)]
+            variants.append(self._normalize_name(self._library_display_name(py_file)))
+            variants.extend(self._library_aliases(py_file))
+            candidates[stem] = [v for v in variants if v]
+            if normalized in candidates[stem]:
+                return stem
+
+        all_variants = {v for variants in candidates.values() for v in variants}
+        close = difflib.get_close_matches(normalized, all_variants, n=1, cutoff=0.75)
+        if close:
+            for stem, variants in candidates.items():
+                if close[0] in variants:
+                    return stem
+        return None
+
+    def _is_library_permitted(self, py_file: Path) -> bool:
+        """
+        Resolves a library's TOOL_LIBRARY_LOAD_FLAG declaration against host
+        configuration. Returns True when the library has no gating flag or the
+        flag is explicitly enabled, False when the flag exists and is disabled.
+        """
+        flag_name = self._library_load_flag(py_file)
+        if not flag_name:
+            return True
+        host_cfg = self.host_tool_configs.get(py_file.stem, {})
+        raw_value = host_cfg.get(flag_name, self._load_flag_kwargs.get(flag_name, False))
+
+        if isinstance(raw_value, str):
+            return raw_value.strip().lower() in ("true", "1", "yes", "on")
+        return bool(raw_value)
+
     def _load_tool_file(self, py_file: Path) -> int:
         file_stem = py_file.stem
+
+        if not self._is_library_permitted(py_file):
+            ASCIIColors.debug(
+                f"[LCP] Library '{file_stem}' skipped: TOOL_LIBRARY_LOAD_FLAG "
+                "not enabled in host configuration."
+            )
+            return 0
 
         tool_defs = self._parse_tool_via_ast(py_file)
         if not tool_defs:
@@ -345,7 +476,7 @@ class LCPBinding(LollmsToolBinding):
                 for py_f in py_files:
                     try:
                         extracted = self._extract_tool_names_from_file(py_f)
-                        if clean_name in extracted:
+                        if clean_name in extracted and self._is_library_permitted(py_f):
                             return item.name if item.is_dir() else py_f.stem
                     except Exception:
                         pass
@@ -365,7 +496,7 @@ class LCPBinding(LollmsToolBinding):
         if match:
             return match
 
-        lib_name = self.find_library_for_tool(clean_name)
+        lib_name = self.find_library_for_tool(clean_name) or self._resolve_library_name(clean_name)
         if lib_name:
             self.mount_tool_library(lib_name)
             tool_match = next((t for t in self.discovered_tools if t.get("name") == clean_name), None)
@@ -418,9 +549,23 @@ class LCPBinding(LollmsToolBinding):
         return self.mount_tool_library(library_name)
 
     def mount_tool_library(self, library_name: str) -> bool:
-        lib_path = self._find_library_dir(library_name)
+        resolved_name = self._resolve_library_name(library_name)
+        if resolved_name and resolved_name != library_name.strip():
+            ASCIIColors.info(f"[LCP Mount] Resolving toolkit '{library_name}' -> '{resolved_name}'.")
+        lib_path = self._find_library_dir(resolved_name or library_name)
         if not lib_path or not lib_path.exists() or not lib_path.is_dir():
             ASCIIColors.warning(f"[LCP Mount] Library '{library_name}' not found in search paths.")
+            return False
+
+        primary_py = lib_path / f"{lib_path.name}.py"
+        if primary_py.exists() and not self._is_library_permitted(primary_py):
+            flag_name = self._library_load_flag(primary_py)
+            ASCIIColors.warning(
+                f"[LCP Mount] Library '{library_name}' is gated by "
+                f"TOOL_LIBRARY_LOAD_FLAG '{flag_name}' which is not enabled. "
+                f"Enable it with tools_binding_config['{flag_name}']=True or "
+                f"host_tool_configs['{primary_py.stem}']['{flag_name}']=True."
+            )
             return False
 
         if self.is_library_mounted(library_name):
@@ -542,6 +687,20 @@ class LCPBinding(LollmsToolBinding):
                     except Exception:
                         pass
 
+    def set_user_interaction_handler(self, handler: Optional[Callable]) -> None:
+        """Registers a user-interaction callback and propagates it to all loaded tool modules."""
+        self.user_interaction_handler = handler
+        for lib_cfg in self.host_tool_configs.values():
+            if isinstance(lib_cfg, dict):
+                lib_cfg["user_interaction_handler"] = handler
+        for mod_name, mod in list(sys.modules.items()):
+            if mod_name.startswith("lollms_client.tools_bindings.lcp.persistent_"):
+                if hasattr(mod, "set_user_interaction_handler") and callable(mod.set_user_interaction_handler):
+                    try:
+                        mod.set_user_interaction_handler(handler)
+                    except Exception:
+                        pass
+
     def _get_or_load_tool_module(self, python_file_path: Path) -> Optional[types.ModuleType]:
         module_name = f"lollms_client.tools_bindings.lcp.persistent_{python_file_path.stem}"
         if module_name in sys.modules:
@@ -549,6 +708,11 @@ class LCPBinding(LollmsToolBinding):
             if self.confirm_handler and hasattr(tool_mod, "set_confirm_handler") and callable(tool_mod.set_confirm_handler):
                 try:
                     tool_mod.set_confirm_handler(self.confirm_handler)
+                except Exception:
+                    pass
+            if self.user_interaction_handler and hasattr(tool_mod, "set_user_interaction_handler") and callable(tool_mod.set_user_interaction_handler):
+                try:
+                    tool_mod.set_user_interaction_handler(self.user_interaction_handler)
                 except Exception:
                     pass
             return tool_mod
@@ -567,10 +731,26 @@ class LCPBinding(LollmsToolBinding):
             host_config = self.host_tool_configs.get(library_name, {})
             if self.confirm_handler and "confirm_handler" not in host_config:
                 host_config["confirm_handler"] = self.confirm_handler
+            if self.user_interaction_handler and "user_interaction_handler" not in host_config:
+                host_config["user_interaction_handler"] = self.user_interaction_handler
+            if self.user_interaction_handler and "user_interaction_handler" not in host_config:
+                host_config["user_interaction_handler"] = self.user_interaction_handler
 
             if hasattr(tool_module, "set_confirm_handler") and callable(tool_module.set_confirm_handler):
                 try:
                     tool_module.set_confirm_handler(host_config.get("confirm_handler", self.confirm_handler))
+                except Exception:
+                    pass
+
+            if hasattr(tool_module, "set_user_interaction_handler") and callable(tool_module.set_user_interaction_handler):
+                try:
+                    tool_module.set_user_interaction_handler(host_config.get("user_interaction_handler", self.user_interaction_handler))
+                except Exception:
+                    pass
+
+            if hasattr(tool_module, "set_user_interaction_handler") and callable(tool_module.set_user_interaction_handler):
+                try:
+                    tool_module.set_user_interaction_handler(host_config.get("user_interaction_handler", self.user_interaction_handler))
                 except Exception:
                     pass
 
@@ -718,6 +898,16 @@ class LCPBinding(LollmsToolBinding):
                         tool_module.set_confirm_handler(self.confirm_handler)
                     except Exception:
                         pass
+                if self.user_interaction_handler and hasattr(tool_module, "set_user_interaction_handler") and callable(tool_module.set_user_interaction_handler):
+                    try:
+                        tool_module.set_user_interaction_handler(self.user_interaction_handler)
+                    except Exception:
+                        pass
+                if self.user_interaction_handler and hasattr(tool_module, "set_user_interaction_handler") and callable(tool_module.set_user_interaction_handler):
+                    try:
+                        tool_module.set_user_interaction_handler(self.user_interaction_handler)
+                    except Exception:
+                        pass
             else:
                 tool_module = tool_def.get("_dynamic_module")
                 if not tool_module:
@@ -745,6 +935,9 @@ class LCPBinding(LollmsToolBinding):
             clean_params.pop("lollms_client_instance", None)
             if host_client is not None and ("lollms_client_instance" in sig.parameters or has_var_kw):
                 clean_params["lollms_client_instance"] = host_client
+
+            if self.user_interaction_handler is not None and ("user_interaction_handler" in sig.parameters or has_var_kw):
+                clean_params["user_interaction_handler"] = self.user_interaction_handler
 
             clean_params.pop("discussion_instance", None)
             if discussion_instance is not None and ("discussion_instance" in sig.parameters or has_var_kw):
