@@ -28,7 +28,10 @@ import time
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+
+if TYPE_CHECKING:
+    from lollms_client.lollms_client import LollmsClient
 
 from ascii_colors import ASCIIColors, trace_exception
 
@@ -137,6 +140,14 @@ _ASSISTANT_MARKER_PREFIXES = (
     "[Assistant executed batched actions]",
     "[Assistant repeated its previous preamble",
 )
+
+_REPEATABLE_OBSERVATION_TOOLS = {
+    "tool_computer_screenshot",
+    "tool_computer_cursor_screenshot",
+    "tool_computer_desktop_info",
+    "tool_computer_cursor_position",
+    "tool_computer_wait",
+}
 
 
 def _is_synthetic_agent_response(text: str) -> bool:
@@ -4564,7 +4575,8 @@ JSON:"""
                         "tool_computer_mouse_down", "tool_computer_mouse_up",
                         "tool_computer_drag",
                         "tool_computer_type", "tool_computer_key", "tool_computer_scroll",
-                        "tool_computer_wait", "tool_computer_cursor_position"
+                        "tool_computer_wait", "tool_computer_cursor_position",
+                        "tool_computer_cursor_screenshot"
                     }
 
                     allowed_tool_names = set()
@@ -4739,7 +4751,8 @@ JSON:"""
                         "tool_computer_mouse_down", "tool_computer_mouse_up",
                         "tool_computer_drag", "tool_computer_type",
                         "tool_computer_key", "tool_computer_scroll",
-                        "tool_computer_wait", "tool_computer_cursor_position"
+                        "tool_computer_wait", "tool_computer_cursor_position",
+                        "tool_computer_cursor_screenshot"
                     ):
                         if cn in specs:
                             active_tools[cn] = specs[cn]
@@ -5519,7 +5532,12 @@ JSON:"""
                 "3. **ACT**: Click, then `tool_computer_type` / `tool_computer_key` / `tool_computer_scroll` as needed. Click into a text field BEFORE typing.\n"
                 "4. **VERIFY**: After EVERY action, take another screenshot to confirm the effect before proceeding.\n"
                 "5. **TERMINATE**: When the goal is achieved, describe the result and emit `<done/>`. Do NOT loop screenshots indefinitely.\n"
-                "Start every computer use task with `tool_computer_desktop_info` to learn the screen geometry.\n"
+                "Start every computer use task with `tool_computer_desktop_info` to learn the screen geometry, and NEVER click at guessed coordinates before you know it: the tool reports the exact width and height, and every screenshot is exactly that size. Coordinates are ABSOLUTE pixels — top-left is (0, 0), bottom-right is (width-1, height-1). To estimate a position, locate the target in the screenshot, express its offset as a fraction of the image width/height, then multiply by the known dimensions. Example: for a 1920x1080 screenshot, a target 3/4 across and at the taskbar is about (1440, 1050).\n"
+                "`tool_computer_screenshot` may be called repeatedly with no parameters: each call captures the CURRENT screen state and overwrites 'computer_use_screenshot.png'. Re-screenshot after every action to verify it.\n"
+                "To PRESERVE a specific frame (e.g. a photo taken with the Camera app), pass `file_name` to `tool_computer_screenshot` (e.g. file_name='photo.png'): the capture is saved under that name and will NOT be overwritten by later verification screenshots. Reference the saved file by name for later use.\n"
+                "COORDINATE RECALIBRATION: Your pixel estimates WILL drift during long desktop sessions. MANDATORY SEQUENCE when a click misses or you are unsure where the pointer is: call `tool_computer_cursor_screenshot` FIRST — it shows the pointer's exact position highlighted with a red circle and blue center dot plus precise (x, y) coordinates — then correct your coordinate map before clicking again. NEVER guess taskbar icon positions by eyeballing; either use `description` grounding or cursor-screenshot calibration.\n"
+                "TARGETING PRIORITY: For UI elements (taskbar search boxes, app icons, buttons, input fields), ALWAYS prefer `tool_computer_click` with a natural-language `description` (e.g. description='the Windows search box in the taskbar') over guessed pixel coordinates — the system visually grounds the description to exact pixel coordinates using the vision model. Guessing raw x/y for taskbar icons is FORBIDDEN: the icons are ~40px wide and your estimates are frequently 50-150px off. After every click, re-screenshot to verify the click landed on the intended target before typing.\n"
+                "ESCALATION RULE: If two consecutive coordinate-based clicks miss their target, you MUST stop guessing coordinates entirely and switch to `description` grounding for every subsequent click (e.g. description='the LTspice icon in the taskbar'). Never re-guess a third time. If description grounding also fails, call `tool_computer_cursor_screenshot` to calibrate, then use `description` again.\n"
                 "=== END COMPUTER USE OPERATING DOCTRINE ===\n"
             )
 
@@ -5793,6 +5811,8 @@ JSON:"""
             self._failure_memory._signatures.clear()
             if hasattr(self._failure_memory, 'failures'):
                 self._failure_memory.failures = []
+
+        object.__setattr__(self, '_pending_vlm_images', [])
 
         kwargs["auto_load_document_editor"] = auto_load_document_editor
         if enable_artefacts:
@@ -6554,11 +6574,13 @@ JSON:"""
                                         stripped_params.pop("max_chars", None)
                                     stripped_sig = f"{tool_name}::{json.dumps(stripped_params, sort_keys=True, default=str)}"
 
-                                    if stripped_sig in successful_tool_signatures:
+                                    if tool_name not in _REPEATABLE_OBSERVATION_TOOLS and stripped_sig in successful_tool_signatures:
                                         action_reports.append(f"Repetitive call to '{tool_name}' with identical file/base parameters blocked. Output already in context. If you need a different page or sheet, change the page_or_sheet parameter.")
                                         continue
 
-                                if context_aware_sig in successful_tool_signatures:
+                                if tool_name in _REPEATABLE_OBSERVATION_TOOLS:
+                                    pass
+                                elif context_aware_sig in successful_tool_signatures:
                                     action_reports.append(f"Repetitive call to '{tool_name}' with identical parameters blocked. Output already in context.")
                                     continue
 
@@ -6606,11 +6628,17 @@ JSON:"""
                                     failed_tool_signatures[context_aware_sig] = failed_tool_signatures.get(context_aware_sig, 0) + 1
                                     raise
 
-                                vlm_images = self._inject_tool_images_for_vlm(tool_res)
-                                if vlm_images:
-                                    if not hasattr(self, '_pending_vlm_images'):
-                                        object.__setattr__(self, '_pending_vlm_images', [])
-                                    self._pending_vlm_images.extend(vlm_images)
+                                try:
+                                    vlm_images = self._inject_tool_images_for_vlm(tool_res)
+                                    if vlm_images:
+                                        if not hasattr(self, '_pending_vlm_images'):
+                                            object.__setattr__(self, '_pending_vlm_images', [])
+                                        if tool_name == "tool_computer_screenshot":
+                                            self._pending_vlm_images = vlm_images
+                                        else:
+                                            self._pending_vlm_images.extend(vlm_images)
+                                except Exception as inj_err:
+                                    ASCIIColors.warning(f"[{self.name}] VLM image injection failed for '{tool_name}': {inj_err}")
 
                                 inner_res = tool_res.get("output", tool_res) if isinstance(tool_res, dict) else tool_res
                                 is_failure = (
@@ -7249,11 +7277,13 @@ JSON:"""
                                     stripped_params.pop("max_chars", None)
                                 stripped_sig = f"{tool_name}::{json.dumps(stripped_params, sort_keys=True, default=str)}"
 
-                                if stripped_sig in successful_tool_signatures:
+                                if tool_name not in _REPEATABLE_OBSERVATION_TOOLS and stripped_sig in successful_tool_signatures:
                                     action_reports.append(f"Repetitive call to '{tool_name}' with identical file/base parameters blocked. Output already in context. If you need a different page or sheet, change the page_or_sheet parameter.")
                                     continue
 
-                            if context_aware_sig in successful_tool_signatures:
+                            if tool_name in _REPEATABLE_OBSERVATION_TOOLS:
+                                pass
+                            elif context_aware_sig in successful_tool_signatures:
                                 action_reports.append(f"Repetitive call to '{tool_name}' with identical parameters blocked. Output already in context.")
                                 continue
 
@@ -7282,11 +7312,17 @@ JSON:"""
                                 failed_tool_signatures[context_aware_sig] = failed_tool_signatures.get(context_aware_sig, 0) + 1
                                 raise
 
-                            vlm_images = self._inject_tool_images_for_vlm(tool_res)
-                            if vlm_images:
-                                if not hasattr(self, '_pending_vlm_images'):
-                                    object.__setattr__(self, '_pending_vlm_images', [])
-                                self._pending_vlm_images.extend(vlm_images)
+                            try:
+                                vlm_images = self._inject_tool_images_for_vlm(tool_res)
+                                if vlm_images:
+                                    if not hasattr(self, '_pending_vlm_images'):
+                                        object.__setattr__(self, '_pending_vlm_images', [])
+                                    if tool_name == "tool_computer_screenshot":
+                                        self._pending_vlm_images = vlm_images
+                                    else:
+                                        self._pending_vlm_images.extend(vlm_images)
+                            except Exception as inj_err:
+                                ASCIIColors.warning(f"[{self.name}] VLM image injection failed for '{tool_name}': {inj_err}")
 
                             if isinstance(tool_res, dict) and tool_res.get("success") is False and not tool_res.get("error"):
                                 raw_preview = ""

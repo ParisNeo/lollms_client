@@ -863,6 +863,30 @@ class LCPBinding(LollmsToolBinding):
             trace_exception(e)
             return False
 
+    def _resolve_context_files(self, context_files: Any) -> List[str]:
+        """Coerces a tool's context_files payload into absolute, existing file paths."""
+        if isinstance(context_files, (str, Path)):
+            entries: List[Any] = [context_files]
+        elif isinstance(context_files, (list, tuple)):
+            entries = list(context_files)
+        else:
+            return []
+
+        resolved: List[str] = []
+        for entry in entries:
+            try:
+                entry_path = Path(str(entry))
+                if not entry_path.is_absolute():
+                    entry_path = Path.cwd() / entry_path
+                entry_path = entry_path.resolve()
+                if entry_path.is_file():
+                    resolved.append(str(entry_path))
+                else:
+                    ASCIIColors.debug(f"[LCP execute_tool] Dropped missing context file: {entry}")
+            except Exception:
+                continue
+        return resolved
+
     def unregister_tools_by_prefix(self, tool_name_prefix: str) -> int:
         initial_count = len(self.discovered_tools)
         self.discovered_tools = [
@@ -1034,11 +1058,27 @@ class LCPBinding(LollmsToolBinding):
             if not result.get("output"):
                 result["output"] = "Tool executed successfully (no output)."
 
-            return {
+            final_result: Dict[str, Any] = {
                 "output": result.get("output"),
                 "status_code": 200,
                 "success": True
             }
+
+            for passthrough_key in (
+                "image_filename",
+                "image_b64",
+                "images",
+                "image_media_types",
+                "prompt_injection",
+            ):
+                passthrough_value = result.get(passthrough_key)
+                if passthrough_value is not None:
+                    final_result[passthrough_key] = passthrough_value
+
+            if result.get("context_files") is not None:
+                final_result["context_files"] = self._resolve_context_files(result.get("context_files"))
+
+            return final_result
 
         except Exception as e:
             tb_str = traceback.format_exc()

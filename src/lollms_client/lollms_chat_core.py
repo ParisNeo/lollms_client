@@ -103,6 +103,19 @@ _BINARY_BLOB_KEYS = {
 _TOOL_UI_PREVIEW_WINDOW = 6000
 _TOOL_UI_PREVIEW_HALF = _TOOL_UI_PREVIEW_WINDOW // 2
 
+_IMAGE_FILE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff", ".tif"}
+_MAX_INJECTABLE_IMAGE_BYTES = 6 * 1024 * 1024
+_IMAGE_MIME_BY_EXT = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".tiff": "image/tiff",
+    ".tif": "image/tiff",
+}
+
 _HOST_ROOT_RE = re.compile(
     r'(?:[A-Za-z]:\\(?:Users|home|Documents|Program Files|Windows)[\\/][^\s"\'<>|]*'
     r'|/(?:home|Users|root|var|opt|usr/local)/[^\s"\'<>|]*'
@@ -751,11 +764,53 @@ def inject_tool_images_for_vlm(tool_result: Dict[str, Any], client: Optional[Any
     raw_images = tool_result.get("images") or tool_result.get("image_b64") or []
     if isinstance(raw_images, str):
         raw_images = [raw_images]
-    if not raw_images or not isinstance(raw_images, list):
-        return []
+    if not isinstance(raw_images, list):
+        raw_images = []
 
-    media_types = tool_result.get("image_media_types") or []
+    raw_media = tool_result.get("image_media_types")
+    media_types = list(raw_media) if isinstance(raw_media, (list, tuple)) else []
     content_blocks: List[Dict[str, str]] = []
+
+    candidate_paths: List[str] = []
+    image_filename = tool_result.get("image_filename")
+    if isinstance(image_filename, str) and image_filename.strip():
+        candidate_paths.append(image_filename.strip())
+    context_files = tool_result.get("context_files")
+    if isinstance(context_files, str) and context_files.strip():
+        candidate_paths.append(context_files.strip())
+    elif isinstance(context_files, (list, tuple)):
+        candidate_paths.extend(
+            str(p).strip() for p in context_files
+            if isinstance(p, str) and p.strip()
+        )
+
+    seen_paths: Set[str] = set()
+    for path_str in candidate_paths:
+        path = Path(path_str)
+        if path.suffix.lower() not in _IMAGE_FILE_EXTS:
+            continue
+        try:
+            resolved = str(path.resolve())
+        except Exception:
+            resolved = path_str
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+        try:
+            if not path.is_file() or path.stat().st_size > _MAX_INJECTABLE_IMAGE_BYTES:
+                continue
+            file_b64 = base64.b64encode(path.read_bytes()).decode("utf-8")
+        except Exception:
+            continue
+        if file_b64 in raw_images:
+            continue
+        mime_aligned = len(media_types) == len(raw_images)
+        raw_images.append(file_b64)
+        if mime_aligned:
+            media_types.append(_IMAGE_MIME_BY_EXT.get(path.suffix.lower(), "image/png"))
+
+    if not raw_images:
+        return []
 
     for idx, img_b64 in enumerate(raw_images):
         if not isinstance(img_b64, str) or not img_b64.strip():

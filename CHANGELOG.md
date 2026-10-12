@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-12 23:09]
+
+- feat(lcp): add computer_use tool enhancements and tool UI preview updates
+
 ## [2026-10-12 21:07]
 
 - feat(code): enhance LCP tool orchestration and STT whisper batching support

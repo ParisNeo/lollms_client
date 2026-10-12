@@ -19,6 +19,7 @@ the PRIMARY monitor (unless the backend exposes a different one).
 
 import base64
 import io
+import json
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -73,12 +74,15 @@ def _resolve_backend():
             pyautogui.PAUSE = 0.05
         except Exception:
             pass
+        pyautogui.size()
         _BACKEND = pyautogui
         return _BACKEND, None
-    except ImportError as import_err:
+    except Exception as import_err:
         _BACKEND_ERROR = (
-            f"pyautogui is not installed ({import_err}). Install it with "
-            f"`pip install pyautogui pillow` to enable computer use tools."
+            f"pyautogui backend failed to initialize ({type(import_err).__name__}: {import_err}). "
+            f"If the message mentions NumPy/_ARRAY_API or cv2, run "
+            f"`pip install --upgrade opencv-python` (or `pip install \"numpy<2\"`). "
+            f"Otherwise install with `pip install pyautogui pillow`."
         )
         ASCIIColors.warning(f"[computer_use] Backend unavailable: {_BACKEND_ERROR}")
         return None, _BACKEND_ERROR
@@ -165,6 +169,60 @@ def _extract_coordinates(text: str) -> Optional[Tuple[int, int]]:
     return None
 
 
+_NORMALIZED_SCALE_MARKERS = (
+    "0-1000", "0 to 1000", "/1000", "normalized", "normalize", "scale 0", "1000x1000",
+)
+
+_NORMALIZED_SCALE_VALUES = {"normalized", "0-1000", "0..1000", "1000", "relative", "percent"}
+
+
+def _rescale_from_1000(x: int, y: int, screen_width: int, screen_height: int) -> Tuple[int, int]:
+    """Converts Qwen-style 0-1000 normalized grid coordinates to absolute pixels."""
+    scaled_x = int(round((x / 1000.0) * screen_width))
+    scaled_y = int(round((y / 1000.0) * screen_height))
+    return _clamp_coordinates(scaled_x, scaled_y)
+
+
+def _extract_coordinates_with_scale(
+    text: str,
+    screen_width: int,
+    screen_height: int,
+) -> Optional[Tuple[int, int]]:
+    """
+    Extracts coordinates from a VLM reply, honoring an explicit coordinate-scale
+    declaration. Some vision models (Qwen-VL family) emit coordinates on a
+    normalized 0-1000 grid instead of absolute pixels; a wrong interpretation
+    clicks the wrong pixel. Only an EXPLICIT declaration triggers rescaling —
+    either a "scale" field in the JSON reply or a normalized-scale marker in
+    the raw text. Absent a declaration, coordinates are treated as absolute.
+    """
+    if not text:
+        return None
+
+    json_blob_match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+    if json_blob_match:
+        try:
+            parsed = json.loads(json_blob_match.group(0))
+            if isinstance(parsed, dict) and "x" in parsed and "y" in parsed:
+                x = int(parsed["x"])
+                y = int(parsed["y"])
+                declared_scale = str(parsed.get("scale", "") or "").strip().lower()
+                if declared_scale in _NORMALIZED_SCALE_VALUES:
+                    return _rescale_from_1000(x, y, screen_width, screen_height)
+                return x, y
+        except (ValueError, TypeError, json.JSONDecodeError):
+            pass
+
+    coords = _extract_coordinates(text)
+    if coords is None:
+        return None
+
+    text_lower = text.lower()
+    if any(marker in text_lower for marker in _NORMALIZED_SCALE_MARKERS):
+        return _rescale_from_1000(coords[0], coords[1], screen_width, screen_height)
+    return coords
+
+
 def _ground_element_coordinates(
     lollms_client_instance: Any,
     screenshot_b64: str,
@@ -186,10 +244,14 @@ def _ground_element_coordinates(
     grounding_prompt = (
         "You are a visual grounding module inside a desktop automation agent.\n"
         f"The attached screenshot is {screen_width} pixels wide and {screen_height} "
-        "pixels tall. Coordinates are absolute pixels from the TOP-LEFT corner.\n"
+        "pixels tall. Coordinates are ABSOLUTE pixels measured from the TOP-LEFT "
+        "corner of the image: (0, 0) is the top-left pixel and "
+        f"({screen_width - 1}, {screen_height - 1}) is the bottom-right pixel.\n"
+        "Do NOT output normalized 0-1000 grid coordinates — raw pixel values only.\n"
         f"Locate: {element_description}\n\n"
         "Reply with ONLY a JSON object of the clickable center point, nothing else:\n"
-        '{"x": <int>, "y": <int>}'
+        '{"x": <int>, "y": <int>, "scale": "absolute"}\n'
+        'The "scale" field must be the literal string "absolute".'
     )
 
     messages = [
@@ -221,7 +283,7 @@ def _ground_element_coordinates(
             continue
 
         text = str(response).strip() if response is not None else ""
-        coords = _extract_coordinates(text)
+        coords = _extract_coordinates_with_scale(text, screen_width, screen_height)
         if coords is None:
             last_error = (
                 f"Vision model did not return parseable coordinates. Raw reply: "
@@ -294,8 +356,27 @@ def tool_computer_desktop_info(
     }
 
 
+def _sanitize_screenshot_filename(raw_name: str) -> str:
+    """
+    Reduces a raw file name to a single safe PNG filename confined to the
+    workspace: strips directories, traversal segments, and unsafe characters.
+    """
+    cleaned = (raw_name or "").strip()
+    cleaned = cleaned.replace("\\", "/")
+    cleaned = cleaned.split("/")[-1]
+    cleaned = re.sub(r"[<>:\"/\\|?*\x00-\x1f]", "", cleaned)
+    cleaned = cleaned.strip(" .")
+    if not cleaned or cleaned in {".", ".."}:
+        return ""
+    if not cleaned.lower().endswith(".png"):
+        cleaned += ".png"
+    return cleaned
+
+
 def tool_computer_screenshot(
     save_to_workspace: bool = True,
+    file_name: str = "",
+    tool_context: Optional[dict] = None,
     discussion_instance: Optional[Any] = None,
     lollms_client_instance: Optional[Any] = None,
 ) -> Dict[str, Any]:
@@ -308,6 +389,7 @@ def tool_computer_screenshot(
 
     Args:
         save_to_workspace (bool): When true, persists the screenshot as a PNG file in the workspace. Default true.
+        file_name (str): Optional custom PNG file name to KEEP this specific frame (e.g. 'photo.png'). When omitted, the default 'computer_use_screenshot.png' is used and overwritten on every recapture.
     """
     try:
         screenshot_b64 = _capture_screenshot_b64()
@@ -328,16 +410,26 @@ def tool_computer_screenshot(
     width, height = _screen_size()
 
     workspace_file: Optional[str] = None
+    saved_file_name: Optional[str] = None
     if save_to_workspace:
         try:
             from pathlib import Path
-            import uuid as _uuid
 
-            workspace_root = Path.cwd()
-            file_name = f"screenshot_{int(time.time())}_{_uuid.uuid4().hex[:6]}.png"
-            target_path = workspace_root / file_name
+            working_dir = Path.cwd()
+            if isinstance(tool_context, dict):
+                context_dir = tool_context.get("working_dir")
+                if context_dir:
+                    try:
+                        candidate = Path(context_dir)
+                        if candidate.is_dir():
+                            working_dir = candidate.resolve()
+                    except Exception:
+                        pass
+
+            saved_file_name = _sanitize_screenshot_filename(file_name) or "computer_use_screenshot.png"
+            target_path = working_dir / saved_file_name
             target_path.write_bytes(base64.b64decode(screenshot_b64))
-            workspace_file = file_name
+            workspace_file = str(target_path.resolve())
         except Exception as persist_err:
             ASCIIColors.warning(
                 f"[computer_use] Screenshot workspace persistence failed: {persist_err}"
@@ -347,7 +439,7 @@ def tool_computer_screenshot(
         "success": True,
         "output": (
             f"Screenshot captured ({width}x{height})."
-            + (f" Saved to workspace as '{workspace_file}'." if workspace_file else "")
+            + (f" Saved to workspace as '{saved_file_name}'." if workspace_file else "")
             + " The image is attached for your inspection; describe what you see "
             "and plan your next action."
         ),
@@ -357,7 +449,20 @@ def tool_computer_screenshot(
         "screen_height": height,
     }
     if workspace_file:
+        result["image_filename"] = workspace_file
+        result["context_files"] = [workspace_file]
         result["screenshot_file"] = workspace_file
+        result["prompt_injection"] = (
+            f"\n\n✅ **Screenshot attached to your visual context** "
+            f"({saved_file_name}). Describe what you observe and act on it.\n"
+            f"📐 **COORDINATE CONVENTION**: The attached screenshot is EXACTLY "
+            f"{width}x{height} pixels. All coordinates are ABSOLUTE pixels: "
+            f"top-left corner is (0, 0), bottom-right corner is ({width - 1}, {height - 1}). "
+            f"When estimating a click position from this image, first locate the target "
+            f"element, then read its position as a fraction of the image width/height "
+            f"(e.g. a target at the horizontal center of a {width}-wide image is at "
+            f"x={width // 2}), and state the estimated (x, y) before clicking."
+        )
     return result
 
 
@@ -421,6 +526,23 @@ def tool_computer_click(
             }
         x, y = coords
 
+    if not (description and description.strip()):
+        try:
+            x_val, y_val = int(x), int(y)
+        except (TypeError, ValueError):
+            return {"success": False, "error": "Coordinates x and y must be integers."}
+        if x_val == 0 and y_val == 0:
+            return {
+                "success": False,
+                "error": (
+                    "Refusing to click (0, 0) — the top-left corner is almost certainly "
+                    "not your intended target. Either pass explicit non-zero x/y coordinates "
+                    "read from your last screenshot, or pass a natural-language 'description' "
+                    "(e.g. description='the Windows search box in the taskbar') so the system "
+                    "can visually ground the exact click point."
+                ),
+            }
+
     try:
         if x is None or y is None:
             return {"success": False, "error": "Coordinates x and y are required when no description is given."}
@@ -436,9 +558,21 @@ def tool_computer_click(
     except Exception as click_err:
         return {"success": False, "error": _sanitize_error(f"Click failed: {click_err}")}
 
+    try:
+        width_geo, height_geo = _screen_size()
+    except Exception:
+        width_geo, height_geo = 0, 0
+
     return {
         "success": True,
-        "output": f"Clicked {button} button {clicks}x at ({x}, {y}).",
+        "output": (
+            f"Clicked {button} button {clicks}x at ({x}, {y})."
+            f" Screen bounds reminder: the screen is {width_geo}x{height_geo} pixels with "
+            f"(0, 0) at top-left and ({width_geo - 1}, {height_geo - 1}) at bottom-right — "
+            "re-screenshot to verify the click landed on your intended target;"
+            " if it missed, call tool_computer_cursor_screenshot to see exactly where"
+            " the pointer is and recalibrate before clicking again."
+        ),
         "x": x,
         "y": y,
     }
@@ -481,6 +615,22 @@ def tool_computer_move_cursor(
             return {"success": False, "error": f"Visual grounding failed: {grounding_error}"}
         x, y = coords
 
+    if not (description and description.strip()):
+        try:
+            x_val, y_val = int(x), int(y)
+        except (TypeError, ValueError):
+            return {"success": False, "error": "Coordinates x and y must be integers."}
+        if x_val == 0 and y_val == 0:
+            return {
+                "success": False,
+                "error": (
+                    "Refusing to move to (0, 0) — the top-left corner is almost certainly "
+                    "not your intended target. Either pass explicit non-zero x/y coordinates "
+                    "read from your last screenshot, or pass a natural-language 'description' "
+                    "so the system can visually ground the destination."
+                ),
+            }
+
     try:
         if x is None or y is None:
             return {"success": False, "error": "Coordinates x and y are required when no description is given."}
@@ -498,7 +648,11 @@ def tool_computer_move_cursor(
 
     return {
         "success": True,
-        "output": f"Moved cursor to ({x}, {y}).",
+        "output": (
+            f"Moved cursor to ({x}, {y})."
+            " The red-circle highlight in tool_computer_cursor_screenshot will show"
+            " you the exact pointer position if you need to verify or recalibrate."
+        ),
         "x": x,
         "y": y,
     }
@@ -674,6 +828,7 @@ def tool_computer_drag(
 def tool_computer_type(
     text: str,
     interval_ms: int = 20,
+    press_enter: bool = False,
     discussion_instance: Optional[Any] = None,
     lollms_client_instance: Optional[Any] = None,
 ) -> Dict[str, Any]:
@@ -685,6 +840,7 @@ def tool_computer_type(
     Args:
         text (str): The text to type. Required.
         interval_ms (int): Delay between keystrokes in milliseconds. Default 20.
+        press_enter (bool): When true, presses Enter after typing. Default false.
     """
     if not isinstance(text, str) or not text:
         return {"success": False, "error": "The 'text' parameter is required and must be a non-empty string."}
@@ -697,14 +853,17 @@ def tool_computer_type(
     try:
         backend = _require_backend()
         backend.typewrite(text, interval=interval_s)
+        if press_enter:
+            backend.press("enter")
     except RuntimeError as backend_err:
         return {"success": False, "error": _sanitize_error(str(backend_err))}
     except Exception as type_err:
         return {"success": False, "error": _sanitize_error(f"Typing failed: {type_err}")}
 
+    enter_note = " Enter pressed." if press_enter else ""
     return {
         "success": True,
-        "output": f"Typed {len(text)} characters.",
+        "output": f"Typed {len(text)} characters.{enter_note}",
         "typed_chars": len(text),
     }
 
@@ -816,7 +975,7 @@ def tool_computer_scroll(
 
 
 def tool_computer_wait(
-    duration_s: float = 1.0,
+    seconds: float = 1.0,
     discussion_instance: Optional[Any] = None,
     lollms_client_instance: Optional[Any] = None,
 ) -> Dict[str, Any]:
@@ -824,10 +983,10 @@ def tool_computer_wait(
     Pauses execution briefly to allow an application to open, a webpage to load, or an animation to complete.
 
     Args:
-        duration_s (float): Seconds to wait (clamped between 0.1 and 10.0 seconds). Default 1.0.
+        seconds (float): Seconds to wait (clamped between 0.1 and 10.0 seconds). Default 1.0.
     """
     try:
-        dur = max(0.1, min(float(duration_s), 10.0))
+        dur = max(0.1, min(float(seconds), 10.0))
     except (TypeError, ValueError):
         dur = 1.0
 
@@ -835,7 +994,7 @@ def tool_computer_wait(
     return {
         "success": True,
         "output": f"Waited {dur:.2f} seconds for the system/UI to settle.",
-        "duration_s": dur,
+        "seconds": dur,
     }
 
 
@@ -846,7 +1005,7 @@ def tool_computer_cursor_position(
     """
     Returns the current pixel coordinates of the mouse cursor.
 
-    Call this to verify where the pointer is currently resting.
+    Call this to verify where the pointer is resting.
     """
     try:
         backend = _require_backend()
@@ -861,3 +1020,141 @@ def tool_computer_cursor_position(
         return {"success": False, "error": _sanitize_error(str(backend_err))}
     except Exception as err:
         return {"success": False, "error": _sanitize_error(f"Position lookup failed: {err}")}
+
+
+def _annotate_cursor_on_screenshot(pil_image: Any, cursor_x: int, cursor_y: int) -> Any:
+    """
+    Draws a red target circle with a blue center dot at the cursor position
+    so the vision model can see exactly where the pointer is resting.
+    """
+    from PIL import ImageDraw
+
+    annotated = pil_image.convert("RGB")
+    draw = ImageDraw.Draw(annotated)
+    radius = 16
+
+    for ring_offset, ring_color in ((4, (255, 255, 255)), (0, (255, 0, 0))):
+        draw.ellipse(
+            (
+                cursor_x - radius + ring_offset,
+                cursor_y - radius + ring_offset,
+                cursor_x + radius - ring_offset,
+                cursor_y + radius - ring_offset,
+            ),
+            outline=ring_color,
+            width=4,
+        )
+
+    draw.ellipse(
+        (cursor_x - 5, cursor_y - 5, cursor_x + 5, cursor_y + 5),
+        fill=(0, 0, 255),
+        outline=(255, 255, 255),
+        width=2,
+    )
+
+    return annotated
+
+
+def tool_computer_cursor_screenshot(
+    file_name: str = "",
+    tool_context: Optional[dict] = None,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Takes a screenshot with the current mouse cursor position highlighted: a red circle with a blue center dot marks the exact pointer location.
+
+    Use this to CALIBRATE yourself: the highlighted screenshot shows you where
+    the pointer actually is, so you can compare it with where you believed it
+    was and correct your coordinate reasoning. Call it after clicks, moves, or
+    drags if you are unsure where the cursor ended up.
+
+    Args:
+        file_name (str): Optional custom PNG file name to keep this calibration frame (e.g. 'cursor_check.png'). Default 'computer_use_cursor.png' is overwritten each call.
+    """
+    backend = _require_backend()
+
+    try:
+        cursor_x, cursor_y = backend.position()
+        cursor_x, cursor_y = int(cursor_x), int(cursor_y)
+    except Exception as pos_err:
+        return {"success": False, "error": _sanitize_error(f"Cursor position lookup failed: {pos_err}")}
+
+    try:
+        pil_image = backend.screenshot()
+    except Exception as shot_err:
+        return {"success": False, "error": _sanitize_error(f"Screenshot capture failed: {shot_err}")}
+
+    try:
+        annotated_image = _annotate_cursor_on_screenshot(pil_image, cursor_x, cursor_y)
+        buffer = io.BytesIO()
+        annotated_image.save(buffer, format="PNG", optimize=True)
+        annotated_b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
+    except Exception as anno_err:
+        return {"success": False, "error": _sanitize_error(f"Cursor annotation failed: {anno_err}")}
+
+    if len(annotated_b64) > _MAX_SCREENSHOT_BASE64_CHARS:
+        return {
+            "success": False,
+            "error": (
+                f"Annotated screenshot payload too large ({len(annotated_b64)} base64 chars). "
+                "Reduce screen resolution or color depth."
+            ),
+        }
+
+    try:
+        width, height = _screen_size()
+    except Exception:
+        width, height = pil_image.size
+
+    workspace_file: Optional[str] = None
+    saved_file_name: Optional[str] = None
+    try:
+        from pathlib import Path
+
+        working_dir = Path.cwd()
+        if isinstance(tool_context, dict):
+            context_dir = tool_context.get("working_dir")
+            if context_dir:
+                try:
+                    candidate = Path(context_dir)
+                    if candidate.is_dir():
+                        working_dir = candidate.resolve()
+                except Exception:
+                    pass
+
+        saved_file_name = _sanitize_screenshot_filename(file_name) or "computer_use_cursor.png"
+        target_path = working_dir / saved_file_name
+        target_path.write_bytes(base64.b64decode(annotated_b64))
+        workspace_file = str(target_path.resolve())
+    except Exception as persist_err:
+        ASCIIColors.warning(
+            f"[computer_use] Cursor screenshot persistence failed: {persist_err}"
+        )
+
+    result: Dict[str, Any] = {
+        "success": True,
+        "output": (
+            f"Cursor is at ({cursor_x}, {cursor_y}) in a {width}x{height} screen. "
+            f"((0, 0) top-left, ({width - 1}, {height - 1}) bottom-right). "
+            "The attached screenshot highlights it with a red circle and blue center dot — "
+            "compare the highlighted location with your intended target to recalibrate "
+            "your coordinates."
+            + (f" Saved to workspace as '{saved_file_name}'." if workspace_file else "")
+        ),
+        "cursor_x": cursor_x,
+        "cursor_y": cursor_y,
+        "image_b64": annotated_b64,
+        "screen_width": width,
+        "screen_height": height,
+    }
+    if workspace_file:
+        result["image_filename"] = workspace_file
+        result["context_files"] = [workspace_file]
+        result["prompt_injection"] = (
+            f"\n\n✅ **Cursor calibration screenshot attached** ({saved_file_name}). "
+            f"The red circle with blue center marks the pointer at ({cursor_x}, {cursor_y}). "
+            "Locate the highlight, compare it with your intended target, and adjust your "
+            "coordinate reasoning before acting."
+        )
+    return result
