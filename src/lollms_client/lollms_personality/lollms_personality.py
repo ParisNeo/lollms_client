@@ -6551,6 +6551,7 @@ JSON:"""
                                 call_data = json.loads(tool_call_json_str)
                                 tool_name = call_data.get("name", "")
                                 tool_params = call_data.get("parameters", {})
+                                _is_observation_tool = tool_name in _REPEATABLE_OBSERVATION_TOOLS
 
                                 if not active_tools or tool_name not in active_tools:
                                     action_reports.append(f"Tool '{tool_name}' not available. Use one of: {list(active_tools.keys())}")
@@ -7254,6 +7255,7 @@ JSON:"""
                             call_data = json.loads(tool_call_json_str)
                             tool_name = call_data.get("name", "")
                             tool_params = call_data.get("parameters", {})
+                            _is_observation_tool = tool_name in _REPEATABLE_OBSERVATION_TOOLS
 
                             if not active_tools or tool_name not in active_tools:
                                 action_reports.append(f"Tool '{tool_name}' not available. Use one of: {list(active_tools.keys())}")

@@ -38,6 +38,8 @@ TOOL_LIBRARY_ICON = "🖥️"
 _MAX_SCREENSHOT_BASE64_CHARS = 6_000_000
 _GROUNDING_MAX_RETRIES = 2
 _VLM_N_PREDICT = 600
+_GRID_STEP = 100
+_POST_ACTION_SETTLE_S = 0.4
 
 
 def init_tools_library(config: Optional[dict] = None) -> None:
@@ -344,15 +346,31 @@ def tool_computer_desktop_info(
     except Exception as gen_err:
         return {"success": False, "error": _sanitize_error(str(gen_err))}
 
+    try:
+        backend = _require_backend()
+        cursor_x, cursor_y = int(backend.position()[0]), int(backend.position()[1])
+        cursor_text = f" Cursor is currently at ({cursor_x}, {cursor_y})."
+    except Exception:
+        cursor_x, cursor_y = -1, -1
+        cursor_text = ""
+
     return {
         "success": True,
         "output": (
             f"Primary screen geometry: {width}x{height} pixels. "
             "Origin (0,0) is the top-left corner. All computer use coordinates "
-            "are absolute pixels within this range."
+            "are absolute pixels within this range. "
+            f"Every screenshot you receive overlays a cyan grid with lines every "
+            f"{_GRID_STEP} pixels, labeled at their (x, y) intersections. "
+            f"To locate an element: find the two nearest grid lines around it, "
+            f"then estimate its position as the fraction of the "
+            f"{_GRID_STEP}-px gap between them (e.g. halfway between the 600 and 700 "
+            f"vertical lines is x≈650)."
+            + cursor_text
         ),
         "screen_width": width,
         "screen_height": height,
+        **({"cursor_x": cursor_x, "cursor_y": cursor_y} if cursor_x >= 0 else {}),
     }
 
 
@@ -392,22 +410,19 @@ def tool_computer_screenshot(
         file_name (str): Optional custom PNG file name to KEEP this specific frame (e.g. 'photo.png'). When omitted, the default 'computer_use_screenshot.png' is used and overwritten on every recapture.
     """
     try:
-        screenshot_b64 = _capture_screenshot_b64()
+        backend = _require_backend()
+        cursor_x, cursor_y = int(backend.position()[0]), int(backend.position()[1])
+    except Exception:
+        cursor_x, cursor_y = -1, -1
+
+    try:
+        screenshot_b64, width, height = _capture_annotated_b64(
+            (cursor_x, cursor_y) if cursor_x >= 0 else None
+        )
     except RuntimeError as capture_err:
         return {"success": False, "error": _sanitize_error(str(capture_err))}
     except Exception as gen_err:
         return {"success": False, "error": _sanitize_error(str(gen_err))}
-
-    if len(screenshot_b64) > _MAX_SCREENSHOT_BASE64_CHARS:
-        return {
-            "success": False,
-            "error": (
-                f"Screenshot payload too large ({len(screenshot_b64)} base64 chars). "
-                "Reduce screen resolution or color depth."
-            ),
-        }
-
-    width, height = _screen_size()
 
     workspace_file: Optional[str] = None
     saved_file_name: Optional[str] = None
@@ -435,6 +450,11 @@ def tool_computer_screenshot(
                 f"[computer_use] Screenshot workspace persistence failed: {persist_err}"
             )
 
+    cursor_clause = (
+        f" The mouse pointer is at ({cursor_x}, {cursor_y}), marked by the red circle with blue center."
+        if cursor_x >= 0
+        else ""
+    )
     result: Dict[str, Any] = {
         "success": True,
         "output": (
@@ -442,12 +462,16 @@ def tool_computer_screenshot(
             + (f" Saved to workspace as '{saved_file_name}'." if workspace_file else "")
             + " The image is attached for your inspection; describe what you see "
             "and plan your next action."
+            + cursor_clause
         ),
         "image_b64": screenshot_b64,
         "screenshot_b64": screenshot_b64,
         "screen_width": width,
         "screen_height": height,
     }
+    if cursor_x >= 0:
+        result["cursor_x"] = cursor_x
+        result["cursor_y"] = cursor_y
     if workspace_file:
         result["image_filename"] = workspace_file
         result["context_files"] = [workspace_file]
@@ -458,10 +482,17 @@ def tool_computer_screenshot(
             f"📐 **COORDINATE CONVENTION**: The attached screenshot is EXACTLY "
             f"{width}x{height} pixels. All coordinates are ABSOLUTE pixels: "
             f"top-left corner is (0, 0), bottom-right corner is ({width - 1}, {height - 1}). "
-            f"When estimating a click position from this image, first locate the target "
-            f"element, then read its position as a fraction of the image width/height "
-            f"(e.g. a target at the horizontal center of a {width}-wide image is at "
-            f"x={width // 2}), and state the estimated (x, y) before clicking."
+            f"Overlay: a CYAN grid with lines every {_GRID_STEP} pixels; each "
+            f"intersection is labeled at its (x, y) coordinate in a black chip. "
+            f"To estimate a target's position: (1) find the two nearest vertical "
+            f"grid lines — call them X1 and X2 — (2) find the two nearest horizontal "
+            f"grid lines — Y1 and Y2 — (3) estimate the fraction of the gap the "
+            f"target sits between them (e.g. 30% of the way from X1=600 to X2=700 "
+            f"gives x≈630). State your estimated (x, y) before clicking. "
+            f"⚠️ Do NOT assume the target is at the center of the image — the "
+            f"center of the image is ({width // 2}, {height // 2}), which is NOT "
+            f"necessarily where the element is. Read the grid labels."
+            + (f" {cursor_clause.strip()}." if cursor_x >= 0 else "")
         )
     return result
 
@@ -550,6 +581,13 @@ def tool_computer_click(
     except (TypeError, ValueError):
         return {"success": False, "error": "Coordinates x and y must be integers."}
 
+    pre_click_cursor = None
+    try:
+        backend = _require_backend()
+        pre_click_cursor = (int(backend.position()[0]), int(backend.position()[1]))
+    except Exception:
+        pass
+
     try:
         backend = _require_backend()
         backend.click(x=x, y=y, clicks=clicks, button=button)
@@ -563,19 +601,21 @@ def tool_computer_click(
     except Exception:
         width_geo, height_geo = 0, 0
 
-    return {
-        "success": True,
-        "output": (
-            f"Clicked {button} button {clicks}x at ({x}, {y})."
-            f" Screen bounds reminder: the screen is {width_geo}x{height_geo} pixels with "
-            f"(0, 0) at top-left and ({width_geo - 1}, {height_geo - 1}) at bottom-right — "
-            "re-screenshot to verify the click landed on your intended target;"
-            " if it missed, call tool_computer_cursor_screenshot to see exactly where"
-            " the pointer is and recalibrate before clicking again."
-        ),
-        "x": x,
-        "y": y,
-    }
+    pre_clause = ""
+    if pre_click_cursor:
+        pre_clause = (
+            f" (cursor was at ({pre_click_cursor[0]}, {pre_click_cursor[1]}) "
+            f"before the click)"
+        )
+
+    return _post_action_result(
+        f"Clicked {button} button {clicks}x at ({x}, {y}){pre_clause}. "
+        f"Screen: {width_geo}x{height_geo} px. "
+        f"⚠️ VERIFY on the attached screenshot: the cursor should now be at "
+        f"({x}, {y}) on the grid — if the red circle is NOT on the intended "
+        f"element, re-estimate coordinates from the grid labels and click again.",
+        {"x": x, "y": y},
+    )
 
 
 def tool_computer_move_cursor(
@@ -640,22 +680,23 @@ def tool_computer_move_cursor(
 
     try:
         backend = _require_backend()
+        pre_move_cursor = (int(backend.position()[0]), int(backend.position()[1]))
         backend.moveTo(x=x, y=y)
     except RuntimeError as backend_err:
         return {"success": False, "error": _sanitize_error(str(backend_err))}
     except Exception as move_err:
         return {"success": False, "error": _sanitize_error(f"Cursor move failed: {move_err}")}
 
-    return {
-        "success": True,
-        "output": (
-            f"Moved cursor to ({x}, {y})."
-            " The red-circle highlight in tool_computer_cursor_screenshot will show"
-            " you the exact pointer position if you need to verify or recalibrate."
-        ),
-        "x": x,
-        "y": y,
-    }
+    pre_clause = (
+        f" (was at ({pre_move_cursor[0]}, {pre_move_cursor[1]}))"
+        if pre_move_cursor else ""
+    )
+    return _post_action_result(
+        f"Moved cursor to ({x}, {y}){pre_clause}. "
+        f"⚠️ VERIFY: the red circle should now be at ({x}, {y}) on the grid — "
+        f"confirm the cursor is where you intended before acting.",
+        {"x": x, "y": y},
+    )
 
 
 def tool_computer_mouse_down(
@@ -692,10 +733,7 @@ def tool_computer_mouse_down(
     except Exception as err:
         return {"success": False, "error": _sanitize_error(f"Mouse down failed: {err}")}
 
-    return {
-        "success": True,
-        "output": f"Held {button} mouse button down {pos_desc}.",
-    }
+    return _post_action_result(f"Held {button} mouse button down {pos_desc}.", {})
 
 
 def tool_computer_mouse_up(
@@ -731,10 +769,7 @@ def tool_computer_mouse_up(
     except Exception as err:
         return {"success": False, "error": _sanitize_error(f"Mouse up failed: {err}")}
 
-    return {
-        "success": True,
-        "output": f"Released {button} mouse button {pos_desc}.",
-    }
+    return _post_action_result(f"Released {button} mouse button {pos_desc}.", {})
 
 
 def tool_computer_drag(
@@ -817,12 +852,10 @@ def tool_computer_drag(
     except Exception as drag_err:
         return {"success": False, "error": _sanitize_error(f"Drag failed: {drag_err}")}
 
-    return {
-        "success": True,
-        "output": f"Dragged {button} button to ({target_to_x}, {target_to_y}) over {duration_s:.2f}s.",
-        "to_x": target_to_x,
-        "to_y": target_to_y,
-    }
+    return _post_action_result(
+        f"Dragged {button} button to ({target_to_x}, {target_to_y}) over {duration_s:.2f}s.",
+        {"to_x": target_to_x, "to_y": target_to_y},
+    )
 
 
 def tool_computer_type(
@@ -861,11 +894,10 @@ def tool_computer_type(
         return {"success": False, "error": _sanitize_error(f"Typing failed: {type_err}")}
 
     enter_note = " Enter pressed." if press_enter else ""
-    return {
-        "success": True,
-        "output": f"Typed {len(text)} characters.{enter_note}",
-        "typed_chars": len(text),
-    }
+    return _post_action_result(
+        f"Typed {len(text)} characters.{enter_note}",
+        {"typed_chars": len(text)},
+    )
 
 
 def tool_computer_key(
@@ -920,10 +952,10 @@ def tool_computer_key(
     except Exception as key_err:
         return {"success": False, "error": _sanitize_error(f"Key press failed: {key_err}")}
 
-    return {
-        "success": True,
-        "output": f"Pressed '{key_normalized}' {presses} time(s).",
-    }
+    return _post_action_result(
+        f"Pressed '{key_normalized}' {presses} time(s).",
+        {},
+    )
 
 
 def tool_computer_scroll(
@@ -968,10 +1000,10 @@ def tool_computer_scroll(
     except Exception as scroll_err:
         return {"success": False, "error": _sanitize_error(f"Scroll failed: {scroll_err}")}
 
-    return {
-        "success": True,
-        "output": f"Scrolled {direction} by {abs(amount)} units.",
-    }
+    return _post_action_result(
+        f"Scrolled {direction} by {abs(amount)} units.",
+        {},
+    )
 
 
 def tool_computer_wait(
@@ -991,11 +1023,10 @@ def tool_computer_wait(
         dur = 1.0
 
     time.sleep(dur)
-    return {
-        "success": True,
-        "output": f"Waited {dur:.2f} seconds for the system/UI to settle.",
-        "seconds": dur,
-    }
+    return _post_action_result(
+        f"Waited {dur:.2f} seconds for the system/UI to settle.",
+        {"seconds": dur},
+    )
 
 
 def tool_computer_cursor_position(
@@ -1022,37 +1053,586 @@ def tool_computer_cursor_position(
         return {"success": False, "error": _sanitize_error(f"Position lookup failed: {err}")}
 
 
-def _annotate_cursor_on_screenshot(pil_image: Any, cursor_x: int, cursor_y: int) -> Any:
+def _grid_label_font(size: int = 18):
     """
-    Draws a red target circle with a blue center dot at the cursor position
-    so the vision model can see exactly where the pointer is resting.
+    Returns the best available font for grid labels: a TrueType font (DejaVu,
+    Arial, Roboto, or the first TTF PIL can find) at the requested size,
+    falling back to PIL's default bitmap font.
     """
-    from PIL import ImageDraw
+    from PIL import ImageFont
+
+    candidate_names = (
+        "DejaVuSans.ttf",
+        "DejaVuSans-Bold.ttf",
+        "arial.ttf",
+        "Arial.ttf",
+        "Roboto-Regular.ttf",
+    )
+    for font_name in candidate_names:
+        try:
+            return ImageFont.truetype(font_name, size)
+        except Exception:
+            continue
+    for directory in (
+        r"C:\Windows\Fonts",
+        "/usr/share/fonts",
+        "/usr/local/share/fonts",
+        "/System/Library/Fonts",
+    ):
+        try:
+            import os
+            if os.path.isdir(directory):
+                for fn in os.listdir(directory):
+                    if fn.lower().endswith((".ttf", ".ttc", ".otf")):
+                        try:
+                            return ImageFont.truetype(os.path.join(directory, fn), size)
+                        except Exception:
+                            continue
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default(size)
+    except TypeError:
+        try:
+            return ImageFont.load_default()
+        except Exception:
+            return None
+    return None
+
+
+def _annotate_screenshot(
+    pil_image: Any,
+    cursor_x: Optional[int] = None,
+    cursor_y: Optional[int] = None,
+) -> Any:
+    """
+    Draws a labeled coordinate grid (lines every _GRID_STEP pixels) and, when
+    given, a red target circle with a blue center dot at the cursor position,
+    so the vision model can cross-reference element locations and see exactly
+    where the pointer is resting.
+    """
+    from PIL import Image, ImageDraw
 
     annotated = pil_image.convert("RGB")
-    draw = ImageDraw.Draw(annotated)
-    radius = 16
+    width, height = annotated.size
 
-    for ring_offset, ring_color in ((4, (255, 255, 255)), (0, (255, 0, 0))):
+    overlay = Image.new("RGBA", annotated.size, (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+    for gx in range(_GRID_STEP, width, _GRID_STEP):
+        overlay_draw.line([(gx, 0), (gx, height)], fill=(0, 180, 255, 120), width=2)
+    for gy in range(_GRID_STEP, height, _GRID_STEP):
+        overlay_draw.line([(0, gy), (width, gy)], fill=(0, 180, 255, 120), width=2)
+    annotated = Image.alpha_composite(annotated.convert("RGBA"), overlay).convert("RGB")
+
+    draw = ImageDraw.Draw(annotated)
+    label_font = _grid_label_font(18)
+
+    def _draw_label(x: int, y: int, text: str):
+        try:
+            bbox = draw.textbbox((x, y), text, font=label_font)
+            pad = 3
+            chip_x0, chip_y0 = x - pad, y - pad
+            chip_x1, chip_y1 = bbox[2] + pad, bbox[3] + pad
+            draw.rectangle([chip_x0, chip_y0, chip_x1, chip_y1], fill=(0, 0, 0, 200))
+            draw.text((x + 1, y + 1), text, fill=(255, 255, 255), font=label_font)
+        except Exception:
+            draw.text((x, y), text, fill=(255, 255, 255), font=label_font)
+
+    for gx in range(_GRID_STEP, width, _GRID_STEP):
+        _draw_label(gx + 4, 4, str(gx))
+    for gy in range(_GRID_STEP, height, _GRID_STEP):
+        _draw_label(4, gy + 4, str(gy))
+
+    if cursor_x is not None and cursor_y is not None:
+        radius = 18
+        for ring_offset, ring_color in ((5, (255, 255, 255)), (0, (255, 0, 0))):
+            draw.ellipse(
+                (
+                    cursor_x - radius + ring_offset,
+                    cursor_y - radius + ring_offset,
+                    cursor_x + radius - ring_offset,
+                    cursor_y + radius - ring_offset,
+                ),
+                outline=ring_color,
+                width=4,
+            )
         draw.ellipse(
-            (
-                cursor_x - radius + ring_offset,
-                cursor_y - radius + ring_offset,
-                cursor_x + radius - ring_offset,
-                cursor_y + radius - ring_offset,
-            ),
-            outline=ring_color,
-            width=4,
+            (cursor_x - 6, cursor_y - 6, cursor_x + 6, cursor_y + 6),
+            fill=(0, 0, 255),
+            outline=(255, 255, 255),
+            width=2,
         )
 
-    draw.ellipse(
-        (cursor_x - 5, cursor_y - 5, cursor_x + 5, cursor_y + 5),
-        fill=(0, 0, 255),
-        outline=(255, 255, 255),
-        width=2,
-    )
-
     return annotated
+
+
+def _capture_annotated_b64(
+    cursor: Optional[Tuple[int, int]] = None,
+) -> Tuple[str, int, int]:
+    """
+    Captures the screen and annotates it with the coordinate grid and, when
+    provided, a cursor marker. Returns (base64_png, width, height).
+    """
+    backend = _require_backend()
+    try:
+        pil_image = backend.screenshot()
+    except Exception as shot_err:
+        raise RuntimeError(f"Screenshot capture failed: {shot_err}")
+
+    width, height = pil_image.size
+    annotated = _annotate_screenshot(
+        pil_image,
+        cursor[0] if cursor else None,
+        cursor[1] if cursor else None,
+    )
+    buffer = io.BytesIO()
+    annotated.save(buffer, format="PNG", optimize=True)
+    b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
+    if len(b64) > _MAX_SCREENSHOT_BASE64_CHARS:
+        raise RuntimeError(
+            f"Annotated screenshot payload too large ({len(b64)} base64 chars). "
+            "Reduce screen resolution or color depth."
+        )
+    return b64, width, height
+
+
+def _post_action_result(action_desc: str, extra: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Builds the result of a desktop action: waits briefly for the UI to settle,
+    captures a grid-annotated, cursor-highlighted verification screenshot, saves
+    it to the workspace, and reports the cursor position alongside the action.
+    The LLM sees the immediate consequence of its action on the next turn.
+    """
+    try:
+        time.sleep(_POST_ACTION_SETTLE_S)
+        backend = _require_backend()
+        cursor_x, cursor_y = int(backend.position()[0]), int(backend.position()[1])
+    except Exception:
+        cursor_x, cursor_y = -1, -1
+
+    result: Dict[str, Any] = {
+        "success": True,
+        "output": action_desc
+        + (
+            f" Cursor is now at ({cursor_x}, {cursor_y}). "
+            "A verification screenshot is attached (cyan grid, lines every "
+            f"{_GRID_STEP}px with labeled intersections; the red circle with "
+            "blue center marks the mouse pointer). VERIFY: does the cursor "
+            "position match where you intended to click? Does the UI show the "
+            "expected change? If the cursor is NOT on the target, re-estimate "
+            "the coordinates using the grid labels and try again."
+        ),
+    }
+    result.update(extra)
+    if cursor_x >= 0:
+        result["cursor_x"] = cursor_x
+        result["cursor_y"] = cursor_y
+
+    try:
+        b64, width, height = _capture_annotated_b64(
+            (cursor_x, cursor_y) if cursor_x >= 0 else None
+        )
+    except Exception as shot_err:
+        ASCIIColors.warning(f"[computer_use] Post-action verification capture failed: {shot_err}")
+        return result
+
+    result["image_b64"] = b64
+    result["screen_width"] = width
+    result["screen_height"] = height
+
+    saved_file_name: Optional[str] = None
+    workspace_file: Optional[str] = None
+    try:
+        from pathlib import Path
+
+        working_dir = Path.cwd()
+        saved_file_name = "computer_use_screenshot.png"
+        target_path = working_dir / saved_file_name
+        target_path.write_bytes(base64.b64decode(b64))
+        workspace_file = str(target_path.resolve())
+    except Exception as persist_err:
+        ASCIIColors.warning(f"[computer_use] Verification screenshot persistence failed: {persist_err}")
+
+    if workspace_file:
+        result["image_filename"] = workspace_file
+        result["context_files"] = [workspace_file]
+        result["screenshot_file"] = workspace_file
+        cursor_clause = (
+            f"the mouse pointer is at ({cursor_x}, {cursor_y})"
+            if cursor_x >= 0
+            else "the mouse pointer position is unknown in this shot"
+        )
+        result["prompt_injection"] = (
+            f"\n\n✅ **Verification screenshot attached** ({saved_file_name}). "
+            f"Screen: {width}x{height} px (top-left origin). "
+            f"Overlay: CYAN grid, lines every {_GRID_STEP}px, intersections "
+            f"labeled at (x, y) in black chips. {cursor_clause} "
+            f"(red circle, blue center). "
+            f"⚠️ CHECK: Does the cursor sit ON the element you intended to "
+            f"click? Compare the cursor's grid position against the element's "
+            f"grid position. If they differ, re-estimate using the nearest "
+            f"grid lines (interpolate the fraction between them) and click "
+            f"again at the corrected coordinates."
+        )
+    return result
+
+
+def _vlm_step_verdict(
+    lollms_client_instance: Any,
+    screenshot_b64: str,
+    step_description: str,
+    last_action_desc: str,
+    screen_width: int,
+    screen_height: int,
+) -> Tuple[bool, str]:
+    """
+    Asks the vision model whether the step is complete. Returns (is_done, reason).
+    """
+    vision_binding = _resolve_vision_binding(lollms_client_instance)
+    if vision_binding is None:
+        return False, "No vision model available for step verification."
+
+    prompt = (
+        "You are verifying a desktop automation step.\n"
+        f"Step objective: {step_description}\n"
+        f"Last action performed: {last_action_desc}\n"
+        f"Screenshot is {screen_width}x{screen_height} pixels.\n\n"
+        "Has the step objective been ACHIEVED in this screenshot? "
+        "Reply with ONLY a JSON object: {\"done\": true|false, \"reason\": \"<one sentence>\"}\n"
+        "If the UI is still loading, the target element is not yet visible, or the "
+        "last action clearly missed, say done=false."
+    )
+    try:
+        response = vision_binding.generate_from_messages(
+            messages=[{"role": "user", "content": prompt}],
+            images=[screenshot_b64],
+            temperature=0.0,
+            stream=False,
+            n_predict=200,
+        )
+    except Exception as gen_err:
+        return False, f"Verification call failed: {gen_err}"
+
+    text = str(response).strip() if response else ""
+    done_match = re.search(r'"done"\s*:\s*(true|false)', text, re.IGNORECASE)
+    reason_match = re.search(r'"reason"\s*:\s*"([^"]*)"', text)
+    is_done = bool(done_match and done_match.group(1).lower() == "true")
+    reason = reason_match.group(1) if reason_match else text[:150] or "(no reason given)"
+    return is_done, reason
+
+
+def _vlm_next_action(
+    lollms_client_instance: Any,
+    screenshot_b64: str,
+    step_description: str,
+    attempt: int,
+    screen_width: int,
+    screen_height: int,
+) -> Optional[Dict[str, Any]]:
+    """
+    Asks the vision model for the next single action to advance the step.
+    Returns a dict like {"tool": "click", "x": 630, "y": 330, "reason": "..."}
+    or {"tool": "done", "reason": "..."} when the model believes the step is complete.
+    Returns None on failure.
+    """
+    vision_binding = _resolve_vision_binding(lollms_client_instance)
+    if vision_binding is None:
+        return None
+
+    prompt = (
+        "You are a desktop automation executor. You see a screenshot and must decide "
+        "the SINGLE next action to advance the step.\n"
+        f"Step objective: {step_description}\n"
+        f"Attempt: {attempt}\n"
+        f"Screenshot: {screen_width}x{screen_height} px, (0,0) top-left. "
+        f"CYAN grid every 100px with labeled intersections — use the grid to read "
+        f"exact pixel coordinates. The red circle (blue center) marks the current "
+        f"mouse pointer.\n\n"
+        "Reply with ONLY a JSON object:\n"
+        '{"tool": "click"|"type"|"key"|"scroll"|"wait"|"move_cursor"|"done", '
+        '"x": <int>, "y": <int>, "text": "<string>", "key": "<string>", '
+        '"reason": "<one sentence: what you see and why this action>"}\n'
+        "Rules:\n"
+        "- Use the grid labels to estimate x,y by interpolation (nearest lines + fraction).\n"
+        "- If the step objective is already satisfied in this screenshot, use tool='done'.\n"
+        "- If you need to type, click the input field FIRST (tool='click'), then type in the next attempt.\n"
+        "- Do NOT repeat an action that clearly had no effect; try a different coordinate or a wait.\n"
+        "- x,y are required for click/move_cursor; text for type; key for key."
+    )
+    try:
+        response = vision_binding.generate_from_messages(
+            messages=[{"role": "user", "content": prompt}],
+            images=[screenshot_b64],
+            temperature=0.0,
+            stream=False,
+            n_predict=600,
+        )
+    except Exception:
+        return None
+
+    text = str(response).strip() if response else ""
+    json_match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+    if not json_match:
+        return None
+    try:
+        action = json.loads(json_match.group(0))
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(action, dict) or "tool" not in action:
+        return None
+    return action
+
+
+def _execute_single_action(action: Dict[str, Any]) -> str:
+    """
+    Executes one action dict and returns a human-readable description.
+    """
+    tool_name = str(action.get("tool", "")).strip().lower()
+    reason = str(action.get("reason", "")).strip()[:120]
+
+    try:
+        backend = _require_backend()
+    except Exception as backend_err:
+        return f"FAILED: backend unavailable ({backend_err})"
+
+    try:
+        if tool_name == "click":
+            x, y = int(action.get("x", 0)), int(action.get("y", 0))
+            x, y = _clamp_coordinates(x, y)
+            if x == 0 and y == 0:
+                return "FAILED: refused to click (0,0)."
+            backend.click(x=x, y=y, button="left")
+            return f"Clicked at ({x}, {y}). {reason}"
+        elif tool_name == "type":
+            text = str(action.get("text", ""))
+            if not text:
+                return "FAILED: no text to type."
+            backend.typewrite(text, interval=0.02)
+            return f"Typed '{text}'. {reason}"
+        elif tool_name == "key":
+            key = str(action.get("key", "")).strip().lower()
+            if not key:
+                return "FAILED: no key specified."
+            parts = [p.strip() for p in key.split("+") if p.strip()]
+            if len(parts) == 1:
+                backend.press(parts[0])
+            else:
+                backend.hotkey(*parts)
+            return f"Pressed '{key}'. {reason}"
+        elif tool_name == "scroll":
+            amount = int(action.get("amount", 300))
+            direction = str(action.get("direction", "down")).strip().lower()
+            sign = -1 if direction == "down" else 1
+            backend.scroll(sign * min(abs(amount), 2000))
+            return f"Scrolled {direction} {abs(amount)}. {reason}"
+        elif tool_name == "wait":
+            time.sleep(min(float(action.get("seconds", 1.0)), 3.0))
+            return f"Waited. {reason}"
+        elif tool_name == "move_cursor":
+            x, y = int(action.get("x", 0)), int(action.get("y", 0))
+            x, y = _clamp_coordinates(x, y)
+            backend.moveTo(x, y)
+            return f"Moved cursor to ({x}, {y}). {reason}"
+        elif tool_name == "done":
+            return f"Executor reports done. {reason}"
+        else:
+            return f"FAILED: unknown tool '{tool_name}'."
+    except Exception as act_err:
+        return f"FAILED: {act_err}"
+
+
+def tool_computer_execute_step(
+    step_description: str,
+    max_attempts: int = 8,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Executes a single desktop automation step in an isolated child loop.
+
+    The child loop takes a fresh screenshot, asks the vision model for the next
+    action, performs it, verifies the result, and repeats until the step is
+    complete or max_attempts is exhausted. The parent agent's context is NOT
+    polluted with the child's screenshots — only the final verdict is returned.
+
+    Use this for each step in a plan (see tool_computer_plan). The step must be
+    self-contained and specific: "open the Camera app via the Start menu search"
+    is a good step; "do something with the camera" is not.
+
+    Args:
+        step_description (str): The specific, self-contained step to execute. Must be detailed enough for a fresh agent to complete without prior context.
+        max_attempts (int): Maximum action cycles before giving up. Default 8.
+    """
+    if not isinstance(step_description, str) or not step_description.strip():
+        return {"success": False, "error": "step_description is required and must be a non-empty string."}
+    if not lollms_client_instance:
+        return {"success": False, "error": "This tool requires a lollms_client_instance (host-injected)."}
+    if not _vision_capability_ready(lollms_client_instance):
+        return {"success": False, "error": "A vision-capable model is required to execute desktop steps."}
+
+    try:
+        max_attempts = max(1, min(int(max_attempts), 20))
+    except (TypeError, ValueError):
+        max_attempts = 8
+
+    width, height = _screen_size()
+    last_action_desc = "initial state"
+    attempts_used = 0
+
+    for attempt in range(1, max_attempts + 1):
+        attempts_used = attempt
+        try:
+            b64, w, h = _capture_annotated_b64()
+        except Exception as shot_err:
+            return {
+                "success": False,
+                "error": f"Screenshot failed at attempt {attempt}: {shot_err}",
+                "attempts_used": attempts_used,
+            }
+
+        action = _vlm_next_action(
+            lollms_client_instance, b64, step_description.strip(), attempt, w, h
+        )
+        if action is None:
+            return {
+                "success": False,
+                "error": f"Vision model returned no parseable action at attempt {attempt}.",
+                "attempts_used": attempts_used,
+            }
+
+        if str(action.get("tool", "")).lower() == "done":
+            return {
+                "success": True,
+                "output": f"Step complete after {attempt} attempt(s). {action.get('reason', '')}",
+                "attempts_used": attempts_used,
+                "final_state": str(action.get("reason", ""))[:300],
+            }
+
+        action_desc = _execute_single_action(action)
+        last_action_desc = action_desc
+
+        if action_desc.startswith("FAILED"):
+            return {
+                "success": False,
+                "error": f"Action failed at attempt {attempt}: {action_desc}",
+                "attempts_used": attempts_used,
+            }
+
+        time.sleep(0.4)
+        b64_verify, vw, vh = _capture_annotated_b64()
+        is_done, verdict_reason = _vlm_step_verdict(
+            lollms_client_instance, b64_verify, step_description.strip(),
+            last_action_desc, vw, vh
+        )
+        if is_done:
+            return {
+                "success": True,
+                "output": f"Step complete after {attempt} attempt(s). {verdict_reason}",
+                "attempts_used": attempts_used,
+                "final_state": verdict_reason[:300],
+            }
+
+    return {
+        "success": False,
+        "error": (
+            f"Gave up after {max_attempts} attempts. Last action: {last_action_desc}. "
+            "The step could not be completed automatically."
+        ),
+        "attempts_used": attempts_used,
+        "final_state": last_action_desc[:300],
+    }
+
+
+def tool_computer_plan(
+    task: str,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Plans a multi-step desktop automation task into ordered, self-contained steps.
+
+    Call this FIRST with the user's goal (e.g. "open the Camera app and take a
+    photo of me"). It returns an ordered list of steps. Then execute each step
+    with tool_computer_execute_step, in order, passing each step_description.
+    If a step fails, re-plan the remaining work or report the failure to the user.
+
+    Args:
+        task (str): The user's high-level desktop automation goal.
+    """
+    if not isinstance(task, str) or not task.strip():
+        return {"success": False, "error": "task is required and must be a non-empty string."}
+    if not lollms_client_instance:
+        return {"success": False, "error": "This tool requires a lollms_client_instance (host-injected)."}
+
+    vision_binding = _resolve_vision_binding(lollms_client_instance)
+    if vision_binding is None:
+        return {"success": False, "error": "A vision-capable model is required to plan desktop tasks."}
+
+    try:
+        width, height = _screen_size()
+    except Exception:
+        width, height = 0, 0
+
+    b64 = None
+    try:
+        b64, _, _ = _capture_annotated_b64()
+    except Exception:
+        pass
+
+    plan_prompt = (
+        "You are a desktop automation planner. You see the current screen state "
+        "(if a screenshot is attached) and must decompose the user's task into "
+        "ordered, self-contained steps.\n"
+        f"Screen size: {width}x{height} pixels.\n"
+        f"User task: {task.strip()}\n\n"
+        "Rules for each step:\n"
+        "- Self-contained: a fresh agent with NO prior context must be able to "
+        "complete it just from the step text.\n"
+        "- Specific: name the exact UI elements, menus, and actions (e.g. "
+        "'click the Windows Start button in the taskbar', 'type the text Camera "
+        "into the search box', 'click the Caméra app entry in the search results').\n"
+        "- One UI interaction per step (one click, one type, one key, or one wait).\n"
+        "- Include a short wait step after actions that trigger loading (app launch, page load).\n"
+        "- Do NOT include steps for verification — the executor handles that.\n"
+        "- Maximum 12 steps. If the task is simpler, use fewer.\n\n"
+        "Reply with ONLY a JSON array of step strings, nothing else:\n"
+        '["step 1", "step 2", ...]'
+    )
+    messages = [{"role": "user", "content": plan_prompt}]
+    try:
+        if b64:
+            response = vision_binding.generate_from_messages(
+                messages=messages, images=[b64], temperature=0.0, stream=False, n_predict=800
+            )
+        else:
+            response = vision_binding.generate_from_messages(
+                messages=messages, temperature=0.0, stream=False, n_predict=800
+            )
+    except Exception as gen_err:
+        return {"success": False, "error": f"Planning generation failed: {gen_err}"}
+
+    text = str(response).strip() if response else ""
+    json_match = re.search(r'\[[^\]]*\]', text, re.DOTALL)
+    if not json_match:
+        return {"success": False, "error": f"Planner did not return a parseable step list. Raw: {text[:300]}"}
+    try:
+        steps = json.loads(json_match.group(0))
+    except (json.JSONDecodeError, ValueError):
+        return {"success": False, "error": "Planner returned invalid JSON."}
+    if not isinstance(steps, list) or not steps:
+        return {"success": False, "error": "Planner returned an empty step list."}
+    steps = [str(s).strip() for s in steps if str(s).strip()][:12]
+
+    return {
+        "success": True,
+        "output": (
+            f"Plan created with {len(steps)} step(s). Execute each step in order "
+            "using tool_computer_execute_step(step_description=<step text>). "
+            "After each step, check the verdict before proceeding to the next."
+        ),
+        "steps": steps,
+        "step_count": len(steps),
+    }
 
 
 def tool_computer_cursor_screenshot(
@@ -1072,89 +1652,15 @@ def tool_computer_cursor_screenshot(
     Args:
         file_name (str): Optional custom PNG file name to keep this calibration frame (e.g. 'cursor_check.png'). Default 'computer_use_cursor.png' is overwritten each call.
     """
-    backend = _require_backend()
-
     try:
-        cursor_x, cursor_y = backend.position()
-        cursor_x, cursor_y = int(cursor_x), int(cursor_y)
+        backend = _require_backend()
+        cursor_x, cursor_y = int(backend.position()[0]), int(backend.position()[1])
     except Exception as pos_err:
         return {"success": False, "error": _sanitize_error(f"Cursor position lookup failed: {pos_err}")}
 
-    try:
-        pil_image = backend.screenshot()
-    except Exception as shot_err:
-        return {"success": False, "error": _sanitize_error(f"Screenshot capture failed: {shot_err}")}
-
-    try:
-        annotated_image = _annotate_cursor_on_screenshot(pil_image, cursor_x, cursor_y)
-        buffer = io.BytesIO()
-        annotated_image.save(buffer, format="PNG", optimize=True)
-        annotated_b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
-    except Exception as anno_err:
-        return {"success": False, "error": _sanitize_error(f"Cursor annotation failed: {anno_err}")}
-
-    if len(annotated_b64) > _MAX_SCREENSHOT_BASE64_CHARS:
-        return {
-            "success": False,
-            "error": (
-                f"Annotated screenshot payload too large ({len(annotated_b64)} base64 chars). "
-                "Reduce screen resolution or color depth."
-            ),
-        }
-
-    try:
-        width, height = _screen_size()
-    except Exception:
-        width, height = pil_image.size
-
-    workspace_file: Optional[str] = None
-    saved_file_name: Optional[str] = None
-    try:
-        from pathlib import Path
-
-        working_dir = Path.cwd()
-        if isinstance(tool_context, dict):
-            context_dir = tool_context.get("working_dir")
-            if context_dir:
-                try:
-                    candidate = Path(context_dir)
-                    if candidate.is_dir():
-                        working_dir = candidate.resolve()
-                except Exception:
-                    pass
-
-        saved_file_name = _sanitize_screenshot_filename(file_name) or "computer_use_cursor.png"
-        target_path = working_dir / saved_file_name
-        target_path.write_bytes(base64.b64decode(annotated_b64))
-        workspace_file = str(target_path.resolve())
-    except Exception as persist_err:
-        ASCIIColors.warning(
-            f"[computer_use] Cursor screenshot persistence failed: {persist_err}"
-        )
-
-    result: Dict[str, Any] = {
-        "success": True,
-        "output": (
-            f"Cursor is at ({cursor_x}, {cursor_y}) in a {width}x{height} screen. "
-            f"((0, 0) top-left, ({width - 1}, {height - 1}) bottom-right). "
-            "The attached screenshot highlights it with a red circle and blue center dot — "
-            "compare the highlighted location with your intended target to recalibrate "
-            "your coordinates."
-            + (f" Saved to workspace as '{saved_file_name}'." if workspace_file else "")
-        ),
-        "cursor_x": cursor_x,
-        "cursor_y": cursor_y,
-        "image_b64": annotated_b64,
-        "screen_width": width,
-        "screen_height": height,
-    }
-    if workspace_file:
-        result["image_filename"] = workspace_file
-        result["context_files"] = [workspace_file]
-        result["prompt_injection"] = (
-            f"\n\n✅ **Cursor calibration screenshot attached** ({saved_file_name}). "
-            f"The red circle with blue center marks the pointer at ({cursor_x}, {cursor_y}). "
-            "Locate the highlight, compare it with your intended target, and adjust your "
-            "coordinate reasoning before acting."
-        )
-    return result
+    return _post_action_result(
+        f"Cursor calibration: the pointer is at ({cursor_x}, {cursor_y}). "
+        "Compare the red-circle highlight with your intended target and recalibrate "
+        "your coordinate reasoning.",
+        {"cursor_x": cursor_x, "cursor_y": cursor_y},
+    )
