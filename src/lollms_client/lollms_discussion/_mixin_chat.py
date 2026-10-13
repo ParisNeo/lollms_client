@@ -20,8 +20,11 @@ import time
 import traceback
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Callable, Union
+from typing import Any, Dict, List, Optional, Tuple, Callable, Union, TYPE_CHECKING
 from types import SimpleNamespace
+
+if TYPE_CHECKING:
+    from .lollms_discussion import LollmsDiscussion
 from datetime import datetime
 from ascii_colors import ASCIIColors, trace_exception
 from lollms_client.lollms_types import MSG_TYPE, EventMode, ToolContext
@@ -47,6 +50,7 @@ from lollms_client.lollms_chat_core import (
     dump_error as _core_dump_error,
     is_connection_or_server_error as _core_is_connection_or_server_error,
     run_fast_context_compaction as _core_run_fast_context_compaction,
+    inject_tool_images_for_vlm as _inject_tool_images_for_vlm,
 )
 
 _HEARTBEAT_MESSAGES = [
@@ -316,6 +320,13 @@ _MAX_TOOL_RESULT_CHARS = 24000
 _INERT_TOOL_PARAM_KEYS = {
     "force", "raw", "verbose", "vbose", "full", "no_summary", "include_metadata",
     "max_tokens", "window", "offset", "instrumentation", "injected",
+}
+
+_REPEATABLE_OBSERVATION_TOOLS = {
+    "tool_computer_screenshot",
+    "tool_computer_desktop_info",
+    "tool_computer_cursor_position",
+    "tool_computer_wait",
 }
 
 
@@ -5089,6 +5100,7 @@ class ChatMixin:
             allow_computer_use = getattr(personality.capabilities, "allow_computer_use", False) or getattr(personality.capabilities, "enable_computer_use", False)
 
         computer_use_requested = bool(enable_computer_use or allow_computer_use)
+        computer_use_mounted = False
 
         if computer_use_requested:
             _computer_use_vision_ready = False
@@ -5117,6 +5129,7 @@ class ChatMixin:
                         f"[ChatMixin] Mounted 'computer_use' toolset "
                         f"({len([n for n in _computer_use_tool_names if n in active_tools])} tools, vision model active)."
                     )
+                    computer_use_mounted = True
                 except Exception as ex:
                     trace_exception(ex)
             else:
@@ -5232,7 +5245,25 @@ class ChatMixin:
             feature_rules += (
                 "\n=== ACTION INTEGRITY PROTOCOL (CRITICAL) ===\n"
                 "1. **USE REAL TAGS**: To create artifacts, you MUST use `<artifact name=\"...\">` XML tags. To call tools, use `<tool>`. Saying you will do something in text without emitting tags produces NO changes.\n"
-                "2. **TAG ISOLATION**: Functional tags (`<artifact>`, `<tool>`) MUST NEVER appear inside <think> blocks. They must ONLY appear in the final response body AFTER the closing </think> tag.\n"
+                "2. **TAG ISOLATION**: Functional tags (`<artifact>`, `<tool>`) MUST NEVER appear inside midt blocks. They must ONLY appear in the final response body AFTER the closing 亢 tag.\n"
+            )
+
+        if computer_use_mounted and not orchestrator_persona:
+            feature_rules += (
+                "\n=== COMPUTER USE PROTOCOL (CRITICAL) ===\n"
+                "Desktop automation follows an OBSERVE → ACT → VERIFY loop:\n"
+                "1. **OBSERVE**: Call `tool_computer_screenshot` (no parameters) to see the current screen. "
+                "The captured image is attached to your next turn as REAL pixels — look at it, do not guess.\n"
+                "2. **ACT**: Use `tool_computer_click`, `tool_computer_type`, `tool_computer_key`, "
+                "`tool_computer_scroll`, or `tool_computer_drag` to interact with the screen.\n"
+                "3. **VERIFY**: After EVERY action, take a fresh screenshot to confirm the result before "
+                "proceeding. Never assume an action succeeded without visual confirmation.\n"
+                "The screenshot file `computer_use_screenshot.png` is OVERWRITTEN on every recapture — "
+                "each new screenshot shows the CURRENT screen state. Re-screenshotting is ALWAYS allowed "
+                "and is never a duplicate-call error.\n"
+                "Optionally pass `file_name` to `tool_computer_screenshot` to KEEP a specific frame "
+                "(e.g. `photo.png`) instead of overwriting the default.\n"
+                "=== END COMPUTER USE PROTOCOL ===\n"
             )
 
         # Inject feature rules into the full system prompt
@@ -5657,6 +5688,10 @@ class ChatMixin:
             # If any actions have been taken in this turn, inject a progress summary
             # so the LLM can see what it has already accomplished and avoid repeating actions.
             if turn_actions_log:
+                _obs_in_log = any(
+                    a.get("action") == "tool_call" and a.get("tool_name") in _REPEATABLE_OBSERVATION_TOOLS
+                    for a in turn_actions_log
+                )
                 progress_summary = "\n[TURN PROGRESS TRACKER]\n"
                 progress_summary += f"You have completed {len(turn_actions_log)} action(s) in this turn:\n\n"
 
@@ -5679,7 +5714,15 @@ class ChatMixin:
                     else:
                         progress_summary += f"{idx}. {action_type} (Round {action_round})\n"
 
-                progress_summary += "\n💡 **IMPORTANT**: You have already performed the actions listed above. Do NOT repeat them.\n"
+                if _obs_in_log:
+                    progress_summary += (
+                        "\n💡 **IMPORTANT**: The OBSERVE → ACT → VERIFY loop requires you to take a fresh "
+                        "screenshot (`tool_computer_screenshot`) after every action to check the current "
+                        "screen state — re-screenshotting is expected and is NEVER a duplicate. For all "
+                        "other tools, do not repeat calls whose results you already have.\n"
+                    )
+                else:
+                    progress_summary += "\n💡 **IMPORTANT**: You have already performed the actions listed above. Do NOT repeat them.\n"
                 progress_summary += "If you have gathered enough information to answer the user's question, provide your final answer and emit `<done/>`.\n"
                 progress_summary += "[END TURN PROGRESS TRACKER]\n"
 
@@ -6891,8 +6934,14 @@ class ChatMixin:
                         _persist_round_state()
                         continue
 
-                    tool_name = call_data.get("name", "")
-                    tool_params = call_data.get("parameters", {})
+
+
+                    # ── Extract tool identity from the parsed call payload ──
+                    tool_name = str(call_data.get("name", "")).strip()
+                    tool_params = call_data.get("parameters", {}) or {}
+                    if not isinstance(tool_params, dict):
+                        tool_params = {}
+                    _is_observation_tool = tool_name in _REPEATABLE_OBSERVATION_TOOLS
 
                     # ── 🛡️ MEMORY TAG AS TOOL INTERCEPTION (CRITICAL FIX) ──
                     # If the LLM tries to call a memory tag as a tool (e.g., <tool>{"name": "memory_search"...}</tool>),
@@ -7137,7 +7186,10 @@ class ChatMixin:
                         consecutive_identical_calls.get(canonical_call_key, 0) + 1
                     )
 
-                    if consecutive_identical_calls[canonical_call_key] >= 2:
+                    if (
+                        not _is_observation_tool
+                        and consecutive_identical_calls[canonical_call_key] >= 2
+                    ):
                         noncompliance_streak += 1
                         ASCIIColors.warning(
                             f"[ChatMixin] Repetitive identical tool call blocked: '{tool_name}' "
@@ -7194,7 +7246,7 @@ class ChatMixin:
                     else:
                         has_prev_failure = False
 
-                    if has_prev_failure:
+                    if has_prev_failure and not _is_observation_tool:
                         if self.is_generation_cancelled():
                             was_cancelled = True
                             _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="cancelled")
@@ -7252,7 +7304,7 @@ class ChatMixin:
                         ))
                         continue
 
-                    if context_aware_signature in successful_tool_signatures:
+                    if context_aware_signature in successful_tool_signatures and not _is_observation_tool:
                         noncompliance_streak += 1
                         ASCIIColors.warning(
                             f"[ChatMixin] Repetitive SUCCESS loop blocked for '{tool_name}'. "
@@ -7819,7 +7871,7 @@ class ChatMixin:
                         clean_result_str = re.sub(r'<tool_result[^>]*>.*?(?:</tool_result>|$)', '', clean_result_str, flags=re.DOTALL | re.IGNORECASE)
                         clean_result_str = clean_result_str.strip()
 
-                    if tool_success:
+                    if tool_success and not _is_observation_tool:
                         successful_tool_signatures.add(context_aware_signature)
                         ASCIIColors.info(f"[ChatMixin] Recorded successful signature for '{tool_name}'. Total successful: {len(successful_tool_signatures)}")
                         
@@ -7879,6 +7931,28 @@ class ChatMixin:
 
                     # Always append the tool result to the conversational history so the LLM can see the output
                     if tool_success:
+                        vlm_blocks_this_run: List[Dict[str, str]] = []
+                        if isinstance(tool_res, dict):
+                            try:
+                                vlm_blocks_this_run = _inject_tool_images_for_vlm(tool_res, self.lollmsClient)
+                            except Exception as vlm_ex:
+                                trace_exception(vlm_ex)
+                                vlm_blocks_this_run = []
+                        if vlm_blocks_this_run:
+                            _existing_round_images = round_images if round_images is not None else []
+                            _seen_b64 = {blk.get("image_url", {}).get("url", "") for blk in _existing_round_images if isinstance(blk, dict)}
+                            for _blk in vlm_blocks_this_run:
+                                _b64_url = _blk.get("image_url", {}).get("url", "")
+                                if _b64_url and _b64_url not in _seen_b64:
+                                    _existing_round_images.append(_blk)
+                                    _seen_b64.add(_b64_url)
+                            if round_images is None:
+                                round_images = _existing_round_images
+                            ASCIIColors.success(
+                                f"[ChatMixin] Injected {len(vlm_blocks_this_run)} tool-generated image(s) "
+                                f"into the vision context for round {round_count + 1}."
+                            )
+
                         # Extract explicit filename if returned in the result dictionary
                         real_filename_instr = ""
                         if isinstance(tool_res, dict) and tool_res.get("plot_filename"):
@@ -7920,11 +7994,37 @@ class ChatMixin:
                                 f"attempt to squeeze a large program inline.\n"
                             )
 
+                        screenshot_instr = ""
+                        if vlm_blocks_this_run:
+                            screenshot_instr = (
+                                "🖼️ **SCREENSHOT ATTACHED**: the captured screenshot is attached to this "
+                                "message as a real image — examine it directly, describe what you observe, "
+                                "and decide your next action.\n\n"
+                            )
+                        elif _is_observation_tool and not _turn_has_vision:
+                            screenshot_instr = (
+                                "⚠️ **NO VISION AVAILABLE**: the tool captured a screenshot "
+                                "(computer_use_screenshot.png) but your active model cannot see images. "
+                                "Do not claim you can see the screen. Tell the user that computer use "
+                                "requires a vision-capable model in this session.\n\n"
+                            )
+                        repeat_rule = (
+                            "   EXCEPTION — OBSERVATION TOOLS: re-calling `tool_computer_screenshot` after "
+                            "every action is REQUIRED, not a loop error. Each capture reflects the CURRENT "
+                            "screen state.\n"
+                            if _is_observation_tool else ""
+                        )
+                        correct_behavior = (
+                            "✅ RIGHT: take a fresh `tool_computer_screenshot` to VERIFY the result, then answer.\n"
+                            if _is_observation_tool else
+                            "✅ RIGHT:  \"Based on the results, I can see that...\"  (ANSWER!)\n"
+                        )
                         user_part = (
                             f"=== ✅ TOOL RESULT (NOT A TOOL CALL): {tool_name} ===\n"
                             f"⚠️ **WARNING**: The JSON below is the **RESULT** of your previous tool call. "
                             f"It is **NOT** a new tool call request. Do **NOT** re-execute it.\n\n"
                             f"{real_filename_instr}"
+                            f"{screenshot_instr}"
                             f"<tool_result name=\"{tool_name}\" status=\"SUCCESS\">\n"
                             f"{clean_result_str}\n"
                             f"</tool_result>\n\n"
@@ -7935,11 +8035,12 @@ class ChatMixin:
                             f"4. 🚫 **FORBIDDEN**: Do **NOT** call '{tool_name}' again with these parameters.\n"
                             f"   The tool already ran successfully. Calling it again is a **LOOP ERROR**.\n"
                             f"5. 🔀 If you need MORE data, call a **DIFFERENT** tool or ask a **DIFFERENT** question.\n"
+                            f"{repeat_rule}"
                             f"6. 🏁 **TERMINATION**: When you have finished your task and written your final answer, you MUST end your generation with a `<done/>` tag on a new line.\n"
                             f"{next_step_guidance}\n"
                             f"### Example of CORRECT behavior:\n"
                             f"❌ WRONG: <tool>{{\"name\": \"{tool_name}\", ...}}</tool>  (LOOP!)\n"
-                            f"✅ RIGHT:  \"Based on the results, I can see that...\"  (ANSWER!)\n"
+                            f"{correct_behavior}"
                         )
 
                         virtual_history.append(SimpleNamespace(
