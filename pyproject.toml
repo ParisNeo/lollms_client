@@ -55,6 +55,7 @@ Homepage = "https://github.com/ParisNeo/lollms_client"
 [project.scripts]
 lollms-code = "lollms_client.apps.lollms_code.cli:main"
 lollms-code-gui = "lollms_client.apps.lollms_code.gui.main:main"
+lollms-code-instances = "lollms_client.apps.lollms_code.instance_manager:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

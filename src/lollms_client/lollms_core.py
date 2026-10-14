@@ -2038,6 +2038,96 @@ class LollmsClient():
         if self.llm and hasattr(self.llm, "cancel"):
             self.llm.cancel()
 
+    def save_config(self, path, format: str = "yaml") -> Path:
+        """
+        Serializes the live Two-Tier Profile Architecture to a portable file.
+
+        The output captures every modality's connection layer
+        (`*_binding_profiles_registry`) and execution layer
+        (`*_model_profiles_registry`) in the canonical Two-Tier shape::
+
+            llm:
+              bindings:
+                <alias>: {binding_name, binding_config, is_default}
+              profiles:
+                <alias>: {binding_profile_name, model_name, is_default, ...}
+
+        The resulting file can be consumed directly by another ``LollmsClient``
+        (via the CLI ``--config <path>``) to reproduce the exact configuration,
+        which is how one agent can spawn sibling agents with different models.
+
+        Args:
+            path: Destination file path. Parent directories are created.
+            format: Output serialization format. Only ``"yaml"`` is supported
+                (PyYAML is a hard dependency); any other value raises ValueError.
+
+        Returns:
+            Path: The resolved absolute path written to.
+
+        Raises:
+            ValueError: If ``format`` is not ``"yaml"``.
+            OSError: If the file cannot be written.
+        """
+        import yaml as _yaml
+
+        if format != "yaml":
+            raise ValueError(f"Unsupported config format: {format!r}. Only 'yaml' is supported.")
+
+        def _binding_dict(p: "LollmsBindingProfile") -> Dict[str, Any]:
+            return {
+                "binding_name": p.binding_name,
+                "binding_config": dict(p.binding_config or {}),
+                "is_default": p.is_default,
+            }
+
+        def _model_dict(p: "LollmsModelProfile") -> Dict[str, Any]:
+            out: Dict[str, Any] = {
+                "binding_profile_name": p.binding_profile_name,
+                "model_name": p.model_name,
+                "is_default": p.is_default,
+                "vision_enabled": p.vision_enabled,
+            }
+            if p.forced_context_size is not None:
+                out["forced_context_size"] = p.forced_context_size
+            if p.routing_config:
+                out["routing_config"] = p.routing_config
+            if p.glm_image_embedding:
+                out["glm_image_embedding"] = p.glm_image_embedding
+            if p.supported_reasoning_efforts:
+                out["supported_reasoning_efforts"] = list(p.supported_reasoning_efforts)
+            if p.video_enabled:
+                out["video_enabled"] = p.video_enabled
+            return out
+
+        modality_registries = {
+            "llm": (self.llm_binding_profiles_registry, self.llm_model_profiles_registry),
+            "tti": (self.tti_binding_profiles_registry, self.tti_model_profiles_registry),
+            "tts": (self.tts_binding_profiles_registry, self.tts_model_profiles_registry),
+            "stt": (self.stt_binding_profiles_registry, self.stt_model_profiles_registry),
+            "ttv": (self.ttv_binding_profiles_registry, self.ttv_model_profiles_registry),
+            "ttm": (self.ttm_binding_profiles_registry, self.ttm_model_profiles_registry),
+            "connection": (self.connection_binding_profiles_registry, self.connection_model_profiles_registry),
+            "rag": (self.rag_binding_profiles_registry, self.rag_model_profiles_registry),
+        }
+
+        document: Dict[str, Any] = {}
+        for modality, (binding_reg, model_reg) in modality_registries.items():
+            if not binding_reg and not model_reg:
+                continue
+            document[modality] = {
+                "bindings": {alias: _binding_dict(p) for alias, p in binding_reg.items()},
+                "profiles": {alias: _model_dict(p) for alias, p in model_reg.items()},
+            }
+
+        target = Path(path).expanduser().resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(target, "w", encoding="utf-8") as f:
+                _yaml.safe_dump(document, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+        except OSError as e:
+            raise OSError(f"Failed to write config to {target}: {e}") from e
+        return target
+
 
 def chunk_text(text, tokenizer, detokenizer, chunk_size, overlap, use_separators=True):
     tokens = tokenizer(text)

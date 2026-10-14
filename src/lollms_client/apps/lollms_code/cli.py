@@ -2191,6 +2191,153 @@ def display_result(result: dict[str, Any], config: CodeAgentConfig, elapsed: flo
         ASCIIColors.blue(f"  🔄 Model switches: {result['model_switches']}")
 
 
+def run_noninteractive(personality: LollmsPersonality, client: LollmsClient, task: str, config: CodeAgentConfig, output: Optional[str] = None, print_: bool = False) -> int:
+    """
+    Runs a single non-interactive agentic turn for the `run` subcommand.
+
+    Mirrors run_single_prompt's personality.chat(...) call but with a silent
+    streaming callback (clean stdout). Captures the final AI text and writes it
+    to `output` and/or prints it if `print_` is set. Returns 0 on success,
+    130 if cancelled, 1 on fatal error.
+    """
+    cli_confirm_handler = make_cli_confirm_handler(config)
+
+    def _silent_stream(*a, **k) -> bool:
+        return True
+
+    try:
+        result = personality.chat(
+            prompt=task,
+            lollms_client=client,
+            streaming_callback=_silent_stream,
+            max_reasoning_steps=config.max_reasoning_steps,
+            temperature=config.temperature,
+            n_predict=config.max_tokens_per_turn,
+            context_compaction_threshold=config.context_compaction_threshold,
+            enable_artefacts=True,
+            use_internal_history=False,
+            enable_shell=config.enable_shell_execution,
+            enable_python_exec=True,
+            enable_workspace_tools=True,
+            event_mode=EventMode.FULL_CALLBACK_MODE,
+            enforce_end_tag=True,
+            shell_autonomy_level=config.shell_autonomy_level,
+            python_autonomy_level=config.shell_autonomy_level,
+            auto_approve_python=getattr(config, "auto_approve_python", False),
+            confirm_handler=cli_confirm_handler,
+            debug=config.debug,
+            debug_export=config.debug,
+            reasoning_effort=config.reasoning_effort,
+            dynamic_effort=config.dynamic_effort,
+        )
+    except KeyboardInterrupt:
+        if hasattr(client, "cancel"):
+            client.cancel()
+        ASCIIColors.yellow("\n\n⚠️  Generation cancelled by user.")
+        return 130
+    except (RuntimeError, ValueError, OSError, ConnectionError) as e:
+        if config.debug:
+            trace_exception(e)
+        ASCIIColors.red(f"\n\n💥 Fatal error: {e}")
+        return 1
+
+    response = result.get("response", "")
+
+    if output:
+        try:
+            out_path = Path(output).expanduser()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(response, encoding="utf-8")
+            ASCIIColors.green(f"📄 Final output saved to: {out_path}")
+        except OSError as e:
+            ASCIIColors.red(f"Failed to write output file '{output}': {e}")
+            return 1
+
+    if print_:
+        print(response)
+
+    return 0 if not result.get("was_cancelled") else 130
+
+
+def _handle_instances_command(args) -> int:
+    """
+    Dispatches the `instances` subcommand to the InstanceManager.
+
+    NOTE: The CLI `instances` command runs in a single process, so its
+    in-memory registry is per-invocation. For cross-process orchestration,
+    use the `lollms-code-instances` console script or the InstanceManager class
+    in-process (see docs/LOLLMS_CODE_SHELL_USAGE.md §5).
+    """
+    from lollms_client.apps.lollms_code.instance_manager import InstanceManager
+
+    mgr = InstanceManager()
+    action = getattr(args, "action", None)
+
+    if action == "spawn":
+        task = getattr(args, "task", None)
+        if not task:
+            ASCIIColors.red("spawn requires a task argument.")
+            return 2
+        try:
+            inst = mgr.spawn(
+                task=task,
+                config=getattr(args, "config", None),
+                output=getattr(args, "output", None),
+                workspace=getattr(args, "workspace", None),
+                llm_profile=getattr(args, "llm_profile", None),
+            )
+        except (ValueError, RuntimeError) as e:
+            ASCIIColors.red(f"Failed to spawn instance: {e}")
+            return 1
+        ASCIIColors.green(f"✅ Spawned instance {inst.id} (pid {inst.pid}) for task: {task[:60]}")
+        if getattr(args, "wait", False):
+            try:
+                code = mgr.wait(inst.id)
+            except subprocess.TimeoutExpired:
+                ASCIIColors.yellow("Instance did not finish within the timeout.")
+                return 124
+            ASCIIColors.green(f"Instance {inst.id} finished with code {code}.")
+            return int(code or 0)
+        return 0
+
+    if action == "list":
+        import json
+        print(json.dumps(mgr.status(), indent=2))
+        return 0
+
+    if action == "kill":
+        target = getattr(args, "instance_id", None)
+        if target in (None, "", "all"):
+            killed = mgr.kill_all()
+            ASCIIColors.green(f"Killed {killed} instance(s).")
+        else:
+            ok = mgr.kill(target)
+            if ok:
+                ASCIIColors.green(f"Killed instance {target}.")
+            else:
+                ASCIIColors.yellow(f"Instance {target} was not alive or not found.")
+        return 0
+
+    if action == "wait":
+        target = getattr(args, "instance_id", None)
+        if not target:
+            targets = [i.id for i in mgr.all_instances]
+        else:
+            targets = [target]
+        codes = []
+        for t in targets:
+            try:
+                codes.append(mgr.wait(t))
+            except (KeyError, subprocess.TimeoutExpired) as e:
+                ASCIIColors.yellow(f"Could not wait for {t}: {e}")
+                codes.append(None)
+        done = [c for c in codes if c is not None]
+        return 0 if done and all(c == 0 for c in done) else 1
+
+    ASCIIColors.red(f"Unknown instances action: {action}")
+    return 2
+
+
 def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prompt: str, config: CodeAgentConfig) -> int:
     _index_workspace_with_progress(personality, client)
 
@@ -2833,6 +2980,130 @@ def _switch_workspace_interactive(config: CodeAgentConfig, client: LollmsClient)
     except (OSError, RuntimeError, ValueError) as e:
         ASCIIColors.red(f"Failed to switch workspace: {e}")
         return None
+
+def run_noninteractive(
+    personality: LollmsPersonality,
+    client: LollmsClient,
+    task: str,
+    config: CodeAgentConfig,
+    output: Optional[str] = None,
+    print_: bool = False,
+) -> int:
+    """Run a single non-interactive task and return the final output."""
+    cli_confirm_handler = make_cli_confirm_handler(config)
+    
+    def no_op_streaming_callback(chunk: str, msg_type=None, meta=None) -> bool:
+        return True
+
+    try:
+        result = personality.chat(
+            prompt=task,
+            lollms_client=client,
+            streaming_callback=no_op_streaming_callback,
+            max_reasoning_steps=config.max_reasoning_steps,
+            temperature=config.temperature,
+            n_predict=config.max_tokens_per_turn,
+            context_compaction_threshold=config.context_compaction_threshold,
+            enable_artefacts=True,
+            use_internal_history=False,
+            enable_shell=config.enable_shell_execution,
+            enable_python_exec=True,
+            enable_workspace_tools=True,
+            event_mode=EventMode.FULL_CALLBACK_MODE,
+            enforce_end_tag=True,
+            shell_autonomy_level=config.shell_autonomy_level,
+            python_autonomy_level=config.shell_autonomy_level,
+            auto_approve_python=getattr(config, "auto_approve_python", False),
+            confirm_handler=cli_confirm_handler,
+            debug=config.debug,
+            debug_export=config.debug,
+            reasoning_effort=config.reasoning_effort,
+            dynamic_effort=config.dynamic_effort,
+        )
+    except KeyboardInterrupt:
+        if hasattr(client, 'cancel'):
+            client.cancel()
+        ASCIIColors.yellow("\n\n⚠️  Generation cancelled by user.")
+        return 130
+    except (RuntimeError, ValueError, OSError, ConnectionError) as e:
+        if config.debug:
+            trace_exception(e)
+        ASCIIColors.red(f"\n\n💥 Fatal error: {e}")
+        return 1
+
+    response = result.get("response", "")
+    
+    if output:
+        try:
+            Path(output).write_text(response, encoding="utf-8")
+            ASCIIColors.green(f"✅ Output saved to: {output}")
+        except OSError as e:
+            ASCIIColors.red(f"Failed to save output to {output}: {e}")
+            return 1
+
+    if print_:
+        print(response)
+
+    return 0 if not result.get("was_cancelled") else 130
+
+def _handle_instances_command(args) -> int:
+    """Handle the 'instances' subcommand."""
+    from lollms_client.apps.lollms_code.instance_manager import InstanceManager
+    
+    mgr = InstanceManager()
+    action = args.action
+
+    if action == "spawn":
+        if not args.task:
+            ASCIIColors.red("Error: 'task' is required for spawn.")
+            return 1
+        inst = mgr.spawn(
+            task=args.task,
+            config_path=getattr(args, "config", None),
+            output=getattr(args, "output", None),
+            workspace=getattr(args, "workspace", None),
+            llm_profile=getattr(args, "llm_profile", None),
+        )
+        ASCIIColors.green(f"✅ Instance {inst.id} (PID {inst.pid}) spawned.")
+        if getattr(args, "wait", False):
+            returncode = mgr.wait(inst.id)
+            ASCIIColors.info(f"Instance finished with code {returncode}")
+            return returncode
+        return 0
+
+    elif action == "list":
+        status = mgr.status()
+        if not status:
+            ASCIIColors.yellow("No active instances.")
+        else:
+            for s in status:
+                print(s)
+        return 0
+
+    elif action == "kill":
+        target = args.instance_id
+        if target == "all":
+            mgr.kill_all()
+            ASCIIColors.green("All instances killed.")
+        else:
+            if not target:
+                ASCIIColors.red("Error: instance_id required.")
+                return 1
+            mgr.kill(target)
+            ASCIIColors.green(f"Instance {target} killed.")
+        return 0
+
+    elif action == "wait":
+        target = args.instance_id
+        if not target:
+            ASCIIColors.red("Error: instance_id required.")
+            return 1
+        returncode = mgr.wait(target)
+        return returncode
+
+    else:
+        ASCIIColors.red(f"Unknown action: {action}")
+        return 1
 
 def run_interactive(personality: LollmsPersonality, client: LollmsClient, config: CodeAgentConfig) -> int:
     _index_workspace_with_progress(personality, client)
@@ -4041,7 +4312,7 @@ Examples:
   lollms-code --list-skills
 """,
     )
-    parser.add_argument("prompt", nargs="?", default=None, help="The task prompt for the autonomous agent.")
+
     parser.add_argument("-i", "--interactive", action="store_true", help="Start in interactive REPL mode.")
     parser.add_argument("--workspace", type=str, default=None, help="Path to the workspace directory. Defaults to current working directory.")
     parser.add_argument("-hb", "--handbag", "--handbag-path", dest="handbag_path", type=str, default=None, help="Path to a custom Handbag folder containing agent resources (SOUL.md, tools, skills, memory).")
@@ -4069,10 +4340,36 @@ Examples:
     parser.add_argument("--config", action="store_true", help="Run configuration wizard and exit.")
     parser.add_argument("--zoo", action="store_true", help="Launch interactive Zoo Package Hub Navigator (tools, skills, personas).")
     parser.add_argument("--config-path", type=str, default=None, dest="config_path", help="Path to a specific configuration file (.env, .json or .yaml) used by both the client and the wizard.")
+    parser.add_argument("--llm-profile", type=str, default=None, help="LLM model profile alias to activate for this session (selects a specific model from the available profiles).")
+    parser.add_argument("--export-config", type=str, default=None, metavar="PATH", help="Save the current configuration (Two-Tier profiles) to a YAML file and exit.")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
     parser.add_argument("--version", action="version", version=f"lollms_code v{APP_VERSION}")
     subparsers = parser.add_subparsers(dest="command", help="Additional commands")
-    subparsers.add_parser("gui", help="Launch the lollms_code GUI (NiceGUI native window).")    
+    subparsers.add_parser("gui", help="Launch the lollms_code GUI (NiceGUI native window).")
+
+    p_run = subparsers.add_parser("run", help="Run a single non-interactive task and return the final output (ideal for shell / multi-agent use).")
+    p_run.add_argument("task", help="The task prompt for the autonomous agent.")
+    p_run.add_argument("--config", type=str, default=None, dest="config_path", help="Path to a config file (.env, .json or .yaml) to use instead of the global configuration.")
+    p_run.add_argument("--output", type=str, default=None, help="Write the final AI response to this file.")
+    p_run.add_argument("--print", action="store_true", dest="print_output", help="Print the final AI response to stdout.")
+    p_run.add_argument("--workspace", type=str, default=None, help="Path to the workspace directory.")
+    p_run.add_argument("--llm-profile", type=str, default=None, help="LLM model profile alias to activate (select a specific model).")
+    p_run.add_argument("--max-steps", type=int, default=None, help="Maximum reasoning steps.")
+    p_run.add_argument("--temperature", type=float, default=None, help="Sampling temperature.")
+    p_run.add_argument("--max-tokens", type=int, default=None, help="Maximum tokens per generation turn.")
+    p_run.add_argument("--effort", "--reasoning-effort", dest="reasoning_effort", type=str, default=None, choices=["none", "low", "medium", "high", "max"], help="Reasoning effort level.")
+    p_run.add_argument("--shell-autonomy", type=str, default="safe", choices=["strict", "safe", "full_access"], help="Autonomy level for shell/Python execution.")
+    p_run.add_argument("--no-shell-execution", action="store_true", help="Disable autonomous shell command execution.")
+
+    p_inst = subparsers.add_parser("instances", help="Spawn and manage multiple lollms-code instances.")
+    p_inst.add_argument("action", choices=["spawn", "list", "kill", "wait"], help="Operation to perform.")
+    p_inst.add_argument("task", nargs="?", default=None, help="Task prompt (for 'spawn').")
+    p_inst.add_argument("instance_id", nargs="?", default=None, help="Instance id (for 'kill'/'wait'; 'all' for kill).")
+    p_inst.add_argument("--config", type=str, default=None, help="Config file path (for 'spawn').")
+    p_inst.add_argument("--llm-profile", type=str, default=None, help="LLM model profile alias (for 'spawn').")
+    p_inst.add_argument("--workspace", type=str, default=None, help="Workspace directory (for 'spawn').")
+    p_inst.add_argument("--output", type=str, default=None, help="Output file path (for 'spawn').")
+    p_inst.add_argument("--wait", action="store_true", help="Block until the spawned instance finishes (for 'spawn').")
     return parser
 
 
@@ -4089,7 +4386,24 @@ def main():
             except Exception:
                 pass
 
+    # Auto-promote a bare first argument into the `run` subcommand so that
+    # `lollms-code "write a poem"` behaves like `lollms-code run "write a poem"`.
+    # This keeps the natural "just pass a task" UX while still supporting the
+    # explicit `run`/`instances`/`gui` subcommands and all `-`/`--` flags.
+    _KNOWN_SUBCOMMANDS = {"gui", "run", "instances"}
+    if len(sys.argv) > 1:
+        _first = sys.argv[1]
+        if not _first.startswith("-") and _first not in _KNOWN_SUBCOMMANDS:
+            sys.argv.insert(1, "run")
+
     parser = build_arg_parser()
+    
+    # Pre-parse: Promote bare task to 'run' subcommand
+    if len(sys.argv) > 1:
+        _first_arg = sys.argv[1]
+        if not _first_arg.startswith("-") and _first_arg not in ("gui", "run", "instances"):
+            sys.argv.insert(1, "run")
+    
     args = parser.parse_args()
 
     if getattr(args, "command", None) == "gui":
@@ -4109,6 +4423,24 @@ def main():
             trace_exception(e)
             ASCIIColors.red(f"GUI crashed: {e}")
             return 1
+
+    if getattr(args, "command", None) == "run":
+        config = CodeAgentConfig.load(args)
+        try:
+            client = create_client(config)
+        except (ImportError, RuntimeError, ValueError, OSError, ConnectionError) as e:
+            trace_exception(e)
+            ASCIIColors.red(f"Failed to create LollmsClient: {e}")
+            return 1
+        personality = create_coding_personality(config, client)
+        return run_noninteractive(
+            personality, client, args.task, config,
+            output=getattr(args, "output", None),
+            print_=getattr(args, "print_output", False),
+        )
+
+    if getattr(args, "command", None) == "instances":
+        return _handle_instances_command(args)
 
     config = CodeAgentConfig.load(args)
 
@@ -4157,8 +4489,6 @@ def main():
 
     if args.interactive:
         mode = "interactive"
-    elif args.prompt:
-        mode = "single"
     else:
         mode = "interactive"
 
