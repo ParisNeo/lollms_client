@@ -47,6 +47,12 @@ gui = [
     "pywebview>=4.4",
     "pygments>=2.15.0"
 ]
+bot = [
+    "python-telegram-bot>=20.0",
+    "discord.py>=2.0",
+    "slack-bolt>=1.18.0",
+    "whatsapp>=0.5.0"
+]
 
 [project.urls]
 Homepage = "https://github.com/ParisNeo/lollms_client"
@@ -56,6 +62,7 @@ Homepage = "https://github.com/ParisNeo/lollms_client"
 lollms-code = "lollms_client.apps.lollms_code.cli:main"
 lollms-code-gui = "lollms_client.apps.lollms_code.gui.main:main"
 lollms-code-instances = "lollms_client.apps.lollms_code.instance_manager:main"
+lollms-bot = "lollms_client.apps.lollms_bot.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

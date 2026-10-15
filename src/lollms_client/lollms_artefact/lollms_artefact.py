@@ -312,7 +312,15 @@ _IGNORED_ARTEFACT_DIRS = {
     "build", "dist", "site-packages", ".venv", "venv", "env", ".env",
     ".git", ".idea", ".vscode", "node_modules", ".lollms", ".lollms_code",
     ".lollms_metadata", ".versions", "versions", "artefacts_metadata",
-    ".hidden_folder"
+    ".hidden_folder",
+    ".cache", ".tox", ".hg", ".svn", ".next", ".nuxt",
+    "out", "target", "obj", "bin",
+    ".ipynb_checkpoints"
+}
+
+_VISIBLE_DOTFILES = {
+    ".gitignore", ".env", ".dockerignore", ".npmrc",
+    ".gitattributes", ".editorconfig"
 }
 
 _IGNORED_ARTEFACT_EXTS = {
@@ -385,18 +393,36 @@ def is_lam_content(content: Any, logical_content: Optional[str] = None, atype: O
 
 
 def _is_ignored_path(path: Union[str, Path]) -> bool:
-    """Returns True if the given file or directory path matches ignored compilation or internal artifacts."""
+    """Returns True if the given file or directory path matches ignored compilation or internal artifacts.
+
+    Directory parts are strictly filtered (dot-folders, __pycache__, venv/env/build, egg-info...).
+    The final component (the filename) is only filtered by extension or by the ignored-dir set;
+    root-level configuration dot-files (e.g. .gitignore, .env) remain visible to the agent.
+    """
     p = Path(path)
     if p.suffix.lower() in _IGNORED_ARTEFACT_EXTS:
         return True
-    for part in p.parts:
+
+    parts = [part for part in p.parts if part not in (".", "..")]
+    if not parts:
+        return False
+
+    for part in parts[:-1]:
         part_lower = part.lower()
         if part_lower in _IGNORED_ARTEFACT_DIRS:
             return True
-        if part_lower.startswith(".") and part_lower not in (".", ".."):
+        if part_lower.startswith(".") and part_lower not in _VISIBLE_DOTFILES:
             return True
         if part_lower.endswith(".egg-info") or part_lower.endswith(".dist-info"):
             return True
+
+    last_part = parts[-1].lower()
+    if last_part in _IGNORED_ARTEFACT_DIRS:
+        return True
+    if last_part.startswith(".") and last_part not in _VISIBLE_DOTFILES:
+        return True
+    if last_part.endswith(".egg-info") or last_part.endswith(".dist-info"):
+        return True
     return False
 
 
@@ -896,7 +922,10 @@ class ArtefactManager:
                     existing_art[k] = v
                 version = existing_art.get('version', 1)
 
-                if visibility:
+                if _is_ignored_path(physical_path or title):
+                    existing_art['visibility'] = ArtefactVisibility.HIDDEN
+                    existing_art['active'] = False
+                elif visibility:
                     existing_art['visibility'] = visibility
                     existing_art['active'] = (visibility == ArtefactVisibility.FULL)
                 elif active is not None:
@@ -923,7 +952,9 @@ class ArtefactManager:
                 a['visibility'] = ArtefactVisibility.HIDDEN
 
         resolved_visibility = visibility
-        if not resolved_visibility:
+        if _is_ignored_path(physical_path or title):
+            resolved_visibility = ArtefactVisibility.HIDDEN
+        elif not resolved_visibility:
             if active is not None:
                 resolved_visibility = ArtefactVisibility.FULL if active else ArtefactVisibility.HIDDEN
             else:
@@ -1770,6 +1801,10 @@ class ArtefactManager:
 
                 phys_path = a.get("physical_path") or a.get("title", "")
                 if not phys_path:
+                    continue
+
+                if _is_ignored_path(phys_path):
+                    orphaned_titles.append(a.get("title"))
                     continue
 
                 clean_path = self._sanitize_path_segments(phys_path)
@@ -2773,7 +2808,10 @@ class ArtefactManager:
         return self.update(title=title, new_content=new_content, new_images=new_images, **extra_data)
 
     def list_artefacts(self) -> List[Dict]:
-        items = self.list()
+        items = [
+            a for a in self.list()
+            if not _is_ignored_path(a.get("physical_path") or a.get("title", ""))
+        ]
         disc  = self._discussion
         for a in items:
             section_start  = f"--- Document: {a['title']} v{a['version']} ---"
@@ -3176,6 +3214,34 @@ class ArtefactManager:
             title = path.name
 
         ext = path.suffix.lower()
+
+        if _is_ignored_path(f"{title}{ext}"):
+            ASCIIColors.info(f"[ArtefactManager] Skipped import of ignored path: '{title}{ext}'")
+            return {
+                "id": str(uuid.uuid4()),
+                "title": f"{title}{ext}",
+                "type": ArtefactType.FILE,
+                "version": 1,
+                "content": "",
+                "visibility": ArtefactVisibility.HIDDEN,
+                "status": ArtefactStatus.STABLE,
+                "active": False,
+                "skipped_ignored_path": True,
+            }
+
+        if _is_ignored_path(f"{title}{ext}"):
+            ASCIIColors.info(f"[ArtefactManager] Skipped import of ignored path: '{title}{ext}'")
+            return {
+                "id": str(uuid.uuid4()),
+                "title": f"{title}{ext}",
+                "type": ArtefactType.FILE,
+                "version": 1,
+                "content": "",
+                "visibility": ArtefactVisibility.HIDDEN,
+                "status": ArtefactStatus.STABLE,
+                "active": False,
+                "skipped_ignored_path": True,
+            }
 
         artefact_type = ArtefactType.DOCUMENT
         if ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3", ".sqlconn", ".ttl", ".rdf", ".parquet"):

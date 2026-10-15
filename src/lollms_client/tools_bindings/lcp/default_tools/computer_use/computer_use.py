@@ -405,6 +405,24 @@ def tool_computer_screenshot(
     after actions to verify their effect. The screenshot is also saved to the
     workspace as a PNG artifact when save_to_workspace is true.
 
+    The returned image overlays a coordinate system you must use for ALL
+    subsequent computer-use actions:
+
+    *   **Origin**: (0, 0) is the top-left corner of the primary monitor.
+    *   **Grid**: A CYAN grid is drawn with lines every 100 pixels (both
+        horizontal and vertical). Each intersection is labeled with its
+        (x, y) coordinate in a small black chip.
+    *   **Cursor**: The current mouse pointer is marked by a RED circle with a
+        BLUE center dot. Its exact (x, y) is also reported in the text output.
+    *   **Reading coordinates**: To target an element, (1) find the two nearest
+        vertical grid lines (X1 < X2) around it, (2) find the two nearest
+        horizontal grid lines (Y1 < Y2), (3) estimate the fraction of the gap
+        the element sits in (e.g. 30 % from X1=600 to X2=700 gives x ≈ 630).
+        State your estimated (x, y) before clicking.
+    *   **Coordinate space**: All x, y values passed to click/move/drag/type
+        tools are ABSOLUTE pixels within this grid. Do NOT use normalized
+        0-1000 values.
+
     Args:
         save_to_workspace (bool): When true, persists the screenshot as a PNG file in the workspace. Default true.
         file_name (str): Optional custom PNG file name to KEEP this specific frame (e.g. 'photo.png'). When omitted, the default 'computer_use_screenshot.png' is used and overwritten on every recapture.
@@ -1215,12 +1233,8 @@ def _post_action_result(action_desc: str, extra: Dict[str, Any]) -> Dict[str, An
         "output": action_desc
         + (
             f" Cursor is now at ({cursor_x}, {cursor_y}). "
-            "A verification screenshot is attached (cyan grid, lines every "
-            f"{_GRID_STEP}px with labeled intersections; the red circle with "
-            "blue center marks the mouse pointer). VERIFY: does the cursor "
-            "position match where you intended to click? Does the UI show the "
-            "expected change? If the cursor is NOT on the target, re-estimate "
-            "the coordinates using the grid labels and try again."
+            "Verify on the attached screenshot that the cursor is on the "
+            "intended target and the UI shows the expected change."
         ),
     }
     result.update(extra)
@@ -1257,22 +1271,11 @@ def _post_action_result(action_desc: str, extra: Dict[str, Any]) -> Dict[str, An
         result["image_filename"] = workspace_file
         result["context_files"] = [workspace_file]
         result["screenshot_file"] = workspace_file
-        cursor_clause = (
-            f"the mouse pointer is at ({cursor_x}, {cursor_y})"
-            if cursor_x >= 0
-            else "the mouse pointer position is unknown in this shot"
-        )
         result["prompt_injection"] = (
-            f"\n\n✅ **Verification screenshot attached** ({saved_file_name}). "
-            f"Screen: {width}x{height} px (top-left origin). "
-            f"Overlay: CYAN grid, lines every {_GRID_STEP}px, intersections "
-            f"labeled at (x, y) in black chips. {cursor_clause} "
-            f"(red circle, blue center). "
-            f"⚠️ CHECK: Does the cursor sit ON the element you intended to "
-            f"click? Compare the cursor's grid position against the element's "
-            f"grid position. If they differ, re-estimate using the nearest "
-            f"grid lines (interpolate the fraction between them) and click "
-            f"again at the corrected coordinates."
+            f"\n\n✅ Screenshot attached ({saved_file_name}). "
+            f"Cursor at ({cursor_x}, {cursor_y}). "
+            f"Verify it is on the intended target; if not, re-estimate from "
+            f"the grid labels and retry."
         )
     return result
 

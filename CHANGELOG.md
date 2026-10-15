@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-15 17:56]
+
+- feat: add bot dependencies, update version to 1.3.1, and expand documentation
+
 ## [2026-10-14 15:14]
 
 - feat(core): add code cli functionality

@@ -29,7 +29,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
-
+from pathlib import Path
 from ascii_colors import ASCIIColors, trace_exception
 
 def sync_default_skills_to_user_home() -> Path:
@@ -77,6 +77,7 @@ from ascii_colors.rich.table import Table
 
 from lollms_client import LollmsClient
 from lollms_client.lollms_personality import LollmsPersonality
+from pathlib import Path
 from lollms_client.lollms_personality.lollms_personality import CapabilityFlags
 from lollms_client.lollms_personality.skills_manager import SkillsManager
 from lollms_client.lollms_types import EventMode, MSG_TYPE
@@ -418,6 +419,10 @@ class CodeAgentConfig:
         b_data = self.llm_binding_profiles.get(b_alias, {}) if b_alias else {}
         return b_data.get("binding_name") or prof.get("binding_name") or "ollama"
 
+    @property
+    def default_handbag_path(self) -> Path:
+        return Path(__file__).parent / "default_handbag"
+    
     @classmethod
     def load(cls, cli_args: argparse.Namespace) -> "CodeAgentConfig":
         config = cls()
@@ -1489,6 +1494,18 @@ def _clean_str(val: Any) -> str:
         return escape(str(val))
     except Exception:
         return str(val).replace("[", "\\[")
+
+
+def _safe_input_or_back(prompt: str, default: str = "") -> str:
+    """Prompts for input; returns 'back' if the user types 'back' or 'q', otherwise the stripped input (or default)."""
+    try:
+        raw = input(f"  {prompt} (or 'back' to cancel)> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return "back"
+    if raw.lower() in ("back", "q", "quit"):
+        return "back"
+    return raw or default
 
 
 def _render_box(content_lines: list[str], title: str = "", border_style: str = "blue"):
@@ -2923,9 +2940,9 @@ def _advanced_prompt(history: PersistentHistory, commands: list[str]) -> str | N
             return input(PROMPT_TEXT)
         except (EOFError, KeyboardInterrupt):
             sys.stdout.write("\n")
-            return None  
-            
-        
+            return None
+
+
 def _switch_workspace_interactive(config: CodeAgentConfig, client: LollmsClient) -> LollmsPersonality | None:
     """Handles the interactive workspace switching process."""
     try:
@@ -4299,7 +4316,6 @@ def list_skills(config: CodeAgentConfig):
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="lollms-code",
         description=f"lollms_code v{APP_VERSION} — Autonomous CLI Coding Agent",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
@@ -4311,6 +4327,13 @@ Examples:
   lollms-code --enable-model-switching "build a CLI tool"
   lollms-code --list-skills
 """,
+    )
+
+    parser.add_argument(
+        "prompt",
+        nargs="?",
+        default=None,
+        help="Optional prompt to execute in single mode"
     )
 
     parser.add_argument("-i", "--interactive", action="store_true", help="Start in interactive REPL mode.")
@@ -4428,16 +4451,12 @@ def main():
         config = CodeAgentConfig.load(args)
         try:
             client = create_client(config)
-        except (ImportError, RuntimeError, ValueError, OSError, ConnectionError) as e:
+            personality = create_coding_personality(config, client)
+            return run_noninteractive(personality, client, args.task, config)
+        except (ImportError, RuntimeError, ValueError) as e:
             trace_exception(e)
-            ASCIIColors.red(f"Failed to create LollmsClient: {e}")
+            ASCIIColors.red(f"Failed to initialize agent: {e}")
             return 1
-        personality = create_coding_personality(config, client)
-        return run_noninteractive(
-            personality, client, args.task, config,
-            output=getattr(args, "output", None),
-            print_=getattr(args, "print_output", False),
-        )
 
     if getattr(args, "command", None) == "instances":
         return _handle_instances_command(args)
@@ -4487,8 +4506,9 @@ def main():
             ASCIIColors.yellow(f"No conversation history found in workspace: {config.workspace_path}")
         return 0
 
-    if args.interactive:
-        mode = "interactive"
+    prompt_value = getattr(args, "prompt", None)
+    if prompt_value:
+        mode = "single"
     else:
         mode = "interactive"
 

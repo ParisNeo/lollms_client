@@ -2368,7 +2368,7 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
 
             dialog.open()
 
-        def seal_current_text_block():
+    def seal_current_text_block():
         """Seals the current conversational agent bubble, deduplicating identical repeat bubbles."""
         nonlocal current_agent_md, agent_text_buffer
         if current_agent_md is not None:
