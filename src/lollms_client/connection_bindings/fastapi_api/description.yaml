@@ -1,0 +1,24 @@
+title: "FastAPI HTTP API"
+author: "ParisNeo"
+version: 1.0.0
+binding_name: "fastapi_api"
+description: |
+  A CONNECTION binding exposing the LLM over a FastAPI HTTP endpoint
+  (POST /chat, GET /health), running in-process via uvicorn on host:port.
+
+global_input_parameters:
+  - name: "host_address"
+    type: "str"
+    default: "127.0.0.1:8000"
+    description: "Bind address and port. Accepts 'host:port', 'http://host:port', or a bare port."
+
+model_input_parameters:
+  - name: "instance_name"
+    type: "str"
+    default: "main"
+    description: "Logical profile name for this HTTP API instance."
+
+commands:
+  - name: "start"
+    description: "Starts the FastAPI server on the configured host:port."
+    parameters: []

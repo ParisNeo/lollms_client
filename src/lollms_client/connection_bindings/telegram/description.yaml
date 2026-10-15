@@ -1,0 +1,30 @@
+title: "Telegram Connection"
+author: "ParisNeo"
+version: 1.0.0
+binding_name: "telegram"
+description: |
+  A CONNECTION binding that runs a Telegram bot. Incoming messages are routed
+  to the configured LLM and answered on the same chat. Set the bot token via
+  'service_key' and optionally restrict it to user IDs via 'allowed_user_ids'.
+
+global_input_parameters:
+  - name: "service_key"
+    type: "str"
+    default: ""
+    description: "Telegram bot token (required to start the bot)."
+    is_secret: true
+  - name: "allowed_user_ids"
+    type: "str"
+    default: ""
+    description: "Optional comma-separated numeric user IDs allowed to use the bot. Empty means anyone."
+
+model_input_parameters:
+  - name: "instance_name"
+    type: "str"
+    default: "main"
+    description: "Logical profile name for this Telegram channel instance."
+
+commands:
+  - name: "start"
+    description: "Starts the Telegram bot and begins polling for messages."
+    parameters: []
