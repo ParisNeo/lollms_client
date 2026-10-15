@@ -394,6 +394,7 @@ def _sanitize_screenshot_filename(raw_name: str) -> str:
 def tool_computer_screenshot(
     save_to_workspace: bool = True,
     file_name: str = "",
+    show_grid: bool = True,
     tool_context: Optional[dict] = None,
     discussion_instance: Optional[Any] = None,
     lollms_client_instance: Optional[Any] = None,
@@ -405,8 +406,8 @@ def tool_computer_screenshot(
     after actions to verify their effect. The screenshot is also saved to the
     workspace as a PNG artifact when save_to_workspace is true.
 
-    The returned image overlays a coordinate system you must use for ALL
-    subsequent computer-use actions:
+    When show_grid is true (default), the returned image overlays a coordinate
+    system you must use for ALL subsequent computer-use actions:
 
     *   **Origin**: (0, 0) is the top-left corner of the primary monitor.
     *   **Grid**: A CYAN grid is drawn with lines every 100 pixels (both
@@ -426,6 +427,7 @@ def tool_computer_screenshot(
     Args:
         save_to_workspace (bool): When true, persists the screenshot as a PNG file in the workspace. Default true.
         file_name (str): Optional custom PNG file name to KEEP this specific frame (e.g. 'photo.png'). When omitted, the default 'computer_use_screenshot.png' is used and overwritten on every recapture.
+        show_grid (bool): When true, overlays a cyan coordinate grid with labeled intersections on the screenshot. Default true.
     """
     try:
         backend = _require_backend()
@@ -435,7 +437,8 @@ def tool_computer_screenshot(
 
     try:
         screenshot_b64, width, height = _capture_annotated_b64(
-            (cursor_x, cursor_y) if cursor_x >= 0 else None
+            (cursor_x, cursor_y) if cursor_x >= 0 else None,
+            show_grid=show_grid,
         )
     except RuntimeError as capture_err:
         return {"success": False, "error": _sanitize_error(str(capture_err))}
@@ -494,12 +497,7 @@ def tool_computer_screenshot(
         result["image_filename"] = workspace_file
         result["context_files"] = [workspace_file]
         result["screenshot_file"] = workspace_file
-        result["prompt_injection"] = (
-            f"\n\n✅ **Screenshot attached to your visual context** "
-            f"({saved_file_name}). Describe what you observe and act on it.\n"
-            f"📐 **COORDINATE CONVENTION**: The attached screenshot is EXACTLY "
-            f"{width}x{height} pixels. All coordinates are ABSOLUTE pixels: "
-            f"top-left corner is (0, 0), bottom-right corner is ({width - 1}, {height - 1}). "
+        grid_desc = (
             f"Overlay: a CYAN grid with lines every {_GRID_STEP} pixels; each "
             f"intersection is labeled at its (x, y) coordinate in a black chip. "
             f"To estimate a target's position: (1) find the two nearest vertical "
@@ -510,6 +508,19 @@ def tool_computer_screenshot(
             f"⚠️ Do NOT assume the target is at the center of the image — the "
             f"center of the image is ({width // 2}, {height // 2}), which is NOT "
             f"necessarily where the element is. Read the grid labels."
+            if show_grid
+            else "No coordinate grid is overlaid. Use the full-screen dimensions "
+            f"({width}x{height}) and estimate coordinates proportionally from the "
+            "image content, or call tool_computer_screenshot with show_grid=true "
+            "for a gridded frame."
+        )
+        result["prompt_injection"] = (
+            f"\n\n✅ **Screenshot attached to your visual context** "
+            f"({saved_file_name}). Describe what you observe and act on it.\n"
+            f"📐 **COORDINATE CONVENTION**: The attached screenshot is EXACTLY "
+            f"{width}x{height} pixels. All coordinates are ABSOLUTE pixels: "
+            f"top-left corner is (0, 0), bottom-right corner is ({width - 1}, {height - 1}). "
+            f"{grid_desc}"
             + (f" {cursor_clause.strip()}." if cursor_x >= 0 else "")
         )
     return result
@@ -1122,25 +1133,33 @@ def _annotate_screenshot(
     pil_image: Any,
     cursor_x: Optional[int] = None,
     cursor_y: Optional[int] = None,
+    show_grid: bool = True,
 ) -> Any:
     """
     Draws a labeled coordinate grid (lines every _GRID_STEP pixels) and, when
     given, a red target circle with a blue center dot at the cursor position,
     so the vision model can cross-reference element locations and see exactly
     where the pointer is resting.
+
+    Args:
+        pil_image: The PIL image to annotate.
+        cursor_x: X coordinate of the cursor (if available).
+        cursor_y: Y coordinate of the cursor (if available).
+        show_grid: When True, draws the cyan coordinate grid and labels.
     """
     from PIL import Image, ImageDraw
 
     annotated = pil_image.convert("RGB")
     width, height = annotated.size
 
-    overlay = Image.new("RGBA", annotated.size, (0, 0, 0, 0))
-    overlay_draw = ImageDraw.Draw(overlay)
-    for gx in range(_GRID_STEP, width, _GRID_STEP):
-        overlay_draw.line([(gx, 0), (gx, height)], fill=(0, 180, 255, 120), width=2)
-    for gy in range(_GRID_STEP, height, _GRID_STEP):
-        overlay_draw.line([(0, gy), (width, gy)], fill=(0, 180, 255, 120), width=2)
-    annotated = Image.alpha_composite(annotated.convert("RGBA"), overlay).convert("RGB")
+    if show_grid:
+        overlay = Image.new("RGBA", annotated.size, (0, 0, 0, 0))
+        overlay_draw = ImageDraw.Draw(overlay)
+        for gx in range(_GRID_STEP, width, _GRID_STEP):
+            overlay_draw.line([(gx, 0), (gx, height)], fill=(0, 180, 255, 120), width=2)
+        for gy in range(_GRID_STEP, height, _GRID_STEP):
+            overlay_draw.line([(0, gy), (width, gy)], fill=(0, 180, 255, 120), width=2)
+        annotated = Image.alpha_composite(annotated.convert("RGBA"), overlay).convert("RGB")
 
     draw = ImageDraw.Draw(annotated)
     label_font = _grid_label_font(18)
@@ -1156,10 +1175,11 @@ def _annotate_screenshot(
         except Exception:
             draw.text((x, y), text, fill=(255, 255, 255), font=label_font)
 
-    for gx in range(_GRID_STEP, width, _GRID_STEP):
-        _draw_label(gx + 4, 4, str(gx))
-    for gy in range(_GRID_STEP, height, _GRID_STEP):
-        _draw_label(4, gy + 4, str(gy))
+    if show_grid:
+        for gx in range(_GRID_STEP, width, _GRID_STEP):
+            _draw_label(gx + 4, 4, str(gx))
+        for gy in range(_GRID_STEP, height, _GRID_STEP):
+            _draw_label(4, gy + 4, str(gy))
 
     if cursor_x is not None and cursor_y is not None:
         radius = 18
@@ -1186,10 +1206,15 @@ def _annotate_screenshot(
 
 def _capture_annotated_b64(
     cursor: Optional[Tuple[int, int]] = None,
+    show_grid: bool = True,
 ) -> Tuple[str, int, int]:
     """
     Captures the screen and annotates it with the coordinate grid and, when
     provided, a cursor marker. Returns (base64_png, width, height).
+
+    Args:
+        cursor: Optional (x, y) tuple for the cursor position.
+        show_grid: When True, draws the cyan coordinate grid and labels.
     """
     backend = _require_backend()
     try:
@@ -1202,6 +1227,7 @@ def _capture_annotated_b64(
         pil_image,
         cursor[0] if cursor else None,
         cursor[1] if cursor else None,
+        show_grid=show_grid,
     )
     buffer = io.BytesIO()
     annotated.save(buffer, format="PNG", optimize=True)
@@ -1220,6 +1246,9 @@ def _post_action_result(action_desc: str, extra: Dict[str, Any]) -> Dict[str, An
     captures a grid-annotated, cursor-highlighted verification screenshot, saves
     it to the workspace, and reports the cursor position alongside the action.
     The LLM sees the immediate consequence of its action on the next turn.
+
+    NOTE: The verification screenshot ALWAYS has the grid (show_grid=True) to
+    preserve the vision-grounding contract for subsequent actions.
     """
     try:
         time.sleep(_POST_ACTION_SETTLE_S)
@@ -1244,7 +1273,8 @@ def _post_action_result(action_desc: str, extra: Dict[str, Any]) -> Dict[str, An
 
     try:
         b64, width, height = _capture_annotated_b64(
-            (cursor_x, cursor_y) if cursor_x >= 0 else None
+            (cursor_x, cursor_y) if cursor_x >= 0 else None,
+            show_grid=True,
         )
     except Exception as shot_err:
         ASCIIColors.warning(f"[computer_use] Post-action verification capture failed: {shot_err}")
@@ -1667,3 +1697,179 @@ def tool_computer_cursor_screenshot(
         "your coordinate reasoning.",
         {"cursor_x": cursor_x, "cursor_y": cursor_y},
     )
+
+
+def tool_computer_screenshot_zone(
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    show_grid: bool = False,
+    file_name: str = "",
+    save_to_workspace: bool = True,
+    tool_context: Optional[dict] = None,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Captures a screenshot of a specific rectangular region (zone) of the screen.
+
+    Use this to focus on a specific part of the screen without capturing the
+    entire desktop. The region is specified by its absolute top-left corner
+    (x, y) and its dimensions (width, height) in pixels.
+
+    The returned image is cropped to the specified region. When show_grid is
+    true, a coordinate grid is overlaid on the cropped image. The grid labels
+    are RELATIVE to the region's top-left corner (0, 0), NOT absolute screen
+    coordinates. To convert a region-relative coordinate (rx, ry) to an
+    absolute screen coordinate, add the region offset: (x + rx, y + ry).
+
+    Args:
+        x (int): Absolute X coordinate of the region's top-left corner.
+        y (int): Absolute Y coordinate of the region's top-left corner.
+        width (int): Width of the region in pixels.
+        height (int): Height of the region in pixels.
+        show_grid (bool): When true, overlays a cyan coordinate grid on the region. Default false.
+        file_name (str): Optional custom PNG file name for the captured region (e.g. 'zone_check.png'). Default 'computer_use_zone.png'.
+        save_to_workspace (bool): When true, persists the screenshot as a PNG file in the workspace. Default true.
+    """
+    try:
+        x, y, width, height = int(x), int(y), int(width), int(height)
+    except (TypeError, ValueError):
+        return {"success": False, "error": "Zone coordinates must be integers."}
+
+    if width <= 0 or height <= 0:
+        return {"success": False, "error": "Region width and height must be positive integers."}
+
+    try:
+        screen_w, screen_h = _screen_size()
+    except RuntimeError as backend_err:
+        return {"success": False, "error": _sanitize_error(str(backend_err))}
+
+    # Clamp the region to the screen boundaries
+    x = max(0, min(x, screen_w - 1))
+    y = max(0, min(y, screen_h - 1))
+    width = min(width, screen_w - x)
+    height = min(height, screen_h - y)
+
+    if width <= 0 or height <= 0:
+        return {
+            "success": False,
+            "error": f"Region ({x}, {y}, {width}x{height}) is entirely outside the screen ({screen_w}x{screen_h}).",
+        }
+
+    try:
+        backend = _require_backend()
+        pil_image = backend.screenshot(region=(x, y, width, height))
+    except Exception as capture_err:
+        return {"success": False, "error": _sanitize_error(str(capture_err))}
+
+    try:
+        cursor_x, cursor_y = int(backend.position()[0]), int(backend.position()[1])
+        # Convert cursor position to region-relative if inside the region
+        if x <= cursor_x < x + width and y <= cursor_y < y + height:
+            region_cursor = (cursor_x - x, cursor_y - y)
+        else:
+            region_cursor = None
+    except Exception:
+        region_cursor = None
+
+    try:
+        annotated = _annotate_screenshot(
+            pil_image,
+            region_cursor[0] if region_cursor else None,
+            region_cursor[1] if region_cursor else None,
+            show_grid=show_grid,
+        )
+        buffer = io.BytesIO()
+        annotated.save(buffer, format="PNG", optimize=True)
+        b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
+    except Exception as ann_err:
+        return {"success": False, "error": _sanitize_error(str(ann_err))}
+
+    if len(b64) > _MAX_SCREENSHOT_BASE64_CHARS:
+        return {
+            "success": False,
+            "error": f"Region screenshot payload too large ({len(b64)} base64 chars).",
+        }
+
+    workspace_file: Optional[str] = None
+    saved_file_name: Optional[str] = None
+    if save_to_workspace:
+        try:
+            from pathlib import Path
+
+            working_dir = Path.cwd()
+            if isinstance(tool_context, dict):
+                context_dir = tool_context.get("working_dir")
+                if context_dir:
+                    try:
+                        candidate = Path(context_dir)
+                        if candidate.is_dir():
+                            working_dir = candidate.resolve()
+                    except Exception:
+                        pass
+
+            saved_file_name = _sanitize_screenshot_filename(file_name) or "computer_use_zone.png"
+            target_path = working_dir / saved_file_name
+            target_path.write_bytes(base64.b64decode(b64))
+            workspace_file = str(target_path.resolve())
+        except Exception as persist_err:
+            ASCIIColors.warning(
+                f"[computer_use] Zone screenshot workspace persistence failed: {persist_err}"
+            )
+
+    grid_desc = (
+        f"A CYAN grid with lines every {_GRID_STEP} pixels is overlaid; labels are "
+        f"RELATIVE to the region's top-left corner (0, 0). To map a region-relative "
+        f"coordinate (rx, ry) to absolute screen coordinates, add the region offset: "
+        f"({x} + rx, {y} + ry)."
+        if show_grid
+        else "No coordinate grid is overlaid. The image is exactly "
+        f"{width}x{height} pixels, cropped from the absolute region ({x}, {y}) to "
+        f"({x + width}, {y + height})."
+    )
+
+    cursor_clause = (
+        f" The mouse pointer is at region-relative ({region_cursor[0]}, {region_cursor[1]}), "
+        f"marked by the red circle with blue center."
+        if region_cursor
+        else ""
+    )
+
+    result: Dict[str, Any] = {
+        "success": True,
+        "output": (
+            f"Zone screenshot captured: region ({x}, {y}) to ({x + width}, {y + height}), "
+            f"size {width}x{height} px."
+            + (f" Saved to workspace as '{saved_file_name}'." if workspace_file else "")
+            + " The image is attached for your inspection."
+            + cursor_clause
+        ),
+        "image_b64": b64,
+        "screenshot_b64": b64,
+        "screen_width": width,
+        "screen_height": height,
+        "zone_x": x,
+        "zone_y": y,
+        "zone_width": width,
+        "zone_height": height,
+    }
+    if region_cursor:
+        result["cursor_x"] = region_cursor[0]
+        result["cursor_y"] = region_cursor[1]
+    if workspace_file:
+        result["image_filename"] = workspace_file
+        result["context_files"] = [workspace_file]
+        result["screenshot_file"] = workspace_file
+        result["prompt_injection"] = (
+            f"\n\n✅ **Zone screenshot attached to your visual context** "
+            f"({saved_file_name}). The image shows the absolute region "
+            f"({x}, {y}) to ({x + width}, {y + height}).\n"
+            f"📐 **COORDINATE CONVENTION**: {grid_desc} "
+            f"All click/move/drag coordinates are ABSOLUTE screen pixels. "
+            f"To target an element in this zone, estimate its position within the "
+            f"image and add the region offset ({x}, {y}) to get the absolute coordinate."
+            + (f" {cursor_clause.strip()}." if region_cursor else "")
+        )
+    return result
