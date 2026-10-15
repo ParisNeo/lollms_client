@@ -51,7 +51,8 @@ bot = [
     "python-telegram-bot>=20.0",
     "discord.py>=2.0",
     "slack-bolt>=1.18.0",
-    "whatsapp>=0.5.0"
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0"
 ]
 
 [project.urls]
@@ -63,6 +64,7 @@ lollms-code = "lollms_client.apps.lollms_code.cli:main"
 lollms-code-gui = "lollms_client.apps.lollms_code.gui.main:main"
 lollms-code-instances = "lollms_client.apps.lollms_code.instance_manager:main"
 lollms-bot = "lollms_client.apps.lollms_bot.cli:main"
+lollms-config = "lollms_client.apps.lollms_config.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

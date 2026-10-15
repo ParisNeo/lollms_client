@@ -1,0 +1,25 @@
+title: "WhatsApp Connection"
+author: "ParisNeo"
+version: 1.0.0
+binding_name: "whatsapp"
+description: |
+  A CONNECTION binding for WhatsApp via an external bridge (e.g. whatsapp-web.js).
+  No `whatsapp` Python package exists on PyPI, so this is a guarded idle stub
+  that never crashes the daemon until a bridge is provided.
+
+global_input_parameters:
+  - name: "host_address"
+    type: "str"
+    default: ""
+    description: "Optional bridge endpoint or config path."
+
+model_input_parameters:
+  - name: "instance_name"
+    type: "str"
+    default: "main"
+    description: "Logical profile name for this WhatsApp instance."
+
+commands:
+  - name: "start"
+    description: "Starts the WhatsApp bridge (idle if no bridge/library is present)."
+    parameters: []

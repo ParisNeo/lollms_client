@@ -1,42 +1,84 @@
 import asyncio
-import logging
-from typing import List
-from lollms_client.apps.lollms_bot.config import BotConfig
-from lollms_client.apps.lollms_bot.connections.telegram import TelegramConnection
-from lollms_client.apps.lollms_bot.connections.discord import DiscordConnection
-from lollms_client.apps.lollms_bot.connections.slack import SlackConnection
-from lollms_client.apps.lollms_bot.connections.whatsapp import WhatsAppConnection
+from typing import Optional, List
+
 from ascii_colors import ASCIIColors
+from lollms_client.apps.lollms_bot.config import BotConfig
+
+
+def _build_client() -> Optional["LollmsClient"]:
+    """
+    Builds the shared LollmsClient from the global configuration, reusing the
+    exact same resolution path as lollms-code (config.yaml + .env + two-tier
+    profiles). Requests both the LLM and the CONNECTION profiles so the client
+    populates its connection bindings. Returns None when no LLM is configured.
+    """
+    try:
+        from lollms_client.lollms_config_cli_env import get_client_from_env
+        return get_client_from_env(
+            create_llm=True,
+            create_connection=True,
+            run_wizard_if_fail=False,
+        )
+    except Exception as e:
+        ASCIIColors.red(f"Could not build the LollmsClient: {e}")
+        ASCIIColors.info("Configure one first: python -m lollms_client.lollms_config_cli_env")
+        return None
+
+
+def _attach_client(bindings: List, client) -> None:
+    """Attaches the shared client to each binding so they can generate replies."""
+    for binding in bindings:
+        try:
+            binding.lollms_client = client
+        except Exception:
+            pass
+
+
+async def _start_connections(bindings: List) -> None:
+    tasks = [b.start() for b in bindings if hasattr(b, "start")]
+    if not tasks:
+        ASCIIColors.yellow("No connection bindings to start.")
+        return
+    ASCIIColors.info(f"Starting {len(tasks)} connection binding(s)...")
+    await asyncio.gather(*tasks)
+
 
 class BotDaemon:
+    """
+    Thin host that starts the configured native connection bindings.
+    The bot no longer defines its own connections: it reuses the global
+    LollmsClient's connection-binding profiles (the same system as lollms-code).
+    """
+
     def __init__(self, config: BotConfig):
         self.config = config
-        self.connections = []
-        self.llm_config = config.config.get("llm", {})
-        
+        self.client = _build_client()
+
     async def start(self):
         ASCIIColors.info("🚀 Starting Lollms-Bot Daemon...")
-        
-        # Initialize LLM Client (Placeholder for actual client creation)
-        # In a real scenario, we'd create a LollmsClient here using the config
-        ASCIIColors.info(f"Using LLM Profile: {self.llm_config.get('profile')}")
-        
-        conn_config = self.config.config.get("connections", {})
-        
-        if conn_config.get("telegram", {}).get("enabled"):
-            self.connections.append(TelegramConnection(conn_config["telegram"], self.llm_config))
-        if conn_config.get("discord", {}).get("enabled"):
-            self.connections.append(DiscordConnection(conn_config["discord"], self.llm_config))
-        if conn_config.get("slack", {}).get("enabled"):
-            self.connections.append(SlackConnection(conn_config["slack"], self.llm_config))
-        if conn_config.get("whatsapp", {}).get("enabled"):
-            self.connections.append(WhatsAppConnection(conn_config["whatsapp"], self.llm_config))
-        
-        if not self.connections:
-            ASCIIColors.yellow("No connections enabled. Check your configuration.")
+
+        if self.client is None:
+            ASCIIColors.red("No LLM client available. The bot cannot respond.")
             return
-        
-        ASCIIColors.info(f"Starting {len(self.connections)} connection(s)...")
-        
-        tasks = [conn.run() for conn in self.connections]
-        await asyncio.gather(*tasks)
+
+        llm = self.client.llm
+        ASCIIColors.info(
+            f"Using LLM → binding: {getattr(llm, 'binding_name', None)}, "
+            f"model: {getattr(llm, 'model_name', None)}"
+        )
+
+        bindings = list(getattr(self.client, "connections", {}).values())
+        if not bindings:
+            active = getattr(self.client, "connection", None)
+            if active is not None:
+                bindings = [active]
+
+        if not bindings:
+            ASCIIColors.yellow(
+                "No connection bindings configured. Add one in the wizard:\n"
+                "   python -m lollms_client.lollms_config_cli_env   (CONNECTION section)"
+            )
+            return
+
+        _attach_client(bindings, self.client)
+        await _start_connections(bindings)

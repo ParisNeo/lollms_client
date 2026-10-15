@@ -1,0 +1,30 @@
+title: "Discord Connection"
+author: "ParisNeo"
+version: 1.0.0
+binding_name: "discord"
+description: |
+  A CONNECTION binding that runs a Discord bot, answering incoming messages
+  with the configured LLM. Set the bot token via 'service_key' and optionally
+  restrict it to guilds via 'allowed_guild_ids'.
+
+global_input_parameters:
+  - name: "service_key"
+    type: "str"
+    default: ""
+    description: "Discord bot token (required to start the bot)."
+    is_secret: true
+  - name: "allowed_guild_ids"
+    type: "str"
+    default: ""
+    description: "Optional comma-separated numeric guild IDs allowed. Empty means any guild the bot is in."
+
+model_input_parameters:
+  - name: "instance_name"
+    type: "str"
+    default: "main"
+    description: "Logical profile name for this Discord channel instance."
+
+commands:
+  - name: "start"
+    description: "Starts the Discord bot client."
+    parameters: []

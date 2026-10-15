@@ -1,0 +1,25 @@
+title: "Slack Connection"
+author: "ParisNeo"
+version: 1.0.0
+binding_name: "slack"
+description: |
+  A CONNECTION binding that runs a Slack bot (Bolt). Incoming messages are
+  answered with the configured LLM. Set the bot token via 'service_key'.
+
+global_input_parameters:
+  - name: "service_key"
+    type: "str"
+    default: ""
+    description: "Slack bot token (required to start the bot)."
+    is_secret: true
+
+model_input_parameters:
+  - name: "instance_name"
+    type: "str"
+    default: "main"
+    description: "Logical profile name for this Slack channel instance."
+
+commands:
+  - name: "start"
+    description: "Starts the Slack bot (Bolt)."
+    parameters: []
