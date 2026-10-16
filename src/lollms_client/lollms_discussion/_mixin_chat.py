@@ -4287,6 +4287,7 @@ class ChatMixin:
         auto_approve_python: bool = False,
         confirm_handler: Optional[Callable] = None,
         enable_computer_use: bool = False,
+        enable_presentations: bool = False,
         allow_computer_use: Optional[bool] = None,
         **kwargs: Any,
     ) -> Dict[str, Dict[str, Any]]:
@@ -4543,7 +4544,6 @@ class ChatMixin:
             enable_skills (bool): Enable skill capture functionality. Default True.
             enable_forms (bool): Enable form generation functionality. Default True.
             enable_books (bool): Enable book/document generation. Default False.
-            enable_presentations (bool): Enable presentation/slides generation. Default False.
             memory_manager: Optional memory manager instance for persistent memory.
             enable_artefacts (bool): Enable artifact creation and management. Default True.
             enable_memory (bool): Enable memory system (working/deep/archived). Default True.
@@ -4575,6 +4575,10 @@ class ChatMixin:
                 (screenshots, click, type, key, scroll). Requires the active model to
                 support vision; silently skipped when no vision capability is detected.
                 Default False.
+            enable_presentations (bool): Mount the PPTX Builder toolset — create, edit and
+                read PowerPoint (.pptx) decks via sandboxed python-pptx recipe code (no
+                imports allowed in recipes). Mounted unconditionally when True; no vision
+                capability required. Default False.
             event_mode (EventMode): Event reporting mode. Default PROCESSING_TAG_MODE.
             think (Optional[bool]): Legacy flag to toggle reasoning/thinking output. If True, maps to reasoning_effort='high'. If False, disables reasoning. Default None.
             reasoning_effort (Optional[str]): Level of reasoning effort for reasoning/thinking models ('low', 'medium', 'high', 'max'). Overrides `think`. Default None.
@@ -5137,6 +5141,45 @@ class ChatMixin:
                     "[ChatMixin] allow_computer_use is True, but no vision-capable "
                     "model is active or no LCP binding is available — computer use "
                     "toolset NOT mounted."
+                )
+
+        # ── 7. Mount PPTX Builder Toolset (Unconditional) ──
+        # Presentation building is a text-only workflow (recipe code in →
+        # markdown inventory out): no vision capability is required, so the
+        # mount is unconditional when the flag is set.
+        if enable_presentations:
+            if lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
+                try:
+                    lcp_binding.mount_tool_library_if_absent("pptx_builder")
+                    lcp_tools = lcp_binding.to_chat_tool_specs(
+                        discussion_instance=self,
+                        lollms_client_instance=self.lollmsClient,
+                    )
+                    mounted_pptx_tools = [
+                        t_name for t_name, _t_spec in lcp_tools.items()
+                        if t_name.startswith("tool_pptx_")
+                    ]
+                    for t_name in mounted_pptx_tools:
+                        active_tools[t_name] = lcp_tools[t_name]
+                    if mounted_pptx_tools:
+                        ASCIIColors.success(
+                            f"[ChatMixin] Mounted 'pptx_builder' toolset "
+                            f"({len(mounted_pptx_tools)} tools)."
+                        )
+                    else:
+                        ASCIIColors.warning(
+                            "[ChatMixin] pptx_builder mounted but no tool_pptx_* "
+                            "specs were produced."
+                        )
+                except Exception as ex:
+                    trace_exception(ex)
+                    ASCIIColors.warning(
+                        f"[ChatMixin] Failed to mount pptx_builder toolset: {ex}"
+                    )
+            else:
+                ASCIIColors.warning(
+                    "[ChatMixin] enable_presentations is True, but no LCP binding "
+                    "with mount_tool_library is available — pptx_builder NOT mounted."
                 )
 
 

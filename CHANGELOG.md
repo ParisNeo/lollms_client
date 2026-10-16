@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-16 00:33]
+
+- feat(chat): add enable_presentations support for mounting pptx_builder toolset
+
 ## [2026-10-15 23:41]
 
 - feat(bot): migrate to FastAPI/uvicorn platform and refactor connection architecture
