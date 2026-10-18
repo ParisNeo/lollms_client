@@ -820,6 +820,19 @@ def _prompt_param(name: str, desc: str, ptype: str, mandatory: bool, default: An
             return _prompt_param(name, desc, ptype, mandatory, default)
         return _convert_value(ans, ptype)
 
+def _normalize_legacy_input_parameters(entries: Any) -> List[Dict[str, Any]]:
+    if not isinstance(entries, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("name"):
+            item = dict(entry)
+            if "default" in item and "default_value" not in item:
+                item["default_value"] = item.pop("default")
+            normalized.append(item)
+    return normalized
+
+
 def _configure_binding_instance(b_type: str, b_name: str, alias: str, config_map: Dict[str, str]):
     prefix = f"{b_type.upper()}_BINDINGS_{alias.upper()}_"
     temp_params: Dict[str, str] = {"BINDING_NAME": b_name}
@@ -828,6 +841,8 @@ def _configure_binding_instance(b_type: str, b_name: str, alias: str, config_map
     desc = _get_binding_description(b_name, b_type)
     if desc:
         raw_params = desc.get("global_input_parameters", []) + desc.get("model_input_parameters", [])
+        if not raw_params:
+            raw_params = _normalize_legacy_input_parameters(desc.get("input_parameters", []))
         seen_names = set()
         params = []
         for p in raw_params:

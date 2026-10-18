@@ -1,7 +1,7 @@
 title: LlamaCpp Server (Enhanced)
 author: ParisNeo
 creation_date: 2025-12-13
-last_update_date: 2026-01-15
+last_update_date: 2026-10-16
 description: |
   Runs a fully-local llama.cpp server that exposes an OpenAI-compatible API.
   Loads GGUF models from a local folder and manages server processes automatically.
@@ -17,7 +17,8 @@ description: |
   automatically.  Setting it to -1 removes the cap entirely.
 
   **Idle Timeout:**
-  When `idle_timeout` is set to a positive number (seconds), a background
+  When `idle_timeout` is set to a
+  positive number (seconds), a background
   watchdog thread will automatically shut down servers that have not received
   a request within that window.
 
@@ -34,12 +35,7 @@ description: |
   Exposes flash-attn, mmap/mlock, rope scaling, tensor-split, cache-type-k/v,
   and per-GPU settings through constructor kwargs.
 
-input_parameters:
-  - name: model_name
-    type: str
-    description: "Filename of the GGUF model to load on startup."
-    mandatory: false
-    default: ""
+global_input_parameters:
   - name: host
     type: str
     description: "Interface to bind the server to."
@@ -142,6 +138,7 @@ input_parameters:
     default: -1
   - name: server_log_depth
     type: int
+    informational: true
     description: "The maximum number of lines of server logs to return when querying get_server_logs."
     mandatory: false
     default: 500
@@ -152,20 +149,29 @@ input_parameters:
     default: "data/models/llama_cpp_models"
   - name: binaries_path
     type: str
-    description: "Directory containing GGUF model files."
+    description: "Directory containing llama.cpp server binaries."
     mandatory: false
     default: "data/bin/llama_cpp_bin"
+
+model_input_parameters:
+  - name: model_name
+    type: str
+    description: "Filename of the GGUF model to load on startup."
+    mandatory: false
+    default: ""
   - name: reasoning
     type: str
-    description: "activates or deactivate reasoning"
+    description: "Activates or deactivates reasoning."
     mandatory: false
     default: "off"
+    options:
+      - "off"
+      - "on"
   - name: reasoning_budget
     type: int
-    description: "Maximum reasoning budget in token"
+    description: "Maximum reasoning budget in tokens."
     mandatory: false
     default: 0
-
 
 commands:
   - name: pull_model

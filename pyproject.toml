@@ -60,9 +60,6 @@ Homepage = "https://github.com/ParisNeo/lollms_client"
 
 # Exclude script launcher from the core library package
 [project.scripts]
-lollms-code = "lollms_client.apps.lollms_code.cli:main"
-lollms-code-gui = "lollms_client.apps.lollms_code.gui.main:main"
-lollms-code-instances = "lollms_client.apps.lollms_code.instance_manager:main"
 lollms-bot = "lollms_client.apps.lollms_bot.cli:main"
 lollms-config = "lollms_client.apps.lollms_config.cli:main"
 
