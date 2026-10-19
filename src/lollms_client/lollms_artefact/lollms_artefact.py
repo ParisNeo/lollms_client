@@ -2219,7 +2219,17 @@ class ArtefactManager:
 
         context_parts = [
             "## Workspace Directory Tree Index",
-            tree_text
+            tree_text,
+            "\n## Artefact Tag Reference",
+            "The <artefact>/<artifact> tag supports an optional visibility attribute that controls whether the file",
+            "is shown in this tree and in your context after creating or editing it:",
+            '  <artefact title="main.py" type="code" visibility="hidden">content</artefact>',
+            "- Optional: omit it for the default visible behavior.",
+            "- Values: hidden | tree_locked | tree_unlockable | folder_collapsed | folder_pinned | pinned | metadata | full",
+            "- DEFAULT (omitted): tree_unlockable (visible in the workspace tree, unlockable).",
+            '- visibility="hidden" saves and versions the file without displaying it in this tree.',
+            '- visibility="full" loads the file content fully into your context [C].',
+            '- visibility="metadata" exposes only signatures/schema [M].',
         ]
 
         if partial_visible_parts:
@@ -2562,6 +2572,31 @@ class ArtefactManager:
 
         return result
 
+    @staticmethod
+    def _resolve_tag_visibility(raw_visibility: Optional[str]) -> Optional[str]:
+        if raw_visibility is None:
+            return None
+        normalized = str(raw_visibility).strip().lower()
+        if not normalized:
+            return None
+        valid_tiers = {
+            ArtefactVisibility.HIDDEN,
+            ArtefactVisibility.TREE_LOCKED,
+            ArtefactVisibility.TREE_UNLOCKABLE,
+            ArtefactVisibility.FOLDER_COLLAPSED,
+            ArtefactVisibility.FOLDER_PINNED,
+            ArtefactVisibility.PINNED,
+            ArtefactVisibility.METADATA,
+            ArtefactVisibility.FULL,
+        }
+        if normalized in valid_tiers:
+            return normalized
+        ASCIIColors.warning(
+            f"[ArtefactManager] Ignoring invalid visibility attribute value '{raw_visibility}'. "
+            f"Valid values: hidden, tree_locked, tree_unlockable, folder_collapsed, folder_pinned, pinned, metadata, full."
+        )
+        return None
+
     def _apply_artefact_xml(
         self,
         text:          str,
@@ -2609,6 +2644,7 @@ class ArtefactManager:
             status      = attrs.pop('status', ArtefactStatus.STABLE)
             commit_message = attrs.pop('commit_message', None)
             version_tags   = attrs.pop('version_tags', None)
+            visibility  = ArtefactManager._resolve_tag_visibility(attrs.pop('visibility', None))
             
             if atype not in ArtefactType.ALL:
                 if atype in ("csv", "tsv", "excel", "xlsx", "xls", "db", "sqlite"):
@@ -2678,9 +2714,9 @@ class ArtefactManager:
                             patched = ArtefactManager.apply_aider_patch(disk_content, content)
                             result_artefact = self.add(
                                 title=resolved_title, artefact_type=atype, content=patched,
-                                language=language, version=1, active=auto_activate,
+                                language=language, version=version, active=auto_activate,
                                 commit_message=commit_message, version_tags=version_tags,
-                                ephemeral=is_ephemeral, status=status,
+                                ephemeral=is_ephemeral, status=status, visibility=visibility,
                                 **attrs
                             )
                     except Exception:
@@ -2701,7 +2737,7 @@ class ArtefactManager:
                             commit_message=commit_message,
                             version_tags=version_tags,
                             ephemeral=is_ephemeral,
-                            status=status,
+                            status=status, visibility=visibility,
                             **attrs
                         )
                     except ValueError as e:
@@ -2741,7 +2777,7 @@ class ArtefactManager:
                             content=content.strip(),
                             language=language, version=version, active=auto_activate,
                             commit_message=commit_message, version_tags=version_tags,
-                            ephemeral=is_ephemeral, status=status,
+                            ephemeral=is_ephemeral, status=status, visibility=visibility,
                             **attrs
                         )
                     else:
@@ -2756,7 +2792,7 @@ class ArtefactManager:
                             commit_message=commit_message,
                             version_tags=version_tags,
                             ephemeral=is_ephemeral,
-                            status=status,
+                            status=status, visibility=visibility,
                             **attrs
                         )
 

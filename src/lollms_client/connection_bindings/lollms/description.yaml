@@ -1,0 +1,35 @@
+title: "LoLLMs Web Bridge"
+author: "ParisNeo"
+version: 1.0.0
+binding_name: "lollms"
+description: |
+  A CONNECTION binding that bridges the local LoLLMs client to the lollms.com
+  web gateway. It polls the gateway for pending prompts addressed to your bot,
+  generates answers with the configured LLM, and posts the responses back to
+  the web interface. Set the bot token via 'service_key'.
+
+global_input_parameters:
+  - name: "service_key"
+    type: "str"
+    default: ""
+    description: "Bot token issued by lollms.com (required to start the bridge)."
+    is_secret: true
+  - name: "host_address"
+    type: "str"
+    default: "https://lollms.com/wp-json/lollms/v1"
+    description: "Base URL of the lollms.com gateway API."
+  - name: "poll_interval"
+    type: "float"
+    default: 1.5
+    description: "Seconds between two gateway polls when idle."
+
+model_input_parameters:
+  - name: "instance_name"
+    type: "str"
+    default: "main"
+    description: "Logical profile name for this web bridge instance."
+
+commands:
+  - name: "start"
+    description: "Starts the bridge and begins polling lollms.com for prompts."
+    parameters: []

@@ -22,6 +22,7 @@ from ascii_colors import ASCIIColors, trace_exception
 from lollms_client.lollms_llm_binding import LollmsLLMBinding
 from lollms_client.lollms_types import MSG_TYPE
 from lollms_client.lollms_discussion import LollmsDiscussion
+from lollms_client.lollms_utilities import to_int, to_float, _convert_to_bool
 
 # Ensure dependencies
 pm.ensure_packages(["openai", "huggingface_hub", "filelock", "requests", "tqdm", "psutil", "pyyaml"])
@@ -51,6 +52,41 @@ def get_free_port(start_port: int = 9624, max_port: int = 10000) -> int:
             except OSError:
                 continue
     raise RuntimeError("No free ports available in range.")
+
+
+_TRUE_TOKENS = frozenset({"true", "yes", "on", "1", "enabled"})
+_FALSE_TOKENS = frozenset({"false", "no", "off", "0", "disabled"})
+_REASONING_TOKENS = frozenset({"on", "off", "auto"})
+
+
+def _normalize_reasoning_mode(value) -> Optional[str]:
+    """Maps any boolean-ish or enum-ish config value to llama.cpp's on/off/auto enum.
+
+    Returns None for None/empty/unrecognized values so callers can omit the flag
+    (llama.cpp then applies its 'auto' default).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if text in _REASONING_TOKENS:
+        return text
+    if text in _TRUE_TOKENS:
+        return "on"
+    if text in _FALSE_TOKENS:
+        return "off"
+    return None
+
+
+def _is_booleanish(value) -> bool:
+    """True when the value looks like a boolean token rather than a number."""
+    if value is None or isinstance(value, bool):
+        return isinstance(value, bool)
+    text = str(value).strip().lower()
+    return text in _TRUE_TOKENS or text in _FALSE_TOKENS
 
 
 def _encode_image(image_path_or_url: str) -> Optional[str]:
@@ -138,22 +174,23 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         # ── Model config ──────────────────────────────────────────────────────
         self.model_name: Optional[str] = _clean(kwargs.get("model_name", "")) or None
 
-        val_ctx = _clean(kwargs.get("ctx_size"), int|None)
+        val_ctx = to_int(kwargs.get("ctx_size"), None)
         self.n_ctx: int|None = val_ctx
 
         val_layers = _clean(kwargs.get("n_gpu_layers"), int)
+        val_layers = to_int(kwargs.get("n_gpu_layers"), None)
         self.n_gpu_layers: int = val_layers if val_layers is not None else -1
 
-        self.n_threads: Optional[int] = _clean(kwargs.get("n_threads"), int)
+        self.n_threads: Optional[int] = to_int(kwargs.get("n_threads"), None)
 
-        val_parallel = _clean(kwargs.get("n_parallel"), int)
+        val_parallel = to_int(kwargs.get("n_parallel"), None)
         self.n_parallel: int = val_parallel if val_parallel is not None else 1
 
-        val_batch = _clean(kwargs.get("batch_size"), int)
+        val_batch = to_int(kwargs.get("batch_size"), None)
         self.batch_size: int = val_batch if val_batch is not None else 512
 
         val_flash = _clean(kwargs.get("flash_attn"))
-        self.flash_attn: bool = bool(val_flash) if val_flash is not None else False
+        self.flash_attn: bool = _convert_to_bool(val_flash) if val_flash is not None else False
 
         val_mmap = _clean(kwargs.get("mmap"))
         self.mmap: bool = bool(val_mmap) if val_mmap is not None else True
@@ -173,14 +210,14 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         self.rope_freq_base: Optional[float] = _clean(kwargs.get("rope_freq_base"), float)
         self.rope_freq_scale: Optional[float] = _clean(kwargs.get("rope_freq_scale"), float)
         self.tensor_split: Optional[str] = _clean(kwargs.get("tensor_split"))  # "0.5,0.5" …
-        self.main_gpu: Optional[int] = _clean(kwargs.get("main_gpu"), int)
+        self.main_gpu: Optional[int] = to_int(kwargs.get("main_gpu"), None)
         self.cache_type_k: Optional[str] = _clean(kwargs.get("cache_type_k"))  # "f16", "q8_0" …
         self.cache_type_v: Optional[str] = _clean(kwargs.get("cache_type_v"))
 
         # ── Capacity / lifecycle ──────────────────────────────────────────────
-        self.max_active_models: int = int(kwargs.get("max_active_models", 1))
-        self.idle_timeout: float = float(kwargs.get("idle_timeout", -1))  # seconds; -1 = disabled
-        self.server_log_depth: int = int(kwargs.get("server_log_depth", 500))
+        self.max_active_models: int = to_int(kwargs.get("max_active_models"), 1)
+        self.idle_timeout: float = to_float(kwargs.get("idle_timeout"), -1.0)  # seconds; -1 = disabled
+        self.server_log_depth: int = to_int(kwargs.get("server_log_depth"), 500)
 
         # ── Paths ─────────────────────────────────────────────────────────────
         self.binding_dir = Path(__file__).parent
@@ -763,10 +800,14 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             "--n-gpu-layers", str(self.n_gpu_layers),
             "--parallel", str(self.n_parallel),
             "--batch-size", str(self.batch_size),
-            "--reasoning", str(self.reasoning),
-            "--reasoning-budget", str(self.reasoning_budget),
+            "--reasoning", _normalize_reasoning_mode(self.reasoning) or "off",
             "--embedding",          # always enable the /embedding endpoint
         ]
+        if not _is_booleanish(self.reasoning_budget):
+            budget = to_int(self.reasoning_budget, None)
+            if budget is not None and budget > 0:
+                cmd += ["--reasoning-budget", str(budget)]
+
         #conditional settings:
         if self.n_ctx:
             cmd.append("--ctx-size")

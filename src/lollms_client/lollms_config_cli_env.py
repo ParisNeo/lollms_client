@@ -718,13 +718,15 @@ def _get_binding_description(b_name: str, b_type: str) -> Optional[Dict[str, Any
     except: return None
 
 def _convert_value(raw: str, p_type: str) -> Any:
+    from lollms_client.lollms_utilities import to_int, to_float
+
     if p_type == "bool": return raw.lower() in ("true", "1", "yes", "y")
     elif p_type == "int":
-        try: return int(raw)
-        except: return raw
+        coerced = to_int(raw)
+        return coerced if coerced is not None else raw
     elif p_type == "float":
-        try: return float(raw)
-        except: return raw
+        coerced = to_float(raw)
+        return coerced if coerced is not None else raw
     return raw
 
 def _format_env_value(value: Any) -> str:
@@ -806,11 +808,27 @@ def _is_back_choice(selection: Any) -> bool:
 
 
 def _prompt_param(name: str, desc: str, ptype: str, mandatory: bool, default: Any) -> Any:
+    from lollms_client.lollms_utilities import to_int, to_float
+
     ASCIIColors.rich_print(f"\n[bold cyan]── {name} ──[/bold cyan]")
     if desc: ASCIIColors.rich_print(f"[dim]{desc[:120]}{'...' if len(desc)>120 else ''}[/dim]")
     ASCIIColors.rich_print(f"Type: [yellow]{ptype}[/yellow] {'[red](required)[/red]' if mandatory else '[dim](optional)[/dim]'}")
     if ptype == "bool":
         return _safe_confirm("Enter yes/no:", default if isinstance(default, bool) else False)
+    elif ptype in ("int", "float"):
+        ans = _safe_input_or_back("Enter value", str(default) if default is not None else "")
+        if ans is None:
+            return _BACK_SENTINEL
+        if not ans.strip() and mandatory:
+            ASCIIColors.red("  ⚠ Required. Please enter a numeric value.")
+            return _prompt_param(name, desc, ptype, mandatory, default)
+        coerced = to_int(ans) if ptype == "int" else to_float(ans)
+        if coerced is None:
+            if mandatory:
+                ASCIIColors.red("  ⚠ Not a valid number. Please enter a numeric value.")
+                return _prompt_param(name, desc, ptype, mandatory, default)
+            return _convert_value(ans, ptype)
+        return coerced
     else:
         ans = _safe_input_or_back("Enter value", str(default) if default is not None else "")
         if ans is None:
@@ -831,6 +849,18 @@ def _normalize_legacy_input_parameters(entries: Any) -> List[Dict[str, Any]]:
                 item["default_value"] = item.pop("default")
             normalized.append(item)
     return normalized
+
+
+def _normalize_legacy_parameters_dict(desc: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Rebuilds a modern `parameters` dict from a legacy `input_parameters` list.
+
+    Legacy schema: list of {'name', 'type', 'description', 'default', ...}.
+    Modern schema: dict keyed by parameter name.
+    """
+    params_dict: Dict[str, Dict[str, Any]] = {}
+    for item in _normalize_legacy_input_parameters(desc.get("input_parameters", [])):
+        params_dict[item["name"]] = item
+    return params_dict
 
 
 def _configure_binding_instance(b_type: str, b_name: str, alias: str, config_map: Dict[str, str]):
@@ -1404,6 +1434,11 @@ def _configure_connection_binding_instance(b_name: str, alias: str, config_map: 
         if key_val:
             config_map[prefix + "SERVICE_KEY"] = _format_env_value(key_val)
         timeout_val = _prompt_param("timeout", "HTTP timeout in seconds", "int", False, 30)
+        if timeout_val is _BACK_SENTINEL:
+            ASCIIColors.yellow("\n  ⚠️ Connection binding configuration cancelled. Rolling back partial keys.")
+            for k in [k for k in config_map if k.startswith(prefix)]:
+                del config_map[k]
+            return
         config_map[prefix + "TIMEOUT"] = _format_env_value(timeout_val)
 
 
@@ -1719,6 +1754,7 @@ def _save_and_validate(
     test_connection: bool = False,
     cli_env_path: Optional[Union[str, Path]] = None,
 ) -> bool:
+    _normalize_config_map_keys(config_map)
     target_dir = Path.home() / ".lollms_client"
     target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1912,7 +1948,7 @@ def run_wizard_and_save(cli_env_path: Optional[Union[str, Path]] = None):
             break
         if callable(selection):
             res = selection()
-            if _is_back_choice(res):
+            if res == _BACK_VALUE:
                 break
         if state.get("saved") or state.get("exited"):
             break

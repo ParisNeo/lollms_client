@@ -6,7 +6,8 @@ messages to the attached LollmsClient's LLM, and replies on the same chat.
 Credentials come from the binding config (service_key = bot token).
 """
 import asyncio
-from typing import Any, Dict, List, Optional
+import mimetypes
+from typing import Any, Dict, List, Optional, Tuple
 
 from ascii_colors import ASCIIColors, trace_exception
 from lollms_client.lollms_connection_binding import LollmsConnectionBinding, ConnectionSendResult
@@ -34,10 +35,33 @@ class TelegramConnectionBinding(LollmsConnectionBinding):
     def list_channels(self) -> List[str]:
         return [f"telegram:{uid}" for uid in self.allowed_user_ids] or ["telegram:*"]
 
-    def send_message(self, content: str, channel_alias: Optional[str] = None, **kwargs) -> ConnectionSendResult:
+    def send_message(self, content: str, channel_alias: Optional[str] = None, artefacts: Optional[List[dict]] = None, **kwargs) -> ConnectionSendResult:
         if not self._running:
             return ConnectionSendResult(success=False, message="Telegram bot is not running.", channel=channel_alias)
+        if artefacts:
+            return ConnectionSendResult(success=True, message="queued", channel=channel_alias, platform="telegram", artefact_count=len(artefacts))
         return ConnectionSendResult(success=True, message="queued", channel=channel_alias, platform="telegram")
+
+    def _reply_with_artefacts(self, text: str) -> Tuple[str, List[dict]]:
+        reply = self._reply(text)
+        return self._extract_artefacts_from_text(str(reply))
+
+    async def _send_artefacts(self, message, artefacts: List[dict]) -> None:
+        for artefact in artefacts or []:
+            data, mime, title = self._load_artefact_payload(artefact)
+            if data is None:
+                continue
+            extension = mimetypes.guess_extension(mime) or ".txt"
+            filename = title if title.endswith(extension) else f"{title}{extension}"
+            try:
+                if mime.startswith("image/"):
+                    await message.reply_photo(photo=data, caption=title)
+                else:
+                    await message.reply_document(document=data, filename=filename)
+                ASCIIColors.info(f"📎 Telegram: delivered artefact '{filename}'")
+            except Exception as e:
+                trace_exception(e)
+                ASCIIColors.warning(f"Telegram binding: failed to deliver artefact '{title}': {e}")
 
     async def start(self) -> None:
         if not self.token:
@@ -60,8 +84,9 @@ class TelegramConnectionBinding(LollmsConnectionBinding):
             async def handle_message(update, context):
                 if self.allowed_user_ids and update.effective_user.id not in self.allowed_user_ids:
                     return
-                reply = self._reply(update.message.text or "")
+                reply, artefacts = self._reply_with_artefacts(update.message.text or "")
                 await update.message.reply_text(reply)
+                await self._send_artefacts(update.message, artefacts)
 
             app.add_handler(CommandHandler("start", start_cmd))
             app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

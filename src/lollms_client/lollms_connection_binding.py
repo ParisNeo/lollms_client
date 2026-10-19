@@ -17,10 +17,14 @@ instance_name specifying which chat/channel/conversation to target.
 
 from __future__ import annotations
 
+import base64
 import importlib
+import inspect
+import mimetypes
+import re
 from abc import abstractmethod
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from ascii_colors import ASCIIColors, trace_exception
 
@@ -39,13 +43,16 @@ class ConnectionSendResult(dict):
         raw: Optional[Any]          -> Raw platform response
         error: Optional[str]        -> Error message if failed
     """
-    def __init__(self, sent=False, message_id=None, channel=None, raw=None, error=None):
+    def __init__(self, sent=None, message_id=None, channel=None, raw=None, error=None, **extra):
+        if sent is None:
+            sent = bool(extra.pop("success", False))
         super().__init__(
             sent=sent,
             message_id=message_id,
             channel=channel,
             raw=raw,
             error=error,
+            **extra,
         )
 
     @property
@@ -103,13 +110,18 @@ class LollmsConnectionBinding(LollmsBaseBinding):
         self.instance_name = kwargs.get("instance_name", "")
         self._connected = False
         self._message_handlers: List[Callable] = []
+        self.artefacts_enabled = bool(kwargs.get("artefacts_enabled", True))
+        self.max_artefact_size = int(kwargs.get("max_artefact_size", 10 * 1024 * 1024))
+        self.artefacts_enabled = bool(kwargs.get("artefacts_enabled", True))
+        self.max_artefact_size = int(kwargs.get("max_artefact_size", 10 * 1024 * 1024))
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
-    @abstractmethod
     def connect(self) -> bool:
-        """Establish the connection to the platform. Returns True on success."""
-        pass
+        """Establish the connection to the platform. Returns True on success.
+        Subclasses that require an active handshake should override this."""
+        self._connected = True
+        return True
 
     def disconnect(self) -> bool:
         """Gracefully close the connection. Default implementation."""
@@ -127,6 +139,7 @@ class LollmsConnectionBinding(LollmsBaseBinding):
         self,
         content: str,
         sender_name: Optional[str] = None,
+        artefacts: Optional[List[dict]] = None,
         **kwargs,
     ) -> ConnectionSendResult:
         """
@@ -135,12 +148,106 @@ class LollmsConnectionBinding(LollmsBaseBinding):
         Args:
             content: The message text.
             sender_name: Optional display name override.
+            artefacts: Optional list of artefact dicts to attach. Schema:
+                {
+                    "title": str,             # display name / filename
+                    "type": str,              # "document" | "code" | "image" | ...
+                    "path": Optional[str],    # local file path (used when content is absent)
+                    "content": Optional[str], # text content, or base64 for binary mimes
+                    "mime": str,              # e.g. "text/markdown", "image/png"
+                }
             **kwargs: Platform-specific parameters (e.g., attachments, embeds).
 
         Returns:
             ConnectionSendResult with sent status and metadata.
         """
         pass
+
+    _ARTEFACT_BLOCK_RE = re.compile(
+        r"<art(?:ef)?act\b([^>]*)>(.*?)</art(?:ef)?act>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    _ARTEFACT_ATTR_RE = re.compile(r"(\w+)\s*=\s*[\"']([^\"']*)[\"']")
+
+    def _extract_artefacts_from_text(self, text: str) -> Tuple[str, List[dict]]:
+        """Splits LLM output into clean text and a list of artefact dicts.
+
+        Recognizes <artefact type="..." title="..." path="...">content</artefact>
+        blocks (the "artifact" spelling is tolerated too). Blocks are removed
+        from the visible text and returned as artefact dicts. Returns the
+        original text unchanged when artefacts are disabled or nothing matches.
+        """
+        if not text or not getattr(self, "artefacts_enabled", True):
+            return text, []
+        if not self._ARTEFACT_BLOCK_RE.search(text):
+            return text, []
+
+        artefacts: List[dict] = []
+
+        def _capture(match) -> str:
+            attrs = dict(self._ARTEFACT_ATTR_RE.findall(match.group(1) or ""))
+            content = (match.group(2) or "").strip()
+            artefact_type = str(attrs.get("type", "document")).strip().lower() or "document"
+            title = str(attrs.get("title") or attrs.get("name") or "").strip() or f"artefact_{len(artefacts) + 1}"
+            path = str(attrs.get("path", "")).strip() or None
+            mime = "text/markdown" if artefact_type == "document" else "text/plain"
+            if path:
+                guessed, _ = mimetypes.guess_type(path)
+                mime = guessed or mime
+            artefacts.append(
+                {
+                    "title": title,
+                    "type": artefact_type,
+                    "path": path,
+                    "content": content,
+                    "mime": mime,
+                }
+            )
+            return ""
+
+        clean_text = self._ARTEFACT_BLOCK_RE.sub(_capture, text)
+        return clean_text.strip(), artefacts
+
+    def _load_artefact_payload(self, artefact: dict) -> Tuple[Optional[bytes], str, str]:
+        """Normalizes an artefact dict into (raw_bytes, mime, title) for delivery.
+
+        Reads `content` (raw text for text/* mimes, base64 otherwise) or the
+        local file at `path`. Enforces `max_artefact_size`. Never raises; the
+        bytes component is None when the artefact must be skipped.
+        """
+        title = str(artefact.get("title") or "artefact")
+        mime = str(artefact.get("mime") or "text/plain")
+        max_size = getattr(self, "max_artefact_size", 0) or 0
+        try:
+            data: Optional[bytes] = None
+            content = artefact.get("content")
+            path = artefact.get("path")
+            if content is not None and str(content).strip():
+                raw = str(content)
+                if mime.startswith("text/"):
+                    data = raw.encode("utf-8")
+                else:
+                    data = base64.b64decode(raw, validate=False)
+            elif path:
+                file_path = Path(str(path))
+                if not file_path.is_file():
+                    ASCIIColors.warning(f"[{self.binding_name}] Artefact file not found: {path}")
+                    return None, mime, title
+                data = file_path.read_bytes()
+
+            if data is None:
+                return None, mime, title
+            if max_size and len(data) > max_size:
+                ASCIIColors.warning(
+                    f"[{self.binding_name}] Artefact '{title}' exceeds max_artefact_size "
+                    f"({len(data)} > {max_size} bytes). Skipped."
+                )
+                return None, mime, title
+            return data, mime, title
+        except Exception as e:
+            ASCIIColors.warning(f"[{self.binding_name}] Failed to load artefact '{title}': {e}")
+            return None, mime, title
+
 
     def receive_message(
         self,
@@ -191,9 +298,9 @@ class LollmsConnectionBinding(LollmsBaseBinding):
         """
         pass
 
-    @abstractmethod
     def list_models(self) -> List[Any]:
-        """List available model profiles (required by LollmsBaseBinding)."""
+        """List available model profiles (required by LollmsBaseBinding).
+        Defaults to the platform's channels."""
         return self.list_channels()
 
     def get_zoo(self) -> List[Dict[str, Any]]:
@@ -236,13 +343,40 @@ class LollmsConnectionBindingManager:
                 module = importlib.import_module(
                     f"lollms_client.connection_bindings.{binding_name}"
                 )
-                binding_class = getattr(module, module.BindingName)
-                self.available_bindings[binding_name] = binding_class
+                binding_class = self._resolve_concrete_class(module, binding_name)
+                if binding_class is not None:
+                    self.available_bindings[binding_name] = binding_class
             except Exception as e:
                 trace_exception(e)
                 ASCIIColors.warning(
                     f"Failed to load Connection binding {binding_name}: {e}"
                 )
+
+    def _resolve_concrete_class(self, module: Any, binding_name: str) -> Optional[type]:
+        preferred_name = getattr(module, "BindingName", None)
+        preferred_cls = getattr(module, preferred_name, None) if preferred_name else None
+        if self._is_concrete_binding_class(preferred_cls):
+            return preferred_cls
+
+        for attr_name in dir(module):
+            member_cls = getattr(module, attr_name)
+            if self._is_concrete_binding_class(member_cls):
+                return member_cls
+
+        ASCIIColors.warning(
+            f"Connection binding '{binding_name}' exposes no concrete "
+            "LollmsConnectionBinding subclass."
+        )
+        return None
+
+    @staticmethod
+    def _is_concrete_binding_class(cls: Any) -> bool:
+        return (
+            inspect.isclass(cls)
+            and issubclass(cls, LollmsConnectionBinding)
+            and cls is not LollmsConnectionBinding
+            and not inspect.isabstract(cls)
+        )
 
     def create_binding(
         self,

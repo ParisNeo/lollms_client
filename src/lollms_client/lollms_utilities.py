@@ -11,6 +11,73 @@ import numpy as np
 import json
 from ascii_colors import ASCIIColors, trace_exception
 
+def _convert_to_bool(value) -> bool:
+    """Never-raising bool coercion for untrusted configuration values."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    return text in ("true", "1", "yes", "y", "on")
+
+
+def to_int(value, default=None):
+    """Never-raising int coercion for untrusted configuration values.
+
+    Accepts None, bool, int, float, or any string representation.
+    Boolean-ish strings ('true'/'false'/'yes'/'no'/'on'/'off') map to 1/0.
+    Numeric strings tolerate decimal notation ('1.5' -> 1). Any value that
+    cannot be interpreted numerically returns the provided default.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return default
+    lowered = text.lower()
+    if lowered in ("true", "yes", "on"):
+        return 1
+    if lowered in ("false", "no", "off"):
+        return 0
+    try:
+        return int(float(text))
+    except (ValueError, TypeError):
+        return default
+
+
+def to_float(value, default=None):
+    """Never-raising float coercion for untrusted configuration values.
+
+    Accepts None, bool, int, float, or any string representation.
+    Boolean-ish strings ('true'/'false'/'yes'/'no'/'on'/'off') map to 1.0/0.0.
+    Any value that cannot be interpreted numerically returns the default.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return default
+    lowered = text.lower()
+    if lowered in ("true", "yes", "on"):
+        return 1.0
+    if lowered in ("false", "no", "off"):
+        return 0.0
+    try:
+        return float(text)
+    except (ValueError, TypeError):
+        return default
+
+
 def dict_to_markdown(d, indent=0):
     """
     Formats a dictionary (with potential nested lists and dicts) as a markdown list.
