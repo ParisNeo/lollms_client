@@ -8,7 +8,8 @@ Credentials come from the binding config (service_key = bot token).
 """
 import asyncio
 import base64
-from typing import Any, Dict, List, Optional, Tuple
+import threading
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 from ascii_colors import ASCIIColors, trace_exception
@@ -36,6 +37,7 @@ class LollmsWebConnectionBinding(LollmsConnectionBinding):
             self.poll_interval = DEFAULT_POLL_INTERVAL_S
         self.lollms_client = kwargs.get("lollms_client")
         self._running = False
+        self._chat_lock = threading.Lock()
 
     def connect(self) -> bool:
         if not self.token:
@@ -62,13 +64,199 @@ class LollmsWebConnectionBinding(LollmsConnectionBinding):
 
         self._running = True
         ASCIIColors.info("🌐 Starting LoLLMs web bridge connection binding...")
+        self._prewarm_personality()
         try:
             await self._poll_loop()
         except Exception as e:
             trace_exception(e)
             ASCIIColors.red(f"lollms binding error: {e}")
         finally:
+            self._cancel_personality()
             self._running = False
+
+    def _cancel_personality(self) -> None:
+        personality = getattr(self, "lollms_personality", None)
+        if personality is not None and bool(personality):
+            try:
+                personality.cancel_generation()
+            except Exception:
+                pass
+
+    def _handle_command(self, prompt: str) -> Optional[str]:
+        """
+        Dispatches slash commands (/personas, /persona, /skills, /skill).
+        Returns a reply string for commands, or None to fall through to the
+        normal personality chat path. Never raises.
+        """
+        text = (prompt or "").strip()
+        if not text.startswith("/"):
+            return None
+        try:
+            command, _, argument = text.partition(" ")
+            command = command.lower()
+            argument = argument.strip()
+
+            if command == "/personas":
+                return self._cmd_personas()
+            if command == "/persona":
+                return self._cmd_persona_switch(argument)
+            if command == "/skills":
+                return self._cmd_skills(argument)
+            if command == "/skill":
+                return self._cmd_skill_load(argument)
+
+            return (
+                "Unknown command. Available commands:\n"
+                "/personas - list available personas\n"
+                "/persona <name> - switch the active persona\n"
+                "/skills - list skills of the active persona\n"
+                "/skill <name> - load a skill into the conversation"
+            )
+        except Exception as e:
+            trace_exception(e)
+            return f"[LollmsBot] Command failed: {e}"
+
+    def _cmd_personas(self) -> str:
+        personality = getattr(self, "lollms_personality", None)
+        active_name = ""
+        if personality is not None and bool(personality):
+            try:
+                active_name = str(personality.display_name or "").lower()
+            except Exception:
+                active_name = ""
+
+        registry = getattr(self, "persona_registry", None) or {}
+        if not registry:
+            return "No personas registered. Add handbag-shaped folders under ~/.lollms-bot/personas/ to create one."
+
+        lines = ["Available personas:"]
+        for index, (name, info) in enumerate(sorted(registry.items()), start=1):
+            display_name = str(info.get("display_name") or name)
+            marker = " ✅ (active)" if name.lower() == active_name else ""
+            lines.append(f"{index}. {display_name} — switch with: /persona {name}{marker}")
+        return "\n".join(lines)
+
+    def _cmd_persona_switch(self, name: str) -> str:
+        if not name:
+            return "Usage: /persona <name> — use /personas to list available personas."
+
+        registry = getattr(self, "persona_registry", None) or {}
+        match = next(
+            (key for key in registry if key.lower() == name.lower()),
+            None,
+        )
+        if match is None:
+            return f"Persona '{name}' not found. Use /personas to list available personas."
+
+        factory = getattr(self, "personality_factory", None)
+        if factory is None:
+            return "Persona switching is unavailable (no personality factory attached)."
+
+        try:
+            with self._chat_lock:
+                new_personality = factory(match)
+                self.lollms_personality = new_personality
+        except Exception as e:
+            trace_exception(e)
+            return f"[LollmsBot] Failed to switch to persona '{match}': {e}"
+
+        display_name = getattr(new_personality, "display_name", match)
+        persist = getattr(self, "on_persona_selected", None)
+        if callable(persist):
+            try:
+                persist(match)
+            except Exception:
+                pass
+        ASCIIColors.success(f"lollms binding: persona switched to '{match}'.")
+        return f"Persona switched to '{display_name}'."
+
+    def _cmd_skills(self, argument: str) -> str:
+        personality = getattr(self, "lollms_personality", None)
+        if personality is None or not bool(personality):
+            return "No personality attached. Cannot list skills."
+
+        skills_manager = getattr(personality, "skills_manager", None)
+        if skills_manager is None:
+            return "Skills are not enabled for the active persona."
+
+        query = argument.partition("search ")[2].strip() if argument.lower().startswith("search ") else ""
+        if query:
+            matches = skills_manager.search_skills(query)
+            if not matches:
+                return f"No skills matching '{query}'."
+            lines = [f"Skills matching '{query}':"]
+            for skill in matches:
+                lines.append(f"• {skill.get('title')} — {skill.get('description', '')}")
+            return "\n".join(lines)
+
+        skills = skills_manager.list_skills()
+        if not skills:
+            return "The active persona has no skills. Add SKILL.md files to the handbag's skills/ folder."
+
+        lines = ["Skills of the active persona:"]
+        for skill in skills:
+            visibility = skill.get("visibility", "")
+            lines.append(f"• {skill.get('title')} ({visibility}) — {skill.get('description', '')}")
+        lines.append("Load one with: /skill <name>")
+        return "\n".join(lines)
+
+    def _cmd_skill_load(self, name: str) -> str:
+        if not name:
+            return "Usage: /skill <name> — use /skills to list available skills."
+
+        personality = getattr(self, "lollms_personality", None)
+        if personality is None or not bool(personality):
+            return "No personality attached. Cannot load skills."
+
+        skills_manager = getattr(personality, "skills_manager", None)
+        if skills_manager is None:
+            return "Skills are not enabled for the active persona."
+
+        skill = skills_manager.get_skill(name)
+        if skill is None:
+            matches = skills_manager.search_skills(name)
+            suggestion = ""
+            if matches:
+                titles = ", ".join(str(m.get("title")) for m in matches[:5])
+                suggestion = f" Did you mean: {titles}?"
+            return f"Skill '{name}' not found.{suggestion} Use /skills to list them."
+
+        try:
+            loaded = skills_manager.load_skill(skill.get("key"))
+        except Exception as e:
+            trace_exception(e)
+            return f"[LollmsBot] Failed to load skill '{name}': {e}"
+
+        title = (loaded or {}).get("title") or skill.get("title") or name
+        return f"Skill '{title}' loaded. It will now be used in this conversation."
+
+    def _prewarm_personality(self) -> None:
+        personality = getattr(self, "lollms_personality", None)
+        if personality is None or not bool(personality):
+            return
+        try:
+            _ = personality.tools
+            ASCIIColors.info("lollms binding: personality tool surface pre-warmed.")
+        except Exception as e:
+            ASCIIColors.warning(f"lollms binding: personality tool pre-warm failed (non-fatal): {e}")
+
+    def _chat_locked(self, prompt: str) -> Tuple[str, Optional[str]]:
+        personality = getattr(self, "lollms_personality", None)
+        if personality is None or not bool(personality):
+            return "", "no_personality"
+        if not self._chat_lock.acquire(blocking=False):
+            ASCIIColors.warning("lollms binding: personality.chat re-entry blocked (turn already in flight).")
+            return "", "busy"
+        try:
+            result = personality.chat(prompt=prompt, enforce_end_tag=False)
+        except Exception as e:
+            trace_exception(e)
+            return "", f"chat_error: {e}"
+        finally:
+            self._chat_lock.release()
+        if isinstance(result, dict):
+            return str(result.get("response", "") or ""), None
+        return str(result or ""), None
 
     async def _poll_loop(self) -> None:
         ASCIIColors.info(f"Gateway: {self.gateway_url}")
@@ -155,9 +343,36 @@ class LollmsWebConnectionBinding(LollmsConnectionBinding):
         return encoded
 
     async def _reply_async(self, prompt: str, history: List[Dict[str, Any]]) -> Tuple[str, List[dict]]:
-        return await asyncio.to_thread(self._reply, prompt, history)
+        command_reply = self._handle_command(prompt)
+        if command_reply is not None:
+            return command_reply, []
+        reply, failure = await asyncio.to_thread(self._chat_locked, prompt)
+        if failure == "no_personality":
+            return self._reply_raw(prompt, history)
+        if failure:
+            ASCIIColors.warning(f"lollms binding: personality chat failed ({failure}). No raw fallback.")
+            return f"[LollmsBot] Personality chat failed: {failure}", []
+        if not reply.strip():
+            ASCIIColors.warning("lollms binding: personality chat returned an empty response. No raw fallback.")
+            return "[LollmsBot] The personality produced an empty response for this prompt.", []
+        return self._extract_artefacts_from_text(reply)
 
     def _reply(self, prompt: str, history: Optional[List[Dict[str, Any]]] = None) -> Tuple[str, List[dict]]:
+        command_reply = self._handle_command(prompt)
+        if command_reply is not None:
+            return command_reply, []
+        reply, failure = self._chat_locked(prompt)
+        if failure == "no_personality":
+            return self._reply_raw(prompt, history)
+        if failure:
+            ASCIIColors.warning(f"lollms binding: personality chat failed ({failure}). No raw fallback.")
+            return f"[LollmsBot] Personality chat failed: {failure}", []
+        if not reply.strip():
+            ASCIIColors.warning("lollms binding: personality chat returned an empty response. No raw fallback.")
+            return "[LollmsBot] The personality produced an empty response for this prompt.", []
+        return self._extract_artefacts_from_text(reply)
+
+    def _reply_raw(self, prompt: str, history: Optional[List[Dict[str, Any]]] = None) -> Tuple[str, List[dict]]:
         client = self.lollms_client
         if client is not None and getattr(client, "llm", None) is not None:
             try:

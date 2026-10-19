@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-19 10:08]
+
+- feat(lollms_bot): revamp CLI, config, and daemon modules
+
 ## [2026-10-19 07:25]
 
 - feat(ollama): add structured output options to binding configuration
