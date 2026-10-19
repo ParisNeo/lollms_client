@@ -529,6 +529,7 @@ class SkillsManager:
         # Proactively highlight relevant skills that match the user's immediate prompt
         if current_query:
             relevant = self.find_relevant_skills(current_query, top_k=2)
+            relevant = [r for r in relevant if r.visibility != "visible"]
             if relevant:
                 if round_count <= 1:
                     rec_lines = [
@@ -746,29 +747,54 @@ class SkillsManager:
                     }
 
                 skill._loaded_in_session = True
-                content = self.load_skill(skill.title)
-                if content:
-                    tool_notice = ""
-                    if loaded_tools_now or skill.required_tools:
-                        active_now = loaded_tools_now or skill.required_tools
-                        tool_notice = (
-                            f"\n\n🛠️ **Required Toolset Automatically Activated**:\n"
-                            f"The required tool(s) for this skill ({', '.join(f'`{t}`' for t in active_now)}) "
-                            f"have been verified and activated in your session.\n"
-                            f"You can now call them directly (e.g. `{active_now[0]}`)."
-                        )
-                    return {
-                        "success": True,
-                        "output": content + tool_notice,
-                        "loaded_tools": loaded_tools_now
-                    }
-                return {"success": False, "error": f"Skill '{title}' not found."}
+
+                already_visible = skill.visibility == "visible"
+                persistence_note = "session"
+                if not already_visible:
+                    try:
+                        promoted = self.set_skill_visibility(skill.title, "visible")
+                        skill = promoted
+                        persistence_note = "persistent"
+                    except ValueError:
+                        skill.visibility = "visible"
+
+                if self.active_tool_names is not None:
+                    self.active_tool_names.add(skill.title.lower())
+
+                content = skill.content or ""
+                read_only_note = " (read-only)" if not skill.modifiable else ""
+                tool_notice = ""
+                if loaded_tools_now or skill.required_tools:
+                    active_now = loaded_tools_now or skill.required_tools
+                    tool_notice = (
+                        f"\nRequired tool(s) ({', '.join(f'`{t}`' for t in active_now)}) "
+                        f"were verified and activated in your session."
+                    )
+                receipt = (
+                    f"✅ Skill '{skill.title}'{read_only_note} is now ACTIVE and fully loaded in the "
+                    f"'=== ACTIVE SKILLS (Always Visible) ===' section of your system prompt ({persistence_note}). "
+                    f"Its complete content ({len(content):,} chars, {len(content.split()):,} words) is available there. "
+                    f"Do NOT re-read it with file tools — consult the ACTIVE SKILLS section directly and follow its methodology now."
+                    + tool_notice
+                )
+                return {
+                    "success": True,
+                    "output": receipt,
+                    "skill_title": skill.title,
+                    "visibility": skill.visibility,
+                    "content_chars": len(content),
+                    "loaded_tools": loaded_tools_now,
+                }
 
             tools["tool_load_skill"] = {
                 "name": "tool_load_skill",
-                "description": "Load the full content of a skill by title. Skills contain reusable knowledge, instructions, and best practices.",
+                "description": (
+                    "Activate a skill by title. The skill's full content is mounted in the "
+                    "ACTIVE SKILLS section of the system prompt (never returned as raw text). "
+                    "Skills contain reusable knowledge, instructions, and best practices."
+                ),
                 "parameters": [
-                    {"name": "title", "type": "str", "description": "The title of the skill to load."}
+                    {"name": "title", "type": "str", "description": "The title of the skill to activate."}
                 ],
                 "callable": tool_load_skill,
             }
@@ -790,8 +816,19 @@ class SkillsManager:
                 if not skill:
                     return {"success": False, "error": f"Skill '{target_title}' not found."}
 
-                skill.visibility = "loadable"
-                return {"success": True, "output": f"Skill '{skill.title}' has been unloaded from active context to free token space."}
+                try:
+                    demoted = self.set_skill_visibility(skill.title, "loadable")
+                    skill = demoted
+                except ValueError:
+                    skill.visibility = "loadable"
+
+                return {
+                    "success": True,
+                    "output": (
+                        f"Skill '{skill.title}' has been unloaded from the ACTIVE SKILLS section "
+                        f"and returned to the loadable list to free token space."
+                    ),
+                }
 
             tools["tool_unload_skill"] = {
                 "name": "tool_unload_skill",

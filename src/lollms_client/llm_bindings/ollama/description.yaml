@@ -78,3 +78,29 @@ commands:
       - name: total
         type: int
         description: "Total percentage (100)"
+  - name: get_user_balance
+    title: Get User Balance
+    description: "Queries the account balance from the Ollama Cloud subscription service (GET https://ollama.com/api/balance). Only available when host_address points to ollama.com and a service_key is configured; local Ollama servers return a not-applicable status. Results are cached briefly to respect the endpoint's shared 10 requests/minute rate limit. Balances are shared across all team members."
+    parameters: []
+    output:
+      - name: status
+        type: bool
+        description: "True if the balance was successfully fetched"
+      - name: balance
+        type: float
+        description: "The available balance (included + purchased), when parseable"
+      - name: included
+        type: float
+        description: "The included subscription balance shared across team members, when exposed"
+      - name: purchased
+        type: float
+        description: "The purchased balance shared across team members, when exposed"
+      - name: data
+        type: dict
+        description: "The raw JSON payload returned by Ollama Cloud"
+      - name: message
+        type: str
+        description: "Error or status message on failure"
+      - name: retry_after
+        type: int
+        description: "Seconds to wait when rate limited (HTTP 429)"

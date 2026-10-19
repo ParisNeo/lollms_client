@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-19 07:25]
+
+- feat(ollama): add structured output options to binding configuration
+
 ## [2026-10-18 23:41]
 
 - feat(client): update telegram and llama.cpp bindings, remove config.json, and extend artefact handling

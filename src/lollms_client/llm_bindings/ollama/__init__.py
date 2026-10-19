@@ -26,6 +26,9 @@ from lollms_client.lollms_utilities import ImageTokenizer
 
 BindingName = "OllamaBinding"
 
+_OLLAMA_CLOUD_BALANCE_URL = "https://ollama.com/api/balance"
+_BALANCE_CACHE_TTL_S = 30.0
+
 _THINK_OPEN = "\n<think>\n"
 
 _THINK_CLOSE = "\n</think>\n"
@@ -158,6 +161,7 @@ class OllamaBinding(LollmsLLMBinding):
 
         self._active_client: "ollama.Client | None" = None
         self._client_lock = threading.Lock()
+        self._balance_cache: dict = {"ts": 0.0, "data": None}
 
     def _resolve_think_setting(
         self,
@@ -774,6 +778,11 @@ class OllamaBinding(LollmsLLMBinding):
             raise RuntimeError(f"Embedding failed: {ex!s}") from ex
 
     @property
+    def is_cloud_subscription(self) -> bool:
+        """True when host_address points to the Ollama Cloud subscription service."""
+        return "ollama.com" in (self.host_address or "").lower()
+
+    @property
     def supports_vision(self) -> bool:
         """
         Dynamically determine if the active model supports vision.
@@ -801,6 +810,136 @@ class OllamaBinding(LollmsLLMBinding):
         except Exception as e:
             ASCIIColors.warning(f"Failed to determine vision support for '{self.model_name}': {e!s}")
             return True
+
+    @staticmethod
+    def _coerce_balance_value(raw: Any) -> Optional[float]:
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            return float(raw)
+        if isinstance(raw, dict):
+            for key in ("available", "balance", "amount", "total", "remaining"):
+                value = raw.get(key)
+                if value is not None:
+                    return OllamaBinding._coerce_balance_value(value)
+            return None
+        text = str(raw).strip().replace("$", "").replace(",", "")
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+    def _extract_cloud_balance(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        extracted: Dict[str, Any] = {}
+        available = self._coerce_balance_value(
+            data.get("availableBalance")
+            or data.get("balance")
+            or data.get("available_balance")
+        )
+        if available is None:
+            nested = data.get("data")
+            if isinstance(nested, dict):
+                available = self._coerce_balance_value(
+                    nested.get("availableBalance")
+                    or nested.get("balance")
+                    or nested.get("available_balance")
+                )
+        if available is not None:
+            extracted["balance"] = available
+
+        included = self._coerce_balance_value(data.get("included"))
+        purchased = self._coerce_balance_value(data.get("purchased"))
+        if included is not None:
+            extracted["included"] = included
+        if purchased is not None:
+            extracted["purchased"] = purchased
+        if "balance" not in extracted and (included is not None or purchased is not None):
+            extracted["balance"] = (included or 0.0) + (purchased or 0.0)
+        return extracted
+
+    def get_user_balance(self) -> Dict[str, Any]:
+        """
+        Queries the account balance from the Ollama Cloud subscription service
+        (GET https://ollama.com/api/balance). Never raises; always returns a dict.
+
+        Available only when host_address points to ollama.com and a service key
+        is configured. Results are cached for a short window to respect the
+        endpoint's shared 10 requests/minute rate limit.
+        """
+        if not self.service_key:
+            return {
+                "status": False,
+                "message": "No API key configured. An Ollama Cloud API key is required to query the balance.",
+            }
+        if not self.is_cloud_subscription:
+            return {
+                "status": False,
+                "message": "Balance is only available for Ollama Cloud (host_address containing 'ollama.com'). Local Ollama servers have no balance endpoint.",
+            }
+
+        now = time.time()
+        cached = self._balance_cache.get("data")
+        if cached is not None and now - self._balance_cache.get("ts", 0.0) < _BALANCE_CACHE_TTL_S:
+            return cached
+
+        headers = {"Authorization": f"Bearer {self.service_key}"}
+        try:
+            response = requests.get(
+                _OLLAMA_CLOUD_BALANCE_URL,
+                headers=headers,
+                verify=self.verify_ssl_certificate,
+                timeout=15,
+            )
+        except requests.exceptions.RequestException as e:
+            return {"status": False, "message": f"Failed to fetch balance from Ollama Cloud: {e}"}
+
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After")
+            try:
+                retry_seconds = int(retry_after) if retry_after is not None else None
+            except ValueError:
+                retry_seconds = None
+            return {
+                "status": False,
+                "message": "Rate limited by the Ollama Cloud balance endpoint (10 requests/minute, shared across API keys and devices).",
+                "retry_after": retry_seconds,
+                "status_code": 429,
+            }
+
+        if response.status_code == 400:
+            return {
+                "status": False,
+                "message": "Ollama Cloud rejected the balance request (400). Unsupported or repeated query parameters are not allowed.",
+                "status_code": 400,
+            }
+
+        if response.status_code != 200:
+            return {
+                "status": False,
+                "message": f"Ollama Cloud balance endpoint returned HTTP {response.status_code}.",
+                "status_code": response.status_code,
+            }
+
+        try:
+            data = response.json()
+        except ValueError:
+            return {
+                "status": False,
+                "message": "Ollama Cloud returned a non-JSON balance payload.",
+                "status_code": 200,
+            }
+
+        result: Dict[str, Any] = {"status": True, "data": data}
+        extracted = self._extract_cloud_balance(data) if isinstance(data, dict) else {}
+        if "balance" in extracted:
+            result["balance"] = extracted["balance"]
+        if "included" in extracted:
+            result["included"] = extracted["included"]
+        if "purchased" in extracted:
+            result["purchased"] = extracted["purchased"]
+
+        self._balance_cache = {"ts": now, "data": result}
+        return result
 
     def get_model_info(self) -> dict:
         """

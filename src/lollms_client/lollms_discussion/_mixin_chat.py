@@ -7757,7 +7757,13 @@ class ChatMixin:
                                 else:
                                     tool_output_tokens = len(clean_result_str) // 4
 
-                                if tool_output_tokens > 1500 and not tool_name.startswith("tool_doc_"):
+                                _is_skill_tool = tool_name in (
+                                    "tool_load_skill",
+                                    "tool_list_skills",
+                                    "tool_search_skills",
+                                    "tool_unload_skill",
+                                )
+                                if tool_output_tokens > 1500 and not tool_name.startswith("tool_doc_") and not _is_skill_tool:
                                     is_structured = (
                                         tool_name.startswith("tool_query") or 
                                         tool_name.startswith("tool_execute_python_data") or
