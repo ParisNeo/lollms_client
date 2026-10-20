@@ -39,142 +39,125 @@ class CoreMixin:
     # ---------------------------------------------------------------- __init__
 
     def __init__(
-        self,
-        lollmsClient: 'LollmsClient',
-        db_manager: Optional['LollmsDataManager'] = None,
-        discussion_id: Optional[str] = None,
-        db_discussion_obj: Optional[Any] = None,
-        autosave: bool = False,
-        max_context_size: Optional[int] = None,
-        memory_manager=None,
-        internet_config: Optional[Dict[str, Any]] = None,
-        workspace_path: Optional[str] = None,
-        auto_create_db: bool = True,
-        auto_sync_workspace: bool = True,
-    ):
-        object.__setattr__(self, 'lollmsClient', lollmsClient)
-        object.__setattr__(self, 'autosave', autosave)
-        object.__setattr__(self, 'max_context_size', max_context_size)
-        object.__setattr__(self, 'scratchpad', "")
-        object.__setattr__(self, '_session', None)
-        object.__setattr__(self, '_db_discussion', None)
-        import threading
-        object.__setattr__(self, '_db_lock', threading.Lock())
-        object.__setattr__(self, '_message_index', None)
-        object.__setattr__(self, '_messages_to_delete_from_db', set())
-        object.__setattr__(self, 'internet_config', internet_config or {})
+            self,
+            lollmsClient: 'LollmsClient',
+            db_manager: Optional['LollmsDataManager'] = None,
+            discussion_id: Optional[str] = None,
+            db_discussion_obj: Optional[Any] = None,
+            autosave: bool = False,
+            max_context_size: Optional[int] = None,
+            memory_manager=None,
+            internet_config: Optional[Dict[str, Any]] = None,
+            workspace_path: Optional[str] = None,
+            auto_create_db: bool = True,
+            auto_sync_workspace: bool = True,
+            _from_db_reload: bool = False,
+        ):
+            object.__setattr__(self, 'lollmsClient', lollmsClient)
+            object.__setattr__(self, 'autosave', autosave)
+            object.__setattr__(self, 'max_context_size', max_context_size)
+            object.__setattr__(self, 'scratchpad', "")
+            object.__setattr__(self, '_session', None)
+            object.__setattr__(self, '_db_discussion', None)
+            import threading
+            object.__setattr__(self, '_db_lock', threading.Lock())
+            object.__setattr__(self, '_message_index', None)
+            object.__setattr__(self, '_messages_to_delete_from_db', set())
+            object.__setattr__(self, 'internet_config', internet_config or {})
 
-        # Resolve clean isolated directory paths
-        resolved_id = discussion_id or (db_discussion_obj.id if db_discussion_obj else "viewer_session")
+            # Initialize turn-level action log eagerly so that _StreamState._dispatch_closed_tag
+            # can always append without hitting the __getattr__ guard on private attributes.
+            object.__setattr__(self, '_turn_actions_log', [])
 
-        # ── RESTORE PERSISTED WORKSPACE PATH ──
-        # If the host didn't explicitly provide a workspace_path, check if we previously
-        # saved one in the discussion metadata. This ensures custom folders persist
-        # across application restarts and discussion reloads.
-        if not workspace_path and db_discussion_obj is not None:
-            saved_meta = getattr(db_discussion_obj, 'discussion_metadata', None) or {}
-            if isinstance(saved_meta, dict) and saved_meta.get("workspace_path"):
-                workspace_path = saved_meta["workspace_path"]
-                ASCIIColors.info(f"[CoreMixin] Restored persisted workspace path: {workspace_path}")
+            # Resolve clean isolated directory paths
+            resolved_id = discussion_id or (db_discussion_obj.id if db_discussion_obj else "viewer_session")
 
-        # ── NATIVE AUTO-INGESTION & CLEAN ISOLATION DIRECTORIES ──
-        # 🛡️ STRICT PATH SOVEREIGNTY PROTOCOL:
-        # If workspace_path is provided by the host application, use it EXACTLY as-is.
-        # The host application is sovereign over its filesystem structure.
-        # Do NOT append 'discussions/' or the discussion ID if the user explicitly provided a path.
-        if workspace_path:
-            parent_dir = Path(workspace_path)
-        else:
-            # 🛡️ FAIL-SAFE FALLBACK: If no workspace_path is provided, auto-generate
-            # a safe, isolated default directory to prevent NoneType crashes and 
-            # ensure tools/viewers can always read/write artifacts.
-            parent_dir = Path("./data_workspace") / "discussions" / resolved_id
+            # ── RESTORE PERSISTED WORKSPACE PATH ──
+            if not workspace_path and db_discussion_obj is not None:
+                saved_meta = getattr(db_discussion_obj, 'discussion_metadata', None) or {}
+                if isinstance(saved_meta, dict) and saved_meta.get("workspace_path"):
+                    workspace_path = saved_meta["workspace_path"]
+                    ASCIIColors.info(f"[CoreMixin] Restored persisted workspace path: {workspace_path}")
 
-        parent_dir.mkdir(parents=True, exist_ok=True)
-
-        # 🛡️ CRITICAL FIX: PATH IDEMPOLENCE
-        # Prevent path duplication (e.g., .../workspace_data/workspace_data/)
-        # If the host app passes a path that ALREADY contains the subfolders, 
-        # we must NOT append them again. This prevents WinError 267 during subprocess CWD resolution.
-        ws_data_dir = parent_dir
-        if not parent_dir.name.lower() == "workspace_data":
-            ws_data_dir = parent_dir / "workspace_data"
-        ws_data_dir.mkdir(parents=True, exist_ok=True)
-
-        metadata_dir = parent_dir
-        if not parent_dir.name.lower() == "artefacts_metadata":
-            # Ensure we don't duplicate if parent is already named artefacts_metadata
-            if ws_data_dir.parent != parent_dir or parent_dir.name.lower() != "artefacts_metadata":
-                metadata_dir = parent_dir / "artefacts_metadata"
-        metadata_dir.mkdir(parents=True, exist_ok=True)
-
-        object.__setattr__(self, '_workspace_path_val', str(parent_dir.resolve()))
-        object.__setattr__(self, 'workspace_data_path', str(ws_data_dir.resolve()))
-        object.__setattr__(self, 'artefacts_metadata_path', str(metadata_dir.resolve()))
-
-        object.__setattr__(self, 'db_manager', db_manager)
-        object.__setattr__(self, '_is_db_backed', db_manager is not None)
-
-        if self._is_db_backed:
-            if not db_discussion_obj and not resolved_id:
-                raise ValueError("Either discussion_id or db_discussion_obj must be provided.")
-            self._session = db_manager.get_session()
-            if db_discussion_obj:
-                self._db_discussion = self._session.merge(db_discussion_obj)
+            # ── NATIVE AUTO-INGESTION & CLEAN ISOLATION DIRECTORIES ──
+            if workspace_path:
+                parent_dir = Path(workspace_path)
             else:
-                try:
-                    self._db_discussion = self._session.query(
-                        db_manager.DiscussionModel).filter_by(id=resolved_id).one()
-                except NoResultFound:
-                    proxy_data = {'id': resolved_id}
-                    self._db_discussion = db_manager.DiscussionModel(**proxy_data)
-                    self._session.add(self._db_discussion)
-                    self._session.commit()
-                    self._session.refresh(self._db_discussion)
-        else:
-            self._create_in_memory_proxy(id=resolved_id)
-            if auto_create_db:
-                from ._db import LollmsDataManager
-                db_file_path = parent_dir / "discussion.db"
-                auto_db_manager = LollmsDataManager(f"sqlite:///{db_file_path}")
-                object.__setattr__(self, 'db_manager', auto_db_manager)
-                object.__setattr__(self, '_is_db_backed', True)
-                self._session = auto_db_manager.get_session()
-                try:
-                    self._db_discussion = self._session.query(
-                        auto_db_manager.DiscussionModel).filter_by(id=resolved_id).one()
-                except NoResultFound:
-                    proxy_data = {'id': resolved_id}
-                    self._db_discussion = auto_db_manager.DiscussionModel(**proxy_data)
-                    self._session.add(self._db_discussion)
-                    self._session.commit()
-                    self._session.refresh(self._db_discussion)
+                parent_dir = Path("./data_workspace") / "discussions" / resolved_id
+
+            parent_dir.mkdir(parents=True, exist_ok=True)
+
+            ws_data_dir = parent_dir
+            if not parent_dir.name.lower() == "workspace_data":
+                ws_data_dir = parent_dir / "workspace_data"
+            ws_data_dir.mkdir(parents=True, exist_ok=True)
+
+            metadata_dir = parent_dir
+            if not parent_dir.name.lower() == "artefacts_metadata":
+                if ws_data_dir.parent != parent_dir or parent_dir.name.lower() != "artefacts_metadata":
+                    metadata_dir = parent_dir / "artefacts_metadata"
+            metadata_dir.mkdir(parents=True, exist_ok=True)
+
+            object.__setattr__(self, '_workspace_path_val', str(parent_dir.resolve()))
+            object.__setattr__(self, 'workspace_data_path', str(ws_data_dir.resolve()))
+            object.__setattr__(self, 'artefacts_metadata_path', str(metadata_dir.resolve()))
+
+            object.__setattr__(self, 'db_manager', db_manager)
+            object.__setattr__(self, '_is_db_backed', db_manager is not None)
+
+            if self._is_db_backed:
+                if not db_discussion_obj and not resolved_id:
+                    raise ValueError("Either discussion_id or db_discussion_obj must be provided.")
+                self._session = db_manager.get_session()
+                if db_discussion_obj:
+                    self._db_discussion = self._session.merge(db_discussion_obj)
+                else:
+                    try:
+                        self._db_discussion = self._session.query(
+                            db_manager.DiscussionModel).filter_by(id=resolved_id).one()
+                    except NoResultFound:
+                        proxy_data = {'id': resolved_id}
+                        self._db_discussion = db_manager.DiscussionModel(**proxy_data)
+                        self._session.add(self._db_discussion)
+                        self._session.commit()
+                        self._session.refresh(self._db_discussion)
             else:
-                object.__setattr__(self, '_is_db_backed', False)
+                self._create_in_memory_proxy(id=resolved_id)
+                if auto_create_db:
+                    from ._db import LollmsDataManager
+                    db_file_path = parent_dir / "discussion.db"
+                    auto_db_manager = LollmsDataManager(f"sqlite:///{db_file_path}")
+                    object.__setattr__(self, 'db_manager', auto_db_manager)
+                    object.__setattr__(self, '_is_db_backed', True)
+                    self._session = auto_db_manager.get_session()
+                    try:
+                        self._db_discussion = self._session.query(
+                            auto_db_manager.DiscussionModel).filter_by(id=resolved_id).one()
+                    except NoResultFound:
+                        proxy_data = {'id': resolved_id}
+                        self._db_discussion = auto_db_manager.DiscussionModel(**proxy_data)
+                        self._session.add(self._db_discussion)
+                        self._session.commit()
+                        self._session.refresh(self._db_discussion)
+                else:
+                    object.__setattr__(self, '_is_db_backed', False)
 
-        object.__setattr__(self, '_system_prompt',
-                           getattr(self._db_discussion, 'system_prompt', None))
+            object.__setattr__(self, '_system_prompt',
+                               getattr(self._db_discussion, 'system_prompt', None))
 
-        metadata = getattr(self._db_discussion, 'discussion_metadata', {}) or {}
-        images_data = metadata.get("discussion_images", [])
-        object.__setattr__(self, 'images', images_data)
+            metadata = getattr(self._db_discussion, 'discussion_metadata', {}) or {}
+            images_data = metadata.get("discussion_images", [])
+            object.__setattr__(self, 'images', images_data)
 
-        object.__setattr__(self, 'artefacts', ArtefactManager(self))
+            object.__setattr__(self, 'artefacts', ArtefactManager(self, skip_sync_on_load=_from_db_reload))
 
-        # ── AUTO-INGEST & SELF-HEAL WORKSPACE ──
-        # Always run the bidirectional sync at startup.
-        # 1. If the workspace_data directory has files, they are ingested into the DB (Disk → DB).
-        # 2. If the DB has artifacts but the directory is empty/missing files, they are restored (DB → Disk).
-        # The previous condition only ran sync if the directory was non-empty, which prevented
-        # the heal pass from restoring orphaned DB artifacts when the physical files were missing.
-        if auto_sync_workspace:
-            try:
-                self.sync_workspace_to_artefacts()
-            except Exception as sync_ex:
-                ASCIIColors.warning(f"[CoreMixin] Auto-ingestion/heal of workspace files failed: {sync_ex}")
+            if auto_sync_workspace and not _from_db_reload:
+                try:
+                    self.sync_workspace_to_artefacts()
+                except Exception as sync_ex:
+                    ASCIIColors.warning(f"[CoreMixin] Auto-ingestion/heal of workspace files failed: {sync_ex}")
 
-        # ── Memory system ─────────────────────────────────────────────────
-        self._init_memory(memory_manager)
+            self._init_memory(memory_manager)
 
 # ---------------------------------------------------------------- factories
 
@@ -217,7 +200,7 @@ class CoreMixin:
                    if existing:
                        session.expunge(existing)
                        return cls(lollmsClient=lollms_client, db_manager=db_manager,
-                                  db_discussion_obj=existing, **init_args)
+                                  db_discussion_obj=existing, _from_db_reload=True, **init_args)
 
                if 'id' not in db_creation_args:
                    db_creation_args['id'] = str(uuid.uuid4())
@@ -229,7 +212,7 @@ class CoreMixin:
                       db_discussion_obj=db_discussion_orm, **init_args)
         else:
             resolved_id = kwargs.get('id') or str(uuid.uuid4())
-            instance = cls(lollmsClient=lollms_client, discussion_id=resolved_id, **init_args)
+            instance = cls(lollmsClient=lollms_client, discussion_id=resolved_id, _from_db_reload=False, **init_args)
             if instance._is_db_backed:
                 with instance._session as session:
                     session.add(instance._db_discussion)

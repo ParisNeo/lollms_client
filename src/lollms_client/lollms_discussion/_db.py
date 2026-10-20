@@ -240,7 +240,8 @@ class LollmsDataManager:
                 db_disc = session.query(self.DiscussionModel).filter_by(id=discussion_id).one()
                 session.expunge(db_disc)
                 return LollmsDiscussion(lollmsClient=lollms_client, db_manager=self,
-                                        db_discussion_obj=db_disc, **kwargs)
+                                        db_discussion_obj=db_disc,
+                                        _from_db_reload=True, **kwargs)
             except NoResultFound:
                 return None
 

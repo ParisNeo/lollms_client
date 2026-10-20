@@ -1,0 +1,39 @@
+import os
+from lollms_client import LollmsClient, MSG_TYPE
+from lollms_client.lollms_config_cli_env import get_client_from_env
+from lollms_client.lollms_discussion import LollmsDiscussion
+from ascii_colors import ASCIIColors
+
+# Initialize client from environment/config
+lc: LollmsClient = get_client_from_env()
+# Print structured TTI status instead of raw attribute
+status = lc.get_tti_engine_status()
+print(f"TTI Engine Status: {status}")
+
+if not status or status.get("status") != "ready":
+    print("⚠️ TTI engine is not ready. Check configuration or server status.")
+    exit(1)
+
+# Create discussion
+ld = LollmsDiscussion(lc)
+
+def cb(chunk, msg_type, metadata):
+    if msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
+        print(chunk, end="", flush=True)
+    return True
+
+print("\n--- Chat Session Started ---")
+while True:
+    user_input = input("you> ")
+    if user_input.lower() in ["exit", "quit"]:
+        break
+
+    try:
+        out = ld.chat(
+            user_input,
+            streaming_callback=cb,
+            enable_image_generation=True,
+            debug=True
+        )
+    except Exception as e:
+        ASCIIColors.error(f"Error during chat: {e}")

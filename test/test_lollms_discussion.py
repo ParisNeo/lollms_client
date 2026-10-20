@@ -9,6 +9,7 @@ import json
 # Assuming your class definitions are in a file named 'lollms_discussion_module.py'
 # Adjust the import path as necessary.
 from lollms_client import LollmsDataManager, LollmsDiscussion
+from lollms_client.lollms_discussion._mixin_chat import _StreamState
 
 # --- Test Fixtures and Helpers ---
 
@@ -432,3 +433,41 @@ class TestLollmsDiscussion:
 
         # Verify that get_active_images returns nothing
         assert len(reloaded_disc.get_active_images()) == 0
+    def test_tti_artefact_persistence(self, mock_lollms_client, db_manager) -> None:
+        """Tests that TTI-generated images are persisted as artefacts and linked to message metadata."""
+        # Mock TTI binding that returns image bytes
+        mock_tti = MagicMock()
+        mock_tti.generate_image.return_value = b"fake_png_image_data_12345"
+        mock_lollms_client.tti = mock_tti
+        
+        d = LollmsDiscussion.create_new(mock_lollms_client, db_manager=db_manager)
+        
+        # Simulate a TTI generation via stream tag dispatch
+        # We call the internal method directly to isolate the persistence logic
+        ss = _StreamState(
+            discussion=d,
+            callback=None,
+            forward_artefact_chunks=False,
+            ai_message=MagicMock(content="", metadata={}),
+            enable_artefacts=True,
+            auto_activate_artefacts=True
+        )
+        ss._dispatch_closed_tag(
+            "generate_image", 
+            '<generate_image name="test_img">', 
+            "a beautiful sunset", 
+            '<generate_image name="test_img">a beautiful sunset</generate_image>'
+        )
+        
+        # Assert artefact was created in the manager
+        art = d.artefacts.get("test_img")
+        assert art is not None, "Artefact should exist in ArtefactManager"
+        assert art.get("type") == "image"
+        assert len(art.get("images", [])) == 1
+        
+        # Assert DB commit persisted metadata
+        # Reload discussion from DB to verify persistence across session boundaries
+        d2 = db_manager.get_discussion(mock_lollms_client, d.id)
+        assert d2 is not None
+        art2 = d2.artefacts.get("test_img")
+        assert art2 is not None, "Artefact should survive DB reload"

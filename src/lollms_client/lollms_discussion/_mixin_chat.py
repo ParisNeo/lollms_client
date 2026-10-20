@@ -519,6 +519,7 @@ class _ArtefactStreamTracker:
         self.current_language = None
         self.current_art_type = "code"
         self.seen_symbol_keys: set = set()
+        self.is_patch = False
 
         # ── 🎨 MEANINGFUL PROGRESS TRACKING ──
         # Track the last meaningful structural element reported to avoid spam
@@ -535,6 +536,7 @@ class _ArtefactStreamTracker:
         self.current_language = None
         self.current_art_type = "code"
         self.seen_symbol_keys.clear()
+        self.is_patch = False
         self.last_reported_symbol = None
         self.last_progress_update_time = 0.0
 
@@ -793,6 +795,7 @@ class _StreamState:
         self.context_unlock_requested = False
         self.context_unlocked_files: List[str] = []
         self.image_unlock_guidance: List[str] = []
+        self._blocked_files_guidance: List[str] = []
         self.noop_context_unlock = False
         self.processed_tags = processed_tags if processed_tags is not None else set()
 
@@ -2119,7 +2122,9 @@ class _StreamState:
             attrs = {}
             for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
                 attrs[m.group(1).lower()] = m.group(2)
-            tag_name = re.match(r'<(\w+)', attrs_str).group(1).lower()
+            _tag_match = re.match(r'<(\w+)', attrs_str)
+            if _tag_match:
+                tag_name = _tag_match.group(1).lower()
         else:
             attrs = {}
             for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
@@ -2651,7 +2656,7 @@ class _StreamState:
                 and getattr(personality, 'skills_manager', None)
             )
 
-            if is_handbag:
+            if is_handbag and personality is not None:
                 # ── HANDBAG MODE: Save directly into handbag's skills/ directory ──
                 skills_mgr = personality.skills_manager
                 existing_skill = skills_mgr.skills.get(title.lower()) or (skills_mgr.search_skills(title)[0] if skills_mgr.search_skills(title) else None)
@@ -2721,7 +2726,8 @@ class _StreamState:
 
                 if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
                     proc_open = f'\n<processing type="skill" title="{title}">\n'
-                    proc_body = f'* 🧠 Skill \'{title}\' created/updated in handbag \'{personality.handbag_path.name}\'.\n'
+                    _handbag_name = getattr(getattr(personality, "handbag_path", None), "name", "personality")
+                    proc_body = f'* 🧠 Skill \'{title}\' created/updated in handbag \'{_handbag_name}\'.\n'
                     proc_close = f'<!-- status:finished -->\n</processing>\n'
                     proc_block = proc_open + proc_body + proc_close
 
@@ -2958,10 +2964,17 @@ class _StreamState:
             title = attrs.get("name") or attrs.get("title") or f"generated_image_{uuid.uuid4().hex[:6]}"
             prompt = (body or "").strip()
             tti = getattr(self.discussion.lollmsClient, "tti", None)
-            if tti is None and not bool(getattr(self.discussion.lollmsClient, "tti_model_profiles_registry", None)):
-                ASCIIColors.warning(
-                    "[StreamState] <" + tag_name + "> tag received but no TTI binding is available."
-                )
+            if tti is None:
+                if bool(getattr(self.discussion.lollmsClient, "tti_model_profiles_registry", None)):
+                    ASCIIColors.warning(
+                        f"[StreamState] <{tag_name}> tag received but TTI binding failed to initialize. "
+                        f"Check TTI profiles in lollms-config."
+                    )
+                else:
+                    ASCIIColors.warning(
+                        f"[StreamState] <{tag_name}> tag received but no TTI model profiles are configured."
+                    )
+                
                 if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
                     failure_block = (
                         f"\n* ⚠️ Image generation requested ('{title}'), but no image engine is "
@@ -3006,6 +3019,7 @@ class _StreamState:
 
             img_b64 = None
             generation_error = None
+            assert tti is not None  # guarded above; narrows Optional for the analyzer
             try:
                 if tag_name == "generate_image":
                     img_bytes = tti.generate_image(prompt=prompt, width=width, height=height)
@@ -3042,6 +3056,30 @@ class _StreamState:
                         "type": "image",
                         "round": getattr(self.discussion, "_current_round", 0)
                     })
+
+                    # ── CRITICAL FIX: Persist artefact + metadata to DB immediately ──
+                    # Without this commit, the artefact lives only in in-memory ArtefactManager
+                    # and is lost when discussion reloads/commutes to DB. We also inject the
+                    # artefact ID into the message metadata so the UI can link them.
+                    try:
+                        artifact_id = art.get("id") or title  # Fallback to title as ID if not in dict
+                        
+                        # Update message metadata to reference the artefact
+                        meta = dict(getattr(self.ai_message, "metadata", {}) or {})
+                        if "image_artefact_ids" not in meta or not isinstance(meta["image_artefact_ids"], list):
+                            meta["image_artefact_ids"] = []
+                        if artifact_id not in meta["image_artefact_ids"]:
+                            meta["image_artefact_ids"].append(artifact_id)
+                        self.ai_message.metadata = meta
+                        
+                        # Force immediate DB commit so the artefact survives discussion lifecycle
+                        if hasattr(self.discussion, "commit"):
+                            self.discussion.commit()
+                            
+                        ASCIIColors.success(f"[TTI] Persisted image artefact '{title}' (ID: {artifact_id}) to DB.")
+                    except Exception as persist_ex:
+                        ASCIIColors.error(f"[TTI] Artefact persistence failed: {persist_ex}")
+                        trace_exception(persist_ex)
 
                 if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
                     result_block = (
@@ -3573,6 +3611,19 @@ class _StreamState:
 
 class ChatMixin:
     """ChatMixin: orchestrates RAG, tiered memory, delegation, and alternating tool rounds."""
+
+    if TYPE_CHECKING:
+        # Attributes/methods supplied by the composed LollmsDiscussion class.
+        lollmsClient: Any
+        artefacts: Any
+        memory_manager: Any
+        active_branch_id: Optional[str]
+        workspace_data_path: Optional[str]
+        _pending_forms_store: Dict[str, Dict]
+        _affected_artefacts_this_turn: List[Any]
+        def get_message(self, *args: Any, **kwargs: Any) -> Any: ...
+        def add_message(self, *args: Any, **kwargs: Any) -> Any: ...
+        def commit(self, *args: Any, **kwargs: Any) -> Any: ...
 
     _WORKSPACE_SCAN_CACHE_KEY = "_workspace_scan_cache"
 
@@ -4263,7 +4314,7 @@ class ChatMixin:
                         ASCIIColors.warning(f"[ChatMixin] Failed to fetch LCP tool specs: {ex}")
                         lcp_tools_cache = {}
 
-                if entry in lcp_tools_cache:
+                if lcp_tools_cache is not None and entry in lcp_tools_cache:
                     resolved[entry] = lcp_tools_cache[entry]
                 else:
                     ASCIIColors.warning(f"[ChatMixin] Requested tool '{entry}' not found in LCP registry.")
@@ -4316,20 +4367,21 @@ class ChatMixin:
             sm = personality.skills_manager
             # Wire LCP dynamic tool loading for skills
             if lcp_binding:
+                _lcp = lcp_binding  # non-None local: closure narrowing survives later reassignment
                 def _disc_check_tool(t_name: str) -> bool:
                     clean = t_name.lower().strip()
                     if clean in active_tools:
                         return True
-                    return lcp_binding.is_tool_available(clean) if hasattr(lcp_binding, "is_tool_available") else False
+                    return _lcp.is_tool_available(clean) if hasattr(_lcp, "is_tool_available") else False
 
                 def _disc_load_tool(t_name: str) -> Optional[Dict[str, Any]]:
                     clean = t_name.strip()
                     if clean in active_tools:
                         return active_tools[clean]
-                    if hasattr(lcp_binding, "load_tool_by_name"):
-                        raw_def = lcp_binding.load_tool_by_name(clean)
+                    if hasattr(_lcp, "load_tool_by_name"):
+                        raw_def = _lcp.load_tool_by_name(clean)
                         if raw_def:
-                            specs = lcp_binding.to_chat_tool_specs(
+                            specs = _lcp.to_chat_tool_specs(
                                 discussion_instance=self,
                                 lollms_client_instance=self.lollmsClient
                             )
@@ -4473,7 +4525,7 @@ class ChatMixin:
         tools=None,
         add_user_message: bool = True,
         images=None,
-        streaming_callback: Callable[[Any,MSG_TYPE,dict],bool] = None,
+        streaming_callback: Optional[Callable[[Any,MSG_TYPE,dict],bool]] = None,
         remove_thinking_blocks: bool = True,
         enable_image_generation: bool = True,
         enable_image_editing:    bool = True,
@@ -6094,6 +6146,94 @@ class ChatMixin:
                     streaming_callback=_inline_relay,
                     **gen_kwargs
                 )
+
+                # ── TTI ARTEFACT PERSISTENCE & STREAMING GATE (REVISED) ──
+                # TTI bindings return binary data via 'image_bytes' or 'images_b64'.
+                # This is a fallback path for bindings that return structured dicts
+                # (e.g., smart_router with TTI profiles). Most TTI bindings generate via
+                # the <generate_image> stream tag handled by _StreamState, not here.
+                # This gate remains for future-proofing and dict-returning providers.
+
+                detected_artefact_id = None
+
+                # Normalize response (handle both dict and string wrappers)
+                res_dict: Dict[str, Any] = {}
+                if isinstance(gen_res, dict):
+                    res_dict = gen_res
+                elif isinstance(gen_res, str):
+                    try:
+                        parsed = json.loads(gen_res)
+                        if isinstance(parsed, dict):
+                            res_dict = parsed
+                    except json.JSONDecodeError:
+                        pass
+
+                # 1. Extract Binary Payload
+                # Prioritize bytes; fall back to base64 list if bytes empty.
+                binary_payload: bytes = res_dict.get("image_bytes") or res_dict.get("image_b64")
+                if not binary_payload:
+                    # Fallback: check for 'images' list containing base64 strings
+                    list_imgs = res_dict.get("images", [])
+                    if list_imgs and isinstance(list_imgs, list):
+                        binary_payload = base64.b64decode(str(list_imgs[0]))
+
+                # 2. Persist and Inject Stream Tag (if payload exists)
+                if binary_payload:
+                    try:
+                        img_bytes = (
+                            base64.b64decode(binary_payload) 
+                            if isinstance(binary_payload, str) else binary_payload
+                        )
+
+                        if img_bytes:
+                            art_id = make_image_id()
+                            ext = ".png" # Default, could be inferred
+                            title = f"Generated Image {art_id[:8]}{ext}"
+
+                            # Persist via ArtefactManager (creates file + DB record)
+                            # This returns the record dict containing the ID.
+                            art_record = self.artefacts.add(
+                                title=title,
+                                artefact_type=ArtefactType.IMAGE,
+                                content=f"### Image: Generated by AI\n\nPrompt was passed via vision capability.",
+                                binary_data=img_bytes,
+                                language="python",
+                                active=True,
+                                visibility=ArtefactVisibility.FULL,
+                                commit_message=f"TTI generation via {self.lollmsClient.binding.name}"
+                            )
+                            detected_artefact_id = art_record.get("id")
+
+                            # ── STREAM INJECTION ──
+                            # We must feed the artefact tag into the StreamState tracking system.
+                            # This ensures the UI receives a MSG_TYPE_ARTEFACT_BUILD_START event.
+                            ss.feed('<artefact name="Generated Image" language="python" type="image">')
+                            ss.feed(f"data:image/{ext[1:]};base64,{base64.b64encode(img_bytes).decode('utf-8')}")
+                            ss.feed('</artefact>')
+
+                            ASCIIColors.success(f"[TTI] Persisted image artefact: {title} (ID: {detected_artefact_id})")
+
+                            # 3. Update Metadata Safely
+                            # Get current metadata (handles ORM object conversion internally)
+                            meta = dict(ai_msg.metadata or {})
+                            if "image_artefact_ids" not in meta or not isinstance(meta["image_artefact_ids"], list):
+                                meta["image_artefact_ids"] = []
+                            meta["image_artefact_ids"].append(detected_artefact_id)
+                            # Re-assignment triggers SQLAlchemy flag_modified
+                            ai_msg.metadata = meta
+
+                            # Ensure touch before commit to flag ORM changes
+                            if hasattr(ai_msg, "touch"):
+                                ai_msg.touch()
+                            if hasattr(self, "touch"):
+                                self.touch()
+                            self.commit() # Persist immediately to DB/disk
+
+                    except Exception as ex:
+                        ASCIIColors.error(f"[TTI] Image persistence failed: {ex}")
+                        trace_exception(ex)
+
+                # Existing connection check logic follows...
                 if isinstance(gen_res, dict):
                     is_conn_dict, conn_reason_dict = _core_is_connection_or_server_error(gen_res)
                     if is_conn_dict:

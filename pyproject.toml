@@ -61,7 +61,9 @@ Homepage = "https://github.com/ParisNeo/lollms_client"
 # Exclude script launcher from the core library package
 [project.scripts]
 lollms-bot = "lollms_client.apps.lollms_bot.cli:main"
+lollms-code = "lollms_client.apps.lollms_code.cli:main"
 lollms-config = "lollms_client.apps.lollms_config.cli:main"
+lollms-config-wizard = "lollms_client.lollms_config_cli_env:run_wizard_and_save"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -70,7 +72,7 @@ exclude = ["lollms_client.egg-info*", "lollms_client.llm_bindings.llama_cpp_serv
 [tool.setuptools.dynamic]
 version = {attr = "lollms_client.__version__"}
 [tool.setuptools.package-data]
-lollms_client = ["assets/*.json", "**/description.yaml", "apps/lollms_discussions/static/*", "apps/lollms_code/*"]
+lollms_client = ["assets/*.json", "**/description.yaml", "apps/lollms_discussions/static/*"]
 
 [tool.pytest.ini_options]
 filterwarnings = [

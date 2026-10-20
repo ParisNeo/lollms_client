@@ -429,9 +429,12 @@ def _is_ignored_path(path: Union[str, Path]) -> bool:
 class ArtefactManager:
     """Manages the lifecycle of typed artefacts inside a LollmsDiscussion."""
 
-    def __init__(self, discussion):
+    def __init__(self, discussion: 'LollmsDiscussion', skip_sync_on_load: bool = False):
         object.__setattr__(self, '_discussion', discussion)
         object.__setattr__(self, 'keep_deleted_versions', getattr(discussion, 'keep_deleted_versions', False))
+
+        if not skip_sync_on_load:
+            self._sync_index_with_disk()
 
     @staticmethod
     def _sanitize_path_segments(path_str: str) -> str:

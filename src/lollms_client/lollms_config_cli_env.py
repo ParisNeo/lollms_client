@@ -510,12 +510,47 @@ def _get_profile_keys(binding_type: str, alias: str, config_map: Dict[str, str])
 # 3. Unified Client Resolver
 # ─────────────────────────────────────────────────────────────────────────────
 
+_LAZY_MODALITIES = frozenset({"tti", "tts", "stt", "ttm", "ttv", "connection", "rag"})
+
+
+def _demote_non_llm_defaults(
+    b_type: str,
+    profiles: Dict[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Prevents eager instantiation of non-LLM modalities at client startup.
+
+    ``LollmsClient.__init__`` calls ``_eagerly_instantiate_default`` for every
+    modality whose registry contains a profile flagged ``is_default=True``.
+    For local spawner bindings (e.g. diffusers) this spawns a subprocess
+    daemon even when the user only intended to use a remote LLM/TTI profile.
+
+    This function strips ``is_default`` from all profiles of non-LLM
+    modalities so the client constructor skips them.  Actual instantiation
+    is deferred to the first explicit ``switch_*()`` call or modality use.
+
+    LLM is intentionally untouched — it is the core engine and must be
+    eagerly available.
+    """
+    if b_type in _LAZY_MODALITIES:
+        for p_data in profiles.values():
+            if isinstance(p_data, dict) and p_data.get("is_default"):
+                p_data["is_default"] = False
+    return profiles
+
+
 def _is_modality_configured(b_type: str, env_data: Dict[str, str]) -> bool:
     prefix = b_type.upper()
     if env_data.get(f"{prefix}_BINDING_NAME"):
         return True
-    if any(k.startswith(f"{prefix}_BINDINGS_") and k.endswith("_BINDING_NAME") and v for k, v in env_data.items()):
-        return True
+    for k, v in env_data.items():
+        ku = k.upper()
+        if not v:
+            continue
+        if ku.startswith(f"{prefix}_BINDINGS_") and ku.endswith("_BINDING_NAME"):
+            return True
+        if ku.startswith(f"{prefix}_PROFILES_") and (ku.endswith("_BINDING_ALIAS") or ku.endswith("_BINDING_NAME") or ku.endswith("_MODEL_NAME")):
+            return True
     return False
 
 def get_client_from_env(
@@ -524,12 +559,12 @@ def get_client_from_env(
     conf_file: Optional[Union[str, Path]] = None,
     entry: Optional[str] = None,
     create_llm: bool = True,
-    create_tti: bool = False,
-    create_stt: bool = False,
-    create_tts: bool = False,
-    create_ttm: bool = False,
-    create_ttv: bool = False,
-    create_connection: bool = False,
+    create_tti: Optional[bool] = None,
+    create_stt: Optional[bool] = None,
+    create_tts: Optional[bool] = None,
+    create_ttm: Optional[bool] = None,
+    create_ttv: Optional[bool] = None,
+    create_connection: Optional[bool] = None,
     create_rag: Optional[bool] = None,
     run_wizard_if_fail: bool = True
 ) -> "LollmsClient":
@@ -600,16 +635,21 @@ def get_client_from_env(
         else:
             raise ValueError("LLM configuration is missing.")
 
-    # Auto-detect RAG presence if create_rag was not explicitly set
-    if create_rag is None:
-        has_rag_configured = _is_modality_configured("rag", resolved_env)
-        create_rag = has_rag_configured
+    # Auto-detect presence of any modality if its create flag was not explicitly set
+    # This ensures symmetry with the wizard: if a config exists, we should hydrate it.
+    auto_detect_map = {
+        "tti": create_tti, "tts": create_tts, "stt": create_stt,
+        "ttm": create_ttm, "ttv": create_ttv, "connection": create_connection,
+        "rag": create_rag,
+    }
+    for mod, flag in auto_detect_map.items():
+        if flag is None:
+            auto_detect_map[mod] = _is_modality_configured(mod, resolved_env)
 
     kwargs = {}
     binding_types = {
-        "llm": create_llm, "tti": create_tti, "tts": create_tts,
-        "stt": create_stt, "ttm": create_ttm, "ttv": create_ttv,
-        "connection": create_connection, "rag": create_rag,
+        "llm": create_llm,
+        **auto_detect_map,
     }
 
     for b_type, should_create in binding_types.items():
@@ -620,10 +660,16 @@ def get_client_from_env(
         bindings = _extract_bindings_from_env(prefix, resolved_env)
         profiles = _extract_profiles_from_env(prefix, bindings, resolved_env)
 
+        if profiles:
+            profiles = _demote_non_llm_defaults(b_type, profiles)
+
         if bindings:
             kwargs[f"{b_type}_binding_profiles"] = bindings
         if profiles:
             kwargs[f"{b_type}_model_profiles"] = profiles
+            
+        if bindings or profiles:
+            ASCIIColors.info(f"[get_client_from_env] Hydrated {b_type.upper()} profiles into client.")
 
         binding_name = None
         if "master" in bindings and bindings["master"].get("binding_name"):
@@ -953,6 +999,55 @@ def _add_binding_flow(b_type: str, config_map: Dict[str, str]):
         if alias != _sanitize_alias(raw_alias):
             ASCIIColors.info(f"  ℹ️ Name collision resolved: {alias}")
     if alias: _configure_binding_instance(b_type, selected, alias, config_map)
+
+def _rename_entry(b_type: str, category: str, old_alias: str, config_map: Dict[str, str]) -> Optional[str]:
+    """
+    Renames a binding or profile alias by rewriting all keys in config_map.
+    Example: LLM_BINDINGS_MASTER_HOST -> LLM_BINDINGS_NEW_ALIAS_HOST.
+    Ensures referential integrity for profiles pointing to renamed bindings.
+    """
+    cat_upper = category.upper()
+    old_alias_clean = _sanitize_alias(old_alias)
+    label = "binding" if cat_upper == "BINDINGS" else "profile"
+
+    raw_alias = _safe_input_or_back(f"Enter new {label} alias for '{old_alias}'", old_alias_clean)
+    if raw_alias is None:
+        ASCIIColors.yellow("\n  ⚠️ Rename cancelled.")
+        return None
+
+    new_alias = _sanitize_alias(raw_alias)
+    if new_alias == old_alias_clean:
+        ASCIIColors.yellow("\n  ⚠️ Alias unchanged.")
+        return None
+
+    existing = _get_configured_aliases(b_type, config_map, cat_upper)
+    if any(_sanitize_alias(a) == new_alias for a in existing):
+        ASCIIColors.red(f"\n  ❌ Alias '{new_alias}' already exists.")
+        return None
+
+    old_prefix = f"{b_type.upper()}_{cat_upper}_{old_alias_clean}_"
+    new_prefix = f"{b_type.upper()}_{cat_upper}_{new_alias}_"
+
+    keys_to_rename = [k for k in config_map.keys() if k.upper().startswith(old_prefix)]
+    if not keys_to_rename:
+        ASCIIColors.yellow(f"\n  ⚠️ No keys found for {label} '{old_alias}'.")
+        return None
+
+    for k in keys_to_rename:
+        suffix = k[len(old_prefix):]
+        config_map[new_prefix + suffix] = config_map.pop(k)
+
+    if cat_upper == "BINDINGS":
+        profile_prefix = f"{b_type.upper()}_PROFILES_"
+        for k in list(config_map.keys()):
+            # Ensure the BINDING_ALIAS change is scoped strictly to the current modality
+            if k.upper().startswith(profile_prefix) and k.upper().endswith("_BINDING_ALIAS") and _sanitize_alias(config_map[k]) == old_alias_clean:
+                config_map[k] = new_alias
+    else:
+        _enforce_single_default_profile(b_type, config_map)
+
+    ASCIIColors.green(f"\n  🏷️ Renamed {label} '{old_alias}' → '{new_alias}'.")
+    return new_alias
 
 def _bindings_menu(b_type: str, config_map: Dict[str, str]):
     while True:
@@ -1523,8 +1618,10 @@ def _connection_edit_menu(config_map: Dict[str, str]):
     all_choices = []
     for b in bindings:
         all_choices.append(f"Binding: {b}")
+        all_choices.append(f"Rename Binding: {b}")
     for p in profiles:
         all_choices.append(f"Profile: {p}")
+        all_choices.append(f"Rename Profile: {p}")
 
     if not all_choices:
         ASCIIColors.warning("No connection bindings or profiles to edit.")
@@ -1540,6 +1637,12 @@ def _connection_edit_menu(config_map: Dict[str, str]):
     elif selected.startswith("Profile:"):
         alias = selected.split(": ", 1)[1].strip()
         _edit_keys_menu("connection", "PROFILES", alias, config_map)
+    elif selected.startswith("Rename Binding:"):
+        alias = selected.split(": ", 1)[1].strip()
+        _rename_entry("connection", "BINDINGS", alias, config_map)
+    elif selected.startswith("Rename Profile:"):
+        alias = selected.split(": ", 1)[1].strip()
+        _rename_entry("connection", "PROFILES", alias, config_map)
 
 
 def _connection_delete_menu(config_map: Dict[str, str]):

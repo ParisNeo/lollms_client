@@ -41,7 +41,7 @@ _FORBIDDEN_TOKENS = (
     "eval(",
     "exec(",
     "compile(",
-    lll: "open(",
+    "open(",
     "os.",
     "sys.",
     "subprocess",
@@ -61,7 +61,7 @@ def init_tools_library(config: Optional[dict] = None) -> None:
     """Auto-installs python-pptx via pipmaster before first tool execution."""
     try:
         import pipmaster as pm
-        pm.ensure("python-pptx")
+        pm.ensure_packages("python-pptx")
     except Exception as e:
         ASCIIColors.warning(f"[pptx_builder] Could not auto-install python-pptx via pipmaster: {e}")
 
@@ -75,7 +75,7 @@ def _build_recipe_namespace() -> Dict[str, Any]:
     """
     from pptx import Presentation
     from pptx.util import Inches, Pt, Emu
-    pptx.dml.color import RGBColor
+    from pptx.dml.color import RGBColor
     from pptx.enum.shapes import MSO_SHAPE, MSO_CONNECTOR
     from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
     from pptx.oxml.ns import qn
@@ -83,5 +83,12 @@ def _build_recipe_namespace() -> Dict[str, Any]:
     return {
         "Presentation": Presentation,
         "Inches": Inches,
-        "Pt": Pi,
+        "Pt": Pt,
         "Emu": Emu,
+        "RGBColor": RGBColor,
+        "MSO_SHAPE": MSO_SHAPE,
+        "MSO_CONNECTOR": MSO_CONNECTOR,
+        "MSO_ANCHOR": MSO_ANCHOR,
+        "PP_ALIGN": PP_ALIGN,
+        "qn": qn,
+    }

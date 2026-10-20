@@ -271,16 +271,34 @@ class LollmsTTIBinding(LollmsTTIBinding):
     # ── Models / Services / Settings ──────────────────────────────────────
 
     def list_models(self) -> list:
-        url = f"{self.open_ai_host_address}/models"
-        headers = self._headers()
-        try:
-            response = requests.get(url, headers=headers, timeout=10, verify=self.verify)
-            if response.status_code == 200:
-                models_data = response.json().get("data", [])
-                return [{"model_name": m["id"]} for m in models_data]
-        except Exception as ex:
-            trace_exception(ex)
-        return []
+            url = f"{self.lollms_host_address}/tti/models"
+            headers = self._headers()
+            try:
+                response = requests.get(url, headers=headers, timeout=10, verify=self.verify)
+                if response.status_code == 200:
+                    try:
+                        payload = response.json()
+                    except (ValueError, requests.exceptions.JSONDecodeError) as json_ex:
+                        ASCIIColors.warning(
+                            f"[{BindingName}] /tti/models returned non-JSON body: {json_ex}"
+                        )
+                        return []
+                
+                    # Handle OpenAI-style {"data": [...]} or direct list [...]
+                    models_data = payload.get("data", []) if isinstance(payload, dict) else (payload if isinstance(payload, list) else [])
+                
+                    normalized = []
+                    for m in models_data:
+                        if isinstance(m, dict):
+                            name = m.get("id") or m.get("model_name") or m.get("name")
+                            if name:
+                                normalized.append({"model_name": name})
+                        elif isinstance(m, str):
+                            normalized.append({"model_name": m})
+                    return normalized
+            except Exception as ex:
+                trace_exception(ex)
+            return []
 
     def list_services(self, **kwargs) -> List[Dict[str, str]]:
         return self.list_models()

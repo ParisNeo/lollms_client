@@ -36,6 +36,18 @@ _GRACEFUL_SHUTDOWN_TIMEOUT_S = 10
 _FORCE_KILL_GRACE_S = 5
 
 
+# Module-level HTTP helpers that go through the global `requests` namespace
+# (not a private Session instance) so that unit tests patching
+# `lollms_client.stt_bindings.whisper.requests.post` / `.get` intercept correctly.
+
+def _module_post(url: str, **kwargs) -> "requests.Response":
+    return requests.post(url, **kwargs)
+
+
+def _module_get(url: str, **kwargs) -> "requests.Response":
+    return requests.get(url, **kwargs)
+
+
 class WhisperSTTBinding(LollmsSTTBinding):
     """
     Speech-To-Text binding for OpenAI Whisper using a resilient, multi-process
@@ -305,8 +317,41 @@ class WhisperSTTBinding(LollmsSTTBinding):
             "filename": filename_hint
         }
 
-        response = self._post_json_request("/transcribe", data=payload)
-        return response.json().get("text", "")
+        if isinstance(audio_source, (str, Path)):
+            audio_file = Path(audio_source)
+            if not audio_file.exists():
+                raise FileNotFoundError(f"Audio file not found at: {audio_source}")
+            audio_bytes = audio_file.read_bytes()
+            filename_hint = audio_file.name
+        elif isinstance(audio_source, bytes):
+            audio_bytes = audio_source
+            filename_hint = kwargs.get("filename")
+        else:
+            raise ValueError("audio_source must be str, Path, or bytes")
+
+        audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+
+        payload = {
+            "audio_b64": audio_b64,
+            "model_name": model or self.config.get("model_name", "base"),
+            "language": kwargs.get("language"),
+            "task": kwargs.get("task", "transcribe"),
+            "fp16": kwargs.get("fp16"),
+            "device": kwargs.get("device"),
+            "filename": filename_hint
+        }
+
+        url = f"{self.base_url}/transcribe"
+        resp = requests.post(
+            url,
+            json=payload,
+            headers=self._get_headers(),
+            timeout=3600,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        text = result.get("text", "") if isinstance(result, dict) else str(result)
+        return text
 
     def transcribe_audio_with_diarization(
         self,
@@ -520,7 +565,16 @@ class WhisperSTTBinding(LollmsSTTBinding):
 
     def ps(self) -> List[dict]:
         try:
-            return self._get_request("/ps").json()
+            resp = requests.get(
+                f"{self.base_url}/ps",
+                headers=self._get_headers(),
+                timeout=10,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            if isinstance(result, list):
+                return result
+            return [result]
         except Exception:
             return [{"error": "Could not connect to server to get process status."}]
 

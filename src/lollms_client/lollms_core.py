@@ -13,11 +13,11 @@ import time
 import warnings
 from pathlib import Path
 from enum import Enum
-from typing import List, Optional, Callable, Union, Dict, Any, Tuple
+from typing import List, Optional, Callable, Union, Dict, Any, Tuple, cast
 from dataclasses import dataclass, field
 import urllib3
-import ascii_colors as logging
-from ascii_colors import ASCIIColors, trace_exception
+import ascii_colors as logging  # type: ignore[import-untyped]  # pyright: ignore[reportMissingImports]
+from ascii_colors import ASCIIColors, trace_exception  # type: ignore[import-untyped]  # pyright: ignore[reportMissingImports]
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", message="Unverified HTTPS request is being made")
@@ -35,8 +35,8 @@ from lollms_client.lollms_connection_binding import LollmsConnectionBinding, Lol
 try:
     from lollms_client.lollms_rag_binding import LollmsRAGBinding, LollmsRAGBindingManager
 except ImportError:
-    LollmsRAGBinding = None
-    LollmsRAGBindingManager = None
+    LollmsRAGBinding = None  # type: ignore[assignment, misc]
+    LollmsRAGBindingManager = None  # type: ignore[assignment, misc]
 from lollms_client.lollms_personality.lollms_personality import ToolsManager
 from lollms_client.lollms_base_binding import LollmsBaseBinding
 
@@ -69,8 +69,6 @@ class LollmsModelProfile:
     glm_image_embedding: bool = False
     supported_reasoning_efforts: Optional[List[str]] = None
     video_enabled: bool = False
-    supported_reasoning_efforts: Optional[List[str]] = None
-
 
 
 class LollmsClient():
@@ -102,15 +100,15 @@ class LollmsClient():
         rag_bindings_dir: Path = Path(__file__).parent / "rag_bindings",
 
         # Configurations
-        llm_binding_config: Optional[Dict[str, any]] = None,
-        tts_binding_config: Optional[Dict[str, any]] = None, 
-        tti_binding_config: Optional[Dict[str, any]] = None, 
-        stt_binding_config: Optional[Dict[str, any]] = None, 
-        ttv_binding_config: Optional[Dict[str, any]] = None, 
-        ttm_binding_config: Optional[Dict[str, any]] = None, 
-        tools_binding_config: Optional[Dict[str, any]] = None,
-        connection_binding_config: Optional[Dict[str, any]] = None,
-        rag_binding_config: Optional[Dict[str, any]] = None,
+        llm_binding_config: Optional[Dict[str, Any]] = None,
+        tts_binding_config: Optional[Dict[str, Any]] = None,
+        tti_binding_config: Optional[Dict[str, Any]] = None,
+        stt_binding_config: Optional[Dict[str, Any]] = None,
+        ttv_binding_config: Optional[Dict[str, Any]] = None,
+        ttm_binding_config: Optional[Dict[str, Any]] = None,
+        tools_binding_config: Optional[Dict[str, Any]] = None,
+        connection_binding_config: Optional[Dict[str, Any]] = None,
+        rag_binding_config: Optional[Dict[str, Any]] = None,
         user_name ="user",
         ai_name = "assistant",
         callback: Optional[Callable[[str, MSG_TYPE, Optional[Dict]], bool]] = None,
@@ -144,65 +142,18 @@ class LollmsClient():
 
         This client implements a strict, decoupled, lazy-loaded Two-Tier Profile Architecture:
 
-        1. Connection Layer (`*_binding_profiles`): Defines the backend engine/server configuration 
+        1. Connection Layer (`*_binding_profiles`): Defines the backend engine/server configuration
            (e.g., host address, API keys, binding library name). Declared once per server.
         2. Execution Layer (`*_model_profiles`): Defines specific models, routing rules, and vision flags.
            References a binding profile via `binding_profile_name`.
 
-        Only the model profile marked as `is_default=True` is eagerly instantiated at startup. 
+        Only the model profile marked as `is_default=True` is eagerly instantiated at startup.
         All other models are instantiated lazily on-demand when switched to, preserving RAM and VRAM.
 
         Backward Compatibility:
-        - Legacy parameters like `llm_binding_name` and `llm_binding_config` are automatically 
+        - Legacy parameters like `llm_binding_name` and `llm_binding_config` are automatically
           registered as the `"master"` binding and model profiles.
         - The legacy `extra_llms` kwarg is mapped into the new two-tier system automatically.
-
-        Args:
-            llm_binding_name (Optional[str]): Legacy direct LLM binding name.
-            tts_binding_name (Optional[str]): Legacy direct TTS binding name.
-            tti_binding_name (Optional[str]): Legacy direct TTI binding name.
-            stt_binding_name (Optional[str]): Legacy direct STT binding name.
-            ttv_binding_name (Optional[str]): Legacy direct TTV binding name.
-            ttm_binding_name (Optional[str]): Legacy direct TTM binding name.
-            tools_binding_name (Optional[str]): Legacy direct MCP/Tools binding name.
-
-            llm_bindings_dir (Path): Directory containing LLM bindings.
-            tts_bindings_dir (Path): Directory containing TTS bindings.
-            tti_bindings_dir (Path): Directory containing TTI bindings.
-            stt_bindings_dir (Path): Directory containing STT bindings.
-            ttv_bindings_dir (Path): Directory containing TTV bindings.
-            ttm_bindings_dir (Path): Directory containing TTM bindings.
-            tools_bindings_dir (Path): Directory containing Tools bindings.
-
-            llm_binding_config (Optional[Dict]): Legacy direct LLM configuration.
-            tts_binding_config (Optional[Dict]): Legacy direct TTS configuration.
-            tti_binding_config (Optional[Dict]): Legacy direct TTI configuration.
-            stt_binding_config (Optional[Dict]): Legacy direct STT configuration.
-            ttv_binding_config (Optional[Dict]): Legacy direct TTV configuration.
-            ttm_binding_config (Optional[Dict]): Legacy direct TTM configuration.
-            tools_binding_config (Optional[Dict]): Legacy direct Tools configuration.
-
-            user_name (str): Name used for the user in prompt headers.
-            ai_name (str): Name used for the AI in prompt headers.
-            callback (Optional[Callable]): Initialization progress callback.
-            debug (Optional[bool]): Enable debug logging.
-            cooperative_vram_management (Optional[bool]): Unload inactive modality models to free VRAM.
-
-            llm_binding_profiles (Optional[Dict]): Connection profiles for LLM engines.
-            tti_binding_profiles (Optional[Dict]): Connection profiles for TTI engines.
-            tts_binding_profiles (Optional[Dict]): Connection profiles for TTS engines.
-            stt_binding_profiles (Optional[Dict]): Connection profiles for STT engines.
-            ttv_binding_profiles (Optional[Dict]): Connection profiles for TTV engines.
-            ttm_binding_profiles (Optional[Dict]): Connection profiles for TTM engines.
-
-            llm_model_profiles (Optional[Dict]): Execution profiles for LLM models.
-            tti_model_profiles (Optional[Dict]): Execution profiles for TTI models.
-            tts_model_profiles (Optional[Dict]): Execution profiles for TTS models.
-            stt_model_profiles (Optional[Dict]): Execution profiles for STT models.
-            ttv_model_profiles (Optional[Dict]): Execution profiles for TTV models.
-            ttm_model_profiles (Optional[Dict]): Execution profiles for TTM models.
-
-            **kwargs: Catch-all for legacy parameters like `extra_llms`.
         """
 
         self.debug = debug
@@ -216,7 +167,7 @@ class LollmsClient():
 
         self.cooperative_vram_management = cooperative_vram_management
         if callback: callback("🚀 Initializing **Lollms Client**...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
-        
+
         self.llm_binding_manager = LollmsLLMBindingManager(llm_bindings_dir)
         self.tts_binding_manager = LollmsTTSBindingManager(tts_bindings_dir)
         self.tti_binding_manager = LollmsTTIBindingManager(tti_bindings_dir)
@@ -262,6 +213,8 @@ class LollmsClient():
         # ⚡ Fast token estimation (CLI mode): bypass remote tokenizer round-trips
         self.use_fast_token_estimate: bool = False
         self._fast_token_coefficient: float = self._parse_fast_token_coefficient()
+
+        self._binding_init_errors: Dict[str, str] = {}
 
         # 🧠 Profile Registries (Declarative Configs - Universal Two-Tier Architecture)
         self.llm_binding_profiles_registry: Dict[str, LollmsBindingProfile] = {}
@@ -331,7 +284,7 @@ class LollmsClient():
             if callback: callback(f"🔌 Initializing **MCP** binding: `{tools_binding_name}`...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
             try:
                 self.tools = self.tools_binding_manager.create_binding(binding_name=tools_binding_name, **(tools_binding_config or {}))
-                if self.tools is None: 
+                if self.tools is None:
                     msg = f"Failed to create MCP binding: {tools_binding_name}"
                     if callback: callback(f"❌ {msg}", MSG_TYPE.MSG_TYPE_ERROR, {})
                     ASCIIColors.warning(msg)
@@ -339,8 +292,8 @@ class LollmsClient():
                     callback(f"✅ **MCP** binding ready.", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
             except Exception as e:
                 trace_exception(e)
-                self.tools = None  
-                if callback: callback(f"❌ Error initializing MCP: {e}", MSG_TYPE.MSG_TYPE_ERROR, {})   
+                self.tools = None
+                if callback: callback(f"❌ Error initializing MCP: {e}", MSG_TYPE.MSG_TYPE_ERROR, {})
 
         if callback: callback("✨ **Lollms Client** Initialization Complete.", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
 
@@ -389,6 +342,22 @@ class LollmsClient():
         _eagerly_instantiate_default(self.ttm_model_profiles_registry, self.switch_ttm, "TTM")
         _eagerly_instantiate_default(self.connection_model_profiles_registry, self.switch_connection, "CONNECTION")
         _eagerly_instantiate_default(self.rag_model_profiles_registry, self.switch_rag, "RAG")
+
+        # Post-init: Surface silent failures for modalities with profiles but no active binding
+        modalities_to_check = [
+            ("TTI", self.tti_model_profiles_registry, self.tti, "tti"),
+            ("TTS", self.tts_model_profiles_registry, self.tts, "tts"),
+            ("STT", self.stt_model_profiles_registry, self.stt, "stt"),
+            ("TTV", self.ttv_model_profiles_registry, self.ttv, "ttv"),
+            ("TTM", self.ttm_model_profiles_registry, self.ttm, "ttm"),
+        ]
+        for name, registry, binding, key in modalities_to_check:
+            if not binding and registry:
+                err = self._binding_init_errors.get(key, "Unknown initialization error")
+                ASCIIColors.error(
+                    f"[LollmsClient] {name} binding failed to initialize despite existing profiles. "
+                    f"Error: {err}. Check your configuration or server status."
+                )
 
         # Automatically persist resolved single defaults to disk so warnings never repeat
         if resolved_defaults_to_save:
@@ -595,27 +564,7 @@ class LollmsClient():
 
         if _ssl_debug:
             ASCIIColors.yellow(f"[LollmsClient][SSL-DEBUG] b_config AFTER sanitize: {b_config}")
-            
-        # Inject model_name if specified at the model profile level        if "verify_ssl_certificate" in b_config and isinstance(b_config["verify_ssl_certificate"], str):
-            b_config["verify_ssl_certificate"] = b_config["verify_ssl_certificate"].lower().strip() in ("true", "1", "yes", "y", "on")
 
-        # For secondary non-LLM modalities, ensure server spawning does not block the caller's main thread
-        if modality != "llm":
-            b_config.setdefault("wait_for_server", False)
-
-        if _ssl_debug:
-            ASCIIColors.yellow(f"[LollmsClient][SSL-DEBUG] b_config AFTER sanitize: {b_config}")
-            
-        # Inject model_name if specified at the model profile level        if "verify_ssl_certificate" in b_config and isinstance(b_config["verify_ssl_certificate"], str):
-            b_config["verify_ssl_certificate"] = b_config["verify_ssl_certificate"].lower().strip() in ("true", "1", "yes", "y", "on")
-
-        # For secondary non-LLM modalities, ensure server spawning does not block the caller's main thread
-        if modality != "llm":
-            b_config.setdefault("wait_for_server", False)
-
-        if _ssl_debug:
-            ASCIIColors.yellow(f"[LollmsClient][SSL-DEBUG] b_config AFTER sanitize: {b_config}")
-            
         # Inject model_name if specified at the model profile level
         if model_profile.model_name:
             b_config['model_name'] = model_profile.model_name
@@ -641,25 +590,19 @@ class LollmsClient():
                 **{k: v for k, v in b_config.items() if k != "binding_name"}
             )
             if binding:
-                binding.vision_enabled = model_profile.vision_enabled or getattr(binding, "vision_enabled", False)
-                binding.video_enabled = model_profile.video_enabled or getattr(binding, "video_enabled", False)
+                setattr(binding, "vision_enabled", model_profile.vision_enabled or getattr(binding, "vision_enabled", False))
+                setattr(binding, "video_enabled", model_profile.video_enabled or getattr(binding, "video_enabled", False))
                 if hasattr(binding, "forced_context_size"):
-                    binding.forced_context_size = model_profile.forced_context_size
+                    setattr(binding, "forced_context_size", model_profile.forced_context_size)
                 if hasattr(binding, "routing_config"):
-                    binding.routing_config = model_profile.routing_config
-                if hasattr(binding, "glm_image_embedding"):
-                    binding.glm_image_embedding = model_profile.glm_image_embedding or getattr(binding, "glm_image_embedding", False)
-                else:
-                    setattr(binding, "glm_image_embedding", model_profile.glm_image_embedding or getattr(binding, "glm_image_embedding", False))
-                if hasattr(binding, "supported_reasoning_efforts"):
-                    if model_profile.supported_reasoning_efforts is not None:
-                        binding.supported_reasoning_efforts = model_profile.supported_reasoning_efforts
-                else:
-                    if model_profile.supported_reasoning_efforts is not None:
-                        setattr(binding, "supported_reasoning_efforts", model_profile.supported_reasoning_efforts)
+                    setattr(binding, "routing_config", model_profile.routing_config)
+                setattr(binding, "glm_image_embedding", model_profile.glm_image_embedding or getattr(binding, "glm_image_embedding", False))
+                if model_profile.supported_reasoning_efforts is not None:
+                    setattr(binding, "supported_reasoning_efforts", model_profile.supported_reasoning_efforts)
                 return binding
         except Exception as e:
             trace_exception(e)
+            self._binding_init_errors[modality] = str(e)
             if callback: callback(f"❌ Failed to instantiate {modality.upper()} '{alias}': {e}", MSG_TYPE.MSG_TYPE_ERROR, {})
         return None
 
@@ -817,7 +760,7 @@ class LollmsClient():
         self.use_fast_token_estimate = True
         if coefficient is not None:
             self._fast_token_coefficient = self._sanitize_coefficient(coefficient)
-        ASCIIColors.info(
+        ASCIIColors.debug(
             f"[LollmsClient] ⚡ Fast token estimation enabled "
             f"(coefficient: {self._fast_token_coefficient})."
         )
@@ -825,7 +768,7 @@ class LollmsClient():
     def disable_fast_token_estimate(self) -> None:
         """Restores exact remote tokenization for all subsequent calls."""
         self.use_fast_token_estimate = False
-        ASCIIColors.info("[LollmsClient] Exact remote tokenization restored.")
+        ASCIIColors.debug("[LollmsClient] Exact remote tokenization restored.")
 
     @staticmethod
     def _sanitize_coefficient(value: float) -> float:
@@ -914,7 +857,7 @@ class LollmsClient():
         if self.llm: return self.llm.load_model(model_name)
         raise RuntimeError("LLM binding not initialized.")
 
-    def get_available_llm_bindings(self) -> List[str]: 
+    def get_available_llm_bindings(self) -> List[str]:
         return self.llm_binding_manager.get_available_bindings()
 
     def free_local_binding_resources(self, except_binding: Optional[Any] = None) -> bool:
@@ -1049,14 +992,15 @@ class LollmsClient():
             try:
                 model_p = models_dir / model_name
                 if model_p.exists() and find_mmproj_fn(model_p) is not None:
-                    target_binding.vision_enabled = True
+                    setattr(target_binding, "vision_enabled", True)
                     return True
             except Exception:
                 pass
 
-        if hasattr(target_binding, "child_bindings") and isinstance(target_binding.child_bindings, dict):
+        child_bindings = getattr(target_binding, "child_bindings", None)
+        if isinstance(child_bindings, dict):
             return any(getattr(child, "vision_enabled", False) or getattr(child, "supports_vision", False)
-                       for child in target_binding.child_bindings.values())
+                       for child in child_bindings.values())
 
         if hasattr(self, "_active_llm_alias") and self._active_llm_alias in self.llm_model_profiles_registry:
             active_profile = self.llm_model_profiles_registry[self._active_llm_alias]
@@ -1078,9 +1022,10 @@ class LollmsClient():
         if getattr(target_binding, "supports_video", False) is True:
             return True
 
-        if hasattr(target_binding, "child_bindings") and isinstance(target_binding.child_bindings, dict):
+        child_bindings = getattr(target_binding, "child_bindings", None)
+        if isinstance(child_bindings, dict):
             return any(getattr(child, "video_enabled", False) or getattr(child, "supports_video", False)
-                       for child in target_binding.child_bindings.values())
+                       for child in child_bindings.values())
 
         if hasattr(self, "_active_llm_alias") and self._active_llm_alias in self.llm_model_profiles_registry:
             active_profile = self.llm_model_profiles_registry[self._active_llm_alias]
@@ -1095,8 +1040,9 @@ class LollmsClient():
         model profiles, or router children.
         """
         # 1. Check active LLM router child bindings
-        if self.llm and hasattr(self.llm, "child_bindings") and isinstance(self.llm.child_bindings, dict):
-            for child in self.llm.child_bindings.values():
+        child_bindings = getattr(self.llm, "child_bindings", None) if self.llm else None
+        if isinstance(child_bindings, dict):
+            for child in child_bindings.values():
                 if getattr(child, "vision_enabled", False) or getattr(child, "supports_vision", False):
                     return child
 
@@ -1294,14 +1240,14 @@ class LollmsClient():
             kwargs["think"] = True
             kwargs["reasoning_effort"] = reasoning_effort
 
-        ASCIIColors.info(
+        ASCIIColors.debug(
             f"[LollmsClient.generate_text] think={kwargs.get('think')} (input: {think_arg}), "
             f"reasoning_effort={kwargs.get('reasoning_effort')} (input: {effort_arg})"
         )
 
         # Non-vision model image stripping and VLM substitution
-        prompt = kwargs.get("prompt", args[0] if len(args) > 0 else "")
-        images = kwargs.get("images")
+        prompt: str = str(kwargs.get("prompt", args[0] if len(args) > 0 else "") or "")
+        images = cast(Optional[List[Any]], kwargs.get("images"))
         if images is not None or not self.has_vision_capability():
             new_prompt, new_images = self._sanitize_images_for_active_llm(prompt, images)
             if "prompt" in kwargs:
@@ -1311,7 +1257,7 @@ class LollmsClient():
             if "images" in kwargs:
                 kwargs["images"] = new_images
 
-        return self.llm.generate_text(*args, **kwargs)
+        return self.llm.generate_text(*args, **kwargs)  # type: ignore
 
     def generate(self, *args, **kwargs) -> Union[str, dict]:
         return self.generate_text(*args, **kwargs)
@@ -1367,7 +1313,7 @@ class LollmsClient():
         )
 
         # Non-vision model message sanitization and VLM substitution
-        messages = kwargs.get("messages", args[0] if len(args) > 0 else [])
+        messages: List[Dict[str, Any]] = cast(List[Dict[str, Any]], kwargs.get("messages", args[0] if len(args) > 0 else []))
         if messages:
             sanitized_messages = self._sanitize_messages_for_active_llm(messages)
             if "messages" in kwargs:
@@ -1377,10 +1323,10 @@ class LollmsClient():
 
         images = kwargs.get("images")
         if images is not None:
-            _, new_images = self._sanitize_images_for_active_llm("", images)
+            _, new_images = self._sanitize_images_for_active_llm("", cast(List[Any], images))
             kwargs["images"] = new_images
 
-        return self.llm.generate_from_messages(*args, **kwargs)
+        return self.llm.generate_from_messages(*args, **kwargs)  # type: ignore
 
     def generate_with_tools(
         self,
@@ -1396,37 +1342,6 @@ class LollmsClient():
     ) -> Dict[str, Any]:
         """
         Generate a response with access to tools (file-based or inline).
-
-        Parameters
-        ----------
-        prompt : str
-            The user prompt / task description.
-        tools : list
-            Mixed list of:
-              • ``str`` or ``Path`` — file path to a lollms-format tool script
-              • ``dict`` — inline tool spec with ``{"name": ..., "callable": ..., ...}``
-        system_prompt : str
-            Optional system prompt override.
-        temperature : float
-            Sampling temperature.
-        n_predict : int
-            Max tokens per generation.
-        max_tool_rounds : int
-            Maximum agentic tool-call loops before forcing final answer.
-        streaming_callback : callable
-            Optional streaming callback ``(chunk, msg_type, meta) -> bool``.
-        auto_execute : bool
-            If True, automatically execute tool calls and feed results back.
-
-        Returns
-        -------
-        dict
-            {
-                "response": str,           # Final text response
-                "tool_calls": list,        # All tool calls made
-                "tool_results": list,      # All tool execution results
-                "rounds": int,             # Number of agentic rounds
-            }
         """
 
         if self.llm is None:
@@ -1539,25 +1454,20 @@ class LollmsClient():
                 raw_response = str(raw_response) if raw_response is not None else ""
 
             # ── 5. Parse tool calls ─────────────────────────────────────────
-            # Primary: XML-wrapped tool calls <tool>...</tool>
             tool_call_pattern = re.compile(
                 r'<tool>(.*?)</tool>',
                 re.DOTALL | re.IGNORECASE,
             )
             matches = list(tool_call_pattern.finditer(raw_response))
 
-            # Fallback: detect raw JSON tool calls (models sometimes omit XML tags)
             tool_json_str = None
             visible_response = raw_response.strip()
 
             if matches:
-                # Extract the first tool call (one per turn)
                 match = matches[0]
                 tool_json_str = match.group(1).strip()
                 visible_response = raw_response[:match.start()].strip()
             else:
-                # Try to detect raw JSON that looks like a tool call
-                # Pattern: {"name": "tool_...", "parameters": {...}}
                 json_obj_pattern = re.compile(
                     r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"parameters"\s*:\s*\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}\s*\}',
                     re.DOTALL,
@@ -1566,7 +1476,6 @@ class LollmsClient():
                 json_match = json_obj_pattern.search(raw_response)
                 if json_match:
                     tool_json_str = json_match.group(0).strip()
-                    # Determine visible response (text before the JSON object)
                     json_start = json_match.start()
                     visible_response = raw_response[:json_start].strip()
                     ASCIIColors.warning(
@@ -1575,7 +1484,6 @@ class LollmsClient():
                     )
 
             if not tool_json_str:
-                # No tool call — this is the final answer
                 cleaned = tool_call_pattern.sub('', raw_response).strip()
                 return {
                     "response": cleaned,
@@ -1584,12 +1492,8 @@ class LollmsClient():
                     "rounds": rounds,
                 }
 
-            # ALWAYS add assistant message to maintain strict user/assistant
-            # alternation required by llama.cpp Jinja chat templates.
-            # Even if visible_response is empty, the assistant "spoke" (the tool call).
             conversation.append({"role": "assistant", "content": visible_response})
 
-            # Parse tool call JSON
             try:
                 call_data = json.loads(tool_json_str)
             except json.JSONDecodeError as e:
@@ -1612,7 +1516,6 @@ class LollmsClient():
             all_tool_calls.append(call_record)
 
             if not auto_execute:
-                # Manual mode: return the tool call for external handling
                 return {
                     "response": visible_response,
                     "tool_calls": all_tool_calls,
@@ -1635,9 +1538,6 @@ class LollmsClient():
                     result = {"error": error_msg, "success": False}
                 else:
                     try:
-                        # Normalize parameters: lollms-format tools use `args: dict`
-                        # but some inline tools may use kwargs. Try kwargs first,
-                        # fall back to single dict arg if signature mismatch.
                         try:
                             result = fn(**tool_params)
                         except TypeError as te:
@@ -1646,7 +1546,6 @@ class LollmsClient():
                             else:
                                 raise
 
-                        # Normalize result to dict if it's a plain string
                         if isinstance(result, str):
                             result = {"output": result, "success": True}
                         elif not isinstance(result, dict):
@@ -1666,18 +1565,15 @@ class LollmsClient():
             }
             all_tool_results.append(result_record)
 
-            # Format result for LLM context
             if isinstance(result, dict) and result.get("success"):
                 result_text = result.get("output", json.dumps(result, indent=2))
             else:
                 result_text = json.dumps(result, indent=2, ensure_ascii=False)
 
-            # Truncate very large results
             max_result_len = 4000
             if len(result_text) > max_result_len:
                 result_text = result_text[:max_result_len] + f"\n... [{len(result_text) - max_result_len} chars truncated]"
 
-            # Add tool result to conversation
             conversation.append({
                 "role": "user",
                 "content": (
@@ -1718,18 +1614,18 @@ class LollmsClient():
     def chat(self, discussion, *args, **kwargs) -> Union[str, dict]:
         self._cooperative_unload_tti()
         if discussion:
-            # Log image payload status at core client layer
             images = kwargs.get("images")
             if images is not None:
-                ASCIIColors.info(f"[LollmsClient.chat] Forwarding 'images' to binding: count={len(images)}, types={[type(img).__name__ for img in images[:5]]}")
+                ASCIIColors.debug(f"[LollmsClient.chat] Forwarding 'images' to binding: count={len(images)}, types={[type(img).__name__ for img in images[:5]]}")
             else:
-                ASCIIColors.warning("[LollmsClient.chat] No 'images' parameter found in kwargs")
+                ASCIIColors.debug("[LollmsClient.chat] No 'images' parameter found in kwargs")
             return discussion.chat(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
 
     def embed(self, *args, **kwargs):
         if self.llm: return self.llm.embed(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
+
     def get_ctx_size(self, model_name: Optional[str] = None) -> Optional[int]:
         """
         Retrieves the context size for the active model.
@@ -1759,19 +1655,70 @@ class LollmsClient():
                 return self._ctx_size_cache[cache_key]
         return 4096
 
-    def list_models(self):
-        models = []
+    def list_models(self) -> List[Any]:
+        models: List[Any] = []
         if self.llm: models += self.llm.list_models()
-        if self.tti: models +=  self.tti.list_models()
-        if self.tts: models +=  self.tts.list_models()
-        if self.stt: models +=  self.stt.list_models()
-        if self.ttm: models +=  self.ttm.list_models()
-        if self.ttv: models +=  self.ttv.list_models()
+        if self.tti: models += self.tti.list_models()
+        if self.tts: models += self.tts.list_models()
+        if self.stt: models += self.stt.list_models()
+        if self.ttm: models += self.ttm.list_models()
+        if self.ttv: models += self.ttv.list_models()
         return models
 
+    def get_tti_engine_status(self) -> Optional[Dict[str, Any]]:
+        """
+        Returns a structured status report of the TTI engine without raising errors.
+        Used by configuration wizards and chat interfaces to verify image readiness.
+        """
+        if self.tti is None:
+            # Lazy-recovery attempt: if profiles exist but binding failed silently,
+            # attempt to switch to the first available profile once.
+            if self.tti_model_profiles_registry:
+                first_alias = next(iter(self.tti_model_profiles_registry))
+                ASCIIColors.warning(
+                    f"[LollmsClient] TTI binding is None. Attempting lazy re-instantiation of '{first_alias}'..."
+                )
+                if self.switch_tti(first_alias):
+                    ASCIIColors.success(f"[LollmsClient] Lazy TTI recovery succeeded for '{first_alias}'.")
+                else:
+                    ASCIIColors.error(f"[LollmsClient] TTI lazy re-instantiation failed for '{first_alias}'.")
+                    return {
+                        "status": "instantiation_failed",
+                        "binding": None,
+                        "models": [],
+                        "error": self._binding_init_errors.get("tti", "Unknown initialization error")
+                    }
+            else:
+                return {
+                    "status": "unconfigured",
+                    "binding": None,
+                    "models": [],
+                    "error": "No TTI model profiles registered"
+                }
+
+        # Binding object exists; verify model availability.
+        try:
+            models = self.tti.list_models()
+            return {
+                "status": "ready" if models else "no_models",
+                "binding": type(self.tti).__name__,
+                "models": models,
+                "error": None
+            }
+        except Exception as ex:
+            trace_exception(ex)
+            return {
+                "status": "listing_failed",
+                "binding": type(self.tti).__name__,
+                "models": [],
+                "error": str(ex)
+            }
+
     def listMountedPersonalities(self) -> Union[List[Dict], Dict]:
-        if self.llm and hasattr(self.llm, 'lollms_listMountedPersonalities'):
-            return self.llm.lollms_listMountedPersonalities()
+        if self.llm:
+            fn = getattr(self.llm, "lollms_listMountedPersonalities", None)
+            if callable(fn):
+                return fn()
         return {"status": False, "error": "Functionality not available for the current binding"}
 
     # --- High Level Text Operations (Delegated to LLM Binding) ---
@@ -1784,15 +1731,19 @@ class LollmsClient():
         raise RuntimeError("LLM binding not initialized.")
 
     def update_code(self, *args, **kwargs):
-        if self.llm: return self.llm.tp.update_code(*args, **kwargs)
+        if self.llm:
+            return getattr(self.llm.tp, "update_code")(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
 
-    def generate_structured_content(self, *args, **kwargs)->dict:
-        if self.llm: return self.llm.tp.generate_structured_content(*args, **kwargs)
+    def generate_structured_content(self, *args, **kwargs) -> dict:
+        if self.llm:
+            result = self.llm.tp.generate_structured_content(*args, **kwargs)
+            return result if isinstance(result, dict) else {}
         raise RuntimeError("LLM binding not initialized.")
 
     def generate_structured_content_pydantic(self, *args, **kwargs):
-        if self.llm: return self.llm.tp.generate_structured_content_pydantic(*args, **kwargs)
+        if self.llm:
+            return getattr(self.llm.tp, "generate_structured_content_pydantic")(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
 
     def yes_no(self, *args, **kwargs):
@@ -1823,10 +1774,6 @@ class LollmsClient():
     def install_model(self, model_name: str, modality: str = "tti", **kwargs) -> dict:
         """
         Installs/downloads a model from Hugging Face on the specified modality binding.
-
-        Args:
-            model_name (str): The Hugging Face repo ID or model name to install.
-            modality (str): Target modality ('tti', 'ttm', 'ttv', 'llm', etc.).
         """
         binding = getattr(self, modality, None)
         if binding and hasattr(binding, "install_model"):
@@ -1839,15 +1786,43 @@ class LollmsClient():
         """Alias for install_model."""
         return self.install_model(model_name, modality=modality, **kwargs)
 
+    def ensure_tti(self) -> bool:
+        """
+        Ensures the TTI binding is instantiated. If None and profiles exist,
+        attempts lazy mounting using the default or first available profile.
+        Returns True if tti is ready after this call.
+        """
+        if self.tti is not None:
+            return True
+        if not self.tti_model_profiles_registry:
+            return False
+
+        default_alias = next(
+            (a for a, p in self.tti_model_profiles_registry.items() if p.is_default),
+            next(iter(self.tti_model_profiles_registry))
+        )
+        ASCIIColors.warning(
+            f"[LollmsClient] TTI binding is None. Attempting lazy mount of '{default_alias}'..."
+        )
+        success = self.switch_tti(default_alias)
+        if success:
+            ASCIIColors.success(f"[LollmsClient] Lazy TTI mount succeeded for '{default_alias}'.")
+        else:
+            err = self._binding_init_errors.get("tti", "Unknown error")
+            ASCIIColors.error(f"[LollmsClient] Lazy TTI mount failed for '{default_alias}': {err}")
+        return success
+
     def generate_image(self, *args, **kwargs):
         self._cooperative_unload_except("tti")
-        if self.tti: return self.tti.generate_image(*args, **kwargs)
-        raise RuntimeError("TTI binding not initialized.")
+        if not self.ensure_tti():
+            raise RuntimeError("TTI binding not initialized and no profiles available for lazy mounting.")
+        return self.tti.generate_image(*args, **kwargs)
 
     def edit_image(self, *args, **kwargs):
         self._cooperative_unload_except("tti")
-        if self.tti: return self.tti.edit_image(*args, **kwargs)
-        raise RuntimeError("TTI binding not initialized.")
+        if not self.ensure_tti():
+            raise RuntimeError("TTI binding not initialized and no profiles available for lazy mounting.")
+        return self.tti.edit_image(*args, **kwargs)
 
     def generate_omni(self, *args, **kwargs):
         """
@@ -1856,7 +1831,7 @@ class LollmsClient():
         Falls back cleanly for legacy bindings since the base class
         provides a default generate() wrapper.
         """
-        self.cooperative_unload_except("tti")
+        self._cooperative_unload_except("tti")
         if self.tti:
             return self.tti.generate(*args, **kwargs)
         raise RuntimeError("TTI binding not initialized.")
@@ -1864,15 +1839,6 @@ class LollmsClient():
     def send_connection_message(self, content: str, channel_alias: Optional[str] = None, sender_name: Optional[str] = None, **kwargs):
         """
         Send a message via a connection binding.
-
-        Args:
-            content: The message text to send.
-            channel_alias: The connection profile alias to use. If None, uses the active/default connection.
-            sender_name: Optional display name override.
-            **kwargs: Platform-specific extra parameters.
-
-        Returns:
-            ConnectionSendResult dict with sent status and metadata.
         """
         if channel_alias and channel_alias != self._active_connection_alias:
             self.switch_connection(channel_alias)
@@ -2022,12 +1988,13 @@ class LollmsClient():
     def long_context_processing(self, text_to_process: str, contextual_prompt: str, **kwargs) -> str:
         if self.llm:
             return self.llm.tp.long_context_processing(text_to_process, contextual_prompt, **kwargs)
+        raise RuntimeError("LLM binding not initialized.")
 
     def generate_with_tag(self, prompt:str, tag:str, **kwargs):
         if self.llm:
             return self.llm.tp.generate_with_tag(prompt, tag, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
-            
+
     def generate_with_tags(self, prompt:str, **kwargs):
         if self.llm:
             return self.llm.tp.generate_with_tags(prompt, **kwargs)
@@ -2041,32 +2008,6 @@ class LollmsClient():
     def save_config(self, path, format: str = "yaml") -> Path:
         """
         Serializes the live Two-Tier Profile Architecture to a portable file.
-
-        The output captures every modality's connection layer
-        (`*_binding_profiles_registry`) and execution layer
-        (`*_model_profiles_registry`) in the canonical Two-Tier shape::
-
-            llm:
-              bindings:
-                <alias>: {binding_name, binding_config, is_default}
-              profiles:
-                <alias>: {binding_profile_name, model_name, is_default, ...}
-
-        The resulting file can be consumed directly by another ``LollmsClient``
-        (via the CLI ``--config <path>``) to reproduce the exact configuration,
-        which is how one agent can spawn sibling agents with different models.
-
-        Args:
-            path: Destination file path. Parent directories are created.
-            format: Output serialization format. Only ``"yaml"`` is supported
-                (PyYAML is a hard dependency); any other value raises ValueError.
-
-        Returns:
-            Path: The resolved absolute path written to.
-
-        Raises:
-            ValueError: If ``format`` is not ``"yaml"``.
-            OSError: If the file cannot be written.
         """
         import yaml as _yaml
 

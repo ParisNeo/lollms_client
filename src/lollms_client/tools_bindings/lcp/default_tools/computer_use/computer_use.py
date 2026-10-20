@@ -1037,6 +1037,7 @@ def tool_computer_scroll(
 
 def tool_computer_wait(
     seconds: float = 1.0,
+    duration_s: Optional[float] = None,
     discussion_instance: Optional[Any] = None,
     lollms_client_instance: Optional[Any] = None,
 ) -> Dict[str, Any]:
@@ -1045,17 +1046,21 @@ def tool_computer_wait(
 
     Args:
         seconds (float): Seconds to wait (clamped between 0.1 and 10.0 seconds). Default 1.0.
+        duration_s (float): Optional alias for 'seconds'. When provided, takes precedence.
     """
+    raw_value = duration_s if duration_s is not None else seconds
     try:
-        dur = max(0.1, min(float(seconds), 10.0))
+        dur = max(0.1, min(float(raw_value), 10.0))
     except (TypeError, ValueError):
         dur = 1.0
 
     time.sleep(dur)
-    return _post_action_result(
+    result = _post_action_result(
         f"Waited {dur:.2f} seconds for the system/UI to settle.",
         {"seconds": dur},
     )
+    result["duration_s"] = dur
+    return result
 
 
 def tool_computer_cursor_position(

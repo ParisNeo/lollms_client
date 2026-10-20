@@ -762,6 +762,7 @@ class LollmsLLMBindingManager:
     def __init__(self, llm_bindings_dir: Union[str, Path] = Path(__file__).parent / "llm_bindings"):
         self.llm_bindings_dir = Path(llm_bindings_dir)
         self.available_bindings = {}
+        self.load_errors: Dict[str, str] = {}
 
     def _load_binding(self, binding_name: str):
         """Dynamically load a specific binding implementation from the llm bindings directory."""
@@ -771,9 +772,11 @@ class LollmsLLMBindingManager:
                 module = importlib.import_module(f"lollms_client.llm_bindings.{binding_name}")
                 binding_class = getattr(module, module.BindingName)
                 self.available_bindings[binding_name] = binding_class
+                self.load_errors.pop(binding_name, None)
             except Exception as e:
                 trace_exception(e)
-                print(f"Failed to load binding {binding_name}: {str(e)}")
+                self.load_errors[binding_name] = f"{type(e).__name__}: {e}"
+                print(f"Failed to load binding {binding_name}: {self.load_errors[binding_name]}")
 
     def create_binding(self, 
                       binding_name: str,
@@ -787,6 +790,11 @@ class LollmsLLMBindingManager:
         binding_class = self.available_bindings.get(binding_name)
         if binding_class:
             return binding_class(**kwargs)
+        if binding_name in self.load_errors:
+            raise RuntimeError(
+                f"Failed to load LLM binding '{binding_name}': {self.load_errors[binding_name]}. "
+                "Ensure the binding's optional Python dependencies are installed."
+            )
         return None
     @staticmethod
     def _get_fallback_description(binding_name: str) -> Dict:
