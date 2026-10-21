@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-21 13:39]
+
+- feat(lollms_discussion): add image generation mixin and update example
+
 ## [2026-10-21 13:06]
 
 - fix(chat): remove leftover `_NO_PROCESSING_BLOCK` debug snippet

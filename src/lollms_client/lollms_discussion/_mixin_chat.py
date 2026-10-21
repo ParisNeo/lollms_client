@@ -305,6 +305,40 @@ _IMAGE_EXT_MIME = {
     ".svg": "image/svg+xml",
 }
 
+_IMAGE_ALLOWED_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+
+
+def _normalize_image_workspace_path(raw_name: str, default_stem: str = "generated_image") -> str:
+    """
+    Normalizes an LLM-provided image name into a safe relative workspace path.
+
+    Rules:
+    - Backslashes are converted to forward slashes (Windows-friendly).
+    - Path traversal ('..'), absolute paths, and drive letters are stripped.
+    - Subfolders are preserved (e.g. 'images/rabbit.png' stays intact).
+    - An allowed image extension is appended when missing (default '.png').
+    - Empty/invalid input falls back to '<default_stem>.png'.
+    """
+    cleaned = (raw_name or "").replace("\\", "/").strip().strip("/").strip()
+    # Strip drive letters (e.g. 'C:') and traversal segments
+    cleaned = re.sub(r'^[A-Za-z]:', '', cleaned)
+    parts = []
+    for seg in cleaned.split("/"):
+        seg = seg.strip()
+        if not seg or seg in (".", ".."):
+            continue
+        # Remove characters unsafe for filenames on Windows/Unix
+        seg = re.sub(r'[<>:"|?*\x00-\x1f]', '', seg).strip()
+        if seg:
+            parts.append(seg)
+    if not parts:
+        return f"{default_stem}.png"
+    rel_path = "/".join(parts)
+    ext = Path(rel_path).suffix.lower()
+    if ext not in _IMAGE_ALLOWED_EXTS:
+        rel_path = f"{rel_path}.png"
+    return rel_path
+
 _MAX_IMAGE_HYDRATION_BYTES = 10 * 1024 * 1024
 
 _ML_WEIGHT_EXTS = {
@@ -2112,7 +2146,15 @@ class _StreamState:
     
     def _note_informational_step(self) -> None:
         """Records an informational step that legitimizes a subsequent scratchpad write."""
-        object.__setattr__(self.discussion, "_scratchpad_write_streak", 0)    
+        object.__setattr__(self.discussion, "_scratchpad_write_streak", 0)
+
+    def _bump_workspace_revision(self) -> None:
+        """Invalidates the cached workspace file scan after a physical file write."""
+        try:
+            rev = int(getattr(self.discussion, "_workspace_write_revision", 0))
+            object.__setattr__(self.discussion, "_workspace_write_revision", rev + 1)
+        except Exception:
+            pass
     
     def _dispatch_closed_tag(self, tag_name: str, attrs_str: str, body: str, full_match_text: str) -> bool:
         # If attrs_str starts with '<', it's the full opening tag. Extract attrs from it.
@@ -2156,7 +2198,7 @@ class _StreamState:
                         f"* ⚠️ Image '{title}' already exists in the workspace — it was created "
                         f"by <generate_image> and its pixels are already saved. An <artifact> tag "
                         f"cannot recreate or modify image pixels. Reference the existing image with "
-                        f"`<artefact_image id=\"{title}::0\" />` in your answer, or use "
+                        f"`![](./{title})` in your answer, or use "
                         f"<edit_image> to modify it. Then finish with `<done/>`.\n"
                         f"<!-- status:failure -->\n</processing>\n"
                     )
@@ -2853,8 +2895,6 @@ class _StreamState:
 
         # 5. Multi-tier Context Visibility Management
         elif tag_name in ("unlock_file", "lock_file", "hide_file"):
-            from lollms_client.lollms_artefact import ArtefactVisibility
-
             self._note_informational_step()
 
             # ── CONTEXT BUDGET GUARD ──
@@ -2986,7 +3026,10 @@ class _StreamState:
         elif tag_name in ("generate_image", "edit_image"):
             if not self.enable_artefacts:
                 return True
-            title = attrs.get("name") or attrs.get("title") or f"generated_image_{uuid.uuid4().hex[:6]}"
+            raw_title = attrs.get("name") or attrs.get("title") or ""
+            title = _normalize_image_workspace_path(
+                raw_title, default_stem=f"generated_image_{uuid.uuid4().hex[:6]}"
+            )
             prompt = (body or "").strip()
             tti = getattr(self.discussion.lollmsClient, "tti", None)
             if tti is None:
@@ -3057,6 +3100,23 @@ class _StreamState:
                     if source_art and source_art.get("images"):
                         source_b64 = source_art["images"][-1]
                     if source_b64 is None:
+                        # ── AS-IS DISK HYDRATION FALLBACK ──
+                        # The artefact may be an AS-IS physical image with no DB pixels.
+                        # Read the bytes directly from the workspace file.
+                        try:
+                            ws_root = _resolve_tool_workspace_root(self.discussion)
+                            candidate = (ws_root / title).resolve()
+                            if str(candidate).startswith(str(ws_root)) and candidate.is_file():
+                                source_b64 = base64.b64encode(candidate.read_bytes()).decode("utf-8")
+                                ASCIIColors.info(
+                                    f"[StreamState] Hydrated source image '{title}' from disk for editing."
+                                )
+                        except Exception as hydrate_ex:
+                            ASCIIColors.warning(
+                                f"[StreamState] Disk hydration failed for '{title}': "
+                                f"{_sanitize_host_paths(str(hydrate_ex))}"
+                            )
+                    if source_b64 is None:
                         source_b64 = self.ai_message.get_active_images()[-1] if self.ai_message.get_active_images() else None
                     if source_b64 is None:
                         raise ValueError(f"No source image available to edit for '{title}'.")
@@ -3068,57 +3128,85 @@ class _StreamState:
                 generation_error = _sanitize_host_paths(str(gen_ex))
 
             if img_b64:
-                art = self.discussion.artefacts.add(
-                    title=title,
-                    artefact_type="image",
-                    content=f"### Image: '{prompt[:200]}'\n\n<artefact_image id=\"{title}::0\" />",
-                    images=[img_b64],
-                    image_media_types=["image/png"],
-                    active=self.auto_activate
-                )
+                img_bytes = base64.b64decode(img_b64)
+                # ── 📁 AS-IS PHYSICAL ARTEFACT PERSISTENCE ──
+                # The image lives ONLY as a physical file in the discussion workspace
+                # (subfolders included). The DB record is a metadata card with NO
+                # pixel data: pixels are hydrated from disk on demand via
+                # <unlock_file> (see _hydrate_image_unlock).
+                ws_root = _resolve_tool_workspace_root(self.discussion)
+                img_rel_path = _normalize_image_workspace_path(title)
+                img_disk_path = ws_root / img_rel_path
+                disk_write_error = None
+                try:
+                    img_disk_path.parent.mkdir(parents=True, exist_ok=True)
+                    img_disk_path.write_bytes(img_bytes)
+                except Exception as write_ex:
+                    disk_write_error = _sanitize_host_paths(str(write_ex))
+                    ASCIIColors.warning(
+                        f"[StreamState] Failed to write image '{img_rel_path}' to disk: {disk_write_error}"
+                    )
+
+                if disk_write_error is None:
+                    # ── AS-IS REGISTRATION (NO DB PIXELS) ──
+                    # Metadata card only: the physical file is the single source of truth.
+                    meta_card = (
+                        f"### Image: `{img_rel_path}`\n\n"
+                        f"Generated via the image engine.\n"
+                        f"- **Type**: Image (AS-IS physical artefact)\n"
+                        f"- **Prompt**: {prompt[:200]}\n"
+                        f"- **Dimensions**: {width}×{height}\n"
+                        f"- **Location**: `./{img_rel_path}`\n\n"
+                        f"> **Action**: The image is saved in the workspace. Reference it directly in your "
+                        f"answer with `![](./{img_rel_path})` (markdown) or `./{img_rel_path}` (plain path), "
+                        f"or unlock it with `<unlock_file>{img_rel_path}</unlock_file>` to attach its pixels "
+                        f"to your context."
+                    )
+                    art = self.discussion.artefacts.add(
+                        title=img_rel_path,
+                        artefact_type="image",
+                        content=meta_card,
+                        active=False,
+                        visibility=ArtefactVisibility.TREE_UNLOCKABLE
+                    )
+                else:
+                    # Disk write failed: fall back to DB-pixel persistence so the
+                    # image is not lost entirely.
+                    ASCIIColors.warning(
+                        "[StreamState] Disk write failed — falling back to DB pixel persistence."
+                    )
+                    art = self.discussion.artefacts.add(
+                        title=img_rel_path,
+                        artefact_type="image",
+                        content=f"### Image: '{prompt[:200]}'\n\n<artefact_image id=\"{img_rel_path}::0\" />",
+                        images=[img_b64],
+                        image_media_types=["image/png"],
+                        active=self.auto_activate,
+                        visibility=ArtefactVisibility.FULL
+                    )
                 if art:
                     self.affected_artefacts.append(art)
                     self.discussion._turn_actions_log.append({
                         "action": "artifact_created",
-                        "title": title,
+                        "title": img_rel_path,
                         "type": "image",
                         "round": getattr(self.discussion, "_current_round", 0)
                     })
-
-                    # ── CRITICAL FIX: Persist artefact + metadata to DB immediately ──
-                    # Without this commit, the artefact lives only in in-memory ArtefactManager
-                    # and is lost when discussion reloads/commutes to DB. We also inject the
-                    # artefact ID into the message metadata so the UI can link them.
-                    try:
-                        artifact_id = art.get("id") or title  # Fallback to title as ID if not in dict
-                        
-                        # Update message metadata to reference the artefact
-                        meta = dict(getattr(self.ai_message, "metadata", {}) or {})
-                        if "image_artefact_ids" not in meta or not isinstance(meta["image_artefact_ids"], list):
-                            meta["image_artefact_ids"] = []
-                        if artifact_id not in meta["image_artefact_ids"]:
-                            meta["image_artefact_ids"].append(artifact_id)
-                        self.ai_message.metadata = meta
-                        
-                        # Force immediate DB commit so the artefact survives discussion lifecycle
-                        if hasattr(self.discussion, "commit"):
-                            self.discussion.commit()
-                            
-                        ASCIIColors.success(f"[TTI] Persisted image artefact '{title}' (ID: {artifact_id}) to DB.")
-                    except Exception as persist_ex:
-                        ASCIIColors.error(f"[TTI] Artefact persistence failed: {persist_ex}")
-                        trace_exception(persist_ex)
+                    if hasattr(self.discussion, "commit"):
+                        self.discussion.commit()
 
                 if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                    saved_to = f"`./{img_rel_path}`" if disk_write_error is None else "the artefact store (disk write failed)"
                     result_block = (
-                        f"* ✅ Image '{title}' generated and saved to the workspace.\n"
+                        f"* ✅ Image '{img_rel_path}' generated and saved to {saved_to}.\n"
                         f"<!-- status:success -->\n</processing>\n"
                     )
                     self.ai_message.content += result_block
                     _cb(self.callback, result_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                     self._processing_block_open = False
+                    self._bump_workspace_revision()
 
-                anchor = f'<artefact_image id="{title}::0" />'
+                anchor = f'![{Path(img_rel_path).stem}](./{img_rel_path})'
                 self.ai_message.content += f"\n\n{anchor}\n"
                 _cb(self.callback, f"\n\n{anchor}\n", MSG_TYPE.MSG_TYPE_CHUNK)
 
@@ -5275,7 +5363,8 @@ class ChatMixin:
                 "\n=== ACTION EXECUTION & TERMINATION PROTOCOL (CRITICAL) ===\n"
                 "1. **INTENT ≠ EXECUTION (SAME-RESPONSE EXECUTION MANDATE)**: Stating 'I will search...', 'Let me analyze...', 'I am now writing...', or any equivalent declaration in ANY language (English, Arabic, Chinese, French, Spanish, etc.) DOES NOT execute the action. Conversational text is completely inert.\n"
                 "   - You MUST emit the corresponding functional XML tag (`<tool>`, `<artifact>`, `<skill>`, `<note>`, `<unlock_file>`, `<generate_image>`, etc.) IN THE EXACT SAME RESPONSE immediately following your brief statement of intent.\n"
-                "   - **IMAGES ARE NEVER `<artifact>` TAGS**: Images are created ONLY with `<generate_image name=\"...\">prompt</generate_image>` and modified ONLY with `<edit_image name=\"...\">instructions</edit_image>`. NEVER emit `<artifact type=\"image\">` — it cannot create pixels and will be rejected. To show an existing image in your answer, use `<artefact_image id=\"name::0\" />`.\n"
+                "   - **IMAGES ARE NEVER `<artifact>` TAGS**: Images are created ONLY with `<generate_image name=\"...\">prompt</generate_image>` and modified ONLY with `<edit_image name=\"...\">instructions</edit_image>`. NEVER emit `<artifact type=\"image\">` — it cannot create pixels and will be rejected. To show an existing image in your answer, reference its workspace path directly: `![](./images/my_image.png)` (markdown) or `./images/my_image.png` (plain path). NEVER use `<artefact_image ...>` anchors — they are legacy and will be stripped.\n"
+                "   - **IMAGE NAMING DOCTRINE**: Always give generated images a descriptive, kebab-case file name via the `name` attribute — e.g. `<generate_image name=\"white_rabbit_dali.png\">`. You MAY include a subfolder path to organize images — e.g. `name=\"images/white_rabbit_dali.png\"` saves the file into the `images/` subfolder of the workspace (subfolders are created automatically). Never use `generated_image_xxxx` placeholders: pick a name that describes the content.\n"
                 "   - **NEVER SPLIT INTENT AND TAGS**: Never announce what you are going to do and then stop without emitting the tag. If you state intent without outputting the XML tag in the same response, the turn will end with nothing done.\n"
                 "   - **DESTRUCTIVE VS CONSTRUCTIVE OPERATIONS**:\n"
                 "     • If an action is risky, destructive, or irreversible (e.g. deleting files, force-pushing git branches, dropping database tables), explicitly ask the user for confirmation and wait for their reply before emitting destructive tags.\n"
@@ -6799,8 +6888,8 @@ class ChatMixin:
                             "Images are created ONLY with <generate_image>...</generate_image> (or modified with "
                             "<edit_image>...</edit_image>); an <artifact> tag cannot create or modify image pixels.\n"
                             "The image is already generated and saved. Do ONE of the following:\n"
-                            "1. Reference it in your final answer using `<artefact_image id=\"TITLE::0\" />` "
-                            "(replace TITLE with the image name), then write your answer and emit `<done/>`.\n"
+                            "1. Reference it in your final answer using `![](./TITLE)` "
+                            "(replace TITLE with the image file path), then write your answer and emit `<done/>`.\n"
                             "2. If the user asked for a DIFFERENT image, emit a new <generate_image> tag with a "
                             "new name and prompt.\n"
                             "3. If the user asked to MODIFY the existing image, emit <edit_image name=\"TITLE\"> "

@@ -1,0 +1,9 @@
+### Image: `super_mug_with_hal_1000_logo.png`
+
+Generated via the image engine.
+- **Type**: Image (AS-IS physical artefact)
+- **Prompt**: A highly detailed, photorealistic image of a massive, imposing coffee mug. The mug should have a sleek, modern design, perhaps made of dark, polished ceramic or matte black metal. Prominently displaye
+- **Dimensions**: 1024×1024
+- **Location**: `./super_mug_with_hal_1000_logo.png`
+
+> **Action**: The image is saved in the workspace. Reference it directly in your answer with `![](./super_mug_with_hal_1000_logo.png)` (markdown) or `./super_mug_with_hal_1000_logo.png` (plain path), or unlock it with `<unlock_file>super_mug_with_hal_1000_logo.png</unlock_file>` to attach its pixels to your context.
