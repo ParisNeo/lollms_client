@@ -225,6 +225,15 @@ def _ensure_import(module_name: str, package_name: str = None):
         except Exception as install_err:
             ASCIIColors.error(f"[execute_python] Failed to auto-install '{pkg}': {install_err}")
             return None
+    except Exception as import_crash:
+        # Catches non-import errors (e.g., ValueError from binary ABI mismatch
+        # between host NumPy and compiled extensions like scipy/seaborn). Auto-install
+        # cannot fix local ABI issues, so degrade gracefully to None.
+        ASCIIColors.warning(
+            f"[execute_python] Optional dependency '{module_name}' crashed during import "
+            f"({type(import_crash).__name__}: {import_crash}). Continuing without it."
+        )
+        return None
 
 
 def _sanitize_host_paths(text: str) -> str:
@@ -406,10 +415,22 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
     except Exception:
         pass
 
-    pandas_mod = _ensure_import("pandas", "pandas")
-    seaborn_mod = _ensure_import("seaborn", "seaborn")
-    sklearn_mod = _ensure_import("sklearn", "scikit-learn")
-    scipy_mod = _ensure_import("scipy", "scipy")
+    try:
+        pandas_mod = _ensure_import("pandas", "pandas")
+    except Exception:
+        pandas_mod = None
+    try:
+        seaborn_mod = _ensure_import("seaborn", "seaborn")
+    except Exception:
+        seaborn_mod = None
+    try:
+        sklearn_mod = _ensure_import("sklearn", "scikit-learn")
+    except Exception:
+        sklearn_mod = None
+    try:
+        scipy_mod = _ensure_import("scipy", "scipy")
+    except Exception:
+        scipy_mod = None
 
     class _NoReconfigureStringIO(io.StringIO):
         """StringIO that silently ignores reconfigure() calls from user code."""
