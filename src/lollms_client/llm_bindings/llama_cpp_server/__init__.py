@@ -1432,7 +1432,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         cb          = streaming_callback or self.default_streaming_callback
         do_stream   = self._resolve(stream, True if cb else (self.default_stream or False))
 
-        ASCIIColors.info(
+        ASCIIColors.debug(
             f"[LlamaCppServerBinding.generate_from_messages] think={think}, reasoning_effort={reasoning_effort}"
         )
 
@@ -1473,7 +1473,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         Internal helper – all public generation methods funnel through here
         when targeting /v1/chat/completions.
         """
-        ASCIIColors.info(
+        ASCIIColors.debug(
             f"[LlamaCppServerBinding._run_chat_messages] think={think}, reasoning_effort={reasoning_effort}"
         )
 

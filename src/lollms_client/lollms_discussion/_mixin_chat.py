@@ -37,6 +37,18 @@ from ._context_sanitizer import scrub_processing_and_status_blocks
 
 _MAX_BRACKET_BUF = 256
 
+# ── 🤫 VERBOSE TELEMETRY GATE ──
+# Per-turn verbose logging flag. chat() sets this from its `debug` parameter;
+# telemetry helpers below log ONLY when it is True. Actionable warnings
+# (failures, loop breaks, cancellations) remain unconditional.
+_DEBUG_VERBOSE = False
+
+
+def _dbg(msg: str) -> None:
+    """Logs verbose telemetry only when debug mode is active for the turn."""
+    if _DEBUG_VERBOSE:
+        ASCIIColors.info(msg)
+
 from lollms_client.lollms_chat_core import (
     sanitize_unicode as _sanitize_unicode,
     sanitize_host_paths as _sanitize_host_paths,
@@ -834,6 +846,12 @@ class _StreamState:
         # Orchestrator→Worker delegation payload captured this round.
         self.delegation_payload: Optional[Dict[str, Any]] = None
 
+        # ── 🖼️ GENERATED IMAGE PIXELS (AS-IS VISION ATTACHMENT) ──
+        # (title, base64) pairs for images generated via <generate_image>/<edit_image>
+        # this round. Pixels live on disk (AS-IS doctrine); these are attached to
+        # the next round's vision context directly, without DB persistence.
+        self.generated_image_pixels: List[Tuple[str, str]] = []
+
         # ── ONE-ACTION-PER-TURN PROTOCOL ──
         # Ensures generation halts immediately after dispatching a single functional tag.
         self._action_dispatched = False
@@ -1108,7 +1126,7 @@ class _StreamState:
         if not self._is_accumulating_tool and not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_secondary and not self._in_code_fence:
             done_match = re.search(r'(?m)^\s*<(?:done|end)\s*/?>', self._pending_buffer, re.IGNORECASE)
             if done_match:
-                ASCIIColors.info("[StreamState] Termination tag (<done/> or <end/>) detected. Halting generation.")
+                _dbg("[StreamState] Termination tag (<done/> or <end/>) detected. Halting generation.")
                 self._done_detected = True
                 self._pending_buffer = re.sub(r'(?m)^\s*<(?:done|end)\s*/?>', '', self._pending_buffer, flags=re.IGNORECASE)
                 return False
@@ -1311,7 +1329,7 @@ class _StreamState:
                 lvl_match = re.search(r'(?:level|value)=["\']([^"\']+)["\']', attrs_part, re.IGNORECASE)
                 effort_level = lvl_match.group(1).lower().strip() if lvl_match else "medium"
                 self.next_reasoning_effort = effort_level
-                ASCIIColors.info(f"[StreamState] Intercepted <effort> tag: level='{effort_level}'. Will apply on next round.")
+                _dbg(f"[StreamState] Intercepted <effort> tag: level='{effort_level}'. Will apply on next round.")
 
                 text_before = self._pending_buffer[:tag_start_idx]
                 if text_before:
@@ -2197,9 +2215,10 @@ class _StreamState:
                     proc_close = (
                         f"* ⚠️ Image '{title}' already exists in the workspace — it was created "
                         f"by <generate_image> and its pixels are already saved. An <artifact> tag "
-                        f"cannot recreate or modify image pixels. Reference the existing image with "
-                        f"`![](./{title})` in your answer, or use "
-                        f"<edit_image> to modify it. Then finish with `<done/>`.\n"
+                        f"cannot recreate or modify image pixels, and it can NEVER be used to view or "
+                        f"'load' an image. To VIEW it, emit `<unlock_file>{title}</unlock_file>`. "
+                        f"To reference it in your answer, use `![](./{title})`. "
+                        f"To modify it, use <edit_image>. Then finish with `<done/>`.\n"
                         f"<!-- status:failure -->\n</processing>\n"
                     )
                     self.ai_message.content += proc_close
@@ -3080,9 +3099,10 @@ class _StreamState:
 
             if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
                 status_line = (
-                    f"* 🎨 Generating image '{title}' ({width}×{height}) via the image engine...\n"
+                    f"* 🎨 Generating image '{title}' ({width}×{height}) via the image engine...\nPrompt:{prompt}\n"
+                    
                     if tag_name == "generate_image"
-                    else f"* 🎨 Editing image '{title}' with the image engine...\n"
+                    else f"* 🎨 Editing image '{title}' with the image engine...\nPrompt:{prompt}\n"
                 )
                 self.ai_message.content += status_line
                 _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
@@ -3158,9 +3178,8 @@ class _StreamState:
                         f"- **Dimensions**: {width}×{height}\n"
                         f"- **Location**: `./{img_rel_path}`\n\n"
                         f"> **Action**: The image is saved in the workspace. Reference it directly in your "
-                        f"answer with `![](./{img_rel_path})` (markdown) or `./{img_rel_path}` (plain path), "
-                        f"or unlock it with `<unlock_file>{img_rel_path}</unlock_file>` to attach its pixels "
-                        f"to your context."
+                        f"answer with `![](./{img_rel_path})` (markdown) or `./{img_rel_path}` (plain path). "
+                        f"To view its pixels in a later turn, emit `<unlock_file>{img_rel_path}</unlock_file>`."
                     )
                     art = self.discussion.artefacts.add(
                         title=img_rel_path,
@@ -3195,10 +3214,29 @@ class _StreamState:
                     if hasattr(self.discussion, "commit"):
                         self.discussion.commit()
 
+                # ── 🖼️ AS-IS VISION ATTACHMENT ──
+                # Record the pixels for the next round's vision context. The
+                # physical file is the source of truth; the DB keeps only the
+                # metadata card. Vision-capable models get the real pixels.
+                self.generated_image_pixels.append((img_rel_path, img_b64))
+
                 if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
                     saved_to = f"`./{img_rel_path}`" if disk_write_error is None else "the artefact store (disk write failed)"
+                    client = getattr(self.discussion, "lollmsClient", None)
+                    has_vision_now = False
+                    if client is not None and hasattr(client, "has_vision_capability"):
+                        try:
+                            has_vision_now = bool(client.has_vision_capability())
+                        except Exception:
+                            has_vision_now = False
+                    vision_note = (
+                        f"\n* 👁️ The image's pixels are attached to your context as a real image — look at it to verify the result.\n"
+                        if has_vision_now else
+                        f"\n* ℹ️ Your active model has no vision capability: you cannot see this image. Do not claim to have verified it visually.\n"
+                    )
                     result_block = (
                         f"* ✅ Image '{img_rel_path}' generated and saved to {saved_to}.\n"
+                        f"{vision_note}"
                         f"<!-- status:success -->\n</processing>\n"
                     )
                     self.ai_message.content += result_block
@@ -3371,11 +3409,12 @@ class _StreamState:
                     f"{_sanitize_host_paths(str(vision_ex))}"
                 )
                 has_vision = False
-        _vision_capability_diagnostics(client, f"unlock:{t_file}")
-        ASCIIColors.info(
-            f"[VisionDiag:unlock:{t_file}] pixel_entries={len(images)} has_vision={has_vision} "
-            f"state_changed={state_changed} hydrated={hydrated} visibility={art.get('visibility')}"
-        )
+        if _DEBUG_VERBOSE:
+            _vision_capability_diagnostics(client, f"unlock:{t_file}")
+            _dbg(
+                f"[VisionDiag:unlock:{t_file}] pixel_entries={len(images)} has_vision={has_vision} "
+                f"state_changed={state_changed} hydrated={hydrated} visibility={art.get('visibility')}"
+            )
 
         if not images:
             guidance = (
@@ -3574,7 +3613,7 @@ class _StreamState:
         if not self._done_detected:
             done_pattern = re.compile(r'(?i)<(?:done|end)\s*/?>')
             if done_pattern.search(self.ai_message.content):
-                ASCIIColors.info("[StreamState] Post-stream sweep detected missed <done/> or <end/> tag. Setting termination flag.")
+                _dbg("[StreamState] Post-stream sweep detected missed <done/> or <end/> tag. Setting termination flag.")
                 self._done_detected = True
                 self.ai_message.content = done_pattern.sub('', self.ai_message.content).strip()
 
@@ -3587,7 +3626,7 @@ class _StreamState:
             if not self._done_detected:
                 pending_done_re = re.compile(r'(?i)<(?:done|end)\s*/?>')
                 if pending_done_re.search(self._pending_buffer):
-                    ASCIIColors.info("[StreamState] Post-flush sweep detected <done/> in pending buffer. Setting termination flag.")
+                    _dbg("[StreamState] Post-flush sweep detected <done/> in pending buffer. Setting termination flag.")
                     self._done_detected = True
                     self._pending_buffer = pending_done_re.sub('', self._pending_buffer)
 
@@ -4456,7 +4495,8 @@ class ChatMixin:
         auto_approve_python: bool = False,
         confirm_handler: Optional[Callable] = None,
         enable_computer_use: bool = False,
-        enable_presentations: bool = False,
+        enable_pptx_builder: bool = False,
+        enable_office_files: bool = False,
         allow_computer_use: Optional[bool] = None,
         **kwargs: Any,
     ) -> Dict[str, Dict[str, Any]]:
@@ -4560,6 +4600,15 @@ class ChatMixin:
             if enable_code_execution:
                 lcp_binding.mount_tool_library_if_absent("execute_python")
 
+            # ── 1b. UNCONDITIONAL MOUNTING: PPTX / OFFICE BUILDERS ──
+            # Both builders are text-only workflows (recipe code in →
+            # markdown inventory out): no vision capability is required,
+            # so the mounts are unconditional when the flags are set.
+            if enable_pptx_builder:
+                lcp_binding.mount_tool_library_if_absent("pptx_builder")
+            if enable_office_files:
+                lcp_binding.mount_tool_library_if_absent("office_files_builder")
+
             # ── 2. CONTEXTUAL MOUNTING: ONLY WHEN MATCHING FILES EXIST ──
             if enable_data_tools and has_data_files:
                 lcp_binding.mount_tool_library_if_absent("semantic_data_engineer")
@@ -4653,7 +4702,8 @@ class ChatMixin:
         enable_notes:                 bool = True,
         enable_skills:                bool = True,
         enable_books:                 bool = False,
-        enable_presentations:         bool = False,
+        enable_pptx_builder:          bool = False,
+        enable_office_files:          bool = False,
         memory_manager=None,
         enable_artefacts:             bool = True,
         enable_memory:                bool = True,
@@ -4676,6 +4726,7 @@ class ChatMixin:
         orchestrator_persona:         bool = False,
         debug_export:                 bool = False,
         debug:                        bool = False,
+        verbose:                      bool = False,
         enable_vlm_query:             bool = False,
         enable_computer_use:          bool = False,
         allow_computer_use:           Optional[bool] = None,
@@ -4740,14 +4791,22 @@ class ChatMixin:
             debug (bool): Enable debug mode: mounts the debug toolset with additional logging. Default False.
                 Persistent per-discussion debug dumps can also be enabled by setting
                 discussion._debug_mode = True externally (mirrors personality.debug_mode).
+            verbose (bool): Enable verbose per-round telemetry (trace timings, token fill,
+                TTFT, round bookkeeping, vision diagnostics). Independent of `debug`.
+                Default False.
             enable_vlm_query (bool): Enable VLM query tool for vision fallback. Default False.
             enable_computer_use (bool): Mount the computer use desktop automation toolset
                 (screenshots, click, type, key, scroll). Requires the active model to
                 support vision; silently skipped when no vision capability is detected.
                 Default False.
-            enable_presentations (bool): Mount the PPTX Builder toolset — create, edit and
+            enable_pptx_builder (bool): Mount the PPTX Builder toolset — create, edit and
                 read PowerPoint (.pptx) decks via sandboxed python-pptx recipe code (no
                 imports allowed in recipes). Mounted unconditionally when True; no vision
+                capability required. Default False.
+            enable_office_files (bool): Mount the Office Files Builder toolset — read,
+                create and edit .pptx/.docx/.xlsx (and .xlsm/.docm/.pptm) files via
+                sandboxed recipe tools. Every save is integrity-verified with automatic
+                rollback on corruption. Mounted unconditionally when True; no vision
                 capability required. Default False.
             event_mode (EventMode): Event reporting mode. Default PROCESSING_TAG_MODE.
             think (Optional[bool]): Legacy flag to toggle reasoning/thinking output. If True, maps to reasoning_effort='high'. If False, disables reasoning. Default None.
@@ -4810,6 +4869,16 @@ class ChatMixin:
             return runner.run(user_message=user_message)
 
         debug_enabled = bool(debug_export) or bool(getattr(self, "_debug_mode", False))
+
+        # ── 🤫 VERBOSE TELEMETRY GATE ──
+        # Telemetry (trace timings, token fill, TTFT, round bookkeeping, vision
+        # diagnostics) is controlled by the dedicated `verbose` flag — NOT by
+        # `debug`. `debug` mounts the debug toolset and logs the tool registry;
+        # `verbose` controls per-round telemetry noise. The CLI stays clean
+        # unless verbose=True.
+        global _DEBUG_VERBOSE
+        _DEBUG_VERBOSE = bool(verbose)
+        object.__setattr__(self, "_debug_verbose", bool(verbose))
 
         # Store tolerance level on active discussion for downstream execution tools (like execute_python_data_query)
         if not hasattr(self, "tolerance_level") or tolerance_level:
@@ -4983,8 +5052,10 @@ class ChatMixin:
                 extra_instructions += self._build_form_instructions()
             if enable_books and any(kw in user_msg_lower for kw in ("book", "tome", "novel", "chapitre")):
                 extra_instructions += self._build_book_instructions()
-            if enable_presentations and any(kw in user_msg_lower for kw in ("presentation", "slide", "slideshow", "deck", "diaporama")):
+            if enable_pptx_builder and any(kw in user_msg_lower for kw in ("presentation", "slide", "slideshow", "deck", "diaporama")):
                 extra_instructions += self._build_presentation_instructions()
+            if enable_office_files:
+                extra_instructions += self._build_office_files_instructions()
 
             # Handle instructions (only if artifacts are enabled)
             branch_msgs_now = self.get_branch(user_msg.id)
@@ -5317,7 +5388,7 @@ class ChatMixin:
         # Presentation building is a text-only workflow (recipe code in →
         # markdown inventory out): no vision capability is required, so the
         # mount is unconditional when the flag is set.
-        if enable_presentations:
+        if enable_pptx_builder:
             if lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
                 try:
                     lcp_binding.mount_tool_library_if_absent("pptx_builder")
@@ -5348,8 +5419,47 @@ class ChatMixin:
                     )
             else:
                 ASCIIColors.warning(
-                    "[ChatMixin] enable_presentations is True, but no LCP binding "
+                    "[ChatMixin] enable_pptx_builder is True, but no LCP binding "
                     "with mount_tool_library is available — pptx_builder NOT mounted."
+                )
+
+        # ── 7b. Mount Office Files Builder Toolset (Unconditional) ──
+        # Office file building (.pptx/.docx/.xlsx) is a text-only workflow
+        # (recipe code in → markdown inventory out): no vision capability is
+        # required, so the mount is unconditional when the flag is set.
+        if enable_office_files:
+            if lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
+                try:
+                    lcp_binding.mount_tool_library_if_absent("office_files_builder")
+                    lcp_tools = lcp_binding.to_chat_tool_specs(
+                        discussion_instance=self,
+                        lollms_client_instance=self.lollmsClient,
+                    )
+                    mounted_office_tools = [
+                        t_name for t_name, _t_spec in lcp_tools.items()
+                        if t_name.startswith("tool_office_")
+                    ]
+                    for t_name in mounted_office_tools:
+                        active_tools[t_name] = lcp_tools[t_name]
+                    if mounted_office_tools:
+                        ASCIIColors.success(
+                            f"[ChatMixin] Mounted 'office_files_builder' toolset "
+                            f"({len(mounted_office_tools)} tools)."
+                        )
+                    else:
+                        ASCIIColors.warning(
+                            "[ChatMixin] office_files_builder mounted but no tool_office_* "
+                            "specs were produced."
+                        )
+                except Exception as ex:
+                    trace_exception(ex)
+                    ASCIIColors.warning(
+                        f"[ChatMixin] Failed to mount office_files_builder toolset: {ex}"
+                    )
+            else:
+                ASCIIColors.warning(
+                    "[ChatMixin] enable_office_files is True, but no LCP binding "
+                    "with mount_tool_library is available — office_files_builder NOT mounted."
                 )
 
 
@@ -5365,6 +5475,7 @@ class ChatMixin:
                 "   - You MUST emit the corresponding functional XML tag (`<tool>`, `<artifact>`, `<skill>`, `<note>`, `<unlock_file>`, `<generate_image>`, etc.) IN THE EXACT SAME RESPONSE immediately following your brief statement of intent.\n"
                 "   - **IMAGES ARE NEVER `<artifact>` TAGS**: Images are created ONLY with `<generate_image name=\"...\">prompt</generate_image>` and modified ONLY with `<edit_image name=\"...\">instructions</edit_image>`. NEVER emit `<artifact type=\"image\">` — it cannot create pixels and will be rejected. To show an existing image in your answer, reference its workspace path directly: `![](./images/my_image.png)` (markdown) or `./images/my_image.png` (plain path). NEVER use `<artefact_image ...>` anchors — they are legacy and will be stripped.\n"
                 "   - **IMAGE NAMING DOCTRINE**: Always give generated images a descriptive, kebab-case file name via the `name` attribute — e.g. `<generate_image name=\"white_rabbit_dali.png\">`. You MAY include a subfolder path to organize images — e.g. `name=\"images/white_rabbit_dali.png\"` saves the file into the `images/` subfolder of the workspace (subfolders are created automatically). Never use `generated_image_xxxx` placeholders: pick a name that describes the content.\n"
+                "   - **VIEWING GENERATED IMAGES**: After `<generate_image>` succeeds, the image's real pixels are automatically attached to your context on the next round (if your model has vision) — look at them and verify the result. To view an image in a LATER turn, emit `<unlock_file>path/to/image.png</unlock_file>`. NEVER use `<artifact type=\"image\">` to view, reference, or 'load' an image — it cannot attach pixels and will be rejected.\n"
                 "   - **NEVER SPLIT INTENT AND TAGS**: Never announce what you are going to do and then stop without emitting the tag. If you state intent without outputting the XML tag in the same response, the turn will end with nothing done.\n"
                 "   - **DESTRUCTIVE VS CONSTRUCTIVE OPERATIONS**:\n"
                 "     • If an action is risky, destructive, or irreversible (e.g. deleting files, force-pushing git branches, dropping database tables), explicitly ask the user for confirmation and wait for their reply before emitting destructive tags.\n"
@@ -5556,11 +5667,10 @@ class ChatMixin:
 
         # ── 8. Active Deliberation Loop ──
         _t_branch_start = time.perf_counter()
-        ASCIIColors.info("[Trace] Retrieving conversation branch...")
         current_branch_tip = branch_tip_id or self.active_branch_id
         branch = self.get_branch(current_branch_tip)
         _t_branch_end = time.perf_counter()
-        ASCIIColors.info(f"[Trace] Branch retrieved in {(_t_branch_end - _t_branch_start)*1000:.2f} ms ({len(branch)} messages).")
+        _dbg(f"[Trace] Branch retrieved in {(_t_branch_end - _t_branch_start)*1000:.2f} ms ({len(branch)} messages).")
 
         # ── 🧠 VIRTUAL HISTORY & KV-CACHE PROTOCOL ──
         # 1. `virtual_history` is managed by `export()` in `UtilsMixin`.
@@ -5874,7 +5984,7 @@ class ChatMixin:
                     round_temperature = bumped if float(base_temp) >= 1.2 else min(bumped, 1.2)
                 else:
                     round_temperature = 0.9
-                ASCIIColors.warning(
+                _dbg(
                     f"[ChatLoop] Shake triggered: {noncompliance_streak} consecutive "
                     f"non-compliant round(s). Bumping temperature to {round_temperature}."
                 )
@@ -6036,10 +6146,10 @@ class ChatMixin:
                 has_vision = getattr(self.lollmsClient.llm, "vision_enabled", True)
 
             if suppress_images:
-                ASCIIColors.info(
+                _dbg(
                     f"[VisionDiag:round:{round_count}] suppress_images=True — all image pixels withheld this round."
                 )
-            if not has_vision:
+            if not has_vision and _DEBUG_VERBOSE:
                 _vision_capability_diagnostics(self.lollmsClient, f"round:{round_count}")
 
             if suppress_images or not has_vision:
@@ -6052,7 +6162,19 @@ class ChatMixin:
                         for img_b64 in art["images"]:
                             if img_b64 not in round_images:
                                 round_images.append(img_b64)
-                                ASCIIColors.success(f"[Vision Sync] Hydrated LLM context with generated plot: '{art['title']}'")
+                                _dbg(f"[Vision Sync] Hydrated LLM context with generated plot: '{art['title']}'")
+                # ── 🖼️ AS-IS GENERATED IMAGE PIXELS ──
+                # Images generated via <generate_image>/<edit_image> this turn are
+                # attached directly from the stream state (disk is the source of
+                # truth; no DB pixel persistence). Vision-capable models see them.
+                if ss is not None and getattr(ss, "generated_image_pixels", None):
+                    for gen_title, gen_b64 in ss.generated_image_pixels:
+                        if gen_b64 not in round_images:
+                            round_images.append(gen_b64)
+                            _dbg(
+                                f"[Vision Sync] Attached generated image '{gen_title}' pixels to vision context."
+                            )
+                    ss.generated_image_pixels = []
 
             # ── 🔬 SCIENTIFIC DEBUG: EXPORTED PROMPT TRACE ──
             # (Logging removed per user request)
@@ -6093,7 +6215,7 @@ class ChatMixin:
                     # ── ⏱️ TIME TO FIRST TOKEN (TTFT) ──
                     if not getattr(self, "_ttft_logged", True) and chunk:
                         ttft = time.perf_counter() - _t_gen_start
-                        ASCIIColors.info(f"[TTFT] First token received in {ttft:.3f} s.")
+                        _dbg(f"[TTFT] First token received in {ttft:.3f} s.")
                         object.__setattr__(self, "_ttft_logged", True)
 
                     if meta and meta.get("was_processed"):
@@ -6124,7 +6246,7 @@ class ChatMixin:
                 if reasoning_summary is not None:
                     gen_kwargs["reasoning_summary"] = reasoning_summary
 
-            ASCIIColors.info(
+            _dbg(
                 f"[ChatMixin.chat] Round {round_count}: think={gen_kwargs.get('think')}, "
                 f"reasoning_effort={gen_kwargs.get('reasoning_effort')}"
             )
@@ -6175,7 +6297,7 @@ class ChatMixin:
 
                 if max_ctx > 1:
                     fill_pct = (total_tokens / max_ctx) * 100.0
-                    ASCIIColors.info(f"[Context] Round {round_count} fill: {total_tokens}/{max_ctx} tokens ({fill_pct:.1f}%)")
+                    _dbg(f"[Context] Round {round_count} fill: {total_tokens}/{max_ctx} tokens ({fill_pct:.1f}%)")
 
                     norm_thresh = context_compaction_threshold if context_compaction_threshold <= 1.0 else context_compaction_threshold / 100.0
                     thresh_pct = norm_thresh * 100.0
@@ -6252,7 +6374,7 @@ class ChatMixin:
                 ASCIIColors.warning(f"[Context] Failed to calculate context fill: {ctx_err}")
 
             # Execute generation turn (streams and appends to the existing ai_msg.content directly)
-            ASCIIColors.info(f"[Trace] Starting generation for round {round_count}...")
+            _dbg(f"[Trace] Starting generation for round {round_count}...")
             _t_gen_start = time.perf_counter()
             object.__setattr__(self, "_ttft_logged", False)
             round_connection_error = None
@@ -6360,7 +6482,7 @@ class ChatMixin:
                         round_connection_error = conn_reason_dict
 
                 _t_gen_end = time.perf_counter()
-                ASCIIColors.info(f"[Trace] Generation round {round_count} stream completed in {(_t_gen_end - _t_gen_start):.2f} s.")
+                _dbg(f"[Trace] Generation round {round_count} stream completed in {(_t_gen_end - _t_gen_start):.2f} s.")
             except Exception as gen_err:
                 _t_gen_end = time.perf_counter()
                 ASCIIColors.warning(f"[Trace] Generation round {round_count} failed after {(_t_gen_end - _t_gen_start):.2f} s.")
@@ -6441,9 +6563,19 @@ class ChatMixin:
             ss.flush_remaining_buffer()
 
             # ── 🛑 EMPTY RESPONSE GUARD (0 TOKENS) ──
+            # A bare <done/> round is a VALID clean termination, not an error:
+            # the model's final answer was already streamed into ai_msg.content
+            # on the previous round. Honor the termination signal first.
             raw_round_delta = ss.get_clean_text_so_far()[current_content_length:]
             raw_text_now = re.sub(r'<round\s+id=["\'][^"\']*["\']\s*/?>\n?', '', raw_round_delta, flags=re.IGNORECASE).strip()
             if not raw_text_now and not getattr(ss, "completed_actions", []) and not ss.was_action_dispatched() and not ss.tool_trigger and not getattr(ss, "affected_artefacts", []):
+                if ss.was_done_detected():
+                    _dbg(
+                        "[ChatMixin] Bare <done/> round received after a complete answer. "
+                        "Terminating cleanly."
+                    )
+                    _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="done")
+                    break
                 ASCIIColors.warning(f"[{getattr(self, 'name', 'Discussion')}] Empty response generated by LLM (0 tokens). Terminating loop.")
                 _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="empty_response")
                 break
@@ -6489,7 +6621,7 @@ class ChatMixin:
             # self-verification is enforced by its task prompt, not by
             # rejecting its termination signal.
             if ss.was_done_detected():
-                ASCIIColors.info("[ChatMixin] Termination tag detected. Terminating agentic loop.")
+                _dbg("[ChatMixin] Termination tag detected. Terminating agentic loop.")
                 _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="done")
                 break
 
@@ -6888,7 +7020,9 @@ class ChatMixin:
                             "Images are created ONLY with <generate_image>...</generate_image> (or modified with "
                             "<edit_image>...</edit_image>); an <artifact> tag cannot create or modify image pixels.\n"
                             "The image is already generated and saved. Do ONE of the following:\n"
-                            "1. Reference it in your final answer using `![](./TITLE)` "
+                            "1. To VIEW the image, emit `<unlock_file>TITLE</unlock_file>` (replace TITLE with the "
+                            "image file path) — its real pixels will be attached to your next round.\n"
+                            "2. Reference it in your final answer using `![](./TITLE)` "
                             "(replace TITLE with the image file path), then write your answer and emit `<done/>`.\n"
                             "2. If the user asked for a DIFFERENT image, emit a new <generate_image> tag with a "
                             "new name and prompt.\n"
@@ -7063,7 +7197,7 @@ class ChatMixin:
                 noncompliance_streak = 0
                 if ss.affected_artefacts:
                     _bump_environment_epoch()
-                    ASCIIColors.info(
+                    _dbg(
                         f"[ChatMixin] Workspace mutated by LLM dispatch "
                         f"(epoch {environment_epoch}). Repetition gates reset."
                     )
@@ -7489,7 +7623,7 @@ class ChatMixin:
                         context_token = f"epoch:{environment_epoch}:rev:{_current_workspace_revision()}"
                     context_aware_signature = f"{full_signature}::{context_token}"
 
-                    ASCIIColors.info(
+                    _dbg(
                         f"[ChatMixin] Loop check: tool='{tool_name}', "
                         f"sig='{context_aware_signature[:120]}...', "
                         f"in_success_set={context_aware_signature in successful_tool_signatures}, "
@@ -8197,7 +8331,7 @@ class ChatMixin:
 
                     if tool_success and not _is_observation_tool:
                         successful_tool_signatures.add(context_aware_signature)
-                        ASCIIColors.info(f"[ChatMixin] Recorded successful signature for '{tool_name}'. Total successful: {len(successful_tool_signatures)}")
+                        _dbg(f"[ChatMixin] Recorded successful signature for '{tool_name}'. Total successful: {len(successful_tool_signatures)}")
                         
                         # Ingest any artifacts produced by tools (e.g. spinoff sub-agents)
                         if isinstance(tool_res, dict) and (tool_res.get("artefacts") or tool_res.get("artifacts_created")):
@@ -8509,11 +8643,11 @@ class ChatMixin:
                 # ── 🛑 SOVEREIGN <done/> TERMINATION CONTRACT ──
                 had_prior_actions = bool(tool_calls_this_turn or (ss and ss.affected_artefacts) or len(virtual_history) > 0)
                 if not enforce_end_tag and round_count == 1 and not had_prior_actions and not getattr(ss, "completed_actions", []) and not ss.was_action_dispatched() and not ss.tool_trigger:
-                    ASCIIColors.info("[ChatMixin] Pure conversational round 1 without enforce_end_tag. Finishing turn.")
+                    _dbg("[ChatMixin] Pure conversational round 1 without enforce_end_tag. Finishing turn.")
                     _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="conversational")
                     break
 
-                ASCIIColors.info("[ChatMixin] Text-only round without <done/>. Continuing loop until explicit termination.")
+                _dbg("[ChatMixin] Text-only round without <done/>. Continuing loop until explicit termination.")
                 noncompliance_streak += 1
                 if _detect_intent_only_round(raw_round_text):
                     ASCIIColors.warning(
@@ -8534,8 +8668,10 @@ class ChatMixin:
                         "1. EMIT a functional tag now (`<tool>{...}</tool>`, "
                         "`<artifact name=\"...\">...</artifact>`, `<agent>...</agent>`, "
                         "`<unlock_file>...</unlock_file>`, etc.) to perform the work.\n"
-                        "2. FINISH by writing your final answer to the user and "
-                        "emitting `<done/>` on a new line.\n"
+                        "2. FINISH: if your previous message ALREADY contains your complete "
+                        "final answer to the user, emit ONLY the `<done/>` tag — do not repeat "
+                        "or rephrase your answer. If you have NOT yet answered, write your "
+                        "final answer and then emit `<done/>` on a new line.\n"
                         "Announcing an action in prose performs nothing. Choose now."
                     )
                 ))

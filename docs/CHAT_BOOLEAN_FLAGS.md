@@ -26,7 +26,7 @@ Before the flag table, understand the three layers a flag can act on:
    (creating artifacts, calling tools). A flag that adds instructions but not
    dispatch means the model can write the tag but nothing happens.
 3. **Context hydration** — content loaded *into* the model's context (active
-   artifacts, memories, RAG excerpts, web results, image pixels).
+   artifacts, memories, RAG excerpts, web results, image pixels). 
 
 Most enable-flags act on all three layers coherently. A few are
 **capability-gated**: the instructions are only injected when the client has the
@@ -44,7 +44,7 @@ has no such capability.
 | `list_available_models` | `False` | Core loop | model picker tool |
 | `enforce_end_tag` | `False` | Core loop | strict `<done/>` protocol |
 | `dynamic_effort` | `False` | Core loop | `<effort>` interception |
-| `clean_reasoning_at_save` | `True` | Core loop | scrub `<think>
+| `clean_reasoning_at_save` | `True` | Core loop | scrub `midt
 ` before saving |
 | `enable_artefacts` | `True` | Artifacts | **master switch** |
 | `auto_activate_artefacts` | `True` | Artifacts | active-context loading |
@@ -53,7 +53,7 @@ has no such capability.
 | `enable_inline_widgets` | `False` | Artifacts | `<lollms_inline>` widgets |
 | `enable_forms` | `False` | Artifacts | `<lollms_form>` interactivity |
 | `enable_books` | `False` | Artifacts | keyword-gated instructions |
-| `enable_presentations` | `False` | Artifacts | **also mounts pptx_builder tools** |
+| `enable_pptx_builder` | `False` | Artifacts | **also mounts pptx_builder tools** |
 | `enable_image_generation` | `True` | Artifacts | TTI capability-gated |
 | `enable_image_editing` | `True` | Artifacts | TTI capability-gated |
 | `forward_artefact_chunks` | `False` | Artifacts | UI streaming events |
@@ -70,6 +70,7 @@ has no such capability.
 | `allow_dynamic_tools` | `False` | Tools | security-sensitive |
 | `enable_vlm_query` | `False` | Tools | vision fallback only |
 | `enable_computer_use` | `False` | Tools | **vision-gated** |
+| `enable_office_files` | `False` | Tools | mounts office_files_builder tools |
 | `suppress_images` | `False` | Tools | negative polarity |
 | `orchestrator_mode` | `False` | Personas | AgenticRunner route |
 | `orchestrator_persona` | `False` | Personas | delegation-only persona |
@@ -113,7 +114,7 @@ registry.
 
 ### `clean_reasoning_at_save: bool = True`
 
-**What it does**: Strips `<think>` / `<|thinking|>` / `<reasoning>` / `<output>`
+**What it does**: Strips `midthink` / `<|thinking|>` / `<reasoning>` / `<output>`
 reasoning blocks from the final saved assistant message.
 
 **What to expect**:
@@ -244,7 +245,7 @@ message mentions "book", "tome", "novel", "chapitre". Requires
 `enable_artefacts=True`. The model then writes chapters as regular document
 artifacts (recovered like any artifact).
 
-### `enable_presentations: bool = False`
+### `enable_pptx_builder: bool = False`
 
 **What it does**: Injects presentation-building instructions (keyword-gated:
 "presentation", "slide", "slideshow", "deck", "diaporama") AND mounts the
@@ -465,6 +466,41 @@ The capability override `allow_computer_use` (Optional[bool], also read from
   `image_b64`/`screenshot_b64` (also attached in-conversation so the vision
   model can verify), `screen_width`, `screen_height`, `cursor_x`, `cursor_y`.
 
+### `enable_office_files: bool = False`
+
+**What it does**: Mounts the `office_files_builder` LCP toolset — read, create
+and edit real Office files via sandboxed recipe tools:
+- `tool_office_read` — inspect an existing `.pptx` / `.docx` / `.xlsx` and get
+  a structured markdown inventory (slides, paragraphs, sheets, tables).
+- `tool_office_build` — create a brand-new Office file from a sandboxed recipe
+  (python-pptx / python-docx / openpyxl code).
+- `tool_office_edit` — modify an existing Office file with a sandboxed recipe
+  operating on the pre-loaded document object.
+
+Supported formats: `.pptx`, `.pptm`, `.docx`, `.docm`, `.xlsx`, `.xlsm`.
+
+**What to expect — NO vision gate**: the mount is **unconditional** when `True`
+(text-only workflow: recipe code in → markdown inventory out). Recipe code is
+sandboxed: **no `import` statements are allowed** — the libraries are
+pre-injected; violations are rejected before execution.
+
+**Integrity-verified saves**: every save passes a 3-layer validation (ZIP
+integrity, strict XML parse, library re-open). If a save would corrupt the
+file, it is automatically **rolled back** to the pre-save snapshot and the tool
+returns a machine-readable failure code — the model fixes the recipe and
+retries. First invocation auto-installs `python-pptx` / `python-docx` /
+`openpyxl` via pipmaster — expect a slower first call.
+
+**Recovering generated stuff**:
+- Tools write into the discussion working directory (`tool_context["working_dir"]`,
+  i.e. the discussion's `workspace_data_path`).
+- Tool result keys: `workspace_file` (absolute path), `context_files` (list
+  containing the path), `file_name` (sanitized).
+- Files are auto-registered as artifacts by `_sync_tool_artifacts` (workspace
+  snapshot diffing) — recover via `discussion.artefacts.get(...)` or open
+  `workspace_file` directly on disk.
+- The turn result's `"artefacts"` array also lists them.
+
 ### `suppress_images: bool = False` — NEGATIVE POLARITY
 
 **What it does**: Withholds **all** image pixels from the model's context this
@@ -534,9 +570,10 @@ end-of-turn JSON context dump.
    per-discussion tool registry and no unmount-after-turn cleanup**. Mounts are
    idempotent (`mount_tool_library_if_absent`); re-enabling a flag on later
    turns is a cheap no-op.
-4. **Keyword-gated instructions**: `enable_books`, `enable_presentations`, and
+4. **Keyword-gated instructions**: `enable_books`, `enable_pptx_builder`, and
    `enable_forms` inject their instructions only when trigger keywords appear in
-   the user message, even with the flag enabled.
+   the user message, even with the flag enabled. `enable_office_files`
+   instructions are injected unconditionally when the flag is on.
 5. **Negative-polarity flags**: `suppress_images` is inverted — `True` *disables*
    vision hydration rather than enabling a feature.
 6. **Memory sub-flags require the master**: `enable_episodic_memory`,
@@ -565,12 +602,24 @@ discussion.chat(
 ```python
 result = discussion.chat(
     "Create a 5-slide presentation about photosynthesis",
-    enable_presentations=True,
+    enable_pptx_builder=True,
 )
 # Recover the deck:
 #   → result["artefacts"] lists the pptx artifact
 #   → tool_pptx_build's workspace_file lives in the discussion working dir
 #   → discussion.artefacts.get("presentation.pptx")
+```
+
+**Build Office documents (.docx / .xlsx / .pptx)**:
+```python
+result = discussion.chat(
+    "Build a quarterly report: a .docx summary and an .xlsx KPI workbook",
+    enable_office_files=True,
+)
+# Recover the files:
+#   → result["artefacts"] lists the office artifacts
+#   → tool_office_build's workspace_file lives in the discussion working dir
+#   → discussion.artefacts.get("quarterly_report.docx")
 ```
 
 **Desktop automation (vision model required)**:

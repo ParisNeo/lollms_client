@@ -1,0 +1,40 @@
+name: office_files_builder
+description: >
+  Read, create and edit every kind of Microsoft Office file (.pptx, .docx, .xlsx, .xlsm, .docm, .pptm)
+  via sandboxed recipe code. Pre-imported design system: python-pptx, python-docx, openpyxl symbols.
+  Recipes are plain Python with NO import statements; violations are rejected before execution.
+  Every save is verified with a strict three-layer OOXML integrity check before being committed
+  to the workspace.
+tools:
+  - name: tool_office_build
+    description: Creates a fresh Microsoft Office file from a recipe. The extension of 'file' selects the format (.pptx, .docx, .xlsx, .xlsm, .docm, .pptm). The root object is pre-bound in the recipe namespace (prs/presentation for pptx, doc for docx, wb/ws for xlsx).
+    parameters:
+      - name: file
+        type: str
+        description: "Target file name (default: document.docx). The extension selects the format."
+        mandatory: false
+        default: "document.docx"
+      - name: recipe
+        type: str
+        description: "Plain Python recipe code (no imports) mutating the pre-bound root object."
+        mandatory: false
+        default: ""
+  - name: tool_office_edit
+    description: Edits an existing Microsoft Office file in place via a recipe. The opened object is pre-bound in the recipe namespace (prs/presentation, doc, wb/ws). The save is transactional: on validation failure the pre-edit bytes are restored.
+    parameters:
+      - name: file
+        type: str
+        description: "Path of the office file to edit (relative to the discussion working dir or absolute)."
+        mandatory: true
+      - name: recipe
+        type: str
+        description: "Plain Python recipe code (no imports) mutating the pre-bound root object."
+        mandatory: false
+        default: ""
+  - name: tool_office_read
+    description: Reads an existing Microsoft Office file and returns a markdown inventory (pptx: slides/shapes/texts/tables; docx: paragraphs/tables; xlsx: sheets/dimensions/cell previews/formulas). Validates the file first; corrupt files return a structured failure.
+    parameters:
+      - name: file
+        type: str
+        description: "Path of the office file to read (relative to the discussion working dir or absolute)."
+        mandatory: true

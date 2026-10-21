@@ -55,11 +55,6 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
     """
     LoLLMS TTI binding for models served via vLLM-Omni's OpenAI-compatible
     server (https://docs.vllm.ai/projects/vllm-omni/).
-
-    Works with:
-      - Pure diffusion / image models (Z-Image, FLUX, Ovis-Image, GLM-Image)
-      - True omni chat models (Qwen3-Omni, BAGEL) that can return text
-        alongside generated images in one /v1/chat/completions call.
     """
 
     def __init__(self,
@@ -86,7 +81,6 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
 
         self.config = kwargs
 
-    # ------------------------------------------------------------------
     def _headers(self):
         h = {"Content-Type": "application/json"}
         if self.service_key:
@@ -131,9 +125,6 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
                 })
         return content
 
-    # ------------------------------------------------------------------
-    # Unified omni entrypoint (preferred)
-    # ------------------------------------------------------------------
     def generate(self,
                  prompt: str,
                  negative_prompt: Optional[str] = "",
@@ -154,30 +145,48 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
 
         eff_guidance = kwargs.get("guidance_scale", self.default_guidance_scale)
         eff_steps = kwargs.get("num_inference_steps", self.default_num_inference_steps)
+        
+        # Fix 3: Handle seed control properly (omit or pass int if valid, else drop or set to None/random)
         eff_seed = kwargs.get("seed", self.default_seed)
+        if eff_seed == -1 or eff_seed is None:
+            # Depending on vLLM version, omitting or passing None handles random seeding cleanly
+            eff_seed = None 
 
         messages = [{"role": "user", "content": self._build_content(prompt, images)}]
 
-        sampling_params_list = [{
+        # Fix 1 & 2: Populate extra_body parameters alongside sampling_params_list 
+        # because vLLM-Omni reads generation controls from extra_body for diffusion backends.
+        extra_body = {
+            "width": width,
+            "height": height,
+            "size": f"{width}x{height}", # Fallback format for OpenAI-compatible parsers
             "num_inference_steps": eff_steps,
             "guidance_scale": eff_guidance,
             "negative_prompt": negative_prompt or "",
-            "seed": eff_seed,
-            "width": width,
-            "height": height,
             "n": n,
-        }]
+        }
+        if eff_seed is not None:
+            extra_body["seed"] = eff_seed
 
         payload = {
             "model": active_model,
             "messages": messages,
             "modalities": modalities or self.default_modalities,
-            "sampling_params_list": sampling_params_list,
+            "sampling_params_list": [{
+                "num_inference_steps": eff_steps,
+                "guidance_scale": eff_guidance,
+                "negative_prompt": negative_prompt or "",
+                "seed": eff_seed if eff_seed is not None else -1,
+                "width": width,
+                "height": height,
+                "n": n,
+            }],
+            "extra_body": extra_body
         }
 
         try:
             resp = requests.post(url, json=payload, headers=self._headers(),
-                                  verify=self.verify_ssl_certificate, timeout=kwargs.get("timeout", 600))
+                                 verify=self.verify_ssl_certificate, timeout=kwargs.get("timeout", 600))
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
@@ -189,22 +198,17 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
         processed = [self.process_image(img, **kwargs) for img in raw_images]
         return TTIGenerationResult(images=processed, text=text, raw=data, metadata={"model": payload["model"]})
     
-    # ------------------------------------------------------------------
-    # Legacy retrocompatible wrappers
-    # ------------------------------------------------------------------
     def generate_image(self,
                        prompt: str,
                        negative_prompt: Optional[str] = "",
                        width: int = 1024,
                        height: int = 1024,
                        **kwargs) -> bytes:
-        
         result = self.generate(prompt=prompt, negative_prompt=negative_prompt,
                                 width=width, height=height, modalities=["image"], **kwargs)
         return result.first_image_bytes()
 
     def _load_image(self, image_source: Union[str, bytes]) -> Optional[Image.Image]:
-        """Loads a PIL image from a data URL, file path, or URL."""
         try:
             if isinstance(image_source, bytes):
                 return Image.open(io.BytesIO(image_source))
@@ -224,7 +228,6 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
         return None
 
     def _img_to_data_url(self, img: Image.Image) -> str:
-        """Converts a PIL Image to a PNG data URL."""
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
@@ -266,9 +269,6 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
                                 images=processed_images, mask=mask, modalities=["image"], **kwargs)
         return result.first_image_bytes()
 
-    # ------------------------------------------------------------------
-    # Service / model management
-    # ------------------------------------------------------------------
     def list_services(self, **kwargs) -> List[Dict[str, str]]:
         return [{"name": self.model_name, "host": self.host_address}]
 

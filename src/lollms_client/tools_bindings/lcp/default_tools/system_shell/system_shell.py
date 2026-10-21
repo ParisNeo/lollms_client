@@ -34,7 +34,7 @@ def init_tools_library(config: dict|None = None) -> None:
         autonomy = config.get("autonomy_level", "safe").lower().strip()
         if autonomy in ("strict", "safe", "full_access"):
             AUTONOMY_LEVEL = autonomy
-            ASCIIColors.info(f"[System Shell] Host configured autonomy level: {AUTONOMY_LEVEL}")
+            ASCIIColors.debug(f"[System Shell] Host configured autonomy level: {AUTONOMY_LEVEL}")
         else:
             ASCIIColors.warning(f"[System Shell] Invalid autonomy level '{autonomy}' received. Defaulting to 'safe'.")
             AUTONOMY_LEVEL = "safe"

@@ -1,5 +1,6 @@
 import unittest
 import sys
+import os
 import tempfile
 import shutil
 import sqlite3
@@ -10,6 +11,11 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from lollms_client.lollms_discussion import LollmsDiscussion, LollmsDataManager
 from lollms_client.lollms_artefact import ArtefactType
+from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query.execute_python_data_query import (
+    tool_execute_python_data_query,
+    _validate_xlsx,
+    _validate_office_file,
+)
 
 
 class MockClient:
@@ -350,6 +356,293 @@ class TestUpdatePhantomRevertFix(unittest.TestCase):
                          "Physical file on disk should contain the updated content, not the original.")
         self.assertNotIn(original_content, disk_content,
                          "Physical file on disk should NOT contain the original content.")
+
+
+class TestExecutePythonDataQueryXlsxGuard(unittest.TestCase):
+    """
+    Validates the transactional XLSX guard in execute_python_data_query:
+    snapshot before execution, strict three-layer validation after execution,
+    and byte-identical rollback (or deletion of corrupt new files) so no
+    Excel-unreadable spreadsheet is ever committed to the workspace.
+    """
+
+    def setUp(self):
+        self.original_cwd = os.getcwd()
+        self.tmp_dir = tempfile.mkdtemp(prefix="lollms_xlsx_guard_")
+        os.chdir(self.tmp_dir)
+
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Feuil1"
+        ws["A1"] = "original"
+        wb.save("to_fill.xlsx")
+        self.original_bytes = Path("to_fill.xlsx").read_bytes()
+
+    def tearDown(self):
+        os.chdir(self.original_cwd)
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_valid_mutation_passes_guard(self):
+        """
+        Scenario: user code loads the workbook, adds a sheet, saves.
+        Expected: success, file remains openable, no rollback occurred.
+        """
+        result = tool_execute_python_data_query(
+            "import openpyxl\n"
+            "wb = openpyxl.load_workbook('to_fill.xlsx')\n"
+            "wb.create_sheet('games')\n"
+            "wb.save('to_fill.xlsx')\n"
+            "print('saved')"
+        )
+        self.assertTrue(result["success"], f"Valid mutation should succeed: {result.get('error')}")
+        self.assertNotIn("xlsx_failed_excel_validation", result.get("output", ""))
+
+        import openpyxl
+        wb = openpyxl.load_workbook("to_fill.xlsx")
+        self.assertIn("games", wb.sheetnames)
+
+    def test_corrupt_mutation_is_rolled_back(self):
+        """
+        Scenario: user code overwrites the workbook with garbage bytes.
+        Expected: structured failure with the xlsx_failed_excel_validation code,
+                  and the file restored byte-identically to its pre-execution state.
+        """
+        result = tool_execute_python_data_query(
+            "with open('to_fill.xlsx', 'wb') as f:\n"
+            "    f.write(b'PK\\x03\\x04garbage-not-a-zip')\n"
+            "print('overwritten')"
+        )
+        self.assertFalse(result["success"], "Corrupting code must not report success.")
+        self.assertIn("xlsx_failed_excel_validation", result["error"])
+        self.assertIn("rolled back", result["error"].lower())
+
+        restored = Path("to_fill.xlsx").read_bytes()
+        self.assertEqual(restored, self.original_bytes,
+                         "File must be restored byte-identically to the pre-execution snapshot.")
+
+    def test_legitimate_pie_chart_passes_guard(self):
+        """
+        Scenario: user code adds a PieChart with geometry set BEFORE add_chart,
+                  anchored at a free cell away from data ranges.
+        Expected: success — the guard must not over-block legitimate chart workloads.
+        """
+        result = tool_execute_python_data_query(
+            "import openpyxl\n"
+            "from openpyxl.chart import PieChart, Reference\n"
+            "wb = openpyxl.load_workbook('to_fill.xlsx')\n"
+            "ws = wb.create_sheet('charts')\n"
+            "ws['A1'] = 'Genre'\n"
+            "ws['B1'] = 'Hours'\n"
+            "ws['A2'] = 'RPG'\n"
+            "ws['B2'] = 120\n"
+            "ws['A3'] = 'FPS'\n"
+            "ws['B3'] = 25\n"
+            "pie = PieChart()\n"
+            "pie.title = 'Playtime by Genre'\n"
+            "pie.width = 15\n"
+            "pie.height = 10\n"
+            "data = Reference(ws, min_col=2, min_row=1, max_row=3)\n"
+            "cats = Reference(ws, min_col=1, min_row=2, max_row=3)\n"
+            "pie.add_data(data, titles_from_data=True)\n"
+            "pie.set_categories(cats)\n"
+            "ws.add_chart(pie, 'D2')\n"
+            "wb.save('to_fill.xlsx')\n"
+            "print('chart saved')"
+        )
+        self.assertTrue(result["success"], f"Legitimate chart should pass the guard: {result.get('error')}")
+        ok, reason = _validate_xlsx(Path("to_fill.xlsx"))
+        self.assertTrue(ok, f"Chart workbook should validate: {reason}")
+
+    def test_corrupt_new_file_is_deleted(self):
+        """
+        Scenario: user code creates a brand-new corrupt .xlsx (no snapshot exists).
+        Expected: structured failure and the corrupt file deleted from the workspace.
+        """
+        result = tool_execute_python_data_query(
+            "with open('new_bad.xlsx', 'wb') as f:\n"
+            "    f.write(b'PK\\x03\\x04garbage-not-a-zip')\n"
+            "print('created')"
+        )
+        self.assertFalse(result["success"], "Creating a corrupt new file must fail.")
+        self.assertIn("xlsx_failed_excel_validation", result["error"])
+        self.assertFalse(Path("new_bad.xlsx").exists(),
+                         "Corrupt new file must be deleted, not committed to the workspace.")
+
+    def test_auto_df_excel_persistence_is_validated(self):
+        """
+        Scenario: code references df without defining it (auto-load triggers on the
+                  .xlsx in CWD), mutates it, and the tool persists via to_excel.
+        Expected: success and the persisted file passes validation.
+        """
+        import pandas as pd
+        source_df = pd.DataFrame({"name": ["Alice", "Bob"], "score": [10, 20]})
+        source_df.to_excel("data.xlsx", index=False)
+
+        result = tool_execute_python_data_query(
+            "df['score'] = df['score'] * 2\n"
+            "print(df.head())"
+        )
+        self.assertTrue(result["success"], f"Auto-df persistence should succeed: {result.get('error')}")
+        ok, reason = _validate_xlsx(Path("data.xlsx"))
+        self.assertTrue(ok, f"Persisted df workbook should validate: {reason}")
+
+
+class TestExecutePythonDataQueryOfficeGuard(unittest.TestCase):
+    """
+    Validates the generalized transactional Office guard in execute_python_data_query:
+    snapshot before execution, strict three-layer validation after execution, and
+    byte-identical rollback (or deletion of corrupt new files) for .docx/.pptx/.xlsx
+    so no Word/Excel/PowerPoint-unreadable document is ever committed to the workspace.
+    """
+
+    def setUp(self):
+        self.original_cwd = os.getcwd()
+        self.tmp_dir = tempfile.mkdtemp(prefix="lollms_office_guard_")
+        os.chdir(self.tmp_dir)
+
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Feuil1"
+        ws["A1"] = "original"
+        wb.save("to_fill.xlsx")
+        self.original_xlsx_bytes = Path("to_fill.xlsx").read_bytes()
+
+        try:
+            from docx import Document
+            doc = Document()
+            doc.add_paragraph("original")
+            doc.save("to_fill.docx")
+            self.original_docx_bytes = Path("to_fill.docx").read_bytes()
+        except ImportError:
+            self.original_docx_bytes = None
+
+        try:
+            from pptx import Presentation
+            prs = Presentation()
+            prs.slide_layouts[6]
+            prs.slides.add_slide(prs.slide_layouts[6])
+            prs.save("to_fill.pptx")
+            self.original_pptx_bytes = Path("to_fill.pptx").read_bytes()
+        except ImportError:
+            self.original_pptx_bytes = None
+
+    def tearDown(self):
+        os.chdir(self.original_cwd)
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_valid_docx_mutation_passes_guard(self):
+        """
+        Scenario: user code loads the document, adds a paragraph, saves.
+        Expected: success, file remains openable, no rollback occurred.
+        """
+        if self.original_docx_bytes is None:
+            self.skipTest("python-docx not installed")
+        result = tool_execute_python_data_query(
+            "from docx import Document\n"
+            "doc = Document('to_fill.docx')\n"
+            "doc.add_paragraph('added by guard test')\n"
+            "doc.save('to_fill.docx')\n"
+            "print('saved')"
+        )
+        self.assertTrue(result["success"], f"Valid docx mutation should succeed: {result.get('error')}")
+        ok, reason = _validate_office_file(Path("to_fill.docx"))
+        self.assertTrue(ok, f"Mutated docx should validate: {reason}")
+
+    def test_valid_pptx_mutation_passes_guard(self):
+        """
+        Scenario: user code loads the presentation, adds a slide, saves.
+        Expected: success, file remains openable, no rollback occurred.
+        """
+        if self.original_pptx_bytes is None:
+            self.skipTest("python-pptx not installed")
+        result = tool_execute_python_data_query(
+            "from pptx import Presentation\n"
+            "prs = Presentation('to_fill.pptx')\n"
+            "prs.slides.add_slide(prs.slide_layouts[6])\n"
+            "prs.save('to_fill.pptx')\n"
+            "print('saved')"
+        )
+        self.assertTrue(result["success"], f"Valid pptx mutation should succeed: {result.get('error')}")
+        ok, reason = _validate_office_file(Path("to_fill.pptx"))
+        self.assertTrue(ok, f"Mutated pptx should validate: {reason}")
+
+    def test_corrupt_docx_mutation_is_rolled_back(self):
+        """
+        Scenario: user code overwrites the document with garbage bytes.
+        Expected: structured failure with the docx_failed_word_validation code,
+                  and the file restored byte-identically to its pre-execution state.
+        """
+        if self.original_docx_bytes is None:
+            self.skipTest("python-docx not installed")
+        result = tool_execute_python_data_query(
+            "with open('to_fill.docx', 'wb') as f:\n"
+            "    f.write(b'PK\\x03\\x04garbage-not-a-zip')\n"
+            "print('overwritten')"
+        )
+        self.assertFalse(result["success"], "Corrupting code must not report success.")
+        self.assertIn("docx_failed_word_validation", result["error"])
+        self.assertIn("rolled back", result["error"].lower())
+
+        restored = Path("to_fill.docx").read_bytes()
+        self.assertEqual(restored, self.original_docx_bytes,
+                         "File must be restored byte-identically to the pre-execution snapshot.")
+
+    def test_corrupt_pptx_mutation_is_rolled_back(self):
+        """
+        Scenario: user code overwrites the presentation with garbage bytes.
+        Expected: structured failure with the pptx_failed_powerpoint_validation code,
+                  and the file restored byte-identically to its pre-execution state.
+        """
+        if self.original_pptx_bytes is None:
+            self.skipTest("python-pptx not installed")
+        result = tool_execute_python_data_query(
+            "with open('to_fill.pptx', 'wb') as f:\n"
+            "    f.write(b'PK\\x03\\x04garbage-not-a-zip')\n"
+            "print('overwritten')"
+        )
+        self.assertFalse(result["success"], "Corrupting code must not report success.")
+        self.assertIn("pptx_failed_powerpoint_validation", result["error"])
+        self.assertIn("rolled back", result["error"].lower())
+
+        restored = Path("to_fill.pptx").read_bytes()
+        self.assertEqual(restored, self.original_pptx_bytes,
+                         "File must be restored byte-identically to the pre-execution snapshot.")
+
+    def test_corrupt_new_pptx_file_is_deleted(self):
+        """
+        Scenario: user code creates a brand-new corrupt .pptx (no snapshot exists).
+        Expected: structured failure and the corrupt file deleted from the workspace.
+        """
+        result = tool_execute_python_data_query(
+            "with open('new_bad.pptx', 'wb') as f:\n"
+            "    f.write(b'PK\\x03\\x04garbage-not-a-zip')\n"
+            "print('created')"
+        )
+        self.assertFalse(result["success"], "Creating a corrupt new file must fail.")
+        self.assertIn("pptx_failed_powerpoint_validation", result["error"])
+        self.assertFalse(Path("new_bad.pptx").exists(),
+                         "Corrupt new file must be deleted, not committed to the workspace.")
+
+    def test_xlsx_regression_intact_under_generalized_guard(self):
+        """
+        Scenario: the original xlsx corrupt-rollback scenario re-run under the
+                  generalized Office guard.
+        Expected: identical behavior to the dedicated xlsx suite — failure with
+                  xlsx_failed_excel_validation and byte-identical restoration.
+        """
+        result = tool_execute_python_data_query(
+            "with open('to_fill.xlsx', 'wb') as f:\n"
+            "    f.write(b'PK\\x03\\x04garbage-not-a-zip')\n"
+            "print('overwritten')"
+        )
+        self.assertFalse(result["success"], "Corrupting code must not report success.")
+        self.assertIn("xlsx_failed_excel_validation", result["error"])
+
+        restored = Path("to_fill.xlsx").read_bytes()
+        self.assertEqual(restored, self.original_xlsx_bytes,
+                         "File must be restored byte-identically to the pre-execution snapshot.")
 
 
 if __name__ == "__main__":
