@@ -147,8 +147,6 @@ _NO_PROCESSING_BLOCK_TAGS = {
     "lock_file",
     "hide_file",
     "agent",
-    "generate_image",
-    "edit_image",
     "lollms_form",
     "lollms_inline"
 }
@@ -2140,6 +2138,33 @@ class _StreamState:
             lang = attrs.get("language")
             is_ephemeral = attrs.get("ephemeral", "false").lower() in ("true", "1", "yes")
 
+            # ── 🖼️ IMAGE ARTIFACT GUARD ──
+            # Images are created exclusively via <generate_image>/<edit_image>, which
+            # store real base64 pixels. An <artifact type="image"> re-dispatch can
+            # only carry a markdown placeholder body — it can never recreate pixels.
+            # If an image artifact with this title already exists, reject immediately
+            # with an image-specific correction instead of the generic patch advice.
+            if atype == "image" and self.discussion.artefacts.get(title) is not None:
+                self._last_dispatch_failed = True
+                self._last_failure_kind = "image_artifact_duplicate"
+                ASCIIColors.warning(
+                    f"[StreamState] <artifact type=\"image\"> re-dispatch blocked: image "
+                    f"'{title}' already exists (created via <generate_image>)."
+                )
+                if self._processing_block_open:
+                    proc_close = (
+                        f"* ⚠️ Image '{title}' already exists in the workspace — it was created "
+                        f"by <generate_image> and its pixels are already saved. An <artifact> tag "
+                        f"cannot recreate or modify image pixels. Reference the existing image with "
+                        f"`<artefact_image id=\"{title}::0\" />` in your answer, or use "
+                        f"<edit_image> to modify it. Then finish with `<done/>`.\n"
+                        f"<!-- status:failure -->\n</processing>\n"
+                    )
+                    self.ai_message.content += proc_close
+                    _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    self._processing_block_open = False
+                return True
+
             is_new = self.discussion.artefacts.get(title) is None
             is_patch = "<<<<<<< SEARCH" in body
             is_scratchpad_target = atype.lower() == "scratchpad" or "scratchpad" in title.lower()
@@ -2983,6 +3008,7 @@ class _StreamState:
                     )
                     self.ai_message.content += failure_block
                     _cb(self.callback, failure_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    self._processing_block_open = False
                 return True
 
             width = 1024
@@ -3004,6 +3030,7 @@ class _StreamState:
                 )
                 self.ai_message.content += failure_block
                 _cb(self.callback, failure_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                self._processing_block_open = False
                 return True
             if tag_name == "generate_image" and not prompt:
                 prompt = title
@@ -3016,6 +3043,7 @@ class _StreamState:
                 )
                 self.ai_message.content += status_line
                 _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                self._processing_block_open = True
 
             img_b64 = None
             generation_error = None
@@ -3088,6 +3116,7 @@ class _StreamState:
                     )
                     self.ai_message.content += result_block
                     _cb(self.callback, result_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    self._processing_block_open = False
 
                 anchor = f'<artefact_image id="{title}::0" />'
                 self.ai_message.content += f"\n\n{anchor}\n"
@@ -3108,6 +3137,7 @@ class _StreamState:
                     )
                     self.ai_message.content += failure_block
                     _cb(self.callback, failure_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    self._processing_block_open = False
 
             self._action_dispatched = True
             return True
@@ -5245,6 +5275,7 @@ class ChatMixin:
                 "\n=== ACTION EXECUTION & TERMINATION PROTOCOL (CRITICAL) ===\n"
                 "1. **INTENT ≠ EXECUTION (SAME-RESPONSE EXECUTION MANDATE)**: Stating 'I will search...', 'Let me analyze...', 'I am now writing...', or any equivalent declaration in ANY language (English, Arabic, Chinese, French, Spanish, etc.) DOES NOT execute the action. Conversational text is completely inert.\n"
                 "   - You MUST emit the corresponding functional XML tag (`<tool>`, `<artifact>`, `<skill>`, `<note>`, `<unlock_file>`, `<generate_image>`, etc.) IN THE EXACT SAME RESPONSE immediately following your brief statement of intent.\n"
+                "   - **IMAGES ARE NEVER `<artifact>` TAGS**: Images are created ONLY with `<generate_image name=\"...\">prompt</generate_image>` and modified ONLY with `<edit_image name=\"...\">instructions</edit_image>`. NEVER emit `<artifact type=\"image\">` — it cannot create pixels and will be rejected. To show an existing image in your answer, use `<artefact_image id=\"name::0\" />`.\n"
                 "   - **NEVER SPLIT INTENT AND TAGS**: Never announce what you are going to do and then stop without emitting the tag. If you state intent without outputting the XML tag in the same response, the turn will end with nothing done.\n"
                 "   - **DESTRUCTIVE VS CONSTRUCTIVE OPERATIONS**:\n"
                 "     • If an action is risky, destructive, or irreversible (e.g. deleting files, force-pushing git branches, dropping database tables), explicitly ask the user for confirmation and wait for their reply before emitting destructive tags.\n"
@@ -6760,6 +6791,21 @@ class ChatMixin:
                             "MANDATORY: the instructions MUST be wrapped in literal <task> and </task> tags. "
                             "Plain-text markers like '=== TASK ===' are NOT parsed. "
                             "Do not wrap the delegation in code fences or any other tags.]"
+                        )
+                    elif getattr(ss, "_last_failure_kind", None) == "image_artifact_duplicate":
+                        ASCIIColors.warning("[ChatMixin] Duplicate image artifact dispatch blocked. Injecting image-specific correction.")
+                        correction_body = (
+                            "[SYSTEM: Your <artifact type=\"image\"> dispatch was REJECTED — the image already exists.\n"
+                            "Images are created ONLY with <generate_image>...</generate_image> (or modified with "
+                            "<edit_image>...</edit_image>); an <artifact> tag cannot create or modify image pixels.\n"
+                            "The image is already generated and saved. Do ONE of the following:\n"
+                            "1. Reference it in your final answer using `<artefact_image id=\"TITLE::0\" />` "
+                            "(replace TITLE with the image name), then write your answer and emit `<done/>`.\n"
+                            "2. If the user asked for a DIFFERENT image, emit a new <generate_image> tag with a "
+                            "new name and prompt.\n"
+                            "3. If the user asked to MODIFY the existing image, emit <edit_image name=\"TITLE\"> "
+                            "with editing instructions.\n"
+                            "Do NOT re-emit an <artifact> tag for an image.]"
                         )
                     elif getattr(ss, "_last_failure_kind", None) == "scratchpad_duplicate":
                         ASCIIColors.warning("[ChatMixin] Identical consecutive scratchpad write blocked. Injecting variation correction.")

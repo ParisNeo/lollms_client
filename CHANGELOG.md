@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-21 13:06]
+
+- fix(chat): remove leftover `_NO_PROCESSING_BLOCK` debug snippet
+
 ## [2026-10-21 00:35]
 
 - Fix minor imports and versions in CLI client modules.
