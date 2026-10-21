@@ -77,17 +77,18 @@ class DiffusersTTMBinding(LollmsTTMBinding):
         self.host = kwargs.get("host", "127.0.0.1")
         self.port = int(kwargs.get("port", 9637))
         self.model_name = kwargs.get("model_name", "MiniMaxAI/MiniMax-Music3")
-        self.auto_start_server = kwargs.get("auto_start_server", True)
+        self.auto_start_server = kwargs.get("auto_start_server", False)
         self.wait_for_server = kwargs.get("wait_for_server", False)
+        self.use_host_env = kwargs.get("use_host_env", False)
         self.base_url = f"http://{self.host}:{self.port}"
         self.binding_root = Path(__file__).parent
         self.server_dir = self.binding_root / "server"
 
         system_root = self.get_system_dir()
-        if kwargs.get("venv_path"):
+        if kwargs.get("venv_path") and not self.use_host_env:
             self.venv_dir = self.resolve_system_path(kwargs["venv_path"])
         else:
-            self.venv_dir = (system_root / "venv" / "ttm_diffusers_venv").resolve()
+            self.venv_dir = None if self.use_host_env else (system_root / "venv" / "ttm_diffusers_venv").resolve()
 
         if kwargs.get("cache_dir"):
             self.cache_dir = self.resolve_system_path(kwargs["cache_dir"])
@@ -158,6 +159,10 @@ class DiffusersTTMBinding(LollmsTTMBinding):
                 raise RuntimeError(f"Timed out waiting for Diffusers TTM shared daemon on {self.base_url}: {e}")
 
     def install_server_dependencies(self):
+        if self.use_host_env:
+            ASCIIColors.info("Using host environment for TTM server. Skipping virtual environment setup.")
+            return
+
         ASCIIColors.info(f"Setting up Diffusers TTM virtual environment in: {self.venv_dir}")
         pm_v = pm.PackageManager(venv_path=str(self.venv_dir), create_if_not_exist=True)
 
@@ -181,18 +186,21 @@ class DiffusersTTMBinding(LollmsTTMBinding):
         def _launch():
             try:
                 server_script = self.server_dir / "main.py"
-                venv_cfg = self.venv_dir / "pyvenv.cfg"
+                venv_cfg = self.venv_dir / "pyvenv.cfg" if not self.use_host_env else None
 
-                if not venv_cfg.exists():
+                if not self.use_host_env and not venv_cfg.exists():
                     self.install_server_dependencies()
 
-                if sys.platform == "win32":
-                    python_executable = self.venv_dir / "Scripts" / "python.exe"
+                if self.use_host_env:
+                    python_executable = sys.executable
                 else:
-                    python_executable = self.venv_dir / "bin" / "python"
+                    if sys.platform == "win32":
+                        python_executable = self.venv_dir / "Scripts" / "python.exe"
+                    else:
+                        python_executable = self.venv_dir / "bin" / "python"
 
                 if not python_executable.exists():
-                    ASCIIColors.error(f"Python executable not found in venv: {python_executable}.")
+                    ASCIIColors.error(f"Python executable not found: {python_executable}.")
                     return
 
                 if not self.service_key:

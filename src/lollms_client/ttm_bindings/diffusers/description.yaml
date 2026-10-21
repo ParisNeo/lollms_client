@@ -22,7 +22,7 @@ global_input_parameters:
     type: bool
     description: "Automatically spawn the shared TTM server daemon in the background."
     mandatory: false
-    default: true
+    default: false
   - name: wait_for_server
     type: bool
     description: "Wait until the server is fully ready before completing initialization."

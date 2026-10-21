@@ -13,7 +13,7 @@ from typing import Dict, Any, List, Optional, Tuple, Union, TYPE_CHECKING
 if TYPE_CHECKING:
     from lollms_client import LollmsClient
 
-from ascii_colors import ASCIIColors, Menu
+from ascii_colors import ASCIIColors, Menu  # type: ignore
 
 try:
     import yaml
@@ -30,35 +30,19 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def resolve_env_file(cli_env_path: Optional[Union[str, Path]] = None) -> Tuple[Optional[Path], bool]:
-    """Resolves the active .env configuration file path."""
+    """Resolves the active configuration file path (config.yaml only)."""
     if cli_env_path:
         p = Path(cli_env_path)
         if p.exists():
             return p, False
 
     home_dir = Path.home() / ".lollms_client"
-    home_env = home_dir / ".env"
     home_yaml = home_dir / "config.yaml"
 
-    if home_env.exists():
-        return home_env, False
     if home_yaml.exists():
         return home_yaml, False
 
     return None, True
-
-def load_env_file(env_path: Path) -> Dict[str, str]:
-    data = {}
-    try:
-        with open(env_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, value = line.split("=", 1)
-                    data[key.strip()] = value.strip().strip("'\"")
-    except Exception:
-        pass
-    return data
 
 _SERIALIZATION_PROFILE_SUFFIXES = (
     "_BINDING_ALIAS", "_BINDING_NAME", "_MODEL_NAME", "_IS_DEFAULT",
@@ -570,73 +554,57 @@ def get_client_from_env(
 ) -> "LollmsClient":
     from lollms_client import LollmsClient
 
-    resolved_env = dict(os.environ)
+    resolved_env: Dict[str, str] = {}
 
-    home_dir = Path.home() / ".lollms_client"
-    home_env = home_dir / ".env"
-    if home_env.exists():
-        resolved_env.update(load_env_file(home_env))
-
-    home_yaml = home_dir / "config.yaml"
+    # Prioritize ~/.lollms_client/config.yaml
+    home_yaml = Path.home() / ".lollms_client" / "config.yaml"
     if home_yaml.exists():
         try:
             yaml_data = load_yaml_file(home_yaml)
             resolved_env.update(_flatten_dict_to_env(yaml_data))
         except Exception as e:
-            ASCIIColors.warning(f"Failed to parse {home_yaml}: {e}")
+            ASCIIColors.warning(f"Failed to parse global config at {home_yaml}: {e}")
 
-    for local_env in [Path.cwd() / ".env", Path.cwd() / "examples" / ".env"]:
-        if local_env.exists():
-            resolved_env.update(load_env_file(local_env))
+    # Then local .lollms_code/config.yaml
+    local_yaml = Path.cwd() / ".lollms_code" / "config.yaml"
+    if local_yaml.exists():
+        try:
+            yaml_data = load_yaml_file(local_yaml)
+            resolved_env.update(_flatten_dict_to_env(yaml_data))
+        except Exception as e:
+            ASCIIColors.warning(f"Failed to parse local config at {local_yaml}: {e}")
 
+    # Finally, the specified conf_file (if any)
+    if conf_file:
+        p = Path(conf_file).expanduser()
+        if p.exists() and p.suffix in (".yaml", ".yml"):
+            try:
+                yaml_data = load_yaml_file(p)
+                data = _descend_into_entry(yaml_data, entry)
+                resolved_env.update(_flatten_dict_to_env(data))
+            except Exception as e:
+                ASCIIColors.warning(f"Failed to parse configuration at {conf_file}: {e}")
+
+    # Apply conf_dict overrides
     if conf_dict:
         resolved_env.update(_flatten_dict_to_env(conf_dict))
-
-    if conf_file:
-        p = Path(conf_file)
-        if not p.exists():
-            raise FileNotFoundError(f"Configuration file not found: {p}")
-
-        if p.suffix == ".env":
-            data = load_env_file(p)
-        elif p.suffix == ".json":
-            data = _descend_into_entry(load_json_file(p), entry)
-        elif p.suffix in (".yaml", ".yml"):
-            data = _descend_into_entry(load_yaml_file(p), entry)
-        elif p.suffix == ".ini":
-            data = load_ini_file(p, entry)
-        else:
-            raise ValueError(f"Unsupported configuration format: {p.suffix}")
-
-        resolved_env.update(_flatten_dict_to_env(data))
-
-    if cli_env_path:
-        p = Path(cli_env_path)
-        if p.exists():
-            resolved_env.update(load_env_file(p))
 
     if create_llm and not _is_modality_configured("llm", resolved_env):
         if run_wizard_if_fail:
             ASCIIColors.yellow("⚠️ LLM Configuration incomplete. Starting wizard...")
             run_wizard_and_save()
-
+            home_yaml = Path.home() / ".lollms_client" / "config.yaml"
             if home_yaml.exists():
                 try:
                     yaml_data = load_yaml_file(home_yaml)
                     resolved_env.update(_flatten_dict_to_env(yaml_data))
                 except Exception:
                     pass
-
-            if home_env.exists():
-                resolved_env.update(load_env_file(home_env))
-
             if not _is_modality_configured("llm", resolved_env):
                 raise ValueError("Wizard completed but LLM configuration is still missing.")
         else:
             raise ValueError("LLM configuration is missing.")
 
-    # Auto-detect presence of any modality if its create flag was not explicitly set
-    # This ensures symmetry with the wizard: if a config exists, we should hydrate it.
     auto_detect_map = {
         "tti": create_tti, "tts": create_tts, "stt": create_stt,
         "ttm": create_ttm, "ttv": create_ttv, "connection": create_connection,
@@ -660,72 +628,32 @@ def get_client_from_env(
         bindings = _extract_bindings_from_env(prefix, resolved_env)
         profiles = _extract_profiles_from_env(prefix, bindings, resolved_env)
 
-        if profiles:
-            profiles = _demote_non_llm_defaults(b_type, profiles)
-
         if bindings:
             kwargs[f"{b_type}_binding_profiles"] = bindings
         if profiles:
             kwargs[f"{b_type}_model_profiles"] = profiles
-            
+
         if bindings or profiles:
             ASCIIColors.info(f"[get_client_from_env] Hydrated {b_type.upper()} profiles into client.")
 
+        default_profile = next((p for p in profiles.values() if p.get("is_default")), None)
+        if not default_profile and profiles:
+            default_profile = next(iter(profiles.values()))
+
         binding_name = None
-        if "master" in bindings and bindings["master"].get("binding_name"):
-            binding_name = bindings["master"]["binding_name"]
+        binding_config = {}
+
+        if default_profile:
+            binding_name = default_profile.get("binding_name")
+            binding_config = dict(default_profile.get("binding_config", {}))
         elif bindings:
             first_alias = next(iter(bindings))
             binding_name = bindings[first_alias].get("binding_name")
-        else:
-            binding_name = resolved_env.get(f"{prefix}_BINDINGS_MASTER_BINDING_NAME") or resolved_env.get(f"{prefix}_BINDING_NAME")
+            binding_config = dict(bindings[first_alias].get("binding_config", {}))
 
         if binding_name:
-            model_name = None
-            default_profile = next((p for p in profiles.values() if p.get("is_default")), None)
-            if default_profile and default_profile.get("model_name"):
-                model_name = default_profile["model_name"]
-            elif "master" in profiles and profiles["master"].get("model_name"):
-                model_name = profiles["master"]["model_name"]
-            elif profiles:
-                first_p = next(iter(profiles.values()))
-                model_name = first_p.get("model_name")
-            else:
-                model_name = resolved_env.get("MODEL_NAME") or resolved_env.get(f"{prefix}_MODEL_NAME")
-
-            binding_config = {}
-            if "master" in bindings:
-                binding_config = dict(bindings["master"].get("binding_config", {}))
-            elif bindings:
-                first_alias = next(iter(bindings))
-                binding_config = dict(bindings[first_alias].get("binding_config", {}))
-
-            for k, v in resolved_env.items():
-                if k.startswith(f"{prefix}_") and not k.startswith(f"{prefix}_BINDINGS_") and not k.startswith(f"{prefix}_PROFILES_"):
-                    key_lower = k[len(f"{prefix}_"):].lower()
-                    if key_lower not in binding_config:
-                        binding_config[key_lower] = _convert_to_bool(v) if key_lower == "verify_ssl_certificate" else v
-
-            if model_name and "model_name" not in binding_config:
-                binding_config["model_name"] = model_name
-            elif not model_name and b_type == "llm":
-                # Fallback: check resolved_env for MODEL_NAME or LLM_MODEL_NAME
-                fallback_model = resolved_env.get("MODEL_NAME") or resolved_env.get(f"{prefix}_MODEL_NAME")
-                if fallback_model:
-                    binding_config["model_name"] = fallback_model
-                    ASCIIColors.warning(f"⚠️ No default profile found for LLM. Using MODEL_NAME from environment: {fallback_model}")
-                else:
-                    ASCIIColors.warning(f"⚠️ No model_name found for LLM binding '{binding_name}'. Please configure a profile or set MODEL_NAME env var.")
-
-            if "host_address" not in binding_config:
-                host = resolved_env.get("HOST_ADDRESS") or resolved_env.get(f"{prefix}_HOST_ADDRESS")
-                if host:
-                    binding_config["host_address"] = host
-
-            if "service_key" not in binding_config:
-                key = resolved_env.get("API_KEY") or resolved_env.get(f"{prefix}_API_KEY") or resolved_env.get("SERVICE_KEY") or resolved_env.get(f"{prefix}_SERVICE_KEY")
-                if key:
-                    binding_config["service_key"] = key
+            if default_profile and default_profile.get("model_name") and "model_name" not in binding_config:
+                binding_config["model_name"] = default_profile["model_name"]
 
             kwargs[f"{b_type}_binding_name"] = binding_name
             kwargs[f"{b_type}_binding_config"] = binding_config
@@ -1008,44 +936,50 @@ def _rename_entry(b_type: str, category: str, old_alias: str, config_map: Dict[s
     """
     cat_upper = category.upper()
     old_alias_clean = _sanitize_alias(old_alias)
-    label = "binding" if cat_upper == "BINDINGS" else "profile"
-
-    raw_alias = _safe_input_or_back(f"Enter new {label} alias for '{old_alias}'", old_alias_clean)
+    raw_alias = _safe_input_or_back(f"Enter new instance name for '{old_alias}'", old_alias_clean)
     if raw_alias is None:
         ASCIIColors.yellow("\n  ⚠️ Rename cancelled.")
         return None
 
     new_alias = _sanitize_alias(raw_alias)
+    if new_alias != raw_alias.strip().lower():
+        ASCIIColors.info(f"  ℹ️ Sanitized alias to: '{new_alias}'")
+
     if new_alias == old_alias_clean:
         ASCIIColors.yellow("\n  ⚠️ Alias unchanged.")
         return None
 
     existing = _get_configured_aliases(b_type, config_map, cat_upper)
     if any(_sanitize_alias(a) == new_alias for a in existing):
-        ASCIIColors.red(f"\n  ❌ Alias '{new_alias}' already exists.")
+        ASCIIColors.red(f"\n  ❌ Instance name '{new_alias}' already exists for {b_type.upper()} {cat_upper.lower()}.")
         return None
 
     old_prefix = f"{b_type.upper()}_{cat_upper}_{old_alias_clean}_"
     new_prefix = f"{b_type.upper()}_{cat_upper}_{new_alias}_"
 
-    keys_to_rename = [k for k in config_map.keys() if k.upper().startswith(old_prefix)]
+    # We must do exact uppercase matching on keys to prevent substring collisions
+    keys_to_rename = [k for k in config_map.keys() if k.upper().startswith(old_prefix.upper())]
     if not keys_to_rename:
-        ASCIIColors.yellow(f"\n  ⚠️ No keys found for {label} '{old_alias}'.")
+        ASCIIColors.yellow(f"\n  ⚠️ No keys found for instance '{old_alias}'.")
         return None
 
     for k in keys_to_rename:
         suffix = k[len(old_prefix):]
         config_map[new_prefix + suffix] = config_map.pop(k)
 
-    if cat_upper == "BINDINGS":
-        profile_prefix = f"{b_type.upper()}_PROFILES_"
-        for k in list(config_map.keys()):
-            # Ensure the BINDING_ALIAS change is scoped strictly to the current modality
-            if k.upper().startswith(profile_prefix) and k.upper().endswith("_BINDING_ALIAS") and _sanitize_alias(config_map[k]) == old_alias_clean:
+    # Ensure referential integrity across profiles for the given modality
+    profile_prefix = f"{b_type.upper()}_PROFILES_"
+    for k in list(config_map.keys()):
+        if k.upper().startswith(profile_prefix) and k.upper().endswith("_BINDING_ALIAS"):
+            current_ref = _sanitize_alias(config_map[k])
+            if current_ref == old_alias_clean:
                 config_map[k] = new_alias
-    else:
+                ASCIIColors.info(f"  ℹ️ Updated profile reference '{k}' to point to '{new_alias}'")
+
+    if cat_upper != "BINDINGS":
         _enforce_single_default_profile(b_type, config_map)
 
+    label = "binding" if cat_upper == "BINDINGS" else "profile"
     ASCIIColors.green(f"\n  🏷️ Renamed {label} '{old_alias}' → '{new_alias}'.")
     return new_alias
 
@@ -1082,16 +1016,25 @@ def _edit_keys_menu(b_type: str, category: str, alias: str, config_map: Dict[str
             return
 
         menu = Menu(f"Edit {b_type.upper()} {category.capitalize()}: {alias}", mode=Menu.MODE_RETURN, exit_text="↩ Back")
-        menu.set_intro("Select a key to edit, add a custom key, or go back.")
+        menu.set_intro("Select a key to edit, add a custom key, or rename this instance.")
+        label_str = "binding" if category.upper() == "BINDINGS" else "profile"
+        menu.add_choice(f"🏷️ Rename this {label_str} instance : {alias}", value="__RENAME_ENTRY__")
         for k, v in keys.items():
-            menu.add_choice(f"✏️ Edit {k}: {str(v)[:40]}", value=lambda k=k: _edit_single_key(b_type, category, alias, k, config_map))
+            if k != "BINDING_NAME": # we can't update the binding name
+                menu.add_choice(f"✏️ Edit {k}: {str(v)[:40]}", value=lambda k=k: _edit_single_key(b_type, category, alias, k, config_map))
         menu.add_choice("➕ Add custom key", value=lambda: _add_custom_key(b_type, category, alias, config_map))
         menu.add_choice("↩ Back", value=_BACK_VALUE)
 
         selection = menu.run()
         if _is_back_choice(selection):
             break
-        if callable(selection):
+        if selection == "__RENAME_ENTRY__":
+            new_alias = _rename_entry(b_type, category, alias, config_map)
+            if new_alias:
+                # Update the local alias loop to ensure the next UI iteration
+                # shows the new name in the title and selections
+                alias = new_alias
+        elif callable(selection):
             selection()
 
 def _edit_single_key(b_type: str, category: str, alias: str, key: str, config_map: Dict[str, str]):
@@ -1138,20 +1081,27 @@ def _delete_entry(b_type: str, category: str, alias: str, config_map: Dict[str, 
             del config_map[k]
         ASCIIColors.green(f"\n  🗑️ Deleted {label}: {alias}")
 
-        if cat_upper == "PROFILES":
+        if cat_upper == "BINDINGS":
+            # Find and delete profiles referencing this binding
+            profile_prefix = f"{b_type.upper()}_PROFILES_"
+            orphaned_profiles = []
+            for k, v in list(config_map.items()):
+                if k.upper().startswith(profile_prefix) and k.upper().endswith("_BINDING_ALIAS") and v.upper() == alias.upper():
+                    profile_alias = k[len(profile_prefix):-len("_BINDING_ALIAS")].rstrip("_")
+                    orphaned_profiles.append(profile_alias)
+
+            for profile_alias in orphaned_profiles:
+                profile_keys = [k for k in list(config_map.keys()) if k.startswith(f"{profile_prefix}{profile_alias.upper()}_")]
+                for pk in profile_keys:
+                    del config_map[pk]
+                ASCIIColors.info(f"  🗑️ Deleted associated profile: {profile_alias}")
+
+            if was_default:
+                ASCIIColors.info("  ℹ️ Default binding deleted; first remaining binding promoted.")
+        elif cat_upper == "PROFILES":
             _enforce_single_default_profile(b_type, config_map)
             if was_default:
                 ASCIIColors.info("  ℹ️ Default profile deleted; first remaining profile promoted.")
-        elif cat_upper == "BINDINGS":
-            profile_prefix = f"{b_type.upper()}_PROFILES_"
-            orphaned = []
-            for k, v in config_map.items():
-                if k.upper().startswith(profile_prefix) and k.upper().endswith("_BINDING_ALIAS"):
-                    if v.upper() == alias.upper():
-                        p_alias = k[len(profile_prefix):-len("_BINDING_ALIAS")].rstrip("_")
-                        orphaned.append(p_alias)
-            if orphaned:
-                ASCIIColors.warning(f"  ⚠️ Note: The following profile(s) still point to deleted binding '{alias}': {', '.join(orphaned)}.")
 
 def _extract_model_name(m: Any) -> Optional[str]:
     """Robustly extracts model name string from raw items (string or dict)."""
@@ -1314,46 +1264,48 @@ def _configure_profile_instance(b_type: str, alias: str, config_map: Dict[str, s
 
 def _enforce_single_default_profile(b_type: str, config_map: Dict[str, str]) -> None:
     """
-    Enforces the SINGLE-DEFAULT INVARIANT across all profiles of a modality:
-    exactly one profile may carry IS_DEFAULT=true; all others are cleared.
-    If several (or none) are flagged, the FIRST profile is promoted.
-    Mutates config_map in place.
+    Enforces the SINGLE-DEFAULT INVARIANT for profiles of a modality.
+    Ensures exactly one profile carries IS_DEFAULT=true; clears others,
+    and promotes the first if none/multiple exist.
+    Mutates config_map in place and keeps YAML consistent.
     """
-    configured_profiles = _get_configured_aliases(b_type, config_map, "PROFILES")
-    if not configured_profiles:
+    profile_prefix = f"{b_type.upper()}_PROFILES_"
+    default_suffix = "_IS_DEFAULT"
+
+    default_keys = [k for k in config_map if k.startswith(profile_prefix) and k.endswith(default_suffix)]
+    if not default_keys:
         return
 
-    profile_prefix = f"{b_type.upper()}_PROFILES_"
+    sorted_keys = sorted(default_keys)
+    chosen_profile_key = None
 
-    flagged = []
-    for alias in configured_profiles:
-        target_key = f"{profile_prefix}{alias.upper()}_IS_DEFAULT"
-        for k, v in config_map.items():
-            if k.upper() == target_key:
-                if str(v).lower() in ("true", "1", "yes", "y", "on"):
-                    flagged.append(alias)
-                break
+    # First, honor any explicitly defaulted profiles
+    for k in sorted_keys:
+        if config_map.get(k) and config_map[k].strip().lower() == "true":
+            chosen_profile_key = k
+            break
 
-    if len(flagged) == 1:
-        owner_alias = flagged[0]
-    elif len(flagged) > 1:
-        owner_alias = flagged[0]
-    else:
-        owner_alias = configured_profiles[0]
+    # Fallback to first if none are default
+    if not chosen_profile_key:
+        chosen_profile_key = sorted_keys[0]
 
-    for alias in configured_profiles:
-        target_key = f"{profile_prefix}{alias.upper()}_IS_DEFAULT"
-        found_key = None
-        for k in list(config_map.keys()):
-            if k.upper() == target_key:
-                found_key = k
-                break
+    chosen_alias = chosen_profile_key.replace(profile_prefix, "").removesuffix(default_suffix)
 
-        val = "true" if alias == owner_alias else "false"
-        if found_key:
-            config_map[found_key] = val
-        else:
-            config_map[target_key] = val
+    # Rewrite the map cleanly: only keep the chosen default as true
+    new_map = dict(config_map)
+    for k in default_keys:
+        new_map[k] = "false"
+    new_map[chosen_profile_key] = "true"
+
+    # Promote alias if needed for consistency (alias keys like PROFILES_ALIAS)
+    alias_key = f"{b_type.upper()}_PROFILES_{chosen_alias}_BINDING_ALIAS"
+    # Ensure BINDING_NAME is normalized before alias assignment
+    if alias_key not in new_map:
+        binding_alias_fallback = f"{b_type.upper()}_BINDINGS_{chosen_alias}"
+        new_map[alias_key] = new_map.get(binding_alias_fallback, "")
+
+    config_map.clear()
+    config_map.update(new_map)
 
 
 def _set_default_profile_action(b_type: str, alias: str, config_map: Dict[str, str]):
@@ -1618,10 +1570,10 @@ def _connection_edit_menu(config_map: Dict[str, str]):
     all_choices = []
     for b in bindings:
         all_choices.append(f"Binding: {b}")
-        all_choices.append(f"Rename Binding: {b}")
+        all_choices.append(f"Rename Binding Instance: {b}")
     for p in profiles:
         all_choices.append(f"Profile: {p}")
-        all_choices.append(f"Rename Profile: {p}")
+        all_choices.append(f"Rename Profile Instance: {p}")
 
     if not all_choices:
         ASCIIColors.warning("No connection bindings or profiles to edit.")
@@ -1637,10 +1589,10 @@ def _connection_edit_menu(config_map: Dict[str, str]):
     elif selected.startswith("Profile:"):
         alias = selected.split(": ", 1)[1].strip()
         _edit_keys_menu("connection", "PROFILES", alias, config_map)
-    elif selected.startswith("Rename Binding:"):
+    elif selected.startswith("Rename Binding Instance:"):
         alias = selected.split(": ", 1)[1].strip()
         _rename_entry("connection", "BINDINGS", alias, config_map)
-    elif selected.startswith("Rename Profile:"):
+    elif selected.startswith("Rename Profile Instance:"):
         alias = selected.split(": ", 1)[1].strip()
         _rename_entry("connection", "PROFILES", alias, config_map)
 
@@ -1738,8 +1690,8 @@ def build_client_with_connection() -> "LollmsClient":
         webhook_url = input("\n  Enter webhook URL (or press Enter to skip): ").strip()
 
     # Re-create the client with connection profiles injected
-    conn_binding_profiles = {}
-    conn_model_profiles = {}
+    conn_binding_profiles: Dict[str, Any] = {}
+    conn_model_profiles: Dict[str, Any] = {}
 
     if webhook_url:
         ASCIIColors.info(f"📡 Using webhook: {webhook_url[:70]}...")
@@ -1779,6 +1731,8 @@ def build_client_with_connection() -> "LollmsClient":
         debug=True,
     )
 
+    return client
+
 def _deduplicate_binding_keys(config_map: Dict[str, str]) -> None:
     """
     Removes duplicate keys in config_map that differ only by case (e.g., VERIFY_SSL_CERTIFICATE vs verify_ssl_certificate).
@@ -1814,40 +1768,31 @@ def _normalize_config_map_keys(config_map: Dict[str, str]) -> None:
 def _load_existing_env_to_map(cli_env_path: Optional[Union[str, Path]] = None) -> Dict[str, str]:
     config_map = {}
 
-    if cli_env_path:
-        p = Path(cli_env_path).expanduser()
-        if p.exists():
-            try:
-                if p.suffix in (".yaml", ".yml"):
-                    config_map.update(_flatten_dict_to_env(load_yaml_file(p)))
-                else:
-                    config_map.update(load_env_file(p))
-            except Exception as e:
-                ASCIIColors.warning(f"Failed to load configuration file {p}: {e}")
-        _normalize_config_map_keys(config_map)
-        return config_map
-
+    # Prioritize ~/.lollms_client/config.yaml
     home_dir = Path.home() / ".lollms_client"
-    home_env = home_dir / ".env"
-    if home_env.exists():
-        config_map.update(load_env_file(home_env))
-
     home_yaml = home_dir / "config.yaml"
     if home_yaml.exists():
         try:
             config_map.update(_flatten_dict_to_env(load_yaml_file(home_yaml)))
         except Exception as e:
-            ASCIIColors.warning(f"Failed to load existing config.yaml: {e}")
+            ASCIIColors.warning(f"Failed to load existing config.yaml from {home_yaml}: {e}")
 
-    for local_env in (Path.cwd() / ".lollms_code" / ".env", Path.cwd() / ".lollms_code" / "config.yaml"):
-        if local_env.exists():
+    # Then local .lollms_code/config.yaml
+    local_yaml = Path.cwd() / ".lollms_code" / "config.yaml"
+    if local_yaml.exists():
+        try:
+            config_map.update(_flatten_dict_to_env(load_yaml_file(local_yaml)))
+        except Exception as e:
+            ASCIIColors.warning(f"Failed to load local configuration from {local_yaml}: {e}")
+
+    # Finally, the specified cli_env_path (if any)
+    if cli_env_path:
+        p = Path(cli_env_path).expanduser()
+        if p.exists() and p.suffix in (".yaml", ".yml"):
             try:
-                if local_env.suffix in (".yaml", ".yml"):
-                    config_map.update(_flatten_dict_to_env(load_yaml_file(local_env)))
-                else:
-                    config_map.update(load_env_file(local_env))
+                config_map.update(_flatten_dict_to_env(load_yaml_file(p)))
             except Exception as e:
-                ASCIIColors.warning(f"Failed to load local configuration {local_env}: {e}")
+                ASCIIColors.warning(f"Failed to load configuration from {p}: {e}")
 
     _normalize_config_map_keys(config_map)
     return config_map
@@ -1863,35 +1808,23 @@ def _save_and_validate(
 
     yaml_data = _serialize_config_map_to_yaml(config_map)
     target_yaml_file = target_dir / "config.yaml"
-    target_env_file = target_dir / ".env"
 
     try:
-        # 1. Always write synchronized config.yaml to ~/.lollms_client/
+        # 1. Write config.yaml to ~/.lollms_client/
         if yaml:
             with open(target_yaml_file, "w", encoding="utf-8") as f:
                 yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False)
 
-        # 2. Always write synchronized .env to ~/.lollms_client/
-        with open(target_env_file, "w", encoding="utf-8") as f:
-            f.write("# Lollms Client Configuration\n# Synchronized with config.yaml\n\n")
-            for k, v in sorted(config_map.items()):
-                if v is not None and str(v).strip() != "":
-                    f.write(f"{k}={v}\n")
-
-        # 3. If explicit custom path was specified outside default home directory, write there too
+        # 2. If explicit custom path was specified outside default home directory, write there too
         explicit_target = Path(cli_env_path).expanduser().resolve() if cli_env_path else None
-        if explicit_target and explicit_target != target_yaml_file and explicit_target != target_env_file:
+        if explicit_target and explicit_target != target_yaml_file:
             explicit_target.parent.mkdir(parents=True, exist_ok=True)
             if explicit_target.suffix in (".yaml", ".yml"):
                 if yaml:
                     with open(explicit_target, "w", encoding="utf-8") as f:
                         yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False)
             else:
-                with open(explicit_target, "w", encoding="utf-8") as f:
-                    f.write("# Lollms Client Configuration\n# Generated by wizard\n\n")
-                    for k, v in sorted(config_map.items()):
-                        if v is not None and str(v).strip() != "":
-                            f.write(f"{k}={v}\n")
+                ASCIIColors.warning("⚠️ Non-YAML output format not supported. Skipping.")
 
         primary_saved_path = explicit_target if explicit_target else target_yaml_file
         ASCIIColors.panel(

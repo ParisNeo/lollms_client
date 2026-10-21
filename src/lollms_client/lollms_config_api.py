@@ -35,7 +35,6 @@ from lollms_client.lollms_config_cli_env import (
     _flatten_dict_to_env,
     _sanitize_alias,
     _serialize_config_map_to_yaml,
-    load_env_file,
     load_json_file,
     load_yaml_file,
     _get_binding_description,
@@ -174,60 +173,54 @@ def get_binding_schema(binding_name: str, modality: str) -> List[Dict[str, Any]]
     return schema
 
 
+from pathlib import Path
+from typing import Any, Dict, Optional, Union
+from lollms_client.lollms_config_cli_env import load_yaml_file, _flatten_dict_to_env
+from ascii_colors import ASCIIColors
+
 def load_config_map(
     conf_file: Optional[Union[str, Path]] = None,
     conf_dict: Optional[Dict[str, Any]] = None,
     global_config: bool = True,
-    local_env: bool = True,
 ) -> Dict[str, str]:
     """
     Loads a flat, env-style configuration map from layered sources.
 
     Resolution order (later sources override earlier ones):
-        1. ~/.lollms_client/ global config (yaml + .env)
-        2. Local project files (./.env and ./examples/.env)
-        3. conf_dict (nested structured dict, e.g. from a database JSON column)
-        4. conf_file (yaml / json / env file)
+        1. ~/.lollms_client/config.yaml (global config)
+        2. conf_dict (nested structured dict, e.g. from a database JSON column)
+        3. conf_file (yaml / json dict)
 
     Returns:
         Dict[str, str]: flat map like {"LLM_BINDINGS_MASTER_HOST_ADDRESS": "..."}
     """
     config_map: Dict[str, str] = {}
 
-    if global_config:
-        home_env = _GLOBAL_CONFIG_DIR / ".env"
-        if home_env.exists():
-            config_map.update(load_env_file(home_env))
+    # Load global config first
+    if global_config and _GLOBAL_CONFIG_FILE.exists():
+        try:
+            config_map.update(_flatten_dict_to_env(load_yaml_file(_GLOBAL_CONFIG_FILE)))
+        except Exception as e:
+            ASCIIColors.warning(f"[lollms_config_api] Failed to parse {_GLOBAL_CONFIG_FILE}: {e}")
 
-        if _GLOBAL_CONFIG_FILE.exists():
-            try:
-                config_map.update(_flatten_dict_to_env(load_yaml_file(_GLOBAL_CONFIG_FILE)))
-            except Exception as e:
-                ASCIIColors.warning(f"[lollms_config_api] Failed to parse {_GLOBAL_CONFIG_FILE}: {e}")
-
-    if local_env:
-        for candidate in (Path.cwd() / ".env", Path.cwd() / "examples" / ".env"):
-            if candidate.exists():
-                config_map.update(load_env_file(candidate))
-
+    # Then conf_dict overrides
     if conf_dict:
         config_map.update(_flatten_dict_to_env(conf_dict))
 
+    # Finally, the specified conf_file overrides if provided
     if conf_file:
         p = Path(conf_file).expanduser()
         if not p.exists():
             raise FileNotFoundError(f"Configuration file not found: {p}")
 
-        if p.suffix == ".env":
-            file_data = load_env_file(p)
-        elif p.suffix == ".json":
-            file_data = _flatten_dict_to_env(load_json_file(p))
-        elif p.suffix in (".yaml", ".yml"):
-            file_data = _flatten_dict_to_env(load_yaml_file(p))
+        if p.suffix in (".yaml", ".yml", ".json"):
+            if p.suffix == ".json":
+                file_data = _flatten_dict_to_env(load_json_file(p))
+            else:
+                file_data = _flatten_dict_to_env(load_yaml_file(p))
+            config_map.update(file_data)
         else:
-            raise ValueError(f"Unsupported configuration format: {p.suffix}. Use .yaml, .json, or .env")
-
-        config_map.update(file_data)
+            raise ValueError(f"Unsupported configuration format: {p.suffix}. Use .yaml, .yml, or .json")
 
     return config_map
 
@@ -393,14 +386,33 @@ def set_default_profile(config_map: Dict[str, str], modality: str, alias: str) -
 
 def delete_binding(config_map: Dict[str, str], modality: str, alias: str) -> Dict[str, str]:
     """
-    Removes a binding instance and its parameters. Profiles referencing it are
-    left untouched; the caller may want to delete or re-link them.
+    Removes a binding instance and all profiles referencing it.
+
+    Args:
+        config_map (Dict[str, str]): The configuration map.
+        modality (str): The modality (e.g., llm, tti).
+        alias (str): The alias of the binding to delete.
+
+    Returns:
+        Dict[str, str]: Updated configuration map.
     """
     modality = _validate_modality(modality)
     alias = _sanitize_alias(alias)
-    prefix = f"{modality.upper()}_BINDINGS_{alias.upper()}_"
-    for key in [k for k in list(config_map.keys()) if k.upper().startswith(prefix)]:
+
+    binding_prefix = f"{modality.upper()}_BINDINGS_{alias.upper()}_"
+    profile_prefix = f"{modality.upper()}_PROFILES_"
+
+    # 1. Delete the binding keys
+    for key in [k for k in list(config_map.keys()) if k.startswith(binding_prefix)]:
         del config_map[key]
+
+    # 2. Find and delete profiles referencing this binding
+    for key in [k for k in list(config_map.keys()) if k.endswith("_BINDING_ALIAS") and k.startswith(profile_prefix)]:
+        profile_alias_key = key.replace("_BINDING_ALIAS", "")
+        if config_map.get(key, "").lower() == alias:
+            for profile_key in [k for k in list(config_map.keys()) if k.startswith(profile_alias_key)]:
+                del config_map[profile_key]
+
     return config_map
 
 
@@ -452,14 +464,8 @@ def save_config_map(
     elif suffix == ".json":
         with open(target, "w", encoding="utf-8") as f:
             json.dump(_serialize_config_map_to_yaml(config_map), f, indent=2)
-    elif suffix == ".env":
-        with open(target, "w", encoding="utf-8") as f:
-            f.write("# Lollms Client Configuration\n")
-            for key, value in config_map.items():
-                if value:
-                    f.write(f"{key}={value}\n")
     else:
-        raise ValueError(f"Unsupported configuration format: {suffix}. Use .yaml, .json, or .env")
+        raise ValueError(f"Unsupported configuration format: {suffix}. Use .yaml, .yml, or .json")
 
     return target
 

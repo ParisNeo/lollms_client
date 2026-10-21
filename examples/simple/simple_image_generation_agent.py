@@ -33,6 +33,7 @@ while True:
             user_input,
             streaming_callback=cb,
             enable_image_generation=True,
+            enforce_end_tag=True,
             debug=True
         )
     except Exception as e:
