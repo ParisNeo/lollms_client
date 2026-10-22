@@ -53,7 +53,6 @@ has no such capability.
 | `enable_inline_widgets` | `False` | Artifacts | `<lollms_inline>` widgets |
 | `enable_forms` | `False` | Artifacts | `<lollms_form>` interactivity |
 | `enable_books` | `False` | Artifacts | keyword-gated instructions |
-| `enable_pptx_builder` | `False` | Artifacts | **also mounts pptx_builder tools** |
 | `enable_image_generation` | `True` | Artifacts | TTI capability-gated |
 | `enable_image_editing` | `True` | Artifacts | TTI capability-gated |
 | `forward_artefact_chunks` | `False` | Artifacts | UI streaming events |
@@ -559,8 +558,9 @@ end-of-turn JSON context dump.
 ## Cross-Flag Interactions & Gotchas
 
 1. **Master-switch hierarchy**: `enable_artefacts=False` disables notes, skills,
-   widgets, books, presentations instructions, and image-tag dispatch even when
-   their own flags are `True`.
+   widgets, books instructions, and image-tag dispatch even when their own
+   flags are `True`. (Office-files instructions and tools are governed solely
+   by `enable_office_files`.)
 2. **Discovery ≠ exposure**: LCP libraries are AST-discovered at client
    construction, but the model only sees a library when the per-turn chat flag
    mounts it. A model claiming "I have no such tools" almost always means the
@@ -570,10 +570,10 @@ end-of-turn JSON context dump.
    per-discussion tool registry and no unmount-after-turn cleanup**. Mounts are
    idempotent (`mount_tool_library_if_absent`); re-enabling a flag on later
    turns is a cheap no-op.
-4. **Keyword-gated instructions**: `enable_books`, `enable_pptx_builder`, and
-   `enable_forms` inject their instructions only when trigger keywords appear in
-   the user message, even with the flag enabled. `enable_office_files`
-   instructions are injected unconditionally when the flag is on.
+4. **Keyword-gated instructions**: `enable_books` and `enable_forms` inject
+   their instructions only when trigger keywords appear in the user message,
+   even with the flag enabled. `enable_office_files` instructions are injected
+   unconditionally when the flag is on.
 5. **Negative-polarity flags**: `suppress_images` is inverted — `True` *disables*
    vision hydration rather than enabling a feature.
 6. **Memory sub-flags require the master**: `enable_episodic_memory`,
@@ -601,12 +601,12 @@ discussion.chat(
 **Build a PowerPoint deck (no vision needed)**:
 ```python
 result = discussion.chat(
-    "Create a 5-slide presentation about photosynthesis",
-    enable_pptx_builder=True,
+    "Create a 5-slide presentation (.pptx) about photosynthesis",
+    enable_office_files=True,
 )
 # Recover the deck:
 #   → result["artefacts"] lists the pptx artifact
-#   → tool_pptx_build's workspace_file lives in the discussion working dir
+#   → tool_office_build's workspace_file lives in the discussion working dir
 #   → discussion.artefacts.get("presentation.pptx")
 ```
 

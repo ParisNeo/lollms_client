@@ -4,6 +4,11 @@
 
 ## What it does
 
+This is the **single Office flag** — PowerPoint decks (`.pptx`/`.pptm`) are
+included alongside Word and Excel files. There is no separate presentation
+flag anymore: the former `enable_pptx_builder` and `enable_presentations`
+flags have been removed, and their capabilities are fully covered here.
+
 Mounts the `office_files_builder` LCP toolset — read, create and edit real
 Office files via sandboxed recipe tools:
 
@@ -19,7 +24,10 @@ Supported formats: `.pptx`, `.pptm`, `.docx`, `.docm`, `.xlsx`, `.xlsm`.
 ## What to expect — NO vision gate
 
 The mount is **unconditional** when `True` (text-only workflow: recipe code
-in → markdown inventory out). Recipe code is sandboxed: **no `import`
+in → markdown inventory out). Office-files instructions are likewise injected
+**unconditionally** whenever the flag is on — there is no keyword gate (the
+old keyword-gated presentation instructions were removed with
+`enable_pptx_builder`). Recipe code is sandboxed: **no `import`
 statements are allowed** — the libraries are pre-injected; violations are
 rejected before execution.
 
@@ -53,8 +61,5 @@ result = discussion.chat(
 
 ## Related flags
 
-- [`enable_pptx_builder`](enable_pptx_builder.md) — the presentation-focused
-  sibling: mounts the `pptx_builder` toolset plus keyword-gated presentation
-  artifact instructions.
 - [`enable_data_tools`](enable_data_tools.md) — contextual data/document
   tools (mount only when matching files exist in the workspace).

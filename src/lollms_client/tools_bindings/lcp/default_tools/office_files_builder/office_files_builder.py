@@ -20,6 +20,14 @@ _FORBIDDEN_TOKENS = (
     "globals(", "locals(", "vars(", "getattr(", "setattr(", "delattr(",
 )
 
+# --- Workspace media support (read-only, workspace-contained) ---
+_MEDIA_EXTENSIONS = (
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".tiff", ".ico",
+    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".wmv",
+)
+_MAX_MEDIA_SCAN = 5000
+_MAX_MEDIA_LIST = 2000
+
 # --- OOXML integrity registry (mirrors execute_python_data_query) ---
 OOXML_VALIDATORS = {
     ".xlsx": {"required_parts": ("[Content_Types].xml", "xl/workbook.xml", "xl/_rels/workbook.xml.rels"), "reopener": "openpyxl"},
@@ -80,8 +88,90 @@ def _annotate_traceback(raw_traceback: str, source_code: str, source_name: str) 
     return "\n".join(annotated_lines)
 
 
-def _build_recipe_namespace() -> Dict[str, Any]:
-    """Pre-populates the recipe namespace with per-format design symbols (lazy imports)."""
+def _resolve_media_path(ref: str, working_dir: Path) -> Path:
+    """Resolves a workspace-relative media reference to an absolute path.
+
+    Search order: exact path under the workspace → recursive search by file
+    name (subfolders included). Raises ValueError when the reference is
+    absolute, escapes the workspace, or cannot be found. Read-only: never
+    writes, never returns a path outside `working_dir`.
+    """
+    raw = str(ref or "").strip().strip('"').strip("'")
+    if not raw:
+        raise ValueError("media() received an empty reference.")
+
+    if "\\" in raw:
+        raw = raw.replace("\\", "/")
+    while raw.startswith("./"):
+        raw = raw[2:]
+
+    if Path(raw).is_absolute() or raw.startswith("/"):
+        raise ValueError(
+            f"Media reference '{ref}' must be workspace-relative, not absolute."
+        )
+    if ".." in Path(raw).parts:
+        raise ValueError(
+            f"Media reference '{ref}' must not contain '..' (workspace escape rejected)."
+        )
+
+    root = Path(working_dir).resolve()
+    candidate = (root / raw).resolve()
+    if not candidate.is_relative_to(root):
+        raise ValueError(
+            f"Media reference '{ref}' resolves outside the workspace and was rejected."
+        )
+    if candidate.is_file():
+        return candidate
+
+    # Recursive fallback: search subfolders by file name.
+    target_name = Path(raw).name
+    scanned = 0
+    for hit in root.rglob(target_name):
+        scanned += 1
+        if scanned > _MAX_MEDIA_SCAN:
+            break
+        hit_resolved = hit.resolve()
+        if hit_resolved.is_relative_to(root) and hit_resolved.is_file():
+            return hit_resolved
+
+    raise ValueError(
+        f"Media file '{ref}' not found in workspace (searched recursively, "
+        f"subfolders included). Use list_media() to see available files."
+    )
+
+
+def _list_media_files(working_dir: Path) -> List[str]:
+    """Enumerates media files under the workspace (subfolders included).
+
+    Returns workspace-relative posix-style paths, sorted, capped at
+    _MAX_MEDIA_LIST entries. Never raises.
+    """
+    root = Path(working_dir).resolve()
+    if not root.is_dir():
+        return []
+    found: List[str] = []
+    scanned = 0
+    for entry in root.rglob("*"):
+        scanned += 1
+        if scanned > _MAX_MEDIA_SCAN:
+            break
+        if entry.suffix.lower() in _MEDIA_EXTENSIONS:
+            try:
+                rel = entry.resolve().relative_to(root)
+            except ValueError:
+                continue
+            found.append(rel.as_posix())
+            if len(found) >= _MAX_MEDIA_LIST:
+                break
+    return sorted(found)
+
+
+def _build_recipe_namespace(working_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """Pre-populates the recipe namespace with per-format design symbols (lazy imports).
+
+    When `working_dir` is provided, also injects the read-only workspace media
+    helpers `media(ref) -> str` and `list_media() -> List[str]`.
+    """
     namespace: Dict[str, Any] = {}
 
     # python-pptx symbols (canonical names, as in pptx_builder)
@@ -145,11 +235,20 @@ def _build_recipe_namespace() -> Dict[str, Any]:
     except ImportError:
         ASCIIColors.warning("[office_files_builder] openpyxl unavailable — xlsx recipes disabled.")
 
+    # Read-only workspace media helpers (images/videos usable in recipes).
+    if working_dir is not None:
+        namespace["media"] = lambda ref: str(_resolve_media_path(ref, working_dir))
+        namespace["list_media"] = lambda: _list_media_files(working_dir)
+
     return namespace
 
 
 def _reopen_office_file(path: Path, suffix: str) -> Tuple[bool, str]:
-    """Layer-3 format-aware re-open. Returns (ok, reason). Never raises."""
+    """Layer-3 format-aware re-open. Returns (ok, reason). Never raises.
+
+    Beyond loading, verifies the document is non-degenerate: a pptx must
+    contain at least one slide, a docx at least one paragraph or table.
+    """
     try:
         if suffix in (".xlsx", ".xlsm"):
             from openpyxl import load_workbook
@@ -159,10 +258,14 @@ def _reopen_office_file(path: Path, suffix: str) -> Tuple[bool, str]:
                 load_workbook(path)
         elif suffix in (".docx", ".docm"):
             from docx import Document
-            Document(path)
+            doc = Document(path)
+            if len(doc.paragraphs) == 0 and len(doc.tables) == 0:
+                return False, "re-open succeeded but the document is empty (no paragraphs, no tables)"
         elif suffix in (".pptx", ".pptm"):
             from pptx import Presentation
-            Presentation(path)
+            prs = Presentation(path)
+            if len(prs.slides) == 0:
+                return False, "re-open succeeded but the presentation has zero slides"
         else:
             return True, "ok (layers 1-2 only; no reopener for this format)"
         return True, "ok"
@@ -393,7 +496,8 @@ def tool_office_build(
                 ),
             }
 
-        namespace = _build_recipe_namespace()
+        working_dir = _resolve_working_dir(discussion_instance)
+        namespace = _build_recipe_namespace(working_dir=working_dir)
         try:
             root_obj = _create_root_object(suffix, namespace)
         except KeyError as missing_symbol:
@@ -409,7 +513,7 @@ def tool_office_build(
         if exec_failure is not None:
             return exec_failure
 
-        save_path = _resolve_working_dir(discussion_instance) / file_name
+        save_path = working_dir / file_name
         save_result = _save_and_verify(root_obj, save_path)
         if not save_result["success"]:
             return save_result
@@ -456,7 +560,7 @@ def tool_office_edit(
                 ),
             }
 
-        namespace = _build_recipe_namespace()
+        namespace = _build_recipe_namespace(working_dir=working_dir)
         try:
             root_obj = _open_existing(file_path, namespace)
         except KeyError as missing_symbol:
@@ -480,6 +584,90 @@ def tool_office_edit(
         return {
             "success": False,
             "error": f"Unexpected failure editing office file: {unexpected_err}",
+        }
+
+
+def build_office_presentation(
+    file: str,
+    slides: List[Dict[str, Any]],
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Builds a real .pptx from a structured slide specification.
+
+    This is the structured entry point used by the chat dispatcher when an
+    LLM emits an <artifact type="presentation"> tag: the markdown body is
+    parsed into slide specs upstream, and this helper renders them through
+    the same sandboxed recipe + integrity-verified save path as
+    tool_office_build. Guarantees a valid OOXML file with real slides.
+    """
+    try:
+        file_name = _sanitize_file_name(file, "presentation.pptx")
+        if Path(file_name).suffix.lower() not in (".pptx", ".pptm"):
+            file_name = f"{Path(file_name).stem}.pptx"
+
+        working_dir = _resolve_working_dir(discussion_instance)
+        namespace = _build_recipe_namespace(working_dir=working_dir)
+        try:
+            root_obj = _create_root_object(Path(file_name).suffix.lower(), namespace)
+        except KeyError as missing_symbol:
+            return {
+                "success": False,
+                "error": (
+                    f"python-pptx is not installed (missing symbol: {missing_symbol}). "
+                    "Ask the user to install it and retry."
+                ),
+            }
+
+        prs = root_obj
+        blank_layout = prs.slide_layouts[6]
+
+        for spec in slides or []:
+            slide = prs.slides.add_slide(blank_layout)
+            title = str(spec.get("title", "")).strip()
+            bullets = [str(b).strip() for b in spec.get("bullets", []) if str(b).strip()]
+            body_text = str(spec.get("body", "")).strip()
+
+            if title:
+                title_box = slide.shapes.add_textbox(
+                    namespace["Inches"](0.5), namespace["Inches"](0.4),
+                    namespace["Inches"](12.3), namespace["Inches"](1.2),
+                )
+                title_frame = title_box.text_frame
+                title_frame.text = title
+                title_run = title_frame.paragraphs[0].runs[0]
+                title_run.font.size = namespace["Pt"](36)
+                title_run.font.bold = True
+
+            if bullets or body_text:
+                content_box = slide.shapes.add_textbox(
+                    namespace["Inches"](0.8), namespace["Inches"](1.9),
+                    namespace["Inches"](11.7), namespace["Inches"](5.0),
+                )
+                frame = content_box.text_frame
+                frame.word_wrap = True
+                first = True
+                for bullet in bullets:
+                    paragraph = frame.paragraphs[0] if first else frame.add_paragraph()
+                    first = False
+                    run = paragraph.add_run()
+                    run.text = bullet
+                    run.font.size = namespace["Pt"](20)
+                if body_text and first:
+                    paragraph = frame.paragraphs[0]
+                    run = paragraph.add_run()
+                    run.text = body_text
+                    run.font.size = namespace["Pt"](20)
+
+        save_path = working_dir / file_name
+        save_result = _save_and_verify(root_obj, save_path)
+        if not save_result["success"]:
+            return save_result
+        return _build_result(save_result, save_path)
+    except Exception as unexpected_err:
+        return {
+            "success": False,
+            "error": f"Unexpected failure building presentation: {unexpected_err}",
         }
 
 
@@ -614,6 +802,218 @@ def tool_office_read(
         }
 
 
+# ── Per-format tool aliases (thin wrappers over the generic office tools) ──
+# The generate_slides incident showed the model routes far better to
+# explicitly-named, format-specific tools than to one generic
+# extension-dispatching tool. Each wrapper validates the file suffix matches
+# its format family, then delegates to the single internal path — all
+# sandbox/validation/rollback logic stays in tool_office_* (zero duplication).
+
+_PPTX_SUFFIXES = (".pptx", ".pptm")
+_DOCX_SUFFIXES = (".docx", ".docm")
+_XLSX_SUFFIXES = (".xlsx", ".xlsm")
+
+
+def _require_suffix(
+    file: str,
+    allowed_suffixes: Tuple[str, ...],
+    tool_name: str,
+) -> Optional[Dict[str, Any]]:
+    """Returns a structured failure dict when the file suffix is outside the
+    tool's format family, else None (proceed to delegate)."""
+    actual = Path(str(file or "")).suffix.lower()
+    if actual not in allowed_suffixes:
+        return {
+            "success": False,
+            "error": (
+                f"{tool_name} requires a {'/'.join(allowed_suffixes)} file, "
+                f"got '{actual or '(no extension)'}'. Use the tool matching "
+                f"this file's format instead."
+            ),
+            "code": "wrong_file_type_for_tool",
+        }
+    return None
+
+
+def tool_build_powerpoint(
+    file: str = "presentation.pptx",
+    recipe: str = "",
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Creates a new PowerPoint presentation (.pptx/.pptm) from a sandboxed python-pptx recipe.
+
+    The root object is pre-bound as `prs` (alias `presentation`). Available
+    symbols: Presentation, Inches, Pt, Emu, RGBColor, MSO_SHAPE, MSO_CONNECTOR,
+    MSO_ANCHOR, PP_ALIGN, qn. Recipes are plain Python with NO import statements.
+    """
+    suffix_failure = _require_suffix(file, _PPTX_SUFFIXES, "tool_build_powerpoint")
+    if suffix_failure is not None:
+        return suffix_failure
+    return tool_office_build(
+        file=file, recipe=recipe,
+        discussion_instance=discussion_instance,
+        lollms_client_instance=lollms_client_instance,
+    )
+
+
+def tool_edit_powerpoint(
+    file: str,
+    recipe: str = "",
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Edits an existing PowerPoint presentation (.pptx/.pptm) in place via a sandboxed python-pptx recipe.
+
+    The opened presentation is pre-bound as `prs` (alias `presentation`). The
+    save is transactional: on validation failure the pre-edit bytes are restored.
+    """
+    suffix_failure = _require_suffix(file, _PPTX_SUFFIXES, "tool_edit_powerpoint")
+    if suffix_failure is not None:
+        return suffix_failure
+    return tool_office_edit(
+        file=file, recipe=recipe,
+        discussion_instance=discussion_instance,
+        lollms_client_instance=lollms_client_instance,
+    )
+
+
+def tool_read_powerpoint(
+    file: str,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Reads an existing PowerPoint presentation (.pptx/.pptm) and returns a markdown inventory (slides, shapes, texts, tables)."""
+    suffix_failure = _require_suffix(file, _PPTX_SUFFIXES, "tool_read_powerpoint")
+    if suffix_failure is not None:
+        return suffix_failure
+    return tool_office_read(
+        file=file,
+        discussion_instance=discussion_instance,
+        lollms_client_instance=lollms_client_instance,
+    )
+
+
+def tool_build_word(
+    file: str = "document.docx",
+    recipe: str = "",
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Creates a new Word document (.docx/.docm) from a sandboxed python-docx recipe.
+
+    The root object is pre-bound as `doc`. Available symbols: DocxDocument,
+    DocxInches, DocxPt, DocxRGBColor, WD_ALIGN_PARAGRAPH. Recipes are plain
+    Python with NO import statements.
+    """
+    suffix_failure = _require_suffix(file, _DOCX_SUFFIXES, "tool_build_word")
+    if suffix_failure is not None:
+        return suffix_failure
+    return tool_office_build(
+        file=file, recipe=recipe,
+        discussion_instance=discussion_instance,
+        lollms_client_instance=lollms_client_instance,
+    )
+
+
+def tool_edit_word(
+    file: str,
+    recipe: str = "",
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Edits an existing Word document (.docx/.docm) in place via a sandboxed python-docx recipe.
+
+    The opened document is pre-bound as `doc`. The save is transactional: on
+    validation failure the pre-edit bytes are restored.
+    """
+    suffix_failure = _require_suffix(file, _DOCX_SUFFIXES, "tool_edit_word")
+    if suffix_failure is not None:
+        return suffix_failure
+    return tool_office_edit(
+        file=file, recipe=recipe,
+        discussion_instance=discussion_instance,
+        lollms_client_instance=lollms_client_instance,
+    )
+
+
+def tool_read_word(
+    file: str,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Reads an existing Word document (.docx/.docm) and returns a markdown inventory (paragraphs and tables)."""
+    suffix_failure = _require_suffix(file, _DOCX_SUFFIXES, "tool_read_word")
+    if suffix_failure is not None:
+        return suffix_failure
+    return tool_office_read(
+        file=file,
+        discussion_instance=discussion_instance,
+        lollms_client_instance=lollms_client_instance,
+    )
+
+
+def tool_build_excel(
+    file: str = "workbook.xlsx",
+    recipe: str = "",
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Creates a new Excel workbook (.xlsx/.xlsm) from a sandboxed openpyxl recipe.
+
+    The root objects are pre-bound as `wb` (workbook) and `ws` (active sheet).
+    Available symbols: Workbook, load_workbook, PieChart, LineChart, BarChart,
+    Reference, Font, PatternFill, Alignment, Border, Side, get_column_letter.
+    Recipes are plain Python with NO import statements.
+    """
+    suffix_failure = _require_suffix(file, _XLSX_SUFFIXES, "tool_build_excel")
+    if suffix_failure is not None:
+        return suffix_failure
+    return tool_office_build(
+        file=file, recipe=recipe,
+        discussion_instance=discussion_instance,
+        lollms_client_instance=lollms_client_instance,
+    )
+
+
+def tool_edit_excel(
+    file: str,
+    recipe: str = "",
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Edits an existing Excel workbook (.xlsx/.xlsm) in place via a sandboxed openpyxl recipe.
+
+    The opened workbook is pre-bound as `wb` and its active sheet as `ws`
+    (.xlsm files are opened with keep_vba=True). The save is transactional: on
+    validation failure the pre-edit bytes are restored.
+    """
+    suffix_failure = _require_suffix(file, _XLSX_SUFFIXES, "tool_edit_excel")
+    if suffix_failure is not None:
+        return suffix_failure
+    return tool_office_edit(
+        file=file, recipe=recipe,
+        discussion_instance=discussion_instance,
+        lollms_client_instance=lollms_client_instance,
+    )
+
+
+def tool_read_excel(
+    file: str,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Reads an existing Excel workbook (.xlsx/.xlsm) and returns a markdown inventory (sheets, dimensions, cell previews, formulas)."""
+    suffix_failure = _require_suffix(file, _XLSX_SUFFIXES, "tool_read_excel")
+    if suffix_failure is not None:
+        return suffix_failure
+    return tool_office_read(
+        file=file,
+        discussion_instance=discussion_instance,
+        lollms_client_instance=lollms_client_instance,
+    )
+
+
 def get_tools() -> List[Dict[str, Any]]:
     """
     Returns the tool specifications for the office files builder toolset.
@@ -622,7 +1022,7 @@ def get_tools() -> List[Dict[str, Any]]:
     return [
         {
             "name": "tool_office_build",
-            "description": "Creates a fresh Microsoft Office file (.pptx/.docx/.xlsx/.xlsm/.docm/.pptm) from a recipe. Recipes are plain Python WITHOUT import statements. The sandbox namespace is pre-populated with python-pptx, python-docx, and openpyxl symbols. Saved files are validated against strict OOXML rules and rolled back on failure.",
+            "description": "Creates a fresh Microsoft Office file (.pptx/.docx/.xlsx/.xlsm/.docm/.pptm) from a recipe. Recipes are plain Python WITHOUT import statements. The sandbox namespace is pre-populated with python-pptx, python-docx, and openpyxl symbols, plus media('relative/path.ext') to resolve workspace images/videos (recursive, subfolders included) and list_media() to enumerate them. Saved files are validated against strict OOXML rules and rolled back on failure.",
             "parameters": [
                 {
                     "name": "file",
@@ -650,7 +1050,7 @@ def get_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "tool_office_edit",
-            "description": "Edits an existing Microsoft Office file in place via a recipe. The opened object is pre-bound into the recipe namespace under the same aliases as tool_office_build. The save is transactional: if the edited file fails validation, the pre-edit bytes are restored.",
+            "description": "Edits an existing Microsoft Office file in place via a recipe. The opened object is pre-bound into the recipe namespace under the same aliases as tool_office_build. The namespace also provides media('relative/path.ext') to resolve workspace images/videos (recursive, subfolders included) and list_media() to enumerate them. The save is transactional: if the edited file fails validation, the pre-edit bytes are restored.",
             "parameters": [
                 {
                     "name": "file",
@@ -693,6 +1093,248 @@ def get_tools() -> List[Dict[str, Any]]:
                 {"name": "error", "type": "str", "description": "Error message if failed."},
             ],
             "callable": tool_office_read,
+            "_source": "office_files_builder",
+            "_source_file": __file__,
+        },
+        {
+            "name": "build_office_presentation",
+            "description": "Internal structured entry point: renders a slide specification list into a real .pptx via the sandboxed python-pptx recipe path. Not exposed to the LLM tool grammar; invoked by the chat dispatcher for <artifact type=\"presentation\"> tags.",
+            "parameters": [],
+            "output": [
+                {"name": "success", "type": "bool", "description": "Whether the operation succeeded."},
+                {"name": "workspace_file", "type": "str", "description": "Absolute path to the saved file."},
+                {"name": "file_name", "type": "str", "description": "Name of the saved file."},
+                {"name": "error", "type": "str", "description": "Error message if failed."},
+            ],
+            "callable": build_office_presentation,
+            "_source": "office_files_builder",
+            "_source_file": __file__,
+        },
+        {
+            "name": "tool_build_powerpoint",
+            "description": "Creates a new PowerPoint presentation (.pptx/.pptm) from a sandboxed python-pptx recipe. The root object is pre-bound as `prs` (alias `presentation`). Symbols: Presentation, Inches, Pt, Emu, RGBColor, MSO_SHAPE, MSO_CONNECTOR, MSO_ANCHOR, PP_ALIGN, qn, plus media('relative/path.ext') to resolve workspace images/videos and list_media() to enumerate them. Recipes are plain Python with NO imports.",
+            "parameters": [
+                {
+                    "name": "file",
+                    "type": "str",
+                    "description": "Target .pptx/.pptm file name (default 'presentation.pptx').",
+                    "optional": True,
+                },
+                {
+                    "name": "recipe",
+                    "type": "str",
+                    "description": "Plain Python recipe code (no imports) mutating the pre-bound `prs` presentation object.",
+                    "optional": True,
+                },
+            ],
+            "output": [
+                {"name": "success", "type": "bool", "description": "Whether the operation succeeded."},
+                {"name": "workspace_file", "type": "str", "description": "Absolute path to the saved file."},
+                {"name": "context_files", "type": "list", "description": "List of context files (the saved file)."},
+                {"name": "file_name", "type": "str", "description": "Name of the saved file."},
+                {"name": "error", "type": "str", "description": "Error message if failed."},
+            ],
+            "callable": tool_build_powerpoint,
+            "_source": "office_files_builder",
+            "_source_file": __file__,
+        },
+        {
+            "name": "tool_edit_powerpoint",
+            "description": "Edits an existing PowerPoint presentation (.pptx/.pptm) in place via a sandboxed python-pptx recipe. The opened presentation is pre-bound as `prs`. The namespace also provides media('relative/path.ext') to resolve workspace images/videos and list_media() to enumerate them. Transactional save: pre-edit bytes restored on validation failure.",
+            "parameters": [
+                {
+                    "name": "file",
+                    "type": "str",
+                    "description": "Existing .pptx/.pptm file to edit (relative to workspace or absolute path).",
+                },
+                {
+                    "name": "recipe",
+                    "type": "str",
+                    "description": "Plain Python recipe code (no imports) mutating the opened `prs` presentation object.",
+                    "optional": True,
+                },
+            ],
+            "output": [
+                {"name": "success", "type": "bool", "description": "Whether the operation succeeded."},
+                {"name": "workspace_file", "type": "str", "description": "Absolute path to the saved file."},
+                {"name": "context_files", "type": "list", "description": "List of context files (the saved file)."},
+                {"name": "file_name", "type": "str", "description": "Name of the saved file."},
+                {"name": "error", "type": "str", "description": "Error message if failed."},
+            ],
+            "callable": tool_edit_powerpoint,
+            "_source": "office_files_builder",
+            "_source_file": __file__,
+        },
+        {
+            "name": "tool_read_powerpoint",
+            "description": "Reads an existing PowerPoint presentation (.pptx/.pptm) and returns a markdown inventory (slides, shapes, texts, tables). Validates the file first; corrupt files return a structured failure.",
+            "parameters": [
+                {
+                    "name": "file",
+                    "type": "str",
+                    "description": "Existing .pptx/.pptm file to read (relative to workspace or absolute path).",
+                },
+            ],
+            "output": [
+                {"name": "success", "type": "bool", "description": "Whether the operation succeeded."},
+                {"name": "inventory", "type": "str", "description": "Markdown inventory of the presentation contents."},
+                {"name": "file_name", "type": "str", "description": "Name of the file read."},
+                {"name": "workspace_file", "type": "str", "description": "Absolute path to the file."},
+                {"name": "error", "type": "str", "description": "Error message if failed."},
+            ],
+            "callable": tool_read_powerpoint,
+            "_source": "office_files_builder",
+            "_source_file": __file__,
+        },
+        {
+            "name": "tool_build_word",
+            "description": "Creates a new Word document (.docx/.docm) from a sandboxed python-docx recipe. The root object is pre-bound as `doc`. Symbols: DocxDocument, DocxInches, DocxPt, DocxRGBColor, WD_ALIGN_PARAGRAPH, plus media('relative/path.ext') to resolve workspace images/videos and list_media() to enumerate them. Recipes are plain Python with NO imports.",
+            "parameters": [
+                {
+                    "name": "file",
+                    "type": "str",
+                    "description": "Target .docx/.docm file name (default 'document.docx').",
+                    "optional": True,
+                },
+                {
+                    "name": "recipe",
+                    "type": "str",
+                    "description": "Plain Python recipe code (no imports) mutating the pre-bound `doc` document object.",
+                    "optional": True,
+                },
+            ],
+            "output": [
+                {"name": "success", "type": "bool", "description": "Whether the operation succeeded."},
+                {"name": "workspace_file", "type": "str", "description": "Absolute path to the saved file."},
+                {"name": "context_files", "type": "list", "description": "List of context files (the saved file)."},
+                {"name": "file_name", "type": "str", "description": "Name of the saved file."},
+                {"name": "error", "type": "str", "description": "Error message if failed."},
+            ],
+            "callable": tool_build_word,
+            "_source": "office_files_builder",
+            "_source_file": __file__,
+        },
+        {
+            "name": "tool_edit_word",
+            "description": "Edits an existing Word document (.docx/.docm) in place via a sandboxed python-docx recipe. The opened document is pre-bound as `doc`. The namespace also provides media('relative/path.ext') to resolve workspace images/videos and list_media() to enumerate them. Transactional save: pre-edit bytes restored on validation failure.",
+            "parameters": [
+                {
+                    "name": "file",
+                    "type": "str",
+                    "description": "Existing .docx/.docm file to edit (relative to workspace or absolute path).",
+                },
+                {
+                    "name": "recipe",
+                    "type": "str",
+                    "description": "Plain Python recipe code (no imports) mutating the opened `doc` document object.",
+                    "optional": True,
+                },
+            ],
+            "output": [
+                {"name": "success", "type": "bool", "description": "Whether the operation succeeded."},
+                {"name": "workspace_file", "type": "str", "description": "Absolute path to the saved file."},
+                {"name": "context_files", "type": "list", "description": "List of context files (the saved file)."},
+                {"name": "file_name", "type": "str", "description": "Name of the saved file."},
+                {"name": "error", "type": "str", "description": "Error message if failed."},
+            ],
+            "callable": tool_edit_word,
+            "_source": "office_files_builder",
+            "_source_file": __file__,
+        },
+        {
+            "name": "tool_read_word",
+            "description": "Reads an existing Word document (.docx/.docm) and returns a markdown inventory (paragraphs and tables). Validates the file first; corrupt files return a structured failure.",
+            "parameters": [
+                {
+                    "name": "file",
+                    "type": "str",
+                    "description": "Existing .docx/.docm file to read (relative to workspace or absolute path).",
+                },
+            ],
+            "output": [
+                {"name": "success", "type": "bool", "description": "Whether the operation succeeded."},
+                {"name": "inventory", "type": "str", "description": "Markdown inventory of the document contents."},
+                {"name": "file_name", "type": "str", "description": "Name of the file read."},
+                {"name": "workspace_file", "type": "str", "description": "Absolute path to the file."},
+                {"name": "error", "type": "str", "description": "Error message if failed."},
+            ],
+            "callable": tool_read_word,
+            "_source": "office_files_builder",
+            "_source_file": __file__,
+        },
+        {
+            "name": "tool_build_excel",
+            "description": "Creates a new Excel workbook (.xlsx/.xlsm) from a sandboxed openpyxl recipe. The root objects are pre-bound as `wb` (workbook) and `ws` (active sheet). Symbols: Workbook, load_workbook, PieChart, LineChart, BarChart, Reference, Font, PatternFill, Alignment, Border, Side, get_column_letter, plus media('relative/path.ext') to resolve workspace images/videos and list_media() to enumerate them. Recipes are plain Python with NO imports.",
+            "parameters": [
+                {
+                    "name": "file",
+                    "type": "str",
+                    "description": "Target .xlsx/.xlsm file name (default 'workbook.xlsx').",
+                    "optional": True,
+                },
+                {
+                    "name": "recipe",
+                    "type": "str",
+                    "description": "Plain Python recipe code (no imports) mutating the pre-bound `wb`/`ws` objects.",
+                    "optional": True,
+                },
+            ],
+            "output": [
+                {"name": "success", "type": "bool", "description": "Whether the operation succeeded."},
+                {"name": "workspace_file", "type": "str", "description": "Absolute path to the saved file."},
+                {"name": "context_files", "type": "list", "description": "List of context files (the saved file)."},
+                {"name": "file_name", "type": "str", "description": "Name of the saved file."},
+                {"name": "error", "type": "str", "description": "Error message if failed."},
+            ],
+            "callable": tool_build_excel,
+            "_source": "office_files_builder",
+            "_source_file": __file__,
+        },
+        {
+            "name": "tool_edit_excel",
+            "description": "Edits an existing Excel workbook (.xlsx/.xlsm) in place via a sandboxed openpyxl recipe. The opened workbook is pre-bound as `wb` and its active sheet as `ws` (.xlsm opened with keep_vba=True). The namespace also provides media('relative/path.ext') to resolve workspace images/videos and list_media() to enumerate them. Transactional save: pre-edit bytes restored on validation failure.",
+            "parameters": [
+                {
+                    "name": "file",
+                    "type": "str",
+                    "description": "Existing .xlsx/.xlsm file to edit (relative to workspace or absolute path).",
+                },
+                {
+                    "name": "recipe",
+                    "type": "str",
+                    "description": "Plain Python recipe code (no imports) mutating the opened `wb`/`ws` objects.",
+                    "optional": True,
+                },
+            ],
+            "output": [
+                {"name": "success", "type": "bool", "description": "Whether the operation succeeded."},
+                {"name": "workspace_file", "type": "str", "description": "Absolute path to the saved file."},
+                {"name": "context_files", "type": "list", "description": "List of context files (the saved file)."},
+                {"name": "file_name", "type": "str", "description": "Name of the saved file."},
+                {"name": "error", "type": "str", "description": "Error message if failed."},
+            ],
+            "callable": tool_edit_excel,
+            "_source": "office_files_builder",
+            "_source_file": __file__,
+        },
+        {
+            "name": "tool_read_excel",
+            "description": "Reads an existing Excel workbook (.xlsx/.xlsm) and returns a markdown inventory (sheets, dimensions, cell previews, formulas). Validates the file first; corrupt files return a structured failure.",
+            "parameters": [
+                {
+                    "name": "file",
+                    "type": "str",
+                    "description": "Existing .xlsx/.xlsm file to read (relative to workspace or absolute path).",
+                },
+            ],
+            "output": [
+                {"name": "success", "type": "bool", "description": "Whether the operation succeeded."},
+                {"name": "inventory", "type": "str", "description": "Markdown inventory of the workbook contents."},
+                {"name": "file_name", "type": "str", "description": "Name of the file read."},
+                {"name": "workspace_file", "type": "str", "description": "Absolute path to the file."},
+                {"name": "error", "type": "str", "description": "Error message if failed."},
+            ],
+            "callable": tool_read_excel,
             "_source": "office_files_builder",
             "_source_file": __file__,
         },

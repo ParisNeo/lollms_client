@@ -18,7 +18,6 @@ Browse by category:
 - [enable_inline_widgets.md](enable_inline_widgets.md)
 - [enable_forms.md](enable_forms.md)
 - [enable_books.md](enable_books.md)
-- [enable_pptx_builder.md](enable_pptx_builder.md) — mounts pptx_builder tools (replaces `enable_presentations`)
 - [enable_image_generation.md](enable_image_generation.md)
 - [enable_image_editing.md](enable_image_editing.md)
 - [forward_artefact_chunks.md](forward_artefact_chunks.md)
@@ -41,7 +40,7 @@ Browse by category:
 - [allow_dynamic_tools.md](allow_dynamic_tools.md)
 - [enable_vlm_query.md](enable_vlm_query.md)
 - [enable_computer_use.md](enable_computer_use.md)
-- [enable_office_files.md](enable_office_files.md) — mounts office_files_builder tools (.pptx/.docx/.xlsx)
+- [enable_office_files.md](enable_office_files.md) — mounts office_files_builder tools (.pptx/.docx/.xlsx); the single Office flag (replaces the removed `enable_pptx_builder` / `enable_presentations`)
 - [suppress_images.md](suppress_images.md)
 
 ## Personas & Diagnostics

@@ -685,6 +685,15 @@ RULES:
             "=== IMAGE GENERATION / EDITING ===",
             "You are equipped with a powerful Text-to-Image (TTI) engine to generate and edit images on-the-fly.",
             "",
+            "🚨 IMAGES ARE TAGS, NOT TOOLS (CRITICAL):",
+            "- Image generation and editing are performed EXCLUSIVELY with the `<generate_image>` and",
+            "  `<edit_image>` XML tags. There is NO tool named 'edit_image', 'generate_image',",
+            "  'resize_image', 'image_edit', or any similar name in the tool registry.",
+            "- NEVER wrap an image operation in a `<tool>` JSON call — it will be blocked as a phantom",
+            "  tool. Resizing, cropping, restyling, or modifying ANY existing image = `<edit_image>` tag.",
+            "- If the user references an existing image file (e.g. 'resize my_image.png to 16:9'), the",
+            "  correct action is ALWAYS an `<edit_image>` tag with `sources` and explicit dimensions.",
+            "",
             "🚨 MANDATORY PROTOCOL (READ CAREFULLY):",
             "- If the user asks you to generate, draw, paint, create, or show an image, picture, or illustration",
             "  (or uses equivalent prompt verbs like 'crée une image', 'dessine', 'génère' in any language),",
@@ -701,6 +710,57 @@ RULES:
             '<edit_image name="artifact_name">',
             "  Detailed English prompt describing the edits/modifications...",
             "</edit_image>",
+            "",
+            "Syntax for editing or COMBINING MULTIPLE images (2 or more):",
+            'Add a `sources` attribute with a comma-separated list of workspace image paths.',
+            'The `name` attribute is the OUTPUT file; each entry in `sources` is an INPUT image.',
+            '<edit_image name="combined_result.png" sources="images/portrait.png, images/style_ref.png">',
+            "  Detailed English prompt describing how to blend/combine the source images...",
+            "</edit_image>",
+            "",
+            "SIZE CONTROL (MANDATORY FOR ASPECT-RATIO/RESIZE REQUESTS):",
+            "- Both tags accept `width` and `height` attributes (64–4096).",
+            "- 🚨 CRITICAL: When the user asks to change the aspect ratio, resize, upscale,",
+            "  or set the dimensions of an image (e.g. 'make it 16:9', 'square format',",
+            "  'portrait version', '4:3', 'widescreen'), you MUST translate the request into",
+            "  explicit `width`/`height` attributes on the tag. Describing the aspect ratio",
+            "  inside the prompt text does NOTHING — the engine renders at the tag's",
+            "  dimensions, and without the attributes it keeps the source size unchanged.",
+            "",
+            "COMMON ASPECT RATIO MAPPINGS (use these exact values):",
+            '  16:9 (widescreen) → width="1920" height="1080"',
+            '  16:9 (small)      → width="1280" height="720"',
+            '  9:16 (portrait)   → width="1080" height="1920"',
+            '  1:1  (square)     → width="1024" height="1024"',
+            '  4:3  (classic)    → width="1024" height="768"',
+            '  3:2  (photo)      → width="1536" height="1024"',
+            '  2:3  (portrait)   → width="1024" height="1536"',
+            '  21:9 (cinematic)  → width="2560" height="1080"',
+            "",
+            "✅ CORRECT — user says 'make the image 16:9':",
+            '<edit_image name="my_image.png" width="1920" height="1080">',
+            "  Preserve the subject and composition, extending the scene naturally",
+            "  to fill the wider 16:9 frame.",
+            "</edit_image>",
+            "",
+            "❌ WRONG — aspect ratio written in prose (the size will NOT change):",
+            '<edit_image name="my_image.png">',
+            "  Change the aspect ratio of this image to 16:9...",
+            "</edit_image>",
+            "",
+            "- Omit `width`/`height` ONLY when the user wants the edit at the source",
+            "  image's natural dimensions (content edits, style changes, inpainting).",
+            "",
+            "MULTI-IMAGE RULES:",
+            "- Use `sources` when the user asks to combine, merge, blend, or apply one image's",
+            "  style/content to another (e.g. 'put the logo on the mug', 'blend these two photos').",
+            "- Every entry in `sources` MUST be an existing workspace image path (check the",
+            "  Workspace Directory Tree for exact names).",
+            "- The prompt must explicitly describe the role of EACH source image so the engine",
+            "  knows how to combine them (e.g. 'use the first image as the base scene and apply",
+            "  the second image as the style reference').",
+            "- Without `sources`, the single-image chain applies: the image named by `name` is",
+            "  edited in place (or the last active image is used).",
             "=== END IMAGE INSTRUCTIONS ===",
             "",
         ]
@@ -1232,6 +1292,26 @@ EXAMPLE OF CORRECT FORM:
                     re.DOTALL | re.IGNORECASE | re.MULTILINE,
                 )
 
+                def _resolve_edit_source(ref: str) -> Optional[str]:
+                    """Resolves one image reference: artefact DB pixels → disk twin."""
+                    ref_clean = (ref or '').strip()
+                    if not ref_clean:
+                        return None
+                    a = self.artefacts.get(ref_clean)
+                    if a and a.get('images'):
+                        return a['images'][-1]
+                    try:
+                        from pathlib import Path as _Path
+                        ws_root = _Path(getattr(self, 'workspace_data_path', '') or './data_workspace').resolve()
+                        candidate = (ws_root / ref_clean).resolve()
+                        if str(candidate).startswith(str(ws_root)) and candidate.is_file():
+                            import base64 as _b64
+                            return _b64.b64encode(candidate.read_bytes()).decode('utf-8')
+                    except Exception as disk_ex:
+                        ASCIIColors.warning(
+                            f"<edit_image> disk hydration failed for '{ref_clean}': {disk_ex}")
+                    return None
+
                 def handle_edit(match: re.Match) -> str:
                     attrs  = _parse_attrs(match.group(1))
                     prompt = match.group(2).strip()
@@ -1241,27 +1321,49 @@ EXAMPLE OF CORRECT FORM:
                             if placeholder in v:
                                 attrs[k] = v.replace(placeholder, original)
 
-                    source_b64: Optional[str] = None
-                    artefact_name = attrs.get('name', '')
-                    if artefact_name:
-                        a = self.artefacts.get(artefact_name)
-                        if a and a.get('images'):
-                            source_b64 = a['images'][-1]
-                        else:
-                            ASCIIColors.warning(
-                                f"<edit_image name='{artefact_name}'> — "
-                                "artifact not found or has no images; "
-                                "falling back to last message image.")
-                    if source_b64 is None:
-                        active_imgs = ai_message.get_active_images()
-                        if active_imgs:
-                            source_b64 = active_imgs[-1]
-                    if source_b64 is None:
+                    sources_attr = (attrs.get('sources') or attrs.get('source') or '').strip()
+                    resolved_sources: List[str] = []
+                    if sources_attr:
+                        for ref in sources_attr.split(','):
+                            b64 = _resolve_edit_source(ref.strip())
+                            if b64:
+                                resolved_sources.append(b64)
+                            else:
+                                ASCIIColors.warning(
+                                    f"<edit_image sources> — could not resolve '{ref.strip()}'; skipped.")
+                    else:
+                        artefact_name = attrs.get('name', '')
+                        source_b64 = _resolve_edit_source(artefact_name) if artefact_name else None
+                        if source_b64 is None:
+                            active_imgs = ai_message.get_active_images()
+                            if active_imgs:
+                                source_b64 = active_imgs[-1]
+                        if source_b64 is not None:
+                            resolved_sources.append(source_b64)
+
+                    if not resolved_sources:
                         ASCIIColors.warning(
                             "<edit_image> — no source image available; skipping.")
                         return match.group(0)
+                    edit_width: Optional[int] = None
+                    edit_height: Optional[int] = None
                     try:
-                        img_bytes = tti.edit_image(image=source_b64, prompt=prompt)
+                        if 'width' in attrs:
+                            edit_width = max(64, min(int(attrs['width']), 4096))
+                        if 'height' in attrs:
+                            edit_height = max(64, min(int(attrs['height']), 4096))
+                    except (TypeError, ValueError):
+                        edit_width = None
+                        edit_height = None
+
+                    try:
+                        if edit_width is not None and edit_height is not None:
+                            img_bytes = tti.edit_image(
+                                images=resolved_sources, prompt=prompt,
+                                width=edit_width, height=edit_height,
+                            )
+                        else:
+                            img_bytes = tti.edit_image(images=resolved_sources, prompt=prompt)
                         if img_bytes:
                             import base64
                             edited_b64 = base64.b64encode(img_bytes).decode('utf-8')
@@ -1532,12 +1634,25 @@ EXAMPLE OF CORRECT FORM:
             "- tool_office_edit(file, recipe): open an EXISTING office file and mutate it via a recipe.\n"
             "- tool_office_read(file): inspect an existing file and return a markdown inventory "
             "(slides/paragraphs/sheets/cells).\n"
-            "Recipes are plain Python WITHOUT import statements. The sandbox namespace is pre-populated:\n"
+            "Recipes are plain Python WITHOUT import statements — the sandbox pre-imports everything. "
+            "FORBIDDEN in recipes: import, open(), os., sys., eval, exec, dunders, file/system access. "
+            "Violations are rejected before execution.\n"
+            "The sandbox namespace is pre-populated:\n"
             "- PowerPoint (root object `prs` or `presentation`): Presentation, Inches, Pt, Emu, RGBColor, "
             "MSO_SHAPE, MSO_CONNECTOR, MSO_ANCHOR, PP_ALIGN, qn\n"
             "- Word (root object `doc`): DocxDocument, DocxInches, DocxPt, DocxRGBColor, WD_ALIGN_PARAGRAPH\n"
             "- Excel (root objects `wb` and `ws`): Workbook, load_workbook, PieChart, LineChart, BarChart, "
             "Reference, Font, PatternFill, Alignment, Border, Side, get_column_letter\n"
+            "\n"
+            "WORKSPACE MEDIA (images/videos):\n"
+            "- `media('relative/path.ext')` returns the absolute path of a workspace image/video "
+            "(searched recursively, subfolders included) for embedding in documents.\n"
+            "- `list_media()` returns the available media files as workspace-relative paths.\n"
+            "- Examples: `prs.slides[0].shapes.add_picture(media('images/logo.png'), Inches(1), Inches(2))`, "
+            "`doc.add_picture(media('photos/team.jpg'))`.\n"
+            "- NEVER hardcode absolute paths or use '..' — media references are workspace-relative; "
+            "traversal outside the workspace is rejected.\n"
+            "\n"
             "Saved files land in the working directory and are automatically registered as artifacts.\n"
             "Every save is validated against strict OOXML rules and rolled back on failure "
             "(office_file_failed_validation). If a save fails: set chart width/height BEFORE add_chart(), "

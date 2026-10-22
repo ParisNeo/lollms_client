@@ -8,7 +8,7 @@ from pathlib import Path
 # Initialize client from environment/config
 lc: LollmsClient = get_client_from_env()
 # Create discussion
-images_path = Path(__file__).parent/"images"
+images_path = Path(__file__).parent/"workspaces"
 images_path.mkdir(parents=True, exist_ok=True)
 ld = LollmsDiscussion(lc, workspace_path=images_path)
 
@@ -28,7 +28,9 @@ while True:
             user_input,
             streaming_callback=cb,
             enable_image_generation=True,
+            enable_image_editing=True,
             enforce_end_tag=True,
         )
+        print()
     except Exception as e:
         ASCIIColors.error(f"Error during chat: {e}")

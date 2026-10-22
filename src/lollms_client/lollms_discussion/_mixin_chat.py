@@ -37,6 +37,18 @@ from ._context_sanitizer import scrub_processing_and_status_blocks
 
 _MAX_BRACKET_BUF = 256
 
+# ── Office toolset mount filter ──
+# The office_files_builder library exposes the three generic tools
+# (tool_office_build/edit/read) plus nine per-format aliases
+# (tool_build/edit/read_powerpoint/word/excel). All twelve mount together
+# under enable_office_files; this prefix tuple admits every name.
+_OFFICE_TOOL_NAME_PREFIXES = (
+    "tool_office_",
+    "tool_build_powerpoint", "tool_edit_powerpoint", "tool_read_powerpoint",
+    "tool_build_word", "tool_edit_word", "tool_read_word",
+    "tool_build_excel", "tool_edit_excel", "tool_read_excel",
+)
+
 # ── 🤫 VERBOSE TELEMETRY GATE ──
 # Per-turn verbose logging flag. chat() sets this from its `debug` parameter;
 # telemetry helpers below log ONLY when it is True. Actionable warnings
@@ -2166,6 +2178,96 @@ class _StreamState:
         """Records an informational step that legitimizes a subsequent scratchpad write."""
         object.__setattr__(self.discussion, "_scratchpad_write_streak", 0)
 
+    def _hydrate_single_image_source(self, ref: str) -> Optional[str]:
+        """
+        Resolves one image reference to base64 pixels.
+
+        Hydration chain (AS-IS doctrine):
+        1. Artefact DB pixels (images list).
+        2. Physical twin on disk in the discussion workspace.
+        3. None when neither exists (caller decides fallback semantics).
+        """
+        ref_clean = (ref or "").strip()
+        if not ref_clean:
+            return None
+
+        art = self.discussion.artefacts.get(ref_clean)
+        if art and art.get("images"):
+            return art["images"][-1]
+
+        ws_root = _resolve_tool_workspace_root(self.discussion)
+        try:
+            candidate = (ws_root / ref_clean).resolve()
+            if str(candidate).startswith(str(ws_root)) and candidate.is_file():
+                if candidate.stat().st_size <= _MAX_IMAGE_HYDRATION_BYTES:
+                    return base64.b64encode(candidate.read_bytes()).decode("utf-8")
+                ASCIIColors.warning(
+                    f"[StreamState] Source image '{ref_clean}' exceeds hydration size limit; skipped."
+                )
+        except Exception as hydrate_ex:
+            ASCIIColors.warning(
+                f"[StreamState] Disk hydration failed for '{ref_clean}': "
+                f"{_sanitize_host_paths(str(hydrate_ex))}"
+            )
+        return None
+
+    def _resolve_edit_image_sources(self, title: str, sources_attr: str) -> Tuple[List[str], List[str]]:
+        """
+        Resolves the source images for an <edit_image> dispatch.
+
+        Returns (resolved_b64_list, missing_refs). When `sources_attr` is empty,
+        falls back to the legacy single-source chain (title artefact → disk →
+        last active image) so existing behavior is preserved byte-for-byte.
+        """
+        resolved: List[str] = []
+        missing: List[str] = []
+
+        if sources_attr:
+            for ref in sources_attr.split(","):
+                ref_clean = ref.strip()
+                if not ref_clean:
+                    continue
+                b64 = self._hydrate_single_image_source(ref_clean)
+                if b64:
+                    resolved.append(b64)
+                else:
+                    missing.append(ref_clean)
+            return resolved, missing
+
+        # ── LEGACY SINGLE-SOURCE CHAIN ──
+        b64 = self._hydrate_single_image_source(title)
+        if b64:
+            resolved.append(b64)
+            return resolved, missing
+
+        active_images = self.ai_message.get_active_images() if hasattr(self.ai_message, "get_active_images") else []
+        if active_images:
+            resolved.append(active_images[-1])
+        return resolved, missing
+
+    _ASPECT_RATIO_PROMPT_RE = re.compile(
+        r'(?i)\b(?:'
+        r'\d{1,2}\s*[:x×]\s*\d{1,2}'          # 16:9, 4x3, 16×9
+        r'|aspect\s+ratio'
+        r'|widescreen'
+        r'|cinematic\s+(?:format|ratio|framing)'
+        r'|square\s+(?:format|image|crop|version)'
+        r'|portrait\s+(?:format|orientation|version)'
+        r'|landscape\s+(?:format|orientation|version)'
+        r'|make\s+it\s+(?:bigger|smaller|larger)'
+        r'|resize'
+        r'|upscale'
+        r'|higher\s+resolution'
+        r'|full\s+hd'
+        r'|4k'
+        r')\b'
+    )
+
+    @classmethod
+    def _prompt_requests_size_change(cls, prompt: str) -> bool:
+        """True when an edit prompt semantically requests a size/aspect change."""
+        return bool(cls._ASPECT_RATIO_PROMPT_RE.search(prompt or ""))
+
     def _bump_workspace_revision(self) -> None:
         """Invalidates the cached workspace file scan after a physical file write."""
         try:
@@ -2229,6 +2331,15 @@ class _StreamState:
             is_new = self.discussion.artefacts.get(title) is None
             is_patch = "<<<<<<< SEARCH" in body
             is_scratchpad_target = atype.lower() == "scratchpad" or "scratchpad" in title.lower()
+
+            # ── 🛑 OFFICE FILE GUARD (REAL BINARY DOCTRINE) ──
+            # An <artifact> tag is a text channel: it can never produce a valid
+            # OOXML (ZIP) container. Intercept Office extensions here and build
+            # the real file via the office_files_builder sandbox instead of
+            # materializing markdown bytes with an Office extension.
+            _office_ext = Path(title).suffix.lower()
+            if _office_ext in (".pptx", ".pptm", ".docx", ".docm", ".xlsx", ".xlsm") and not is_patch:
+                return self._dispatch_office_artifact(title, atype, body)
 
             if is_scratchpad_target and self._is_identical_scratchpad_retry(title, body):
                 self._last_dispatch_failed = True
@@ -3081,12 +3192,15 @@ class _StreamState:
 
             width = 1024
             height = 1024
+            explicit_size_requested = False
             try:
                 width = max(64, min(int(attrs.get("width", 1024)), 4096))
+                explicit_size_requested = explicit_size_requested or "width" in attrs
             except (TypeError, ValueError):
                 width = 1024
             try:
                 height = max(64, min(int(attrs.get("height", 1024)), 4096))
+                explicit_size_requested = explicit_size_requested or "height" in attrs
             except (TypeError, ValueError):
                 height = 1024
 
@@ -3103,13 +3217,76 @@ class _StreamState:
             if tag_name == "generate_image" and not prompt:
                 prompt = title
 
-            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
-                status_line = (
-                    f"* 🎨 Generating image '{title}' ({width}×{height}) via the image engine...\nPrompt:{prompt}\n"
-                    
-                    if tag_name == "generate_image"
-                    else f"* 🎨 Editing image '{title}' with the image engine...\nPrompt:{prompt}\n"
+            # ── 🖼️ MULTI-SOURCE RESOLUTION (<edit_image sources="a.png, b.png">) ──
+            # `sources` is a comma-separated list of workspace image references.
+            # Each is hydrated independently (DB pixels → disk twin). When absent,
+            # the legacy single-source chain applies (title → disk → last active).
+            sources_attr = (attrs.get("sources") or attrs.get("source") or "").strip()
+            resolved_sources: List[str] = []
+            missing_sources: List[str] = []
+            if tag_name == "edit_image":
+                resolved_sources, missing_sources = self._resolve_edit_image_sources(title, sources_attr)
+                if resolved_sources:
+                    src_names = sources_attr.split(",") if sources_attr else [title]
+                    src_names = [s.strip() for s in src_names if s.strip()]
+                    ASCIIColors.info(
+                        f"[StreamState] <edit_image> resolved {len(resolved_sources)} source image(s): "
+                        f"{', '.join(src_names)}"
+                        + (f" (missing: {', '.join(missing_sources)})" if missing_sources else "")
+                    )
+
+            # ── 🚨 ASPECT-RATIO GUARD (SELF-CORRECTING FAILURE) ──
+            # An edit prompt that semantically requests a size/aspect change
+            # REQUIRES explicit width/height attributes. Without them the engine
+            # renders at the source dimensions and the request silently fails.
+            # Fail the dispatch with the exact corrective recipe instead.
+            if (
+                tag_name == "edit_image"
+                and not explicit_size_requested
+                and resolved_sources
+                and self._prompt_requests_size_change(prompt)
+            ):
+                ASCIIColors.warning(
+                    "[StreamState] <edit_image> prompt requests a size/aspect change "
+                    "but no width/height attributes were provided. Rejecting with correction."
                 )
+                if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                    correction_block = (
+                        f"\n* ⚠️ Image edit REJECTED: the prompt asks for a size or aspect-ratio change, "
+                        f"but the tag has no `width`/`height` attributes. The engine renders at the "
+                        f"tag's dimensions — without them the image keeps its current size and the "
+                        f"request would silently fail.\n"
+                        f"Re-emit the tag with explicit dimensions, e.g.:\n"
+                        f'<edit_image name="{title}" width="1920" height="1080">\n'
+                        f"  {prompt[:120]}\n"
+                        f"</edit_image>\n"
+                        f"Common ratios: 16:9 → 1920×1080 · 1:1 → 1024×1024 · 9:16 → 1080×1920 · "
+                        f"4:3 → 1024×768 · 21:9 → 2560×1080.\n"
+                        f"<!-- status:failure -->\n</processing>\n"
+                    )
+                    self.ai_message.content += correction_block
+                    _cb(self.callback, correction_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    self._processing_block_open = False
+                self._last_dispatch_failed = True
+                self._last_failure_kind = "edit_image_missing_size"
+                self._action_dispatched = True
+                return True
+
+            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                if tag_name == "generate_image":
+                    status_line = (
+                        f"* 🎨 Generating image '{title}' ({width}×{height}) via the image engine...\nPrompt:{prompt}\n"
+                    )
+                elif sources_attr:
+                    src_display = ", ".join(s.strip() for s in sources_attr.split(",") if s.strip())
+                    status_line = (
+                        f"* 🎨 Editing image '{title}' from {len(resolved_sources)} source(s) "
+                        f"[{src_display}] with the image engine...\nPrompt:{prompt}\n"
+                    )
+                else:
+                    status_line = (
+                        f"* 🎨 Editing image '{title}' with the image engine...\nPrompt:{prompt}\n"
+                    )
                 self.ai_message.content += status_line
                 _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                 self._processing_block_open = True
@@ -3121,32 +3298,24 @@ class _StreamState:
                 if tag_name == "generate_image":
                     img_bytes = tti.generate_image(prompt=prompt, width=width, height=height)
                 else:
-                    source_b64 = None
-                    source_art = self.discussion.artefacts.get(title)
-                    if source_art and source_art.get("images"):
-                        source_b64 = source_art["images"][-1]
-                    if source_b64 is None:
-                        # ── AS-IS DISK HYDRATION FALLBACK ──
-                        # The artefact may be an AS-IS physical image with no DB pixels.
-                        # Read the bytes directly from the workspace file.
-                        try:
-                            ws_root = _resolve_tool_workspace_root(self.discussion)
-                            candidate = (ws_root / title).resolve()
-                            if str(candidate).startswith(str(ws_root)) and candidate.is_file():
-                                source_b64 = base64.b64encode(candidate.read_bytes()).decode("utf-8")
-                                ASCIIColors.info(
-                                    f"[StreamState] Hydrated source image '{title}' from disk for editing."
-                                )
-                        except Exception as hydrate_ex:
-                            ASCIIColors.warning(
-                                f"[StreamState] Disk hydration failed for '{title}': "
-                                f"{_sanitize_host_paths(str(hydrate_ex))}"
-                            )
-                    if source_b64 is None:
-                        source_b64 = self.ai_message.get_active_images()[-1] if self.ai_message.get_active_images() else None
-                    if source_b64 is None:
-                        raise ValueError(f"No source image available to edit for '{title}'.")
-                    img_bytes = tti.edit_image(image=source_b64, prompt=prompt)
+                    if not resolved_sources:
+                        missing_hint = (
+                            f" Missing or unreadable source(s): {', '.join(missing_sources)}."
+                            if missing_sources
+                            else ""
+                        )
+                        raise ValueError(
+                            f"No source image available to edit for '{title}'.{missing_hint} "
+                            f"Use the sources attribute (e.g. sources=\"a.png, b.png\") or ensure "
+                            f"the named image exists in the workspace."
+                        )
+                    if explicit_size_requested:
+                        img_bytes = tti.edit_image(
+                            images=resolved_sources, prompt=prompt,
+                            width=width, height=height,
+                        )
+                    else:
+                        img_bytes = tti.edit_image(images=resolved_sources, prompt=prompt)
                 if img_bytes:
                     img_b64 = base64.b64encode(img_bytes).decode("utf-8")
             except Exception as gen_ex:
@@ -3265,8 +3434,13 @@ class _StreamState:
             else:
                 if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
                     reason = generation_error or "The image engine returned no data."
+                    missing_note = (
+                        f" Unresolved source image(s): {', '.join(missing_sources)}. "
+                        f"Verify the exact file names in the Workspace Directory Tree."
+                        if (tag_name == "edit_image" and missing_sources) else ""
+                    )
                     failure_block = (
-                        f"\n* ❌ Image '{title}' could not be generated. Reason: {reason}\n"
+                        f"\n* ❌ Image '{title}' could not be generated. Reason: {reason}{missing_note}\n"
                         f"<!-- status:failure -->\n</processing>\n"
                     )
                     self.ai_message.content += failure_block
@@ -3370,6 +3544,104 @@ class _StreamState:
     def was_tool_refusal_detected(self) -> bool:
         """Returns True if a <tool> dispatch was refused for a tool-less agent tier."""
         return self._tool_refusal_detected
+
+    def _parse_presentation_markdown(self, body: str) -> List[Dict[str, Any]]:
+        """Parses an <artifact type="presentation"> markdown body into slide specs."""
+        slides: List[Dict[str, Any]] = []
+        current: Optional[Dict[str, Any]] = None
+        for raw_line in (body or "").splitlines():
+            line = raw_line.rstrip()
+            slide_match = re.match(r'^#{2,3}\s*(?:Slide\s*\d+\s*[:.]?\s*)?(.*)$', line, re.IGNORECASE)
+            if slide_match:
+                if current is not None:
+                    slides.append(current)
+                current = {"title": slide_match.group(1).strip(), "bullets": []}
+                continue
+            if current is None:
+                continue
+            bullet_match = re.match(r'^\s*[-*•]\s+(.*)$', line)
+            if bullet_match:
+                current["bullets"].append(bullet_match.group(1).strip())
+                continue
+            text_match = re.match(r'^\*\*[^*]+\*\*\s*:\s*(.*)$', line)
+            if text_match and text_match.group(1).strip():
+                current["bullets"].append(text_match.group(1).strip())
+        if current is not None:
+            slides.append(current)
+        return slides
+
+    def _dispatch_office_artifact(self, title: str, atype: str, body: str) -> bool:
+        """Builds a real Office file from an <artifact> dispatch via the office_files_builder sandbox."""
+        lcp_binding = getattr(self.discussion.lollmsClient, "tools", None)
+        office_builder = None
+        if lcp_binding is not None:
+            for tool_def in getattr(lcp_binding, "discovered_tools", []) or []:
+                if tool_def.get("name") == "build_office_presentation":
+                    office_builder = tool_def.get("callable")
+                    break
+
+        build_result: Optional[Dict[str, Any]] = None
+        if office_builder is not None and atype in ("presentation", "pptx", "powerpoint"):
+            slide_specs = self._parse_presentation_markdown(body)
+            if slide_specs:
+                try:
+                    build_result = office_builder(
+                        file=title,
+                        slides=slide_specs,
+                        discussion_instance=self.discussion,
+                        lollms_client_instance=self.discussion.lollmsClient,
+                    )
+                except Exception as build_ex:
+                    trace_exception(build_ex)
+                    build_result = {"success": False, "error": _sanitize_host_paths(str(build_ex))}
+
+        if build_result is not None and build_result.get("success"):
+            art = self.discussion.artefacts.add(
+                title=title,
+                artefact_type=atype,
+                content=body,
+                active=self.auto_activate,
+            )
+            if art:
+                self.affected_artefacts.append(art)
+                self.discussion._turn_actions_log.append({
+                    "action": "artifact_created",
+                    "title": title,
+                    "type": atype,
+                    "round": getattr(self.discussion, "_current_round", 0),
+                })
+            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                proc_close = (
+                    f"* ✅ Real Office file '{title}' built via the office sandbox "
+                    f"({len(build_result.get('file_name', '')) and build_result.get('file_name') or title}).\n"
+                    f"<!-- status:success -->\n</processing>\n"
+                )
+                self.ai_message.content += proc_close
+                _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                self._processing_block_open = False
+            return True
+
+        # ── FAILURE / TOOLSET UNAVAILABLE: reject with the corrective recipe ──
+        self._last_dispatch_failed = True
+        self._last_failure_kind = "office_artifact_text_rejected"
+        ASCIIColors.warning(
+            f"[StreamState] <artifact> dispatch for Office file '{title}' rejected: "
+            "artifact tags cannot produce binary Office files."
+        )
+        if self._processing_block_open:
+            proc_close = (
+                f"* ⚠️ REJECTED: '{title}' is an Office file. An <artifact> tag writes plain text — "
+                f"it can NEVER produce a valid .pptx/.docx/.xlsx. Use the office tools instead:\n"
+                f"  - `tool_office_build` (create) / `tool_office_edit` (modify) / `tool_office_read` (inspect)\n"
+                f"  - Example: <tool>{{\"name\": \"tool_office_build\", \"parameters\": {{\"file\": \"{title}\", "
+                f"\"recipe\": \"<python-pptx recipe>\"}}}}</tool>\n"
+                f"Do NOT re-emit the <artifact> tag for this file.\n"
+                f"<!-- status:failure -->\n</processing>\n"
+            )
+            self.ai_message.content += proc_close
+            _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            self._processing_block_open = False
+        return True
 
     def _hydrate_image_unlock(self, t_file: str, art: Dict[str, Any], file_ext: str, processed_files: List[str]) -> None:
         """Self-heals pixel hydration for an image artifact targeted by <unlock_file>."""
@@ -4503,7 +4775,6 @@ class ChatMixin:
         auto_approve_python: bool = False,
         confirm_handler: Optional[Callable] = None,
         enable_computer_use: bool = False,
-        enable_pptx_builder: bool = False,
         enable_office_files: bool = False,
         allow_computer_use: Optional[bool] = None,
         **kwargs: Any,
@@ -4608,12 +4879,10 @@ class ChatMixin:
             if enable_code_execution:
                 lcp_binding.mount_tool_library_if_absent("execute_python")
 
-            # ── 1b. UNCONDITIONAL MOUNTING: PPTX / OFFICE BUILDERS ──
-            # Both builders are text-only workflows (recipe code in →
-            # markdown inventory out): no vision capability is required,
-            # so the mounts are unconditional when the flags are set.
-            if enable_pptx_builder:
-                lcp_binding.mount_tool_library_if_absent("pptx_builder")
+            # ── 1b. UNCONDITIONAL MOUNTING: OFFICE FILES BUILDER ──
+            # Office file building (.pptx/.docx/.xlsx) is a text-only workflow
+            # (recipe code in → markdown inventory out): no vision capability
+            # is required, so the mount is unconditional when the flag is set.
             if enable_office_files:
                 lcp_binding.mount_tool_library_if_absent("office_files_builder")
 
@@ -4700,33 +4969,42 @@ class ChatMixin:
         tools=None,
         add_user_message: bool = True,
         images=None,
-        streaming_callback: Optional[Callable[[Any,MSG_TYPE,dict],bool]] = None,
-        remove_thinking_blocks: bool = True,
-        enable_image_generation: bool = True,
-        enable_image_editing:    bool = True,
-        auto_activate_artefacts: bool = True,
+        streaming_callback:           Optional[Callable[[Any,MSG_TYPE,dict],bool]] = None,
+        max_nb_rounds:                Optional[int] = None,
+        max_reasoning_steps:          Optional[int] = None,
+        fast_artefact_replicas:       Optional[List[str]] = None,
+        tolerance_level:              Optional[str] = "strict",
+        memory_manager:               Optional =None,
+        context_compaction_threshold: float = 0.85,
+        event_mode:                   EventMode = EventMode.PROCESSING_TAG_MODE,        
+        think:                        Optional[bool] = None,
+        reasoning_effort:             Optional[str] = None,
+        reasoning_summary:            Optional[str] = None,
+        
+        shell_autonomy_level:         Optional[str] = "safe",
+        python_autonomy_level:        Optional[str] = "safe",
+        confirm_handler:              Optional[Callable] = None,
+
         enable_inline_widgets:        bool = False,
         enable_forms:                 bool = False,
+        remove_thinking_blocks:       bool = True,
+        enable_image_generation:      bool = True,
+        enable_image_editing:         bool = True,
+        auto_activate_artefacts:      bool = True,
         enable_notes:                 bool = True,
         enable_skills:                bool = True,
         enable_books:                 bool = False,
-        enable_pptx_builder:          bool = False,
         enable_office_files:          bool = False,
-        memory_manager=None,
         enable_artefacts:             bool = True,
-        enable_memory:                bool = True,
-        enable_episodic_memory:       bool = True,  # 🆕 NEW: Control episodic memory saving
-        enable_auto_dream:            bool = True,
-        enable_deep_memory_pulling:   bool = True,
-        prehydrate_rag:               bool = True,
+        enable_memory:                bool = False,
+        enable_episodic_memory:       bool = False,  # 🆕 NEW: Control episodic memory saving
+        enable_auto_dream:            bool = False,
+        enable_deep_memory_pulling:   bool = False,
         web_search:                   bool = False,
         internet_search:              bool = False,
-        max_nb_rounds:                Optional[int] = None,
-        max_reasoning_steps:          Optional[int] = None,
         enable_in_message_status:     bool = False,
         forward_artefact_chunks:      bool = False,
-        fast_artefact_replicas:       Optional[List[str]] = None,
-        tolerance_level:              Optional[str] = "strict",
+        prehydrate_rag:               bool = True,
         allow_dynamic_tools:          bool = False,
         enable_data_tools:            bool = True,
         suppress_images:              bool = False,
@@ -4737,20 +5015,13 @@ class ChatMixin:
         verbose:                      bool = False,
         enable_vlm_query:             bool = False,
         enable_computer_use:          bool = False,
-        allow_computer_use:           Optional[bool] = None,
-        context_compaction_threshold: float = 0.85,
-        event_mode:                   EventMode = EventMode.PROCESSING_TAG_MODE,
-        think:                        Optional[bool] = None,
-        reasoning_effort:             Optional[str] = None,
-        reasoning_summary:            Optional[str] = None,
+        allow_computer_use:           bool = False,
         
         enable_code_execution:        bool = False,
         auto_approve_python:          bool = False,
-        shell_autonomy_level:         Optional[str] = "safe",
-        python_autonomy_level:        Optional[str] = "safe",
-        confirm_handler:              Optional[Callable] = None,
         dynamic_effort:               bool = False,
         enforce_end_tag:              bool = False,
+        
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -5060,8 +5331,6 @@ class ChatMixin:
                 extra_instructions += self._build_form_instructions()
             if enable_books and any(kw in user_msg_lower for kw in ("book", "tome", "novel", "chapitre")):
                 extra_instructions += self._build_book_instructions()
-            if enable_pptx_builder and any(kw in user_msg_lower for kw in ("presentation", "slide", "slideshow", "deck", "diaporama")):
-                extra_instructions += self._build_presentation_instructions()
             if enable_office_files:
                 extra_instructions += self._build_office_files_instructions()
 
@@ -5083,6 +5352,44 @@ class ChatMixin:
         _has_tti = getattr(self.lollmsClient, 'tti', None) is not None or bool(getattr(self.lollmsClient, 'tti_model_profiles_registry', None))
         if (enable_image_generation or enable_image_editing) and _has_tti and not orchestrator_persona:
             extra_instructions += self._build_image_generation_instructions()
+            # ── 🖼️ IMAGE EDIT DOCTRINE (EDIT vs GENERATE DECISION) ──
+            # Teaches the model WHEN to edit an existing image instead of
+            # generating a fresh one, and HOW to pass the source reference
+            # plus explicit dimensions for size/aspect-ratio requests.
+            if enable_image_editing:
+                extra_instructions += (
+                    "\n=== IMAGE EDITING PROTOCOL (EDIT vs GENERATE — CRITICAL) ===\n"
+                    "1. **DECISION RULE**: When the user references an EXISTING image (a filename, an "
+                    "artefact title, 'this image', 'the image you made', or any transform verb such as "
+                    "resize, crop, restyle, extend, recolor, upscale, or modify), you MUST use "
+                    "`<edit_image>` — NEVER `<generate_image>`. Generating a fresh image for a "
+                    "modification request destroys the user's original content and is a CRITICAL ERROR.\n"
+                    "2. **SYNTAX**: `<edit_image name=\"OUTPUT_NAME.png\" sources=\"SOURCE.png\" "
+                    "width=\"W\" height=\"H\">editing instruction</edit_image>`\n"
+                    "   - `sources` (REQUIRED): the exact workspace file name(s) of the image(s) to edit, "
+                    "comma-separated for multiple inputs (e.g. `sources=\"ai_is_gonna_kill_us_all.png\"`).\n"
+                    "   - `name`: the output file name for the edited result (kebab-case, descriptive).\n"
+                    "   - `width`/`height` (REQUIRED for any size or aspect-ratio request): the target "
+                    "dimensions. Without them the engine renders at the source size and the request "
+                    "silently fails.\n"
+                    "3. **ASPECT-RATIO TABLE** (emit explicit width/height attributes):\n"
+                    "   - 16:9 → width=\"1920\" height=\"1080\"\n"
+                    "   - 9:16 → width=\"1080\" height=\"1920\"\n"
+                    "   - 1:1 → width=\"1024\" height=\"1024\"\n"
+                    "   - 4:3 → width=\"1024\" height=\"768\"\n"
+                    "   - 21:9 → width=\"2560\" height=\"1080\"\n"
+                    "4. **EXAMPLE** — user asks: 'resize ai_is_gonna_kill_us_all.png to be 16:9':\n"
+                    "<edit_image name=\"ai_is_gonna_kill_us_all_16x9.png\" "
+                    "sources=\"ai_is_gonna_kill_us_all.png\" width=\"1920\" height=\"1080\">\n"
+                    "Resize this image to a 16:9 aspect ratio, preserving the original content and composition.\n"
+                    "</edit_image>\n"
+                    "5. **PROMPT FOCUS**: The tag body describes the CONTENT edit only. Dimensions belong "
+                    "in the attributes, never in the prompt text.\n"
+                    "6. **GENERATION IS ONLY FOR NEW IMAGES**: `<generate_image>` is exclusively for "
+                    "brand-new images from a text prompt with NO source file. If a source image exists, "
+                    "it is an edit — always.\n"
+                    "=== END IMAGE EDITING PROTOCOL ===\n"
+                )
 
         # Vision Capability Instructions (only when the active model profile is vision-capable)
         _turn_has_vision = False
@@ -5392,46 +5699,7 @@ class ChatMixin:
                     "toolset NOT mounted."
                 )
 
-        # ── 7. Mount PPTX Builder Toolset (Unconditional) ──
-        # Presentation building is a text-only workflow (recipe code in →
-        # markdown inventory out): no vision capability is required, so the
-        # mount is unconditional when the flag is set.
-        if enable_pptx_builder:
-            if lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
-                try:
-                    lcp_binding.mount_tool_library_if_absent("pptx_builder")
-                    lcp_tools = lcp_binding.to_chat_tool_specs(
-                        discussion_instance=self,
-                        lollms_client_instance=self.lollmsClient,
-                    )
-                    mounted_pptx_tools = [
-                        t_name for t_name, _t_spec in lcp_tools.items()
-                        if t_name.startswith("tool_pptx_")
-                    ]
-                    for t_name in mounted_pptx_tools:
-                        active_tools[t_name] = lcp_tools[t_name]
-                    if mounted_pptx_tools:
-                        ASCIIColors.success(
-                            f"[ChatMixin] Mounted 'pptx_builder' toolset "
-                            f"({len(mounted_pptx_tools)} tools)."
-                        )
-                    else:
-                        ASCIIColors.warning(
-                            "[ChatMixin] pptx_builder mounted but no tool_pptx_* "
-                            "specs were produced."
-                        )
-                except Exception as ex:
-                    trace_exception(ex)
-                    ASCIIColors.warning(
-                        f"[ChatMixin] Failed to mount pptx_builder toolset: {ex}"
-                    )
-            else:
-                ASCIIColors.warning(
-                    "[ChatMixin] enable_pptx_builder is True, but no LCP binding "
-                    "with mount_tool_library is available — pptx_builder NOT mounted."
-                )
-
-        # ── 7b. Mount Office Files Builder Toolset (Unconditional) ──
+        # ── 7. Mount Office Files Builder Toolset (Unconditional) ──
         # Office file building (.pptx/.docx/.xlsx) is a text-only workflow
         # (recipe code in → markdown inventory out): no vision capability is
         # required, so the mount is unconditional when the flag is set.
@@ -5445,7 +5713,7 @@ class ChatMixin:
                     )
                     mounted_office_tools = [
                         t_name for t_name, _t_spec in lcp_tools.items()
-                        if t_name.startswith("tool_office_")
+                        if t_name.startswith(_OFFICE_TOOL_NAME_PREFIXES)
                     ]
                     for t_name in mounted_office_tools:
                         active_tools[t_name] = lcp_tools[t_name]
@@ -5485,6 +5753,7 @@ class ChatMixin:
                 "   - **IMAGE NAMING DOCTRINE**: Always give generated images a descriptive, kebab-case file name via the `name` attribute — e.g. `<generate_image name=\"white_rabbit_dali.png\">`. You MAY include a subfolder path to organize images — e.g. `name=\"images/white_rabbit_dali.png\"` saves the file into the `images/` subfolder of the workspace (subfolders are created automatically). Never use `generated_image_xxxx` placeholders: pick a name that describes the content.\n"
                 "   - **VIEWING GENERATED IMAGES**: After `<generate_image>` succeeds, the image's real pixels are automatically attached to your context on the next round (if your model has vision) — look at them and verify the result. To view an image in a LATER turn, emit `<unlock_file>path/to/image.png</unlock_file>`. NEVER use `<artifact type=\"image\">` to view, reference, or 'load' an image — it cannot attach pixels and will be rejected.\n"
                 "   - **NEVER SPLIT INTENT AND TAGS**: Never announce what you are going to do and then stop without emitting the tag. If you state intent without outputting the XML tag in the same response, the turn will end with nothing done.\n"
+                "   - **OFFICE FILES ARE NEVER `<artifact>` TAGS**: Real .pptx/.docx/.xlsx files are binary OOXML containers. An `<artifact>` tag writes plain text and can NEVER produce them. Build Office files ONLY with the office tools: `tool_office_build` (create), `tool_office_edit` (modify), `tool_office_read` (inspect). Never emit `<artifact name=\"...pptx\">` — it will be rejected.\n"
                 "   - **DESTRUCTIVE VS CONSTRUCTIVE OPERATIONS**:\n"
                 "     • If an action is risky, destructive, or irreversible (e.g. deleting files, force-pushing git branches, dropping database tables), explicitly ask the user for confirmation and wait for their reply before emitting destructive tags.\n"
                 "     • For ALL normal, constructive tasks (creating/editing files, querying data, reading files, searching memories), output the functional tag IMMEDIATELY in the same turn without asking or waiting.\n"
@@ -7012,6 +7281,21 @@ class ChatMixin:
                             "with editing instructions.\n"
                             "Do NOT re-emit an <artifact> tag for an image.]"
                         )
+                    elif getattr(ss, "_last_failure_kind", None) == "edit_image_missing_size":
+                        ASCIIColors.warning("[ChatMixin] <edit_image> missing size attributes for a resize request. Injecting size correction.")
+                        correction_body = (
+                            "[SYSTEM: Your <edit_image> dispatch was REJECTED because the prompt requests a "
+                            "size or aspect-ratio change but the tag carries no `width`/`height` attributes. "
+                            "The image engine renders at the tag's dimensions: without them, the edit runs at "
+                            "the source size and the aspect ratio does NOT change.\n"
+                            "Re-emit the tag with explicit dimensions. Examples:\n"
+                            '  16:9 → <edit_image name="TITLE" width="1920" height="1080">...\n'
+                            '  1:1  → <edit_image name="TITLE" width="1024" height="1024">...\n'
+                            '  9:16 → <edit_image name="TITLE" width="1080" height="1920">...\n'
+                            '  4:3  → <edit_image name="TITLE" width="1024" height="768">...\n'
+                            "Keep the prompt focused on the CONTENT edit; the dimensions belong in the "
+                            "attributes, never in the prompt text.]"
+                        )
                     elif getattr(ss, "_last_failure_kind", None) == "scratchpad_duplicate":
                         ASCIIColors.warning("[ChatMixin] Identical consecutive scratchpad write blocked. Injecting variation correction.")
                         correction_body = (
@@ -7530,16 +7814,70 @@ class ChatMixin:
 
                         # Inject a targeted correction into virtual history
                         available_tools_str = ", ".join(f"`{t}`" for t in active_tools.keys()) if active_tools else "No tools are available."
-                        correction_msg = (
-                            f"=== ⚠️ INVALID TOOL CALL ===\n"
-                            f"You attempted to call `{tool_name}`, which is **NOT REGISTERED** in this session.\n"
-                            f"You are STRICTLY FORBIDDEN from hallucinating tool names.\n\n"
-                            f"The ONLY tools available to you right now are:\n"
-                            f"{available_tools_str}\n\n"
-                            f"If one of these tools is suitable, output the corrected `<tool>` call now.\n"
-                            f"If NONE of these tools can accomplish the task, DO NOT try to call any tool. "
-                            f"Instead, inform the user that the required tool is not available and complete your response."
-                        )
+
+                        # ── 🖼️ IMAGE-PHANTOM REDIRECTION ──
+                        # Image generation/editing is a TAG capability, not a tool. When the
+                        # model hallucinates an image tool name, redirect it to the correct
+                        # <generate_image>/<edit_image> tag syntax instead of leaving it
+                        # stranded with "no suitable tool".
+                        _IMAGE_PHANTOM_NAMES = {
+                            "edit_image", "generate_image", "resize_image", "image_edit",
+                            "image_generate", "edit_images", "generate_images", "image_resize",
+                            "crop_image", "image_crop", "modify_image", "image_modify",
+                            "create_image", "image_create", "draw_image", "image_draw",
+                        }
+                        _is_image_phantom = tool_name.lower() in _IMAGE_PHANTOM_NAMES
+
+                        if _is_image_phantom:
+                            # Recover the referenced source image from the phantom parameters
+                            # (common keys: sources, source, image, file, file_name, filename, name).
+                            _src_hint = ""
+                            for _pk in ("sources", "source", "image", "file", "file_name", "filename", "name"):
+                                _pv = tool_params.get(_pk)
+                                if isinstance(_pv, str) and _pv.strip():
+                                    _src_hint = _pv.strip()
+                                    break
+                                if isinstance(_pv, list) and _pv and isinstance(_pv[0], str):
+                                    _src_hint = _pv[0].strip()
+                                    break
+                            _src_attr = f' sources="{_src_hint}"' if _src_hint else ""
+                            _w = tool_params.get("width") or tool_params.get("w") or "1920"
+                            _h = tool_params.get("height") or tool_params.get("h") or "1080"
+                            _out_name = (
+                                tool_params.get("output") or tool_params.get("output_name")
+                                or tool_params.get("new_name") or ""
+                            )
+                            _name_attr = f' name="{_out_name}"' if _out_name else ""
+                            correction_msg = (
+                                f"=== ⚠️ INVALID TOOL CALL — IMAGE OPERATIONS ARE TAGS, NOT TOOLS ===\n"
+                                f"You attempted to call `{tool_name}`, which is **NOT REGISTERED** — because image "
+                                f"generation and editing are NOT tools. They are dedicated XML tags.\n\n"
+                                f"**CORRECT ACTION** — emit the tag directly (never inside `<tool>` JSON):\n"
+                                f"```\n"
+                                f'<edit_image{_name_attr}{_src_attr} width="{_w}" height="{_h}">\n'
+                                f"Describe the content edit here (dimensions belong in the attributes, not the prompt).\n"
+                                f"</edit_image>\n"
+                                f"```\n"
+                                f"- `sources`: the exact workspace file name(s) of the image(s) to edit (comma-separated).\n"
+                                f"- `width`/`height`: REQUIRED for any resize or aspect-ratio request.\n"
+                                f"  Common ratios: 16:9 → 1920×1080 · 1:1 → 1024×1024 · 9:16 → 1080×1920 · "
+                                f"4:3 → 1024×768 · 21:9 → 2560×1080.\n"
+                                f"- For a BRAND-NEW image (no source file), use `<generate_image>` instead.\n\n"
+                                f"Re-emit the correct tag now. Do NOT call any tool for image work."
+                            )
+                        else:
+                            correction_msg = (
+                                f"=== ⚠️ INVALID TOOL CALL ===\n"
+                                f"You attempted to call `{tool_name}`, which is **NOT REGISTERED** in this session.\n"
+                                f"You are STRICTLY FORBIDDEN from hallucinating tool names.\n\n"
+                                f"The ONLY tools available to you right now are:\n"
+                                f"{available_tools_str}\n\n"
+                                f"**NOTE**: Image generation/editing is NOT a tool — use the "
+                                f"`<generate_image>`/`<edit_image>` XML tags directly for any image work.\n\n"
+                                f"If one of these tools is suitable, output the corrected `<tool>` call now.\n"
+                                f"If NONE of these tools can accomplish the task, DO NOT try to call any tool. "
+                                f"Instead, inform the user that the required tool is not available and complete your response."
+                            )
 
                         # 🛑 CRITICAL FIX: Sanitize raw_round_text before appending to virtual_history.
                         # The _StreamState emits <processing> blocks into ai_msg.content when it
@@ -7562,6 +7900,9 @@ class ChatMixin:
                         ))
 
                         # 🛑 CRITICAL FIX: If the phantom call has been seen before, break immediately.
+                        # Image-phantom redirections get a fresh budget: the first blocked call
+                        # teaches the tag syntax, and the model's corrected re-emission is a
+                        # DIFFERENT action (a tag, not a tool), so it must not trip the breaker.
                         if not hasattr(self, "_phantom_call_counts"):
                             object.__setattr__(self, "_phantom_call_counts", {})
                         

@@ -718,7 +718,7 @@ def chat(
     enable_notes:                 bool = True,
     enable_skills:                bool = True,
     enable_books:                 bool = False,
-    enable_presentations:         bool = False,
+    enable_office_files:          bool = False,
     memory_manager=None,
     enable_artefacts:             bool = True,
     enable_memory:                bool = True,
@@ -772,7 +772,7 @@ def chat(
 *   `enable_skills` (`bool`): Enables the `<skill>` tag for persistent AI behavior capsules.
 *   `enable_forms` (`bool`): Enables the `<lollms_form>` tag for pausing generation to request structured user input.
 *   `enable_books` (`bool`): Conditionally enables book-specific instructions in the system prompt if the user request matches.
-*   `enable_presentations` (`bool`): Conditionally enables HTML presentation slide instructions.
+*   `enable_office_files` (`bool`): Mounts the unified `office_files_builder` LCP toolset (`tool_office_build` / `tool_office_edit` / `tool_office_read`) for creating, editing, and reading Microsoft Office files — PowerPoint (`.pptx`/`.pptm`), Word (`.docx`/`.docm`), Excel (`.xlsx`/`.xlsm`) — via sandboxed recipe code (no `import` statements; pre-bound root objects `prs`/`doc`/`wb`+`ws`; 3-layer OOXML validation with rollback, failure code `office_file_failed_validation`). Office-file instructions are injected unconditionally whenever the flag is on; there is no keyword gate and no separate presentation flag. Default `False`.
 *   `enable_image_generation` (`bool`): Enables the `<generate_image>` tag if a TTI binding is available.
 *   `enable_image_editing` (`bool`): Enables the `<edit_image>` tag if a TTI binding is available.
 
@@ -785,7 +785,7 @@ The tool registry follows a **Strict Sovereign Opt-In Doctrine**. The system wil
     *   **Dictionary of Callables**: A mapping of tool names to their specification dictionaries (containing `name`, `description`, `parameters`, `callable`). This is used for injecting custom, session-specific functions.
     *   **List of Default Tool Names**: A list of strings matching the names of tools available in the `LCPBinding`'s discovered registry (e.g., `["tool_execute_python_code", "tool_query_database_sql"]`). The orchestrator will resolve these names to their specs and register them. If a requested name is not found in the LCP registry, it is ignored.
 3.  **Auto-Mounted Data Tools**: If `enable_data_tools=True` (Default: `True`) AND data files (`.csv`, `.db`, `.xlsx`) exist in the discussion workspace, the system will automatically mount and register the `semantic_data_engineer` LCP library.
-4.  **Spinoff Sub-Agents (Worker-Tier Only)**: The in-process spinoff sub-agents (`tool_spinoff_code_specialist`, `tool_spinoff_presentation_designer`) are registered ONLY in the Worker persona's tool registry (`orchestrator_mode=False`). The Orchestrator persona NEVER receives them — it never sees tool syntax at all. When the Orchestrator delegates a task, the spawned Worker inherits the spinoff tools through the tools registry resolved once at turn start. This closes the contradictory double-mandate where the Orchestrator was told "you do not execute" while being handed executable tools.
+4.  **Spinoff Sub-Agents (Worker-Tier Only, No Flag)**: The in-process spinoff sub-agents (`tool_spinoff_code_specialist`, `tool_spinoff_presentation_designer`) are registered ONLY in the Worker persona's tool registry (`orchestrator_mode=False`) — automatically, with **no user-facing flag**. The Orchestrator persona NEVER receives them — it never sees tool syntax at all. When the Orchestrator delegates a task, the spawned Worker inherits the spinoff tools through the tools registry resolved once at turn start. This closes the contradictory double-mandate where the Orchestrator was told "you do not execute" while being handed executable tools.
 
 *   `tools` (`Union[Dict[str, Dict[str, Any]], List[str], None]`): A dictionary of external tool specifications OR a list of default LCP tool names to activate.
     
