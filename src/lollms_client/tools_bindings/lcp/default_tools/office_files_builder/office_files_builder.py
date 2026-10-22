@@ -9,16 +9,24 @@ from typing import Any, Dict, List, Optional, Tuple
 from ascii_colors import ASCIIColors
 
 TOOL_LIBRARY_NAME = "Office Files Builder"
-TOOL_LIBRARY_DESC = "Read, create and edit every kind of Microsoft Office file (.pptx, .docx, .xlsx, .xlsm, .docm, .pptm) via sandboxed recipe code. Pre-imported design system: python-pptx, python-docx, openpyxl symbols. Recipes are plain Python with NO import statements; violations are rejected before execution. Every save is verified with a strict three-layer OOXML integrity check before being committed to the workspace."
+TOOL_LIBRARY_DESC = "Read, create and edit every kind of Microsoft Office file (.pptx, .docx, .xlsx, .xlsm, .docm, .pptm) via sandboxed recipe code. Pre-imported design system: python-pptx, python-docx, openpyxl symbols. Recipes are plain Python. Imports are allowed ONLY from the whitelist (pptx.*, docx.*, openpyxl.* and safe stdlib modules); all core design symbols are pre-imported. Do NOT call save() — the tool saves and validates automatically. Every save is verified with a strict three-layer OOXML integrity check before being committed to the workspace."
 TOOL_LIBRARY_ICON = "🧰"
 
 # --- Recipe sandbox limits (mirrors pptx_builder) ---
 _MAX_RECIPE_CHARS = 60_000
 _FORBIDDEN_TOKENS = (
-    "import ", "__import__", "eval(", "exec(", "compile(", "open(",
+    "eval(", "exec(", "compile(", "open(",
     "os.", "sys.", "subprocess", "shutil", "pathlib", "__",
     "globals(", "locals(", "vars(", "getattr(", "setattr(", "delattr(",
 )
+
+# --- Import whitelist (imports are intercepted at __import__, not token-banned) ---
+_IMPORT_PREFIX_WHITELIST = ("pptx.", "docx.", "openpyxl.")
+_SAFE_STDLIB_MODULES = frozenset({
+    "math", "datetime", "random", "json", "statistics", "itertools",
+    "functools", "re", "uuid", "calendar", "decimal", "fractions",
+    "textwrap", "base64", "hashlib", "string", "collections",
+})
 
 # --- Workspace media support (read-only, workspace-contained) ---
 _MEDIA_EXTENSIONS = (
@@ -60,13 +68,51 @@ def init_tools_library(config: dict = None) -> None:
         ASCIIColors.warning(f"[office_files_builder] Failed to ensure all dependencies: {e}")
 
 
+def _safe_import(name: Any, *args: Any, **kwargs: Any) -> Any:
+    """Whitelist gate for recipe imports (installed as __import__ in the sandbox).
+
+    Allows pptx.*, docx.*, openpyxl.* derivatives and curated safe stdlib
+    modules; anything else raises an ImportError naming the allowed list.
+    Accepts the full __import__(name, globals, locals, fromlist, level) signature.
+    """
+    module_name = str(name)
+    root_mod = module_name.split(".")[0]
+    if root_mod in _SAFE_STDLIB_MODULES or any(
+        module_name == prefix.rstrip(".") or module_name.startswith(prefix)
+        for prefix in _IMPORT_PREFIX_WHITELIST
+    ):
+        import importlib
+        return importlib.import_module(module_name)
+    raise ImportError(
+        f"Import '{module_name}' is not allowed in recipes. Allowed imports: pptx.*, docx.*, "
+        "openpyxl.* and safe stdlib modules (math, datetime, random, json, statistics, "
+        "itertools, functools, re, uuid, calendar, decimal, fractions, textwrap, base64, "
+        "hashlib, string, collections). All design symbols are also pre-imported."
+    )
+
+
+def _build_safe_builtins() -> Dict[str, Any]:
+    """Curated builtins for the recipe sandbox: no file/system/eval access,
+    no reflective helpers, and __import__ replaced by the whitelist gate."""
+    import builtins
+    base = {k: v for k, v in vars(builtins).items() if not k.startswith("_")}
+    for dangerous in ("open", "eval", "exec", "compile", "breakpoint", "input",
+                      "exit", "quit", "help", "license", "globals", "locals",
+                      "vars", "getattr", "setattr", "delattr"):
+        base.pop(dangerous, None)
+    base["__import__"] = _safe_import
+    return base
+
+
 def _check_recipe(recipe: str) -> None:
     """Rejects recipes containing forbidden tokens before execution."""
     for token in _FORBIDDEN_TOKENS:
         if token in recipe:
             raise ValueError(
-                f"Forbidden token '{token}' in recipe. Recipes are plain Python with NO imports, "
-                "no file/system access, and no dunder access. Use only the pre-imported design symbols."
+                f"Forbidden token '{token}' in recipe. Recipes are plain Python: imports are "
+                "allowed only from the whitelist (pptx.*, docx.*, openpyxl.* and safe stdlib "
+                "modules), with no file/system access and no dunder access. Prefer the "
+                "pre-imported design symbols."
             )
 
 
@@ -385,11 +431,17 @@ def _exec_recipe(recipe: str, namespace: Dict[str, Any], source_name: str) -> Op
         return {"success": False, "error": str(forbidden_err)}
 
     dedented = textwrap.dedent(recipe)
+    namespace["__builtins__"] = _build_safe_builtins()
     try:
         exec(compile(dedented, source_name, "exec"), namespace)
         return None
     except Exception:
         annotated = _annotate_traceback(traceback.format_exc(), dedented, source_name)
+        if "save(" in annotated and "missing" in annotated:
+            annotated += (
+                "\nHint: the tool saves the file automatically after your recipe — "
+                "remove the save() call."
+            )
         return {"success": False, "error": f"Recipe execution error:\n{annotated}"}
 
 
@@ -455,6 +507,25 @@ def _open_existing(path: Path, namespace: Dict[str, Any]) -> Any:
     raise ValueError(f"Unsupported office file extension: {suffix}")
 
 
+def _pick_effective_root(namespace: Dict[str, Any], suffix: str, original_root: Any) -> Any:
+    """Returns the recipe-rebound root alias when the recipe replaced the
+    pre-bound root object (e.g. `wb = Workbook()`), else the original root.
+
+    This is what makes recipes that build their own document save THEIR
+    object instead of the stale pre-bound one (the empty-excel defect).
+    """
+    aliases = {
+        ".pptx": ("prs", "presentation"), ".pptm": ("prs", "presentation"),
+        ".docx": ("doc",), ".docm": ("doc",),
+        ".xlsx": ("wb",), ".xlsm": ("wb",),
+    }
+    for alias in aliases.get(suffix, ()):
+        candidate = namespace.get(alias)
+        if candidate is not None and candidate is not original_root:
+            return candidate
+    return original_root
+
+
 def _build_result(save_result: Dict[str, Any], save_path: Path) -> Dict[str, Any]:
     """Shapes a successful save result into the pptx_builder result contract."""
     return {
@@ -478,9 +549,14 @@ def tool_office_build(
     - docx: `doc`
     - xlsx: `wb` (workbook) and `ws` (active sheet)
 
+    Recipes are plain Python. Imports are allowed ONLY from the whitelist
+    (pptx.*, docx.*, openpyxl.* and safe stdlib modules); all core design
+    symbols are also pre-imported. The tool saves automatically; calling
+    prs.save()/doc.save()/wb.save() inside the recipe is a no-op — remove it.
+
     Args:
         file: Target file name (default "document.docx"). The extension selects the format.
-        recipe: Plain Python recipe code (no imports) mutating the root object.
+        recipe: Plain Python recipe code mutating the root object.
         discussion_instance: Active discussion session instance.
         lollms_client_instance: Active client instance.
     """
@@ -509,9 +585,16 @@ def tool_office_build(
                 ),
             }
 
+        try:
+            root_obj.save = lambda *args, **kwargs: None  # the tool performs the real validated save
+        except Exception:
+            pass
+
         exec_failure = _exec_recipe(recipe, namespace, "<office_recipe>")
         if exec_failure is not None:
             return exec_failure
+
+        root_obj = _pick_effective_root(namespace, suffix, root_obj)
 
         save_path = working_dir / file_name
         save_result = _save_and_verify(root_obj, save_path)
@@ -534,8 +617,12 @@ def tool_office_edit(
     """Edits an existing Microsoft Office file in place via a recipe.
 
     The opened object is pre-bound into the recipe namespace under the same aliases
-    as tool_office_build (`prs`/`presentation`, `doc`, `wb`/`ws`). The save is
-    transactional: if the edited file fails validation, the pre-edit bytes are restored.
+    as tool_office_build (`prs`/`presentation`, `doc`, `wb`/`ws`). Recipes are plain
+    Python: imports are allowed ONLY from the whitelist (pptx.*, docx.*, openpyxl.*
+    and safe stdlib modules); all core design symbols are also pre-imported. The
+    tool saves automatically; calling prs.save()/doc.save()/wb.save() inside the
+    recipe is a no-op — remove it. The save is transactional: if the edited file
+    fails validation, the pre-edit bytes are restored.
     """
     try:
         if not file or not str(file).strip():
@@ -572,9 +659,16 @@ def tool_office_edit(
                 ),
             }
 
+        try:
+            root_obj.save = lambda *args, **kwargs: None  # the tool performs the real validated save
+        except Exception:
+            pass
+
         exec_failure = _exec_recipe(recipe, namespace, "<office_recipe>")
         if exec_failure is not None:
             return exec_failure
+
+        root_obj = _pick_effective_root(namespace, suffix, root_obj)
 
         save_result = _save_and_verify(root_obj, file_path)
         if not save_result["success"]:
@@ -845,7 +939,10 @@ def tool_build_powerpoint(
 
     The root object is pre-bound as `prs` (alias `presentation`). Available
     symbols: Presentation, Inches, Pt, Emu, RGBColor, MSO_SHAPE, MSO_CONNECTOR,
-    MSO_ANCHOR, PP_ALIGN, qn. Recipes are plain Python with NO import statements.
+    MSO_ANCHOR, PP_ALIGN, qn. Recipes are plain Python: imports are allowed ONLY
+    from the whitelist (pptx.*, docx.*, openpyxl.* and safe stdlib modules); all
+    core design symbols are also pre-imported. The tool saves automatically;
+    calling prs.save() inside the recipe is a no-op — remove it.
     """
     suffix_failure = _require_suffix(file, _PPTX_SUFFIXES, "tool_build_powerpoint")
     if suffix_failure is not None:
@@ -865,8 +962,12 @@ def tool_edit_powerpoint(
 ) -> Dict[str, Any]:
     """Edits an existing PowerPoint presentation (.pptx/.pptm) in place via a sandboxed python-pptx recipe.
 
-    The opened presentation is pre-bound as `prs` (alias `presentation`). The
-    save is transactional: on validation failure the pre-edit bytes are restored.
+    The opened presentation is pre-bound as `prs` (alias `presentation`). Recipes
+    are plain Python: imports are allowed ONLY from the whitelist (pptx.*, docx.*,
+    openpyxl.* and safe stdlib modules); all core design symbols are also
+    pre-imported. The tool saves automatically; calling prs.save() inside the
+    recipe is a no-op — remove it. The save is transactional: on validation
+    failure the pre-edit bytes are restored.
     """
     suffix_failure = _require_suffix(file, _PPTX_SUFFIXES, "tool_edit_powerpoint")
     if suffix_failure is not None:
@@ -904,7 +1005,10 @@ def tool_build_word(
 
     The root object is pre-bound as `doc`. Available symbols: DocxDocument,
     DocxInches, DocxPt, DocxRGBColor, WD_ALIGN_PARAGRAPH. Recipes are plain
-    Python with NO import statements.
+    Python: imports are allowed ONLY from the whitelist (pptx.*, docx.*,
+    openpyxl.* and safe stdlib modules); all core design symbols are also
+    pre-imported. The tool saves automatically; calling doc.save() inside the
+    recipe is a no-op — remove it.
     """
     suffix_failure = _require_suffix(file, _DOCX_SUFFIXES, "tool_build_word")
     if suffix_failure is not None:
@@ -924,8 +1028,12 @@ def tool_edit_word(
 ) -> Dict[str, Any]:
     """Edits an existing Word document (.docx/.docm) in place via a sandboxed python-docx recipe.
 
-    The opened document is pre-bound as `doc`. The save is transactional: on
-    validation failure the pre-edit bytes are restored.
+    The opened document is pre-bound as `doc`. Recipes are plain Python: imports
+    are allowed ONLY from the whitelist (pptx.*, docx.*, openpyxl.* and safe
+    stdlib modules); all core design symbols are also pre-imported. The tool
+    saves automatically; calling doc.save() inside the recipe is a no-op —
+    remove it. The save is transactional: on validation failure the pre-edit
+    bytes are restored.
     """
     suffix_failure = _require_suffix(file, _DOCX_SUFFIXES, "tool_edit_word")
     if suffix_failure is not None:
@@ -964,7 +1072,10 @@ def tool_build_excel(
     The root objects are pre-bound as `wb` (workbook) and `ws` (active sheet).
     Available symbols: Workbook, load_workbook, PieChart, LineChart, BarChart,
     Reference, Font, PatternFill, Alignment, Border, Side, get_column_letter.
-    Recipes are plain Python with NO import statements.
+    Recipes are plain Python: imports are allowed ONLY from the whitelist
+    (pptx.*, docx.*, openpyxl.* and safe stdlib modules); all core design
+    symbols are also pre-imported. The tool saves automatically; calling
+    wb.save() inside the recipe is a no-op — remove it.
     """
     suffix_failure = _require_suffix(file, _XLSX_SUFFIXES, "tool_build_excel")
     if suffix_failure is not None:
@@ -985,8 +1096,12 @@ def tool_edit_excel(
     """Edits an existing Excel workbook (.xlsx/.xlsm) in place via a sandboxed openpyxl recipe.
 
     The opened workbook is pre-bound as `wb` and its active sheet as `ws`
-    (.xlsm files are opened with keep_vba=True). The save is transactional: on
-    validation failure the pre-edit bytes are restored.
+    (.xlsm files are opened with keep_vba=True). Recipes are plain Python:
+    imports are allowed ONLY from the whitelist (pptx.*, docx.*, openpyxl.*
+    and safe stdlib modules); all core design symbols are also pre-imported.
+    The tool saves automatically; calling wb.save() inside the recipe is a
+    no-op — remove it. The save is transactional: on validation failure the
+    pre-edit bytes are restored.
     """
     suffix_failure = _require_suffix(file, _XLSX_SUFFIXES, "tool_edit_excel")
     if suffix_failure is not None:
@@ -1022,7 +1137,7 @@ def get_tools() -> List[Dict[str, Any]]:
     return [
         {
             "name": "tool_office_build",
-            "description": "Creates a fresh Microsoft Office file (.pptx/.docx/.xlsx/.xlsm/.docm/.pptm) from a recipe. Recipes are plain Python WITHOUT import statements. The sandbox namespace is pre-populated with python-pptx, python-docx, and openpyxl symbols, plus media('relative/path.ext') to resolve workspace images/videos (recursive, subfolders included) and list_media() to enumerate them. Saved files are validated against strict OOXML rules and rolled back on failure.",
+            "description": "Creates a fresh Microsoft Office file (.pptx/.docx/.xlsx/.xlsm/.docm/.pptm) from a recipe. Recipes are plain Python. Imports are allowed ONLY from the whitelist (pptx.*, docx.*, openpyxl.* and safe stdlib modules: math, datetime, random, json, statistics, itertools, functools, re, uuid, calendar, decimal, fractions, textwrap, base64, hashlib, string, collections); all core design symbols are pre-imported. Do NOT call save() — the tool saves and validates automatically. The sandbox namespace also provides media('relative/path.ext') to resolve workspace images/videos (recursive, subfolders included) and list_media() to enumerate them. Saved files are validated against strict OOXML rules and rolled back on failure.",
             "parameters": [
                 {
                     "name": "file",
@@ -1033,7 +1148,7 @@ def get_tools() -> List[Dict[str, Any]]:
                 {
                     "name": "recipe",
                     "type": "str",
-                    "description": "Plain Python recipe code (no imports) mutating the root object (prs/presentation for pptx, doc for docx, wb/ws for xlsx).",
+                    "description": "Plain Python recipe code mutating the root object (prs/presentation for pptx, doc for docx, wb/ws for xlsx). Imports allowed only from the whitelist (pptx.*, docx.*, openpyxl.*, safe stdlib). Do NOT call save() — the tool saves automatically.",
                     "optional": True,
                 },
             ],
@@ -1050,7 +1165,7 @@ def get_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "tool_office_edit",
-            "description": "Edits an existing Microsoft Office file in place via a recipe. The opened object is pre-bound into the recipe namespace under the same aliases as tool_office_build. The namespace also provides media('relative/path.ext') to resolve workspace images/videos (recursive, subfolders included) and list_media() to enumerate them. The save is transactional: if the edited file fails validation, the pre-edit bytes are restored.",
+            "description": "Edits an existing Microsoft Office file in place via a recipe. The opened object is pre-bound into the recipe namespace under the same aliases as tool_office_build. Recipes are plain Python: imports are allowed ONLY from the whitelist (pptx.*, docx.*, openpyxl.* and safe stdlib modules); all core design symbols are pre-imported. Do NOT call save() — the tool saves and validates automatically. The namespace also provides media('relative/path.ext') to resolve workspace images/videos (recursive, subfolders included) and list_media() to enumerate them. The save is transactional: if the edited file fails validation, the pre-edit bytes are restored.",
             "parameters": [
                 {
                     "name": "file",
@@ -1060,7 +1175,7 @@ def get_tools() -> List[Dict[str, Any]]:
                 {
                     "name": "recipe",
                     "type": "str",
-                    "description": "Plain Python recipe code (no imports) mutating the opened object.",
+                    "description": "Plain Python recipe code mutating the opened object. Imports allowed only from the whitelist (pptx.*, docx.*, openpyxl.*, safe stdlib). Do NOT call save() — the tool saves automatically.",
                     "optional": True,
                 },
             ],
@@ -1112,7 +1227,7 @@ def get_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "tool_build_powerpoint",
-            "description": "Creates a new PowerPoint presentation (.pptx/.pptm) from a sandboxed python-pptx recipe. The root object is pre-bound as `prs` (alias `presentation`). Symbols: Presentation, Inches, Pt, Emu, RGBColor, MSO_SHAPE, MSO_CONNECTOR, MSO_ANCHOR, PP_ALIGN, qn, plus media('relative/path.ext') to resolve workspace images/videos and list_media() to enumerate them. Recipes are plain Python with NO imports.",
+            "description": "Creates a new PowerPoint presentation (.pptx/.pptm) from a sandboxed python-pptx recipe. The root object is pre-bound as `prs` (alias `presentation`). Symbols: Presentation, Inches, Pt, Emu, RGBColor, MSO_SHAPE, MSO_CONNECTOR, MSO_ANCHOR, PP_ALIGN, qn, plus media('relative/path.ext') to resolve workspace images/videos and list_media() to enumerate them. Recipes are plain Python: imports are allowed ONLY from the whitelist (pptx.*, docx.*, openpyxl.* and safe stdlib modules); all core design symbols are pre-imported. Do NOT call save() — the tool saves and validates automatically.",
             "parameters": [
                 {
                     "name": "file",
@@ -1123,7 +1238,7 @@ def get_tools() -> List[Dict[str, Any]]:
                 {
                     "name": "recipe",
                     "type": "str",
-                    "description": "Plain Python recipe code (no imports) mutating the pre-bound `prs` presentation object.",
+                    "description": "Plain Python recipe code mutating the pre-bound `prs` presentation object. Imports allowed only from the whitelist (pptx.*, docx.*, openpyxl.*, safe stdlib). Do NOT call save() — the tool saves automatically.",
                     "optional": True,
                 },
             ],
@@ -1140,7 +1255,7 @@ def get_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "tool_edit_powerpoint",
-            "description": "Edits an existing PowerPoint presentation (.pptx/.pptm) in place via a sandboxed python-pptx recipe. The opened presentation is pre-bound as `prs`. The namespace also provides media('relative/path.ext') to resolve workspace images/videos and list_media() to enumerate them. Transactional save: pre-edit bytes restored on validation failure.",
+            "description": "Edits an existing PowerPoint presentation (.pptx/.pptm) in place via a sandboxed python-pptx recipe. The opened presentation is pre-bound as `prs`. Recipes are plain Python: imports are allowed ONLY from the whitelist (pptx.*, docx.*, openpyxl.* and safe stdlib modules); all core design symbols are pre-imported. Do NOT call save() — the tool saves and validates automatically. The namespace also provides media('relative/path.ext') to resolve workspace images/videos and list_media() to enumerate them. Transactional save: pre-edit bytes restored on validation failure.",
             "parameters": [
                 {
                     "name": "file",
@@ -1150,7 +1265,7 @@ def get_tools() -> List[Dict[str, Any]]:
                 {
                     "name": "recipe",
                     "type": "str",
-                    "description": "Plain Python recipe code (no imports) mutating the opened `prs` presentation object.",
+                    "description": "Plain Python recipe code mutating the opened `prs` presentation object. Imports allowed only from the whitelist (pptx.*, docx.*, openpyxl.*, safe stdlib). Do NOT call save() — the tool saves automatically.",
                     "optional": True,
                 },
             ],
@@ -1188,7 +1303,7 @@ def get_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "tool_build_word",
-            "description": "Creates a new Word document (.docx/.docm) from a sandboxed python-docx recipe. The root object is pre-bound as `doc`. Symbols: DocxDocument, DocxInches, DocxPt, DocxRGBColor, WD_ALIGN_PARAGRAPH, plus media('relative/path.ext') to resolve workspace images/videos and list_media() to enumerate them. Recipes are plain Python with NO imports.",
+            "description": "Creates a new Word document (.docx/.docm) from a sandboxed python-docx recipe. The root object is pre-bound as `doc`. Symbols: DocxDocument, DocxInches, DocxPt, DocxRGBColor, WD_ALIGN_PARAGRAPH, plus media('relative/path.ext') to resolve workspace images/videos and list_media() to enumerate them. Recipes are plain Python: imports are allowed ONLY from the whitelist (pptx.*, docx.*, openpyxl.* and safe stdlib modules); all core design symbols are pre-imported. Do NOT call save() — the tool saves and validates automatically.",
             "parameters": [
                 {
                     "name": "file",
@@ -1199,7 +1314,7 @@ def get_tools() -> List[Dict[str, Any]]:
                 {
                     "name": "recipe",
                     "type": "str",
-                    "description": "Plain Python recipe code (no imports) mutating the pre-bound `doc` document object.",
+                    "description": "Plain Python recipe code mutating the pre-bound `doc` document object. Imports allowed only from the whitelist (pptx.*, docx.*, openpyxl.*, safe stdlib). Do NOT call save() — the tool saves automatically.",
                     "optional": True,
                 },
             ],
@@ -1216,7 +1331,7 @@ def get_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "tool_edit_word",
-            "description": "Edits an existing Word document (.docx/.docm) in place via a sandboxed python-docx recipe. The opened document is pre-bound as `doc`. The namespace also provides media('relative/path.ext') to resolve workspace images/videos and list_media() to enumerate them. Transactional save: pre-edit bytes restored on validation failure.",
+            "description": "Edits an existing Word document (.docx/.docm) in place via a sandboxed python-docx recipe. The opened document is pre-bound as `doc`. Recipes are plain Python: imports are allowed ONLY from the whitelist (pptx.*, docx.*, openpyxl.* and safe stdlib modules); all core design symbols are pre-imported. Do NOT call save() — the tool saves and validates automatically. The namespace also provides media('relative/path.ext') to resolve workspace images/videos and list_media() to enumerate them. Transactional save: pre-edit bytes restored on validation failure.",
             "parameters": [
                 {
                     "name": "file",
@@ -1226,7 +1341,7 @@ def get_tools() -> List[Dict[str, Any]]:
                 {
                     "name": "recipe",
                     "type": "str",
-                    "description": "Plain Python recipe code (no imports) mutating the opened `doc` document object.",
+                    "description": "Plain Python recipe code mutating the opened `doc` document object. Imports allowed only from the whitelist (pptx.*, docx.*, openpyxl.*, safe stdlib). Do NOT call save() — the tool saves automatically.",
                     "optional": True,
                 },
             ],
@@ -1264,7 +1379,7 @@ def get_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "tool_build_excel",
-            "description": "Creates a new Excel workbook (.xlsx/.xlsm) from a sandboxed openpyxl recipe. The root objects are pre-bound as `wb` (workbook) and `ws` (active sheet). Symbols: Workbook, load_workbook, PieChart, LineChart, BarChart, Reference, Font, PatternFill, Alignment, Border, Side, get_column_letter, plus media('relative/path.ext') to resolve workspace images/videos and list_media() to enumerate them. Recipes are plain Python with NO imports.",
+            "description": "Creates a new Excel workbook (.xlsx/.xlsm) from a sandboxed openpyxl recipe. The root objects are pre-bound as `wb` (workbook) and `ws` (active sheet). Symbols: Workbook, load_workbook, PieChart, LineChart, BarChart, Reference, Font, PatternFill, Alignment, Border, Side, get_column_letter, plus media('relative/path.ext') to resolve workspace images/videos and list_media() to enumerate them. Recipes are plain Python: imports are allowed ONLY from the whitelist (pptx.*, docx.*, openpyxl.* and safe stdlib modules); all core design symbols are pre-imported. Do NOT call save() — the tool saves and validates automatically.",
             "parameters": [
                 {
                     "name": "file",
@@ -1275,7 +1390,7 @@ def get_tools() -> List[Dict[str, Any]]:
                 {
                     "name": "recipe",
                     "type": "str",
-                    "description": "Plain Python recipe code (no imports) mutating the pre-bound `wb`/`ws` objects.",
+                    "description": "Plain Python recipe code mutating the pre-bound `wb`/`ws` objects. Imports allowed only from the whitelist (pptx.*, docx.*, openpyxl.*, safe stdlib). Do NOT call save() — the tool saves automatically.",
                     "optional": True,
                 },
             ],
@@ -1292,7 +1407,7 @@ def get_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "tool_edit_excel",
-            "description": "Edits an existing Excel workbook (.xlsx/.xlsm) in place via a sandboxed openpyxl recipe. The opened workbook is pre-bound as `wb` and its active sheet as `ws` (.xlsm opened with keep_vba=True). The namespace also provides media('relative/path.ext') to resolve workspace images/videos and list_media() to enumerate them. Transactional save: pre-edit bytes restored on validation failure.",
+            "description": "Edits an existing Excel workbook (.xlsx/.xlsm) in place via a sandboxed openpyxl recipe. The opened workbook is pre-bound as `wb` and its active sheet as `ws` (.xlsm opened with keep_vba=True). Recipes are plain Python: imports are allowed ONLY from the whitelist (pptx.*, docx.*, openpyxl.* and safe stdlib modules); all core design symbols are pre-imported. Do NOT call save() — the tool saves and validates automatically. The namespace also provides media('relative/path.ext') to resolve workspace images/videos and list_media() to enumerate them. Transactional save: pre-edit bytes restored on validation failure.",
             "parameters": [
                 {
                     "name": "file",
@@ -1302,7 +1417,7 @@ def get_tools() -> List[Dict[str, Any]]:
                 {
                     "name": "recipe",
                     "type": "str",
-                    "description": "Plain Python recipe code (no imports) mutating the opened `wb`/`ws` objects.",
+                    "description": "Plain Python recipe code mutating the opened `wb`/`ws` objects. Imports allowed only from the whitelist (pptx.*, docx.*, openpyxl.*, safe stdlib). Do NOT call save() — the tool saves automatically.",
                     "optional": True,
                 },
             ],

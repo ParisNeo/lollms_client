@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-22 15:34]
+
+- fix(tools): update office_files_builder tool binding
+
 ## [2026-10-22 11:37]
 
 - docs(flags): consolidate presentation flags into `enable_office_files`
