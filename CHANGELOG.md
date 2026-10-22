@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-22 00:08]
+
+- feat(chat): enhance image artefact naming and add office files builder prompt instructions
+
 ## [2026-10-21 23:29]
 
 - feat: add boolean flags documentation and update chat bindings

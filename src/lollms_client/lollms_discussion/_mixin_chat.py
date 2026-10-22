@@ -3049,6 +3049,12 @@ class _StreamState:
             title = _normalize_image_workspace_path(
                 raw_title, default_stem=f"generated_image_{uuid.uuid4().hex[:6]}"
             )
+            # Preserve the LLM-provided name as the canonical artefact title when
+            # it is a bare name (no path separators, no image extension): the
+            # artefact must be retrievable by the exact name the model used.
+            if raw_title and "/" not in raw_title and "\\" not in raw_title \
+                    and Path(raw_title).suffix.lower() not in _IMAGE_ALLOWED_EXTS:
+                title = raw_title
             prompt = (body or "").strip()
             tti = getattr(self.discussion.lollmsClient, "tti", None)
             if tti is None:
@@ -3185,7 +3191,9 @@ class _StreamState:
                         title=img_rel_path,
                         artefact_type="image",
                         content=meta_card,
-                        active=False,
+                        images=[img_b64],
+                        image_media_types=["image/png"],
+                        active=self.auto_activate,
                         visibility=ArtefactVisibility.TREE_UNLOCKABLE
                     )
                 else:

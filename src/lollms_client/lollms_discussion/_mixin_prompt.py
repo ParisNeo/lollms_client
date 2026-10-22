@@ -1416,3 +1416,37 @@ EXAMPLE OF CORRECT FORM:
                     "[silent-artifact guard] Auto-generated explanation appended.")
 
         return cleaned, affected_artefacts
+
+    def _build_office_files_instructions(self) -> str:
+        """
+        Builds the system-prompt instruction block for the office_files_builder
+        toolset (mounted when enable_office_files=True).
+
+        Pure string provider: no state mutation, no I/O, never raises. The
+        content mirrors the on-disk office_files_builder contract (tool names,
+        pre-populated recipe namespace, root-object bindings, transactional
+        save semantics with OOXML validation and rollback).
+        """
+        return (
+            "\n=== OFFICE FILES BUILDER TOOLSET ===\n"
+            "You can create, edit, and read Microsoft Office files with three tools:\n"
+            "- tool_office_build(file, recipe): create a NEW .docx/.docm (Word), "
+            ".xlsx/.xlsm (Excel), or .pptx/.pptm (PowerPoint) file.\n"
+            "- tool_office_edit(file, recipe): open an EXISTING office file and mutate it via a recipe.\n"
+            "- tool_office_read(file): inspect an existing file and return a markdown inventory "
+            "(slides/paragraphs/sheets/cells).\n"
+            "Recipes are plain Python WITHOUT import statements. The sandbox namespace is pre-populated:\n"
+            "- PowerPoint (root object `prs` or `presentation`): Presentation, Inches, Pt, Emu, RGBColor, "
+            "MSO_SHAPE, MSO_CONNECTOR, MSO_ANCHOR, PP_ALIGN, qn\n"
+            "- Word (root object `doc`): DocxDocument, DocxInches, DocxPt, DocxRGBColor, WD_ALIGN_PARAGRAPH\n"
+            "- Excel (root objects `wb` and `ws`): Workbook, load_workbook, PieChart, LineChart, BarChart, "
+            "Reference, Font, PatternFill, Alignment, Border, Side, get_column_letter\n"
+            "Saved files land in the working directory and are automatically registered as artifacts.\n"
+            "Every save is validated against strict OOXML rules and rolled back on failure "
+            "(office_file_failed_validation). If a save fails: set chart width/height BEFORE add_chart(), "
+            "anchor charts away from data/helper ranges, and precompute aggregate values as Python literals "
+            "instead of formulas feeding charts — then retry with corrected code.\n"
+            "Use this toolset whenever the user asks for Word documents, Excel spreadsheets, or "
+            "PowerPoint presentations, or asks to read or modify such files.\n"
+            "=== END OFFICE FILES BUILDER TOOLSET ===\n"
+        )
