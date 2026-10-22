@@ -344,20 +344,20 @@ class LollmsClient():
         _eagerly_instantiate_default(self.rag_model_profiles_registry, self.switch_rag, "RAG")
 
         # Post-init: Surface silent failures for modalities with profiles but no active binding
-        modalities_to_check = [
-            ("TTI", self.tti_model_profiles_registry, self.tti, "tti"),
-            ("TTS", self.tts_model_profiles_registry, self.tts, "tts"),
-            ("STT", self.stt_model_profiles_registry, self.stt, "stt"),
-            ("TTV", self.ttv_model_profiles_registry, self.ttv, "ttv"),
-            ("TTM", self.ttm_model_profiles_registry, self.ttm, "ttm"),
-        ]
-        for name, registry, binding, key in modalities_to_check:
-            if not binding and registry:
-                err = self._binding_init_errors.get(key, "Unknown initialization error")
-                ASCIIColors.error(
-                    f"[LollmsClient] {name} binding failed to initialize despite existing profiles. "
-                    f"Error: {err}. Check your configuration or server status."
-                )
+        # modalities_to_check = [
+        #     ("TTI", self.tti_model_profiles_registry, self.tti, "tti"),
+        #     ("TTS", self.tts_model_profiles_registry, self.tts, "tts"),
+        #     ("STT", self.stt_model_profiles_registry, self.stt, "stt"),
+        #     ("TTV", self.ttv_model_profiles_registry, self.ttv, "ttv"),
+        #     ("TTM", self.ttm_model_profiles_registry, self.ttm, "ttm"),
+        # ]
+        # for name, registry, binding, key in modalities_to_check:
+        #     if not binding and registry:
+        #         err = self._binding_init_errors.get(key, "Unknown initialization error")
+        #         ASCIIColors.error(
+        #             f"[LollmsClient] {name} binding failed to initialize despite existing profiles. "
+        #             f"Error: {err}. Check your configuration or server status."
+        #         )
 
         # Automatically persist resolved single defaults to disk so warnings never repeat
         if resolved_defaults_to_save:
