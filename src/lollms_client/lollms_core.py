@@ -334,30 +334,30 @@ class LollmsClient():
                 "These profiles will fall back to the server's default model."
             )
 
-        _eagerly_instantiate_default(self.llm_model_profiles_registry, self.switch_model, "LLM")
-        _eagerly_instantiate_default(self.tts_model_profiles_registry, self.switch_tts, "TTS")
-        _eagerly_instantiate_default(self.tti_model_profiles_registry, self.switch_tti, "TTI")
-        _eagerly_instantiate_default(self.stt_model_profiles_registry, self.switch_stt, "STT")
-        _eagerly_instantiate_default(self.ttv_model_profiles_registry, self.switch_ttv, "TTV")
-        _eagerly_instantiate_default(self.ttm_model_profiles_registry, self.switch_ttm, "TTM")
-        _eagerly_instantiate_default(self.connection_model_profiles_registry, self.switch_connection, "CONNECTION")
-        _eagerly_instantiate_default(self.rag_model_profiles_registry, self.switch_rag, "RAG")
+        # _eagerly_instantiate_default(self.llm_model_profiles_registry, self.switch_model, "LLM")
+        # _eagerly_instantiate_default(self.tts_model_profiles_registry, self.switch_tts, "TTS")
+        # _eagerly_instantiate_default(self.tti_model_profiles_registry, self.switch_tti, "TTI")
+        # _eagerly_instantiate_default(self.stt_model_profiles_registry, self.switch_stt, "STT")
+        # _eagerly_instantiate_default(self.ttv_model_profiles_registry, self.switch_ttv, "TTV")
+        # _eagerly_instantiate_default(self.ttm_model_profiles_registry, self.switch_ttm, "TTM")
+        # _eagerly_instantiate_default(self.connection_model_profiles_registry, self.switch_connection, "CONNECTION")
+        # _eagerly_instantiate_default(self.rag_model_profiles_registry, self.switch_rag, "RAG")
 
-        # Post-init: Surface silent failures for modalities with profiles but no active binding
-        modalities_to_check = [
-            ("TTI", self.tti_model_profiles_registry, self.tti, "tti"),
-            ("TTS", self.tts_model_profiles_registry, self.tts, "tts"),
-            ("STT", self.stt_model_profiles_registry, self.stt, "stt"),
-            ("TTV", self.ttv_model_profiles_registry, self.ttv, "ttv"),
-            ("TTM", self.ttm_model_profiles_registry, self.ttm, "ttm"),
-        ]
-        for name, registry, binding, key in modalities_to_check:
-            if not binding and registry:
-                err = self._binding_init_errors.get(key, "Unknown initialization error")
-                ASCIIColors.error(
-                    f"[LollmsClient] {name} binding failed to initialize despite existing profiles. "
-                    f"Error: {err}. Check your configuration or server status."
-                )
+        # # Post-init: Surface silent failures for modalities with profiles but no active binding
+        # modalities_to_check = [
+        #     ("TTI", self.tti_model_profiles_registry, self.tti, "tti"),
+        #     ("TTS", self.tts_model_profiles_registry, self.tts, "tts"),
+        #     ("STT", self.stt_model_profiles_registry, self.stt, "stt"),
+        #     ("TTV", self.ttv_model_profiles_registry, self.ttv, "ttv"),
+        #     ("TTM", self.ttm_model_profiles_registry, self.ttm, "ttm"),
+        # ]
+        # for name, registry, binding, key in modalities_to_check:
+        #     if not binding and registry:
+        #         err = self._binding_init_errors.get(key, "Unknown initialization error")
+        #         ASCIIColors.error(
+        #             f"[LollmsClient] {name} binding failed to initialize despite existing profiles. "
+        #             f"Error: {err}. Check your configuration or server status."
+        #         )
 
         # Automatically persist resolved single defaults to disk so warnings never repeat
         if resolved_defaults_to_save:
