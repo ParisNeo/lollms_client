@@ -1,4 +1,7 @@
 import re
+import shutil
+import subprocess
+import tempfile
 import textwrap
 import traceback
 import zipfile
@@ -134,13 +137,37 @@ def _annotate_traceback(raw_traceback: str, source_code: str, source_name: str) 
     return "\n".join(annotated_lines)
 
 
-def _resolve_media_path(ref: str, working_dir: Path) -> Path:
+def _candidate_working_dirs(working_dir: Optional[Path]) -> List[Path]:
+    """Enumerates the roots a media reference may be anchored to.
+
+    The artifact/image engine and the office tool may anchor to different
+    bases (discussion workspace vs process CWD). Returns every distinct,
+    existing directory among them, `working_dir` first.
+    """
+    roots: List[Path] = []
+    for base in (working_dir, Path(".").resolve()):
+        if base is None:
+            continue
+        try:
+            resolved = Path(base).resolve()
+        except Exception:
+            continue
+        if resolved.is_dir() and resolved not in roots:
+            roots.append(resolved)
+    return roots
+
+
+def _resolve_media_path(ref: str, working_dir: Optional[Path]) -> Path:
     """Resolves a workspace-relative media reference to an absolute path.
 
-    Search order: exact path under the workspace → recursive search by file
-    name (subfolders included). Raises ValueError when the reference is
-    absolute, escapes the workspace, or cannot be found. Read-only: never
-    writes, never returns a path outside `working_dir`.
+    Search order, per candidate root (discussion workspace, then CWD):
+    1. exact path under the root;
+    2. recursive search by file name (subfolders included, case-insensitive
+       on case-insensitive filesystems).
+    Raises ValueError when the reference is absolute, escapes every root,
+    or cannot be found — the error lists the roots searched and the media
+    files available so the caller can self-correct. Read-only: never writes,
+    never returns a path outside a candidate root.
     """
     raw = str(ref or "").strip().strip('"').strip("'")
     if not raw:
@@ -160,29 +187,41 @@ def _resolve_media_path(ref: str, working_dir: Path) -> Path:
             f"Media reference '{ref}' must not contain '..' (workspace escape rejected)."
         )
 
-    root = Path(working_dir).resolve()
-    candidate = (root / raw).resolve()
-    if not candidate.is_relative_to(root):
+    roots = _candidate_working_dirs(working_dir)
+    if not roots:
         raise ValueError(
-            f"Media reference '{ref}' resolves outside the workspace and was rejected."
+            f"Media file '{ref}' could not be resolved: no accessible workspace directory."
         )
-    if candidate.is_file():
-        return candidate
 
-    # Recursive fallback: search subfolders by file name.
     target_name = Path(raw).name
-    scanned = 0
-    for hit in root.rglob(target_name):
-        scanned += 1
-        if scanned > _MAX_MEDIA_SCAN:
-            break
-        hit_resolved = hit.resolve()
-        if hit_resolved.is_relative_to(root) and hit_resolved.is_file():
-            return hit_resolved
+    searched_roots: List[str] = []
+    for root in roots:
+        searched_roots.append(str(root))
+        candidate = (root / raw).resolve()
+        if candidate.is_relative_to(root) and candidate.is_file():
+            return candidate
 
+    # Recursive fallback: search subfolders by file name in every root.
+    for root in roots:
+        scanned = 0
+        for hit in root.rglob(target_name):
+            scanned += 1
+            if scanned > _MAX_MEDIA_SCAN:
+                break
+            hit_resolved = hit.resolve()
+            if hit_resolved.is_relative_to(root) and hit_resolved.is_file():
+                return hit_resolved
+
+    available = []
+    for root in roots:
+        available.extend(_list_media_files(root))
+        if len(available) >= 20:
+            break
+    available_hint = ", ".join(available[:20]) if available else "(none found)"
     raise ValueError(
-        f"Media file '{ref}' not found in workspace (searched recursively, "
-        f"subfolders included). Use list_media() to see available files."
+        f"Media file '{ref}' not found. Searched roots: {', '.join(searched_roots)} "
+        f"(exact path and recursive name search, subfolders included). "
+        f"Available media: {available_hint}. Use list_media() for the full list."
     )
 
 
@@ -209,7 +248,7 @@ def _list_media_files(working_dir: Path) -> List[str]:
             found.append(rel.as_posix())
             if len(found) >= _MAX_MEDIA_LIST:
                 break
-    return sorted(found)
+    return sorted(found, key=str.lower)
 
 
 def _build_recipe_namespace(working_dir: Optional[Path] = None) -> Dict[str, Any]:
@@ -284,7 +323,16 @@ def _build_recipe_namespace(working_dir: Optional[Path] = None) -> Dict[str, Any
     # Read-only workspace media helpers (images/videos usable in recipes).
     if working_dir is not None:
         namespace["media"] = lambda ref: str(_resolve_media_path(ref, working_dir))
-        namespace["list_media"] = lambda: _list_media_files(working_dir)
+
+        def _list_all_media() -> List[str]:
+            aggregated: List[str] = []
+            for root in _candidate_working_dirs(working_dir):
+                for rel in _list_media_files(root):
+                    if rel not in aggregated:
+                        aggregated.append(rel)
+            return sorted(aggregated, key=str.lower)
+
+        namespace["list_media"] = _list_all_media
 
     return namespace
 
@@ -765,6 +813,142 @@ def build_office_presentation(
         }
 
 
+def _find_libreoffice() -> Optional[str]:
+    """Locates a LibreOffice executable (soffice) across platforms.
+
+    Search order: PATH lookup, then well-known install locations on
+    Windows and Linux. Returns the executable path or None. Never raises.
+    """
+    try:
+        found = shutil.which("soffice")
+        if found:
+            return found
+        candidates = [
+            r"C:\Program Files\LibreOffice\program\soffice.exe",
+            r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+            "/usr/bin/soffice",
+            "/usr/local/bin/soffice",
+            "/opt/libreoffice/program/soffice",
+            "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        ]
+        for candidate in candidates:
+            if Path(candidate).is_file():
+                return candidate
+    except Exception:
+        pass
+    return None
+
+
+def _extract_single_slide(source_pptx: Path, slide_index: int, output_path: Path) -> None:
+    """Copies `source_pptx` keeping only slide `slide_index` (1-based).
+
+    Uses the documented python-pptx XML drop pattern to remove every other
+    slide. Raises on failure; the caller converts exceptions into structured
+    errors.
+    """
+    from pptx import Presentation
+
+    prs = Presentation(str(source_pptx))
+    xml_slides = prs.slides._sldIdLst
+    slide_ids = list(xml_slides)
+    total = len(slide_ids)
+    if slide_index < 1 or slide_index > total:
+        raise ValueError(
+            f"Slide index {slide_index} is out of range (presentation has {total} slides)."
+        )
+    for position, slide_id in enumerate(slide_ids, start=1):
+        if position != slide_index:
+            xml_slides.remove(slide_id)
+    prs.save(str(output_path))
+
+
+def _convert_first_slide_to_png(pptx_path: Path, output_dir: Path) -> Optional[Path]:
+    """Converts the first slide of `pptx_path` to PNG via LibreOffice headless.
+
+    Returns the produced PNG path or None when conversion produced no file.
+    Raises subprocess errors upward. LibreOffice names the output after the
+    input stem, so we rename/move it to a deterministic name.
+    """
+    soffice = _find_libreoffice()
+    if not soffice:
+        return None
+    cmd = [
+        soffice,
+        "--headless",
+        "--norestore",
+        "--convert-to",
+        "png",
+        "--outdir",
+        str(output_dir),
+        str(pptx_path),
+    ]
+    subprocess.run(
+        cmd,
+        capture_output=True,
+        timeout=120,
+        check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    expected = output_dir / (pptx_path.stem + ".png")
+    if expected.is_file():
+        return expected
+    png_candidates = sorted(output_dir.glob("*.png"))
+    return png_candidates[0] if png_candidates else None
+
+
+def _render_slide_to_png(source_pptx: Path, slide_index: int, output_png: Path) -> Dict[str, Any]:
+    """Renders slide `slide_index` (1-based) of `source_pptx` to `output_png`.
+
+    Pipeline: single-slide temp pptx → LibreOffice headless PNG conversion →
+    move into place. Returns a structured result dict; never raises.
+    """
+    if not _find_libreoffice():
+        return {
+            "success": False,
+            "error": (
+                "LibreOffice (soffice) was not found on this system. Slide rendering "
+                "requires LibreOffice for headless pptx→PNG conversion. Install it "
+                "(https://www.libreoffice.org/download/) and ensure 'soffice' is on "
+                "PATH, then retry."
+            ),
+        }
+    temp_dir = None
+    try:
+        temp_dir = Path(tempfile.mkdtemp(prefix="lollms_slide_render_"))
+        single_slide_pptx = temp_dir / "slide.pptx"
+        _extract_single_slide(source_pptx, slide_index, single_slide_pptx)
+        produced = _convert_first_slide_to_png(single_slide_pptx, temp_dir)
+        if produced is None:
+            return {
+                "success": False,
+                "error": (
+                    f"LibreOffice conversion produced no PNG for slide {slide_index} "
+                    f"of '{source_pptx.name}'. The file may use features LibreOffice "
+                    "cannot render."
+                ),
+            }
+        output_png.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(produced), str(output_png))
+        return {
+            "success": True,
+            "saved_path": str(output_png),
+            "file_name": output_png.name,
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "error": "LibreOffice conversion timed out after 120 seconds.",
+        }
+    except Exception as render_err:
+        return {
+            "success": False,
+            "error": f"Slide rendering failed: {render_err}",
+        }
+    finally:
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def _read_pptx(path: Path) -> str:
     """Builds a markdown inventory of a presentation (slides, shapes, texts, tables)."""
     from pptx import Presentation
@@ -837,6 +1021,78 @@ def _read_xlsx(path: Path) -> str:
         lines.append("```")
         lines.append("")
     return "\n".join(lines)
+
+
+def tool_see_slide(
+    file: str,
+    slide: int = 1,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Renders one slide of a PowerPoint presentation to a PNG image.
+
+    The image is saved into the workspace under slide_previews/ and returned
+    as a context file so vision-capable models can visually inspect the slide
+    (layout, colors, image placement, overlaps). Rendering uses LibreOffice
+    headless; a clear error is returned when it is not installed.
+    """
+    try:
+        if not file or not str(file).strip():
+            return {"success": False, "error": "No file provided for slide rendering."}
+
+        working_dir = _resolve_working_dir(discussion_instance)
+        candidate = Path(str(file).strip())
+        file_path = candidate if candidate.is_absolute() else working_dir / candidate
+        if not file_path.is_file():
+            return {"success": False, "error": f"File not found: {file_path}"}
+
+        suffix = file_path.suffix.lower()
+        if suffix not in _PPTX_SUFFIXES:
+            return {
+                "success": False,
+                "error": (
+                    f"tool_see_slide requires a {'/'.join(_PPTX_SUFFIXES)} file, "
+                    f"got '{suffix or '(no extension)'}'."
+                ),
+            }
+
+        try:
+            slide_index = int(slide)
+        except (TypeError, ValueError):
+            return {"success": False, "error": f"Slide index must be an integer, got: {slide!r}"}
+        if slide_index < 1:
+            return {"success": False, "error": f"Slide index must be 1-based (>= 1), got {slide_index}."}
+
+        ok, reason = _validate_office_file(file_path)
+        if not ok:
+            return {
+                "success": False,
+                "error": (
+                    f"Office Document Integrity Failure [{OFFICE_GUARD_FAILURE_CODE}]: "
+                    f"'{file_path.name}' is corrupt and cannot be rendered.\n"
+                    f"Reason: {reason}"
+                ),
+            }
+
+        output_png = working_dir / "slide_previews" / f"{file_path.stem}_slide_{slide_index}.png"
+        render_result = _render_slide_to_png(file_path, slide_index, output_png)
+        if not render_result["success"]:
+            return render_result
+
+        return {
+            "success": True,
+            "workspace_file": str(output_png.resolve()),
+            "context_files": [str(output_png.resolve())],
+            "file_name": output_png.name,
+            "image_path": str(output_png.resolve()),
+            "slide_index": slide_index,
+            "source_file": str(file_path.resolve()),
+        }
+    except Exception as unexpected_err:
+        return {
+            "success": False,
+            "error": f"Unexpected failure rendering slide: {unexpected_err}",
+        }
 
 
 def tool_office_read(
@@ -1277,6 +1533,36 @@ def get_tools() -> List[Dict[str, Any]]:
                 {"name": "error", "type": "str", "description": "Error message if failed."},
             ],
             "callable": tool_edit_powerpoint,
+            "_source": "office_files_builder",
+            "_source_file": __file__,
+        },
+        {
+            "name": "tool_see_slide",
+            "description": "Renders one slide of a PowerPoint presentation (.pptx/.pptm) to a PNG image saved in the workspace (slide_previews/<name>_slide_<N>.png) and returns it as a context file so vision-capable models can visually inspect the slide (layout, colors, image placement, overlaps). Rendering uses LibreOffice headless; returns a clear installation error when unavailable. Use this for visual QA of generated slides.",
+            "parameters": [
+                {
+                    "name": "file",
+                    "type": "str",
+                    "description": "Existing .pptx/.pptm file (relative to workspace or absolute path).",
+                },
+                {
+                    "name": "slide",
+                    "type": "int",
+                    "description": "1-based slide index to render (default 1).",
+                    "optional": True,
+                },
+            ],
+            "output": [
+                {"name": "success", "type": "bool", "description": "Whether the operation succeeded."},
+                {"name": "workspace_file", "type": "str", "description": "Absolute path to the rendered PNG."},
+                {"name": "context_files", "type": "list", "description": "List of context files (the rendered PNG)."},
+                {"name": "file_name", "type": "str", "description": "Name of the rendered PNG."},
+                {"name": "image_path", "type": "str", "description": "Absolute path to the rendered PNG (vision pipeline)."},
+                {"name": "slide_index", "type": "int", "description": "The rendered slide number."},
+                {"name": "source_file", "type": "str", "description": "Absolute path to the source presentation."},
+                {"name": "error", "type": "str", "description": "Error message if failed."},
+            ],
+            "callable": tool_see_slide,
             "_source": "office_files_builder",
             "_source_file": __file__,
         },
