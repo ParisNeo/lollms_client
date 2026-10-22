@@ -7,14 +7,6 @@ from pathlib import Path
 
 # Initialize client from environment/config
 lc: LollmsClient = get_client_from_env()
-# Print structured TTI status instead of raw attribute
-status = lc.get_tti_engine_status()
-print(f"TTI Engine Status: {status}")
-
-if not status or status.get("status") != "ready":
-    print("⚠️ TTI engine is not ready. Check configuration or server status.")
-    exit(1)
-
 # Create discussion
 images_path = Path(__file__).parent/"images"
 images_path.mkdir(parents=True, exist_ok=True)

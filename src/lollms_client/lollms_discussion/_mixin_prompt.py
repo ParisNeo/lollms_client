@@ -14,7 +14,7 @@
 
 import re
 import uuid
-from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING
 
 from ascii_colors import ASCIIColors
 from lollms_client.lollms_artefact import ArtefactType
@@ -883,6 +883,77 @@ RULES:
         ]
         return "\n".join(lines)
 
+    def _build_tool_prompt(self, active_tools: Dict[str, Any], orchestrator_persona: bool) -> str:
+        """Constructs the tool-related part of the system prompt (the tool registry and calling rules)."""
+        if not active_tools:
+            return ""
+
+        # Filter out any tools that are actually internal memory tags, which should never be exposed.
+        memory_tool_names = {"memory_search", "mem_search", "memory_add", "mem_new", "memory_update", "mem_update", "memory_tag", "mem_tag", "memory_load", "mem_load", "memory_delete", "mem_delete", "mem_rel"}
+        
+        # Create a new dict containing only the tools that should be visible to the LLM.
+        visible_tools = {
+            name: spec for name, spec in active_tools.items() if name not in memory_tool_names
+        }
+
+        if not visible_tools:
+            return ""
+
+        if orchestrator_persona:
+            tools_prompt = (
+                "\n=== WORKER SPECIALTIES (delegation catalogue — NOT callable by you) ===\n"
+                "These are the capabilities held by the specialist workers you spawn.\n"
+                "You cannot invoke them yourself. Never emit tool-call tags or tool "
+                "syntax of any kind. When a specialist needs one of these "
+                "capabilities, describe it in plain words inside your <task> text.\n"
+            )
+            for t_name, t_spec in visible_tools.items():
+                tools_prompt += f"- {t_name}: {t_spec.get('description', '')}\n"
+            tools_prompt += "=== END WORKER SPECIALTIES ===\n"
+            return tools_prompt
+
+        tools_prompt = "\n=== TOOLS AVAILABLE ===\n"
+        tools_prompt += "To use a tool, you MUST emit a single <tool> tag on a new line with the tool parameters as a JSON object, and then stop generating. Do NOT write prose before or after the tag.\n"
+        tools_prompt += (
+            "\n=== TOOL CALLING DISCIPLINE (CRITICAL — READ BEFORE CALLING TOOLS) ===\n"
+            "1. **EXACT CLOSING TAG**: The closing tag is  `</tool>` . You MUST NOT write  `` `` ``  or any other variation.\n"
+            "2. **NEW LINE ONLY**: The <tool> tag MUST start on a brand new line. It MUST NEVER be placed inline inside conversational prose.\n"
+            "3. **NO PROSE AROUND IT**: Do NOT write introductory text (e.g., 'Let me try...') before the tag, and do NOT write text after it on the same line.\n\n"
+            "❌ WRONG (inline + wrong closing tag):\n"
+            "Sure! Let's test the tool: <tool>{\"name\": \"tool_add\", \"parameters\": {\"a\": 7, \"b\": 5}}</tool>\n\n"
+            "❌ WRONG (wrong closing tag):\n"
+            "<tool>{\"name\": \"tool_add\", \"parameters\": {\"a\": 7, \"b\": 5}}</tool>\n\n"
+            "✅ CORRECT (new line + exact closing tag ``)`):\n"
+            "<tool>{\"name\": \"tool_add\", \"parameters\": {\"a\": 7, \"b\": 5}}</tool>\n"
+            "=== END TOOL CALLING DISCIPLINE ===\n"
+        )
+        tools_prompt += (
+            "\n=== 🏁 TASK COMPLETION PROTOCOL (CRITICAL) ===\n"
+            "Your goal is to SOLVE the user's problem, not to infinitely call tools.\n"
+            "1. **TOOL CALLS ARE TEMPORARY**: You call a `<tool>` only to gather data you don't have.\n"
+            "2. **ANSWERING IS THE GOAL**: Once you have the data, writing a comprehensive, helpful response to the user IS the successful completion of your task.\n"
+            "3. **HOW TO FINISH**: When your work is complete, write your final answer to the user and then emit `<done/>` on a new line. This is the ONLY way the turn ends.\n"
+            "4. **NEVER LOOP**: If you have already written your final answer, do NOT emit another `<tool>` tag. Emitting a tool call after your answer is a CRITICAL ERROR that ruins the completed task. Terminate with `<done/>`.\n"
+            "=== END TASK COMPLETION PROTOCOL ===\n"
+        )
+        tools_prompt += "\nExact syntax (copy this pattern exactly):\n<tool>{\"name\": \"tool_name\", \"parameters\": {\"param1\": \"value1\"}}</tool>\n\n"
+        tools_prompt += "Available tools:\n"
+        for t_name, t_spec in visible_tools.items():
+            desc = t_spec.get("description", "")
+            params_list = t_spec.get("parameters", [])
+            param_desc = ", ".join([f"{p['name']}: {p['type']}" for p in params_list])
+            tools_prompt += f"- {t_name}({param_desc}): {desc}\n"
+
+        # ── 🛡️ PHANTOM TOOL PREVENTION PROTOCOL ──
+        allowed_tool_names = list(visible_tools.keys())
+        tools_prompt += f"\n🚨 **STRICT TOOL REGISTRY ENFORCEMENT** 🚨\n"
+        tools_prompt += f"You are STRICTLY FORBIDDEN from calling any tool not listed above.\n"
+        tools_prompt += f"The ONLY valid tool names you may use are: {', '.join(allowed_tool_names)}\n"
+        tools_prompt += f"If you need to perform an action and no tool in this list is suitable, DO NOT hallucinate a tool name. Instead, inform the user that the required tool is not available in this session.\n"
+        tools_prompt += "=== END TOOLS ===\n"
+        
+        return tools_prompt
+
     def _build_form_instructions(self) -> str:
         """Instruction for rich interactive form building."""
         return """
@@ -1416,6 +1487,32 @@ EXAMPLE OF CORRECT FORM:
                     "[silent-artifact guard] Auto-generated explanation appended.")
 
         return cleaned, affected_artefacts
+
+    def _get_office_files_tools(self) -> List[Dict[str, Any]]:
+        """
+        Returns the tool specifications for the office files builder toolset.
+        This method is a safe accessor that imports the tools dynamically to avoid
+        circular dependencies and ensure the tools are available when needed.
+        """
+        try:
+            from lollms_client.tools_bindings.lcp.default_tools.office_files_builder.office_files_builder import get_tools
+            return get_tools()
+        except ImportError as e:
+            ASCIIColors.warning(f"Could not import office files builder tools: {e}")
+            return []
+
+    def _get_office_files_tools(self) -> List[Dict[str, Any]]:
+        """
+        Returns the tool specifications for the office files builder toolset.
+        This method is a safe accessor that imports the tools dynamically to avoid
+        circular dependencies and ensure the tools are available when needed.
+        """
+        try:
+            from lollms_client.tools_bindings.lcp.default_tools.office_files_builder.office_files_builder import get_tools
+            return get_tools()
+        except ImportError as e:
+            ASCIIColors.warning(f"Could not import office files builder tools: {e}")
+            return []
 
     def _build_office_files_instructions(self) -> str:
         """

@@ -5609,22 +5609,8 @@ class ChatMixin:
         if orchestrator_persona:
             full_system_prompt += self._build_orchestrator_instructions()
 
-        tools_prompt = ""
-        if orchestrator_persona and active_tools:
-            tools_prompt = (
-                "\n=== WORKER SPECIALTIES (delegation catalogue — NOT callable by you) ===\n"
-                "These are the capabilities held by the specialist workers you spawn.\n"
-                "You cannot invoke them yourself. Never emit tool-call tags or tool "
-                "syntax of any kind. When a specialist needs one of these "
-                "capabilities, describe it in plain words inside your <task> text.\n"
-            )
-            for t_name, t_spec in active_tools.items():
-                tools_prompt += f"- {t_name}: {t_spec.get('description', '')}\n"
-            tools_prompt += "=== END WORKER SPECIALTIES ===\n"
-        elif active_tools:
-            tools_prompt = "\n=== TOOLS AVAILABLE ===\n"
-            tools_prompt += "To use a tool, you MUST emit a single <tool> tag on a new line with the tool parameters as a JSON object, and then stop generating. Do NOT write prose before or after the tag.\n"
-            tools_prompt += (
+        tools_prompt = self._build_tool_prompt(active_tools, orchestrator_persona)
+        tools_prompt += (
                 "\n=== TOOL CALLING DISCIPLINE (CRITICAL — READ BEFORE CALLING TOOLS) ===\n"
                 "1. **EXACT CLOSING TAG**: The closing tag is  `</tool>` . You MUST NOT write  `` `` ``  or any other variation.\n"
                 "2. **NEW LINE ONLY**: The <tool> tag MUST start on a brand new line. It MUST NEVER be placed inline inside conversational prose.\n"
@@ -5637,7 +5623,7 @@ class ChatMixin:
                 "<tool>{\"name\": \"tool_add\", \"parameters\": {\"a\": 7, \"b\": 5}}</tool>\n"
                 "=== END TOOL CALLING DISCIPLINE ===\n"
             )
-            tools_prompt += (
+        tools_prompt += (
                 "\n=== 🏁 TASK COMPLETION PROTOCOL (CRITICAL) ===\n"
                 "Your goal is to SOLVE the user's problem, not to infinitely call tools.\n"
                 "1. **TOOL CALLS ARE TEMPORARY**: You call a `<tool>` only to gather data you don't have.\n"
@@ -5646,21 +5632,9 @@ class ChatMixin:
                 "4. **NEVER LOOP**: If you have already written your final answer, do NOT emit another `<tool>` tag. Emitting a tool call after your answer is a CRITICAL ERROR that ruins the completed task. Terminate with `<done/>`.\n"
                 "=== END TASK COMPLETION PROTOCOL ===\n"
             )
-            tools_prompt += "\nExact syntax (copy this pattern exactly):\n<tool>{\"name\": \"tool_name\", \"parameters\": {\"param1\": \"value1\"}}</tool>\n\n"
-            tools_prompt += "Available tools:\n"
-            for t_name, t_spec in active_tools.items():
-                desc = t_spec.get("description", "")
-                params_list = t_spec.get("parameters", [])
-                param_desc = ", ".join([f"{p['name']}: {p['type']}" for p in params_list])
-                tools_prompt += f"- {t_name}({param_desc}): {desc}\n"
 
-            # ── 🛡️ PHANTOM TOOL PREVENTION PROTOCOL ──
-            allowed_tool_names = list(active_tools.keys())
-            tools_prompt += f"\n🚨 **STRICT TOOL REGISTRY ENFORCEMENT** 🚨\n"
-            tools_prompt += f"You are STRICTLY FORBIDDEN from calling any tool not listed above.\n"
-            tools_prompt += f"The ONLY valid tool names you may use are: {', '.join(allowed_tool_names)}\n"
-            tools_prompt += f"If you need to perform an action and no tool in this list is suitable, DO NOT hallucinate a tool name. Instead, inform the user that the required tool is not available in this session.\n"
-            tools_prompt += "=== END TOOLS ===\n"
+
+
 
         # ── 🔬 SCIENTIFIC RESOLUTION: Clear FailureMemory at start of turn ──
         if not hasattr(self, "_failure_memory") or not isinstance(self._failure_memory, FailureMemory) or not hasattr(self._failure_memory, "_signatures"):

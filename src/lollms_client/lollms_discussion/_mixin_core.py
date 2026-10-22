@@ -48,7 +48,7 @@ class CoreMixin:
             max_context_size: Optional[int] = None,
             memory_manager=None,
             internet_config: Optional[Dict[str, Any]] = None,
-            workspace_path: Optional[str] = None,
+            workspace_path: Optional[str|Path] = None,
             auto_create_db: bool = True,
             auto_sync_workspace: bool = True,
             _from_db_reload: bool = False,

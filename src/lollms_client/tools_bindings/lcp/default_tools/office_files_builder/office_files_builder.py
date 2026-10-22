@@ -612,3 +612,88 @@ def tool_office_read(
             "success": False,
             "error": f"Unexpected failure reading office file: {unexpected_err}",
         }
+
+
+def get_tools() -> List[Dict[str, Any]]:
+    """
+    Returns the tool specifications for the office files builder toolset.
+    Each spec includes name, description, parameters, output, and callable.
+    """
+    return [
+        {
+            "name": "tool_office_build",
+            "description": "Creates a fresh Microsoft Office file (.pptx/.docx/.xlsx/.xlsm/.docm/.pptm) from a recipe. Recipes are plain Python WITHOUT import statements. The sandbox namespace is pre-populated with python-pptx, python-docx, and openpyxl symbols. Saved files are validated against strict OOXML rules and rolled back on failure.",
+            "parameters": [
+                {
+                    "name": "file",
+                    "type": "str",
+                    "description": "Target file name (default 'document.docx'). The extension selects the format.",
+                    "optional": True,
+                },
+                {
+                    "name": "recipe",
+                    "type": "str",
+                    "description": "Plain Python recipe code (no imports) mutating the root object (prs/presentation for pptx, doc for docx, wb/ws for xlsx).",
+                    "optional": True,
+                },
+            ],
+            "output": [
+                {"name": "success", "type": "bool", "description": "Whether the operation succeeded."},
+                {"name": "workspace_file", "type": "str", "description": "Absolute path to the saved file."},
+                {"name": "context_files", "type": "list", "description": "List of context files (the saved file)."},
+                {"name": "file_name", "type": "str", "description": "Name of the saved file."},
+                {"name": "error", "type": "str", "description": "Error message if failed."},
+            ],
+            "callable": tool_office_build,
+            "_source": "office_files_builder",
+            "_source_file": __file__,
+        },
+        {
+            "name": "tool_office_edit",
+            "description": "Edits an existing Microsoft Office file in place via a recipe. The opened object is pre-bound into the recipe namespace under the same aliases as tool_office_build. The save is transactional: if the edited file fails validation, the pre-edit bytes are restored.",
+            "parameters": [
+                {
+                    "name": "file",
+                    "type": "str",
+                    "description": "File to edit (relative to workspace or absolute path).",
+                },
+                {
+                    "name": "recipe",
+                    "type": "str",
+                    "description": "Plain Python recipe code (no imports) mutating the opened object.",
+                    "optional": True,
+                },
+            ],
+            "output": [
+                {"name": "success", "type": "bool", "description": "Whether the operation succeeded."},
+                {"name": "workspace_file", "type": "str", "description": "Absolute path to the saved file."},
+                {"name": "context_files", "type": "list", "description": "List of context files (the saved file)."},
+                {"name": "file_name", "type": "str", "description": "Name of the saved file."},
+                {"name": "error", "type": "str", "description": "Error message if failed."},
+            ],
+            "callable": tool_office_edit,
+            "_source": "office_files_builder",
+            "_source_file": __file__,
+        },
+        {
+            "name": "tool_office_read",
+            "description": "Reads an existing Microsoft Office file and returns a markdown inventory. The file is validated first; a corrupt file returns a structured failure instead of a crash. No recipe is executed and nothing is saved.",
+            "parameters": [
+                {
+                    "name": "file",
+                    "type": "str",
+                    "description": "File to read (relative to workspace or absolute path).",
+                },
+            ],
+            "output": [
+                {"name": "success", "type": "bool", "description": "Whether the operation succeeded."},
+                {"name": "inventory", "type": "str", "description": "Markdown inventory of the file contents."},
+                {"name": "file_name", "type": "str", "description": "Name of the file read."},
+                {"name": "workspace_file", "type": "str", "description": "Absolute path to the file."},
+                {"name": "error", "type": "str", "description": "Error message if failed."},
+            ],
+            "callable": tool_office_read,
+            "_source": "office_files_builder",
+            "_source_file": __file__,
+        },
+    ]
