@@ -1,61 +1,49 @@
-# `enable_office_files: bool = False`
+# `enable_office_files` — DEPRECATED
 
 **Category**: Tools & Security
 
-## What it does
+> ⚠️ **This flag is deprecated.** It is no longer a signature parameter of
+> `chat()` — it is accepted as a keyword argument for backward compatibility
+> only.
 
-This is the **single Office flag** — PowerPoint decks (`.pptx`/`.pptm`) are
-included alongside Word and Excel files. There is no separate presentation
-flag anymore: the former `enable_pptx_builder` and `enable_presentations`
-flags have been removed, and their capabilities are fully covered here.
+## What it does now
 
-Mounts the `office_files_builder` LCP toolset — read, create and edit real
-Office files via sandboxed recipe tools:
+Passing `enable_office_files=True` enables **all three per-software office
+flags** and mounts the monolithic legacy `office_files_builder` library:
 
-- `tool_office_read` — inspect an existing `.pptx` / `.docx` / `.xlsx` and
-  get a structured markdown inventory (slides, paragraphs, sheets, tables).
-- `tool_office_build` — create a brand-new Office file from a sandboxed
-  recipe (python-pptx / python-docx / openpyxl code).
-- `tool_office_edit` — modify an existing Office file with a sandboxed
-  recipe operating on the pre-loaded document object.
+- `enable_powerpoint = True`
+- `enable_word = True`
+- `enable_excel = True`
 
-Supported formats: `.pptx`, `.pptm`, `.docx`, `.docm`, `.xlsx`, `.xlsm`.
+A one-line deprecation notice is logged to the console.
 
-## What to expect — NO vision gate
+## Migrate to the per-software flags
 
-The mount is **unconditional** when `True` (text-only workflow: recipe code
-in → markdown inventory out). Office-files instructions are likewise injected
-**unconditionally** whenever the flag is on — there is no keyword gate (the
-old keyword-gated presentation instructions were removed with
-`enable_pptx_builder`). Recipe code is sandboxed: **no `import`
-statements are allowed** — the libraries are pre-injected; violations are
-rejected before execution.
+The canonical API is now three dedicated flags, each mounting exactly one
+toolset with its own doctrine:
 
-**Integrity-verified saves**: every save passes a 3-layer validation
-(ZIP integrity, strict XML parse, library re-open). If a save would corrupt
-the file, it is automatically **rolled back** to the pre-save snapshot and
-the tool returns a machine-readable failure code — the model fixes the
-recipe and retries. First invocation auto-installs `python-pptx` /
-`python-docx` / `openpyxl` via pipmaster — expect a slower first call.
+- [`enable_powerpoint`](enable_powerpoint.md) — 5 tools: build/edit/read +
+  `tool_pptx_info` (template awareness) + `tool_view_slides` (≤4 transient
+  slide images per call).
+- [`enable_word`](enable_word.md) — 3 tools: build/edit/read with
+  comment/highlight/section/field helpers.
+- [`enable_excel`](enable_excel.md) — 3 tools: build/edit/read with the
+  formulas-only doctrine.
 
-## Recovering generated stuff
-
-- Tools write into the discussion working directory
-  (`tool_context["working_dir"]`, i.e. the discussion's
-  `workspace_data_path`).
-- Tool result keys: `workspace_file` (absolute path), `context_files` (list
-  containing the path), `file_name` (sanitized).
-- Files are auto-registered as artifacts by `_sync_tool_artifacts`
-  (workspace snapshot diffing) — recover via `discussion.artefacts.get(...)`
-  or open `workspace_file` directly on disk.
-- The turn result's `"artefacts"` array also lists them.
-
-## Usage
+## Usage (legacy)
 
 ```python
+# Legacy — still works, logs a deprecation notice:
 result = discussion.chat(
     "Build a quarterly report: a .docx summary and an .xlsx KPI workbook",
     enable_office_files=True,
+)
+
+# Preferred — per-software:
+result = discussion.chat(
+    "Build a quarterly report: a .docx summary and an .xlsx KPI workbook",
+    enable_word=True,
+    enable_excel=True,
 )
 ```
 

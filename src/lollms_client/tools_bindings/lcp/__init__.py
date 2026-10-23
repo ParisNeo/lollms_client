@@ -18,6 +18,42 @@ from ascii_colors import ASCIIColors, trace_exception
 
 BindingName = "LCPBinding"
 
+# ── OFFICE-FAMILY LIBRARY GATE (fail-closed) ──
+# These library stems are office-family: without an explicit session flag they
+# are EXCLUDED from discovery/mounting. This prevents office toolsets from
+# auto-appearing in every session (the as_is leak class).
+_OFFICE_LIBRARY_STEMS = frozenset({
+    "as_is_document_tools", "office_files_builder", "document_editor",
+    "pptx_builder", "docx_mastery", "pptx_mastery", "xlsx_mastery",
+    "powerpoint_tools", "word_tools", "excel_tools",
+})
+# Per-software stems gate on their OWN flag only (fail-closed when absent).
+_PER_SOFTWARE_GATES = {
+    "powerpoint_tools": ("enable_powerpoint",),
+    "word_tools": ("enable_word",),
+    "excel_tools": ("enable_excel",),
+}
+
+
+def _office_library_admitted(stem: str, session_flags: Optional[Dict[str, Any]]) -> bool:
+    """Resolves office-family admission for a library stem against session flags.
+
+    Per-software stems (powerpoint_tools/word_tools/excel_tools) require their
+    own flag. Legacy office stems are admitted when ANY office-family flag is
+    truthy. Unknown/missing flags are fail-closed (excluded).
+    """
+    if stem not in _OFFICE_LIBRARY_STEMS:
+        return True
+    flags = session_flags if isinstance(session_flags, dict) else {}
+    own_gates = _PER_SOFTWARE_GATES.get(stem)
+    if own_gates is not None:
+        return any(bool(flags.get(g)) for g in own_gates)
+    office_enabled = bool(flags.get("enable_office_files")) or any(
+        bool(flags.get(g)) for gates in _PER_SOFTWARE_GATES.values() for g in gates
+    )
+    return office_enabled
+
+
 class LCPBinding(LollmsToolBinding):
     """
     Local LollmsCommunicationProtocol (LCP) Binding.
@@ -63,8 +99,19 @@ class LCPBinding(LollmsToolBinding):
 
         self._load_flag_kwargs: Dict[str, Any] = kwargs
 
+        # Session flags (set by the host chat layer via set_session_flags).
+        # Office-family libraries are gated against these; absent flags are
+        # fail-closed.
+        self.session_flags: Dict[str, Any] = {}
+
         self.discovered_tools: List[Dict[str, Any]] = []
         self._dynamic_tool_modules: Dict[str, types.ModuleType] = {}
+        self._discover_local_tools()
+
+    def set_session_flags(self, flags: Optional[Dict[str, Any]]) -> None:
+        """Registers session feature flags and re-runs discovery so office-family
+        libraries are admitted/excluded per the new flag state."""
+        self.session_flags = dict(flags) if isinstance(flags, dict) else {}
         self._discover_local_tools()
 
     @property
@@ -381,6 +428,14 @@ class LCPBinding(LollmsToolBinding):
     def _load_tool_file(self, py_file: Path) -> int:
         file_stem = py_file.stem
 
+        # ── OFFICE-FAMILY SESSION GATE (fail-closed) ──
+        # Office libraries are excluded unless their session flag is set.
+        if not _office_library_admitted(file_stem, self.session_flags):
+            ASCIIColors.debug(
+                f"[LCP] Library '{file_stem}' skipped: office-family session flag not enabled."
+            )
+            return 0
+
         if not self._is_library_permitted(py_file):
             ASCIIColors.debug(
                 f"[LCP] Library '{file_stem}' skipped: TOOL_LIBRARY_LOAD_FLAG "
@@ -550,6 +605,12 @@ class LCPBinding(LollmsToolBinding):
 
     def mount_tool_library(self, library_name: str) -> bool:
         resolved_name = self._resolve_library_name(library_name)
+        if resolved_name and not _office_library_admitted(resolved_name, self.session_flags):
+            ASCIIColors.warning(
+                f"[LCP Mount] Library '{library_name}' is office-family gated and its "
+                "session flag is not enabled. Mount refused (fail-closed)."
+            )
+            return False
         if resolved_name and resolved_name != library_name.strip():
             ASCIIColors.info(f"[LCP Mount] Resolving toolkit '{library_name}' -> '{resolved_name}'.")
         lib_path = self._find_library_dir(resolved_name or library_name)

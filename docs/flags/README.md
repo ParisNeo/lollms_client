@@ -40,7 +40,10 @@ Browse by category:
 - [allow_dynamic_tools.md](allow_dynamic_tools.md)
 - [enable_vlm_query.md](enable_vlm_query.md)
 - [enable_computer_use.md](enable_computer_use.md)
-- [enable_office_files.md](enable_office_files.md) — mounts office_files_builder tools (.pptx/.docx/.xlsx); the single Office flag (replaces the removed `enable_pptx_builder` / `enable_presentations`)
+- [enable_powerpoint.md](enable_powerpoint.md) — mounts PowerPoint tools (build/edit/read + template info + ≤4 transient slide vision per call)
+- [enable_word.md](enable_word.md) — mounts Word tools (build/edit/read with comment/highlight/section/field hints)
+- [enable_excel.md](enable_excel.md) — mounts Excel tools (build/edit/read with formulas-only doctrine)
+- [enable_office_files.md](enable_office_files.md) — **DEPRECATED** legacy alias: enables all three per-software flags; see `enable_powerpoint` / `enable_word` / `enable_excel`
 - [suppress_images.md](suppress_images.md)
 
 ## Personas & Diagnostics

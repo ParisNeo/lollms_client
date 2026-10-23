@@ -69,7 +69,9 @@ has no such capability.
 | `allow_dynamic_tools` | `False` | Tools | security-sensitive |
 | `enable_vlm_query` | `False` | Tools | vision fallback only |
 | `enable_computer_use` | `False` | Tools | **vision-gated** |
-| `enable_office_files` | `False` | Tools | mounts office_files_builder tools |
+| `enable_powerpoint` | `False` | Tools | mounts PowerPoint tools (build/edit/read + info + view_slides) |
+| `enable_word` | `False` | Tools | mounts Word tools (build/edit/read) |
+| `enable_excel` | `False` | Tools | mounts Excel tools (build/edit/read, formulas doctrine) |
 | `suppress_images` | `False` | Tools | negative polarity |
 | `orchestrator_mode` | `False` | Personas | AgenticRunner route |
 | `orchestrator_persona` | `False` | Personas | delegation-only persona |
@@ -278,6 +280,12 @@ engine fails gracefully with a `status:failure` processing block.
 **What to expect**:
 - `edit_image` requires a source image (existing artifact pixels or the last
   active image) AND non-empty instructions; otherwise it fails cleanly.
+- **Dimension pass-through**: `width`/`height` are OPTIONAL. When the model
+  omits them, they are forwarded as absent to the TTI engine, which edits at
+  the SOURCE image's native dimensions. Explicit (valid) values are clamped to
+  the engine's supported range (64–4096); a malformed value is treated as
+  unspecified (never silently coerced to a default that would resize the
+  source).
 - Generated images are stored as image artifacts with their pixels (base64 PNG)
   plus a logical markdown twin.
 
@@ -465,40 +473,75 @@ The capability override `allow_computer_use` (Optional[bool], also read from
   `image_b64`/`screenshot_b64` (also attached in-conversation so the vision
   model can verify), `screen_width`, `screen_height`, `cursor_x`, `cursor_y`.
 
-### `enable_office_files: bool = False`
+### Per-Software Office Toolsets: `enable_powerpoint` / `enable_word` / `enable_excel`
 
-**What it does**: Mounts the `office_files_builder` LCP toolset — read, create
-and edit real Office files via sandboxed recipe tools:
-- `tool_office_read` — inspect an existing `.pptx` / `.docx` / `.xlsx` and get
-  a structured markdown inventory (slides, paragraphs, sheets, tables).
-- `tool_office_build` — create a brand-new Office file from a sandboxed recipe
-  (python-pptx / python-docx / openpyxl code).
-- `tool_office_edit` — modify an existing Office file with a sandboxed recipe
-  operating on the pre-loaded document object.
+**What they do**: Each flag mounts exactly ONE dedicated LCP toolset and admits
+ONLY its own tool family (per-flag isolation — `enable_excel=True` alone never
+exposes PowerPoint or Word tools):
 
-Supported formats: `.pptx`, `.pptm`, `.docx`, `.docm`, `.xlsx`, `.xlsm`.
+| Flag | Library | Tools |
+|---|---|---|
+| `enable_powerpoint` | `powerpoint_tools` | `tool_build_powerpoint`, `tool_edit_powerpoint`, `tool_read_powerpoint`, `tool_pptx_info`, `tool_view_slides` |
+| `enable_word` | `word_tools` | `tool_build_word`, `tool_edit_word`, `tool_read_word` |
+| `enable_excel` | `excel_tools` | `tool_build_excel`, `tool_edit_excel`, `tool_read_excel` |
 
-**What to expect — NO vision gate**: the mount is **unconditional** when `True`
-(text-only workflow: recipe code in → markdown inventory out). Recipe code is
-sandboxed: **no `import` statements are allowed** — the libraries are
-pre-injected; violations are rejected before execution.
+Supported formats: `.pptx`, `.pptm` (PowerPoint); `.docx`, `.docm` (Word);
+`.xlsx`, `.xlsm` (Excel).
+
+**Per-software doctrine** (injected into the system prompt when the flag is on):
+- **PowerPoint**: new decks are **16:9** (13.333in × 7.5in, EMU 12192000×6858000);
+  call `tool_pptx_info` FIRST to discover slide layouts and theme fonts; verify
+  visually with `tool_view_slides` — **max 4 slides per call**, images attached
+  to the CURRENT ROUND ONLY, never stored in the workspace; never call
+  `prs.save()` — auto-saved and validated.
+- **Word**: full edit freedom with python-docx ("use your own coding skills")
+  plus high-leverage hints: `add_comment(doc, paragraph, text, author)` (real
+  OOXML comment with yellow-highlight fallback), `run.font.highlight_color =
+  WD_COLOR_INDEX.YELLOW`, styles/fonts/alignment reformatting,
+  `doc.add_section(WD_SECTION.NEW_PAGE)`, links/fields via OXML
+  `qn('w:fldSimple')` (Word updates on open), tables/images via `media()`.
+- **Excel**: **FORMULAS ONLY for computed values — NEVER write calculation
+  results manually**. Excel computes them on open:
+  `ws["F2"] = "=SUM(B2:E2)"`, `ws["G2"] = "=AVERAGE(B2:E2)"`,
+  `ws["H2"] = '=IF(F2>100,"High","Low")'`, `=VLOOKUP(...)`, `=INDEX/MATCH`.
+  Literals are ONLY for input data. Chart-recalc caveat: charts referencing
+  formula cells may appear empty until Excel recalculates on open — formulas
+  are still the correct choice.
+
+**What to expect — NO vision gate**: mounts are **unconditional** when their
+flag is set (text-only workflow: recipe code in → markdown inventory out).
+Recipe code is sandboxed: imports are allowed ONLY from the per-format
+whitelist (`pptx.*` / `docx.*` / `openpyxl.*` plus safe stdlib modules) —
+core design symbols are pre-imported; forbidden tokens (`eval`, `exec`,
+`open`, `os.`, `sys.`, subprocess, dunder access, ...) are rejected before
+execution. Recipes are capped at 60,000 characters.
 
 **Integrity-verified saves**: every save passes a 3-layer validation (ZIP
-integrity, strict XML parse, library re-open). If a save would corrupt the
-file, it is automatically **rolled back** to the pre-save snapshot and the tool
-returns a machine-readable failure code — the model fixes the recipe and
-retries. First invocation auto-installs `python-pptx` / `python-docx` /
-`openpyxl` via pipmaster — expect a slower first call.
+integrity + required OOXML parts, strict XML parse, library re-open). If a
+save would corrupt the file, it is automatically **rolled back** to the
+pre-save snapshot and the tool returns the machine-readable failure code
+`office_file_failed_validation` — the model fixes the recipe and retries.
+First invocation auto-installs the per-format library (`python-pptx` /
+`python-docx` / `openpyxl`) via pipmaster — expect a slower first call.
+
+**LCP fail-closed gate**: the three toolset libraries are office-family and
+are **excluded from discovery unless their flag is set** — they never
+auto-appear in a session (the same leak class fixed earlier for as-is tools).
 
 **Recovering generated stuff**:
 - Tools write into the discussion working directory (`tool_context["working_dir"]`,
   i.e. the discussion's `workspace_data_path`).
-- Tool result keys: `workspace_file` (absolute path), `context_files` (list
-  containing the path), `file_name` (sanitized).
+- Tool result keys: `workspace_file`, `file_name` (sanitized).
 - Files are auto-registered as artifacts by `_sync_tool_artifacts` (workspace
   snapshot diffing) — recover via `discussion.artefacts.get(...)` or open
   `workspace_file` directly on disk.
 - The turn result's `"artefacts"` array also lists them.
+
+**Legacy flag — `enable_office_files` (DEPRECATED)**: passing
+`enable_office_files=True` as a kwarg enables all three per-software flags AND
+mounts the monolithic legacy `office_files_builder` library (12 tools:
+`tool_office_build/edit/read` plus nine per-format aliases). A one-line
+deprecation notice is logged. Prefer the three per-software flags.
 
 ### `suppress_images: bool = False` — NEGATIVE POLARITY
 
@@ -559,8 +602,9 @@ end-of-turn JSON context dump.
 
 1. **Master-switch hierarchy**: `enable_artefacts=False` disables notes, skills,
    widgets, books instructions, and image-tag dispatch even when their own
-   flags are `True`. (Office-files instructions and tools are governed solely
-   by `enable_office_files`.)
+   flags are `True`. (Office toolset instructions and tools are governed solely
+   by `enable_powerpoint` / `enable_word` / `enable_excel` — or the deprecated
+   `enable_office_files` kwarg.)
 2. **Discovery ≠ exposure**: LCP libraries are AST-discovered at client
    construction, but the model only sees a library when the per-turn chat flag
    mounts it. A model claiming "I have no such tools" almost always means the
@@ -572,8 +616,13 @@ end-of-turn JSON context dump.
    turns is a cheap no-op.
 4. **Keyword-gated instructions**: `enable_books` and `enable_forms` inject
    their instructions only when trigger keywords appear in the user message,
-   even with the flag enabled. `enable_office_files` instructions are injected
-   unconditionally when the flag is on.
+   even with the flag enabled. Office toolset instructions are injected
+   unconditionally per-flag when the flag is on.
+5. **Per-flag isolation**: each office flag exposes ONLY its own tool family —
+   `enable_excel=True` alone never exposes PowerPoint or Word tools. When both
+   a per-software flag and the legacy `enable_office_files` kwarg are set,
+   per-library mounting selects the winner and the later mount wins (identical
+   tool names are deduplicated by the LCP registry).
 5. **Negative-polarity flags**: `suppress_images` is inverted — `True` *disables*
    vision hydration rather than enabling a feature.
 6. **Memory sub-flags require the master**: `enable_episodic_memory`,
@@ -602,24 +651,30 @@ discussion.chat(
 ```python
 result = discussion.chat(
     "Create a 5-slide presentation (.pptx) about photosynthesis",
-    enable_office_files=True,
+    enable_powerpoint=True,
 )
+# The model calls tool_pptx_info first (layouts), builds via
+# tool_build_powerpoint, then verifies visually with tool_view_slides
+# (max 4 slides per call, transient images).
 # Recover the deck:
 #   → result["artefacts"] lists the pptx artifact
-#   → tool_office_build's workspace_file lives in the discussion working dir
+#   → tool_build_powerpoint's workspace_file lives in the discussion working dir
 #   → discussion.artefacts.get("presentation.pptx")
 ```
 
-**Build Office documents (.docx / .xlsx / .pptx)**:
+**Build Office documents (.docx / .xlsx)**:
 ```python
 result = discussion.chat(
     "Build a quarterly report: a .docx summary and an .xlsx KPI workbook",
-    enable_office_files=True,
+    enable_word=True,
+    enable_excel=True,
 )
 # Recover the files:
 #   → result["artefacts"] lists the office artifacts
-#   → tool_office_build's workspace_file lives in the discussion working dir
+#   → tool_build_word / tool_build_excel workspace_file paths live in the
+#     discussion working dir
 #   → discussion.artefacts.get("quarterly_report.docx")
+#   → discussion.artefacts.get("kpi_workbook.xlsx")  # formulas, not literals
 ```
 
 **Desktop automation (vision model required)**:

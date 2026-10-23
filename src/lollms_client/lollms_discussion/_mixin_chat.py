@@ -49,6 +49,30 @@ _OFFICE_TOOL_NAME_PREFIXES = (
     "tool_build_excel", "tool_edit_excel", "tool_read_excel",
 )
 
+# ── Per-software office toolset admission sets ──
+# Exact-name admission for the three split toolsets. NOTE: the
+# tool_build/edit/read_powerpoint|word|excel names ALSO exist in the
+# monolithic office_files_builder library; per-library mounting selects
+# the winner (the later mount wins when both flags are on, and the LCP
+# registry deduplicates identical tool names).
+_OFFICE_PPTX_TOOL_NAMES = {
+    "tool_build_powerpoint",
+    "tool_edit_powerpoint",
+    "tool_read_powerpoint",
+    "tool_pptx_info",
+    "tool_view_slides",
+}
+_OFFICE_WORD_TOOL_NAMES = {
+    "tool_build_word",
+    "tool_edit_word",
+    "tool_read_word",
+}
+_OFFICE_XLSX_TOOL_NAMES = {
+    "tool_build_excel",
+    "tool_edit_excel",
+    "tool_read_excel",
+}
+
 # ── 🤫 VERBOSE TELEMETRY GATE ──
 # Per-turn verbose logging flag. chat() sets this from its `debug` parameter;
 # telemetry helpers below log ONLY when it is True. Actionable warnings
@@ -3190,19 +3214,28 @@ class _StreamState:
                     self._processing_block_open = False
                 return True
 
-            width = 1024
-            height = 1024
+            # ── 📐 DIMENSION PASS-THROUGH (OPTIONAL CONTRACT) ──
+            # width/height are OPTIONAL. When the LLM omits them, they stay None
+            # and are forwarded as absent to the TTI engine, which then renders
+            # the edit at the SOURCE image's native dimensions. Only an explicit
+            # (and valid) attribute value is clamped into the engine's supported
+            # range; a malformed value is treated as "unspecified" (None), never
+            # silently coerced to a default that would resize the source.
+            width: Optional[int] = None
+            height: Optional[int] = None
             explicit_size_requested = False
-            try:
-                width = max(64, min(int(attrs.get("width", 1024)), 4096))
-                explicit_size_requested = explicit_size_requested or "width" in attrs
-            except (TypeError, ValueError):
-                width = 1024
-            try:
-                height = max(64, min(int(attrs.get("height", 1024)), 4096))
-                explicit_size_requested = explicit_size_requested or "height" in attrs
-            except (TypeError, ValueError):
-                height = 1024
+            if "width" in attrs:
+                try:
+                    width = max(64, min(int(attrs["width"]), 4096))
+                    explicit_size_requested = True
+                except (TypeError, ValueError):
+                    width = None
+            if "height" in attrs:
+                try:
+                    height = max(64, min(int(attrs["height"]), 4096))
+                    explicit_size_requested = True
+                except (TypeError, ValueError):
+                    height = None
 
             if tag_name == "edit_image" and not prompt:
                 failure_block = (
@@ -3235,42 +3268,26 @@ class _StreamState:
                         + (f" (missing: {', '.join(missing_sources)})" if missing_sources else "")
                     )
 
-            # ── 🚨 ASPECT-RATIO GUARD (SELF-CORRECTING FAILURE) ──
-            # An edit prompt that semantically requests a size/aspect change
-            # REQUIRES explicit width/height attributes. Without them the engine
-            # renders at the source dimensions and the request silently fails.
-            # Fail the dispatch with the exact corrective recipe instead.
+            # ── 📐 ASPECT-RATIO NOTE (NON-BLOCKING) ──
+            # With the dimension pass-through contract, an omitted width/height is
+            # forwarded as absent and the engine renders at the source image's
+            # native dimensions. A size/aspect-change prompt without explicit
+            # dimensions is therefore NOT a silent failure: the engine applies
+            # the requested transform at the source size (or keeps it if the
+            # provider cannot resize). We log a note for observability but do NOT
+            # reject the dispatch — the user's intent (edit the existing image)
+            # is honored and the source dimensions are preserved.
             if (
                 tag_name == "edit_image"
                 and not explicit_size_requested
                 and resolved_sources
                 and self._prompt_requests_size_change(prompt)
             ):
-                ASCIIColors.warning(
+                ASCIIColors.info(
                     "[StreamState] <edit_image> prompt requests a size/aspect change "
-                    "but no width/height attributes were provided. Rejecting with correction."
+                    "with no explicit width/height — proceeding at the source image's "
+                    "native dimensions (pass-through contract)."
                 )
-                if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
-                    correction_block = (
-                        f"\n* ⚠️ Image edit REJECTED: the prompt asks for a size or aspect-ratio change, "
-                        f"but the tag has no `width`/`height` attributes. The engine renders at the "
-                        f"tag's dimensions — without them the image keeps its current size and the "
-                        f"request would silently fail.\n"
-                        f"Re-emit the tag with explicit dimensions, e.g.:\n"
-                        f'<edit_image name="{title}" width="1920" height="1080">\n'
-                        f"  {prompt[:120]}\n"
-                        f"</edit_image>\n"
-                        f"Common ratios: 16:9 → 1920×1080 · 1:1 → 1024×1024 · 9:16 → 1080×1920 · "
-                        f"4:3 → 1024×768 · 21:9 → 2560×1080.\n"
-                        f"<!-- status:failure -->\n</processing>\n"
-                    )
-                    self.ai_message.content += correction_block
-                    _cb(self.callback, correction_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                    self._processing_block_open = False
-                self._last_dispatch_failed = True
-                self._last_failure_kind = "edit_image_missing_size"
-                self._action_dispatched = True
-                return True
 
             if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
                 if tag_name == "generate_image":
@@ -3310,11 +3327,16 @@ class _StreamState:
                             f"the named image exists in the workspace."
                         )
                     if explicit_size_requested:
+                        # At least one dimension was explicitly provided. Pass both
+                        # (the unspecified one falls back to the source's native
+                        # value on the engine side) so the requested size is honored.
                         img_bytes = tti.edit_image(
                             images=resolved_sources, prompt=prompt,
                             width=width, height=height,
                         )
                     else:
+                        # No dimensions specified: forward as absent so the engine
+                        # edits at the SOURCE image's native dimensions.
                         img_bytes = tti.edit_image(images=resolved_sources, prompt=prompt)
                 if img_bytes:
                     img_b64 = base64.b64encode(img_bytes).decode("utf-8")
@@ -4994,7 +5016,9 @@ class ChatMixin:
         enable_notes:                 bool = True,
         enable_skills:                bool = True,
         enable_books:                 bool = False,
-        enable_office_files:          bool = False,
+        enable_powerpoint:            bool = False,
+        enable_word:                  bool = False,
+        enable_excel:                 bool = False,
         enable_artefacts:             bool = True,
         enable_memory:                bool = False,
         enable_episodic_memory:       bool = False,  # 🆕 NEW: Control episodic memory saving
@@ -5082,11 +5106,21 @@ class ChatMixin:
                 read PowerPoint (.pptx) decks via sandboxed python-pptx recipe code (no
                 imports allowed in recipes). Mounted unconditionally when True; no vision
                 capability required. Default False.
-            enable_office_files (bool): Mount the Office Files Builder toolset — read,
-                create and edit .pptx/.docx/.xlsx (and .xlsm/.docm/.pptm) files via
-                sandboxed recipe tools. Every save is integrity-verified with automatic
-                rollback on corruption. Mounted unconditionally when True; no vision
-                capability required. Default False.
+            enable_powerpoint (bool): Mount the PowerPoint toolset — build, edit, read
+                and visually inspect .pptx/.pptm decks via sandboxed python-pptx recipe
+                code. New decks are 16:9; tool_pptx_info gives template/layout
+                awareness; tool_view_slides attaches up to 4 transient slide images per
+                call. Default False.
+            enable_word (bool): Mount the Word toolset — build, edit and read
+                .docx/.docm documents via sandboxed python-docx recipe code, with
+                comment/highlight/section/field helpers. Default False.
+            enable_excel (bool): Mount the Excel toolset — build, edit and read
+                .xlsx/.xlsm workbooks via sandboxed openpyxl recipe code. Computed
+                values MUST be formulas (SUM/AVERAGE/IF/VLOOKUP...), never manual
+                results. Default False.
+            enable_office_files (deprecated): legacy kwarg — enables all three
+                per-software flags above and mounts the monolithic
+                office_files_builder library.
             event_mode (EventMode): Event reporting mode. Default PROCESSING_TAG_MODE.
             think (Optional[bool]): Legacy flag to toggle reasoning/thinking output. If True, maps to reasoning_effort='high'. If False, disables reasoning. Default None.
             reasoning_effort (Optional[str]): Level of reasoning effort for reasoning/thinking models ('low', 'medium', 'high', 'max'). Overrides `think`. Default None.
@@ -5116,6 +5150,19 @@ class ChatMixin:
             )
 
         callback = streaming_callback
+
+        # ── LEGACY OFFICE FLAG SHIM ──
+        # enable_office_files is deprecated: it maps to all three per-software
+        # flags so existing callers keep working unchanged.
+        _legacy_office = bool(kwargs.pop("enable_office_files", False))
+        if _legacy_office:
+            enable_powerpoint = True
+            enable_word = True
+            enable_excel = True
+            ASCIIColors.info(
+                "[chat] enable_office_files is deprecated — enabled all three "
+                "per-software flags (enable_powerpoint/enable_word/enable_excel)."
+            )
 
         if orchestrator_mode:
             from ..lollms_agentic.runner import AgenticRunner
@@ -5331,8 +5378,14 @@ class ChatMixin:
                 extra_instructions += self._build_form_instructions()
             if enable_books and any(kw in user_msg_lower for kw in ("book", "tome", "novel", "chapitre")):
                 extra_instructions += self._build_book_instructions()
-            if enable_office_files:
+            if _legacy_office:
                 extra_instructions += self._build_office_files_instructions()
+            if enable_powerpoint:
+                extra_instructions += self._build_powerpoint_instructions()
+            if enable_word:
+                extra_instructions += self._build_word_instructions()
+            if enable_excel:
+                extra_instructions += self._build_excel_instructions()
 
             # Handle instructions (only if artifacts are enabled)
             branch_msgs_now = self.get_branch(user_msg.id)
@@ -5369,10 +5422,11 @@ class ChatMixin:
                     "   - `sources` (REQUIRED): the exact workspace file name(s) of the image(s) to edit, "
                     "comma-separated for multiple inputs (e.g. `sources=\"ai_is_gonna_kill_us_all.png\"`).\n"
                     "   - `name`: the output file name for the edited result (kebab-case, descriptive).\n"
-                    "   - `width`/`height` (REQUIRED for any size or aspect-ratio request): the target "
-                    "dimensions. Without them the engine renders at the source size and the request "
-                    "silently fails.\n"
-                    "3. **ASPECT-RATIO TABLE** (emit explicit width/height attributes):\n"
+                    "   - `width`/`height` (OPTIONAL): the target dimensions. When omitted, the engine "
+                    "edits at the SOURCE image's native dimensions (pass-through). Provide them only when "
+                    "you need to force a specific size or aspect ratio.\n"
+                    "3. **ASPECT-RATIO TABLE** (emit explicit width/height ONLY when you must force a "
+                    "specific output size):\n"
                     "   - 16:9 → width=\"1920\" height=\"1080\"\n"
                     "   - 9:16 → width=\"1080\" height=\"1920\"\n"
                     "   - 1:1 → width=\"1024\" height=\"1024\"\n"
@@ -5699,43 +5753,65 @@ class ChatMixin:
                     "toolset NOT mounted."
                 )
 
-        # ── 7. Mount Office Files Builder Toolset (Unconditional) ──
+        # ── 7. Mount Office Toolsets (Unconditional, Per-Software) ──
         # Office file building (.pptx/.docx/.xlsx) is a text-only workflow
         # (recipe code in → markdown inventory out): no vision capability is
-        # required, so the mount is unconditional when the flag is set.
-        if enable_office_files:
-            if lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
-                try:
-                    lcp_binding.mount_tool_library_if_absent("office_files_builder")
-                    lcp_tools = lcp_binding.to_chat_tool_specs(
-                        discussion_instance=self,
-                        lollms_client_instance=self.lollmsClient,
-                    )
-                    mounted_office_tools = [
-                        t_name for t_name, _t_spec in lcp_tools.items()
-                        if t_name.startswith(_OFFICE_TOOL_NAME_PREFIXES)
-                    ]
-                    for t_name in mounted_office_tools:
-                        active_tools[t_name] = lcp_tools[t_name]
-                    if mounted_office_tools:
-                        ASCIIColors.success(
-                            f"[ChatMixin] Mounted 'office_files_builder' toolset "
-                            f"({len(mounted_office_tools)} tools)."
-                        )
-                    else:
-                        ASCIIColors.warning(
-                            "[ChatMixin] office_files_builder mounted but no tool_office_* "
-                            "specs were produced."
-                        )
-                except Exception as ex:
-                    trace_exception(ex)
-                    ASCIIColors.warning(
-                        f"[ChatMixin] Failed to mount office_files_builder toolset: {ex}"
-                    )
-            else:
+        # required, so mounts are unconditional when their flag is set.
+        # Each flag mounts exactly one library and admits ONLY its own tool
+        # family (per-flag isolation). The legacy flag mounts the monolithic
+        # office_files_builder unchanged (backward-compat path). When both a
+        # per-software flag and the legacy flag are set, per-library mounting
+        # selects the winner and the later mount wins (identical tool names
+        # are deduplicated by the LCP registry).
+        _office_mount_requests = []
+        if _legacy_office:
+            _office_mount_requests.append(("office_files_builder", _OFFICE_TOOL_NAME_PREFIXES))
+        if enable_powerpoint:
+            _office_mount_requests.append(("powerpoint_tools", _OFFICE_PPTX_TOOL_NAMES))
+        if enable_word:
+            _office_mount_requests.append(("word_tools", _OFFICE_WORD_TOOL_NAMES))
+        if enable_excel:
+            _office_mount_requests.append(("excel_tools", _OFFICE_XLSX_TOOL_NAMES))
+
+        for _lib_name, _admission in _office_mount_requests:
+            if not (lcp_binding and hasattr(lcp_binding, "mount_tool_library")):
                 ASCIIColors.warning(
-                    "[ChatMixin] enable_office_files is True, but no LCP binding "
-                    "with mount_tool_library is available — office_files_builder NOT mounted."
+                    f"[ChatMixin] {_lib_name} requested, but no LCP binding "
+                    "with mount_tool_library is available — toolset NOT mounted."
+                )
+                continue
+            try:
+                lcp_binding.mount_tool_library_if_absent(_lib_name)
+                lcp_tools = lcp_binding.to_chat_tool_specs(
+                    discussion_instance=self,
+                    lollms_client_instance=self.lollmsClient,
+                )
+                if isinstance(_admission, tuple):
+                    mounted_lib_tools = [
+                        t_name for t_name, _t_spec in lcp_tools.items()
+                        if t_name.startswith(_admission)
+                    ]
+                else:
+                    mounted_lib_tools = [
+                        t_name for t_name, _t_spec in lcp_tools.items()
+                        if t_name in _admission
+                    ]
+                for t_name in mounted_lib_tools:
+                    active_tools[t_name] = lcp_tools[t_name]
+                if mounted_lib_tools:
+                    ASCIIColors.success(
+                        f"[ChatMixin] Mounted '{_lib_name}' toolset "
+                        f"({len(mounted_lib_tools)} tools)."
+                    )
+                else:
+                    ASCIIColors.warning(
+                        f"[ChatMixin] {_lib_name} mounted but no matching tool "
+                        "specs were produced."
+                    )
+            except Exception as ex:
+                trace_exception(ex)
+                ASCIIColors.warning(
+                    f"[ChatMixin] Failed to mount {_lib_name} toolset: {ex}"
                 )
 
 

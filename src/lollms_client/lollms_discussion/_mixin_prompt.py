@@ -1662,3 +1662,71 @@ EXAMPLE OF CORRECT FORM:
             "PowerPoint presentations, or asks to read or modify such files.\n"
             "=== END OFFICE FILES BUILDER TOOLSET ===\n"
         )
+
+    def _build_powerpoint_instructions(self) -> str:
+        """PowerPoint doctrine: 16:9 awareness, template discovery, transient visual verification."""
+        return (
+            "\n=== POWERPOINT TOOLS PROTOCOL ===\n"
+            "1. **SLIDE SIZE (16:9)**: every new deck is created at 16:9 — 13.333in x 7.5in "
+            "(EMU 12192000 x 6858000). The root `prs` is pre-bound. Position all shapes "
+            "within these bounds.\n"
+            "2. **TEMPLATE AWARENESS FIRST**: before building, call `tool_pptx_info` to "
+            "discover the deck's slide layouts (names + placeholder idx/type) and theme "
+            "fonts. Add slides via `prs.slide_layouts[i]` using the layout index you found.\n"
+            "3. **VISUAL VERIFICATION**: after building or editing, call `tool_view_slides` "
+            "to SEE rendered slides — a maximum of 4 slides per call. The images are "
+            "attached to the CURRENT ROUND ONLY and are never stored in the workspace. "
+            "Look at them and verify layout, overflow and positioning before finishing.\n"
+            "4. **IMPORTS**: recipe code may import ONLY from the whitelist (pptx.* plus "
+            "safe stdlib modules). All core design symbols (Presentation, Inches, Pt, Emu, "
+            "RGBColor, MSO_SHAPE, PP_ALIGN, qn, ...) are pre-imported.\n"
+            "5. **NO save()**: never call `prs.save()` — the harness saves and "
+            "integrity-verifies the file automatically after your recipe runs.\n"
+            "=== END POWERPOINT TOOLS PROTOCOL ===\n"
+        )
+
+    def _build_word_instructions(self) -> str:
+        """Word doctrine: edit vocabulary hints — freedom plus high-leverage helpers."""
+        return (
+            "\n=== WORD TOOLS PROTOCOL ===\n"
+            "You have full freedom to edit .docx/.docm documents with python-docx recipe "
+            "code — use your own coding skills. The root `doc` is pre-bound, and `qn` plus "
+            "all WD_* enums are pre-imported. High-leverage vocabulary hints:\n"
+            "1. **COMMENTS**: `add_comment(doc, paragraph, text, author)` inserts a real "
+            "OOXML comment (falls back to yellow highlighting when the comment part is "
+            "unavailable).\n"
+            "2. **HIGHLIGHTS**: `run.font.highlight_color = WD_COLOR_INDEX.YELLOW` (or any "
+            "WD_COLOR_INDEX member) to mark text for review.\n"
+            "3. **REFORMATTING**: restyle freely — styles (`doc.styles`), fonts, alignment, "
+            "spacing, numbering.\n"
+            "4. **SECTIONS**: `doc.add_section(WD_SECTION.NEW_PAGE)` for page breaks and "
+            "per-section layout.\n"
+            "5. **LINKS & FIELDS**: build them via OXML — `qn('w:fldSimple')` with an "
+            "instruction attribute; Word updates fields on open.\n"
+            "6. **TABLES & IMAGES**: use `media('name.png')` to resolve workspace media "
+            "files for insertion.\n"
+            "These are hints, not restrictions — any python-docx technique is allowed. "
+            "Never call `doc.save()`; the harness saves and verifies automatically.\n"
+            "=== END WORD TOOLS PROTOCOL ===\n"
+        )
+
+    def _build_excel_instructions(self) -> str:
+        """Excel doctrine: formulas only for computed values — never manual results."""
+        return (
+            "\n=== EXCEL TOOLS PROTOCOL (FORMULAS ONLY — CRITICAL) ===\n"
+            "1. **NEVER write calculation results manually. ALWAYS use formulas** for any "
+            "computed value. Excel computes them when the user opens the file:\n"
+            "   - `ws[\"F2\"] = \"=SUM(B2:E2)\"`\n"
+            "   - `ws[\"G2\"] = \"=AVERAGE(B2:E2)\"`\n"
+            "   - `ws[\"H2\"] = '=IF(F2>100,\"High\",\"Low\")'`\n"
+            "   - `ws[\"I2\"] = \"=VLOOKUP(A2, Sheet2!A:C, 3, FALSE)\"`\n"
+            "   - `ws[\"J2\"] = \"=INDEX(C:C, MATCH(A2, A:A, 0))\"`\n"
+            "2. **LITERALS ONLY FOR INPUT DATA**: raw values belong only in the source "
+            "data cells the user provided. Every derived cell must be a formula.\n"
+            "3. **CHART RECALC CAVEAT**: charts referencing formula cells may appear empty "
+            "until Excel recalculates on open — formulas are still the correct choice.\n"
+            "4. The root `wb` is pre-bound with `ws` for its active sheet. Imports only "
+            "from openpyxl.* + safe stdlib. Never call `wb.save()`; the harness saves and "
+            "verifies automatically.\n"
+            "=== END EXCEL TOOLS PROTOCOL ===\n"
+        )

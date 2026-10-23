@@ -1,0 +1,41 @@
+name: excel_tools
+description: >
+  Dedicated Excel toolset: create, edit and read .xlsx/.xlsm workbooks via
+  sandboxed openpyxl recipe code. DOCTRINE: never write computed results
+  manually — always write formulas (=SUM, =AVERAGE, =IF, =VLOOKUP ...) so
+  Excel computes them; literal values only for input data. Every save is
+  verified with a strict three-layer OOXML integrity check before being
+  committed to the workspace.
+tools:
+  - name: tool_build_excel
+    description: Creates a new Excel workbook from a sandboxed openpyxl recipe. Root objects pre-bound as wb/ws. FORMULAS ONLY for computed cells — never manual results.
+    parameters:
+      - name: file
+        type: str
+        description: "Target .xlsx/.xlsm file name (default: workbook.xlsx)."
+        mandatory: false
+        default: "workbook.xlsx"
+      - name: recipe
+        type: str
+        description: "Plain Python recipe mutating the pre-bound wb/ws objects. Formulas (=SUM, =AVERAGE, =IF...) for every computed cell; literals only for input data."
+        mandatory: false
+        default: ""
+  - name: tool_edit_excel
+    description: Edits an existing Excel workbook in place via a sandboxed openpyxl recipe. Opened workbook pre-bound as wb/ws (.xlsm with keep_vba=True). FORMULAS ONLY for computed cells. Transactional save: pre-edit bytes restored on validation failure.
+    parameters:
+      - name: file
+        type: str
+        description: "Path of the workbook to edit (relative to the discussion working dir or absolute)."
+        mandatory: true
+      - name: recipe
+        type: str
+        description: "Plain Python recipe mutating the opened wb/ws objects. Formulas for every computed cell; literals only for input data."
+        mandatory: false
+        default: ""
+  - name: tool_read_excel
+    description: Reads an existing Excel workbook and returns a markdown inventory (sheets, dimensions, cell previews, formulas). Validates the file first; corrupt files return a structured failure.
+    parameters:
+      - name: file
+        type: str
+        description: "Path of the workbook to read (relative to the discussion working dir or absolute)."
+        mandatory: true
