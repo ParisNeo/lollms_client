@@ -23,7 +23,7 @@ BindingName = "LCPBinding"
 # are EXCLUDED from discovery/mounting. This prevents office toolsets from
 # auto-appearing in every session (the as_is leak class).
 _OFFICE_LIBRARY_STEMS = frozenset({
-    "as_is_document_tools", "office_files_builder", "document_editor",
+    "as_is_document_tools", "document_editor",
     "pptx_builder", "docx_mastery", "pptx_mastery", "xlsx_mastery",
     "powerpoint_tools", "word_tools", "excel_tools",
 })

@@ -772,7 +772,6 @@ def chat(
 *   `enable_skills` (`bool`): Enables the `<skill>` tag for persistent AI behavior capsules.
 *   `enable_forms` (`bool`): Enables the `<lollms_form>` tag for pausing generation to request structured user input.
 *   `enable_books` (`bool`): Conditionally enables book-specific instructions in the system prompt if the user request matches.
-*   `enable_office_files` (`bool`): Mounts the unified `office_files_builder` LCP toolset (`tool_office_build` / `tool_office_edit` / `tool_office_read`) for creating, editing, and reading Microsoft Office files — PowerPoint (`.pptx`/`.pptm`), Word (`.docx`/`.docm`), Excel (`.xlsx`/`.xlsm`) — via sandboxed recipe code (no `import` statements; pre-bound root objects `prs`/`doc`/`wb`+`ws`; 3-layer OOXML validation with rollback, failure code `office_file_failed_validation`). Office-file instructions are injected unconditionally whenever the flag is on; there is no keyword gate and no separate presentation flag. Default `False`.
 *   `enable_image_generation` (`bool`): Enables the `<generate_image>` tag if a TTI binding is available.
 *   `enable_image_editing` (`bool`): Enables the `<edit_image>` tag if a TTI binding is available.
 

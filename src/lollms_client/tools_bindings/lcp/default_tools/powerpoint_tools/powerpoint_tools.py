@@ -154,18 +154,25 @@ def _annotate_traceback(raw_traceback: str, source_code: str, source_name: str) 
 
 
 def _candidate_working_dirs(working_dir: Optional[Path]) -> List[Path]:
-    """Builds the ordered list of directories scanned for media files."""
-    candidates: List[Path] = []
+    """Builds the ordered list of directories scanned for media files.
+
+    Workspace-first anchoring: when a discussion workspace is provided it is
+    the SOLE root, so bare filenames resolve against the workspace and never
+    against the process CWD (the daemon's startup folder). The CWD fallback
+    applies only when no workspace was supplied (standalone/test harness).
+    """
     if working_dir is not None:
         try:
-            candidates.append(Path(working_dir).resolve())
+            resolved = Path(working_dir).resolve()
         except Exception:
-            pass
+            resolved = None
+        if resolved is not None and resolved.is_dir():
+            return [resolved]
     try:
-        candidates.append(Path.cwd().resolve())
+        cwd = Path(".").resolve()
     except Exception:
-        pass
-    return candidates
+        return []
+    return [cwd] if cwd.is_dir() else []
 
 
 def _resolve_media_path(ref: str, working_dir: Optional[Path]) -> Optional[Path]:
@@ -249,7 +256,20 @@ def _build_recipe_namespace(working_dir: Optional[Path] = None) -> Dict[str, Any
             "Recipes will fail until 'pip install python-pptx' is run."
         )
 
-    namespace["media"] = lambda ref: _resolve_media_path(ref, working_dir)
+    def _media_or_raise(ref: str) -> str:
+        resolved = _resolve_media_path(ref, working_dir)
+        if resolved is None:
+            available = _list_media_files(working_dir)
+            available_hint = ", ".join(available[:20]) if available else "(none found)"
+            raise ValueError(
+                f"Media file '{ref}' not found in the workspace. Bare filenames "
+                f"resolve against the workspace, not the process folder. "
+                f"Available media: {available_hint}. Use list_media() for the full list."
+            )
+        return str(resolved)
+
+    namespace["media"] = _media_or_raise
+    namespace["resolve_path"] = _media_or_raise
     namespace["list_media"] = lambda: _list_media_files(working_dir)
     return namespace
 
@@ -622,6 +642,9 @@ def tool_build_powerpoint(
     whitelist (pptx.* plus safe stdlib modules). Do NOT call prs.save() — the
     file is saved and integrity-verified automatically. Verify visually with
     tool_view_slides (max 4 slides per call, transient images).
+    WORKSPACE RULE: every slide image/asset reference MUST go through media()/
+    resolve_path() (e.g. slide.shapes.add_picture(media("img.png"), left, top))
+    — bare filenames resolve against the workspace, not the process folder.
 
     Args:
         file (str): Output file name (default 'presentation.pptx'; .pptx or .pptm).
@@ -680,6 +703,9 @@ def tool_edit_powerpoint(
     the file is saved and integrity-verified automatically; the pre-edit bytes are
     restored if validation fails. Verify visually with tool_view_slides (max 4
     slides per call, transient images).
+    WORKSPACE RULE: every slide image/asset reference MUST go through media()/
+    resolve_path() (e.g. slide.shapes.add_picture(media("img.png"), left, top))
+    — bare filenames resolve against the workspace, not the process folder.
 
     Args:
         file (str): Deck file name to edit (.pptx or .pptm).
@@ -1010,7 +1036,10 @@ def get_tools() -> List[Dict[str, Any]]:
                 "Build a new PowerPoint deck (.pptx/.pptm) from sandboxed python-pptx "
                 "recipe code. The root `prs` is pre-bound at 16:9 (13.333in x 7.5in). "
                 "Discover layouts with tool_pptx_info BEFORE building. Imports only from "
-                "pptx.* + safe stdlib. Do NOT call prs.save() — auto-saved and verified."
+                "pptx.* + safe stdlib. Do NOT call prs.save() — auto-saved and verified. "
+                "WORKSPACE RULE: every slide image/asset reference MUST use media()/"
+                "resolve_path() (e.g. add_picture(media('img.png'), left, top)) — bare "
+                "filenames resolve against the workspace, not the process folder."
             ),
             "parameters": [
                 {"name": "file", "type": "string", "description": "Output file name (.pptx or .pptm)."},
@@ -1026,7 +1055,10 @@ def get_tools() -> List[Dict[str, Any]]:
             "description": (
                 "Edit an existing PowerPoint deck with sandboxed python-pptx recipe code. "
                 "The deck is pre-bound as `prs`. Imports only from pptx.* + safe stdlib. "
-                "Do NOT call prs.save() — auto-saved, verified, rolled back on failure."
+                "Do NOT call prs.save() — auto-saved, verified, rolled back on failure. "
+                "WORKSPACE RULE: every slide image/asset reference MUST use media()/"
+                "resolve_path() — bare filenames resolve against the workspace, not the "
+                "process folder."
             ),
             "parameters": [
                 {"name": "file", "type": "string", "description": "Deck file name to edit (.pptx or .pptm)."},

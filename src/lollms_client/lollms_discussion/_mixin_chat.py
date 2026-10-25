@@ -37,22 +37,10 @@ from ._context_sanitizer import scrub_processing_and_status_blocks
 
 _MAX_BRACKET_BUF = 256
 
-# ── Office toolset mount filter ──
-# The office_files_builder library exposes the three generic tools
-# (tool_office_build/edit/read) plus nine per-format aliases
-# (tool_build/edit/read_powerpoint/word/excel). All twelve mount together
-# under enable_office_files; this prefix tuple admits every name.
-_OFFICE_TOOL_NAME_PREFIXES = (
-    "tool_office_",
-    "tool_build_powerpoint", "tool_edit_powerpoint", "tool_read_powerpoint",
-    "tool_build_word", "tool_edit_word", "tool_read_word",
-    "tool_build_excel", "tool_edit_excel", "tool_read_excel",
-)
 
 # ── Per-software office toolset admission sets ──
 # Exact-name admission for the three split toolsets. NOTE: the
-# tool_build/edit/read_powerpoint|word|excel names ALSO exist in the
-# monolithic office_files_builder library; per-library mounting selects
+# tool_build/edit/read_powerpoint|word|excel 
 # the winner (the later mount wins when both flags are on, and the LCP
 # registry deduplicates identical tool names).
 _OFFICE_PPTX_TOOL_NAMES = {
@@ -4901,7 +4889,6 @@ class ChatMixin:
         auto_approve_python: bool = False,
         confirm_handler: Optional[Callable] = None,
         enable_computer_use: bool = False,
-        enable_office_files: bool = False,
         enable_powerpoint: bool = False,
         enable_word: bool = False,
         enable_excel: bool = False,
@@ -5014,10 +5001,9 @@ class ChatMixin:
             # Deliver the per-software flags through the real mechanism so
             # mount_tool_library_if_absent succeeds when chat() requests the
             # mount later. Fail-closed is preserved: absent flags still refuse.
-            if enable_office_files or enable_powerpoint or enable_word or enable_excel:
+            if enable_powerpoint or enable_word or enable_excel:
                 if hasattr(lcp_binding, "set_session_flags"):
                     lcp_binding.set_session_flags({
-                        "enable_office_files": enable_office_files,
                         "enable_powerpoint": enable_powerpoint,
                         "enable_word": enable_word,
                         "enable_excel": enable_excel,
@@ -5238,9 +5224,6 @@ class ChatMixin:
                 .xlsx/.xlsm workbooks via sandboxed openpyxl recipe code. Computed
                 values MUST be formulas (SUM/AVERAGE/IF/VLOOKUP...), never manual
                 results. Default False.
-            enable_office_files (deprecated): legacy kwarg — enables all three
-                per-software flags above and mounts the monolithic
-                office_files_builder library.
             event_mode (EventMode): Event reporting mode. Default PROCESSING_TAG_MODE.
             think (Optional[bool]): Legacy flag to toggle reasoning/thinking output. If True, maps to reasoning_effort='high'. If False, disables reasoning. Default None.
             reasoning_effort (Optional[str]): Level of reasoning effort for reasoning/thinking models ('low', 'medium', 'high', 'max'). Overrides `think`. Default None.
@@ -5270,19 +5253,6 @@ class ChatMixin:
             )
 
         callback = streaming_callback
-
-        # ── LEGACY OFFICE FLAG SHIM ──
-        # enable_office_files is deprecated: it maps to all three per-software
-        # flags so existing callers keep working unchanged.
-        _legacy_office = bool(kwargs.pop("enable_office_files", False))
-        if _legacy_office:
-            enable_powerpoint = True
-            enable_word = True
-            enable_excel = True
-            ASCIIColors.info(
-                "[chat] enable_office_files is deprecated — enabled all three "
-                "per-software flags (enable_powerpoint/enable_word/enable_excel)."
-            )
 
         if orchestrator_mode:
             from ..lollms_agentic.runner import AgenticRunner
@@ -5733,7 +5703,6 @@ class ChatMixin:
             auto_approve_python=auto_approve_python,
             confirm_handler=confirm_handler,
             enable_computer_use=enable_computer_use,
-            enable_office_files=_legacy_office,
             enable_powerpoint=enable_powerpoint,
             enable_word=enable_word,
             enable_excel=enable_excel,
@@ -5893,8 +5862,6 @@ class ChatMixin:
         _refused_office_libs: List[str] = []
 
         _office_mount_requests = []
-        if _legacy_office:
-            _office_mount_requests.append(("office_files_builder", _OFFICE_TOOL_NAME_PREFIXES))
         if enable_powerpoint:
             _office_mount_requests.append(("powerpoint_tools", _OFFICE_PPTX_TOOL_NAMES))
         if enable_word:
@@ -5960,9 +5927,6 @@ class ChatMixin:
         _pptx_mounted = bool(_office_mount_outcomes.get("powerpoint_tools"))
         _word_mounted = bool(_office_mount_outcomes.get("word_tools"))
         _xlsx_mounted = bool(_office_mount_outcomes.get("excel_tools"))
-        _legacy_mounted = bool(_office_mount_outcomes.get("office_files_builder"))
-        if _legacy_office and _legacy_mounted:
-            extra_instructions += self._build_office_files_instructions()
         if enable_powerpoint and _pptx_mounted:
             extra_instructions += self._build_powerpoint_instructions()
         if enable_word and _word_mounted:

@@ -290,6 +290,14 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-25 23:27]
+
+- feat(lollms_discussion): add `enable_skills` parameter to chat and prompt methods
+
+## [2026-10-25 16:53]
+
+- feat(lcp): add document_editor tool and update word_tools
+
 ## [2026-10-25 16:19]
 
 - feat(lcp): add word tools and document editor tools

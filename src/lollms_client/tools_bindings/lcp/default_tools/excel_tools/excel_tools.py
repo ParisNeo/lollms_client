@@ -152,18 +152,25 @@ def _annotate_traceback(raw_traceback: str, source_code: str, source_name: str) 
 
 
 def _candidate_working_dirs(working_dir: Optional[Path]) -> List[Path]:
-    """Enumerates the roots a media reference may be anchored to."""
-    roots: List[Path] = []
-    for base in (working_dir, Path(".").resolve()):
-        if base is None:
-            continue
+    """Enumerates the roots a media reference may be anchored to.
+
+    Workspace-first anchoring: when a discussion workspace is provided it is
+    the SOLE root, so bare filenames resolve against the workspace and never
+    against the process CWD (the daemon's startup folder). The CWD fallback
+    applies only when no workspace was supplied (standalone/test harness).
+    """
+    if working_dir is not None:
         try:
-            resolved = Path(base).resolve()
+            resolved = Path(working_dir).resolve()
         except Exception:
-            continue
-        if resolved.is_dir() and resolved not in roots:
-            roots.append(resolved)
-    return roots
+            resolved = None
+        if resolved is not None and resolved.is_dir():
+            return [resolved]
+    try:
+        cwd = Path(".").resolve()
+    except Exception:
+        return []
+    return [cwd] if cwd.is_dir() else []
 
 
 def _resolve_media_path(ref: str, working_dir: Optional[Path]) -> Path:
@@ -283,6 +290,7 @@ def _build_recipe_namespace(working_dir: Optional[Path] = None) -> Dict[str, Any
 
     if working_dir is not None:
         namespace["media"] = lambda ref: str(_resolve_media_path(ref, working_dir))
+        namespace["resolve_path"] = lambda ref: str(_resolve_media_path(ref, working_dir))
 
         def _list_all_media() -> List[str]:
             aggregated: List[str] = []
@@ -592,7 +600,11 @@ def tool_build_excel(
     The root objects are pre-bound as `wb` (workbook) and `ws` (active sheet).
     Available symbols: Workbook, load_workbook, PieChart, LineChart, BarChart,
     Reference, Font, PatternFill, Alignment, Border, Side, get_column_letter,
-    CellIsRule, ColorScaleRule, DataValidation, media(), list_media().
+    CellIsRule, ColorScaleRule, DataValidation, media(), list_media(),
+    resolve_path().
+    WORKSPACE RULE: every workspace asset reference (images, CSV inputs,
+    sub-documents) MUST go through media()/resolve_path() — bare filenames
+    resolve against the workspace, not the process folder.
     Recipes are plain Python: imports are allowed ONLY from the whitelist
     (openpyxl.* and safe stdlib modules); all core design symbols are also
     pre-imported. The tool saves automatically; calling wb.save() inside the
@@ -677,7 +689,10 @@ def tool_edit_excel(
     (.xlsm files are opened with keep_vba=True). Available symbols: Workbook,
     load_workbook, PieChart, LineChart, BarChart, Reference, Font, PatternFill,
     Alignment, Border, Side, get_column_letter, CellIsRule, ColorScaleRule,
-    DataValidation, media(), list_media(). Recipes are plain Python: imports
+    DataValidation, media(), list_media(), resolve_path(). WORKSPACE RULE:
+    every workspace asset reference (images, inputs) MUST use media()/
+    resolve_path() — bare filenames resolve against the workspace, not the
+    process folder. Recipes are plain Python: imports
     are allowed ONLY from the whitelist (openpyxl.* and safe stdlib modules);
     all core design symbols are also pre-imported. The tool saves
     automatically; calling wb.save() inside the recipe is a no-op — remove it.
@@ -1018,7 +1033,10 @@ def get_tools() -> List[Dict[str, Any]]:
                 "ws['H2']='=IF(F2>100,\"High\",\"Low\")'. Literals only for input data. Root objects "
                 "pre-bound as wb/ws. Symbols: Workbook, load_workbook, PieChart, LineChart, BarChart, "
                 "Reference, Font, PatternFill, Alignment, Border, Side, get_column_letter, CellIsRule, "
-                "ColorScaleRule, DataValidation, media(), list_media(). Imports allowed ONLY from the "
+                "ColorScaleRule, DataValidation, media(), list_media(), resolve_path(). WORKSPACE "
+                "RULE: every workspace asset reference (images, inputs) MUST use media()/"
+                "resolve_path() — bare filenames resolve against the workspace, not the process "
+                "folder. Imports allowed ONLY from the "
                 "whitelist (openpyxl.*, safe stdlib). Do NOT call save() — the tool saves and validates "
                 "automatically. Chart note: charts referencing formula cells may appear empty in some "
                 "viewers until Excel recalculates."
@@ -1055,6 +1073,8 @@ def get_tools() -> List[Dict[str, Any]]:
                 "recipe. DOCTRINE: NEVER write computed results manually — ALWAYS write formulas so "
                 "Excel computes them (=SUM, =AVERAGE, =IF, =VLOOKUP...). Literals only for input data. "
                 "Opened workbook pre-bound as wb, active sheet as ws (.xlsm opened with keep_vba=True). "
+                "WORKSPACE RULE: every workspace asset reference (images, inputs) MUST use media()/"
+                "resolve_path() — bare filenames resolve against the workspace, not the process folder. "
                 "Imports allowed ONLY from the whitelist (openpyxl.*, safe stdlib). Do NOT call save() — "
                 "the tool saves and validates automatically. Transactional save: pre-edit bytes restored "
                 "on validation failure."

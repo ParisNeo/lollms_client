@@ -150,18 +150,25 @@ def _annotate_traceback(raw_traceback: str, source_code: str, source_name: str) 
 
 
 def _candidate_working_dirs(working_dir: Optional[Path]) -> List[Path]:
-    """Enumerates the roots a media reference may be anchored to."""
-    roots: List[Path] = []
-    for base in (working_dir, Path(".").resolve()):
-        if base is None:
-            continue
+    """Enumerates the roots a media reference may be anchored to.
+
+    Workspace-first anchoring: when a discussion workspace is provided it is
+    the SOLE root, so bare filenames resolve against the workspace and never
+    against the process CWD (the daemon's startup folder). The CWD fallback
+    applies only when no workspace was supplied (standalone/test harness).
+    """
+    if working_dir is not None:
         try:
-            resolved = Path(base).resolve()
+            resolved = Path(working_dir).resolve()
         except Exception:
-            continue
-        if resolved.is_dir() and resolved not in roots:
-            roots.append(resolved)
-    return roots
+            resolved = None
+        if resolved is not None and resolved.is_dir():
+            return [resolved]
+    try:
+        cwd = Path(".").resolve()
+    except Exception:
+        return []
+    return [cwd] if cwd.is_dir() else []
 
 
 def _resolve_media_path(ref: str, working_dir: Optional[Path]) -> Path:
@@ -442,6 +449,7 @@ def _build_recipe_namespace(working_dir: Optional[Path] = None) -> Dict[str, Any
 
     if working_dir is not None:
         namespace["media"] = lambda ref: str(_resolve_media_path(ref, working_dir))
+        namespace["resolve_path"] = lambda ref: str(_resolve_media_path(ref, working_dir))
 
         def _list_all_media() -> List[str]:
             aggregated: List[str] = []
@@ -717,7 +725,10 @@ def tool_build_word(
     DocxInches, DocxPt, DocxRGBColor, WD_ALIGN_PARAGRAPH, WD_LINE_SPACING,
     WD_BREAK, WD_COLOR_INDEX, WD_SECTION, WD_ORIENT, WD_TABLE_ALIGNMENT, qn,
     OxmlElement, add_comment, list_comments, list_highlights,
-    resolve_comment_runs, media(), list_media().
+    resolve_comment_runs, media(), list_media(), resolve_path().
+    WORKSPACE RULE: every workspace asset reference (images, sub-documents,
+    inputs) MUST go through media()/resolve_path() — bare filenames resolve
+    against the workspace, not the process folder.
 
     Building hints (not restrictions — use your own coding skills):
     - Rich text: doc.add_paragraph("text", style="Heading 1"), runs with
@@ -802,7 +813,10 @@ def tool_edit_word(
     DocxInches, DocxPt, DocxRGBColor, WD_ALIGN_PARAGRAPH, WD_LINE_SPACING,
     WD_BREAK, WD_COLOR_INDEX, WD_SECTION, WD_ORIENT, WD_TABLE_ALIGNMENT, qn,
     OxmlElement, add_comment, list_comments, list_highlights,
-    resolve_comment_runs, media(), list_media().
+    resolve_comment_runs, media(), list_media(), resolve_path().
+    WORKSPACE RULE: every workspace asset reference (images, sub-documents,
+    inputs) MUST go through media()/resolve_path() — bare filenames resolve
+    against the workspace, not the process folder.
 
     Edit vocabulary hints (not restrictions — use your own coding skills):
     - INSERT COMMENTS: add_comment(doc, paragraph, "comment text", author="Assistant",
@@ -1021,7 +1035,10 @@ def get_tools() -> List[Dict[str, Any]]:
                 "Root object pre-bound as doc. Symbols: DocxDocument, DocxInches, DocxPt, "
                 "DocxRGBColor, WD_ALIGN_PARAGRAPH, WD_LINE_SPACING, WD_BREAK, WD_COLOR_INDEX, "
                 "WD_SECTION, WD_ORIENT, WD_TABLE_ALIGNMENT, qn, OxmlElement, add_comment, "
-                "list_comments, list_highlights, resolve_comment_runs, media(), list_media(). "
+                "list_comments, list_highlights, resolve_comment_runs, media(), list_media(), "
+                "resolve_path(). WORKSPACE RULE: every workspace asset reference (images, "
+                "inputs) MUST use media()/resolve_path() — bare filenames resolve against "
+                "the workspace, not the process folder. "
                 "Hints: styles, tables, images via media(), headers/footers, TOC field "
                 "via OXML, sections via doc.add_section(WD_SECTION.NEW_PAGE). Comments are "
                 "REAL Word comments (comments part auto-created, run-anchored). Imports "
@@ -1044,7 +1061,18 @@ def get_tools() -> List[Dict[str, Any]]:
             ],
             "output": [
                 {"name": "success", "type": "bool", "description": "Whether the operation succeeded."},
-                {"name": "workspace_file", "type": "str", "description": "Absolute path to the saved file."},
+                {"name": "comments", "type": "list", "description": "Structured comments (author, initials, date, text)."},
+                {"name": "highlights", "type": "list", "description": "Highlighted runs (paragraph index, excerpt, color)."},
+                {"name": "inventory", "type": "str", "description": "Full markdown inventory of the document."},
+                {"name": "file_name", "type": "str", "description": "Name of the file reviewed."},
+                {"name": "workspace_file", "type": "str", "description": "Absolute path to the file."},
+                {"name": "error", "type": "str", "description": "Error message if failed."},
+            ],
+            "callable": tool_word_review,
+            "_source": "word_tools",
+            "_source_file": __file__,
+        },
+    ]name": "workspace_file", "type": "str", "description": "Absolute path to the saved file."},
                 {"name": "context_files", "type": "list", "description": "List of context files (the saved file)."},
                 {"name": "file_name", "type": "str", "description": "Name of the saved file."},
                 {"name": "error", "type": "str", "description": "Error message if failed."},
@@ -1064,7 +1092,9 @@ def get_tools() -> List[Dict[str, Any]]:
                 "via run.font.highlight_color = WD_COLOR_INDEX.YELLOW; reformat via styles/fonts/"
                 "alignment/spacing; sections via doc.add_section(WD_SECTION.NEW_PAGE); links/fields "
                 "via OXML field codes (qn, fldSimple — Word updates on open); find & replace over "
-                "runs; tables; images via media(). Imports allowed ONLY from the whitelist (docx.*, "
+                "runs; tables; images via media(). WORKSPACE RULE: every workspace asset "
+                "reference (images, inputs) MUST use media()/resolve_path() — bare filenames "
+                "resolve against the workspace, not the process folder. Imports allowed ONLY from the whitelist (docx.*, "
                 "safe stdlib). Do NOT call save() — the tool saves and validates automatically. "
                 "Transactional save: pre-edit bytes restored on validation failure."
             ),
