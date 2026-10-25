@@ -3,10 +3,21 @@ Test suite to verify that ALL active artifacts are properly synced to workspace
 before tool execution, enabling the LLM to build artifacts and then call custom tools.
 """
 
+import hashlib
 import unittest
 from pathlib import Path
+import pytest
 import shutil
 import tempfile
+
+
+def pytest_importorskip_excel():
+    try:
+        import openpyxl
+    except ImportError:
+        pytest.skip("openpyxl is not installed")
+    import openpyxl
+    return openpyxl
 
 # Add src to path for direct execution
 import sys
@@ -151,6 +162,54 @@ class TestArtifactSyncForTools(unittest.TestCase):
         
         content = file_path.read_text()
         self.assertIn("def process()", content)
+
+    def test_excel_artifact_sync_binary_integrity(self):
+        """Excel artifacts must survive sync_all_active_to_disk() byte-intact.
+
+        XLSX is a binary ZIP container: any text-mode read/write in the sync
+        path corrupts it. This test gates the binary-safe sync seam with a
+        sha256 comparison over raw bytes.
+        """
+        openpyxl = pytest_importorskip_excel()
+        ws_path = Path(self.discussion.workspace_data_path)
+        ws_path.mkdir(parents=True, exist_ok=True)
+
+        # 1. Build a REAL xlsx in the workspace (mirrors tool_build_excel output).
+        source_path = ws_path / "report.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws["A1"] = "Name"
+        ws["B1"] = 10
+        ws["C1"] = "=SUM(B1:B1)"
+        wb.save(str(source_path))
+        source_bytes = source_path.read_bytes()
+        self.assertTrue(source_bytes[:2] == b"PK", "source file is not a ZIP container")
+
+        # 2. Register it as an active artifact using the suite's existing pattern.
+        self.discussion.artefacts.add(
+            title="report.xlsx",
+            artefact_type="data",
+            content="### Data File: report.xlsx",
+            active=True,
+            visibility=ArtefactVisibility.FULL,
+            physical_data=source_bytes,
+        )
+        self.discussion.commit()
+
+        # 3. Sync and verify byte-identity (binary-safe, never read_text).
+        sync_ws, sync_files = self.discussion.artefacts.sync_all_active_to_disk()
+        synced_path = ws_path / "report.xlsx"
+        self.assertTrue(synced_path.is_file(), "synced xlsx was not written to disk")
+        self.assertEqual(
+            hashlib.sha256(source_bytes).hexdigest(),
+            hashlib.sha256(synced_path.read_bytes()).hexdigest(),
+            "synced xlsx is not byte-identical to the source (binary corruption)",
+        )
+
+        # 4. The synced file must remain a loadable workbook.
+        reloaded = openpyxl.load_workbook(synced_path)
+        self.assertEqual(reloaded.active["A1"].value, "Name")
+        self.assertEqual(reloaded.active["C1"].value, "=SUM(B1:B1)")
 
     def test_cir_file_accessible_to_tools(self):
         """Test that .cir files are synced and accessible."""

@@ -1754,6 +1754,182 @@ The `import_file` method supports sophisticated ingestion strategies:
 | **`data_bundle`** | **Schema Fusion**. Scans a folder, groups files by column signature, fuses them into a single SQLite DB. | Merging 100s of daily CSV reports into one DB. |
 | **`audio_stt`** | Transcribes speech audio (`.mp3`, `.wav`, `.m4a`) using the active Speech-to-Text binding. | Voice memos, call recordings, podcasts. |
 
+### 📖 The `import_file()` API
+
+All ingestion goes through a single entry point on the discussion object (`FileImportMixin.import_file`):
+
+```python
+result = discussion.import_file(
+    path="path/to/file.ext",       # Absolute or relative path to the source file
+    mode="text_images",            # Ingestion strategy (see table above)
+    title="my_report",             # Optional: override the artefact title
+                                   # (defaults to the full filename, with extension)
+    activate=True,                 # Activate the text artefact immediately (FULL visibility)
+    progress_cb=my_callback,       # Optional fn(str) receiving progress updates
+    description="Q3 sales data",   # Optional description appended to the artefact content
+    on_conflict="suffix",          # "suffix" | "version" | "overwrite" | "replace"
+                                   # (applies to text-extraction modes only)
+)
+```
+
+**Key parameters:**
+
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `path` | `str \| Path` | — | The source file to import. Must exist on disk (`FileNotFoundError` otherwise). |
+| `mode` | `str` | `"text_images"` | The ingestion strategy. Must be one of the nine modes listed above (`ValueError` otherwise). |
+| `title` | `Optional[str]` | `None` | Custom artefact title. If omitted, the full filename (with extension) is used. |
+| `activate` | `bool` | `True` | Whether to activate the text artefact immediately (`FULL` visibility → content injected into LLM context). |
+| `progress_cb` | `Optional[Callable[[str], None]]` | `None` | Optional callback receiving human-readable progress strings (e.g., `"Rendering page 3/12..."`). |
+| `description` | `Optional[str]` | `None` | Optional description text appended to the artefact content (supported in `as_is`, `data`, and `data_bundle` modes). |
+| `on_conflict` | `str` | `"suffix"` | Collision strategy when an artefact with the same title already exists. **Applies to text-extraction modes only** (`text`, `text_images`, `text_embedded_images`, `ocr`, and `images_only` companion text). See [Import Conflict Resolution](#import-conflict-resolution). |
+
+**Return value** — the method returns a **result dictionary** (not the artefact itself) and commits the discussion:
+
+```python
+{
+    "text_artefact":  Dict | None,  # created/updated text (or data/file) artefact
+    "image_artefact": Dict | None,  # companion image artefact, if any (deactivated by default)
+    "mode":           str,          # the mode that ran
+    "page_count":     int,          # pages processed (PDF/PPTX rendering, OCR)
+    "image_count":    int,          # images extracted/anchored
+    "warnings":       List[str],    # non-fatal issues (e.g., "XLSX files have no embedded images")
+}
+```
+
+> **Note on rich-text titles**: For rich formats (`.pdf`, `.docx`, `.pptx`, `.xlsx`, `.odt`) imported in text-extraction modes, a `.md` suffix is automatically appended to the title (e.g., `report.pdf` → `report.pdf.md`). This guarantees the physical twin is written as a Markdown file, preventing the binary-data protocols from overwriting the extracted text.
+
+---
+
+### 🗄️ Native As-Is Import (Preserving Original Bytes & Images)
+
+The `as_is` mode is the **Native File Preservation** strategy: the file's **raw physical bytes are stored directly into the discussion workspace**, untouched. No Markdown conversion, no text extraction, no re-encoding.
+
+**What happens under the hood:**
+
+1. **Physical preservation**: The original binary payload (`.docx`, `.pdf`, `.xlsx`, `.pptx`, `.png`, …) is written verbatim into `workspace_data/`. The file on disk is byte-identical to the source.
+2. **Logical metadata twin (`.lam`)**: A lightweight metadata stub is registered for the LLM describing the file (name, type, size) — the raw bytes never pollute the context window.
+3. **Tool-native interaction**: Because the physical file is intact, document LCP tools (`tool_office_read`, `tool_office_edit`, `tool_inspect_document`, `tool_read_document_content`, data query tools) operate on the *real* file — formatting, embedded images, charts, and layout are all preserved.
+
+**When to use `as_is`:**
+
+| Scenario | Why `as_is` wins |
+| :--- | :--- |
+| Word reports with inline images / letterheads | Images and layout survive; `tool_office_read` renders them faithfully. |
+| PowerPoint decks with graphics | Slide images, animations metadata, and themes remain native. |
+| Excel workbooks with charts & styling | Formulas, charts, and cell styles are untouched. |
+| PDFs with diagrams | The original PDF is kept; OCR/text extraction can be layered on demand. |
+| Any binary file (ZIPs, media, databases) | Raw bytes are the only sane representation. |
+
+**Example 1: Import a Word document with embedded images, as-is**
+
+```python
+# The .docx (images included) lands in workspace_data/ byte-for-byte.
+# The LLM sees only a metadata stub and uses office tools to read/edit it.
+artefact = discussion.import_file(
+    path="reports/quarterly_review.docx",
+    mode="as_is",
+    title="quarterly_review",
+)
+
+# The LLM can then be asked (with enable_office_files=True):
+# "Read quarterly_review.docx and summarize the findings."
+```
+
+**Example 2: Import an image file directly**
+
+```python
+# PNG/JPG bytes are preserved; the artefact is typed as IMAGE and
+# anchored so vision models can query it (enable_vlm_query / vision bindings).
+artefact = discussion.import_file(
+    path="assets/architecture_diagram.png",
+    mode="as_is",
+)
+```
+
+**Example 3: Import a PDF as-is, then extract text on demand**
+
+```python
+# Keep the original PDF pristine...
+discussion.import_file(path="papers/spec.pdf", mode="as_is")
+
+# ...and let the agent pull text/OCR only when needed:
+# <unlock_file>spec.pdf</unlock_file>  → loads extracted text into context
+# or tool_inspect_document / tool_read_document_content for targeted reads.
+```
+
+**Contrast with conversion modes:**
+
+| Need | Use |
+| :--- | :--- |
+| Keep the original file perfectly intact (images, layout, styling) | `mode="as_is"` |
+| Extract text into an editable Markdown artefact | `mode="text"` |
+| Extract text **and** keep images anchored inline (`<artefact_image id="..." />`) | `mode="text_images"` |
+| Extract text and split embedded images out as separate companion image artefacts | `mode="text_embedded_images"` |
+| Rasterize everything (scanned books, complex layouts) | `mode="images_only"` or `mode="ocr"` |
+
+> **Rule of thumb**: If the file's *appearance* matters (images, formatting, charts) or a tool must edit the *real* file, import `as_is`. If only the *words* matter, use a text-extraction mode.
+
+---
+
+### 🖼️ Image Handling Across Modes
+
+Images are never lost during import — every mode has a defined image policy:
+
+| Mode | Image behavior |
+| :--- | :--- |
+| `as_is` | Images stay **embedded inside the original binary** (DOCX/PPTX/PDF). Nothing is extracted; nothing is degraded. |
+| `text` | Images are **dropped** from the extracted text artefact. For a pure image file, only a metadata stub is stored (`[Image file: name.png]`). |
+| `text_images` | Pages/images are **rendered and anchored** in the extracted text via `<artefact_image id="title::N" />` tags — the LLM context shows text with image placeholders that vision-capable models can resolve. PDF: one anchor per rendered page. DOCX: anchors appended at the end under `## Embedded Images`. PPTX: one anchor per slide block. |
+| `text_embedded_images` | Embedded images are **extracted as separate companion image artefacts** (registered as `title::images`), keeping the text artefact lean while images remain individually accessible. |
+| `images_only` | The document **becomes images** — every page/slide is rasterized into a single multi-image artefact (`title::images`), plus a companion anchors text artefact. |
+| `ocr` | Pages are rendered to images and sent to the Vision LLM for transcription. **No image artefact is created** — only the stitched transcription text artefact is returned. |
+| `data` / `data_bundle` | Not applicable (tabular data). |
+
+**Example: Import a rich PDF keeping both text and inline image anchors**
+
+```python
+# Text is extracted; each page/figure becomes an anchored image the
+# vision model can see in-context via <artefact_image /> references.
+artefact = discussion.import_file(
+    path="manuals/user_guide.pdf",
+    mode="text_images",
+    title="user_guide",
+)
+```
+
+**Example: Split a DOCX's embedded images into standalone artefacts**
+
+```python
+# The text becomes a clean Markdown artefact; every embedded image
+# is registered as its own IMAGE artefact (companion "user_guide::images").
+discussion.import_file(
+    path="reports/annual_report.docx",
+    mode="text_embedded_images",
+    title="annual_report",
+)
+```
+
+---
+
+### 🧭 Mode Selection Decision Guide
+
+```text
+Is the file tabular data (CSV/XLSX/DB)?
+ ├─ Yes → Single file?  → mode="data"
+ │        Whole folder of same-schema files? → mode="data_bundle"
+ └─ No
+     ├─ Is it audio? → mode="audio_stt"
+     ├─ Does the ORIGINAL file need to survive intact
+     │  (images, formatting, tool editing)? → mode="as_is"
+     ├─ Do you only need the words?
+     │   ├─ Yes, and images are irrelevant → mode="text"
+     │   ├─ Yes, but images must stay visible inline → mode="text_images"
+     │   └─ Yes, but images should be separate artefacts → mode="text_embedded_images"
+     ├─ Is it a scanned/visual document? → mode="images_only"
+     └─ Is the text non-selectable (handwriting, scans)? → mode="ocr"
+```
+
 ### Data Bundle Fusion Logic
 When importing a folder as `data_bundle`:
 1.  **Scan**: Reads headers of all CSV/XLSX files.

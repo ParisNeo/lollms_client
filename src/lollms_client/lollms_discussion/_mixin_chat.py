@@ -71,6 +71,7 @@ _OFFICE_XLSX_TOOL_NAMES = {
     "tool_build_excel",
     "tool_edit_excel",
     "tool_read_excel",
+    "tool_excel_from_markdown",
 }
 
 # ── 🤫 VERBOSE TELEMETRY GATE ──
@@ -3180,6 +3181,8 @@ class _StreamState:
         elif tag_name in ("generate_image", "edit_image"):
             if not self.enable_artefacts:
                 return True
+            if tag_name == "generate_image":
+                return self._handle_generate_image_tag(attrs_str, body)
             raw_title = attrs.get("name") or attrs.get("title") or ""
             title = _normalize_image_workspace_path(
                 raw_title, default_stem=f"generated_image_{uuid.uuid4().hex[:6]}"
@@ -3664,6 +3667,107 @@ class _StreamState:
             _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
             self._processing_block_open = False
         return True
+
+    def _handle_generate_image_tag(self, tag_str: str, body: str) -> bool:
+        """Handles a closed <generate_image> tag: TTI call → artefact persistence.
+
+        Defensive by contract: never raises. TTI absence/failure degrades to a
+        warning + return; the stream must survive any backend shape (raw bytes,
+        base64 str, dict payload, or result object).
+        """
+        try:
+            attrs = {m.group(1): m.group(2) for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', tag_str)}
+            name = attrs.get("name") or attrs.get("title")
+            if not name:
+                sanitized_body = re.sub(r'[^a-zA-Z0-9_-]+', '_', (body or "").strip())[:24].strip('_')
+                name = sanitized_body or f"image_{uuid.uuid4().hex[:8]}"
+            prompt = (body or "").strip() or name
+
+            disc = self.discussion
+            client = getattr(disc, "lollmsClient", None) or getattr(disc, "lollms_client", None)
+            tti = getattr(client, "tti", None)
+            if tti is None or not callable(getattr(tti, "generate_image", None)):
+                ASCIIColors.warning(
+                    "[generate_image] No usable TTI binding available — image generation skipped."
+                )
+                return True
+
+            result = tti.generate_image(prompt)
+            images_b64: List[str] = []
+
+            def _strip_data_url(s: str) -> str:
+                return re.sub(r'^data:image/[^;]+;base64,', '', s)
+
+            if isinstance(result, (bytes, bytearray)):
+                images_b64.append(base64.b64encode(bytes(result)).decode("utf-8"))
+            elif isinstance(result, str) and result.strip():
+                images_b64.append(_strip_data_url(result.strip()))
+            elif isinstance(result, dict):
+                for key in ("image", "images", "bytes", "data", "b64", "b64_json"):
+                    value = result.get(key)
+                    if isinstance(value, (bytes, bytearray)):
+                        images_b64.append(base64.b64encode(bytes(value)).decode("utf-8"))
+                        break
+                    if isinstance(value, str) and value.strip():
+                        images_b64.append(_strip_data_url(value.strip()))
+                        break
+                    if isinstance(value, list) and value:
+                        first = value[0]
+                        if isinstance(first, (bytes, bytearray)):
+                            images_b64.append(base64.b64encode(bytes(first)).decode("utf-8"))
+                        elif isinstance(first, str) and first.strip():
+                            images_b64.append(_strip_data_url(first.strip()))
+                        break
+            else:
+                first_image_bytes = getattr(result, "first_image_bytes", None)
+                if callable(first_image_bytes):
+                    try:
+                        raw = first_image_bytes()
+                        if isinstance(raw, (bytes, bytearray)) and raw:
+                            images_b64.append(base64.b64encode(bytes(raw)).decode("utf-8"))
+                    except Exception:
+                        pass
+                if not images_b64:
+                    images_attr = getattr(result, "images", None)
+                    if isinstance(images_attr, list) and images_attr:
+                        first = images_attr[0]
+                        if isinstance(first, (bytes, bytearray)):
+                            images_b64.append(base64.b64encode(bytes(first)).decode("utf-8"))
+                        elif isinstance(first, str) and first.strip():
+                            images_b64.append(_strip_data_url(first.strip()))
+
+            if not images_b64:
+                ASCIIColors.warning("[generate_image] TTI returned no usable image data.")
+                return True
+
+            art = disc.artefacts.add(
+                title=name,
+                artefact_type=ArtefactType.IMAGE,
+                content=prompt,
+                images=images_b64,
+                image_media_types=["image/png"],
+                active=bool(getattr(self, "auto_activate", True)),
+            )
+            if art:
+                if not hasattr(self, "affected_artefacts"):
+                    self.affected_artefacts = []
+                self.affected_artefacts.append(art)
+                turn_arts = getattr(disc, "_affected_artefacts_this_turn", None)
+                if isinstance(turn_arts, list):
+                    turn_arts.append(art)
+                if getattr(disc, "_is_db_backed", False):
+                    try:
+                        disc.commit()
+                    except Exception:
+                        pass
+
+            if getattr(self, "forward_artefact_chunks", False):
+                _cb(self.callback, "", MSG_TYPE.MSG_TYPE_INFO, {"type": "artefact_image_generated", "title": name})
+            return True
+        except Exception as ex:
+            trace_exception(ex)
+            ASCIIColors.error(f"[generate_image] Failed to create image artefact: {ex}")
+            return True
 
     def _hydrate_image_unlock(self, t_file: str, art: Dict[str, Any], file_ext: str, processed_files: List[str]) -> None:
         """Self-heals pixel hydration for an image artifact targeted by <unlock_file>."""
@@ -4798,6 +4902,9 @@ class ChatMixin:
         confirm_handler: Optional[Callable] = None,
         enable_computer_use: bool = False,
         enable_office_files: bool = False,
+        enable_powerpoint: bool = False,
+        enable_word: bool = False,
+        enable_excel: bool = False,
         allow_computer_use: Optional[bool] = None,
         **kwargs: Any,
     ) -> Dict[str, Dict[str, Any]]:
@@ -4901,12 +5008,25 @@ class ChatMixin:
             if enable_code_execution:
                 lcp_binding.mount_tool_library_if_absent("execute_python")
 
-            # ── 1b. UNCONDITIONAL MOUNTING: OFFICE FILES BUILDER ──
-            # Office file building (.pptx/.docx/.xlsx) is a text-only workflow
-            # (recipe code in → markdown inventory out): no vision capability
-            # is required, so the mount is unconditional when the flag is set.
-            if enable_office_files:
-                lcp_binding.mount_tool_library_if_absent("office_files_builder")
+            # ── 1b. OFFICE FAMILY SESSION FLAGS (FAIL-CLOSED GATE) ──
+            # The LCP binding's office-family gate reads self.session_flags
+            # (populated via set_session_flags), NOT host_tool_configs.
+            # Deliver the per-software flags through the real mechanism so
+            # mount_tool_library_if_absent succeeds when chat() requests the
+            # mount later. Fail-closed is preserved: absent flags still refuse.
+            if enable_office_files or enable_powerpoint or enable_word or enable_excel:
+                if hasattr(lcp_binding, "set_session_flags"):
+                    lcp_binding.set_session_flags({
+                        "enable_office_files": enable_office_files,
+                        "enable_powerpoint": enable_powerpoint,
+                        "enable_word": enable_word,
+                        "enable_excel": enable_excel,
+                    })
+                else:
+                    ASCIIColors.warning(
+                        "[ChatMixin] LCP binding lacks set_session_flags(); "
+                        "office-family mounts will be refused (fail-closed)."
+                    )
 
             # ── 2. CONTEXTUAL MOUNTING: ONLY WHEN MATCHING FILES EXIST ──
             if enable_data_tools and has_data_files:
@@ -5380,12 +5500,10 @@ class ChatMixin:
                 extra_instructions += self._build_book_instructions()
             if _legacy_office:
                 extra_instructions += self._build_office_files_instructions()
-            if enable_powerpoint:
-                extra_instructions += self._build_powerpoint_instructions()
-            if enable_word:
-                extra_instructions += self._build_word_instructions()
-            if enable_excel:
-                extra_instructions += self._build_excel_instructions()
+            # Per-software office instructions are injected AFTER the mount
+            # loop (section 7) — gated on actual mount success — so the model
+            # never receives doctrine for tools that were refused by the
+            # fail-closed office-family gate.
 
             # Handle instructions (only if artifacts are enabled)
             branch_msgs_now = self.get_branch(user_msg.id)
@@ -5615,6 +5733,10 @@ class ChatMixin:
             auto_approve_python=auto_approve_python,
             confirm_handler=confirm_handler,
             enable_computer_use=enable_computer_use,
+            enable_office_files=_legacy_office,
+            enable_powerpoint=enable_powerpoint,
+            enable_word=enable_word,
+            enable_excel=enable_excel,
             allow_computer_use=allow_computer_use,
             **kwargs,
         )
@@ -5763,6 +5885,13 @@ class ChatMixin:
         # per-software flag and the legacy flag are set, per-library mounting
         # selects the winner and the later mount wins (identical tool names
         # are deduplicated by the LCP registry).
+        # ── OFFICE MOUNT DIAGNOSTICS (UNCONDITIONAL INIT) ──
+        # Always defined before any loop consumer reads it: the empty-response
+        # terminator references this list unconditionally, and a skip-path
+        # (no office flags set) must never produce a NameError that silently
+        # kills the turn with zero diagnostics.
+        _refused_office_libs: List[str] = []
+
         _office_mount_requests = []
         if _legacy_office:
             _office_mount_requests.append(("office_files_builder", _OFFICE_TOOL_NAME_PREFIXES))
@@ -5772,13 +5901,19 @@ class ChatMixin:
             _office_mount_requests.append(("word_tools", _OFFICE_WORD_TOOL_NAMES))
         if enable_excel:
             _office_mount_requests.append(("excel_tools", _OFFICE_XLSX_TOOL_NAMES))
+        if not _office_mount_requests and (lcp_binding and hasattr(lcp_binding, "set_session_flags")):
+            # No office flags set: clear any stale office-family session flags
+            # so the fail-closed gate stays closed for this turn.
+            lcp_binding.set_session_flags({})
 
+        _office_mount_outcomes: Dict[str, List[str]] = {}
         for _lib_name, _admission in _office_mount_requests:
             if not (lcp_binding and hasattr(lcp_binding, "mount_tool_library")):
                 ASCIIColors.warning(
                     f"[ChatMixin] {_lib_name} requested, but no LCP binding "
                     "with mount_tool_library is available — toolset NOT mounted."
                 )
+                _office_mount_outcomes[_lib_name] = []
                 continue
             try:
                 lcp_binding.mount_tool_library_if_absent(_lib_name)
@@ -5798,21 +5933,51 @@ class ChatMixin:
                     ]
                 for t_name in mounted_lib_tools:
                     active_tools[t_name] = lcp_tools[t_name]
+                _office_mount_outcomes[_lib_name] = mounted_lib_tools
                 if mounted_lib_tools:
                     ASCIIColors.success(
                         f"[ChatMixin] Mounted '{_lib_name}' toolset "
                         f"({len(mounted_lib_tools)} tools)."
                     )
                 else:
-                    ASCIIColors.warning(
-                        f"[ChatMixin] {_lib_name} mounted but no matching tool "
-                        "specs were produced."
+                    ASCIIColors.error(
+                        f"[ChatMixin] Office library '{_lib_name}' produced 0 tool "
+                        "specs despite its flag — session-flag propagation failed "
+                        "(the LCP office-family gate refused the mount)."
                     )
             except Exception as ex:
                 trace_exception(ex)
                 ASCIIColors.warning(
                     f"[ChatMixin] Failed to mount {_lib_name} toolset: {ex}"
                 )
+                _office_mount_outcomes[_lib_name] = []
+
+        # ── INSTRUCTION GATING (NO DOCTRINE FOR NONEXISTENT TOOLS) ──
+        # Inject per-family office instructions ONLY when the corresponding
+        # library actually produced ≥1 admitted tool spec. When the mount was
+        # refused, the model must never receive doctrine for tools that do
+        # not exist (the primary driver of empty/garbage output).
+        _pptx_mounted = bool(_office_mount_outcomes.get("powerpoint_tools"))
+        _word_mounted = bool(_office_mount_outcomes.get("word_tools"))
+        _xlsx_mounted = bool(_office_mount_outcomes.get("excel_tools"))
+        _legacy_mounted = bool(_office_mount_outcomes.get("office_files_builder"))
+        if _legacy_office and _legacy_mounted:
+            extra_instructions += self._build_office_files_instructions()
+        if enable_powerpoint and _pptx_mounted:
+            extra_instructions += self._build_powerpoint_instructions()
+        if enable_word and _word_mounted:
+            extra_instructions += self._build_word_instructions()
+        if enable_excel and _xlsx_mounted:
+            extra_instructions += self._build_excel_instructions()
+        _refused_office_libs = [
+            lib for lib, tools in _office_mount_outcomes.items() if not tools
+        ] or _refused_office_libs
+        if _refused_office_libs:
+            ASCIIColors.error(
+                f"[ChatMixin] Office mount failures this turn: "
+                f"{', '.join(_refused_office_libs)}. The LLM will NOT receive "
+                "office tool doctrine for these libraries."
+            )
 
 
         # ── 🎯 WORKER-TIER EXECUTION DOCTRINE ──
@@ -6136,6 +6301,77 @@ class ChatMixin:
                 kept.extend(msgs)
             virtual_history[:] = kept
 
+        def _previous_round_was_artifact_only_or_empty() -> bool:
+            """True when the last assistant round in virtual history carried no
+            prose — only functional tags (artifact/image) or nothing at all.
+
+            This is the mimicry-risk condition: a model that just saw an
+            artifact-only assistant turn tends to imitate that empty-prose
+            shape on the follow-up request instead of emitting the required
+            action tag.
+            """
+            last_assistant = None
+            for vh in reversed(virtual_history):
+                if getattr(vh, "sender_type", "") == "assistant":
+                    last_assistant = vh
+                    break
+            if last_assistant is None:
+                return False
+            content = (getattr(last_assistant, "content", "") or "").strip()
+            if not content:
+                return True
+            stripped = re.sub(
+                r'<(?:artifact|artefact|generate_image|edit_image)\b[^>]*>.*?</(?:artifact|artefact|generate_image|edit_image)>',
+                '',
+                content,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            stripped = re.sub(
+                r'<(?:artifact|artefact|generate_image|edit_image)\b[^>]*/?>',
+                '',
+                stripped,
+                flags=re.IGNORECASE,
+            )
+            stripped = re.sub(r'!\[[^\]]*\]\([^)]*\)', '', stripped)
+            return not stripped.strip()
+
+        def _inject_empty_round_mimicry_correction(tool_context: Optional[str] = None) -> None:
+            """Records the empty-round attempt and injects the correction nudge
+            into virtual history, mirroring the system-marker mimicry protocol."""
+            self._mimicry_attempt_counts[1] += 1
+            ASCIIColors.warning(
+                f"[ChatMixin] Empty round detected — retrying "
+                f"(mimicry-risk/tools-present) attempt "
+                f"{self._mimicry_attempt_counts[1]}/2."
+            )
+            correction_text = (
+                "[SYSTEM: EMPTY RESPONSE DETECTED. Your previous assistant "
+                "turn contained only an artifact/image tag with no prose — that is "
+                "NOT a template to copy. An empty round is an INVALID answer. The "
+                "user's request is still pending. You MUST respond with actual "
+                "content: for image modification requests emit an <edit_image> tag "
+                "referencing the source image (e.g. <edit_image name=\"...\" "
+                "sources=\"chicken_head_friends.png\">digital drawing with thick "
+                "outlines</edit_image>); for new images emit <generate_image>; "
+                "otherwise answer in prose. Do not emit an empty round again.]"
+            )
+            if tool_context:
+                correction_text = (
+                    "[SYSTEM: EMPTY RESPONSE DETECTED. Your last round produced ZERO "
+                    "content — no prose, no tool call, no functional tag. An empty "
+                    "response is an INVALID answer; the user's request is still "
+                    "pending. You MUST respond now with actual content.\n"
+                    f"{tool_context}\n"
+                    "If the user's request requires a tool, emit the appropriate "
+                    "`<tool>{\"name\": \"...\", \"parameters\": {...}}</tool>` call. "
+                    "Otherwise answer in prose. Empty responses are invalid — do not "
+                    "emit an empty round again.]"
+                )
+            virtual_history.append(SimpleNamespace(
+                sender_type="user",
+                content=correction_text,
+            ))
+
         def _compress_virtual_history_if_needed():
             """
             Enforces the action-window doctrine on virtual_history.
@@ -6228,7 +6464,9 @@ class ChatMixin:
 
         # Initialize mimicry attempt counter exactly once at the start of the turn
         # CRITICAL FIX: Use a list to ensure safe mutation across reasoning rounds.
-        object.__setattr__(self, "_mimicry_attempt_counts", [0])
+        # Index 0 = system-marker mimicry class (test-locked: [0] == 2 on cap).
+        # Index 1 = empty-round mimicry class (artifact-only shape imitation).
+        object.__setattr__(self, "_mimicry_attempt_counts", [0, 0])
 
         # CRITICAL FIX: Persistent set to track dispatched tags across all reasoning rounds.
         # This prevents the LLM from re-dispatching the same artifact in a subsequent round,
@@ -6903,7 +7141,74 @@ class ChatMixin:
                     )
                     _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="done")
                     break
-                ASCIIColors.warning(f"[{getattr(self, 'name', 'Discussion')}] Empty response generated by LLM (0 tokens). Terminating loop.")
+                # ── 🛡️ EMPTY-ROUND RECOVERY (MIMICRY OR TOOLS-PRESENT) ──
+                # Two recoverable classes share this retry path (2-attempt cap):
+                #  1. Mimicry risk: the previous assistant round was artifact-only
+                #     or empty — the model imitates that empty-prose shape.
+                #  2. Tools-present: an empty round with mounted tools is almost
+                #     always a generation fluke; a corrective nudge usually fixes it.
+                # Non-recoverable empties (no tools, prose-previous round) keep the
+                # legacy warn+break behavior.
+                _mimicry_risk = _previous_round_was_artifact_only_or_empty()
+                _tools_present = bool(active_tools)
+                if (_mimicry_risk or _tools_present) and self._mimicry_attempt_counts[1] < 2:
+                    _tool_context = None
+                    if _tools_present:
+                        _sample_names = ", ".join(list(active_tools.keys())[:3])
+                        _tool_context = (
+                            f"You have {len(active_tools)} tools available "
+                            f"(e.g., {_sample_names})."
+                        )
+                    _inject_empty_round_mimicry_correction(tool_context=_tool_context)
+                    _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
+                    try:
+                        _persist_round_state()
+                    except Exception as persist_err:
+                        ASCIIColors.warning(
+                            f"[ChatMixin] Round-state persist failed during empty-round "
+                            f"recovery: {persist_err}"
+                        )
+                    continue
+
+                if self._mimicry_attempt_counts[1] >= 2:
+                    ASCIIColors.error(
+                        "[ChatMixin] Empty-response recovery exhausted — "
+                        "terminating after 2 attempts."
+                    )
+                    _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="empty_response_mimicry")
+                    try:
+                        _persist_round_state()
+                    except Exception as persist_err:
+                        ASCIIColors.warning(
+                            f"[ChatMixin] Round-state persist failed at empty-response "
+                            f"cap: {persist_err}"
+                        )
+                    break
+
+                _empty_diag = ""
+                if _refused_office_libs:
+                    _empty_diag = (
+                        f" Office libraries {', '.join(_refused_office_libs)} were "
+                        "requested but REFUSED by the fail-closed session-flag gate "
+                        "(0 tool specs produced). Fix: ensure the chat layer calls "
+                        "lcp_binding.set_session_flags({'enable_powerpoint': True, "
+                        "'enable_word': True, 'enable_excel': True, ...}) BEFORE the "
+                        "mount loop."
+                    )
+                if active_tools:
+                    ASCIIColors.error(
+                        f"[ChatMixin] LLM returned 0 tokens with {len(active_tools)} "
+                        f"tools mounted — check binding/tool-schema compatibility."
+                    )
+                else:
+                    ASCIIColors.info(
+                        "[ChatMixin] Empty round — no mimicry-risk and no tools — "
+                        "terminating (legacy path)."
+                    )
+                ASCIIColors.warning(
+                    f"[{getattr(self, 'name', 'Discussion')}] Empty response generated "
+                    f"by LLM (0 tokens). Terminating loop.{_empty_diag}"
+                )
                 _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="empty_response")
                 break
 

@@ -2,6 +2,11 @@
 Excel Tools — dedicated LCP toolset for Microsoft Excel workbooks.
 
 Doctrine (read this before writing any recipe):
+- Excel (.xlsx) is a BINARY OOXML workbook (a ZIP of XML parts). NEVER write
+  plain text or markdown into an .xlsx file — it becomes unreadable. Build
+  workbooks ONLY via these tools: openpyxl recipes (tool_build_excel /
+  tool_edit_excel) or tool_excel_from_markdown for markdown/structured-text
+  input.
 - NEVER write computed results manually. ALWAYS write FORMULAS into cells so
   Excel computes them: ws["F2"] = "=SUM(B2:E2)", ws["G2"] = "=AVERAGE(B2:E2)",
   ws["H2"] = '=IF(F2>100,"High","Low")'. Use SUM, AVERAGE, MIN, MAX, COUNT,
@@ -26,10 +31,14 @@ from ascii_colors import ASCIIColors
 TOOL_LIBRARY_NAME = "Excel Tools"
 TOOL_LIBRARY_DESC = (
     "Create, edit and read Excel workbooks (.xlsx/.xlsm) via sandboxed openpyxl "
-    "recipe code. DOCTRINE: never write computed results manually — always write "
-    "formulas (=SUM, =AVERAGE, =IF, =VLOOKUP ...) so Excel computes them. Literal "
-    "values only for input data. Every save is verified with a strict three-layer "
-    "OOXML integrity check before being committed to the workspace."
+    "recipe code, or convert markdown documents into real workbooks. DOCTRINE: "
+    "Excel (.xlsx) is a binary OOXML workbook (ZIP of XML parts) — NEVER paste "
+    "markdown or plain text into an .xlsx file, it becomes unreadable; produce "
+    "workbooks ONLY through these tools (openpyxl recipes or "
+    "tool_excel_from_markdown). Never write computed results manually — always "
+    "write formulas (=SUM, =AVERAGE, =IF, =VLOOKUP ...) so Excel computes them. "
+    "Literal values only for input data. Every save is verified with a strict "
+    "three-layer OOXML integrity check before being committed to the workspace."
 )
 TOOL_LIBRARY_ICON = "📈"
 
@@ -227,17 +236,33 @@ def _list_media_files(working_dir: Path) -> List[str]:
 
 
 def _build_recipe_namespace(working_dir: Optional[Path] = None) -> Dict[str, Any]:
-    """Pre-populates the recipe namespace with openpyxl design symbols (lazy imports)."""
+    """Pre-populates the recipe namespace with openpyxl design symbols (lazy imports).
+
+    The `Workbook` symbol is a SHIM FACTORY: every workbook a recipe constructs
+    (rebound or not) arrives with a no-op instance-level `save`, so in-recipe
+    `wb.save()` calls are absorbed instead of raising TypeError. The real,
+    validated save is performed by `_save_and_verify` via the class-level
+    genuine method, which bypasses the instance attribute.
+    """
     namespace: Dict[str, Any] = {}
     try:
-        from openpyxl import Workbook, load_workbook
+        from openpyxl import Workbook as _RealWorkbook, load_workbook
         from openpyxl.chart import PieChart, LineChart, BarChart, Reference
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         from openpyxl.utils import get_column_letter
         from openpyxl.formatting.rule import CellIsRule, ColorScaleRule
         from openpyxl.worksheet.datavalidation import DataValidation
+
+        def _make_shimmed_workbook(*args: Any, **kwargs: Any) -> Any:
+            wb = _RealWorkbook(*args, **kwargs)
+            try:
+                wb.save = lambda *a, **k: None  # the tool performs the real validated save
+            except Exception:
+                pass
+            return wb
+
         namespace.update({
-            "Workbook": Workbook,
+            "Workbook": _make_shimmed_workbook,
             "load_workbook": load_workbook,
             "PieChart": PieChart,
             "LineChart": LineChart,
@@ -281,9 +306,16 @@ def _reopen_office_file(path: Path, suffix: str) -> Tuple[bool, str]:
     try:
         from openpyxl import load_workbook
         if suffix == ".xlsm":
-            load_workbook(path, keep_vba=True)
+            wb = load_workbook(path, keep_vba=True)
         else:
-            load_workbook(path)
+            wb = load_workbook(path)
+        # STRUCTURAL checks only: formula cells carry no cached values under
+        # openpyxl authoring, so demanding data would false-negative every
+        # doctrine-compliant workbook and trigger a spurious rollback.
+        if not wb.sheetnames:
+            return False, "re-open failed: workbook has no sheets"
+        if all(wb[name].max_row < 1 for name in wb.sheetnames):
+            return False, "re-open failed: all sheets are empty"
         return True, "ok"
     except ImportError:
         return True, "ok (layers 1-2 only; openpyxl unavailable)"
@@ -325,12 +357,23 @@ def _validate_office_file(path) -> Tuple[bool, str]:
 
 
 def _save_and_verify(obj: Any, save_path: Path) -> Dict[str, Any]:
-    """Transactional save: snapshot → save → validate → rollback on failure."""
+    """Transactional save: snapshot → save → validate → rollback on failure.
+
+    The recipe sandbox installs a no-op `save` shim on the root object so
+    in-recipe `wb.save()` calls are absorbed. That instance attribute would
+    shadow the REAL openpyxl save here, producing a missing/truncated file.
+    We therefore invoke the genuine bound method captured from the class.
+    """
     save_path = Path(save_path)
     pre_existing = save_path.is_file()
     snapshot_bytes = save_path.read_bytes() if pre_existing else None
+    # Invoke the GENUINE class-level save: an explicit class-attribute call
+    # bypasses any no-op instance-level `save` shim installed by the sandbox.
+    real_save = getattr(type(obj), "save", None)
+    if real_save is None:
+        real_save = obj.save
     try:
-        obj.save(str(save_path))
+        real_save(obj, str(save_path))
     except Exception as save_err:
         if pre_existing:
             save_path.write_bytes(snapshot_bytes)
@@ -423,7 +466,11 @@ def _sanitize_file_name(file: str, default: str) -> str:
 
 
 def _create_root_object(suffix: str, namespace: Dict[str, Any]) -> Any:
-    """Creates a fresh workbook and binds it into the namespace as wb/ws."""
+    """Creates a fresh workbook and binds it into the namespace as wb/ws.
+
+    Uses the namespace's shimmed Workbook factory so the pre-created root is
+    save-absorbed exactly like recipe-constructed workbooks.
+    """
     if suffix in (".xlsx", ".xlsm"):
         wb = namespace["Workbook"]()
         ws = wb.active
@@ -697,6 +744,215 @@ def tool_edit_excel(
         }
 
 
+_MD_SEPARATOR_CELL_RE = re.compile(r"^\s*\|?\s*:?-{1,}:?\s*$")
+_MD_MAX_COLUMN_WIDTH = 50
+
+
+def _split_markdown_table_row(line: str) -> List[str]:
+    """Splits a markdown pipe-table row into stripped cell values."""
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def _is_markdown_separator_row(line: str) -> bool:
+    """Detects a pipe-table separator row (|---|:---:|---|)."""
+    if "|" not in line:
+        return False
+    cells = _split_markdown_table_row(line)
+    if not cells:
+        return False
+    return all(_MD_SEPARATOR_CELL_RE.match(cell) for cell in cells if cell != "")
+
+
+def _coerce_markdown_cell(value: str) -> Any:
+    """Types a cell value: clean int/float strings become numbers, all else strings.
+
+    No invented data: '-', '98.7%', '-2π à 2π' and empty strings stay strings
+    exactly as written; only unambiguous numeric literals are converted.
+    """
+    text = (value or "").strip()
+    if not text:
+        return ""
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    return text
+
+
+def _parse_markdown_tables(content: str) -> List[Dict[str, Any]]:
+    """Parses markdown into ordered sections: headings, pipe tables, plain text.
+
+    Returns a list of blocks in document order, each shaped as
+    {"title": str|None, "headers": List[str], "rows": List[List], "text_lines": List[str]}.
+    Code fences are ignored; a pipe row above a separator row becomes the
+    header row of a table; remaining pipe rows are data rows.
+    """
+    blocks: List[Dict[str, Any]] = []
+    current: Dict[str, Any] = {"title": None, "headers": [], "rows": [], "text_lines": []}
+
+    def _flush() -> None:
+        nonlocal current
+        if current["title"] is not None or current["headers"] or current["rows"] or current["text_lines"]:
+            blocks.append(current)
+        current = {"title": None, "headers": [], "rows": [], "text_lines": []}
+
+    inside_code_fence = False
+    pending_pipe_rows: List[List[str]] = []
+
+    def _absorb_pending() -> None:
+        nonlocal pending_pipe_rows
+        for cells in pending_pipe_rows:
+            current["text_lines"].append(" | ".join(cells))
+        pending_pipe_rows = []
+
+    for raw_line in (content or "").splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            inside_code_fence = not inside_code_fence
+            continue
+        if inside_code_fence:
+            continue
+        if not stripped:
+            _absorb_pending()
+            continue
+        if stripped.startswith("#"):
+            _absorb_pending()
+            _flush()
+            current["title"] = stripped.lstrip("#").strip()
+            continue
+        if _is_markdown_separator_row(stripped):
+            if pending_pipe_rows:
+                current["headers"] = pending_pipe_rows.pop(0)
+                current["rows"].extend(pending_pipe_rows)
+                pending_pipe_rows = []
+            continue
+        if stripped.startswith("|") and stripped.count("|") >= 1:
+            pending_pipe_rows.append(_split_markdown_table_row(stripped))
+            continue
+        _absorb_pending()
+        current["text_lines"].append(stripped)
+
+    _absorb_pending()
+    _flush()
+    return blocks
+
+
+def tool_excel_from_markdown(
+    file: str = "generated_report.xlsx",
+    content: str = "",
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Creates a real Excel (.xlsx) workbook from a markdown document (headings + pipe tables).
+
+    Excel files are BINARY OOXML workbooks (ZIP of XML parts) — this tool
+    converts markdown into genuine openpyxl worksheets with styled section
+    titles, bold header rows and typed cells (clean numbers become numbers,
+    everything else stays text); it NEVER writes raw text or markdown into an
+    .xlsx file. Use it whenever the source material is markdown or structured
+    text instead of a Python recipe.
+
+    Args:
+        file: Target .xlsx/.xlsm file name (default "generated_report.xlsx").
+        content: Markdown payload: '#'/'##' headings become section title rows,
+            pipe tables become styled header + data rows, plain lines become
+            single-column text rows.
+        discussion_instance: Active discussion session instance.
+        lollms_client_instance: Active client instance.
+    """
+    suffix_failure = _require_suffix(file, _XLSX_SUFFIXES, "tool_excel_from_markdown")
+    if suffix_failure is not None:
+        return suffix_failure
+    try:
+        if not content or not str(content).strip():
+            return {
+                "success": False,
+                "error": "No markdown content provided. Pass the document text (headings and/or pipe tables) via the 'content' parameter.",
+            }
+
+        file_name = _sanitize_file_name(file, "generated_report.xlsx")
+        suffix = Path(file_name).suffix.lower()
+        if suffix not in GUARDED_EXTENSIONS:
+            return {
+                "success": False,
+                "error": f"Unsupported Excel file extension '{suffix}'. Supported: {', '.join(GUARDED_EXTENSIONS)}.",
+            }
+
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
+        from openpyxl.utils import get_column_letter
+
+        blocks = _parse_markdown_tables(str(content))
+        if not blocks:
+            return {
+                "success": False,
+                "error": "The provided content contains no usable markdown (no headings, tables or text lines).",
+            }
+
+        title_font = Font(bold=True, size=13)
+        header_font = Font(bold=True)
+        header_fill = PatternFill(
+            start_color="FFD9E1F2", end_color="FFD9E1F2", fill_type="solid"
+        )
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Report"
+        column_widths: Dict[int, int] = {}
+
+        def _track(column_index: int, value: Any) -> None:
+            length = len(str(value)) if value is not None else 0
+            if length > column_widths.get(column_index, 0):
+                column_widths[column_index] = length
+
+        for block in blocks:
+            if block["title"] is not None:
+                ws.cell(row=ws.max_row + 1 if ws.max_row > 1 or ws["A1"].value is not None else 1, column=1, value=block["title"]).font = title_font
+                _track(1, block["title"])
+            for text_line in block["text_lines"]:
+                ws.cell(row=ws.max_row + 1, column=1, value=text_line)
+                _track(1, text_line)
+            if block["headers"] or block["rows"]:
+                header_row_index = ws.max_row + 1 if ws["A1"].value is not None or ws.max_row > 1 else 1
+                for column_index, header in enumerate(block["headers"], start=1):
+                    cell = ws.cell(row=header_row_index, column=column_index, value=header)
+                    cell.font = header_font
+                    cell.fill = header_fill
+                    _track(column_index, header)
+                for data_cells in block["rows"]:
+                    row_index = ws.max_row + 1
+                    for column_index, raw_value in enumerate(data_cells, start=1):
+                        typed_value = _coerce_markdown_cell(raw_value)
+                        ws.cell(row=row_index, column=column_index, value=typed_value)
+                        _track(column_index, raw_value)
+                ws.cell(row=ws.max_row + 1, column=1, value=None)  # spacer row between sections
+
+        for column_index, width in column_widths.items():
+            ws.column_dimensions[get_column_letter(column_index)].width = min(width + 2, _MD_MAX_COLUMN_WIDTH)
+
+        working_dir = _resolve_working_dir(discussion_instance)
+        save_path = working_dir / file_name
+        save_result = _save_and_verify(wb, save_path)
+        if not save_result["success"]:
+            return save_result
+        return _build_result(save_result, save_path)
+    except Exception as unexpected_err:
+        return {
+            "success": False,
+            "error": f"Unexpected failure converting markdown to Excel workbook: {unexpected_err}",
+        }
+
+
 def tool_read_excel(
     file: str,
     discussion_instance: Optional[Any] = None,
@@ -849,6 +1105,40 @@ def get_tools() -> List[Dict[str, Any]]:
                 {"name": "error", "type": "str", "description": "Error message if failed."},
             ],
             "callable": tool_read_excel,
+            "_source": "excel_tools",
+            "_source_file": __file__,
+        },
+        {
+            "name": "tool_excel_from_markdown",
+            "description": (
+                "Creates a real Excel (.xlsx) workbook from a markdown document (headings + pipe "
+                "tables). Excel files are BINARY OOXML workbooks — this tool converts markdown into "
+                "genuine openpyxl worksheets with styled section titles, bold header rows and typed "
+                "cells (clean numbers become numbers, everything else stays text); it NEVER writes "
+                "raw text or markdown into an .xlsx file. Use it whenever the source material is "
+                "markdown or structured text instead of a Python recipe."
+            ),
+            "parameters": [
+                {
+                    "name": "file",
+                    "type": "str",
+                    "description": "Target .xlsx/.xlsm file name (default 'generated_report.xlsx').",
+                    "optional": True,
+                },
+                {
+                    "name": "content",
+                    "type": "str",
+                    "description": "Markdown payload: '#'/'##' headings become section title rows, pipe tables become styled header + data rows, plain lines become single-column text rows.",
+                },
+            ],
+            "output": [
+                {"name": "success", "type": "bool", "description": "Whether the operation succeeded."},
+                {"name": "workspace_file", "type": "str", "description": "Absolute path to the saved file."},
+                {"name": "context_files", "type": "list", "description": "List of context files (the saved file)."},
+                {"name": "file_name", "type": "str", "description": "Name of the saved file."},
+                {"name": "error", "type": "str", "description": "Error message if failed."},
+            ],
+            "callable": tool_excel_from_markdown,
             "_source": "excel_tools",
             "_source_file": __file__,
         },

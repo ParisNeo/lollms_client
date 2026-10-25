@@ -207,12 +207,22 @@ class OllamaBinding(LollmsLLMBinding):
         """
         Ensures all base64-encoded images in the messages list are clean,
         decoded bytes objects (stripping any 'data:image/...;base64,' prefix).
+
+        Additionally enforces the OpenAI-compatible invariant that image
+        content may only appear on user-role messages: any images found on a
+        system-role message are moved to the first user message (synthesizing
+        one if none exists). OpenAI-compatible servers 400-reject payloads
+        with system-role images ('System message cannot contain images.').
         """
         cleaned_messages = []
+        rescued_images: list = []
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
             images = msg.get("images") or []
+            if str(role).lower() == "system":
+                rescued_images.extend(images)
+                images = []
 
             text_parts = []
             if isinstance(content, list):
@@ -254,6 +264,17 @@ class OllamaBinding(LollmsLLMBinding):
                 cleaned_msg["images"] = cleaned_images
 
             cleaned_messages.append(cleaned_msg)
+
+        if rescued_images:
+            first_user_idx = next(
+                (i for i, m in enumerate(cleaned_messages) if str(m.get("role", "")).lower() == "user"),
+                None,
+            )
+            if first_user_idx is None:
+                cleaned_messages.append({"role": "user", "content": "", "images": rescued_images})
+            else:
+                target = cleaned_messages[first_user_idx]
+                target["images"] = (target.get("images") or []) + rescued_images
 
         return cleaned_messages
 

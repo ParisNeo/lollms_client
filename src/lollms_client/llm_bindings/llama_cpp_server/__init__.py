@@ -89,6 +89,81 @@ def _is_booleanish(value) -> bool:
     return text in _TRUE_TOKENS or text in _FALSE_TOKENS
 
 
+def _sanitize_system_images(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Enforces the OpenAI-compatible invariant: image content may only appear on
+    user-role messages.
+
+    Servers (OpenAI, vLLM, llama.cpp) reject the whole request with HTTP 400
+    'System message cannot contain images.' when the system message carries
+    image content. This guard extracts any system-role image blocks and moves
+    them to the first user message (synthesizing one if none exists) so the
+    vision context survives and the payload stays valid. No-op when clean.
+    """
+    def _extract_media(msg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        media: List[Dict[str, Any]] = []
+        content = msg.get("content")
+        if isinstance(content, list):
+            texts: List[str] = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    texts.append(part.get("text", ""))
+                elif isinstance(part, dict) and part.get("type") in (
+                    "image_url", "input_image", "video_url", "input_video",
+                ):
+                    media.append(part)
+            if media:
+                joined = "\n".join(t for t in texts if t.strip())
+                msg["content"] = joined if joined else ""
+        legacy_images = msg.pop("images", None)
+        if legacy_images:
+            media.extend(
+                {"type": "image_url", "image_url": {"url": img}}
+                if isinstance(img, str) else img
+                for img in legacy_images
+            )
+        legacy_videos = msg.pop("videos", None)
+        if legacy_videos:
+            media.extend(
+                {"type": "video_url", "video_url": {"url": vid}}
+                if isinstance(vid, str) else vid
+                for vid in legacy_videos
+            )
+        return media
+
+    rescued: List[Dict[str, Any]] = []
+    sanitized: List[Dict[str, Any]] = []
+    for msg in messages:
+        if not isinstance(msg, dict) or str(msg.get("role", "")).lower() != "system":
+            sanitized.append(msg)
+            continue
+        extracted = _extract_media(msg)
+        if extracted:
+            rescued.extend(extracted)
+        sanitized.append(msg)
+
+    if not rescued:
+        return sanitized
+
+    first_user_idx = next(
+        (i for i, m in enumerate(sanitized) if isinstance(m, dict) and str(m.get("role", "")).lower() == "user"),
+        None,
+    )
+    if first_user_idx is None:
+        sanitized.append({"role": "user", "content": rescued})
+        return sanitized
+
+    target = sanitized[first_user_idx]
+    content = target.get("content")
+    if isinstance(content, str):
+        target["content"] = [{"type": "text", "text": content}] + rescued
+    elif isinstance(content, list):
+        target["content"] = list(content) + rescued
+    else:
+        target["content"] = rescued
+    return sanitized
+
+
 def _encode_image(image_path_or_url: str) -> Optional[str]:
     """
     Encodes an image as a base64 data-URI for use in OpenAI-style vision payloads.
@@ -1179,11 +1254,17 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             except openai.InternalServerError as e:
                 if getattr(e, "status_code", None) == 503:
                     if i % 10 == 0:
-                        ASCIIColors.warning(
+                        ASCIIColors.message(
                             f"Server loading (503) – retrying … ({i + 1}/{retries})"
                         )
                     time.sleep(2)
                     continue
+                raise
+            except openai.BadRequestError as e:
+                # 400 = malformed payload (e.g. 'System message cannot contain
+                # images.'). Retrying is pointless; log the server's body and
+                # re-raise so the caller sees the true cause.
+                ASCIIColors.error(f"[llama_cpp_server] Request rejected 400: {e}")
                 raise
             except openai.APIConnectionError:
                 if i % 10 == 0:
@@ -1391,7 +1472,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             return completion.choices[0].text
         except Exception as e:
             trace_exception(e)
-            return {"status": False, "error": str(e)}
+            return {"status": False, "error": str(e), "server_body": getattr(e, "body", None)}
 
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -1505,6 +1586,19 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         if stream:
             return self._stream_completion(response, cb)
         content = response.choices[0].message.content
+        if not content:
+            # Fail-safe: a 0-token answer kills the discussion loop. If the
+            # model emitted only reasoning (or nothing), surface the raw
+            # reasoning so the turn never dies silently.
+            reasoning = getattr(response.choices[0].message, "reasoning_content", None) or getattr(
+                response.choices[0].message, "reasoning", None
+            )
+            if reasoning:
+                ASCIIColors.warning(
+                    "[LlamaCppServerBinding] Model returned empty content but non-empty "
+                    "reasoning. Surfacing reasoning to avoid a 0-token response."
+                )
+                return str(reasoning)
         return content or ""
 
     # ──────────────────────────────────────────────────────────────────────────

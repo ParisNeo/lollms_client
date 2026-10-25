@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-25 15:34]
+
+- feat(llm_bindings): add data URL conversion helper to lollms binding
+
 ## [2026-10-23 13:50]
 
 - feat: deprecate `enable_office_files` flag in favor of unified file handling

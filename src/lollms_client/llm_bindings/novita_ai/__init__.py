@@ -361,12 +361,14 @@ class NovitaAIBinding(LollmsLLMBinding):
                 return content
 
         except requests.exceptions.RequestException as e:
-            err_msg = f"Novita AI API request failed: {e}"
+            err_msg = "Novita AI API request failed"
             if hasattr(e, "response") and e.response is not None:
                 try:
                     err_msg += f" (Status {e.response.status_code}: {e.response.text})"
                 except Exception:
                     pass
+            if getattr(e, "response", None) is not None and getattr(e.response, "status_code", None) == 400:
+                ASCIIColors.error(f"[NovitaAIBinding] Request rejected 400: {err_msg}")
             ASCIIColors.error(err_msg)
             raise RuntimeError(err_msg) from e
         except Exception as ex:

@@ -6,6 +6,33 @@ if TYPE_CHECKING:
     from lollms_discussion import LollmsDiscussion
 
 
+def _diagnose_image_roles(messages) -> str:
+    """One-line summary of which message roles carry images.
+
+    Defensive over both LollmsMessage proxies and plain dicts. Used by the
+    chat layer's 400-recovery log path to reveal payloads where images sit on
+    non-user roles ('System message cannot contain images.').
+    """
+    counts = {"user": 0, "system": 0, "assistant": 0, "other": 0}
+    for msg in messages or []:
+        if isinstance(msg, dict):
+            role = str(msg.get("sender_type", msg.get("role", ""))).lower()
+            images = msg.get("images") or []
+        else:
+            role = str(getattr(msg, "sender_type", getattr(msg, "role", "")) or "").lower()
+            images = getattr(msg, "images", None) or []
+        if not images:
+            continue
+        if role in counts:
+            counts[role] += 1
+        else:
+            counts["other"] += 1
+    return (
+        f"roles with images: user={counts['user']} system={counts['system']} "
+        f"assistant={counts['assistant']} other={counts['other']}"
+    )
+
+
 class LollmsMessage:
     """A lightweight proxy wrapper for a message ORM object."""
 
@@ -289,6 +316,38 @@ class LollmsMessage:
             metadata["image_groups"].append(new_group)
             self.metadata = metadata
             self._sync_active_images_flags()
+        if self._discussion._is_db_backed:
+            self._discussion.commit()
+
+    def add_image(self, image: str) -> None:
+        """Appends a single base64 image to this message.
+
+        Follows the same mutation semantics as add_image_pack: extend the
+        images list, then keep active_images flags in sync. Intended for
+        user-role messages (vision pixels are only legal on user messages).
+        """
+        if not image:
+            return
+        current_images = self.images or []
+        current_images.append(image)
+        self.images = current_images
+        self._sync_active_images_flags()
+        if self._discussion._is_db_backed:
+            self._discussion.commit()
+
+    def add_images(self, images: List[str]) -> None:
+        """Appends multiple base64 images to this message.
+
+        Follows the same mutation semantics as add_image_pack: extend the
+        images list, then keep active_images flags in sync. Intended for
+        user-role messages (vision pixels are only legal on user messages).
+        """
+        if not images:
+            return
+        current_images = self.images or []
+        current_images.extend(images)
+        self.images = current_images
+        self._sync_active_images_flags()
         if self._discussion._is_db_backed:
             self._discussion.commit()
 
