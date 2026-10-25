@@ -4,14 +4,18 @@ Word Tools — dedicated LCP toolset for Microsoft Word documents.
 Doctrine (read this before writing any recipe):
 - Full edit freedom: the LLM may use its own coding skills with python-docx.
   These are HINTS on what is possible, not restrictions.
-- Comments: use the pre-bound add_comment(doc, paragraph, text, author) helper
-  (real OXML comments injected into comments.xml).
+- Comments: use the pre-bound add_comment(doc, paragraph, text, author, run)
+  helper (real OXML comments injected into comments.xml — the comments part is
+  created automatically when missing). Pass run=resolve_comment_runs(doc,
+  "text") to anchor the comment on the exact text fragment.
 - Highlights: run.font.highlight_color = WD_COLOR_INDEX.YELLOW.
 - Reformat: styles, fonts, alignment (WD_ALIGN_PARAGRAPH), spacing
   (WD_LINE_SPACING), colors (DocxRGBColor).
 - Sections: doc.add_section(WD_SECTION.NEW_PAGE).
 - Links/fields: python-docx cannot refresh external links; insert field codes
   (TOC, HYPERLINK) via OXML using the pre-bound qn() helper.
+- Review: list_comments(doc) / list_highlights(doc) expose existing review
+  state to recipes; tool_word_review reads it without a recipe.
 """
 import re
 import textwrap
@@ -26,11 +30,14 @@ from ascii_colors import ASCIIColors
 TOOL_LIBRARY_NAME = "Word Tools"
 TOOL_LIBRARY_DESC = (
     "Create, edit and read Word documents (.docx/.docm) via sandboxed python-docx "
-    "recipe code. Full edit vocabulary: comments (add_comment helper), highlights "
-    "(WD_COLOR_INDEX), reformatting (styles/fonts/alignment/spacing), sections "
-    "(WD_SECTION), links/fields via OXML (qn). Hints, not restrictions — the LLM "
-    "codes freely. Every save is verified with a strict three-layer OOXML integrity "
-    "check before being committed to the workspace."
+    "recipe code. Full edit vocabulary: REAL anchored comments (add_comment helper "
+    "auto-creates the comments part and anchors commentRangeStart/End on the exact "
+    "run via resolve_comment_runs), highlights (WD_COLOR_INDEX), reformatting "
+    "(styles/fonts/alignment/spacing), sections (WD_SECTION), links/fields via OXML "
+    "(qn), plus review helpers (list_comments, list_highlights) and a dedicated "
+    "tool_word_review reader. Hints, not restrictions — the LLM codes freely. Every "
+    "save is verified with a strict three-layer OOXML integrity check before being "
+    "committed to the workspace."
 )
 TOOL_LIBRARY_ICON = "📝"
 
@@ -226,61 +233,172 @@ def _list_media_files(working_dir: Path) -> List[str]:
     return sorted(found, key=str.lower)
 
 
+def _ensure_comments_part(doc: Any) -> Any:
+    """Returns the document's comments part, creating and wiring it when absent.
+
+    Mirrors the proven OPC part-creation pattern: a Part with an explicit
+    comments content type at /word/comments.xml, related to the main document
+    part via the COMMENTS relationship. The part is then included in package
+    saves and [Content_Types].xml automatically.
+    """
+    for rel in doc.part.rels.values():
+        if "comments" in rel.reltype:
+            return rel.target_part
+
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    from docx.opc.packuri import PackURI
+    from docx.opc.part import Part
+    from docx.oxml import parse_xml
+    from docx.oxml.ns import nsdecls
+
+    comments_part = Part(
+        PackURI("/word/comments.xml"),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml",
+        parse_xml(f'<w:comments {nsdecls("w")}/>'),
+        doc.part.package,
+    )
+    doc.part.relate_to(comments_part, RT.COMMENTS)
+    return comments_part
+
+
+def _list_comments(doc: Any) -> List[Dict[str, Any]]:
+    """Read-only extraction of all comments (author/initials/date/text). Never raises."""
+    try:
+        from docx.oxml.ns import qn
+
+        comments: List[Dict[str, Any]] = []
+        for rel in doc.part.rels.values():
+            if "comments" not in rel.reltype:
+                continue
+            for node in rel.target_part.element.findall(qn("w:comment")):
+                try:
+                    text = "".join(
+                        t.text or "" for t in node.findall(f".//{qn('w:t')}")
+                    )
+                    comments.append({
+                        "id": node.get(qn("w:id")),
+                        "author": node.get(qn("w:author")) or "",
+                        "initials": node.get(qn("w:initials")) or "",
+                        "date": node.get(qn("w:date")) or "",
+                        "text": text,
+                    })
+                except Exception:
+                    continue
+            break
+        return comments
+    except Exception:
+        return []
+
+
+def _list_highlights(doc: Any, max_entries: int = 200) -> List[Dict[str, Any]]:
+    """Read-only extraction of highlighted runs (paragraph index, excerpt, color). Never raises."""
+    try:
+        from docx.oxml.ns import qn
+
+        highlights: List[Dict[str, Any]] = []
+        for para_idx, para in enumerate(doc.paragraphs):
+            for run in para.runs:
+                rPr = run._element.find(qn("w:rPr"))
+                if rPr is None:
+                    continue
+                hl = rPr.find(qn("w:highlight"))
+                if hl is None:
+                    continue
+                highlights.append({
+                    "paragraph_index": para_idx,
+                    "excerpt": (run.text or "")[:80],
+                    "color": hl.get(qn("w:val")) or "",
+                })
+                if len(highlights) >= max_entries:
+                    return highlights
+        return highlights
+    except Exception:
+        return []
+
+
+def _resolve_run_for_text(doc: Any, search_text: str) -> Optional[Any]:
+    """Finds the first run containing search_text (exact, then case-insensitive)."""
+    needle = str(search_text or "")
+    if not needle:
+        return None
+    lowered = needle.lower()
+    for para in doc.paragraphs:
+        for run in para.runs:
+            run_text = run.text or ""
+            if needle in run_text:
+                return run
+    for para in doc.paragraphs:
+        for run in para.runs:
+            run_text = run.text or ""
+            if lowered and lowered in run_text.lower():
+                return run
+    return None
+
+
 def _build_add_comment_helper() -> Any:
-    """Builds the real-OXML add_comment(doc, paragraph, text, author) helper.
+    """Builds the real-OXML add_comment(doc, paragraph, text, author, run) helper.
 
     python-docx has no native comment API: this helper injects a genuine
-    w:comment into the comments part and anchors it on the paragraph with
-    commentRangeStart/commentRangeEnd + a reference run. Falls back to a
-    highlighted bracketed run when the OXML path fails (e.g. exotic parts).
+    w:comment into the comments part (created automatically when missing) and
+    anchors it with commentRangeStart/commentRangeEnd + a reference run. When
+    a run is provided the range wraps that exact run; otherwise the comment is
+    anchored at the end of the paragraph. Raises on total OXML failure so the
+    recipe sees the real error instead of silently polluting the body text.
     """
-    def add_comment(doc: Any, paragraph: Any, text: str, author: str = "Assistant") -> None:
+    def add_comment(
+        doc: Any,
+        paragraph: Any,
+        text: str,
+        author: str = "Assistant",
+        run: Optional[Any] = None,
+    ) -> None:
+        from datetime import datetime, timezone
         from docx.oxml.ns import qn
         from docx.oxml import OxmlElement
 
-        try:
-            # ── Real OXML comment path ──
-            comments_part = None
-            for rel in doc.part.rels.values():
-                if "comments" in rel.reltype:
-                    comments_part = rel.target_part
-                    break
+        comments_part = _ensure_comments_part(doc)
 
-            if comments_part is None:
-                raise RuntimeError("no comments part in this document")
+        existing = comments_part.element.findall(qn("w:comment"))
+        comment_id = str(
+            max((int(c.get(qn("w:id"), 0)) for c in existing), default=-1) + 1
+        )
 
-            from docx.oxml.parser import parse_xml
-            from docx.oxml.ns import nsmap
+        initials = "".join(part[0] for part in str(author).split() if part)[:4].upper()
+        comment_date = datetime.now(timezone.utc).isoformat()
 
-            # Determine the next comment id.
-            existing = comments_part.element.findall(qn("w:comment"))
-            comment_id = str(len(existing))
+        comment_el = OxmlElement("w:comment")
+        comment_el.set(qn("w:id"), comment_id)
+        comment_el.set(qn("w:author"), str(author))
+        comment_el.set(qn("w:initials"), initials)
+        comment_el.set(qn("w:date"), comment_date)
 
-            comment_xml = (
-                f'<w:comment xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
-                f'w:id="{comment_id}" w:author="{author}" w:date="2026-01-01T00:00:00Z">'
-                f'<w:p><w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>'
-                f'</w:comment>'
-            )
-            comments_part.element.append(parse_xml(comment_xml))
+        comment_p = OxmlElement("w:p")
+        comment_r = OxmlElement("w:r")
+        comment_t = OxmlElement("w:t")
+        comment_t.text = str(text)
+        comment_t.set(qn("xml:space"), "preserve")
+        comment_r.append(comment_t)
+        comment_p.append(comment_r)
+        comment_el.append(comment_p)
+        comments_part.element.append(comment_el)
 
-            # Anchor the comment on the paragraph.
-            range_start = OxmlElement("w:commentRangeStart")
-            range_start.set(qn("w:id"), comment_id)
-            range_end = OxmlElement("w:commentRangeEnd")
-            range_end.set(qn("w:id"), comment_id)
-            reference_run = OxmlElement("w:r")
-            reference_run.append(OxmlElement("w:commentReference"))
-            reference_run.find(qn("w:commentReference")).set(qn("w:id"), comment_id)
+        range_start = OxmlElement("w:commentRangeStart")
+        range_start.set(qn("w:id"), comment_id)
+        range_end = OxmlElement("w:commentRangeEnd")
+        range_end.set(qn("w:id"), comment_id)
+        reference_run = OxmlElement("w:r")
+        comment_ref = OxmlElement("w:commentReference")
+        comment_ref.set(qn("w:id"), comment_id)
+        reference_run.append(comment_ref)
 
+        if run is not None:
+            run._element.addprevious(range_start)
+            run._element.addnext(range_end)
+            range_end.addnext(reference_run)
+        else:
             paragraph._p.append(range_start)
             paragraph._p.append(range_end)
             paragraph._p.append(reference_run)
-        except Exception:
-            # ── Highlight fallback: visible bracketed comment run ──
-            from docx.enum.text import WD_COLOR_INDEX
-            run = paragraph.add_run(f" [COMMENT ({author}): {text}] ")
-            run.font.highlight_color = WD_COLOR_INDEX.YELLOW
 
     return add_comment
 
@@ -318,6 +436,9 @@ def _build_recipe_namespace(working_dir: Optional[Path] = None) -> Dict[str, Any
         return namespace
 
     namespace["add_comment"] = _build_add_comment_helper()
+    namespace["list_comments"] = lambda doc: _list_comments(doc)
+    namespace["list_highlights"] = lambda doc: _list_highlights(doc)
+    namespace["resolve_comment_runs"] = _resolve_run_for_text
 
     if working_dir is not None:
         namespace["media"] = lambda ref: str(_resolve_media_path(ref, working_dir))
@@ -542,7 +663,7 @@ def _require_suffix(
 
 
 def _read_docx(path: Path) -> str:
-    """Builds a markdown inventory of a document (paragraphs and tables)."""
+    """Builds a markdown inventory of a document (paragraphs, tables, comments, highlights)."""
     from docx import Document
 
     doc = Document(str(path))
@@ -557,6 +678,29 @@ def _read_docx(path: Path) -> str:
     lines.append(f"## Tables: {len(doc.tables)}")
     for table_idx, table in enumerate(doc.tables, start=1):
         lines.append(f"- table {table_idx}: {len(table.rows)} rows x {len(table.columns)} cols")
+
+    lines.append("")
+    lines.append("## Comments")
+    comments = _list_comments(doc)
+    if comments:
+        for i, comment in enumerate(comments, start=1):
+            lines.append(
+                f"- [{i}] {comment['author']} ({comment['date']}): {comment['text']}"
+            )
+    else:
+        lines.append("- (no comments)")
+
+    lines.append("")
+    lines.append("## Highlights")
+    highlights = _list_highlights(doc)
+    if highlights:
+        for hl in highlights:
+            lines.append(
+                f"- paragraph {hl['paragraph_index']}: \"{hl['excerpt']}\" ({hl['color']})"
+            )
+    else:
+        lines.append("- (none)")
+
     return "\n".join(lines)
 
 
@@ -572,7 +716,8 @@ def tool_build_word(
     The root object is pre-bound as `doc`. Available symbols: DocxDocument,
     DocxInches, DocxPt, DocxRGBColor, WD_ALIGN_PARAGRAPH, WD_LINE_SPACING,
     WD_BREAK, WD_COLOR_INDEX, WD_SECTION, WD_ORIENT, WD_TABLE_ALIGNMENT, qn,
-    OxmlElement, add_comment, media(), list_media().
+    OxmlElement, add_comment, list_comments, list_highlights,
+    resolve_comment_runs, media(), list_media().
 
     Building hints (not restrictions — use your own coding skills):
     - Rich text: doc.add_paragraph("text", style="Heading 1"), runs with
@@ -656,13 +801,18 @@ def tool_edit_word(
     The opened document is pre-bound as `doc`. Available symbols: DocxDocument,
     DocxInches, DocxPt, DocxRGBColor, WD_ALIGN_PARAGRAPH, WD_LINE_SPACING,
     WD_BREAK, WD_COLOR_INDEX, WD_SECTION, WD_ORIENT, WD_TABLE_ALIGNMENT, qn,
-    OxmlElement, add_comment, media(), list_media().
+    OxmlElement, add_comment, list_comments, list_highlights,
+    resolve_comment_runs, media(), list_media().
 
     Edit vocabulary hints (not restrictions — use your own coding skills):
-    - INSERT COMMENTS: add_comment(doc, paragraph, "comment text", author="Assistant")
-      — real OXML comments (w:comment in comments.xml, anchored with
-      commentRangeStart/End). Falls back to a highlighted bracketed run when
-      the document has no comments part.
+    - INSERT COMMENTS: add_comment(doc, paragraph, "comment text", author="Assistant",
+      run=resolve_comment_runs(doc, "target text")) — real OXML comments
+      (w:comment in comments.xml, anchored with commentRangeStart/End around
+      the exact run). The comments part is created automatically when missing;
+      resolve_comment_runs(doc, "text") returns the first run containing the
+      text so the comment anchors precisely on it.
+    - REVIEW STATE: list_comments(doc) and list_highlights(doc) return the
+      existing comments (author/date/text) and highlighted runs.
     - HIGHLIGHT TEXT: run.font.highlight_color = WD_COLOR_INDEX.YELLOW
       (also GREEN, PINK, CYAN, RED...).
     - REFORMAT: paragraph.style = doc.styles["Heading 2"],
@@ -800,6 +950,67 @@ def tool_read_word(
         }
 
 
+def tool_word_review(
+    file: str,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Reads the review state of a Word document (.docx/.docm): comments and highlights.
+
+    Returns the structured list of comments (author, initials, date, text) and
+    highlighted runs (paragraph index, excerpt, color), plus the full markdown
+    inventory. Read-only: no recipe is executed and nothing is saved. Use this
+    to verify annotations you added or to review feedback before editing.
+    """
+    try:
+        if not file or not str(file).strip():
+            return {"success": False, "error": "No file provided for review."}
+
+        working_dir = _resolve_working_dir(discussion_instance)
+        candidate = Path(str(file).strip())
+        file_path = candidate if candidate.is_absolute() else working_dir / candidate
+        if not file_path.is_file():
+            return {"success": False, "error": f"File not found: {file_path}"}
+
+        suffix = file_path.suffix.lower()
+        if suffix not in _DOCX_SUFFIXES:
+            return {
+                "success": False,
+                "error": f"tool_word_review requires a {'/'.join(_DOCX_SUFFIXES)} file, got '{suffix or '(no extension)'}'.",
+            }
+
+        ok, reason = _validate_office_file(file_path)
+        if not ok:
+            return {
+                "success": False,
+                "error": (
+                    f"Office Document Integrity Failure [{OFFICE_GUARD_FAILURE_CODE}]: "
+                    f"'{file_path.name}' is corrupt and cannot be read safely.\n"
+                    f"Reason: {reason}"
+                ),
+            }
+
+        from docx import Document
+        doc = Document(str(file_path))
+        comments = _list_comments(doc)
+        highlights = _list_highlights(doc)
+        inventory = _read_docx(file_path)
+
+        return {
+            "success": True,
+            "file_name": file_path.name,
+            "workspace_file": str(file_path.resolve()),
+            "comments": comments,
+            "highlights": highlights,
+            "inventory": inventory,
+        }
+    except Exception as unexpected_err:
+        return {
+            "success": False,
+            "error": f"Unexpected failure reviewing Word document: {unexpected_err}",
+        }
+
+
 def get_tools() -> List[Dict[str, Any]]:
     """Returns the tool specifications for the Word Tools toolset."""
     return [
@@ -809,11 +1020,13 @@ def get_tools() -> List[Dict[str, Any]]:
                 "Creates a new Word document (.docx/.docm) from a sandboxed python-docx recipe. "
                 "Root object pre-bound as doc. Symbols: DocxDocument, DocxInches, DocxPt, "
                 "DocxRGBColor, WD_ALIGN_PARAGRAPH, WD_LINE_SPACING, WD_BREAK, WD_COLOR_INDEX, "
-                "WD_SECTION, WD_ORIENT, WD_TABLE_ALIGNMENT, qn, OxmlElement, add_comment, media(), "
-                "list_media(). Hints: styles, tables, images via media(), headers/footers, TOC field "
-                "via OXML, sections via doc.add_section(WD_SECTION.NEW_PAGE). Imports allowed ONLY "
-                "from the whitelist (docx.*, safe stdlib). Do NOT call save() — the tool saves and "
-                "validates automatically."
+                "WD_SECTION, WD_ORIENT, WD_TABLE_ALIGNMENT, qn, OxmlElement, add_comment, "
+                "list_comments, list_highlights, resolve_comment_runs, media(), list_media(). "
+                "Hints: styles, tables, images via media(), headers/footers, TOC field "
+                "via OXML, sections via doc.add_section(WD_SECTION.NEW_PAGE). Comments are "
+                "REAL Word comments (comments part auto-created, run-anchored). Imports "
+                "allowed ONLY from the whitelist (docx.*, safe stdlib). Do NOT call save() "
+                "— the tool saves and validates automatically."
             ),
             "parameters": [
                 {
@@ -845,13 +1058,15 @@ def get_tools() -> List[Dict[str, Any]]:
             "description": (
                 "Edits an existing Word document (.docx/.docm) in place via a sandboxed python-docx "
                 "recipe. Opened document pre-bound as doc. EDIT VOCABULARY (hints, not restrictions): "
-                "comments via add_comment(doc, paragraph, text, author); highlights via "
-                "run.font.highlight_color = WD_COLOR_INDEX.YELLOW; reformat via styles/fonts/alignment/"
-                "spacing; sections via doc.add_section(WD_SECTION.NEW_PAGE); links/fields via OXML "
-                "field codes (qn, fldSimple — Word updates on open); find & replace over runs; tables; "
-                "images via media(). Imports allowed ONLY from the whitelist (docx.*, safe stdlib). Do "
-                "NOT call save() — the tool saves and validates automatically. Transactional save: "
-                "pre-edit bytes restored on validation failure."
+                "REAL comments via add_comment(doc, paragraph, text, author, run=resolve_comment_runs("
+                "doc, 'target text')) — the comments part is auto-created and the comment anchors on "
+                "the exact run; review state via list_comments(doc)/list_highlights(doc); highlights "
+                "via run.font.highlight_color = WD_COLOR_INDEX.YELLOW; reformat via styles/fonts/"
+                "alignment/spacing; sections via doc.add_section(WD_SECTION.NEW_PAGE); links/fields "
+                "via OXML field codes (qn, fldSimple — Word updates on open); find & replace over "
+                "runs; tables; images via media(). Imports allowed ONLY from the whitelist (docx.*, "
+                "safe stdlib). Do NOT call save() — the tool saves and validates automatically. "
+                "Transactional save: pre-edit bytes restored on validation failure."
             ),
             "parameters": [
                 {
@@ -862,7 +1077,7 @@ def get_tools() -> List[Dict[str, Any]]:
                 {
                     "name": "recipe",
                     "type": "str",
-                    "description": "Plain Python recipe mutating the opened doc. Comments: add_comment(doc, paragraph, text). Highlights: WD_COLOR_INDEX. Sections: WD_SECTION. Fields: OXML via qn. Imports allowed only from the whitelist (docx.*, safe stdlib). Do NOT call save().",
+                    "description": "Plain Python recipe mutating the opened doc. Comments: add_comment(doc, paragraph, text, author, run=resolve_comment_runs(doc, 'text')). Highlights: WD_COLOR_INDEX. Review: list_comments/list_highlights. Sections: WD_SECTION. Fields: OXML via qn. Imports allowed only from the whitelist (docx.*, safe stdlib). Do NOT call save().",
                     "optional": True,
                 },
             ],
@@ -881,8 +1096,8 @@ def get_tools() -> List[Dict[str, Any]]:
             "name": "tool_read_word",
             "description": (
                 "Reads an existing Word document (.docx/.docm) and returns a markdown inventory "
-                "(paragraphs with styles, tables). Validates the file first; corrupt files return "
-                "a structured failure."
+                "(paragraphs with styles, tables, comments, highlights). Validates the file first; "
+                "corrupt files return a structured failure."
             ),
             "parameters": [
                 {
@@ -902,4 +1117,22 @@ def get_tools() -> List[Dict[str, Any]]:
             "_source": "word_tools",
             "_source_file": __file__,
         },
-    ]
+        {
+            "name": "tool_word_review",
+            "description": (
+                "Reads the review state of an existing Word document (.docx/.docm): returns the "
+                "structured list of comments (author, initials, date, text) and highlighted runs "
+                "(paragraph index, excerpt, color), plus the full markdown inventory. Read-only: "
+                "no recipe is executed and nothing is saved. Use it to verify annotations you "
+                "added or to review feedback before editing."
+            ),
+            "parameters": [
+                {
+                    "name": "file",
+                    "type": "str",
+                    "description": "Existing .docx/.docm file to review (relative to workspace or absolute path).",
+                },
+            ],
+            "output": [
+                {"name": "success", "type": "bool", "description": "Whether the operation succeeded."},
+                {"

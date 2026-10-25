@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-25 16:19]
+
+- feat(lcp): add word tools and document editor tools
+
 ## [2026-10-25 15:34]
 
 - feat(llm_bindings): add data URL conversion helper to lollms binding

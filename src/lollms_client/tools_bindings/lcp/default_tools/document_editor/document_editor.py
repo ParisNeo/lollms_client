@@ -17,7 +17,7 @@ except ImportError:
     fitz = None
 
 TOOL_LIBRARY_NAME = "Document Editor"
-TOOL_LIBRARY_DESC = "Surgically edits, annotates (batch capable), highlights, copies-pastes between documents, deletes pages, and replaces text globally in PDF, DOCX, and PPTX files."
+TOOL_LIBRARY_DESC = "Surgically edits, annotates (batch capable), highlights, copies-pastes between documents, deletes pages, and replaces text globally in PDF, DOCX, and PPTX files. DOCX comments are REAL Word review-pane comments anchored to the matched text. Also provides read-only probes: find text, read existing comments, and report document metadata."
 TOOL_LIBRARY_ICON = "📝"
 
 _DEFAULT_COMMENTER = getpass.getuser()
@@ -214,6 +214,264 @@ def _fuzzy_find_in_paragraphs(paragraphs_text: List[str], search_text: str) -> L
                 continue
     
     return matched_indices
+
+
+_DOCX_HIGHLIGHT_COLORS = {
+    "yellow", "red", "green", "blue", "cyan", "magenta",
+    "darkBlue", "darkCyan", "darkGreen", "darkMagenta",
+    "darkRed", "darkYellow", "gray", "lightGray", "black", "white",
+}
+
+
+def _split_run_at(paragraph, search_text: str) -> Optional[Tuple[Any, Any]]:
+    """
+    Splits the runs of a paragraph so that the first occurrence of search_text
+    occupies exact run boundaries. Returns (first_run, last_run) of the matched
+    fragment, or None when the text cannot be isolated (e.g. spans runs).
+    """
+    norm_search = _normalize_text_for_search(search_text)
+    if not norm_search:
+        return None
+
+    runs = list(paragraph.runs)
+    for i, run in enumerate(runs):
+        run_text = run.text or ""
+        pos = run_text.find(search_text)
+        if pos < 0:
+            norm_run = _normalize_text_for_search(run_text)
+            pos = norm_run.find(norm_search)
+            if pos >= 0 and norm_run != run_text:
+                return None
+        if pos < 0:
+            continue
+
+        end = pos + len(search_text)
+        if end > len(run_text):
+            return None
+
+        first_run = run
+        if pos > 0:
+            first_run = paragraph.add_run(run_text[:pos])
+            first_run._element.addprevious(run._element)
+            run.text = run_text[pos:]
+
+        last_run = run
+        if end < len(run_text):
+            tail = paragraph.add_run(run_text[end:])
+            tail._element.addnext(run._element)
+            run.text = run_text[pos:end]
+            last_run = run
+
+        return (first_run, last_run)
+
+    return None
+
+
+def _highlight_docx_text(paragraph, search_text: str, highlight_color: str) -> int:
+    """
+    Highlights ONLY the matched text fragment inside a DOCX paragraph by
+    splitting runs at the match boundaries. Falls back to highlighting the
+    whole paragraph when the fragment cannot be isolated. Returns the number
+    of highlighted runs.
+    """
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    color = highlight_color if highlight_color in _DOCX_HIGHLIGHT_COLORS else "yellow"
+
+    def apply_highlight(run) -> None:
+        rPr = run._element.get_or_add_rPr()
+        existing = rPr.find(qn('w:highlight'))
+        if existing is not None:
+            existing.set(qn('w:val'), color)
+        else:
+            highlight = OxmlElement('w:highlight')
+            highlight.set(qn('w:val'), color)
+            rPr.append(highlight)
+
+    boundaries = _split_run_at(paragraph, search_text)
+    if boundaries is not None:
+        start_run, end_run = boundaries
+        runs = list(paragraph.runs)
+        started = False
+        count = 0
+        for run in runs:
+            if run is start_run:
+                started = True
+            if started:
+                apply_highlight(run)
+                count += 1
+            if run is end_run:
+                break
+        if count:
+            return count
+
+    for run in paragraph.runs:
+        apply_highlight(run)
+    return max(1, len(paragraph.runs))
+
+
+def _get_docx_comments_part(doc):
+    """Returns the w:comments part of a docx document, or None."""
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    try:
+        return doc.part.part_related_by(RT.COMMENTS)
+    except Exception:
+        return None
+
+
+def _next_comment_id(doc) -> int:
+    """Computes the next free comment id from the live comments part."""
+    part = _get_docx_comments_part(doc)
+    if part is None:
+        return 1
+    try:
+        existing = part.element.xpath('.//w:comment')
+    except Exception:
+        existing = []
+    max_id = 0
+    for node in existing:
+        try:
+            max_id = max(max_id, int(node.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}id')))
+        except (TypeError, ValueError):
+            continue
+    return max_id + 1
+
+
+def _ensure_docx_comments_part(doc):
+    """
+    Returns the w:comments part of a docx document, creating and wiring it
+    via the COMMENTS relationship when it does not exist yet.
+    """
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    from docx.oxml import parse_xml
+    from docx.oxml.ns import nsdecls
+
+    part = _get_docx_comments_part(doc)
+    if part is not None:
+        return part
+
+    comments_xml = (
+        '<w:comments %s/>' % nsdecls('w')
+    )
+    from docx.opc.part import Part
+    from docx.opc.packuri import PackURI
+
+    part = Part(
+        PackURI('/word/comments.xml'),
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml',
+        parse_xml(comments_xml),
+        doc.part.package
+    )
+    doc.part.relate_to(part, RT.COMMENTS)
+    return part
+
+
+def _add_word_comment(doc, paragraph, search_text: str, comment: str, commenter_name: str) -> int:
+    """
+    Anchors a REAL Word comment (review-pane visible) to the matched text in a
+    DOCX paragraph. Tries the native python-docx API (>=1.1.0) first, then
+    falls back to manual OXML construction. Returns 1 on success, 0 on failure.
+    """
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    from datetime import datetime, timezone
+
+    initials = "".join(part[0] for part in commenter_name.split() if part)[:4].upper()
+    comment_date = datetime.now(timezone.utc).isoformat()
+
+    try:
+        paragraph.add_comment(comment, author=commenter_name, initials=initials)
+        return 1
+    except AttributeError:
+        pass
+    except Exception:
+        pass
+
+    try:
+        comment_id = _next_comment_id(doc)
+        comments_part = _ensure_docx_comments_part(doc)
+
+        comment_el = OxmlElement('w:comment')
+        comment_el.set(qn('w:id'), str(comment_id))
+        comment_el.set(qn('w:author'), commenter_name)
+        comment_el.set(qn('w:date'), comment_date)
+        comment_el.set(qn('w:initials'), initials)
+
+        comment_p = OxmlElement('w:p')
+        comment_r = OxmlElement('w:r')
+        comment_t = OxmlElement('w:t')
+        comment_t.text = comment
+        comment_r.append(comment_t)
+        comment_p.append(comment_r)
+        comment_el.append(comment_p)
+        comments_part.element.append(comment_el)
+
+        range_start = OxmlElement('w:commentRangeStart')
+        range_start.set(qn('w:id'), str(comment_id))
+        range_end = OxmlElement('w:commentRangeEnd')
+        range_end.set(qn('w:id'), str(comment_id))
+
+        ref_run = paragraph.add_run()
+        ref_rPr = ref_run._element.get_or_add_rPr()
+        comment_ref = OxmlElement('w:commentReference')
+        comment_ref.set(qn('w:id'), str(comment_id))
+        ref_rPr.append(comment_ref)
+
+        boundaries = _split_run_at(paragraph, search_text)
+        if boundaries is not None:
+            start_run, end_run = boundaries
+            start_run._element.addprevious(range_start)
+            end_run._element.addnext(range_end)
+            end_run._element.addnext(ref_run._element)
+        else:
+            first_el = paragraph._element.find(qn('w:pPr'))
+            if first_el is not None:
+                first_el.addnext(range_start)
+            else:
+                paragraph._element.insert(0, range_start)
+            paragraph._element.append(range_end)
+            paragraph._element.append(ref_run._element)
+
+        return 1
+    except Exception:
+        return 0
+
+
+def _list_docx_comments(doc) -> List[Dict[str, Any]]:
+    """Reads all comments from the w:comments part. Returns [] when absent."""
+    part = _get_docx_comments_part(doc)
+    if part is None:
+        return []
+
+    comments: List[Dict[str, Any]] = []
+    try:
+        nodes = part.element.xpath('.//w:comment')
+    except Exception:
+        return comments
+
+    for node in nodes:
+        try:
+            texts = node.xpath('.//w:t')
+            body = "".join(t.text or "" for t in texts)
+            comments.append({
+                "id": node.get(qn('w:id')) if _qn_available() else node.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}id'),
+                "author": node.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}author'),
+                "initials": node.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}initials'),
+                "date": node.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}date'),
+                "text": body,
+            })
+        except Exception:
+            continue
+    return comments
+
+
+def _qn_available() -> bool:
+    try:
+        from docx.oxml.ns import qn
+        return True
+    except Exception:
+        return False
 
 
 def _apply_single_pdf_edit(page, operation: str, search_text: str, replacement_text: str, flags: int) -> int:
@@ -746,6 +1004,240 @@ def tool_batch_annotate_document(
             "error": f"Batch annotation failed: {str(e)}",
             "traceback": traceback.format_exc()
         }
+
+def tool_find_text_in_document(
+    file_name: str,
+    search_text: str,
+    pages: str = ""
+) -> Dict[str, Any]:
+    """
+    Read-only probe that locates a text fragment inside a PDF, DOCX, or PPTX
+    document and returns the exact locations (page, paragraph, or slide/shape
+    indices) with surrounding context snippets. Use this BEFORE editing or
+    annotating to verify the target text exists and to confirm its location.
+
+    Args:
+        file_name (str): The path to the document file (PDF, DOCX, or PPTX).
+        search_text (str): The text fragment to locate.
+        pages (str, optional): Pages to search (PDF only). E.g., "1-3, 5". Empty means all pages.
+    """
+    err = _check_file_exists(file_name)
+    if err:
+        return err
+
+    if not search_text or not str(search_text).strip():
+        return {"success": False, "error": "search_text must be a non-empty string."}
+
+    search_text = str(search_text)
+    file_ext = Path(file_name).suffix.lower()
+    matches: List[Dict[str, Any]] = []
+
+    try:
+        if file_ext == ".pdf":
+            if fitz is None:
+                return {"success": False, "error": "PyMuPDF (fitz) is not installed. Cannot search PDF files. Install it via 'pip install pymupdf'."}
+            doc = fitz.open(file_name)
+            target_pages = _parse_page_numbers(pages, len(doc))
+            search_flags = _resolve_fitz_flag("TEXT_DEHYPHENATE")
+
+            for page_num in target_pages:
+                page = doc[page_num]
+                hits = _fuzzy_search_pdf_page(page, search_text, flags=search_flags)
+                if hits:
+                    page_text = page.get_text("text")
+                    snippet = page_text[:200].replace("\n", " ").strip()
+                    matches.append({
+                        "page": page_num + 1,
+                        "hit_count": len(hits),
+                        "snippet": snippet
+                    })
+            doc.close()
+
+        elif file_ext == ".docx":
+            import docx
+            doc = docx.Document(file_name)
+            paragraph_texts = [p.text for p in doc.paragraphs]
+            matched_indices = _fuzzy_find_in_paragraphs(paragraph_texts, search_text)
+
+            for idx in matched_indices:
+                snippet = paragraph_texts[idx][:200].replace("\n", " ").strip()
+                matches.append({
+                    "paragraph_index": idx,
+                    "snippet": snippet
+                })
+
+        elif file_ext == ".pptx":
+            from pptx import Presentation
+            prs = Presentation(file_name)
+
+            for slide_idx, slide in enumerate(prs.slides):
+                for shape_idx, shape in enumerate(slide.shapes):
+                    if not shape.has_text_frame:
+                        continue
+                    for para in shape.text_frame.paragraphs:
+                        full_text = "".join(run.text for run in para.runs)
+                        if not full_text:
+                            continue
+                        matched = search_text in full_text
+                        if not matched:
+                            norm_search = _normalize_text_for_search(search_text)
+                            norm_full = _normalize_text_for_search(full_text)
+                            matched = bool(norm_search) and norm_search in norm_full
+                        if matched:
+                            matches.append({
+                                "slide_index": slide_idx + 1,
+                                "shape_index": shape_idx,
+                                "snippet": full_text[:200].replace("\n", " ").strip()
+                            })
+                            break
+
+        else:
+            return {"success": False, "error": f"Unsupported file extension: '{file_ext}'. Supported: .pdf, .docx, .pptx"}
+
+        if not matches:
+            return {"success": False, "error": f"Search text not found. Try a shorter, more specific search_text fragment."}
+
+        return {
+            "success": True,
+            "output": f"Found {len(matches)} match(es) for the search text in {file_name}.",
+            "file_name": file_name,
+            "matches": matches
+        }
+
+    except Exception as e:
+        import traceback
+        return {
+            "success": False,
+            "error": f"Text search failed: {str(e)}",
+            "traceback": traceback.format_exc()
+        }
+
+
+def tool_read_document_comments(file_name: str) -> Dict[str, Any]:
+    """
+    Read-only probe that lists all existing comments/annotations in a PDF or
+    DOCX document, including author, date, and text. Use this to review
+    feedback left by reviewers before or after editing.
+
+    Args:
+        file_name (str): The path to the document file (PDF or DOCX).
+    """
+    err = _check_file_exists(file_name)
+    if err:
+        return err
+
+    file_ext = Path(file_name).suffix.lower()
+    comments: List[Dict[str, Any]] = []
+
+    try:
+        if file_ext == ".pdf":
+            if fitz is None:
+                return {"success": False, "error": "PyMuPDF (fitz) is not installed. Cannot read PDF comments. Install it via 'pip install pymupdf'."}
+            doc = fitz.open(file_name)
+            for page_num, page in enumerate(doc):
+                for annot in page.annots() or []:
+                    try:
+                        if annot.type[1] not in ("Text", "FreeText"):
+                            continue
+                        info = annot.info or {}
+                        comments.append({
+                            "page": page_num + 1,
+                            "type": annot.type[1],
+                            "author": info.get("title", ""),
+                            "date": info.get("modDate", ""),
+                            "text": info.get("content", "")
+                        })
+                    except Exception:
+                        continue
+            doc.close()
+
+        elif file_ext == ".docx":
+            import docx
+            doc = docx.Document(file_name)
+            comments = _list_docx_comments(doc)
+
+        elif file_ext == ".pptx":
+            return {
+                "success": True,
+                "output": "PPTX files do not expose comments through this interface. No comments listed.",
+                "file_name": file_name,
+                "comments": []
+            }
+
+        else:
+            return {"success": False, "error": f"Unsupported file extension: '{file_ext}'. Supported: .pdf, .docx"}
+
+        return {
+            "success": True,
+            "output": f"Found {len(comments)} comment(s) in {file_name}.",
+            "file_name": file_name,
+            "comments": comments
+        }
+
+    except Exception as e:
+        import traceback
+        return {
+            "success": False,
+            "error": f"Reading comments failed: {str(e)}",
+            "traceback": traceback.format_exc()
+        }
+
+
+def tool_get_document_info(file_name: str) -> Dict[str, Any]:
+    """
+    Read-only probe that reports metadata about a document: file format,
+    page/slide/paragraph counts, and (for DOCX) the number of existing
+    comments. Use this to understand a document's structure before editing.
+
+    Args:
+        file_name (str): The path to the document file (PDF, DOCX, or PPTX).
+    """
+    err = _check_file_exists(file_name)
+    if err:
+        return err
+
+    file_ext = Path(file_name).suffix.lower()
+    info: Dict[str, Any] = {"file_name": file_name, "format": file_ext.lstrip('.')}
+
+    try:
+        if file_ext == ".pdf":
+            if fitz is None:
+                return {"success": False, "error": "PyMuPDF (fitz) is not installed. Cannot inspect PDF files. Install it via 'pip install pymupdf'."}
+            doc = fitz.open(file_name)
+            info["page_count"] = len(doc)
+            info["metadata"] = {k: str(v) for k, v in (doc.metadata or {}).items() if v}
+            doc.close()
+
+        elif file_ext == ".docx":
+            import docx
+            doc = docx.Document(file_name)
+            info["paragraph_count"] = len(doc.paragraphs)
+            info["table_count"] = len(doc.tables)
+            info["comment_count"] = len(_list_docx_comments(doc))
+
+        elif file_ext == ".pptx":
+            from pptx import Presentation
+            prs = Presentation(file_name)
+            info["slide_count"] = len(prs.slides)
+
+        else:
+            return {"success": False, "error": f"Unsupported file extension: '{file_ext}'. Supported: .pdf, .docx, .pptx"}
+
+        return {
+            "success": True,
+            "output": f"Document info for {file_name}: {json.dumps(info)}",
+            "file_name": file_name,
+            "info": info
+        }
+
+    except Exception as e:
+        import traceback
+        return {
+            "success": False,
+            "error": f"Document inspection failed: {str(e)}",
+            "traceback": traceback.format_exc()
+        }
+
 
 def tool_copy_paste_between_documents(
     source_file: str,
