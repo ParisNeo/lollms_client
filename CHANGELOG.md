@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-26 03:20]
+
+- fix(word_tools): repair corrupted tool definitions in get_tools
+
 ## [2026-10-26 01:10]
 
 - feat(client): add new TTI functionality and enhance discussion chat/prompt mixins
