@@ -3728,14 +3728,52 @@ class _StreamState:
                 ASCIIColors.warning("[generate_image] TTI returned no usable image data.")
                 return True
 
+            # ── 📁 AS-IS PHYSICAL PERSISTENCE (CRITICAL FIX) ──
+            # The image MUST exist as a physical file in the discussion workspace.
+            # Without a disk twin, the DB↔disk reconciliation sync purges the
+            # record on the next pass (the artifact "disappears after first sync").
+            # We write the PNG bytes to disk FIRST, then register the artifact
+            # with physical_data so ArtefactManager.add() persists the binary twin.
+            img_rel_path = _normalize_image_workspace_path(
+                name, default_stem=f"generated_image_{uuid.uuid4().hex[:6]}"
+            )
+            img_bytes = base64.b64decode(images_b64[0])
+            ws_root = _resolve_tool_workspace_root(disc)
+            img_disk_path = ws_root / img_rel_path
+            disk_write_error = None
+            try:
+                img_disk_path.parent.mkdir(parents=True, exist_ok=True)
+                img_disk_path.write_bytes(img_bytes)
+            except Exception as write_ex:
+                disk_write_error = _sanitize_host_paths(str(write_ex))
+                ASCIIColors.warning(
+                    f"[generate_image] Failed to write image '{img_rel_path}' to disk: {disk_write_error}"
+                )
+
+            meta_card = (
+                f"### Image: `{img_rel_path}`\n\n"
+                f"Generated via the image engine.\n"
+                f"- **Type**: Image (AS-IS physical artefact)\n"
+                f"- **Prompt**: {prompt[:200]}\n"
+                f"- **Location**: `./{img_rel_path}`\n\n"
+                f"> **Action**: The image is saved in the workspace. Reference it directly in your "
+                f"answer with `![](./{img_rel_path})` (markdown) or `./{img_rel_path}` (plain path). "
+                f"To view its pixels in a later turn, emit `<unlock_file>{img_rel_path}</unlock_file>`."
+            )
+
             art = disc.artefacts.add(
-                title=name,
+                title=img_rel_path,
                 artefact_type=ArtefactType.IMAGE,
-                content=prompt,
+                content=meta_card,
                 images=images_b64,
                 image_media_types=["image/png"],
                 active=bool(getattr(self, "auto_activate", True)),
+                visibility=ArtefactVisibility.TREE_UNLOCKABLE,
+                physical_data=img_bytes if disk_write_error is None else None,
+                logical_content=meta_card,
             )
+            if disk_write_error is None:
+                self._bump_workspace_revision()
             if art:
                 if not hasattr(self, "affected_artefacts"):
                     self.affected_artefacts = []
@@ -3743,6 +3781,19 @@ class _StreamState:
                 turn_arts = getattr(disc, "_affected_artefacts_this_turn", None)
                 if isinstance(turn_arts, list):
                     turn_arts.append(art)
+                # ── 🖼️ AS-IS VISION ATTACHMENT ──
+                # Record the pixels for the next round's vision context so
+                # vision-capable models can verify the generated result.
+                if not hasattr(self, "generated_image_pixels"):
+                    self.generated_image_pixels = []
+                self.generated_image_pixels.append((img_rel_path, images_b64[0]))
+                if getattr(disc, "_turn_actions_log", None) is not None:
+                    disc._turn_actions_log.append({
+                        "action": "artifact_created",
+                        "title": img_rel_path,
+                        "type": "image",
+                        "round": getattr(disc, "_current_round", 0)
+                    })
                 if getattr(disc, "_is_db_backed", False):
                     try:
                         disc.commit()
@@ -5468,12 +5519,6 @@ class ChatMixin:
                 extra_instructions += self._build_form_instructions()
             if enable_books and any(kw in user_msg_lower for kw in ("book", "tome", "novel", "chapitre")):
                 extra_instructions += self._build_book_instructions()
-            if _legacy_office:
-                extra_instructions += self._build_office_files_instructions()
-            # Per-software office instructions are injected AFTER the mount
-            # loop (section 7) — gated on actual mount success — so the model
-            # never receives doctrine for tools that were refused by the
-            # fail-closed office-family gate.
 
             # Handle instructions (only if artifacts are enabled)
             branch_msgs_now = self.get_branch(user_msg.id)
@@ -5490,14 +5535,27 @@ class ChatMixin:
             extra_instructions += self._build_dynamic_effort_instructions()
 
         # Image Generation Instructions (only if image generation/editing is enabled AND TTI capability exists)
-        _has_tti = getattr(self.lollmsClient, 'tti', None) is not None or bool(getattr(self.lollmsClient, 'tti_model_profiles_registry', None))
-        if (enable_image_generation or enable_image_editing) and _has_tti and not orchestrator_persona:
+        # ── 🛡️ HARDENED TTI GATE (FAIL-CLOSED DOCTRINE) ──
+        # A non-empty tti_model_profiles_registry is NOT sufficient: the binding
+        # may have failed to initialize (client.tti is None) while profiles remain
+        # configured. Injecting image doctrine into context without a usable
+        # binding teaches the model to emit <generate_image>/<edit_image> tags
+        # that are guaranteed to fail at dispatch time. The gate therefore
+        # requires a LIVE binding with the required callable(s).
+        _tti_binding = getattr(self.lollmsClient, 'tti', None)
+        _has_tti = (
+            _tti_binding is not None
+            and callable(getattr(_tti_binding, 'generate_image', None))
+        )
+        _has_tti_edit = _has_tti and callable(getattr(_tti_binding, 'edit_image', None))
+        if (enable_image_generation or (enable_image_editing and _has_tti_edit)) and _has_tti and not orchestrator_persona:
             extra_instructions += self._build_image_generation_instructions()
             # ── 🖼️ IMAGE EDIT DOCTRINE (EDIT vs GENERATE DECISION) ──
             # Teaches the model WHEN to edit an existing image instead of
             # generating a fresh one, and HOW to pass the source reference
             # plus explicit dimensions for size/aspect-ratio requests.
-            if enable_image_editing:
+            # Only injected when the binding actually supports edit_image.
+            if enable_image_editing and _has_tti_edit:
                 extra_instructions += (
                     "\n=== IMAGE EDITING PROTOCOL (EDIT vs GENERATE — CRITICAL) ===\n"
                     "1. **DECISION RULE**: When the user references an EXISTING image (a filename, an "
@@ -9626,7 +9684,14 @@ class ChatMixin:
             except Exception as dump_err:
                 ASCIIColors.warning(f"[ChatMixin] Failed to write debug context dump: {dump_err}")
 
-        _has_tti = getattr(self.lollmsClient, 'tti', None) is not None or bool(getattr(self.lollmsClient, 'tti_model_profiles_registry', None))
+        # ── 🛡️ HARDENED TTI GATE (RETURN VALUE) ──
+        # Report capability only when a live, callable binding exists —
+        # mirrors the fail-closed doctrine used for context injection.
+        _tti_binding_final = getattr(self.lollmsClient, 'tti', None)
+        _has_tti = (
+            _tti_binding_final is not None
+            and callable(getattr(_tti_binding_final, 'generate_image', None))
+        )
 
         all_turn_artefacts = []
         seen_art_titles = set()

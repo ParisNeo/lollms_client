@@ -1824,6 +1824,137 @@ class LollmsClient():
             raise RuntimeError("TTI binding not initialized and no profiles available for lazy mounting.")
         return self.tti.edit_image(*args, **kwargs)
 
+    # --- 🎵 Music / Speech / Video Generation & Editing Facade (chat-mixin tags) ---
+
+    def ensure_tts(self) -> bool:
+        """
+        Ensures the TTS binding is instantiated. If None and profiles exist,
+        attempts lazy mounting using the default or first available profile.
+        Returns True if tts is ready after this call.
+        """
+        if self.tts is not None:
+            return True
+        if not self.tts_model_profiles_registry:
+            return False
+
+        default_alias = next(
+            (a for a, p in self.tts_model_profiles_registry.items() if p.is_default),
+            next(iter(self.tts_model_profiles_registry))
+        )
+        ASCIIColors.warning(
+            f"[LollmsClient] TTS binding is None. Attempting lazy mount of '{default_alias}'..."
+        )
+        success = self.switch_tts(default_alias)
+        if success:
+            ASCIIColors.success(f"[LollmsClient] Lazy TTS mount succeeded for '{default_alias}'.")
+        else:
+            err = self._binding_init_errors.get("tts", "Unknown error")
+            ASCIIColors.error(f"[LollmsClient] Lazy TTS mount failed for '{default_alias}': {err}")
+        return success
+
+    def ensure_ttm(self) -> bool:
+        """
+        Ensures the TTM binding is instantiated. If None and profiles exist,
+        attempts lazy mounting using the default or first available profile.
+        Returns True if ttm is ready after this call.
+        """
+        if self.ttm is not None:
+            return True
+        if not self.ttm_model_profiles_registry:
+            return False
+
+        default_alias = next(
+            (a for a, p in self.ttm_model_profiles_registry.items() if p.is_default),
+            next(iter(self.ttm_model_profiles_registry))
+        )
+        ASCIIColors.warning(
+            f"[LollmsClient] TTM binding is None. Attempting lazy mount of '{default_alias}'..."
+        )
+        success = self.switch_ttm(default_alias)
+        if success:
+            ASCIIColors.success(f"[LollmsClient] Lazy TTM mount succeeded for '{default_alias}'.")
+        else:
+            err = self._binding_init_errors.get("ttm", "Unknown error")
+            ASCIIColors.error(f"[LollmsClient] Lazy TTM mount failed for '{default_alias}': {err}")
+        return success
+
+    def ensure_ttv(self) -> bool:
+        """
+        Ensures the TTV binding is instantiated. If None and profiles exist,
+        attempts lazy mounting using the default or first available profile.
+        Returns True if ttv is ready after this call.
+        """
+        if self.ttv is not None:
+            return True
+        if not self.ttv_model_profiles_registry:
+            return False
+
+        default_alias = next(
+            (a for a, p in self.ttv_model_profiles_registry.items() if p.is_default),
+            next(iter(self.ttv_model_profiles_registry))
+        )
+        ASCIIColors.warning(
+            f"[LollmsClient] TTV binding is None. Attempting lazy mount of '{default_alias}'..."
+        )
+        success = self.switch_ttv(default_alias)
+        if success:
+            ASCIIColors.success(f"[LollmsClient] Lazy TTV mount succeeded for '{default_alias}'.")
+        else:
+            err = self._binding_init_errors.get("ttv", "Unknown error")
+            ASCIIColors.error(f"[LollmsClient] Lazy TTV mount failed for '{default_alias}': {err}")
+        return success
+
+    def generate_music(self, *args, **kwargs):
+        self._cooperative_unload_except("ttm")
+        if not self.ensure_ttm():
+            raise RuntimeError("TTM binding not initialized and no profiles available for lazy mounting.")
+        return self.ttm.generate_music(*args, **kwargs)
+
+    def edit_music(self, *args, **kwargs):
+        self._cooperative_unload_except("ttm")
+        if not self.ensure_ttm():
+            raise RuntimeError("TTM binding not initialized and no profiles available for lazy mounting.")
+        edit_fn = getattr(self.ttm, "edit_music", None)
+        if not callable(edit_fn):
+            raise RuntimeError(
+                "The active TTM binding does not support music editing (no 'edit_music' method)."
+            )
+        return edit_fn(*args, **kwargs)
+
+    def generate_speech(self, *args, **kwargs):
+        self._cooperative_unload_except("tts")
+        if not self.ensure_tts():
+            raise RuntimeError("TTS binding not initialized and no profiles available for lazy mounting.")
+        return self.tts.generate_audio(*args, **kwargs)
+
+    def edit_speech(self, *args, **kwargs):
+        self._cooperative_unload_except("tts")
+        if not self.ensure_tts():
+            raise RuntimeError("TTS binding not initialized and no profiles available for lazy mounting.")
+        edit_fn = getattr(self.tts, "edit_audio", None) or getattr(self.tts, "edit_speech", None)
+        if not callable(edit_fn):
+            raise RuntimeError(
+                "The active TTS binding does not support speech editing (no 'edit_audio'/'edit_speech' method)."
+            )
+        return edit_fn(*args, **kwargs)
+
+    def generate_video(self, *args, **kwargs):
+        self._cooperative_unload_except("ttv")
+        if not self.ensure_ttv():
+            raise RuntimeError("TTV binding not initialized and no profiles available for lazy mounting.")
+        return self.ttv.generate_video(*args, **kwargs)
+
+    def edit_video(self, *args, **kwargs):
+        self._cooperative_unload_except("ttv")
+        if not self.ensure_ttv():
+            raise RuntimeError("TTV binding not initialized and no profiles available for lazy mounting.")
+        edit_fn = getattr(self.ttv, "edit_video", None)
+        if not callable(edit_fn):
+            raise RuntimeError(
+                "The active TTV binding does not support video editing (no 'edit_video' method)."
+            )
+        return edit_fn(*args, **kwargs)
+
     def generate_omni(self, *args, **kwargs):
         """
         Unified TTI/Omni generation. Returns a TTIGenerationResult
@@ -1948,6 +2079,10 @@ class LollmsClient():
         self._cooperative_unload_except("tts")
         if self.tts: return self.tts.generate_audio(*args, **kwargs)
         raise RuntimeError("TTS binding not initialized.")
+
+    def generate_speech(self, *args, **kwargs):
+        """Alias for generate_audio (speech synthesis via the active TTS binding)."""
+        return self.generate_audio(*args, **kwargs)
 
     def transcribe_audio(self, *args, **kwargs):
         self._cooperative_unload_except("stt")
