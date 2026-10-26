@@ -25,9 +25,9 @@ if TYPE_CHECKING:
 
 class PromptMixin:
     """
-    Builds artifact / image-generation / inline-widget / form instructions for the
-    system prompt and post-processes the LLM response to apply any XML action
-    tags it contains.
+    Builds artifact / image-generation / music / speech / video / inline-widget /
+    form instructions for the system prompt and post-processes the LLM response
+    to apply any XML action tags it contains.
     """
 
     # ─────────────────────────────────────── instruction builders ────────────
@@ -674,12 +674,25 @@ RULES:
         ]
         return "\n".join(lines)
 
+    def _media_capability_probe(self, kind: str) -> bool:
+        """
+        Defensive capability probe for a media binding (tti/ttm/tts/ttv).
+
+        Returns True when the binding is instantiated OR at least one model
+        profile is registered (lazily mountable). Never raises — a host
+        without `lollmsClient` is simply not capable.
+        """
+        client = getattr(self, 'lollmsClient', None)
+        if client is None:
+            return False
+        if getattr(client, kind, None) is not None:
+            return True
+        registry = getattr(client, f"{kind}_model_profiles_registry", None)
+        return bool(registry)
+
     def _build_image_generation_instructions(self) -> str:
-        tti = getattr(self.lollmsClient, 'tti', None)
-        if tti is None:
-            tti_registry = getattr(self.lollmsClient, 'tti_model_profiles_registry', None)
-            if not tti_registry:
-                return ""
+        if not self._media_capability_probe('tti'):
+            return ""
         lines = [
             "",
             "=== IMAGE GENERATION / EDITING ===",
@@ -764,7 +777,189 @@ RULES:
             "=== END IMAGE INSTRUCTIONS ===",
             "",
         ]
+        image_block = "\n".join(lines)
+
+        # ── 🎵 MEDIA DOCTRINE TAIL (music / speech / video) ──
+        # The host assembly invokes this method as the single media-doctrine
+        # seam. Each sibling builder self-gates on its own capability probe,
+        # so the media tags are advertised ONLY when a ttm/tts/ttv profile is
+        # active (or lazily mountable). No recursion: none of the siblings
+        # call back into this method.
+        media_tail = (
+            self._build_music_generation_instructions()
+            + self._build_speech_generation_instructions()
+            + self._build_video_generation_instructions()
+        )
+        return image_block + media_tail
+
+    def _build_music_generation_instructions(self) -> str:
+        """Music (TTM) doctrine — advertised only when a TTM profile is active."""
+        if not self._media_capability_probe('ttm'):
+            return ""
+        lines = [
+            "",
+            "=== MUSIC GENERATION / EDITING (TTM) ===",
+            "You are equipped with a Text-to-Music (TTM) engine to generate and edit music on-the-fly.",
+            "",
+            "🚨 MUSIC IS TAGS, NOT TOOLS (CRITICAL):",
+            "- Music generation and editing are performed EXCLUSIVELY with the `<generate_music>` and",
+            "  `<edit_music>` XML tags. There is NO tool named 'generate_music', 'edit_music',",
+            "  'remix_music', or any similar name in the tool registry.",
+            "- NEVER wrap a music operation in a `<tool>` JSON call — it will be blocked as a phantom",
+            "  tool. Remixing, restyling, looping, or modifying ANY existing track = `<edit_music>` tag.",
+            "- If the user references an existing music file (e.g. 'make this track faster'), the",
+            "  correct action is ALWAYS an `<edit_music>` tag with `sources`.",
+            "",
+            "🚨 MANDATORY PROTOCOL (READ CAREFULLY):",
+            "- If the user asks you to compose, generate, create, or make music, a song, a beat,",
+            "  a jingle, or a soundtrack (in any language), you MUST output the `<generate_music>`",
+            "  XML tag. DO NOT write prose descriptions — output the tag directly.",
+            "- Translate the user's request into a highly detailed English prompt describing genre,",
+            "  instruments, tempo, mood, and structure.",
+            "",
+            "Syntax for creating a new track:",
+            '<generate_music name="chill_beat.mp3" duration="30">',
+            "  Lofi hip hop, relaxed, 90bpm, mellow piano chords, soft vinyl crackle,",
+            "  warm bassline, jazzy hi-hats...",
+            "</generate_music>",
+            "",
+            "Syntax for editing an existing track:",
+            '<edit_music name="remix.mp3" sources="chill_beat.mp3">',
+            "  Detailed English instructions describing the edits (tempo change,",
+            "  instrument swap, section extension, style transfer)...",
+            "</edit_music>",
+            "",
+            "FILE NAMING:",
+            "- `name` (REQUIRED): the output file name with extension `.mp3` or `.wav`.",
+            "- The tag body is the generation prompt (or editing instructions for edit tags).",
+            "",
+            "DURATION CONTROL:",
+            "- `duration` (OPTIONAL, seconds) is an explicit tag attribute. Describing the",
+            "  length inside the prompt text does NOTHING — set the attribute.",
+            "",
+            "MULTI-SOURCE RULES:",
+            "- `sources` (comma-separated workspace paths) is REQUIRED for edit tags; each",
+            "  entry must be an existing workspace audio file.",
+            "- The prompt must describe the role of EACH source so the engine knows how to",
+            "  combine them.",
+            "- The output is saved as a NEW file — the source is never overwritten.",
+            "=== END MUSIC INSTRUCTIONS ===",
+            "",
+        ]
         return "\n".join(lines)
+
+    def _build_speech_generation_instructions(self) -> str:
+        """Speech (TTS) doctrine — advertised only when a TTS profile is active."""
+        if not self._media_capability_probe('tts'):
+            return ""
+        lines = [
+            "",
+            "=== SPEECH GENERATION / EDITING (TTS) ===",
+            "You are equipped with a Text-to-Speech (TTS) engine to synthesize and edit speech on-the-fly.",
+            "",
+            "🚨 SPEECH IS TAGS, NOT TOOLS (CRITICAL):",
+            "- Speech synthesis and editing are performed EXCLUSIVELY with the `<generate_speech>` and",
+            "  `<edit_speech>` XML tags. There is NO tool named 'generate_speech', 'edit_speech',",
+            "  'text_to_speech', or any similar name in the tool registry.",
+            "- NEVER wrap a speech operation in a `<tool>` JSON call — it will be blocked as a phantom",
+            "  tool. Re-voicing, restyling, or modifying ANY existing audio clip = `<edit_speech>` tag.",
+            "",
+            "🚨 MANDATORY PROTOCOL (READ CAREFULLY):",
+            "- If the user asks you to speak, read aloud, narrate, or voice any text (in any",
+            "  language), you MUST output the `<generate_speech>` XML tag. DO NOT write prose",
+            "  descriptions — output the tag directly.",
+            "- The tag body is the exact text to speak.",
+            "",
+            "Syntax for synthesizing speech:",
+            '<generate_speech name="greeting.wav" voice="default">',
+            "  Hello and welcome to this presentation!",
+            "</generate_speech>",
+            "",
+            "Syntax for editing an existing audio clip:",
+            '<edit_speech name="fixed.wav" sources="greeting.wav">',
+            "  Detailed English instructions describing the edits (change voice, adjust",
+            "  pacing, remove pauses, change language)...",
+            "</edit_speech>",
+            "",
+            "FILE NAMING:",
+            "- `name` (REQUIRED): the output file name with extension `.wav` (or `.mp3`).",
+            "- The tag body is the text to speak (or editing instructions for edit tags).",
+            "",
+            "OPTIONAL ATTRIBUTES (pass-through doctrine):",
+            "- `voice`, `language`, `style`, `format` are OPTIONAL attributes passed to the",
+            "  engine ONLY when provided. Never invent values — omit them when the user",
+            "  did not specify.",
+            "=== END SPEECH INSTRUCTIONS ===",
+            "",
+        ]
+        return "\n".join(lines)
+
+    def _build_video_generation_instructions(self) -> str:
+        """Video (TTV) doctrine — advertised only when a TTV profile is active."""
+        if not self._media_capability_probe('ttv'):
+            return ""
+        lines = [
+            "",
+            "=== VIDEO GENERATION / EDITING (TTV) ===",
+            "You are equipped with a Text-to-Video (TTV) engine to generate and edit video clips on-the-fly.",
+            "",
+            "🚨 VIDEO IS TAGS, NOT TOOLS (CRITICAL):",
+            "- Video generation and editing are performed EXCLUSIVELY with the `<generate_video>` and",
+            "  `<edit_video>` XML tags. There is NO tool named 'generate_video', 'edit_video',",
+            "  'animate_video', or any similar name in the tool registry.",
+            "- NEVER wrap a video operation in a `<tool>` JSON call — it will be blocked as a phantom",
+            "  tool. Trimming, restyling, or modifying ANY existing clip = `<edit_video>` tag.",
+            "",
+            "🚨 MANDATORY PROTOCOL (READ CAREFULLY):",
+            "- If the user asks you to generate, create, animate, or make a video or clip (in",
+            "  any language), you MUST output the `<generate_video>` XML tag. DO NOT write",
+            "  prose descriptions — output the tag directly.",
+            "- Translate the user's request into a highly detailed English prompt describing",
+            "  subject, camera movement, lighting, and style.",
+            "",
+            "Syntax for creating a new clip:",
+            '<generate_video name="sunset_clip.mp4" duration="5">',
+            "  A timelapse of a sunset over the ocean, warm golden light, gentle waves,",
+            "  cinematic wide shot, slow camera pan...",
+            "</generate_video>",
+            "",
+            "Syntax for editing an existing clip:",
+            '<edit_video name="edited_clip.mp4" sources="sunset_clip.mp4">',
+            "  Detailed English instructions describing the edits (trim, restyle,",
+            "  change pacing, add motion)...",
+            "</edit_video>",
+            "",
+            "FILE NAMING:",
+            "- `name` (REQUIRED): the output file name with extension `.mp4` or `.webm`.",
+            "- The tag body is the generation prompt (or editing instructions for edit tags).",
+            "",
+            "DURATION CONTROL (MANDATORY FOR LENGTH REQUESTS):",
+            "- `duration` (OPTIONAL, seconds) is an explicit tag attribute. Describing the",
+            "  length inside the prompt text does NOTHING — set the attribute.",
+            "",
+            "MULTI-SOURCE RULES:",
+            "- `sources` (comma-separated workspace paths) is REQUIRED for edit tags; each",
+            "  entry must be an existing workspace video file.",
+            "- The output is saved as a NEW file — the source is never overwritten.",
+            "=== END VIDEO INSTRUCTIONS ===",
+            "",
+        ]
+        return "\n".join(lines)
+
+    def _build_media_generation_instructions(self) -> str:
+        """
+        Orchestrator: full media doctrine (image + music + speech + video).
+
+        Each block self-gates on its own capability probe; returns "" when no
+        media capability exists at all. Safe alias of the public image seam —
+        neither path recurses.
+        """
+        return (
+            self._build_image_generation_instructions()
+            + self._build_music_generation_instructions()
+            + self._build_speech_generation_instructions()
+            + self._build_video_generation_instructions()
+        )
 
     def _build_inline_widget_instructions(self) -> str:
         # Retrieve the custom widget CSS or use a modern, sober dark-mode default

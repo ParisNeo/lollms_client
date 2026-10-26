@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-26 01:10]
+
+- feat(client): add new TTI functionality and enhance discussion chat/prompt mixins
+
 ## [2026-10-26 02:34]
 
 - `fix mcp binding imports and ensure proper client session handling with updated package versions and HTTP client refactoring`
