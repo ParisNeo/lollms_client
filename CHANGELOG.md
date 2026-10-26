@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-26 21:47]
+
+- fix: update lollms client version to v1.21.1
+
 ## [2026-10-26 21:45]
 
 - `Fix: update doc guides & improve simple chat/image generation examples; enhance core LLM client config and TTV binding for better usability.`
