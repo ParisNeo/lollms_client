@@ -12,21 +12,29 @@ from lollms_client.lollms_tools_binding import LollmsToolBinding
 from ascii_colors import ASCIIColors, trace_exception
 
 try:
-    pm.ensure_packages(["mcp", "httpx", "pywintypes"])
+    pm.ensure_packages(["mcp==2.3.0", "httpx==0.28.1"])
+
     from mcp import ClientSession, StdioServerParameters, types
     from mcp.client.stdio import stdio_client
-    from mcp.client.streamable_http import streamablehttp_client
+    from mcp.client.streamable_http import streamable_http_client
     import httpx
+    import httpx2
+
     MCP_LIBRARY_AVAILABLE = True
+
 except ImportError as e:
-    ASCIIColors.error(f"MCPBinding: Critical MCP library components could not be imported: {e}")
+    trace_exception(e)
+    ASCIIColors.error(
+        f"MCPBinding: Critical MCP library components could not be imported: {e}"
+    )
     MCP_LIBRARY_AVAILABLE = False
     ClientSession = None
     StdioServerParameters = None
     stdio_client = None
-    streamablehttp_client = None
+    streamable_http_client = None
     types = None
     httpx = None
+    httpx2 = None
 
 BindingName = "MCPBinding"
 TOOL_NAME_SEPARATOR = "::"
@@ -282,11 +290,29 @@ class MCPBinding(LollmsToolBinding):
                 read_stream, write_stream = await exit_stack.enter_async_context(stdio_client(server_params))
             elif config["type"] == "http":
                 auth_headers = self._prepare_http_headers(alias)
-                final_url = await self._resolve_redirects(config["url"], auth_headers)
-                client_streams = await exit_stack.enter_async_context(
-                    streamablehttp_client(url=final_url, headers=auth_headers)
+                final_url = await self._resolve_redirects(
+                    config["url"],
+                    auth_headers,
                 )
-                read_stream, write_stream, _ = client_streams
+
+                http_client = httpx2.AsyncClient(
+                    headers=auth_headers,
+                    follow_redirects=True,
+                    timeout=httpx2.Timeout(
+                        30.0,
+                        connect=10.0,
+                        read=300.0,
+                    ),
+                )
+
+                await exit_stack.enter_async_context(http_client)
+
+                read_stream, write_stream = await exit_stack.enter_async_context(
+                    streamable_http_client(
+                        url=final_url,
+                        http_client=http_client,
+                    )
+                )
             else:
                 raise ValueError(f"Unsupported server type: {config['type']}")
 

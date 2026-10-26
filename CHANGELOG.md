@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-26 02:34]
+
+- `fix mcp binding imports and ensure proper client session handling with updated package versions and HTTP client refactoring`
+
 ## [2026-10-25 23:27]
 
 - feat(lollms_discussion): add `enable_skills` parameter to chat and prompt methods
