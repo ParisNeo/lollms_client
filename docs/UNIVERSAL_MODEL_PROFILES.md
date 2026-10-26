@@ -1,6 +1,6 @@
 # Universal Model Profiles — The Two-Tier Architecture
 
-> **Authoritative guide** for creating, configuring, persisting, and switching model profiles across **all eight modalities** of `LollmsClient`: LLM (text generation), TTI (text-to-image), TTS (text-to-speech), STT (speech-to-text), TTV (text-to-video), TTM (text-to-music), Connection, and RAG.
+> **Authoritative guide** for creating, configuring, persisting, and switching model profiles across **all nine modalities** of `LollmsClient`: LLM (text generation), TTI (text-to-image), TTS (text-to-speech), STT (speech-to-text), TTV (text-to-video), TTM (text-to-music), Connection, RAG, and Tools.
 >
 > **Applies to**: `lollms_client` (core profiles machinery in `src/lollms_client/lollms_core.py`).
 
@@ -15,7 +15,7 @@
 5. [Switching Models & Modalities](#5-switching-models--modalities)
 6. [The Instantiation Pipeline](#6-the-instantiation-pipeline)
 7. [Default Resolution & the Single-Default Invariant](#7-default-resolution--the-single-default-invariant)
-8. [Per-Modality Guide (LLM, TTI, TTS, TTM, STT, TTV, Connection, RAG)](#8-per-modality-guide)
+8. [Per-Modality Guide (LLM, TTI, TTS, TTM, STT, TTV, Connection, RAG, Tools)](#8-per-modality-guide)
 9. [Persistence Formats](#9-persistence-formats)
    - 9.4 [Discovering Available Bindings](#94-discovering-available-bindings)
    - 9.5 [Inspecting a Binding's Configuration Parameters](#95-inspecting-a-bindings-configuration-parameters)
@@ -28,7 +28,7 @@
 
 ## 1. Overview — Why Two Tiers?
 
-`LollmsClient` manages **eight generation/perception modalities** through a single, uniform profile system. Before the two-tier design, each modality required a binding *name* plus a *config* dict passed directly to the constructor — one model per modality, no way to declare several, no lazy loading.
+`LollmsClient` manages **nine generation/perception modalities** through a single, uniform profile system. Before the two-tier design, each modality required a binding *name* plus a *config* dict passed directly to the constructor — one model per modality, no way to declare several, no lazy loading.
 
 The **Universal Two-Tier Profile Architecture** solves this with two declarative layers:
 
@@ -62,7 +62,7 @@ The **Universal Two-Tier Profile Architecture** solves this with two declarative
 - **Lazy** — only the model profile marked `is_default=True` is instantiated at startup. Every other model is instantiated **on first switch**, preserving RAM and VRAM.
 - **Backward compatible** — legacy `llm_binding_name` / `llm_binding_config` (and `extra_llms`) are auto-registered as `"master"` profiles.
 
-### The Eight Modalities
+### The Nine Modalities
 
 | Modality | Direction | Client attribute | Helper methods |
 |---|---|---|---|
@@ -74,8 +74,7 @@ The **Universal Two-Tier Profile Architecture** solves this with two declarative
 | `ttm` | text→music | `client.ttm` | `generate_music`, `generate_song`, `generate_song_from_lyrics` |
 | `connection` | outbound messaging | `client.connection` | `send_connection_message` (auto-switches by `channel_alias`) |
 | `rag` | retrieval / knowledge graph | `client.rag` | `query_rag`, `add_document_to_rag`, `add_text_to_rag`, `query_sparql` (auto-switch by `store_alias`) |
-
-> **Tools (MCP/LCP) are the exception**: `tools_binding_name` / `tools_binding_config` remain direct constructor parameters — the tools binding is intentionally *not* part of the two-tier profile system yet (see `_update_binding` bypass in `update_tools_binding`).
+| `tools` | tool provisioning | `client.tools` | `list_tools`, `call_tool`, `switch_tools` |
 
 ### Common Misconceptions (Verified Facts)
 
@@ -165,7 +164,7 @@ class LollmsModelProfile:
 
 ## 3. Creating Profiles — Constructor Kwargs & Formats
 
-### 3.1 The Sixteen Profile Kwargs
+### 3.1 The Eighteen Profile Kwargs
 
 The constructor accepts one binding-profiles kwarg and one model-profiles kwarg **per modality**:
 
@@ -179,6 +178,7 @@ The constructor accepts one binding-profiles kwarg and one model-profiles kwarg 
 | TTM | `ttm_binding_profiles` | `ttm_model_profiles` |
 | Connection | `connection_binding_profiles` | `connection_model_profiles` |
 | RAG | `rag_binding_profiles` | `rag_model_profiles` |
+| Tools | `tools_binding_profiles` | `tools_model_profiles` |
 
 Each kwarg accepts:
 
@@ -287,6 +287,7 @@ After construction, the client holds **two registries per modality** — declara
 | stt | `stt_binding_profiles_registry` | `stt_model_profiles_registry` | `stts` | `_active_stt_alias` |
 | ttv | `ttv_binding_profiles_registry` | `ttv_model_profiles_registry` | `ttvs` | `_active_ttv_alias` |
 | ttm | `ttm_binding_profiles_registry` | `ttm_model_profiles_registry` | `ttms` | `_active_ttm_alias` |
+| tools | `tools_binding_profiles_registry` | `tools_model_profiles_registry` | `toolss` | `_active_tools_alias` |
 | connection | `connection_binding_profiles_registry` | `connection_model_profiles_registry` | `connections` | `_active_connection_alias` |
 | rag | `rag_binding_profiles_registry` | `rag_model_profiles_registry` | `rags` | `_active_rag_alias` |
 
@@ -317,6 +318,7 @@ client.switch_ttv(alias, callback=None)         # text→video
 client.switch_ttm(alias, callback=None)         # text→music
 client.switch_connection(alias, callback=None)  # outbound channel
 client.switch_rag(alias, callback=None)         # RAG store
+client.switch_tools(alias, callback=None)       # tools/toolsets
 ```
 
 All delegate to the generic engine:
@@ -350,6 +352,7 @@ For backward compatibility, `mount_*` methods simply delegate:
 | `mount_ttm(alias)` | `switch_ttm(alias)` |
 | `mount_connection(alias)` | `switch_connection(alias)` |
 | `mount_rag(alias)` | `switch_rag(alias)` |
+| `mount_tools(alias)` | `switch_tools(alias)` |
 
 > The names say "mount" but the semantics are identical to switching — they exist purely so older code keeps working.
 
@@ -364,11 +367,10 @@ client.update_ttv_binding(binding_name, config=None)
 client.update_ttm_binding(binding_name, config=None)
 client.update_connection_binding(binding_name, config=None)
 client.update_rag_binding(binding_name, config=None)
+client.update_tools_binding(binding_name, config=None)
 ```
 
 `_update_binding` **recreates the `"master"` binding profile** with the given name/config, ensures a `"master"` model profile points at it, evicts the cached instance, and switches to it. Use this for runtime re-pointing of a single-server setup (e.g. a GUI settings dialog).
-
-Exception: `update_tools_binding(binding_name, config)` bypasses profiles entirely and directly re-creates the tools binding (tools are not yet two-tier).
 
 ---
 
@@ -730,6 +732,42 @@ client.query_sparql("SELECT ?s WHERE { ?s ?p ?o } LIMIT 10", store_alias="archiv
 
 > RAG requires the optional `safe_store` dependency; if unavailable, the RAG manager is `None` and RAG profiles are inert (graceful degradation).
 
+### 8.9 Tools Modality
+
+The `tools` modality represents toolset providers such as MCP servers or LCP tool bundles.  
+Here the “model profile” is semantically a **toolset name**, not a neural model.
+
+| Field | Interpretation for Tools |
+|---|---|
+| `binding_name` | `"mcp"`, `"lcp"`, etc. |
+| `binding_config` | Connection parameters (host, port, api_key, transport, etc.) |
+| `model_name` | Toolset identifier/name (e.g., `"filesystem"`, `"web-search"`) |
+| `is_default` | Toolset activated by default at startup |
+
+Example:
+
+```python
+client = LollmsClient(
+    tools_binding_profiles={
+        "mcp_main": {
+            "binding_name": "mcp",
+            "binding_config": {"host": "127.0.0.1", "port": 12345},
+        },
+    },
+    tools_model_profiles={
+        "web-tools": {
+            "binding_profile_name": "mcp_main",
+            "model_name": "web-search",
+            "is_default": True,
+        },
+    },
+)
+client.switch_tools("web-tools")
+tools = client.tools.list_tools()
+```
+
+This enables lazy loading of toolsets and consistent switching APIs across all modalities.
+
 ---
 
 ## 9. Persistence Formats
@@ -755,7 +793,7 @@ LLM_PROFILES_<ALIAS>_FORCED_CONTEXT_SIZE
 LLM_PROFILES_<ALIAS>_ROUTING_<KEY>            # flattened routing_config entries
 ```
 
-The same pattern repeats with `TTS_`, `TTI_`, `STT_`, `TTV_`, `TTM_`, `CONNECTION_`, `RAG_` prefixes.
+The same pattern repeats with `TTS_`, `TTI_`, `STT_`, `TTV_`, `TTM_`, `CONNECTION_`, `RAG_`, `TOOLS_` prefixes.
 
 Example `.env` lines:
 
@@ -794,6 +832,19 @@ llm:
       binding_profile_name: local
       model_name: qwen3-vl-8b.gguf
       vision_enabled: true
+
+tools:
+  bindings:
+    mcp_main:
+      binding_name: mcp
+      binding_config:
+        host: 127.0.0.1
+        port: 12345
+  profiles:
+    web-tools:
+      binding_profile_name: mcp_main
+      model_name: web-search
+      is_default: true
 
 ttm:
   bindings:
@@ -1180,6 +1231,7 @@ class LollmsModelProfile:
 | ttm | `ttm_binding_profiles` | `ttm_model_profiles` |
 | connection | `connection_binding_profiles` | `connection_model_profiles` |
 | rag | `rag_binding_profiles` | `rag_model_profiles` |
+| tools | `tools_binding_profiles` | `tools_model_profiles` |
 
 ### Registries, caches, aliases
 
@@ -1191,6 +1243,7 @@ class LollmsModelProfile:
 | stt | `stt_binding_profiles_registry` | `stt_model_profiles_registry` | `stts` | `_active_stt_alias` | `switch_stt` |
 | ttv | `ttv_binding_profiles_registry` | `ttv_model_profiles_registry` | `ttvs` | `_active_ttv_alias` | `switch_ttv` |
 | ttm | `ttm_binding_profiles_registry` | `ttm_model_profiles_registry` | `ttms` | `_active_ttm_alias` | `switch_ttm` |
+| tools | `tools_binding_profiles_registry` | `tools_model_profiles_registry` | `toolss` | `_active_tools_alias` | `switch_tools` |
 | connection | `connection_binding_profiles_registry` | `connection_model_profiles_registry` | `connections` | `_active_connection_alias` | `switch_connection` |
 | rag | `rag_binding_profiles_registry` | `rag_model_profiles_registry` | `rags` | `_active_rag_alias` | `switch_rag` |
 

@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-26 21:45]
+
+- `Fix: update doc guides & improve simple chat/image generation examples; enhance core LLM client config and TTV binding for better usability.`
+
 ## [2026-10-26 16:28]
 
 - docs(lcp): add LCP architecture documentation suite

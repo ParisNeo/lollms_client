@@ -6,7 +6,7 @@ from ascii_colors import ASCIIColors
 from pathlib import Path
 
 # Initialize client from environment/config
-lc: LollmsClient = get_client_from_env()
+lc: LollmsClient = get_client_from_env(create_tti=True)
 # Create discussion
 images_path = Path(__file__).parent/"workspaces"
 images_path.mkdir(parents=True, exist_ok=True)

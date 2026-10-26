@@ -1,0 +1,54 @@
+title: "Novita AI TTV"
+author: "ParisNeo"
+version: 0.1.0
+binding_name: "novita_ai_ttv"
+description: |
+  Cloud Text-to-Video and Image-to-Video generation using the Novita AI async API.
+  Provides high-speed inference across state-of-the-art open-weights and proprietary 
+  diffusion video models including Wan 2.1, Kling, Hunyuan Video, and PixVerse.
+  Tasks are queued remotely, polled with automatic progress reporting, and the 
+  resulting MP4 files are downloaded directly into your LoLLMs workspace.
+
+global_input_parameters:
+  - {name: novita_api_key, type: str, default: "", description: "Novita AI API Key (falls back to NOVITA_API_KEY env var).", is_secret: true}
+  - {name: base_url, type: str, default: "https://api.novita.ai/v3/async", description: "Novita AI async API base endpoint."}
+  - {name: output_folder, type: str, default: "./data/ttv_outputs/novita_ai", description: "Directory where downloaded videos are saved."}
+  - {name: poll_interval_s, type: int, default: 3, description: "Polling check interval in seconds."}
+  - {name: timeout_s, type: int, default: 600, description: "Abort and fail task after this many seconds."}
+
+model_input_parameters:
+  - {name: model, type: str, default: "wan2.1-t2v", description: "Model name: wan2.1-t2v | kling-v3.0-std-t2v | hunyuan-video-fast | pixverse-v4.5-t2v."}
+  - {name: aspect_ratio, type: str, default: "16:9", description: "Video aspect ratio: 16:9 | 9:16 | 1:1."}
+  - {name: duration, type: int, default: 5, description: "Video duration in seconds (model dependent: 3, 5, or 10)."}
+  - {name: negative_prompt, type: str, default: "blurry, low quality, distorted, artifacts", description: "Negative prompt to avoid specific artifacts."}
+  - {name: seed, type: int, default: -1, description: "Seed for reproducibility (-1 = random)."}
+  - {name: watermark, type: bool, default: false, description: "Whether to append Novita watermark (if applicable)."}
+
+commands:
+  - name: test_connection
+    title: Test API Connection and Balance
+    description: "Validates the Novita AI API key and checks account credit balance."
+    parameters:
+      - {name: api_key, type: str, description: "Optional override key to test; uses global key if empty.", mandatory: false}
+    output:
+      - {name: status, type: bool, description: "true if API key is valid"}
+      - {name: balance, type: float, description: "Available credit balance in USD"}
+      - {name: message, type: str, description: "Result status or error explanation"}
+
+  - name: list_models
+    title: List Supported Video Models
+    description: "Returns the supported Novita AI TTV model slugs and their default resolutions."
+    parameters: []
+    output:
+      - {name: models, type: list, description: "List of supported model identifiers and metadata"}
+
+  - name: check_task_status
+    title: Check Asynchronous Task Status
+    description: "Queries the Novita AI async API to inspect the progress or result of an ongoing task ID."
+    parameters:
+      - {name: task_id, type: str, description: "Novita task ID returned upon initial dispatch.", mandatory: true}
+    output:
+      - {name: status, type: str, description: "TASK_STATUS_QUEUED | TASK_STATUS_PROCESSING | TASK_STATUS_SUCCEED | TASK_STATUS_FAILED"}
+      - {name: progress, type: int, description: "Estimated completion percentage (0 - 100)"}
+      - {name: video_url, type: str, description: "Direct download URL if completed, empty otherwise"}
+      - {name: message, type: str, description: "Task diagnostic message or failure reason"}

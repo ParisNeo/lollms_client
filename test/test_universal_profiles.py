@@ -216,6 +216,76 @@ def test_invalid_modality_switch(mock_all_binding_managers):
     assert result is False
     assert client._active_tti_alias == "default_tti"
 
+def test_tools_profiles_and_switching(mock_all_binding_managers):
+    """Tests tools binding/model profile registration, lazy loading, switching, and eager instantiation."""
+    manager_patch = patch("lollms_client.lollms_core.LollmsTOOLBindingManager")
+    tools_mgr_mock = manager_patch.start()
+
+    def tools_create_side_effect(binding_name, **kwargs):
+        m = MagicMock()
+        m.binding_name = binding_name
+        m.model_name = kwargs.get("model_name")
+        return m
+
+    tools_mgr_mock.return_value.create_binding.side_effect = tools_create_side_effect
+
+    try:
+        client = LollmsClient(
+            tools_binding_profiles={
+                "mcp_main": LollmsBindingProfile(name="mcp_main", binding_name="mcp", binding_config={"host": "127.0.0.1"})
+            },
+            tools_model_profiles={
+                "default_tools": LollmsModelProfile(name="default_tools", binding_profile_name="mcp_main", model_name="web-tools", is_default=True),
+                "secondary_tools": LollmsModelProfile(name="secondary_tools", binding_profile_name="mcp_main", model_name="filesystem")
+            }
+        )
+
+        assert "default_tools" in client.toolss
+        assert "secondary_tools" not in client.toolss
+        assert client.tools is not None
+        assert client._active_tools_alias == "default_tools"
+
+        res = client.switch_tools("secondary_tools")
+        assert res is True
+        assert "secondary_tools" in client.toolss
+        assert client._active_tools_alias == "secondary_tools"
+        assert client.tools == client.toolss["secondary_tools"]
+
+        first_inst = client.toolss["secondary_tools"]
+        client.switch_tools("default_tools")
+        client.switch_tools("secondary_tools")
+        assert client.toolss["secondary_tools"] is first_inst
+    finally:
+        manager_patch.stop()
+
+def test_update_tools_binding_replaces_master(mock_all_binding_managers):
+    manager_patch = patch("lollms_client.lollms_core.LollmsTOOLBindingManager")
+    tools_mgr_mock = manager_patch.start()
+
+    def tools_create_side_effect(binding_name, **kwargs):
+        m = MagicMock()
+        m.binding_name = binding_name
+        m.model_name = kwargs.get("model_name")
+        return m
+
+    tools_mgr_mock.return_value.create_binding.side_effect = tools_create_side_effect
+
+    try:
+        client = LollmsClient(
+            tools_binding_name="mcp",
+            tools_binding_config={"model_name": "web-tools"}
+        )
+        assert "master" in client.tools_binding_profiles_registry
+        assert client._active_tools_alias == "master"
+
+        client.update_tools_binding("lcp", {"model_name": "filesystem"})
+        assert client.tools_binding_profiles_registry["master"].binding_name == "lcp"
+        assert client.tools_binding_profiles_registry["master"].binding_config["model_name"] == "filesystem"
+        assert "master" in client.toolss
+        assert client._active_tools_alias == "master"
+    finally:
+        manager_patch.stop()
+
 def test_update_tti_binding_replaces_master(mock_all_binding_managers):
     """Tests updating a modality binding replaces the master profile and reinstantiates."""
     client = LollmsClient(

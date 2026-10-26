@@ -118,31 +118,64 @@ class LollmsTTVBindingManager:
                     raise ImportError(f"Cannot find spec for {init_file}")
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
-                binding_class = getattr(module, module.BindingName)
+
+                binding_class_name = getattr(module, "BindingName", None)
+                if not binding_class_name:
+                    raise AttributeError(
+                        f"Module '{binding_name}' missing required 'BindingName' attribute. "
+                        f"Define BindingName = 'YourClassName' at module level."
+                    )
+
+                binding_class = getattr(module, binding_class_name, None)
+                if binding_class is None:
+                    raise AttributeError(
+                        f"Module '{binding_name}' defines BindingName='{binding_class_name}' "
+                        f"but class '{binding_class_name}' does not exist in the module."
+                    )
+                if not issubclass(binding_class, LollmsTTVBinding):
+                    raise TypeError(
+                        f"Binding class '{binding_class_name}' must inherit from LollmsTTVBinding"
+                    )
                 self.available_bindings[binding_name] = binding_class
             except Exception as e:
                 trace_exception(e)
-                print(f"Failed to load TTV binding {binding_name}: {str(e)}")
+                from ascii_colors import ASCIIColors
+                ASCIIColors.error(f"Failed to load TTV binding {binding_name}: {str(e)}")
+                raise RuntimeError(
+                    f"Failed to load TTV binding '{binding_name}': {e}"
+                ) from e
+        else:
+            raise FileNotFoundError(
+                f"TTV binding '{binding_name}' not found in {self.ttv_bindings_dir}"
+            )
 
     def create_binding(self,
                       binding_name: str,
                       **kwargs) -> Optional[LollmsTTVBinding]:
         """
         Create an instance of a specific TTV binding.
+
+        Raises on failure so callers (e.g. LollmsClient._instantiate_binding_from_profile)
+        can capture the precise error message for diagnostics.
         """
         if binding_name not in self.available_bindings:
             self._load_binding(binding_name)
 
         binding_class = self.available_bindings.get(binding_name)
-        if binding_class:
-            try:
-                return binding_class(**kwargs)
-            except Exception as e:
-                trace_exception(e)
-                from ascii_colors import ASCIIColors
-                ASCIIColors.error(f"Failed to instantiate TTV binding {binding_name}: {str(e)}")
-                return None
-        return None
+        if binding_class is None:
+            raise RuntimeError(
+                f"TTV binding '{binding_name}' was loaded but its class is not registered."
+            )
+
+        try:
+            return binding_class(**kwargs)
+        except Exception as e:
+            trace_exception(e)
+            from ascii_colors import ASCIIColors
+            ASCIIColors.error(f"Failed to instantiate TTV binding {binding_name}: {str(e)}")
+            raise RuntimeError(
+                f"Failed to instantiate TTV binding '{binding_name}': {e}"
+            ) from e
 
     def get_available_bindings(self) -> list[str]:
         """

@@ -15,7 +15,7 @@ personalities).
 ## What to expect
 
 - `True`: `tool_list_available_models`, `tool_switch_model` (and friends) are
-  registered in the tool registry.
+  registered in the tool registry. Supports all modalities including tools.
 - `False`: no model-switching tools; the model uses the active binding.
 
 ## Usage

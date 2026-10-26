@@ -610,9 +610,10 @@ def get_client_from_env(
         "ttm": create_ttm, "ttv": create_ttv, "connection": create_connection,
         "rag": create_rag,
     }
+    # Opt-in semantics: None means "do not create". Only True triggers loading.
     for mod, flag in auto_detect_map.items():
         if flag is None:
-            auto_detect_map[mod] = _is_modality_configured(mod, resolved_env)
+            auto_detect_map[mod] = False
 
     kwargs = {}
     binding_types = {

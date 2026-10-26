@@ -40,7 +40,8 @@ dependencies = [
     "pillow",
     "sqlalchemy",
     "jsonschema",
-    "pymupdf4llm==1.28.0"
+    "filelock",
+    "pymupdf4llm==1.28.0",
 ]
 
 [project.optional-dependencies]
