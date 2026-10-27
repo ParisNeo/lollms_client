@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-27 15:08]
+
+- fix: Update LollmsClient client library to version 1.21.3, removing unnecessary refs to deprecated interaction queue and removing redundant package imports.
+
 ## [2026-10-27 15:01]
 
 - feat: add .env file loading and attach unlocked images to user role

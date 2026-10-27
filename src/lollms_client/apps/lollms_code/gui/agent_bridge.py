@@ -1186,14 +1186,6 @@ def cancel_agent_turn(personality, client=None) -> bool:
             pass
         _CURRENT_INTERACTION_QUEUE = None
 
-    global _CURRENT_INTERACTION_QUEUE
-    if _CURRENT_INTERACTION_QUEUE is not None:
-        try:
-            _CURRENT_INTERACTION_QUEUE.put(None)
-        except Exception:
-            pass
-        _CURRENT_INTERACTION_QUEUE = None
-
     cancelled = False
     if personality is not None:
         if hasattr(personality, "_sub_agent_spawner") and personality._sub_agent_spawner:

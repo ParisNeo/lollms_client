@@ -10,10 +10,11 @@ import re
 import ssl
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+import pipmaster as pm
+pm.ensure_packages(["openai", "tiktoken"])
 
 import httpx
 import openai
-import pipmaster as pm
 import requests
 import tiktoken
 from ascii_colors import ASCIIColors, trace_exception
@@ -23,7 +24,6 @@ from lollms_client.lollms_llm_binding import LollmsLLMBinding
 from lollms_client.lollms_types import ELF_COMPLETION_FORMAT, MSG_TYPE
 from lollms_client.lollms_utilities import encode_image
 
-pm.ensure_packages(["openai", "tiktoken"])
 
 BindingName = "LollmsBinding"
 
