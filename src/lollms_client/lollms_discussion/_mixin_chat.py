@@ -877,6 +877,14 @@ class _StreamState:
         # the next round's vision context directly, without DB persistence.
         self.generated_image_pixels: List[Tuple[str, str]] = []
 
+        # ── 🖼️ UNLOCKED IMAGE PIXELS (USER-ROLE ATTACHMENT) ──
+        # (filename, base64) pairs for images unlocked via <unlock_file> this
+        # round. Per the USER-role-only media invariant, these pixels are
+        # attached to the LAST USER MESSAGE in virtual history — never to the
+        # system prompt. The system prompt receives only a textual index→
+        # filename annotation (see the unlock-continuation block in chat()).
+        self.unlocked_image_pixels: List[Tuple[str, str]] = []
+
         # ── ONE-ACTION-PER-TURN PROTOCOL ──
         # Ensures generation halts immediately after dispatching a single functional tag.
         self._action_dispatched = False
@@ -3876,10 +3884,16 @@ class _StreamState:
             )
         else:
             guidance = (
-                f"The image '{t_file}' is attached to your context as an ACTUAL image — its pixels are "
-                f"directly visible to you in this conversation. Do NOT unlock it again and do NOT call any tool "
-                f"to read it. Look at the image, answer the user's question about it, and finish with `<done/>`."
+                f"The image '{t_file}' is attached to the LAST USER MESSAGE of this conversation as an "
+                f"ACTUAL image — its pixels are directly visible to you. Do NOT unlock it again and do NOT "
+                f"call any tool to read it. Look at the image, answer the user's question about it, and "
+                f"finish with `<done/>`."
             )
+            # ── USER-ROLE ATTACHMENT (INVARIANT-COMPLIANT) ──
+            # Record the pixels for attachment to the last user message in
+            # virtual history. The system prompt gets only the textual
+            # index→filename annotation (built by the chat loop).
+            self.unlocked_image_pixels.append((t_file, images[-1]))
 
         self.context_unlock_requested = True
         self.image_unlock_guidance.append(guidance)
@@ -9361,6 +9375,43 @@ class ChatMixin:
                             + "\n</action_result>"
                         )
                     ))
+
+                    # ── 🖼️ USER-ROLE IMAGE ATTACHMENT (INVARIANT-COMPLIANT) ──
+                    # Unlocked image pixels attach to the LAST USER MESSAGE in
+                    # virtual history — never to the system prompt. The system
+                    # prompt receives only a textual index→filename annotation
+                    # (appended to current_system_prompt below), so the LLM can
+                    # map each attached image to its workspace file.
+                    unlocked_pixels = list(getattr(ss, "unlocked_image_pixels", None) or [])
+                    if unlocked_pixels:
+                        _existing_round_images = round_images if round_images is not None else []
+                        _seen_b64 = {
+                            img if isinstance(img, str) else img.get("image_url", {}).get("url", "")
+                            for img in _existing_round_images
+                        }
+                        for _img_name, _img_b64 in unlocked_pixels:
+                            if _img_b64 and _img_b64 not in _seen_b64:
+                                _existing_round_images.append(_img_b64)
+                                _seen_b64.add(_img_b64)
+                        if round_images is None:
+                            round_images = _existing_round_images
+
+                        annotation_lines = [
+                            f"Image {i} is {name}" for i, (name, _b64) in enumerate(unlocked_pixels, start=1)
+                        ]
+                        current_system_prompt += (
+                            "\n=== UNLOCKED IMAGE ANNOTATION ===\n"
+                            "The following images are attached to the LAST USER MESSAGE of this "
+                            "conversation as real image payloads (in order):\n"
+                            + "\n".join(annotation_lines)
+                            + "\n=== END UNLOCKED IMAGE ANNOTATION ===\n"
+                        )
+                        _dbg(
+                            f"[ChatMixin] Attached {len(unlocked_pixels)} unlocked image(s) to the "
+                            f"last user message; system prompt carries the index→filename annotation only."
+                        )
+                        ss.unlocked_image_pixels = []
+
                     ss.context_unlock_requested = False
                     _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
                     _persist_round_state()

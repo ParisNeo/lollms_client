@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-27 15:01]
+
+- feat: add .env file loading and attach unlocked images to user role
+
 ## [2026-10-26 21:47]
 
 - fix: update lollms client version to v1.21.1

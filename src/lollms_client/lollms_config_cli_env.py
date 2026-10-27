@@ -44,6 +44,47 @@ def resolve_env_file(cli_env_path: Optional[Union[str, Path]] = None) -> Tuple[O
 
     return None, True
 
+
+def load_env_file(env_path: Optional[Union[str, Path]] = None) -> Dict[str, str]:
+    """Parses a classic .env file into a flat KEY=VALUE string map.
+
+    Legacy compatibility shim: the configuration system is YAML-first, but
+    callers (e.g. lollms_code CLI) still consume flat .env maps. Supports
+    'KEY=VALUE' lines, '#' comments, optional 'export ' prefixes, and strips
+    surrounding quotes from values. Missing or unreadable files yield an
+    empty dict (soft-fail, consistent with the module's philosophy).
+    """
+    if not env_path:
+        return {}
+
+    env_map: Dict[str, str] = {}
+    try:
+        env_file = Path(env_path).expanduser()
+        if not env_file.is_file():
+            return {}
+
+        for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export ") or line.startswith("set "):
+                line = line.split(None, 1)[1].strip()
+            if "=" not in line:
+                continue
+
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            if key:
+                env_map[key] = value
+    except Exception as e:
+        ASCIIColors.warning(f"Failed to parse env file '{env_path}': {e}")
+        return {}
+
+    return env_map
+
 _SERIALIZATION_PROFILE_SUFFIXES = (
     "_BINDING_ALIAS", "_BINDING_NAME", "_MODEL_NAME", "_IS_DEFAULT",
     "_VISION_ENABLED", "_FORCED_CONTEXT_SIZE", "_VERIFY_SSL_CERTIFICATE",
