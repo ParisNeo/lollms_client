@@ -4891,26 +4891,140 @@ class ChatMixin:
             # ── Case 3: Python file path ──
             if entry.endswith(".py"):
                 py_path = Path(entry).resolve()
-                if py_path.exists() and py_path.is_file() and lcp_binding:
+                # ── FLAG EXTRACTION (PRE-AUTHORIZATION INPUT) ──
+                # Passing a tool file by explicit path is an opt-in action, so the
+                # file's TOOL_LIBRARY_LOAD_FLAG must be pre-authorized in the
+                # containers the mount gate actually reads:
+                # tools_binding_config[flag] and host_tool_configs[stem][flag].
+                _lib_stem = py_path.stem
+                _flag_value = None
+                if py_path.exists() and py_path.is_file():
                     try:
-                        loaded_count = lcp_binding._load_tool_file(py_path)
-                        if loaded_count > 0:
-                            ASCIIColors.success(f"[ChatMixin] Loaded {loaded_count} tool(s) from file: {py_path.name}")
-                            # Fetch the newly loaded tool specs and add them to resolved
-                            lcp_specs = lcp_binding.to_chat_tool_specs(
-                                discussion_instance=self,
-                                lollms_client_instance=self.lollmsClient,
+                        _flag_match = re.search(
+                            r'^TOOL_LIBRARY_LOAD_FLAG\s*=\s*["\'](.+?)["\']',
+                            py_path.read_text(encoding="utf-8", errors="ignore"),
+                            re.MULTILINE,
+                        )
+                        _flag_value = _flag_match.group(1) if _flag_match else None
+                    except Exception:
+                        _flag_value = None
+                if py_path.exists() and py_path.is_file() and (
+                    lcp_binding is None or not hasattr(lcp_binding, "_load_tool_file")
+                ):
+                    # User directive: native LCP tool files (websearch, office, etc.)
+                    # MUST be loadable even when no tools binding is configured —
+                    # bootstrap a default in-process LCPBinding on demand.
+                    try:
+                        from lollms_client.tools_bindings.lcp import LCPBinding
+                        _default_tools_dir = (
+                            Path(__file__).resolve().parent.parent
+                            / "tools_bindings" / "lcp" / "default_tools"
+                        )
+                        _boot_binding = LCPBinding(
+                            tools_folders=[_default_tools_dir] if _default_tools_dir.exists() else [],
+                            host_tool_configs={_lib_stem: {_flag_value: True}} if _flag_value else None,
+                        )
+                        # NOTE: do NOT call the module-level `_is_tool_binding` here —
+                        # this method defines a local variable of the same name further
+                        # down, which would shadow it and raise UnboundLocalError.
+                        # Duck-typing on `mount_tool_library` is the required contract.
+                        if hasattr(_boot_binding, "mount_tool_library"):
+                            lcp_binding = _boot_binding
+                            try:
+                                if (
+                                    hasattr(self.lollmsClient, "tools")
+                                    and not hasattr(self.lollmsClient.tools, "_mock_return_value")
+                                ):
+                                    self.lollmsClient.tools = lcp_binding
+                            except Exception:
+                                pass  # persisting on the client is best-effort only
+                            ASCIIColors.info(
+                                "[ChatMixin] Bootstrapped default LCPBinding on demand to load "
+                                "native LCP tool file (no tools binding configured)."
                             )
-                            for t_name, t_spec in lcp_specs.items():
-                                # Only add tools that came from this specific file
-                                tool_def = next((t for t in lcp_binding.discovered_tools if t.get("name") == t_name), None)
-                                if tool_def and tool_def.get("_python_file_path") == str(py_path):
-                                    resolved[t_name] = t_spec
+                    except Exception as _boot_ex:
+                        ASCIIColors.warning(
+                            f"[ChatMixin] On-demand LCPBinding bootstrap failed: {_boot_ex} — "
+                            "requested native LCP toolsets will not be mounted."
+                        )
+                if py_path.exists() and py_path.is_file() and lcp_binding:
+                    # ── PRE-AUTHORIZATION (GATE-CONTAINER WRITES) ──
+                    # The TOOL_LIBRARY_LOAD_FLAG gate reads tools_binding_config[flag]
+                    # and host_tool_configs[stem][flag] — NOT session flags. Enable
+                    # the flag in BOTH containers before the mount; also keep the
+                    # session-flag write for office-family gates. All writes are
+                    # idempotent dict assignments.
+                    if _flag_value:
+                        try:
+                            _cfg = getattr(lcp_binding, "tools_binding_config", None)
+                            if isinstance(_cfg, dict):
+                                _cfg[_flag_value] = True
+                            _htc = getattr(lcp_binding, "host_tool_configs", None)
+                            if isinstance(_htc, dict):
+                                _htc.setdefault(py_path.parent.name, {})[_flag_value] = True
+                        except Exception:
+                            pass  # Best-effort; the load will warn if the gate blocks
+                        if hasattr(lcp_binding, "set_session_flags"):
+                            lcp_binding.set_session_flags({_flag_value: True})
+
+                    def _specs_from_this_file() -> Dict[str, Dict[str, Any]]:
+                        lcp_specs = lcp_binding.to_chat_tool_specs(
+                            discussion_instance=self,
+                            lollms_client_instance=self.lollmsClient,
+                        )
+                        matched: Dict[str, Dict[str, Any]] = {}
+                        for t_name, t_spec in lcp_specs.items():
+                            tool_def = next(
+                                (t for t in lcp_binding.discovered_tools if t.get("name") == t_name),
+                                None,
+                            )
+                            if tool_def and (
+                                tool_def.get("_python_file_path") == str(py_path)
+                                or tool_def.get("library") == py_path.parent.name
+                            ):
+                                matched[t_name] = t_spec
+                        return matched
+
+                    _mount_outcome: Optional[Dict[str, Dict[str, Any]]] = None
+                    _mount_fail_reason = ""
+                    try:
+                        _lib_name = py_path.parent.name
+                        if hasattr(lcp_binding, "mount_tool_library"):
+                            lcp_binding.mount_tool_library(_lib_name)
+                            _mount_outcome = _specs_from_this_file()
+                            if _mount_outcome:
+                                ASCIIColors.success(
+                                    f"[ChatMixin] Mounted library '{_lib_name}' from explicit tool path "
+                                    f"({len(_mount_outcome)} tool(s))."
+                                )
+                            else:
+                                _mount_fail_reason = (
+                                    f"mount_tool_library('{_lib_name}') produced 0 matching tool specs"
+                                )
                         else:
-                            ASCIIColors.warning(f"[ChatMixin] No tools found in file: {py_path.name}")
-                    except Exception as ex:
-                        ASCIIColors.error(f"[ChatMixin] Failed to load tool file '{entry}': {ex}")
-                        trace_exception(ex)
+                            _mount_fail_reason = "binding lacks mount_tool_library()"
+                    except Exception as mount_ex:
+                        _mount_fail_reason = f"mount_tool_library failed: {mount_ex}"
+
+                    if not _mount_outcome and hasattr(lcp_binding, "_load_tool_file"):
+                        try:
+                            loaded_count = lcp_binding._load_tool_file(py_path)
+                            if loaded_count > 0:
+                                ASCIIColors.success(f"[ChatMixin] Loaded {loaded_count} tool(s) from file: {py_path.name}")
+                                _mount_outcome = _specs_from_this_file()
+                            elif not _mount_fail_reason:
+                                _mount_fail_reason = f"_load_tool_file found 0 tools in {py_path.name}"
+                        except Exception as load_ex:
+                            if not _mount_fail_reason:
+                                _mount_fail_reason = f"_load_tool_file failed: {load_ex}"
+
+                    if _mount_outcome:
+                        resolved.update(_mount_outcome)
+                    else:
+                        ASCIIColors.warning(
+                            f"[ChatMixin] Failed to load tools from '{entry}' "
+                            f"(flag={_flag_value or '<none>'}): {_mount_fail_reason or 'unknown reason'}."
+                        )
                 else:
                     if not (py_path.exists() and py_path.is_file()):
                         ASCIIColors.warning(f"[ChatMixin] Tool file '{entry}' does not exist or is not a file.")

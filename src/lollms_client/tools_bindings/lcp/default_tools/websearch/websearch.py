@@ -13,6 +13,7 @@ import urllib.parse
 import html.parser
 import re
 
+__lcp_tool_binding__ = True  # Explicit marker for binding detection
 TOOL_LIBRARY_LOAD_FLAG = "enable_websearch"
 
 _WORKSPACE = Path(".")
@@ -20,7 +21,11 @@ _WORKSPACE = Path(".")
 
 def init_tools_library(config=None):
     """Never raises: dependency checks or configuration loading soft-fail."""
-    pass
+    try:
+        # Any future config loading here
+        pass
+    except Exception:
+        pass  # Soft-fail per LCP contract
 
 
 def _resolve_workspace_path(relative_path: str) -> Path:

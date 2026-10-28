@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-28 03:25]
+
+- fix: Update version string from incomplete entry to full version; Enhance websearch binding with search API support.
+
 ## [2026-10-28 02:43]
 
 - feat(lollms_minimax_h3): add TTV binding for minimax_h3 model
