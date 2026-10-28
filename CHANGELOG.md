@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-28 01:33]
+
+- feat: add websearch tool and example agent
+
 ## [2026-10-28 01:32]
 
 - fix: docs - clarify chat API behavior & build-time dependencies for headless configuration engine

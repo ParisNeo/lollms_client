@@ -1,0 +1,6 @@
+name: websearch
+description: Web search and web fetching toolset.
+load_flag: enable_websearch
+tools:
+  - tool_web_search
+  - tool_web_fetch
