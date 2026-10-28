@@ -31,6 +31,32 @@ Whether you're connecting to a remote LoLLMs server, an Ollama instance, the Ope
 >
 > 🖥️ **Building your own UI?** The whole configuration engine is exposed as a **headless API** — drive it from PyQt, NiceGUI, Vue/React, or your own database. **[→ Embeddable Configuration Engine](#-embeddable-configuration-engine-build-your-own-configuration-ui)**
 
+## 🧰 Per-Turn Builtin Tools API (No Tools Binding Required)
+
+Native LCP tools (workspace file ops, document inspection, data query, office suites, and more) can be discovered and force-loaded for a single turn **even when the client has no tools binding configured**:
+
+```python
+# 1. Discover the native catalog — no binding required, client state untouched
+available = discussion.list_builtin_tools(category="workspace")
+
+# 2. Activate tools for this turn only
+result = discussion.chat(
+    "Inspect this document and summarize it",
+    builtin_tools_activation_list=["inspect_text", "read_text_file"],
+)
+```
+
+The identical API exists on autonomous agents: `personality.list_builtin_tools()` and `personality.chat(..., builtin_tools_activation_list=[...])`.
+
+**Key behaviors:**
+- Activates **only when no LCP tools binding resolves** — LCP takes precedence; a suppressed list is debug-logged, never error-spammed.
+- Direct-callable dispatch with the standard `{success, error, output, file_name, context_files, ...}` result normalization — identical to binding-dispatched calls.
+- Validation: non-empty strings only; duplicates deduplicated order-preserved; unknown or uncallable names warn-and-skip, never raise.
+- **Per-turn only** — nothing is persisted to `client.tools`.
+- Distinct from `chat(tools=[...])`, which resolves tool IDs *through* an active binding.
+
+📖 Reference: [LCP Toolset Docs](docs/lcp/00_OVERVIEW.md) · [Chat Mixin Integration](docs/lcp/06_CHAT_MIXIN_INTEGRATION.md) · [Chat Boolean Flags](docs/CHAT_BOOLEAN_FLAGS.md)
+
 ## 🧩 Embeddable Configuration Engine (Build Your Own Configuration UI)
 
 The wizard is just one frontend. The entire configuration engine — binding discovery, parameter schemas, the flat config map, and client reconstruction — is available as a **headless, UI-agnostic API** (`lollms_config_api`). Any application can embed it: build a settings page in PyQt/PySide, render auto-generated forms in NiceGUI, or expose it over REST to a Vue/React frontend.
@@ -156,6 +182,16 @@ You can install `lollms_client` directly from PyPI:
 
 ```bash
 pip install lollms-client
+
+# Optional extras (declared in pyproject.toml):
+pip install lollms-client[gui]      # NiceGUI + pywebview desktop UI stack
+pip install lollms-client[bot]      # Telegram/Discord/Slack bots + FastAPI server stack
+pip install lollms-client[gui,bot]  # everything
+```
+
+**Python**: 3.7+ (actively tested on 3.8 → 3.15).
+
+Office toolsets (PowerPoint/Word/Excel) require `python-pptx`, `python-docx`, and `openpyxl` — installed on demand by `pipmaster`, or manually for GPU/pinned environments.
 ```
 
 This will install the core library. Some bindings may require additional dependencies (e.g., `llama-cpp-python`, `torch`, `transformers`, `ollama`, `vllm`, `Pillow` for image utilities, `docling` for document parsing). The library attempts to manage these using `pipmaster`, but for complex dependencies (especially those requiring compilation like `llama-cpp-python` with GPU support), manual installation might be preferred.
@@ -1240,6 +1276,7 @@ def chat(
     python_autonomy_level:        Optional[str] = "safe",
     auto_approve_python:          bool = False,
     confirm_handler:              Optional[Callable] = None,
+    builtin_tools_activation_list: Optional[List[str]] = None,
     **kwargs
 ) -> Dict[str, Any]:
 ```
@@ -1307,6 +1344,35 @@ discussion.chat(
 
 **LCP Tool Agnosticism Doctrine:**
 LCP tools are strictly agnostic by default. They must **NEVER** accept `discussion_instance` or `lollms_client_instance` as input parameters (unless explicitly required for advanced patterns like recursive sub-agent spawning). The LCP AST parser filters these internal parameters out when building the JSON schema for the LLM. Tools must rely on CWD for file resolution and communicate results back solely via their return dictionary.
+
+### Builtin Tool Discovery & Activation (Binding-Free Fallback)
+
+`list_builtin_tools()` enumerates the native LCP catalog without mutating client state — it builds a throwaway `LCPBinding()` probe (office session flags pre-enabled so the catalog is complete) and returns spec dicts:
+
+```python
+def list_builtin_tools(self, category: Optional[str] = None) -> List[Dict[str, Any]]:
+    # Returns: [{"name", "description", "schema",
+    #            "parameters": [{"name", "type", "description"}, ...],
+    #            "library", "requires_lcp": False,  # direct-callable path
+    #            "callable"}, ...]
+    # `category` is a case-insensitive substring filter on library stem or name.
+    # Soft-fails to [] when LCP infrastructure is unavailable.
+```
+
+`builtin_tools_activation_list` then force-loads selected tools **only when no binding resolves**:
+
+| `lcp_binding` state | Effect of `builtin_tools_activation_list` |
+| :--- | :--- |
+| Valid binding present | Ignored (debug log: LCP takes precedence) |
+| On-demand bootstrap succeeded (office/data flags) | Ignored |
+| Bootstrap failed / no flags / `lcp_binding is None` | Names registered directly with `callable` into `active_tools`; dispatched via the existing seam |
+
+Entries are validated at `chat()` entry (non-empty strings, order-preserved dedup via `dict.fromkeys`); unknown or uncallable names warn-and-skip. Activation is per-turn — nothing is persisted to `client.tools`.
+
+```python
+# Binding-required convenience:  chat(tools=["pptx_tools.list_slides"])
+# Binding-free fallback:         chat(builtin_tools_activation_list=["inspect_text"])
+```
 
 ### Cognitive Checkpoint System
 
