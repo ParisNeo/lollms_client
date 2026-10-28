@@ -8,6 +8,7 @@ Requirements: standard library only (urllib, html.parser, json).
 
 from pathlib import Path
 import json
+import time
 import urllib.request
 import urllib.parse
 import html.parser
@@ -17,6 +18,31 @@ __lcp_tool_binding__ = True  # Explicit marker for binding detection
 TOOL_LIBRARY_LOAD_FLAG = "enable_websearch"
 
 _WORKSPACE = Path(".")
+
+_BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# Class presence checked via lookahead so attribute order (class↔href) never matters.
+_RESULT_TITLE_HREF = re.compile(
+    r'<a(?=[^>]*\bclass="result__a")[^>]*\bhref="([^"]+)"[^>]*>(.*?)</a>',
+    re.DOTALL | re.IGNORECASE,
+)
+_RESULT_SNIPPET = re.compile(
+    r'<a(?=[^>]*\bclass="result__snippet")[^>]*>(.*?)</a>',
+    re.DOTALL | re.IGNORECASE,
+)
+_LITE_LINK = re.compile(
+    r'<a(?=[^>]*\bclass=["\']result-link["\'])[^>]*\bhref="([^"]+)"[^>]*>(.*?)</a>',
+    re.DOTALL | re.IGNORECASE,
+)
+_LITE_SNIPPET = re.compile(
+    r'<td(?=[^>]*\bclass=["\']result-snippet["\'])[^>]*>(.*?)</td>',
+    re.DOTALL | re.IGNORECASE,
+)
 
 
 def init_tools_library(config=None):
@@ -53,8 +79,92 @@ class _HTMLTextExtractor(html.parser.HTMLParser):
         return " ".join(self.text)
 
 
+def _clean_fragment(fragment: str) -> str:
+    """Strip tags from an HTML fragment using a FRESH parser instance."""
+    parser = _HTMLTextExtractor()
+    parser.feed(fragment)
+    parser.close()
+    return html.parser.unescape(parser.get_text()).strip()
+
+
+def _unwrap_ddg_link(href: str) -> str:
+    """Unwrap DuckDuckGo redirect links to the real target URL."""
+    href = html.parser.unescape(href)
+    if "uddg=" in href:
+        try:
+            parsed = urllib.parse.urlparse(href)
+            query = urllib.parse.parse_qs(parsed.query)
+            if query.get("uddg"):
+                return urllib.parse.unquote(query["uddg"][0])
+        except Exception:
+            pass
+    if href.startswith("//"):
+        return "https:" + href
+    return href
+
+
+def _ddg_fetch(url: str, data=None) -> str:
+    """Fetch a DuckDuckGo endpoint with browser-like headers. Raises on HTTP errors."""
+    req = urllib.request.Request(url, data=data, headers=_BROWSER_HEADERS)
+    with urllib.request.urlopen(req, timeout=12) as response:
+        return response.read().decode("utf-8", errors="ignore")
+
+
+def _extract_html_results(page: str, max_results: int):
+    """Extract results from html.duckduckgo.com output, pairing each title
+    anchor with the first snippet occurring after it."""
+    results = []
+    seen_urls = set()
+    snippets = list(_RESULT_SNIPPET.finditer(page))
+    for match in _RESULT_TITLE_HREF.finditer(page):
+        url = _unwrap_ddg_link(match.group(1))
+        if url in seen_urls:
+            continue
+        snippet = ""
+        for snip_match in snippets:
+            if snip_match.start() > match.start():
+                snippet = _clean_fragment(snip_match.group(1))
+                break
+        results.append({
+            "title": _clean_fragment(match.group(2)),
+            "url": url,
+            "snippet": snippet,
+        })
+        seen_urls.add(url)
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def _extract_lite_results(page: str, max_results: int):
+    """Extract results from lite.duckduckgo.com output, pairing each link
+    with the first snippet occurring after it."""
+    results = []
+    seen_urls = set()
+    snippets = list(_LITE_SNIPPET.finditer(page))
+    for match in _LITE_LINK.finditer(page):
+        url = _unwrap_ddg_link(match.group(1))
+        if url in seen_urls:
+            continue
+        snippet = ""
+        for snip_match in snippets:
+            if snip_match.start() > match.start():
+                snippet = _clean_fragment(snip_match.group(1))
+                break
+        results.append({
+            "title": _clean_fragment(match.group(2)),
+            "url": url,
+            "snippet": snippet,
+        })
+        seen_urls.add(url)
+        if len(results) >= max_results:
+            break
+    return results
+
+
 def tool_web_search(query: str, max_results: int = 5, save_to_file: str = ""):
-    """Perform a web search and return relevant search snippets and sources.
+    """Perform a web search (DuckDuckGo with fallback endpoints) and return
+    relevant search snippets and sources.
 
     Args:
         query (str): The search query string.
@@ -66,51 +176,49 @@ def tool_web_search(query: str, max_results: int = 5, save_to_file: str = ""):
         if not query:
             return {"success": False, "error": "Search query cannot be empty."}
 
-        # Using DuckDuckGo HTML endpoint via standard library as a zero-dependency fallback,
-        # or checking for configured API providers (Tavily/Exa) if present in environment.
+        try:
+            max_results = max(1, int(max_results))
+        except (TypeError, ValueError):
+            max_results = 5
+
         encoded_query = urllib.parse.quote_plus(query)
-        url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
-        
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (Compatible; LCP-OpenCodeWebSearch/1.0)"}
-        )
+        post_data = urllib.parse.urlencode({"q": query}).encode("utf-8")
 
-        with urllib.request.urlopen(req, timeout=10) as response:
-            html_content = response.read().decode("utf-8", errors="ignore")
-
-        # Basic regex extraction for DuckDuckGo HTML results
-        # Pattern matches result snippets and links
-        result_blocks = re.findall(r'<a class="result__snippet[^>]*>(.*?)</a>', html_content, re.DOTALL)
-        title_blocks = re.findall(r'<a class="result__url"[^>]*>(.*?)</a>', html_content, re.DOTALL)
-        link_blocks = re.findall(r'<a class="result__url"[^>]*href="([^"]+)"', html_content, re.DOTALL)
-
+        # 3-attempt chain: GET html → POST html → GET lite.
         results = []
-        parser = _HTMLTextExtractor()
+        diagnostics = []
 
-        for i in range(min(max_results, len(result_blocks))):
-            parser.feed(result_blocks[i])
-            snippet = parser.get_text()
-            parser.text.clear()
+        attempts = [
+            ("GET-html", lambda: _ddg_fetch(f"https://html.duckduckgo.com/html/?q={encoded_query}"), _extract_html_results),
+            ("POST-html", lambda: _ddg_fetch("https://html.duckduckgo.com/html/", data=post_data), _extract_html_results),
+            ("GET-lite", lambda: _ddg_fetch(f"https://lite.duckduckgo.com/lite/?q={encoded_query}"), _extract_lite_results),
+        ]
 
-            title = title_blocks[i] if i < len(title_blocks) else "No Title"
-            link = link_blocks[i] if i < len(link_blocks) else ""
-
-            results.append({
-                "index": i + 1,
-                "title": title.strip(),
-                "snippet": snippet,
-                "url": link
-            })
+        for name, fetch, extractor in attempts:
+            try:
+                page = fetch()
+                results = extractor(page, max_results)
+                if results:
+                    break
+                diagnostics.append(f"{name}: 0 results parsed")
+            except Exception as ex:
+                diagnostics.append(f"{name}: {ex}")
 
         if not results:
             return {
-                "success": True,
-                "output": f"Web search executed for '{query}', but no structured HTML results were parsed.",
-                "results": []
+                "success": False,
+                "error": (
+                    "Web search failed: DuckDuckGo returned no parseable results "
+                    "(possible bot-block or markup change). Attempts: " + "; ".join(diagnostics)
+                ),
+                "results": [],
             }
 
-        output_text = f"Found {len(results)} results for query: '{query}'\n\n"
+        for i, r in enumerate(results, start=1):
+            r["index"] = i
+
+        date_stamp = time.strftime("%Y-%m-%d")
+        output_text = f"Found {len(results)} results for query: '{query}' (searched on {date_stamp})\n\n"
         for r in results:
             output_text += f"[{r['index']}] {r['title']}\nURL: {r['url']}\nSnippet: {r['snippet']}\n\n"
 
@@ -124,7 +232,8 @@ def tool_web_search(query: str, max_results: int = 5, save_to_file: str = ""):
         return {
             "success": True,
             "output": output_text.strip(),
-            "context_files": context_files
+            "results": results,
+            "context_files": context_files,
         }
 
     except Exception as ex:
@@ -146,10 +255,7 @@ def tool_web_fetch(url: str, save_to_file: str = ""):
         if not url.startswith(("http://", "https://")):
             return {"success": False, "error": "Invalid URL. Must start with http:// or https://."}
 
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (Compatible; LCP-OpenCodeWebFetch/1.0)"}
-        )
+        req = urllib.request.Request(url, headers=_BROWSER_HEADERS)
 
         with urllib.request.urlopen(req, timeout=15) as response:
             html_content = response.read().decode("utf-8", errors="ignore")
