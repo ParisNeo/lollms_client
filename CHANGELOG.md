@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-28 01:48]
+
+- feat: add MiniMax-H3 Omni TTV binding for vLLM-Omni video generation
+
 ## [2026-10-28 01:33]
 
 - feat: add websearch tool and example agent
