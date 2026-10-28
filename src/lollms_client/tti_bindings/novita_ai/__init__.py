@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
 import time
@@ -18,32 +19,33 @@ pm.ensure_packages(["requests"])
 BindingName = "NovitaAITTIBinding"
 
 NOVITA_DEFAULT_HOST = "https://api.novita.ai"
-DEFAULT_MODEL = "qwen-image"
+DEFAULT_MODEL = "ming-image-0.1-design"
+DEFAULT_EDIT_MODEL = "ming-image-0.1-design-layer"
 
 FAMILY_QWEN = "qwen"
 FAMILY_MING = "ming"
 
 NOVITA_AI_MODELS = [
     {
-        "model_name": "qwen-image",
-        "display_name": "Qwen-Image (Generation & Editing)",
-        "description": "20B MMDiT model bundling text-to-image generation and prompt-based image editing. The appropriate Novita API is selected automatically: generation calls use the Qwen-Image txt2img task, editing calls with input images use the Qwen-Image Edit task.",
-        "family": FAMILY_QWEN,
-        "capabilities": ["generation", "editing"],
-    },
-    {
         "model_name": "ming-image-0.1-design",
-        "display_name": "Ming Image 0.1 Design",
-        "description": "Ming Image text-to-image generation using the OpenAI image generations protocol.",
+        "display_name": "Ming Image 0.1 Design (Text to Image)",
+        "description": "Ming Image 0.1 text-to-image foundation model using the OpenAI image generations protocol.",
         "family": FAMILY_MING,
         "capabilities": ["generation"],
     },
     {
         "model_name": "ming-image-0.1-design-layer",
-        "display_name": "Ming Image 0.1 Design (Layer Decoupling)",
-        "description": "Splits an input image into decoupled layers (foreground/background) using the OpenAI image edits protocol.",
+        "display_name": "Ming Image 0.1 Design (Layer Decoupling & Editing)",
+        "description": "Decomposes input images into decoupled transparent RGBA layers (foreground subject, background) using the OpenAI image edits protocol.",
         "family": FAMILY_MING,
         "capabilities": ["editing"],
+    },
+    {
+        "model_name": "qwen-image",
+        "display_name": "Qwen-Image (Retired by Novita)",
+        "description": "Legacy Qwen-Image model. Notice: As of Novita's Sep 30, 2026 update, /v3/async/qwen-image* endpoints are retired and return 404.",
+        "family": FAMILY_QWEN,
+        "capabilities": ["deprecated"],
     },
 ]
 
@@ -51,7 +53,7 @@ SUPPORTED_MODEL_NAMES = [model["model_name"] for model in NOVITA_AI_MODELS]
 
 
 class NovitaAITTIBinding(LollmsTTIBinding):
-    """Novita.ai TTI binding for the Qwen-Image and Ming-Image model APIs."""
+    """Novita.ai TTI binding supporting Ming-Image generation and layer-decoupling editing."""
 
     def __init__(self, **kwargs):
         if "model" in kwargs and "model_name" not in kwargs:
@@ -69,7 +71,7 @@ class NovitaAITTIBinding(LollmsTTIBinding):
         raw_host = (
             self.config.get("base_url")
             or self.config.get("host_address")
-            or f"{NOVITA_DEFAULT_HOST}/v3"
+            or NOVITA_DEFAULT_HOST
         ).rstrip("/")
         self.base_url = self._normalize_v3_url(raw_host)
         self.v1_base_url = f"{self.base_url[: -len('/v3')]}/v1"
@@ -124,7 +126,7 @@ class NovitaAITTIBinding(LollmsTTIBinding):
     def _normalize_v3_url(raw_host: str) -> str:
         if raw_host.endswith("/v3"):
             return raw_host
-        if raw_host.endswith("/v1") or raw_host.endswith("/v2"):
+        if raw_host.endswith("/v1") or raw_host.endswith("/v2") or raw_host.endswith("/openai"):
             return f"{raw_host[: raw_host.rfind('/')]}/v3"
         return f"{raw_host}/v3"
 
@@ -136,24 +138,16 @@ class NovitaAITTIBinding(LollmsTTIBinding):
             dimension = default
         return max(low, min(high, dimension))
 
-    def _resolve_family(self) -> Optional[str]:
+    def _resolve_family(self) -> str:
         lowered = (self.model_name or "").lower()
-        if "qwen" in lowered:
-            return FAMILY_QWEN
         if "ming" in lowered:
             return FAMILY_MING
-        return None
+        if "qwen" in lowered:
+            return FAMILY_QWEN
+        return FAMILY_MING
 
     def _is_layer_model(self) -> bool:
         return "layer" in (self.model_name or "").lower()
-
-    def _raise_unsupported_model(self) -> NoReturn:
-        raise RuntimeError(
-            f"Novita.ai no longer supports generic Stable Diffusion checkpoint generation. "
-            f"The legacy /v3/async/txt2img and /v3/async/img2img routes have been retired, "
-            f"so model '{self.model_name}' cannot be used. "
-            f"Set model_name to one of the supported foundation models: {', '.join(SUPPORTED_MODEL_NAMES)}."
-        )
 
     def get_zoo(self) -> List[Dict[str, Any]]:
         return [
@@ -166,10 +160,6 @@ class NovitaAITTIBinding(LollmsTTIBinding):
             }
             for model in NOVITA_AI_MODELS
         ]
-
-    # ------------------------------------------------------------------
-    # Model Listing
-    # ------------------------------------------------------------------
 
     def list_models(self) -> list:
         return [dict(model) for model in NOVITA_AI_MODELS]
@@ -190,15 +180,17 @@ class NovitaAITTIBinding(LollmsTTIBinding):
         modalities: Optional[List[str]] = None,
         **kwargs
     ) -> TTIGenerationResult:
-        if images and self._resolve_family() == FAMILY_MING and self._is_layer_model():
+        # If input images are provided, execute image editing / layer decoupling
+        if images:
             self._require_api_key()
             image_bytes = self._read_image_bytes(images)
             layers, layer_structure = self._edit_ming_layers(image_bytes, prompt, width, height, **kwargs)
             return TTIGenerationResult(
                 images=layers,
                 raw=layer_structure,
-                metadata={"model": self.model_name, "layer_structure": layer_structure},
+                metadata={"model": DEFAULT_EDIT_MODEL, "layer_structure": layer_structure},
             )
+
         return super().generate(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -221,20 +213,25 @@ class NovitaAITTIBinding(LollmsTTIBinding):
     ) -> bytes:
         self._require_api_key()
         family = self._resolve_family()
+
         if family == FAMILY_QWEN:
-            if negative_prompt:
-                ASCIIColors.info(f"[{self.binding_name}] Qwen-Image does not support negative prompts; ignoring it.")
-            return self._generate_qwen_image(prompt, width, height, **kwargs)
+            ASCIIColors.warning(
+                f"[{self.binding_name}] Qwen-Image was retired by Novita AI on Sep 30, 2026. "
+                f"Routing call to '{DEFAULT_MODEL}'."
+            )
+            family = FAMILY_MING
+
         if family == FAMILY_MING:
             if self._is_layer_model():
-                raise ValueError(
-                    "ming-image-0.1-design-layer only supports layer decoupling on an input image. "
-                    "Provide images via edit_image or the generate() images argument."
+                ASCIIColors.info(
+                    f"[{self.binding_name}] Switching model from '{self.model_name}' to "
+                    f"'{DEFAULT_MODEL}' for text-to-image generation."
                 )
             if negative_prompt:
                 ASCIIColors.info(f"[{self.binding_name}] Ming-Image does not support negative prompts; ignoring it.")
             return self._generate_ming_image(prompt, width, height, **kwargs)
-        self._raise_unsupported_model()
+
+        raise RuntimeError(f"Unsupported model family for generation: {self.model_name}")
 
     def edit_image(
         self,
@@ -249,96 +246,55 @@ class NovitaAITTIBinding(LollmsTTIBinding):
         self._require_api_key()
         if mask:
             ASCIIColors.info(
-                f"[{self.binding_name}] Novita.ai image edit APIs do not support inpainting masks; ignoring the provided mask."
+                f"[{self.binding_name}] Novita.ai layer decoupling does not require an inpainting mask; ignoring mask."
             )
+
         image_bytes = self._read_image_bytes(images)
         family = self._resolve_family()
+
         if family == FAMILY_QWEN:
-            return self._edit_qwen_image(image_bytes, prompt, **kwargs)
-        if family == FAMILY_MING:
-            if not self._is_layer_model():
-                raise ValueError(
-                    "ming-image-0.1-design only supports text-to-image generation. "
-                    "Use ming-image-0.1-design-layer for layer decoupling edits."
-                )
-            layers, _ = self._edit_ming_layers(image_bytes, prompt, width, height, **kwargs)
+            ASCIIColors.warning(
+                f"[{self.binding_name}] Qwen-Image Edit was retired by Novita AI on Sep 30, 2026. "
+                f"Automatically using '{DEFAULT_EDIT_MODEL}' (Ming Layer Decoupling)."
+            )
+
+        # Ming-Image-0.1-Design-Layer handles layer decoupling / alpha background extraction
+        layers, _ = self._edit_ming_layers(image_bytes, prompt, width, height, **kwargs)
+
+        # Identify which layer to return:
+        # Layer decoupling usually yields: layer 0 = background, layer 1 = foreground / transparent subject.
+        # If the user specifically wants the subject/transparent cutout, layer -1 is the extracted foreground.
+        lower_prompt = prompt.lower()
+        if any(w in lower_prompt for w in ["background only", "isolate background", "only background"]):
             return layers[0]
-        self._raise_unsupported_model()
-
-    # ------------------------------------------------------------------
-    # Qwen-Image (v3 asynchronous task pipeline)
-    # ------------------------------------------------------------------
-
-    def _generate_qwen_image(self, prompt: str, width: int, height: int, **kwargs) -> bytes:
-        payload = {
-            "prompt": prompt,
-            "size": (
-                f"{self._clamp_dimension(width, 256, 1536, 1024)}"
-                f"*{self._clamp_dimension(height, 256, 1536, 1024)}"
-            ),
-        }
-        endpoints = [
-            f"{self.base_url}/async/qwen-image-txt2img",
-            f"{NOVITA_DEFAULT_HOST}/v3/async/qwen-image-txt2img",
-        ]
-        data = self._post_with_fallback(endpoints, payload)
-        task_id = self._extract_task_id(data)
-        if not task_id:
-            raise RuntimeError(f"Novita.ai did not return a task_id for Qwen-Image. Response: {data}")
-        return self._poll_task_result(task_id, timeout=kwargs.get("timeout", 300))
-
-    def _qwen_edit_endpoints(self) -> List[str]:
-        model_slug = self._clean_model_name(self.model_name)
-        candidates = [
-            "qwen-image-edit",
-            "qwen-image-edit-2509",
-            "qwen-image-edit-img2img",
-            "qwen-image-img2img",
-            "qwen-image-image-to-image",
-        ]
-        if model_slug not in candidates:
-            candidates.append(model_slug)
-        endpoints: List[str] = []
-        for candidate in candidates:
-            endpoints.append(f"{self.base_url}/async/{candidate}")
-            endpoints.append(f"{NOVITA_DEFAULT_HOST}/v3/async/{candidate}")
-        return endpoints
-
-    def _edit_qwen_image(self, image_bytes: bytes, prompt: str, **kwargs) -> bytes:
-        payload = {
-            "prompt": prompt,
-            "image": base64.b64encode(image_bytes).decode("utf-8"),
-            "seed": int(kwargs.get("seed", -1)),
-            "output_format": kwargs.get("output_format", "jpeg"),
-        }
-        endpoints = self._qwen_edit_endpoints()
-        data = self._post_with_fallback(endpoints, payload)
-        task_id = self._extract_task_id(data)
-        if not task_id:
-            raise RuntimeError(f"Novita.ai did not return a task_id for the Qwen-Image edit. Response: {data}")
-        return self._poll_task_result(task_id, timeout=kwargs.get("timeout", 300))
+        if len(layers) > 1:
+            return layers[-1]
+        return layers[0]
 
     # ------------------------------------------------------------------
     # Ming-Image (OpenAI-compatible image protocol)
     # ------------------------------------------------------------------
 
     def _ming_image_endpoints(self, action: str) -> List[str]:
+        endpoints: List[str] = [
+            f"{NOVITA_DEFAULT_HOST}/openai/v1/images/{action}",
+            f"{NOVITA_DEFAULT_HOST}/v1/images/{action}",
+            f"{NOVITA_DEFAULT_HOST}/v3/openai/images/{action}",
+            f"{NOVITA_DEFAULT_HOST}/openapi/v1/images/{action}",
+        ]
         api_root = self.v1_base_url[: -len("/v1")]
-        endpoints: List[str] = []
-        for root in (api_root, NOVITA_DEFAULT_HOST):
-            endpoints.append(f"{root}/v1/images/{action}")
-            endpoints.append(f"{root}/v3/openai/images/{action}")
-            endpoints.append(f"{root}/v3/images/{action}")
-            endpoints.append(f"{root}/openapi/v1/images/{action}")
+        if api_root != NOVITA_DEFAULT_HOST:
+            endpoints.insert(0, f"{api_root}/openai/v1/images/{action}")
+            endpoints.insert(1, f"{api_root}/v1/images/{action}")
         return endpoints
 
     def _generate_ming_image(self, prompt: str, width: int, height: int, **kwargs) -> bytes:
         payload = {
-            "model": self.model_name,
+            "model": DEFAULT_MODEL,
             "prompt": prompt,
             "output_format": kwargs.get("output_format", "png"),
             "response_format": "b64_json",
-            "size": self._format_ming_size(width, height, **kwargs),
+            "size": self._format_ming_size(width, height, is_edit=False, **kwargs),
             "watermark": bool(kwargs.get("watermark", False)),
         }
         data = self._post_with_fallback(
@@ -367,14 +323,20 @@ class NovitaAITTIBinding(LollmsTTIBinding):
         height: Optional[int],
         **kwargs
     ) -> Tuple[List[bytes], Optional[str]]:
-        form_fields = {
-            "model": self.model_name,
+        form_fields: Dict[str, Any] = {
+            "model": DEFAULT_EDIT_MODEL,
             "prompt": prompt,
             "output_format": kwargs.get("output_format", "png"),
             "response_format": "b64_json",
-            "size": self._format_ming_size(width, height, **kwargs),
             "watermark": "true" if kwargs.get("watermark") else "false",
         }
+        # Novita documentation: ming-image-0.1-design-layer preserves input dimensions.
+        # Explicit sizes are rejected; pass size only if explicitly provided in kwargs.
+        size_str = self._format_ming_size(width, height, is_edit=True, **kwargs)
+        if size_str:
+            form_fields["size"] = size_str
+
+        # Endpoint uses multipart/form-data with field name 'image[]'
         data = self._post_with_fallback(
             self._ming_image_endpoints("edits"),
             form_fields,
@@ -391,18 +353,32 @@ class NovitaAITTIBinding(LollmsTTIBinding):
             b64_image = item.get("b64_json")
             if b64_image:
                 layers.append(base64.b64decode(b64_image))
+            elif item.get("url"):
+                dl = requests.get(item["url"], timeout=60)
+                dl.raise_for_status()
+                layers.append(dl.content)
+
         if not layers:
             raise RuntimeError(
-                f"Novita.ai Ming layer decoupling returned no layer images. Response: {str(data)[:300]}"
+                f"Novita.ai Ming layer decoupling returned no layers. Response: {str(data)[:300]}"
             )
         return layers, layer_structure
 
-    def _format_ming_size(self, width: Optional[int], height: Optional[int], **kwargs) -> str:
+    def _format_ming_size(
+        self,
+        width: Optional[int],
+        height: Optional[int],
+        is_edit: bool = False,
+        **kwargs
+    ) -> Optional[str]:
         explicit_size = kwargs.get("size")
         if explicit_size:
             return str(explicit_size)
-        if width is None and height is None:
+        if is_edit:
+            # Ming Layer decoupling rejects explicit resize dims; default to auto
             return "auto"
+        if width is None and height is None:
+            return "1024x1024"
         return (
             f"{self._clamp_dimension(width, 1024, 8192, 1024)}"
             f"x{self._clamp_dimension(height, 1024, 8192, 1024)}"
@@ -438,37 +414,6 @@ class NovitaAITTIBinding(LollmsTTIBinding):
                 ) from decode_error
         raise ValueError("Unsupported image input type. Provide bytes, base64, a data URI, a file path, or an image URL.")
 
-    @staticmethod
-    def _extract_task_id(data: Any) -> Optional[str]:
-        if not isinstance(data, dict):
-            return None
-        task_id = data.get("task_id")
-        if not task_id and isinstance(data.get("data"), dict):
-            task_id = data["data"].get("task_id")
-        return task_id
-
-    @staticmethod
-    def _extract_task_image(result_json: Dict[str, Any], task_info: Dict[str, Any]) -> Optional[bytes]:
-        images = result_json.get("images") or task_info.get("images") or []
-        if not images:
-            return None
-        first_image = images[0]
-        if isinstance(first_image, dict):
-            if first_image.get("image_base64"):
-                return base64.b64decode(first_image["image_base64"])
-            if first_image.get("image_url"):
-                download = requests.get(first_image["image_url"], timeout=60)
-                download.raise_for_status()
-                return download.content
-            return None
-        if isinstance(first_image, str):
-            if first_image.startswith("http://") or first_image.startswith("https://"):
-                download = requests.get(first_image, timeout=60)
-                download.raise_for_status()
-                return download.content
-            return base64.b64decode(first_image)
-        return None
-
     def _post_with_fallback(
         self,
         path_variants: List[str],
@@ -476,12 +421,6 @@ class NovitaAITTIBinding(LollmsTTIBinding):
         request_timeout: float = 60.0,
         files: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        request_headers = self.headers
-        if files is not None:
-            request_headers = {"Accept": "application/json"}
-            authorization = self.headers.get("Authorization")
-            if authorization:
-                request_headers["Authorization"] = authorization
         unique_urls: List[str] = []
         for variant in path_variants:
             if variant.startswith("http://") or variant.startswith("https://"):
@@ -490,21 +429,30 @@ class NovitaAITTIBinding(LollmsTTIBinding):
                 url = f"{self.base_url}/{variant.lstrip('/')}"
             if url not in unique_urls:
                 unique_urls.append(url)
+
         last_error: Optional[Exception] = None
         for url in unique_urls:
+            request_headers = dict(self.headers)
+            if files is not None:
+                # requests automatically sets multipart/form-data boundary when Content-Type is omitted
+                request_headers.pop("Content-Type", None)
+
             try:
                 ASCIIColors.info(f"[{self.binding_name}] Requesting {url}...")
                 if files is None:
                     response = requests.post(url, json=payload, headers=request_headers, timeout=request_timeout)
                 else:
                     response = requests.post(url, data=payload, files=files, headers=request_headers, timeout=request_timeout)
+
                 if response.status_code == 404:
-                    detail = response.text[:300] if response.text else "No response body"
+                    detail = response.text[:200] if response.text else "No response body"
                     ASCIIColors.warning(f"[{self.binding_name}] 404 from {url}: {detail}")
                     last_error = requests.exceptions.HTTPError(f"404 Client Error for url: {url}", response=response)
                     continue
+
                 if response.status_code != 200:
                     ASCIIColors.error(f"[{self.binding_name}] HTTP {response.status_code} from {url}: {response.text[:500]}")
+
                 response.raise_for_status()
                 return response.json()
             except requests.exceptions.HTTPError as http_error:
@@ -518,45 +466,10 @@ class NovitaAITTIBinding(LollmsTTIBinding):
             except Exception as ex:
                 last_error = ex
                 continue
+
         raise RuntimeError(
             f"Novita.ai endpoint not found. Tried routes: {', '.join(unique_urls)}. Last error: {last_error}"
         ) from last_error
-
-    def _poll_task_result(self, task_id: str, timeout: float = 180.0) -> bytes:
-        poll_urls = [
-            f"{self.base_url}/async/task-result",
-            f"{NOVITA_DEFAULT_HOST}/v3/async/task-result",
-        ]
-        start_time = time.time()
-        working_url = poll_urls[0]
-        while time.time() - start_time < timeout:
-            time.sleep(1.5)
-            result_json: Optional[Dict[str, Any]] = None
-            for url in [working_url] + [candidate for candidate in poll_urls if candidate != working_url]:
-                try:
-                    response = requests.get(url, params={"task_id": task_id}, headers=self.headers, timeout=30)
-                    if response.status_code == 200:
-                        working_url = url
-                        result_json = response.json()
-                        break
-                    if response.status_code != 404:
-                        response.raise_for_status()
-                except Exception as poll_error:
-                    ASCIIColors.warning(f"[{self.binding_name}] Task poll error on {url}: {poll_error}")
-                    continue
-            if not isinstance(result_json, dict):
-                continue
-            task_info = result_json.get("task") if isinstance(result_json.get("task"), dict) else {}
-            status = task_info.get("status") or result_json.get("status") or ""
-            if status in ("TASK_STATUS_SUCCEED", "SUCCEED", "SUCCESS"):
-                image_bytes = self._extract_task_image(result_json, task_info)
-                if image_bytes is None:
-                    raise RuntimeError(f"Novita.ai task succeeded but returned no images. Response: {result_json}")
-                return image_bytes
-            if status in ("TASK_STATUS_FAILED", "FAILED"):
-                reason = task_info.get("reason") or result_json.get("reason") or "Unknown task failure."
-                raise RuntimeError(f"Novita.ai task failed: {reason}")
-        raise TimeoutError(f"Novita.ai task timed out after {timeout} seconds.")
 
     # ------------------------------------------------------------------
     # Management Commands
@@ -589,28 +502,10 @@ class NovitaAITTIBinding(LollmsTTIBinding):
         return {"status": False, "message": "Failed to query Novita AI account balance."}
 
     def validate_key(self) -> Dict[str, Any]:
-        if not self.api_key:
-            return {"status": False, "message": "API key is missing."}
-        try:
-            response = requests.get(
-                f"{self.base_url}/model",
-                params={
-                    "filter.visibility": "public",
-                    "filter.types": "checkpoint",
-                    "pagination.limit": 1,
-                },
-                headers=self.headers,
-                timeout=15,
-            )
-            if response.status_code == 200:
-                model_count = len(response.json().get("models") or [])
-                return {"status": True, "message": f"API key is valid. Novita AI responded with {model_count} model(s)."}
-            return {
-                "status": False,
-                "message": f"Validation failed: HTTP {response.status_code}: {response.text[:200]}",
-            }
-        except Exception as e:
-            return {"status": False, "message": f"Validation failed: {e}"}
+        balance = self.get_user_balance()
+        if balance.get("status"):
+            return {"status": True, "message": f"API key is valid. Balance: {balance.get('balance_usd', 'OK')}"}
+        return {"status": False, "message": "Validation failed: Could not authenticate with Novita.ai."}
 
     def get_credits(self) -> Optional[Dict[str, float]]:
         balance = self.get_user_balance()

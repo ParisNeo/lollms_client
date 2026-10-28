@@ -5793,10 +5793,16 @@ class ChatMixin:
                     )
                 else:
                     raw_disc = personality.tools.discover_tools() if hasattr(personality.tools, "discover_tools") else []
-                    ASCIIColors.warning(
-                        f"[ChatMixin] Personality binding '{getattr(personality.tools, 'binding_name', '?')}' "
-                        f"yielded 0 chat tool specs (discovered_tools count: {len(raw_disc)})."
-                    )
+                    _binding_name = getattr(personality.tools, 'binding_name', '?')
+                    if _binding_name and str(_binding_name).lower() == "null":
+                        ASCIIColors.debug(
+                            "[ChatMixin] Personality is the null binding — no personality-derived tools expected."
+                        )
+                    else:
+                        ASCIIColors.warning(
+                            f"[ChatMixin] Personality binding '{_binding_name}' "
+                            f"yielded 0 chat tool specs (discovered_tools count: {len(raw_disc)})."
+                        )
             except Exception as ex:
                 ASCIIColors.error(f"[ChatMixin] Personality tool binding failed to produce specs: {ex}")
                 trace_exception(ex)
@@ -5946,12 +5952,50 @@ class ChatMixin:
             lcp_binding.set_session_flags({})
 
         _office_mount_outcomes: Dict[str, List[str]] = {}
-        for _lib_name, _admission in _office_mount_requests:
-            if not (lcp_binding and hasattr(lcp_binding, "mount_tool_library")):
-                ASCIIColors.warning(
-                    f"[ChatMixin] {_lib_name} requested, but no LCP binding "
-                    "with mount_tool_library is available — toolset NOT mounted."
+        # ── ON-DEMAND LCP BOOTSTRAP (FLAG-HONORING CONTRACT) ──
+        # When the calling app activated office flags, the office toolsets MUST
+        # be loaded. If the client has no tools binding, bootstrap a default
+        # in-process LCPBinding (mirrors the LollmsPersonality precedent).
+        if _office_mount_requests and (
+            lcp_binding is None or not hasattr(lcp_binding, "mount_tool_library")
+        ):
+            try:
+                from lollms_client.tools_bindings.lcp import LCPBinding
+                _default_tools_dir = (
+                    Path(__file__).resolve().parent.parent
+                    / "tools_bindings" / "lcp" / "default_tools"
                 )
+                _boot_binding = LCPBinding(
+                    tools_folders=[_default_tools_dir] if _default_tools_dir.exists() else []
+                )
+                if _is_tool_binding(_boot_binding):
+                    lcp_binding = _boot_binding
+                    try:
+                        if (
+                            hasattr(self.lollmsClient, "tools")
+                            and not hasattr(self.lollmsClient.tools, "_mock_return_value")
+                        ):
+                            self.lollmsClient.tools = lcp_binding
+                    except Exception:
+                        pass  # persisting on the client is best-effort only
+                    ASCIIColors.info(
+                        "[ChatMixin] Bootstrapped default LCPBinding on demand because "
+                        "office tool flags are active."
+                    )
+            except Exception as _e:
+                ASCIIColors.warning(
+                    f"[ChatMixin] On-demand LCPBinding bootstrap failed: {_e} — "
+                    "office toolsets will not be mounted."
+                )
+        _lcp_available = lcp_binding is not None and hasattr(lcp_binding, "mount_tool_library")
+        if _office_mount_requests and not _lcp_available:
+            ASCIIColors.info(
+                f"[ChatMixin] Office toolsets {[lib for lib, _ in _office_mount_requests]} requested, "
+                "but no tools binding is configured on the client — skipping office mount. "
+                "To enable office tools, configure a tools binding (e.g. 'lcp') via create_tools=True."
+            )
+        for _lib_name, _admission in _office_mount_requests:
+            if not _lcp_available:
                 _office_mount_outcomes[_lib_name] = []
                 continue
             try:
@@ -6009,11 +6053,17 @@ class ChatMixin:
             lib for lib, tools in _office_mount_outcomes.items() if not tools
         ] or _refused_office_libs
         if _refused_office_libs:
-            ASCIIColors.error(
-                f"[ChatMixin] Office mount failures this turn: "
-                f"{', '.join(_refused_office_libs)}. The LLM will NOT receive "
-                "office tool doctrine for these libraries."
-            )
+            if _lcp_available:
+                ASCIIColors.error(
+                    f"[ChatMixin] Office mount failures this turn: "
+                    f"{', '.join(_refused_office_libs)}. The LLM will NOT receive "
+                    "office tool doctrine for these libraries."
+                )
+            else:
+                ASCIIColors.info(
+                    f"[ChatMixin] Office toolsets {', '.join(_refused_office_libs)} not mounted "
+                    "(no tools binding configured) — office doctrine withheld by design."
+                )
 
 
         # ── 🎯 WORKER-TIER EXECUTION DOCTRINE ──

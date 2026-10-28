@@ -4481,6 +4481,13 @@ JSON:"""
                 ASCIIColors.warning(f"[{self.name}] Failed to initialize LCPBinding: {e}")
                 lcp_binding = None
 
+        if lcp_binding is None:
+            ASCIIColors.info(
+                f"[{self.name}] No tools binding available — skipping LCP toolset mounting "
+                "(workspace/shell/python/git/computer-use libraries will not be mounted). "
+                "To enable, configure a tools binding (e.g. 'lcp') on the client."
+            )
+
         if lcp_binding and hasattr(lcp_binding, 'mount_tool_library'):
             # Update host configs dynamically
             if not hasattr(lcp_binding, "host_tool_configs") or lcp_binding.host_tool_configs is None:
@@ -4862,9 +4869,10 @@ JSON:"""
                 if t_name in all_skill_tools:
                     active_tools[t_name] = all_skill_tools[t_name]
 
-        lcp_binding = getattr(self.lollms_client, 'tools', None)
-        if not _is_tool_binding(lcp_binding) or hasattr(lcp_binding, "_mock_return_value"):
-            lcp_binding = None
+        if lcp_binding is None:
+            lcp_binding = getattr(self.lollms_client, 'tools', None)
+            if not _is_tool_binding(lcp_binding) or hasattr(lcp_binding, "_mock_return_value"):
+                lcp_binding = None
 
 
         if enable_data_tools and lcp_binding is None and (tool_files or self._resolved_workspace):
