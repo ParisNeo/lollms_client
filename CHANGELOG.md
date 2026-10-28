@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-28 01:23]
+
+- Fix chat mixin integration documentation and flags documentation
+
 ## [2026-10-28 01:07]
 
 - fix: tti-binds: chat-mixin discussion api updates.

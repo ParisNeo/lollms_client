@@ -107,6 +107,81 @@ The result dict's `context_files` are resolved to absolute existing paths and
 feed the artefact/attachment pipeline: workspace artefacts produced by the
 tool become next-round context, attached as **USER-role messages only**.
 
+### 3.1.5 Built-in tools loading (non-LCP fallback)
+
+When the discussion client has **no tools binding configured**, native LCP
+tools can still be force-loaded per turn through the explicit
+`builtin_tools_activation_list` parameter on `chat()`:
+
+```python
+result = discussion.chat(
+    "Inspect this document and summarize it",
+    builtin_tools_activation_list=["inspect_text", "read_text_file"],
+)
+```
+
+**Mechanism** (inside `_resolve_active_tools`, after the binding resolution and
+the on-demand `LCPBinding()` bootstrap attempt):
+
+1. If a valid binding **resolved** (`lcp_binding is not None`), the list is
+   **ignored** — a debug log states *"LCP takes precedence"*. This includes the
+   case where the on-demand bootstrap succeeded because data/office flags
+   forced a binding into existence; the flag-driven LCP path then owns mounts.
+2. If `lcp_binding is None`, the inventory from `list_builtin_tools()` is
+   consulted; each requested name is looked up by exact tool name and
+   registered into the turn-local `active_tools` as
+   `{name, description, parameters, callable, _source: "builtin", library}`.
+3. The **existing dispatch seam consumes `active_tools` unchanged** — the tool
+   executes via the direct-callable path (no LCP binding required) and its
+   result flows through the standard
+   `{success, error, output, file_name, context_files, ...}` normalization and
+   artefact pipeline exactly like a binding-dispatched call.
+
+**Validation & failure semantics:**
+- Entries are validated at `chat()` entry: non-list input is warned and
+  ignored; non-empty strings only; duplicates are deduplicated
+  order-preserved (`dict.fromkeys`).
+- Unknown names and entries whose spec has no callable are **warn-and-skip** —
+  activation never raises.
+- The fallback is **per-turn only**: nothing is persisted onto
+  `self.lollmsClient.tools`.
+
+The companion discovery method exposes the native catalog without a binding:
+
+```python
+def list_builtin_tools(self, category: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Enumerate native (LCP-packaged default_tools) without mutating client state.
+
+    Lazily builds a throwaway LCPBinding on the packaged default_tools folder
+    (office session flags pre-enabled so the catalogue is complete — discovery
+    only, nothing is mounted or attached to the client). `category` is a
+    case-insensitive substring filter matched against each tool's library
+    stem or name. Soft-fails to [] when LCPBinding cannot be instantiated.
+
+    Returns: [{"name", "description", "schema",
+               "parameters": [{"name", "type", "description"}, ...],
+               "library", "requires_lcp": False,   # direct-callable path, no LCP needed
+               "callable"}, ...]
+    """
+```
+
+```python
+# Discover what is available (no binding required, client state untouched)
+available = discussion.list_builtin_tools(category="workspace")
+
+# Activate directly on a client with NO tools binding configured
+discussion.chat(
+    "Inspect this document",
+    builtin_tools_activation_list=["inspect_text", "read_text_file"],
+)
+```
+
+> **Distinct from `chat(tools=[...])`**: the existing `tools` convenience
+> parameter resolves IDs **through the active binding** (`load_single_tool`)
+> and therefore requires a binding. `builtin_tools_activation_list` only fires
+> in the **absence** of a binding and bypasses LCP entirely via direct
+> callables. See §3.5 for the `tools`/`skills` additive conveniences.
+
 ### 3.2 The office-mount seam
 
 The chat mixin can mount office toolsets on demand. The seam:
@@ -181,6 +256,68 @@ The context sent to the LLM is assembled in **fixed stages** by
 5. RAG
 6. user message
 ```
+
+`chat()` also accepts additive, per-turn lists of tool identifiers and skill names instead of requiring manual configuration. These are **additive conveniences only** — flag-driven mounts and previously loaded tools are never removed or replaced:
+
+| Parameter | Type | Behavior |
+|---|---|---|
+| `tools: list[str]` | Tool IDs from the discussion's binding | Each ID is force-loaded via `load_single_tool(tool_id)` — equivalent to calling `load_tools(tools)` |
+| `skills: list[str]` | Skill names or aliases (e.g. `"pptx-mastery"`, `"pptx"`) | Each entry is matched case-insensitively by name, alias, `lollms-skill:<name>`, `<name>-skill`, or `<name>-mastery`; matched skills are loaded via `personality.load_skill_tool(...)` |
+| `builtin_tools_activation_list: Optional[List[str]]` (default `None`) | Native built-in tool names (from `list_builtin_tools()`) | **Active only when no LCP binding resolves** (auto-bootstrap failed or no flags). Ignored with a debug log when LCP is live. Unknown names warn-and-skip. See §3.1.5 |
+
+```python
+# OLD: Complex manual loading
+discussion.load_document_inspector()
+discussion.load_data_query_tool()
+
+# NEW: Unified list-based loading, resolved by the Toolset Registry
+discussion.chat(
+    "Analyze this PDF and query the database",
+    tools=["inspect_text", "execute_python_data_query"],
+    skills=["pptx-mastery"]
+)
+```
+
+Both parameters are consumed **per turn** before the RAG/artefact context injection. Skills remain in the **active persistent skill set**, but the virtual-history system message is rewritten to the **current turn's skills** so a later turn does not inherit a permanently bloated doctrine. Skills are also removed from the chat-level dynamic-tools map each turn to avoid double-counting.
+
+The discussion object also exposes two registry-backed methods so callers can enumerate what is available and request it by ID:
+
+```python
+# 1. List every dynamically loadable tool on the active LCP binding.
+#    Optionally filter by top-level category segment (e.g. "powerpoint", "workspace").
+available = discussion.list_tools(category="powerpoint")
+# → {
+#     "pptx_tools.list_slides": {"description": "...", "parameters": [...], "library": "powerpoint_tools"},
+#     ...
+# }
+
+# 2. Force-load tools by ID outside of chat().
+discussion.load_tools(["pptx_tools.list_slides", "edit_text_file"])
+```
+
+**Contracts:**
+
+```python
+def list_tools(self, category: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """Enumerate tools exposed by the discussion's LCP tools binding.
+
+    Discovery only — tools are NOT loaded/activated. Returns {} when no tools
+    binding exists or the binding cannot enumerate specs. `category` matches
+    against the dot-prefix of each spec ID (e.g. "pptx_tools" for
+    "pptx_tools.list_slides") and is matched case-insensitively.
+    """
+
+def load_tools(self, tools: Union[str, Iterable[str]]) -> List[str]:
+    """Force-load specific tools into this turn's dynamic tools registry by ID.
+
+    Uses the same `_load_single_tool` infrastructure as `chat(tools=[...])`:
+    specs are marked `_source: "dynamic"` and `library` metadata is attached.
+    Unknown IDs are skipped with a warning. Returns the list of successfully
+    loaded tool names.
+    """
+```
+
+**Implementation mapping (registry):** `list_tools()` delegates to `LollmsDiscussion._toolset_registry.list_available(category=...)` → `binding.to_chat_tool_specs()`; `load_tools()` delegates to `_toolset_registry.load_tools(tools, mark_dynamic=True)` → `binding.load_single_tool(tool_id)` per entry. The registry is the single seam — document tools, data tools, and IPC tools (see `SHARED_DAEMON_IPC.md` §5) all flow through it, with no special-case loading logic.
 
 - **`TAGS` registry** — the tag vocabulary for stage control, including
   `[SNSC]` (sensations) and `[DISCUSSION_DATA]` (discussion data).

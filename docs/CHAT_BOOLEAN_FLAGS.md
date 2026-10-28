@@ -537,7 +537,46 @@ auto-appear in a session (the same leak class fixed earlier for as-is tools).
   `workspace_file` directly on disk.
 - The turn result's `"artefacts"` array also lists them.
 
-**Legacy flag — `enable_office_files` (DEPRECATED)**: passing
+### Per-turn built-in tool activation (non-LCP): `builtin_tools_activation_list`
+
+**Not a boolean flag** — a parameter (`Optional[List[str]]`, default `None`) —
+documented here because it gates tool exposure per turn. It carries a list of
+native built-in tool names (discoverable via `discussion.list_builtin_tools()`)
+to force-load **when the client has no tools binding configured**:
+
+```python
+result = discussion.chat(
+    "Inspect this document",
+    builtin_tools_activation_list=["inspect_text", "read_text_file"],
+)
+```
+
+| Property | Value |
+|---|---|
+| Type | `Optional[List[str]]` |
+| Default | `None` |
+| Effect | When `lcp_binding is None`: each name is looked up in the builtin inventory and registered directly with its callable into the turn's tool registry — executed via the direct-callable path, no LCP infrastructure required |
+
+**Constraints:**
+- Non-empty **strings only** — validated at `chat()` entry; non-list input and
+  invalid entries are warned and skipped, never raised.
+- Duplicates are deduplicated order-preserved (`dict.fromkeys`).
+- Unknown names and uncallable specs are warn-and-skip.
+- No schema validation at activation (deferred to call time).
+- Result normalization is **identical** to LCP-dispatched tools
+  (`{success, error, output, file_name, context_files, ...}`) and feeds the
+  same artefact pipeline.
+- Per-turn only: nothing is persisted onto `self.lollmsClient.tools`.
+
+**Interaction matrix:**
+
+| `lcp_binding` state | `builtin_tools_activation_list` effect |
+|---|---|
+| Valid binding present | Ignored (debug log: LCP takes precedence) |
+| Bootstrap succeeded (flags active) | Ignored |
+| Bootstrap failed / no flags / `lcp_binding is None` | Direct-call registration; tools dispatch normally |
+
+### Legacy flag — `enable_office_files` (DEPRECATED)**: passing
 `enable_office_files=True` as a kwarg enables all three per-software flags AND
 mounts the monolithic legacy `office_files_builder` library (12 tools:
 `tool_office_build/edit/read` plus nine per-format aliases). A one-line

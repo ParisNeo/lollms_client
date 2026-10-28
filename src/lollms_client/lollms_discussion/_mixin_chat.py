@@ -4937,6 +4937,74 @@ class ChatMixin:
 
         return resolved
 
+    def list_builtin_tools(self, category: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Enumerates all built-in (LCP native) tools WITHOUT mutating the active
+        binding state. Discovery-only: tools are NOT mounted or activated.
+
+        Lazily instantiates a temporary LCPBinding on the packaged default_tools
+        folder so callers can inventory native tools (document inspection, data
+        query, workspace, shell, etc.) even when the client has no tools binding
+        configured. Office families are included (session flags fully enabled on
+        the throwaway binding) so the catalogue is complete.
+
+        Args:
+            category: Optional case-insensitive filter matched against each
+                tool's library/module stem (e.g. "workspace", "inspect_text").
+
+        Returns:
+            List of dicts: {"name", "description", "schema", "parameters",
+            "library", "requires_lcp" (always False), "callable"}.
+            Empty list when the builtin registry cannot be initialized.
+        """
+        try:
+            from lollms_client.tools_bindings.lcp import LCPBinding
+        except Exception as ex:
+            ASCIIColors.warning(f"[ChatMixin] list_builtin_tools: LCPBinding unavailable: {ex}")
+            return []
+
+        try:
+            _probe = LCPBinding()
+            if hasattr(_probe, "set_session_flags"):
+                _probe.set_session_flags({
+                    "enable_powerpoint": True,
+                    "enable_word": True,
+                    "enable_excel": True,
+                    "enable_office_files": True,
+                })
+            discovered = _probe.discover_tools()
+        except Exception as ex:
+            ASCIIColors.warning(f"[ChatMixin] list_builtin_tools: discovery failed: {ex}")
+            return []
+
+        cat_filter = (category or "").strip().lower()
+        inventory: List[Dict[str, Any]] = []
+        for entry in discovered or []:
+            t_name = entry.get("name")
+            if not t_name:
+                continue
+            library = entry.get("library") or getattr(entry.get("call"), "__module__", "") or ""
+            if cat_filter and cat_filter not in str(library).lower() and cat_filter not in t_name.lower():
+                continue
+            input_schema = entry.get("input_schema") or {}
+            params_list = []
+            for prop_name, prop_info in (input_schema.get("properties") or {}).items():
+                params_list.append({
+                    "name": prop_name,
+                    "type": prop_info.get("type", "string"),
+                    "description": prop_info.get("description", ""),
+                })
+            inventory.append({
+                "name": t_name,
+                "description": entry.get("description", ""),
+                "schema": input_schema,
+                "parameters": params_list,
+                "library": library,
+                "requires_lcp": False,
+                "callable": entry.get("call") or entry.get("callable"),
+            })
+        return inventory
+
     def _resolve_active_tools(
         self,
         personality,
@@ -5034,6 +5102,49 @@ class ChatMixin:
             except Exception as ex:
                 trace_exception(ex)
                 lcp_binding = None
+
+        # ── BUILTIN TOOLS FALLBACK (MUTUAL EXCLUSIVITY WITH LCP) ──
+        # The caller can force-load native built-in tools by explicit name via
+        # chat(builtin_tools_activation_list=[...]).
+        # - LCP binding takes precedence: when a valid binding exists, the list
+        #   is ignored (debug-logged) because the flag-driven LCP path owns
+        #   mounting.
+        # - When NO binding resolves, each name is looked up in the builtin
+        #   inventory (list_builtin_tools) and registered directly with its
+        #   callable, so the existing dispatch seam executes it via the
+        #   direct-call path (no LCP infrastructure required).
+        _builtin_requested = list(kwargs.get("builtin_tools_activation_list") or [])
+        if _builtin_requested:
+            if lcp_binding is not None:
+                _dbg(
+                    f"[ChatMixin] LCP binding active; builtin_tools_activation_list "
+                    f"{_builtin_requested} ignored (LCP takes precedence)."
+                )
+            else:
+                _inventory = self.list_builtin_tools()
+                _inv_by_name = {t["name"]: t for t in _inventory}
+                for _bt_name in _builtin_requested:
+                    _bt_spec = _inv_by_name.get(_bt_name)
+                    if _bt_spec is None:
+                        ASCIIColors.warning(
+                            f"[ChatMixin] builtin_tools_activation_list entry '{_bt_name}' "
+                            "not found in the builtin registry — skipped."
+                        )
+                        continue
+                    if _bt_spec.get("callable") is None:
+                        ASCIIColors.warning(
+                            f"[ChatMixin] Builtin tool '{_bt_name}' has no callable — skipped."
+                        )
+                        continue
+                    active_tools[_bt_name] = {
+                        "name": _bt_name,
+                        "description": _bt_spec["description"],
+                        "parameters": _bt_spec["parameters"],
+                        "callable": _bt_spec["callable"],
+                        "_source": "builtin",
+                        "library": _bt_spec["library"],
+                    }
+                    ASCIIColors.success(f"[ChatMixin] Activated builtin tool '{_bt_name}' (no LCP binding).")
 
         if lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
             if not hasattr(lcp_binding, "host_tool_configs") or lcp_binding.host_tool_configs is None:
@@ -5216,7 +5327,8 @@ class ChatMixin:
         auto_approve_python:          bool = False,
         dynamic_effort:               bool = False,
         enforce_end_tag:              bool = False,
-        
+        builtin_tools_activation_list: Optional[List[str]] = None,
+
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -5309,6 +5421,28 @@ class ChatMixin:
         resolved_max_rounds = max_nb_rounds if max_nb_rounds is not None else max_reasoning_steps
         if resolved_max_rounds is None:
             resolved_max_rounds = 20
+
+        # ── BUILTIN TOOLS ACTIVATION LIST (PER-TURN, DEDUPLICATED) ──
+        # Caller-supplied list of built-in native tool names to force-load when
+        # no LCP binding is configured. Validated (strings only), deduplicated
+        # (order-preserved), and forwarded through kwargs so both the standard
+        # and orchestrator tool-resolution paths consume it.
+        _validated_builtin_tools: List[str] = []
+        if builtin_tools_activation_list:
+            if not isinstance(builtin_tools_activation_list, (list, tuple)):
+                ASCIIColors.warning(
+                    "[ChatMixin] builtin_tools_activation_list must be a list of strings — ignored."
+                )
+            else:
+                for _entry in builtin_tools_activation_list:
+                    if isinstance(_entry, str) and _entry.strip():
+                        _validated_builtin_tools.append(_entry.strip())
+                    else:
+                        ASCIIColors.warning(
+                            f"[ChatMixin] builtin_tools_activation_list entry {_entry!r} "
+                            "is not a non-empty string — skipped."
+                        )
+        kwargs["builtin_tools_activation_list"] = list(dict.fromkeys(_validated_builtin_tools))
 
         is_infinite_rounds = resolved_max_rounds <= 0 or resolved_max_rounds == float("inf")
         if is_infinite_rounds:
@@ -5961,13 +6095,9 @@ class ChatMixin:
         ):
             try:
                 from lollms_client.tools_bindings.lcp import LCPBinding
-                _default_tools_dir = (
-                    Path(__file__).resolve().parent.parent
-                    / "tools_bindings" / "lcp" / "default_tools"
-                )
-                _boot_binding = LCPBinding(
-                    tools_folders=[_default_tools_dir] if _default_tools_dir.exists() else []
-                )
+                # LCPBinding defaults tools_folder_path to the packaged
+                # default_tools folder — no path arithmetic needed.
+                _boot_binding = LCPBinding()
                 if _is_tool_binding(_boot_binding):
                     lcp_binding = _boot_binding
                     try:
@@ -5978,9 +6108,20 @@ class ChatMixin:
                             self.lollmsClient.tools = lcp_binding
                     except Exception:
                         pass  # persisting on the client is best-effort only
+                    # ── FAIL-CLOSED GATE UNLOCK ──
+                    # The fresh binding has empty session_flags: the office-family
+                    # gate would refuse every mount ("produced 0 tool specs").
+                    # Deliver the active office flags NOW so the mount loop below
+                    # actually succeeds.
+                    if hasattr(lcp_binding, "set_session_flags"):
+                        lcp_binding.set_session_flags({
+                            "enable_powerpoint": enable_powerpoint,
+                            "enable_word": enable_word,
+                            "enable_excel": enable_excel,
+                        })
                     ASCIIColors.info(
                         "[ChatMixin] Bootstrapped default LCPBinding on demand because "
-                        "office tool flags are active."
+                        "office tool flags are active (session flags delivered)."
                     )
             except Exception as _e:
                 ASCIIColors.warning(
@@ -5988,6 +6129,18 @@ class ChatMixin:
                     "office toolsets will not be mounted."
                 )
         _lcp_available = lcp_binding is not None and hasattr(lcp_binding, "mount_tool_library")
+        # ── SESSION-FLAG DELIVERY (IDEMPOTENT) ──
+        # The office-family gate is fail-closed: mounts are refused unless the
+        # per-software flags are live on the binding. Deliver them immediately
+        # before mounting so flags activated THIS turn always take effect —
+        # whether the binding was pre-configured, bootstrapped above, or
+        # created earlier with stale/empty flags.
+        if _office_mount_requests and _lcp_available and hasattr(lcp_binding, "set_session_flags"):
+            lcp_binding.set_session_flags({
+                "enable_powerpoint": enable_powerpoint,
+                "enable_word": enable_word,
+                "enable_excel": enable_excel,
+            })
         if _office_mount_requests and not _lcp_available:
             ASCIIColors.info(
                 f"[ChatMixin] Office toolsets {[lib for lib, _ in _office_mount_requests]} requested, "
