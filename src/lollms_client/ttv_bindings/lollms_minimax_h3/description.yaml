@@ -1,14 +1,13 @@
-title: "MiniMax-H3 Omni TTV"
+title: "MiniMax-H3 Omni TTV & I2V"
 author: "ParisNeo"
-version: 1.0.0
+version: 1.1.0
 binding_name: "minimax_h3"
 description: |
   A specialized LoLLMs TTV binding for MiniMax-H3 video generation models 
   served via vLLM-Omni. 
 
-  Supports state-of-the-art text-to-video (T2VA) and first-last frame conditioning (FL2VA)
-  with strict adherence to MiniMax-H3 parameter requirements (Fixed 24 FPS, Aspect Ratios,
-  and 4.0–15.0s duration windows).
+  Supports Text-to-Video (T2VA), Single Image-to-Video (I2V), and First/Last Frame
+  Interpolation (FL2VA) using native vLLM-Omni input_reference and input_references fields.
 
   Start your server with:
     vllm serve ParisNeo/MiniMax-H3-FL2VA-FP8 \
@@ -31,7 +30,7 @@ global_input_parameters:
   - name: "timeout"
     type: "int"
     default: 600
-    description: "HTTP request timeout in seconds. Video generation with MiniMax-H3 can take several minutes."
+    description: "HTTP request timeout in seconds. Video generation can take several minutes."
 
 model_input_parameters:
   - name: "model"
@@ -42,12 +41,12 @@ model_input_parameters:
   - name: "default_aspect_ratio"
     type: "str"
     default: "16:9"
-    description: "Default video aspect ratio format ('16:9', '9:16', '1:1', '4:3', '21:9')."
+    description: "Default aspect ratio format for T2V ('16:9', '9:16', '1:1', '4:3', '21:9')."
 
   - name: "default_duration"
     type: "float"
     default: 4.0
-    description: "Video duration in seconds. Must be strictly between 4.0 and 15.0."
+    description: "Video duration in seconds. Must be between 4.0 and 15.0."
 
   - name: "default_fps"
     type: "int"
@@ -101,14 +100,35 @@ commands:
         description: "Random seed (-1 for random)."
 
   - name: "generate_video_from_image"
-    description: "First/Last Frame video generation (FL2VA mode)."
+    description: "Single image-to-video generation (FL2VA mode using input_reference)."
     params:
-      - name: "image"
-        type: "str"
-        description: "Path or base64 data string of the conditioning image."
       - name: "prompt"
         type: "str"
         description: "Motion/scene description prompt."
+      - name: "image"
+        type: "str"
+        description: "Path or base64 data string of the start image."
+      - name: "duration"
+        type: "float"
+        default: 4.0
+        description: "Duration in seconds (4.0 - 15.0)."
+      - name: "seed"
+        type: "int"
+        default: -1
+        description: "Random seed (-1 for random)."
+
+  - name: "generate_video_first_and_last_frame"
+    description: "First and last frame interpolation (FL2VA mode using input_references)."
+    params:
+      - name: "prompt"
+        type: "str"
+        description: "Motion/transition prompt."
+      - name: "start_image"
+        type: "str"
+        description: "Path or base64 string for the start frame."
+      - name: "end_image"
+        type: "str"
+        description: "Path or base64 string for the end frame."
       - name: "duration"
         type: "float"
         default: 4.0

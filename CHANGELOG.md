@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-28 02:43]
+
+- feat(lollms_minimax_h3): add TTV binding for minimax_h3 model
+
 ## [2026-10-28 01:48]
 
 - feat: add MiniMax-H3 Omni TTV binding for vLLM-Omni video generation

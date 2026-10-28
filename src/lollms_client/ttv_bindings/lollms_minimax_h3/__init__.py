@@ -1,8 +1,7 @@
 """
-MiniMax-H3 TTV (Text-to-Video) binding for lollms_client.
+MiniMax-H3 TTV & Image-to-Video binding for lollms_client.
 
-Supports video generation models served via vllm-omni:
-  - MiniMax-H3 (FL2VA / T2VA partition)
+Supports MiniMax-H3 models served via vllm-omni.
 
 Server startup example:
     vllm serve ParisNeo/MiniMax-H3-FL2VA-FP8 \
@@ -12,8 +11,9 @@ Server startup example:
 """
 
 from __future__ import annotations
-import io
+
 import base64
+import io
 import json
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -34,9 +34,9 @@ _TTV_ZOO: List[Dict[str, Any]] = [
     {
         "name": "MiniMax-H3-FL2VA-FP8",
         "hf_id": "ParisNeo/MiniMax-H3-FL2VA-FP8",
-        "description": "Optimized FP8 quantized MiniMax-H3 Text-to-Video model for vLLM-Omni",
+        "description": "Optimized FP8 quantized MiniMax-H3 Text/Image-to-Video model for vLLM-Omni",
         "size": "~35-40 GB",
-        "type": "t2va",
+        "type": "t2va/fl2va",
         "link": "https://huggingface.co/ParisNeo/MiniMax-H3-FL2VA-FP8",
     },
     {
@@ -44,7 +44,7 @@ _TTV_ZOO: List[Dict[str, Any]] = [
         "hf_id": "MiniMaxAI/MiniMax-H3",
         "description": "Original unquantized MiniMax-H3 multimodal model base",
         "size": "~100+ GB",
-        "type": "t2va",
+        "type": "t2va/fl2va",
         "link": "https://huggingface.co/MiniMaxAI/MiniMax-H3",
     },
 ]
@@ -61,18 +61,17 @@ class MiniMaxH3TTVBinding(LollmsTTVBinding):
     Parameters
     ----------
     base_url : str
-        Base URL of the running vllm-omni server,
-        e.g. "http://localhost:8002".
+        Base URL of the running vllm-omni server, e.g. "http://localhost:8002".
     model : str, optional
         Model identifier forwarded in the request body.
     default_aspect_ratio : str
-        Default video aspect ratio (e.g. "16:9", "9:16", "1:1").
+        Default video aspect ratio (e.g. "16:9", "9:16", "1:1", "4:3", "21:9").
     default_duration : float
         Default video duration in seconds (must be between 4.0 and 15.0).
     default_fps : int
-        Fixed frames per second (MiniMax-H3 enforces 24 fps).
+        Fixed frames per second (MiniMax-H3 enforces strictly 24 fps).
     timeout : int
-        HTTP request timeout in seconds (video generation can be slow).
+        HTTP request timeout in seconds (video generation can take several minutes).
     api_key : str, optional
         Bearer token, if the server requires auth.
     debug : bool
@@ -111,6 +110,15 @@ class MiniMaxH3TTVBinding(LollmsTTVBinding):
     def _generate_url(self, path: str) -> str:
         return f"{self.base_url}{path}"
 
+    def _prepare_image_bytes(self, image: Union[bytes, str, Path]) -> bytes:
+        if isinstance(image, (str, Path)):
+            path = Path(image)
+            if path.exists():
+                return path.read_bytes()
+            # If not a valid file path, assume base64 string
+            return base64.b64decode(image)
+        return image
+
     # ------------------------------------------------------------------
     # Core API
     # ------------------------------------------------------------------
@@ -130,38 +138,12 @@ class MiniMaxH3TTVBinding(LollmsTTVBinding):
     ) -> bytes:
         """
         Generate a video from a text prompt using MiniMax-H3 via vLLM-Omni.
-
-        Parameters
-        ----------
-        prompt : str
-            Text description of the desired video.
-        negative_prompt : str, optional
-            Negative guidance text.
-        aspect_ratio : str, optional
-            Video aspect ratio string ("16:9", "9:16", "1:1", "4:3", "21:9").
-        duration : float, optional
-            Video duration in seconds (4.0 to 15.0).
-        fps : int, optional
-            Frames per second (MiniMax-H3 strictly requires 24).
-        num_inference_steps : int
-            Denoising steps.
-        seed : int, optional
-            RNG seed for reproducible generation.
-        output_format : str
-            Container format hint: "mp4" or "webm".
-        task : str
-            Generation task type: "t2va" (text-to-video) or "fl2va" (first-last frame).
-
-        Returns
-        -------
-        bytes
-            Raw video bytes (MP4 container).
         """
         resolved_aspect_ratio = aspect_ratio or self.default_aspect_ratio
         resolved_duration = duration if duration is not None else self.default_duration
         resolved_fps = fps or self.default_fps
 
-        # Build multipart/form-data payload as required by vLLM-Omni video endpoints
+        # Form data fields for vLLM-Omni /v1/videos/sync endpoint
         data: Dict[str, Any] = {
             "prompt": prompt,
             "aspect_ratio": resolved_aspect_ratio,
@@ -178,7 +160,7 @@ class MiniMaxH3TTVBinding(LollmsTTVBinding):
         if seed is not None and seed != -1:
             data["seed"] = seed
 
-        # MiniMax-H3 requires task and duration inside extra_params JSON payload
+        # MiniMax-H3 requires task and duration inside extra_params JSON string
         extra_params = {
             "task": task,
             "duration": resolved_duration,
@@ -209,7 +191,6 @@ class MiniMaxH3TTVBinding(LollmsTTVBinding):
         if "video" in content_type or "octet-stream" in content_type:
             return resp.content
 
-        # Fallback for JSON envelope
         try:
             res_json = resp.json()
             if "video" in res_json:
@@ -225,7 +206,6 @@ class MiniMaxH3TTVBinding(LollmsTTVBinding):
         prompt: str,
         image: Union[bytes, str, Path],
         negative_prompt: Optional[str] = None,
-        aspect_ratio: Optional[str] = None,
         duration: Optional[float] = None,
         fps: Optional[int] = None,
         num_inference_steps: int = 30,
@@ -233,25 +213,14 @@ class MiniMaxH3TTVBinding(LollmsTTVBinding):
         **kwargs,
     ) -> bytes:
         """
-        First/Last Frame to Video generation (FL2VA mode) for MiniMax-H3.
+        Single Image-to-Video generation using input_reference field in vLLM-Omni.
         """
-        if isinstance(image, (str, Path)):
-            path = Path(image)
-            if path.exists():
-                image_bytes = path.read_bytes()
-            else:
-                image_bytes = base64.b64decode(image)
-        else:
-            image_bytes = image
-
-        # Pass image file bytes via files parameter in multipart form data
-        resolved_aspect_ratio = aspect_ratio or self.default_aspect_ratio
+        image_bytes = self._prepare_image_bytes(image)
         resolved_duration = duration if duration is not None else self.default_duration
         resolved_fps = fps or self.default_fps
 
         data: Dict[str, Any] = {
             "prompt": prompt,
-            "aspect_ratio": resolved_aspect_ratio,
             "fps": resolved_fps,
             "num_inference_steps": num_inference_steps,
         }
@@ -271,8 +240,9 @@ class MiniMaxH3TTVBinding(LollmsTTVBinding):
         }
         data["extra_params"] = json.dumps(extra_params)
 
+        # Correct field name for single image conditioning in vLLM-Omni
         files = {
-            "image": ("input_image.png", io.BytesIO(image_bytes), "image/png")
+            "input_reference": ("start_frame.png", io.BytesIO(image_bytes), "image/png")
         }
 
         try:
@@ -289,13 +259,82 @@ class MiniMaxH3TTVBinding(LollmsTTVBinding):
                 detail = resp.json().get("detail", resp.text)
             except Exception:
                 detail = resp.text
-            raise RuntimeError(f"MiniMax-H3 FL2VA generation failed: {detail}") from e
+            raise RuntimeError(f"MiniMax-H3 I2V generation failed [{resp.status_code}]: {detail}") from e
+        except Exception as e:
+            trace_exception(e)
+            raise RuntimeError(f"MiniMax-H3 request error: {e}") from e
+
+    def generate_video_first_and_last_frame(
+        self,
+        prompt: str,
+        start_image: Union[bytes, str, Path],
+        end_image: Union[bytes, str, Path],
+        negative_prompt: Optional[str] = None,
+        duration: Optional[float] = None,
+        fps: Optional[int] = None,
+        num_inference_steps: int = 30,
+        seed: Optional[int] = None,
+        **kwargs,
+    ) -> bytes:
+        """
+        Two-Image First & Last frame interpolation using repeated input_references 
+        and frame_indices in extra_params.
+        """
+        start_bytes = self._prepare_image_bytes(start_image)
+        end_bytes = self._prepare_image_bytes(end_image)
+
+        resolved_duration = duration if duration is not None else self.default_duration
+        resolved_fps = fps or self.default_fps
+
+        data: Dict[str, Any] = {
+            "prompt": prompt,
+            "fps": resolved_fps,
+            "num_inference_steps": num_inference_steps,
+        }
+
+        if self.model:
+            data["model"] = self.model
+
+        if negative_prompt:
+            data["negative_prompt"] = negative_prompt
+
+        if seed is not None and seed != -1:
+            data["seed"] = seed
+
+        # Set task to fl2va with frame_indices for first and last frames
+        extra_params = {
+            "task": "fl2va",
+            "duration": resolved_duration,
+            "frame_indices": [0, -1],
+        }
+        data["extra_params"] = json.dumps(extra_params)
+
+        # Pass multiple images as a list of tuples for multipart/form-data
+        files = [
+            ("input_references", ("start_frame.png", io.BytesIO(start_bytes), "image/png")),
+            ("input_references", ("end_frame.png", io.BytesIO(end_bytes), "image/png")),
+        ]
+
+        try:
+            resp = self._session.post(
+                self._generate_url("/v1/videos/sync"),
+                data=data,
+                files=files,
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            return resp.content
+        except requests.HTTPError as e:
+            try:
+                detail = resp.json().get("detail", resp.text)
+            except Exception:
+                detail = resp.text
+            raise RuntimeError(f"MiniMax-H3 First/Last frame generation failed: {detail}") from e
         except Exception as e:
             trace_exception(e)
             raise RuntimeError(f"MiniMax-H3 request error: {e}") from e
 
     def list_models(self, **kwargs) -> List[str]:
-        """Query running vLLM server for models via OpenAI-compatible endpoint."""
         try:
             resp = self._session.get(self._generate_url("/v1/models"), timeout=10)
             resp.raise_for_status()
