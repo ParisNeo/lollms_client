@@ -1,11 +1,15 @@
 """
 execute_python.py
-LCP toolset for sandboxed Python execution. Two single-purpose tools:
-  - tool_execute_python_code:   executes INLINE Python source (the 'code' string).
-                                Nothing is saved to disk by the tool itself.
+LCP toolset for sandboxed Python execution. Three tools:
+  - tool_create_and_execute_python_file: PREFERRED for substantial programs. Writes
+                                the given 'code' to a workspace .py file and executes
+                                it in ONE call (write + run, no round-trip waste).
   - tool_execute_python_file:   executes an EXISTING workspace .py file with optional
                                 argv-style arguments (sys.argv / argparse compatible).
                                 Read-only: never saves, creates, or overwrites files.
+  - tool_execute_python_code:   executes INLINE Python source (the 'code' string).
+                                Nothing is saved to disk by the tool itself.
+                                STRICTLY for short, punctual, throwaway snippets.
 Interception of matplotlib figures and stdout/stderr capture.
 
 When captured stdout exceeds the inline preview window, the FULL output is
@@ -33,7 +37,15 @@ from typing import Any, Dict, List, Optional, Tuple
 from ascii_colors import ASCIIColors
 
 TOOL_LIBRARY_NAME = "Execute Python"
-TOOL_LIBRARY_DESC = "Executes sandboxed Python code. PREFERRED path: persist code as a .py artifact and run it with tool_execute_python_file. tool_execute_python_code is strictly reserved for short, punctual inline snippets. Long outputs are persisted to a .log file with a head/tail preview returned inline. Returns stdout, stderr, and generated plots."
+TOOL_LIBRARY_DESC = (
+    "Executes sandboxed Python code. DEFAULT for substantial programs: "
+    "tool_create_and_execute_python_file(code=..., file_name=..., args=[...]) — "
+    "writes the .py file AND runs it in ONE call (no wasted round-trip). "
+    "Use tool_execute_python_file to RE-RUN an already-created workspace .py file. "
+    "tool_execute_python_code is strictly reserved for short, punctual inline snippets "
+    "(one-liners, quick checks). Long outputs are persisted to a .log file with a "
+    "head/tail preview returned inline. Returns stdout, stderr, and generated plots."
+)
 TOOL_LIBRARY_ICON = "🐍"
 
 AUTONOMY_LEVEL: str = "safe"
@@ -976,6 +988,165 @@ def tool_execute_python_code(code: str = "", tool_context: Optional[Any] = None)
         }
 
     return _run_python_source(code_str, "python_code", tool_context=tool_context)
+
+
+def _sanitize_python_file_name(file_name: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Validates and normalizes a target .py file name for the combined write+run tool.
+
+    Returns (clean_name, None) on success, or (None, error_message) on rejection.
+    Enforces: non-empty, no directory components, no traversal, .py extension,
+    and rejects names that collide with the tool's own log naming scheme.
+    """
+    if not isinstance(file_name, str) or not file_name.strip():
+        return None, "The 'file_name' parameter is empty. Provide a target .py file name (e.g. 'script.py')."
+
+    raw = file_name.strip()
+    if ".." in raw or "/" in raw or "\\" in raw or raw.startswith("~"):
+        return None, (
+            f"Invalid or unsafe file name: '{file_name}'. Directory components, "
+            "path traversal ('..'), and '~' are blocked. Provide a bare file name "
+            "such as 'script.py'."
+        )
+
+    name = Path(raw).name
+    if not name or name in (".", ".."):
+        return None, f"Invalid file name: '{file_name}'."
+
+    if not name.lower().endswith(".py"):
+        name = f"{name}.py"
+
+    if name.lower().startswith("exec_output_"):
+        return None, (
+            f"Reserved file name: '{name}'. Names starting with 'exec_output_' are "
+            "used for persisted execution logs. Choose a different name."
+        )
+
+    return name, None
+
+
+def tool_create_and_execute_python_file(
+    code: str = "",
+    file_name: str = "",
+    args: Optional[List[Any]] = None,
+    tool_context: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    PREFERRED tool for substantial programs: writes 'code' to a workspace .py file
+    and executes it in ONE call, returning stdout, stderr, and generated plots.
+
+    Collapses the wasteful two-call pattern (inline run, then run-file) into a
+    single round-trip. The file is written to the workspace root and executed
+    through the exact same sandboxed pipeline as 'tool_execute_python_file'
+    (matplotlib Agg, stdout/stderr capture, .log persistence, user validation).
+
+    The file is written ONLY AFTER user authorization succeeds, so a rejected
+    prompt leaves no dangling file behind. If the file already exists it is
+    overwritten (intended for iterative fixes).
+
+    SANDBOX INTEGRITY: in safe mode, process execution and shell escape calls
+    (subprocess, os.system, os.popen) are blocked.
+
+    Args:
+        code (str): The complete Python source to write and execute. Required.
+        file_name (str): Target .py file name in the workspace (bare name, no
+            directories). Required. Path traversal is blocked.
+        args (list): Optional command-line style arguments passed via sys.argv[1:].
+        tool_context: Optional host-injected ToolContext for live stdout streaming.
+    """
+    if isinstance(code, dict):
+        ASCIIColors.warning("[execute_python] Unwrapping nested dictionary parameter.")
+        code = code.get("code") or next((v for v in code.values() if isinstance(v, str)), "")
+
+    code_str = code if isinstance(code, str) else ("" if code is None else str(code))
+    if not code_str.strip():
+        return {
+            "success": False,
+            "error": (
+                "The 'code' parameter is empty. Provide the complete Python source "
+                "to write and execute. To run an existing workspace .py file instead, "
+                "call 'tool_execute_python_file'."
+            ),
+            "output": "",
+            "stderr": ""
+        }
+
+    clean_name, name_error = _sanitize_python_file_name(file_name)
+    if name_error:
+        return {
+            "success": False,
+            "error": name_error,
+            "output": "",
+            "stderr": ""
+        }
+
+    workspace_root = _get_workspace_root(tool_context)
+    target_path = (workspace_root / clean_name).resolve()
+    try:
+        target_path.relative_to(workspace_root.resolve())
+    except ValueError:
+        return {
+            "success": False,
+            "error": f"Invalid or unsafe file path: '{file_name}'. Path traversal is blocked.",
+            "output": "",
+            "stderr": ""
+        }
+
+    # Authorize BEFORE writing so a rejection leaves no dangling file behind.
+    global _AUTO_APPROVE_PYTHON
+    risky_reason = _detect_risky_operations(code_str)
+    requires_user_prompt = False
+    prompt_label = clean_name
+
+    if not _AUTO_APPROVE_PYTHON:
+        if AUTONOMY_LEVEL == "strict":
+            requires_user_prompt = True
+            prompt_label = f"[STRICT] {clean_name}"
+        elif AUTONOMY_LEVEL == "safe" and risky_reason:
+            requires_user_prompt = True
+            prompt_label = f"[RISKY: {risky_reason}] {clean_name}"
+
+    if requires_user_prompt:
+        decision, rejection_reason = _prompt_user_validation(code_str, prompt_label, args)
+        if decision == "reject":
+            reason_msg = rejection_reason or (
+                f"Risky operation detected ({risky_reason or 'Restricted operation'}) "
+                "and not authorized by operator."
+            )
+            ASCIIColors.warning(f"[execute_python] ❌ Write+execute blocked: {reason_msg}")
+            return {
+                "success": False,
+                "error": (
+                    f"🛑 BLOCKED BY SANDBOX ({AUTONOMY_LEVEL.upper()} MODE): {reason_msg}\n"
+                    "The file was NOT written and the code was NOT executed."
+                ),
+                "output": "",
+                "stderr": f"Execution rejected: {reason_msg}"
+            }
+        if decision == "always":
+            _AUTO_APPROVE_PYTHON = True
+            ASCIIColors.success("[execute_python] 🔓 Auto-approval enabled for this session.")
+
+    try:
+        target_path.write_text(code_str, encoding="utf-8")
+    except Exception as write_err:
+        return {
+            "success": False,
+            "error": f"Failed to write file '{clean_name}': {write_err}",
+            "output": "",
+            "stderr": ""
+        }
+
+    argv = _normalize_argv(clean_name, args)
+    result = _run_python_source(code_str, clean_name, argv=argv, tool_context=tool_context)
+
+    if isinstance(result, dict):
+        result["file_path"] = clean_name
+        if result.get("success"):
+            result["message"] = (
+                f"Wrote '{clean_name}' to the workspace and executed it in one call."
+            )
+    return result
 
 
 def tool_execute_python_file(
