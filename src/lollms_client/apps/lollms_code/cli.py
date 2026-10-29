@@ -267,6 +267,15 @@ This is highly recommended for large workspaces to save context tokens.
 
 [bold green]Pro-Tip:[/bold green]
 If the agent is running out of context space, manually `/load` only the files relevant to your current task.
+
+[bold yellow]Attachment Commands:[/bold yellow]
+  - [cyan]/attach <path>[/cyan]        Copy a local file into uploads/ and load it into context.
+  - [cyan]/attach-text <text>[/cyan]   Write inline text as a timestamped note in uploads/ and load it.
+  - [cyan]/upload[/cyan]               (GUI only) open the upload dialog.
+
+[bold yellow]CLI flags:[/bold yellow]
+  - [cyan]--attach PATH[/cyan]         Same as /attach (repeatable).
+  - [cyan]--attach-text TEXT[/cyan]    Same as /attach-text (repeatable).
 """
     },
     "q": {
@@ -393,6 +402,8 @@ class CodeAgentConfig:
         self.show_skills: bool = True
         self.show_progress: bool = True
         self.debug: bool = False
+        self.attach_files: list[str] = []
+        self.attach_texts: list[str] = []
 
     @property
     def active_profile_alias(self) -> str:
@@ -643,7 +654,10 @@ class CodeAgentConfig:
             config.skills_dir = str(Path(cli_args.skills_dir).resolve())
         if cli_args.handbag_path:
             config.handbag_path = str(Path(cli_args.handbag_path).resolve())
-
+        if getattr(cli_args, "attach_files", None):
+            config.attach_files = list(cli_args.attach_files)
+        if getattr(cli_args, "attach_texts", None):
+            config.attach_texts = list(cli_args.attach_texts)
         return config
 
     def save(self):
@@ -1593,6 +1607,47 @@ def get_workspace_stats(personality: LollmsPersonality) -> dict[str, Any]:
         ASCIIColors.warning(f"Failed to calculate workspace stats: {e}")
 
     return stats
+
+def _attach_paths_to_context(personality, paths: list) -> list:
+    """
+    Loads a batch of paths into the agent's visible context using the SAME
+    artefact-manager mechanism used by get_workspace_stats / the GUI's /load path.
+    Returns the list of paths that were requested.
+    """
+    if not paths:
+        return []
+    try:
+        ws_root = Path(personality._resolved_workspace).resolve()
+    except AttributeError:
+        try:
+            ws_root = Path(personality.workspace_path).resolve()
+        except Exception:
+            ws_root = Path.cwd().resolve()
+
+    rel_targets = []
+    for p in paths:
+        try:
+            rel = Path(p).resolve().relative_to(ws_root)
+            rel_targets.append(str(rel).replace("\\", "/"))
+        except ValueError:
+            rel_targets.append(str(Path(p).resolve()))
+
+    try:
+        mgr = getattr(personality, "_artefact_manager", None)
+        if mgr is not None and hasattr(mgr, "change_file_visibility"):
+            mgr.change_file_visibility(rel_targets, "load")
+            return list(paths)
+        if mgr is not None and hasattr(mgr, "load_files"):
+            mgr.load_files(rel_targets)
+            return list(paths)
+    except Exception as e:
+        ASCIIColors.warning(f"[CLI] Could not load files into context: {e}")
+    try:
+        if hasattr(personality, "load_files_into_context"):
+            personality.load_files_into_context([str(p) for p in paths])
+    except Exception as e:
+        ASCIIColors.warning(f"[CLI] Fallback context load failed: {e}")
+    return list(paths)
 
 
 class StreamRenderer:
@@ -4338,6 +4393,14 @@ Examples:
 
     parser.add_argument("-i", "--interactive", action="store_true", help="Start in interactive REPL mode.")
     parser.add_argument("--workspace", type=str, default=None, help="Path to the workspace directory. Defaults to current working directory.")
+    parser.add_argument(
+        "--attach", action="append", dest="attach_files", metavar="PATH", default=[],
+        help="Copy a local file into <workspace>/uploads/ and load it into the agent's context (repeatable).",
+    )
+    parser.add_argument(
+        "--attach-text", action="append", dest="attach_texts", metavar="TEXT", default=[],
+        help="Write inline TEXT as a timestamped note in <workspace>/uploads/ and load it into context (repeatable).",
+    )    
     parser.add_argument("-hb", "--handbag", "--handbag-path", dest="handbag_path", type=str, default=None, help="Path to a custom Handbag folder containing agent resources (SOUL.md, tools, skills, memory).")
     parser.add_argument("--model", type=str, default=None, help="Model name to use.")
     parser.add_argument("--llm-binding", type=str, default=None, help="LLM binding name.")
@@ -4520,7 +4583,15 @@ def main():
         return 1
 
     personality = create_coding_personality(config, client)
-
+    if getattr(config, "attach_files", None) or getattr(config, "attach_texts", None):
+        _n_att = materialize_attachments(
+            workspace=config.workspace_path,
+            attach_files=config.attach_files,
+            attach_texts=config.attach_texts,
+            load_into_context=lambda _p: _attach_paths_to_context(personality, _p),
+        )
+        if _n_att:
+            ASCIIColors.green(f"📎 {_n_att} attachment(s) loaded into context.")
     config.save()
 
     if mode == "single":

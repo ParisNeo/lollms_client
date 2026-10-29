@@ -32,6 +32,14 @@ from pathlib import Path
 import json
 from ascii_colors import ASCIIColors
 
+from lollms_client.apps.lollms_code.upload_utils import (
+    uploads_dir,
+    write_text_note,
+    describe_result,
+    sanitize_upload_name,
+    write_bytes_atomic,
+)
+
 
 HELP_TEXT = """\
 **Commands**
@@ -54,6 +62,9 @@ HELP_TEXT = """\
 - `/workspace <path>` — switch the active workspace directory
 - `/config` — open Settings
 - `/models` — model switching info
+- `/upload` — (GUI) opens the upload dialog (files → uploads/ + into context; text → note_<ts>.md + into context)
+- `/attach <path>` — (CLI) copies a local file into uploads/ and loads it into context
+- `/attach-text <text>` — (CLI) writes text as a note and loads it into context
 
 Anything else is sent to the agent as a task.
 
@@ -1080,24 +1091,103 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
             stop_button.bind_visibility_from(session, "busy")
             send_button = ui.button(icon="send").props("round dense size=md color=primary")
 
-    # ---- Upload dialog (drop a file straight into the workspace root) ----
+    # ---- Upload dialog (files → uploads/ + into context; text → note_<ts>.md + into context) ----
+    def _load_paths_into_context(paths: List[Path]) -> List[Path]:
+        """Loads the given absolute paths into the agent's context via the same
+        bridge used by `/load`. Returns the list of paths that were requested."""
+        if not paths:
+            return []
+        try:
+            session.ensure_ready()
+        except Exception as e:
+            ui.notify(f"Agent not ready: {e}", type="warning")
+            return []
+        try:
+            ws_root = Path(prefs.workspace_path).resolve()
+            rel_targets: List[str] = []
+            for p in paths:
+                try:
+                    rel_targets.append(str(Path(p).resolve().relative_to(ws_root)).replace("\\", "/"))
+                except ValueError:
+                    # Outside workspace — pass absolute; bridge will reject if unsupported
+                    rel_targets.append(str(Path(p).resolve()))
+            result = agent_bridge.change_file_visibility(session.personality, rel_targets, "load")
+            status = result.get("status_str", "")
+            if status and ("❌" in status or "BLOCKED" in status):
+                ui.notify(status, type="warning")
+        except Exception as e:
+            ui.notify(f"Could not load into context: {e}", type="warning")
+        return paths
+
+    def _handle_text_upload(text: str) -> None:
+        if not text or not text.strip():
+            ui.notify("Nothing to send", type="warning")
+            return
+        try:
+            target = write_text_note(prefs.workspace_path, text.strip(), stem="note")
+        except (ValueError, OSError) as e:
+            ui.notify(f"Failed to save note: {e}", type="negative")
+            return
+        try:
+            _load_paths_into_context([target])
+        except Exception as e:
+            ui.notify(f"Note saved but not loaded: {e}", type="warning")
+        refresh_workspace_tree()
+        ui.notify(f"📝 Note saved → {describe_result(target)}", type="positive")
+
     upload_dialog = ui.dialog()
-    with upload_dialog, ui.card().classes("w-[420px]"):
-        ui.label("Upload to workspace root").classes("font-bold")
+    with upload_dialog, ui.card().classes("w-[520px]"):
+        ui.label("Upload to workspace").classes("font-bold")
+        ui.label("Files are saved under uploads/ and loaded into the agent's context.").classes(
+            "text-xs opacity-70"
+        )
 
         def handle_upload(e):
             try:
                 ws_root = Path(prefs.workspace_path).resolve()
-                dest = ws_root / e.name
-                dest.write_bytes(e.content.read())
-                ui.notify(f"Uploaded {e.name}", type="positive")
-                upload_dialog.close()
+                target_dir = uploads_dir(ws_root)
+                raw_name = getattr(getattr(e, "file", None), "name", None) or getattr(e, "name", "upload.bin")
+                safe_name = sanitize_upload_name(raw_name)
+                target = target_dir / safe_name
+
+                # NiceGUI modern: e.file.read() returns bytes; legacy: e.content is file-like
+                file_obj = getattr(e, "file", None)
+                if file_obj is not None and hasattr(file_obj, "read"):
+                    data = file_obj.read()
+                    if isinstance(data, str):
+                        data = data.encode("utf-8")
+                    write_bytes_atomic(target, data)
+                else:
+                    content = getattr(e, "content", None)
+                    if content is None:
+                        raise ValueError("No file content available in upload event.")
+                    data = content.read() if hasattr(content, "read") else content
+                    if isinstance(data, str):
+                        data = data.encode("utf-8")
+                    write_bytes_atomic(target, data)
+
+                _load_paths_into_context([target])
                 refresh_workspace_tree()
+                ui.notify(f"📎 {describe_result(target)}", type="positive")
             except Exception as ex:
                 notify_error(f"Upload failed: {ex}")
 
-        ui.upload(on_upload=handle_upload, auto_upload=True).props("flat dense accept='*'").classes("w-full")
-        with ui.row().classes("w-full justify-end mt-2"):
+        ui.upload(
+            on_upload=handle_upload,
+            auto_upload=True,
+            multiple=True,
+        ).props("flat dense accept='*'").classes("w-full")
+
+        ui.separator()
+        ui.label("Or paste text as a note file").classes("text-xs opacity-70")
+        note_input = ui.textarea(
+            placeholder="Paste any text here — it will be saved as a timestamped .md note and loaded into context"
+        ).classes("w-[32rem]").props("outlined autogrow")
+        with ui.row().classes("gap-2 mt-2"):
+            ui.button(
+                "📝 Send as note file",
+                on_click=lambda: (_handle_text_upload(note_input.value or ""), note_input.set_value("")),
+            ).props("color=primary")
             ui.button("Close", on_click=upload_dialog.close).props("flat")
 
     def add_user_bubble(text: str, persist: bool = True) -> str:
@@ -3356,6 +3446,10 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                 add_system_notice(result.get("status_str", "Files unloaded."))
             except Exception as e:
                 add_system_notice(f"Could not unload files: {e}", is_error=True)
+            return True
+
+        if cmd == "/upload":
+            upload_dialog.open()
             return True
 
         if cmd in ("/load", "/unload", "/lock", "/hide", "/unhide"):

@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-29 23:55]
+
+- feat(lollms_code): add new features to CLI and GUI
+
 ## [2026-10-29 23:25]
 
 - fix(chat): update chat mixin logic and extend personality documentation
