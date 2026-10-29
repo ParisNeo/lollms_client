@@ -5322,7 +5322,7 @@ class ChatMixin:
                     if t_name in ("tool_find_files", "tool_grep_files", "tool_list_files", "tool_read_file", "tool_write_file") and enable_workspace_tools:
                         active_tools[t_name] = t_spec
                     # Core execution
-                    elif t_name in ("tool_execute_python_code", "tool_execute_python_file") and enable_code_execution:
+                    elif t_name in ("tool_execute_python_code", "tool_execute_python_file", "tool_create_and_execute_python_file") and enable_code_execution:
                         active_tools[t_name] = t_spec
                     # Contextual data query
                     elif t_name in ("tool_execute_python_data_query", "tool_get_table_schema", "tool_query_database_sql") and enable_data_tools and has_data_files:
@@ -5337,7 +5337,7 @@ class ChatMixin:
                 t_name = td.get("name", "")
                 if t_name not in active_tools:
                     if (t_name == "tool_execute_python_data_query" and enable_data_tools and has_data_files) or \
-                       (t_name in ("tool_execute_python_code", "tool_execute_python_file") and enable_code_execution) or \
+                       (t_name in ("tool_execute_python_code", "tool_execute_python_file", "tool_create_and_execute_python_file") and enable_code_execution) or \
                        (t_name in ("tool_read_lines", "tool_read_chars", "tool_grep_file") and enable_code_execution) or \
                        (t_name.startswith(("tool_inspect_document", "tool_read_document_content", "tool_grep_document", "tool_modify_docx", "tool_modify_excel", "tool_edit_document_text", "tool_annotate_document", "tool_modify_pdf_annotation", "tool_modify_pptx_slide")) and enable_data_tools and has_doc_files):
                         params_list = []
@@ -9492,21 +9492,29 @@ class ChatMixin:
                                 f"   c) Provide your final analysis answer.\n"
                                 f"   Do NOT run another SQL query unless you need genuinely different data.\n"
                             )
-                        elif tool_name in ("tool_execute_python_code", "tool_execute_python_file"):
+                        elif tool_name in ("tool_execute_python_code", "tool_execute_python_file", "tool_create_and_execute_python_file"):
                             next_step_guidance = (
-                                f"6. 🐍 **CODE EXECUTION & FILE ORIENTATION**: 'tool_execute_python_code' runs inline "
-                                f"Python (the 'code' parameter) and never saves files. 'tool_execute_python_file' runs "
-                                f"an EXISTING workspace .py file ('file_name' parameter) and is read-only. The sandbox "
-                                f"CWD IS the workspace root: files created via <artifact> tags sit as siblings of your "
-                                f"code, so import them directly ('from rlc_filter import RLCFilter') with NO 'workspace/' "
-                                f"prefix and NO sys.path manipulation. To persist a new script for later reuse, emit an "
-                                f"<artifact type=\"code\" name=\"...\"> tag first, then run it with "
-                                f"'tool_execute_python_file'.\n"
+                                f"6. 🐍 **CODE EXECUTION & FILE ORIENTATION**: Three complementary tools exist:\n"
+                                f"   • 'tool_execute_python_code' — runs INLINE Python (the 'code' parameter) and "
+                                f"NEVER saves files. Best for tiny throwaway snippets.\n"
+                                f"   • 'tool_execute_python_file' — runs an EXISTING workspace .py file "
+                                f"('file_name' parameter). Read-only: it does NOT create or modify files.\n"
+                                f"   • 'tool_create_and_execute_python_file' — **THE CREATE-THEN-EXECUTE PRIMITIVE**: "
+                                f"writes a new .py file into the workspace AND immediately runs it in one atomic "
+                                f"call. Use this whenever you need to CREATE a script and then EXECUTE it — it is "
+                                f"the canonical path for any non-trivial program (optimization loops, simulations, "
+                                f"multi-function scripts, plotting pipelines, data processing). It saves the file "
+                                f"for later reuse AND runs it in the same step, eliminating the two-step "
+                                f"'emit artifact → tool_execute_python_file' dance.\n"
+                                f"   The sandbox CWD IS the workspace root: files created via <artifact> tags or "
+                                f"'tool_create_and_execute_python_file' sit as siblings of your code, so import "
+                                f"them directly ('from rlc_filter import RLCFilter') with NO 'workspace/' prefix "
+                                f"and NO sys.path manipulation.\n"
                                 f"   🚨 **SIZE DOCTRINE**: 'tool_execute_python_code' accepts a MAXIMUM of 2000 "
                                 f"characters. Larger programs are hard-rejected at the gate. For ANY substantial "
-                                f"program (optimization loops, simulations, multi-function scripts, plotting "
-                                f"pipelines), ALWAYS use the artifact + 'tool_execute_python_file' path. Never "
-                                f"attempt to squeeze a large program inline.\n"
+                                f"program, ALWAYS use 'tool_create_and_execute_python_file' (create + run in one "
+                                f"shot) or, if the file already exists, 'tool_execute_python_file'. Never attempt "
+                                f"to squeeze a large program inline.\n"
                             )
 
                         screenshot_instr = ""

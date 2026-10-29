@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-29 23:25]
+
+- fix(chat): update chat mixin logic and extend personality documentation
+
 ## [2026-10-29 17:10]
 
 - fix(execute_python): update python execution tool implementation and description

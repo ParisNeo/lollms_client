@@ -578,6 +578,146 @@ A no-op personality substituted when `personality=None` is passed to `chat()`. I
 
 ---
 
+## Personalities & Handbags
+
+This section introduces the two-layer model that powers every LoLLMS agent: the **`LollmsPersonality`** (the runtime brain) and the **`Handbag`** (the self-contained resource folder). For the full canonical narrative — including a complete runnable build example, the authoritative directory reference, and best-practices — see [`docs/PERSONALITIES_AND_HANDBAGS.md`](../../../docs/PERSONALITIES_AND_HANDBAGS.md).
+
+### What is a personality?
+
+A `LollmsPersonality` is the **runtime brain** of an agent. It is a plain Python object that carries:
+
+- `name` — a non-empty display name.
+- `system_prompt` — the persona/identity text (never `None`).
+- `tools` — a tool binding (never `None`; a `_NullToolBinding` when no tools are configured).
+- `tool_specs()` — a dict of tool specifications (never raises).
+- `query_data(q)` — a normalized RAG result dict (never raises).
+- `has_data` — a boolean indicating whether any RAG source is attached.
+- Optional stateful components: a `SkillsManager`, a `DocNavigator`, a `FailureMemory`, and a `LollmsMemoryManager`.
+
+A personality can be created in code (stateless, minimal) or loaded from a **Handbag** (stateful, fully-armed). The `LollmsPersonality` design contract guarantees that `bool(personality)` is `False` only for the `NullPersonality` sentinel, so the chat loop can run without `if personality:` guards.
+
+### What is a Handbag? (the self-contained agent folder)
+
+A **Handbag** is a single directory that carries **all** of an agent's resources: its soul, its tools, its skills, its RAG knowledge, its assets, its memory database, its documents, and its writable workspace. It is discovered by the `Handbag` class in `lollms_personality/handbag.py`.
+
+```python
+from lollms_client.lollms_personality.handbag import Handbag
+
+hb = Handbag("./my_agent_handbag")
+print(hb.tool_files)      # discovered *.py tool files
+print(hb.rag_files)       # discovered RAG source files
+print(hb.skills_dirs)     # registered skill libraries
+print(hb.memory_db_path)  # sqlite:///.../memory/memory.db (or None)
+```
+
+The constructor takes a path, validates that it is an existing directory (raising `ValueError` otherwise), and then **auto-discovers** every sub-resource. Nothing else is required — the folder *is* the agent.
+
+### Handbag directory layout (table)
+
+| Path | Attribute | Discovery rule |
+| :--- | :--- | :--- |
+| `SOUL.md` | `soul_path` | The agent's persona/identity text. |
+| `handbag.yaml` | `manifest` | Parsed YAML dict (safe load; `{}` on error). Declares e.g. `extra_knowledge_bases`. |
+| `coworkers/` | `coworkers_dir` | Co-worker definitions (sub-agents / crewmates). |
+| `tools/` | `tools_dir` → `tool_files` | Every `*.py` file (recursively one level into subdirs), excluding `__init__.py`. |
+| `skills/` | `skills_dir` → `skills_dirs` | Canonical `SKILL.md` library. `register_skills_dir()` appends extra app-shipped libraries. |
+| `assets/` | `assets_dir` → `assets` | Media/config assets loaded into a `Dict[str, str]`. |
+| `memory/` | `memory_dir` → `memory_db_path` | If present, `memory_db_path = sqlite:///<memory/memory.db>`. Absent ⇒ `None`. |
+| `rag/` | `rag_dir` → `rag_files` | All non-hidden files, recursively (`rglob("*")`, files only, skip names starting with `.`). |
+| `docs/` | `docs_dir` | Documents for the `DocNavigator`. |
+| `workspace/` | `workspace_dir` | The agent's writable sandbox root. |
+| `handbag.yaml:extra_knowledge_bases` | `extra_knowledge_bases` / `extra_safe_stores` | Plain paths → `extra_knowledge_bases`; `.db` files (case-insensitive) → opened as safe stores in `extra_safe_stores`. |
+
+### Building a Handbag — step by step
+
+A Handbag is just a directory tree. You can build one with `Path.mkdir()` and `write_text()`:
+
+```python
+from pathlib import Path
+from lollms_client.lollms_personality.handbag import Handbag
+
+root = Path("./my_agent_handbag")
+
+# 1. Create the directory tree
+for sub in ("tools", "rag", "assets", "skills", "docs", "workspace", "memory"):
+    (root / sub).mkdir(parents=True, exist_ok=True)
+
+# 2. Write the soul (the agent's identity)
+(root / "SOUL.md").write_text(
+    "# Research Assistant\n\n"
+    "You are a meticulous research assistant. Cite sources, verify claims, "
+    "and never fabricate references.\n",
+    encoding="utf-8",
+)
+
+# 3. Write the manifest (declares extra knowledge bases)
+(root / "handbag.yaml").write_text(
+    "extra_knowledge_bases:\n"
+    "  - ./shared/company_handbook.md\n"
+    "  - ./shared/archive.db\n",
+    encoding="utf-8",
+)
+
+# 4. Drop a tool
+(root / "tools" / "my_tool.py").write_text(
+    "def tool_echo(text: str) -> dict:\n"
+    "    '''Echoes the input text back.'''\n"
+    "    return {'success': True, 'output': text}\n",
+    encoding="utf-8",
+)
+
+# 5. Drop a RAG source
+(root / "rag" / "notes.md").write_text(
+    "# Notes\n\nKey fact: the sky is blue.\n", encoding="utf-8"
+)
+
+# 6. Drop a skill
+(root / "skills" / "SKILL.md").write_text(
+    "---\ntitle: Citation Style\ndescription: How to cite sources.\n---\n\n"
+    "Always cite with author, year, and title.\n",
+    encoding="utf-8",
+)
+
+# 7. Discover everything
+hb = Handbag(root)
+print("tools:", [p.name for p in hb.tool_files])
+print("rag:", [p.name for p in hb.rag_files])
+print("skills:", [p.name for p in hb.skills_dirs])
+print("manifest:", hb.manifest)
+print("memory_db_path:", hb.memory_db_path)
+```
+
+### Wiring a Handbag into a LollmsPersonality
+
+Once a Handbag exists, `LollmsPersonality.from_handbag()` consumes it and wires every discovered resource into the runtime:
+
+- `hb.tool_files` → the personality's tool binding.
+- `hb.rag_files` + `hb.extra_safe_stores` → the RAG source.
+- `hb.skills_dirs` → the `SkillsManager`.
+- `hb.docs_dir` → the `DocNavigator`.
+- `hb.soul_path` → the system prompt seed.
+- `hb.memory_db_path` → the `FailureMemory` / `LollmsMemoryManager`.
+
+```python
+from lollms_client.lollms_personality import LollmsPersonality
+
+personality = LollmsPersonality.from_handbag("./my_agent_handbag")
+response = discussion.chat(user_message="Summarize my notes.", personality=personality)
+```
+
+For a fully working end-to-end example, see [`examples/handbag_agent_example.py`](../../../examples/handbag_agent_example.py).
+
+### See also
+
+- [`docs/PERSONALITIES_AND_HANDBAGS.md`](../../../docs/PERSONALITIES_AND_HANDBAGS.md) — the canonical narrative (anatomy, programmatic construction, wiring, worked example, best practices).
+- [`examples/handbag_agent_example.py`](../../../examples/handbag_agent_example.py) — minimal agent from a Handbag.
+- [`examples/handbag_rag_skills_example.py`](../../../examples/handbag_rag_skills_example.py) — RAG + skills from a Handbag.
+- [`examples/handbag_docs_example.py`](../../../examples/handbag_docs_example.py) — documents + `DocNavigator`.
+- [`examples/agentic_personality_tools_example.py`](../../../examples/agentic_personality_tools_example.py) — agentic tool use.
+- [`docs/lcp/07_PERSONALITY_INTEGRATION.md`](../../../docs/lcp/07_PERSONALITY_INTEGRATION.md) and [`docs/lcp/10_TOOLSET_AUTHORING_GUIDE.md`](../../../docs/lcp/10_TOOLSET_AUTHORING_GUIDE.md) — deeper LCP integration.
+
+---
+
 ## 📡 5. Event Modes & Streaming Protocol (Live Telemetry)
 
 When using the independent `LollmsPersonality.chat()` method (outside of a `LollmsDiscussion`), you can control how execution telemetry is reported to the `streaming_callback` using the `event_mode` parameter.
