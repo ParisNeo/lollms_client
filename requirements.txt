@@ -4,7 +4,7 @@ pillow
 pipmaster>=1.1.13
 tiktoken
 pydantic
-numpy
+numpy>=2.0,<3
 jsonschema
 prompt-toolkit>=3.0.0
 pymupdf4llm==1.28.0

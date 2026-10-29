@@ -1,16 +1,5 @@
 """
-vLLM-Omni TTV (Text-to-Video) binding for lollms_client.
-
-Supports video generation models served via vllm-omni:
-  - Wan2.1/2.2 T2V, I2V, TI2V
-  - HunyuanVideo 1.5
-  - LTX-2 / LTX-2.3
-  - Cosmos3 T2V/I2V/V2V
-
-Server startup example:
-    vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-        --deploy-config vllm_omni/deploy/wan_t2v.yaml \
-        --omni --port 8000 --trust-remote-code
+vLLM-Omni / MiniMax-H3 Self-Managed TTV binding for lollms_client.
 """
 
 from __future__ import annotations
@@ -18,461 +7,410 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import requests
-from ascii_colors import trace_exception
+from ascii_colors import ASCIIColors, trace_exception
 
 from lollms_client.lollms_ttv_binding import LollmsTTVBinding
 
-# Required by LollmsTTVBindingManager – must match the class name below.
 BindingName = "VllmOmniTTVBinding"
 
-
-# ---------------------------------------------------------------------------
-# Model zoo: curated list of vLLM-Omni text-to-video models
-# ---------------------------------------------------------------------------
 _TTV_ZOO: List[Dict[str, Any]] = [
     {
-        "name": "Wan2.1-T2V-1.3B",
-        "hf_id": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
-        "description": "Wan 2.1 text-to-video, 1.3B lightweight model",
-        "size": "~3 GB",
-        "type": "t2v",
-        "link": "https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        "name": "MiniMax-H3-FL2VA-FP8",
+        "hf_id": "ParisNeo/MiniMax-H3-FL2VA-FP8",
+        "description": "Optimized FP8 pre-quantized MiniMax-H3 video model for single GPU (A100 40G)",
+        "size": "~35-40 GB",
+        "type": "t2va/fl2va",
+        "link": "https://huggingface.co/ParisNeo/MiniMax-H3-FL2VA-FP8",
     },
     {
-        "name": "Wan2.1-T2V-14B",
-        "hf_id": "Wan-AI/Wan2.1-T2V-14B-Diffusers",
-        "description": "Wan 2.1 text-to-video, 14B flagship model",
-        "size": "~28 GB",
-        "type": "t2v",
-        "link": "https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers",
-    },
-    {
-        "name": "Wan2.2-T2V-A14B",
-        "hf_id": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
-        "description": "Wan 2.2 text-to-video MoE, ~14B active params",
-        "size": "~28 GB",
-        "type": "t2v",
-        "link": "https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers",
-    },
-    {
-        "name": "Wan2.2-TI2V-5B",
-        "hf_id": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
-        "description": "Wan 2.2 text-image-to-video, 5B",
-        "size": "~10 GB",
-        "type": "ti2v",
-        "link": "https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers",
-    },
-    {
-        "name": "Wan2.2-I2V-A14B",
-        "hf_id": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-        "description": "Wan 2.2 image-to-video MoE, ~14B active params",
-        "size": "~28 GB",
-        "type": "i2v",
-        "link": "https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-    },
-    {
-        "name": "HunyuanVideo-1.5-T2V-480p",
-        "hf_id": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v",
-        "description": "HunyuanVideo 1.5, text-to-video 480p",
-        "size": "~30 GB",
-        "type": "t2v",
-        "link": "https://huggingface.co/hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v",
-    },
-    {
-        "name": "HunyuanVideo-1.5-T2V-720p",
-        "hf_id": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v",
-        "description": "HunyuanVideo 1.5, text-to-video 720p",
-        "size": "~30 GB",
-        "type": "t2v",
-        "link": "https://huggingface.co/hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v",
-    },
-    {
-        "name": "LTX-2-T2V",
-        "hf_id": "Lightricks/LTX-2",
-        "description": "LTX-2 text-to-video by Lightricks",
-        "size": "~20 GB",
-        "type": "t2v",
-        "link": "https://huggingface.co/Lightricks/LTX-2",
-    },
-    {
-        "name": "Cosmos3-Nano-T2V",
-        "hf_id": "nvidia/Cosmos3-Nano",
-        "description": "NVIDIA Cosmos3 Nano: T2I / T2V / I2V / V2V",
-        "size": "~8 GB",
-        "type": "t2v",
-        "link": "https://huggingface.co/nvidia/Cosmos3-Nano",
+        "name": "MiniMax-H3-Original",
+        "hf_id": "MiniMaxAI/MiniMax-H3",
+        "description": "Original unquantized MiniMax-H3 multimodal base model",
+        "size": "~100+ GB",
+        "type": "t2va/fl2va",
+        "link": "https://huggingface.co/MiniMaxAI/MiniMax-H3",
     },
 ]
 
 
-# ---------------------------------------------------------------------------
-# Binding implementation
-# ---------------------------------------------------------------------------
-
 class VllmOmniTTVBinding(LollmsTTVBinding):
-    """
-    lollms TTV binding for vLLM-Omni video generation endpoints.
-
-    vLLM-Omni exposes an OpenAI-compatible REST API for diffusion-based
-    video generation (Wan, HunyuanVideo, LTX-2, Cosmos3, …).
-
-    The generation endpoint follows the convention:
-        POST /v1/video/generate
-    with a JSON body mirroring the diffusers pipeline kwargs.
-
-    Parameters
-    ----------
-    base_url : str
-        Base URL of the running vllm-omni server,
-        e.g. "http://localhost:8000".
-    model : str, optional
-        Model identifier forwarded in the request body.
-        If None the server's loaded model is used.
-    default_num_frames : int
-        Default number of frames to request (fps × duration).
-    default_height : int
-        Default video height in pixels.
-    default_width : int
-        Default video width in pixels.
-    default_fps : int
-        Default frames-per-second hint forwarded to the pipeline.
-    timeout : int
-        HTTP request timeout in seconds (video gen can be slow).
-    api_key : str, optional
-        Bearer token, if the server requires auth.
-    debug : bool
-        Enable verbose error traces.
-    """
-
     def __init__(
         self,
-        base_url: str = "http://localhost:8000",
-        model: Optional[str] = None,
-        default_num_frames: int = 49,
-        default_height: int = 480,
-        default_width: int = 832,
-        default_fps: int = 16,
-        timeout: int = 300,
+        server_mode: str = "remote",
+        base_url: str = "http://localhost:8002",
+        model: str = "ParisNeo/MiniMax-H3-FL2VA-FP8",
         api_key: Optional[str] = None,
+        venv_path: str = "./venv_vllm_omni",
+        models_dir: str = "./models/vllm_omni",
+        gpus: str = "0",
+        gpu_memory_utilization: float = 0.90,
+        port: int = 8002,
+        auto_start_server: bool = True,
+        default_aspect_ratio: str = "16:9",
+        default_duration: float = 4.0,
+        default_fps: int = 24,
+        timeout: int = 600,
         debug: bool = False,
         **kwargs,
     ):
-        super().__init__(binding_name="vllm_omni", debug=debug, **kwargs)
+        super().__init__(binding_name="vllm_omni_ttv", debug=debug, **kwargs)
 
+        self.server_mode = server_mode.lower().strip()
         self.base_url = base_url.rstrip("/")
         self.model = model
-        self.default_num_frames = default_num_frames
-        self.default_height = default_height
-        self.default_width = default_width
+        self.api_key = api_key
+        
+        self.venv_path = Path(venv_path).resolve()
+        self.models_dir = Path(models_dir).resolve()
+        self.gpus = str(gpus)
+        self.gpu_memory_utilization = float(gpu_memory_utilization)
+        self.port = int(port)
+        self.auto_start_server = auto_start_server
+
+        self.default_aspect_ratio = default_aspect_ratio
+        self.default_duration = default_duration
         self.default_fps = default_fps
         self.timeout = timeout
 
+        self.process: Optional[subprocess.Popen] = None
+
         self._session = requests.Session()
-        if api_key:
-            self._session.headers.update({"Authorization": f"Bearer {api_key}"})
-        self._session.headers.update({"Content-Type": "application/json"})
+        if self.api_key:
+            self._session.headers.update({"Authorization": f"Bearer {self.api_key}"})
+
+        # Ensure directories exist
+        self.models_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Environment & Server Management Methods
     # ------------------------------------------------------------------
 
-    def _generate_url(self, path: str) -> str:
-        return f"{self.base_url}{path}"
+    def get_python_executable(self) -> Path:
+        """Returns the Python executable path within the configured venv."""
+        if os.name == "nt":
+            return self.venv_path / "Scripts" / "python.exe"
+        return self.venv_path / "bin" / "python"
 
-    def _build_payload(
-        self,
-        prompt: str,
-        negative_prompt: Optional[str],
-        num_frames: int,
-        height: int,
-        width: int,
-        fps: int,
-        num_inference_steps: int,
-        guidance_scale: float,
-        seed: Optional[int],
-        extra: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "prompt": prompt,
-            "num_frames": num_frames,
-            "height": height,
-            "width": width,
-            "fps": fps,
-            "num_inference_steps": num_inference_steps,
-            "guidance_scale": guidance_scale,
-        }
-        if self.model:
-            payload["model"] = self.model
-        # Qwen-Image-Edit and other models may require negative_prompt to be present (even if empty)
-        payload["negative_prompt"] = negative_prompt if negative_prompt is not None else ""
-        if seed is not None:
-            payload["seed"] = seed
-        payload.update(extra)
-        return payload
+    def get_vllm_executable(self) -> Path:
+        """Returns the vllm CLI executable path within the configured venv."""
+        if os.name == "nt":
+            return self.venv_path / "Scripts" / "vllm.exe"
+        return self.venv_path / "bin" / "vllm"
+
+    def install_environment(self, **kwargs) -> Dict[str, Any]:
+        """Creates the virtualenv and installs vllm and vllm-omni."""
+        try:
+            ASCIIColors.info(f"Creating virtual environment at {self.venv_path}...")
+            subprocess.run([sys.executable, "-m", "venv", str(self.venv_path)], check=True)
+
+            py_bin = self.get_python_executable()
+            ASCIIColors.info("Upgrading pip and installing wheel/setuptools...")
+            subprocess.run([str(py_bin), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"], check=True)
+
+            ASCIIColors.info("Installing vllm and vllm-omni packages...")
+            subprocess.run([str(py_bin), "-m", "pip", "install", "vllm>=0.32.0", "vllm-omni>=0.32.0", "huggingface_hub"], check=True)
+
+            return {"status": True, "message": f"Environment successfully initialized at {self.venv_path}"}
+        except Exception as e:
+            trace_exception(e)
+            return {"status": False, "message": f"Environment installation failed: {str(e)}"}
+
+    def start_server(self, **kwargs) -> Dict[str, Any]:
+        """Launches the vLLM-Omni server process in managed mode."""
+        if self.health_check():
+            return {"status": True, "message": "Server is already running and healthy."}
+
+        vllm_bin = self.get_vllm_executable()
+        if not vllm_bin.exists():
+            return {"status": False, "message": f"vLLM executable not found at {vllm_bin}. Run install_environment() first."}
+
+        # Select model source: local directory if downloaded, or HF repo ID
+        local_model_path = self.models_dir / self.model.replace("/", "--")
+        target_model = str(local_model_path) if local_model_path.exists() else self.model
+
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = self.gpus
+        env["HF_HOME"] = str(self.models_dir)
+
+        cmd = [
+            str(vllm_bin), "serve", target_model,
+            "--host", "0.0.0.1" if os.name != "nt" else "127.0.0.1",
+            "--port", str(self.port),
+            "--tensor-parallel-size", "1",
+            "--max-model-len", "4096",
+            "--gpu-memory-utilization", str(self.gpu_memory_utilization),
+            "--init-timeout", "1200",
+            "--stage-init-timeout", "1200",
+            "--omni",
+            "--task-type", "fl2va",
+            "--trust-remote-code",
+            "--vae-use-slicing",
+            "--vae-use-tiling",
+            "--enable-layerwise-offload",
+            "--cache-backend", "cache_dit",
+        ]
+
+        ASCIIColors.info(f"Starting managed vLLM-Omni server on GPUs [{self.gpus}] port {self.port}...")
+        try:
+            self.process = subprocess.Popen(cmd, env=env)
+            
+            # Wait for server readiness
+            start_time = time.time()
+            while time.time() - start_time < 300:
+                if self.health_check():
+                    ASCIIColors.success("vLLM-Omni server successfully started and ready!")
+                    return {"status": True, "message": "Server started successfully."}
+                if self.process.poll() is not None:
+                    return {"status": False, "message": f"Server process exited unexpectedly with code {self.process.returncode}."}
+                time.sleep(3)
+
+            return {"status": False, "message": "Timed out waiting for server to start."}
+        except Exception as e:
+            trace_exception(e)
+            return {"status": False, "message": f"Failed to launch server: {e}"}
+
+    def stop_server(self, **kwargs) -> Dict[str, Any]:
+        """Stops the managed server process to free VRAM."""
+        if self.process and self.process.poll() is None:
+            ASCIIColors.info("Terminating managed vLLM-Omni server process...")
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+            self.process = None
+            return {"status": True, "message": "Server process stopped."}
+        return {"status": True, "message": "No active managed server process was running."}
 
     # ------------------------------------------------------------------
-    # Core API
+    # Model Pulling & Zoo
     # ------------------------------------------------------------------
+
+    def pull_model(self, model_name: str, **kwargs) -> Dict[str, Any]:
+        """Downloads model weights from Hugging Face into the configured models_dir."""
+        try:
+            from huggingface_hub import snapshot_download
+
+            target_dir = self.models_dir / model_name.replace("/", "--")
+            ASCIIColors.info(f"Downloading {model_name} into {target_dir}...")
+            
+            download_path = snapshot_download(
+                repo_id=model_name,
+                local_dir=target_dir,
+                ignore_patterns=["*.msgpack", "*.h5", "flax_model*"],
+            )
+            return {"status": True, "path": download_path, "message": f"Successfully pulled {model_name}"}
+        except Exception as e:
+            trace_exception(e)
+            return {"status": False, "message": f"Failed to pull model: {str(e)}"}
+
+    def install_model(self, model_name: str, **kwargs) -> Dict[str, Any]:
+        return self.pull_model(model_name, **kwargs)
+
+    def get_zoo(self) -> List[Dict[str, Any]]:
+        return _TTV_ZOO
+
+    def download_from_zoo(self, index: int, progress_callback: Optional[Callable[[dict], None]] = None) -> Dict[str, Any]:
+        if index < 0 or index >= len(_TTV_ZOO):
+            return {"status": False, "message": f"Index {index} out of range"}
+        entry = _TTV_ZOO[index]
+        return self.pull_model(entry["hf_id"])
+
+    # ------------------------------------------------------------------
+    # Generation Logic
+    # ------------------------------------------------------------------
+
+    def _ensure_server_ready(self):
+        if self.server_mode == "managed" and self.auto_start_server and not self.health_check():
+            res = self.start_server()
+            if not res["status"]:
+                raise RuntimeError(f"Managed server auto-start failed: {res['message']}")
+
+    def _prepare_image_bytes(self, image: Union[bytes, str, Path]) -> bytes:
+        if isinstance(image, (str, Path)):
+            path = Path(image)
+            if path.exists():
+                return path.read_bytes()
+            return base64.b64decode(image)
+        return image
 
     def generate_video(
         self,
         prompt: str,
         negative_prompt: Optional[str] = None,
-        num_frames: Optional[int] = None,
-        height: Optional[int] = None,
-        width: Optional[int] = None,
+        aspect_ratio: Optional[str] = None,
+        duration: Optional[float] = None,
         fps: Optional[int] = None,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 5.0,
+        num_inference_steps: int = 30,
         seed: Optional[int] = None,
-        output_format: str = "mp4",
+        task: str = "t2va",
         **kwargs,
     ) -> bytes:
-        """
-        Generate a video from a text prompt using vLLM-Omni.
+        self._ensure_server_ready()
 
-        Parameters
-        ----------
-        prompt : str
-            Text description of the desired video.
-        negative_prompt : str, optional
-            Negative guidance text.
-        num_frames : int, optional
-            Number of frames. Defaults to ``self.default_num_frames``.
-        height : int, optional
-            Video height in pixels.
-        width : int, optional
-            Video width in pixels.
-        fps : int, optional
-            Frames per second hint.
-        num_inference_steps : int
-            Denoising steps (higher = better quality, slower).
-        guidance_scale : float
-            Classifier-free guidance strength.
-        seed : int, optional
-            RNG seed for reproducible generation.
-        output_format : str
-            Container format hint: "mp4" or "webm".
-        **kwargs
-            Extra pipeline kwargs forwarded verbatim to the server
-            (e.g. ``image`` as base64 for I2V models).
+        data: Dict[str, Any] = {
+            "prompt": prompt,
+            "aspect_ratio": aspect_ratio or self.default_aspect_ratio,
+            "fps": fps or self.default_fps,
+            "num_inference_steps": num_inference_steps,
+        }
+        if self.model:
+            data["model"] = self.model
+        if negative_prompt:
+            data["negative_prompt"] = negative_prompt
+        if seed is not None and seed != -1:
+            data["seed"] = seed
 
-        Returns
-        -------
-        bytes
-            Raw video bytes (MP4 / WebM container).
-
-        Raises
-        ------
-        RuntimeError
-            On HTTP error or unexpected server response.
-        """
-        payload = self._build_payload(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            num_frames=num_frames or self.default_num_frames,
-            height=height or self.default_height,
-            width=width or self.default_width,
-            fps=fps or self.default_fps,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            seed=seed,
-            extra={"output_format": output_format, **kwargs},
-        )
+        extra_params = {
+            "task": task,
+            "duration": duration if duration is not None else self.default_duration,
+        }
+        extra_params.update(kwargs.get("extra_params", {}))
+        data["extra_params"] = json.dumps(extra_params)
 
         try:
             resp = self._session.post(
-                self._generate_url("/v1/video/generate"),
-                json=payload,
+                f"{self.base_url}/v1/videos/sync",
+                data=data,
                 timeout=self.timeout,
             )
             resp.raise_for_status()
+            return resp.content
         except requests.HTTPError as e:
             try:
                 detail = resp.json().get("detail", resp.text)
             except Exception:
                 detail = resp.text
-            raise RuntimeError(
-                f"vLLM-Omni generation failed [{resp.status_code}]: {detail}"
-            ) from e
-        except requests.RequestException as e:
-            trace_exception(e)
-            raise RuntimeError(f"vLLM-Omni request error: {e}") from e
-
-        # The server may return raw bytes or a JSON envelope with b64 video.
-        content_type = resp.headers.get("Content-Type", "")
-        if "video" in content_type or "octet-stream" in content_type:
-            return resp.content
-
-        # JSON envelope: {"video": "<base64>", "format": "mp4"}
-        try:
-            data = resp.json()
-            if "video" in data:
-                return base64.b64decode(data["video"])
-            raise RuntimeError(
-                f"Unexpected JSON response from vLLM-Omni: {list(data.keys())}"
-            )
-        except (json.JSONDecodeError, KeyError) as e:
-            raise RuntimeError(
-                f"Could not parse vLLM-Omni response. "
-                f"Content-Type: {content_type}, body[:200]: {resp.text[:200]}"
-            ) from e
+            raise RuntimeError(f"MiniMax-H3 T2V generation failed [{resp.status_code}]: {detail}") from e
 
     def generate_video_from_image(
         self,
         prompt: str,
         image: Union[bytes, str, Path],
         negative_prompt: Optional[str] = None,
-        num_frames: Optional[int] = None,
-        height: Optional[int] = None,
-        width: Optional[int] = None,
+        duration: Optional[float] = None,
         fps: Optional[int] = None,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 5.0,
+        num_inference_steps: int = 30,
         seed: Optional[int] = None,
         **kwargs,
     ) -> bytes:
-        """
-        Image-to-video generation (I2V / TI2V models).
+        self._ensure_server_ready()
 
-        Parameters
-        ----------
-        image : bytes | str | Path
-            Input image as raw bytes, a file path, or a base64 string.
-        All other params identical to ``generate_video``.
-        """
-        if isinstance(image, (str, Path)):
-            path = Path(image)
-            if path.exists():
-                image_b64 = base64.b64encode(path.read_bytes()).decode()
-            else:
-                # Assume already base64
-                image_b64 = str(image)
-        else:
-            image_b64 = base64.b64encode(image).decode()
+        image_bytes = self._prepare_image_bytes(image)
+        data: Dict[str, Any] = {
+            "prompt": prompt,
+            "fps": fps or self.default_fps,
+            "num_inference_steps": num_inference_steps,
+        }
+        if self.model:
+            data["model"] = self.model
+        if negative_prompt:
+            data["negative_prompt"] = negative_prompt
+        if seed is not None and seed != -1:
+            data["seed"] = seed
 
-        return self.generate_video(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            num_frames=num_frames,
-            height=height,
-            width=width,
-            fps=fps,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            seed=seed,
-            image=image_b64,
-            **kwargs,
-        )
+        extra_params = {
+            "task": "fl2va",
+            "duration": duration if duration is not None else self.default_duration,
+        }
+        data["extra_params"] = json.dumps(extra_params)
 
-    def list_models(self, **kwargs) -> List[str]:
-        """
-        Query the running vLLM-Omni server for its loaded model(s).
+        files = {
+            "input_reference": ("start_frame.png", io.BytesIO(image_bytes), "image/png")
+        }
 
-        Falls back to querying the standard OpenAI /v1/models endpoint.
-        Returns only the model ID strings.
-        """
         try:
-            resp = self._session.get(
-                self._generate_url("/v1/models"),
-                timeout=10,
+            resp = self._session.post(
+                f"{self.base_url}/v1/videos/sync",
+                data=data,
+                files=files,
+                timeout=self.timeout,
             )
             resp.raise_for_status()
-            data = resp.json()
-            return [m["id"] for m in data.get("data", [])]
-        except Exception as e:
-            if self.debug:
-                trace_exception(e)
-            # If the server is not reachable, return zoo names as fallback
-            return [entry["name"] for entry in _TTV_ZOO]
+            return resp.content
+        except requests.HTTPError as e:
+            try:
+                detail = resp.json().get("detail", resp.text)
+            except Exception:
+                detail = resp.text
+            raise RuntimeError(f"MiniMax-H3 I2V generation failed [{resp.status_code}]: {detail}") from e
 
-    # ------------------------------------------------------------------
-    # Zoo
-    # ------------------------------------------------------------------
-
-    def get_zoo(self) -> List[Dict[str, Any]]:
-        """Return the curated list of supported vLLM-Omni video models."""
-        return _TTV_ZOO
-
-    def download_from_zoo(
+    def generate_video_first_and_last_frame(
         self,
-        index: int,
-        progress_callback: Optional[Callable[[dict], None]] = None,
-    ) -> dict:
-        """
-        Pull a model from HuggingFace Hub using huggingface_hub.
+        prompt: str,
+        start_image: Union[bytes, str, Path],
+        end_image: Union[bytes, str, Path],
+        negative_prompt: Optional[str] = None,
+        duration: Optional[float] = None,
+        fps: Optional[int] = None,
+        num_inference_steps: int = 30,
+        seed: Optional[int] = None,
+        **kwargs,
+    ) -> bytes:
+        self._ensure_server_ready()
 
-        Parameters
-        ----------
-        index : int
-            Index into the list returned by ``get_zoo()``.
-        progress_callback : callable, optional
-            Called with ``{"status": str, "progress": float, "model": str}``.
+        start_bytes = self._prepare_image_bytes(start_image)
+        end_bytes = self._prepare_image_bytes(end_image)
 
-        Returns
-        -------
-        dict
-            ``{"status": True, "path": str}`` on success,
-            ``{"status": False, "message": str}`` on failure.
-        """
-        if index < 0 or index >= len(_TTV_ZOO):
-            return {"status": False, "message": f"Index {index} out of range"}
+        data: Dict[str, Any] = {
+            "prompt": prompt,
+            "fps": fps or self.default_fps,
+            "num_inference_steps": num_inference_steps,
+        }
+        if self.model:
+            data["model"] = self.model
+        if negative_prompt:
+            data["negative_prompt"] = negative_prompt
+        if seed is not None and seed != -1:
+            data["seed"] = seed
 
-        entry = _TTV_ZOO[index]
-        hf_id = entry["hf_id"]
+        extra_params = {
+            "task": "fl2va",
+            "duration": duration if duration is not None else self.default_duration,
+            "frame_indices": [0, -1],
+        }
+        data["extra_params"] = json.dumps(extra_params)
+
+        files = [
+            ("input_references", ("start_frame.png", io.BytesIO(start_bytes), "image/png")),
+            ("input_references", ("end_frame.png", io.BytesIO(end_bytes), "image/png")),
+        ]
 
         try:
-            from huggingface_hub import snapshot_download
-
-            if progress_callback:
-                progress_callback({"status": "starting", "progress": 0.0, "model": hf_id})
-
-            local_dir = snapshot_download(
-                repo_id=hf_id,
-                ignore_patterns=["*.msgpack", "*.h5", "flax_model*"],
+            resp = self._session.post(
+                f"{self.base_url}/v1/videos/sync",
+                data=data,
+                files=files,
+                timeout=self.timeout,
             )
-
-            if progress_callback:
-                progress_callback({"status": "done", "progress": 1.0, "model": hf_id})
-
-            return {"status": True, "path": local_dir, "model": hf_id}
-
-        except ImportError:
-            msg = "huggingface_hub is required: pip install huggingface_hub"
-            return {"status": False, "message": msg}
-        except Exception as e:
-            trace_exception(e)
-            return {"status": False, "message": str(e)}
-
-    # ------------------------------------------------------------------
-    # Health / convenience
-    # ------------------------------------------------------------------
+            resp.raise_for_status()
+            return resp.content
+        except requests.HTTPError as e:
+            try:
+                detail = resp.json().get("detail", resp.text)
+            except Exception:
+                detail = resp.text
+            raise RuntimeError(f"MiniMax-H3 First/Last frame generation failed [{resp.status_code}]: {detail}") from e
 
     def health_check(self) -> bool:
-        """Return True if the vLLM-Omni server is reachable and healthy."""
         try:
-            resp = self._session.get(
-                self._generate_url("/health"), timeout=5
-            )
+            resp = self._session.get(f"{self.base_url}/health", timeout=5)
             return resp.status_code == 200
         except Exception:
             return False
 
-    def server_info(self) -> Dict[str, Any]:
-        """
-        Fetch server metadata (model, version, GPU info) from /info or
-        /v1/models and return as a dict. Returns empty dict on failure.
-        """
-        for path in ("/info", "/v1/models"):
-            try:
-                resp = self._session.get(self._generate_url(path), timeout=5)
-                if resp.status_code == 200:
-                    return resp.json()
-            except Exception:
-                pass
-        return {}
+    def list_models(self, **kwargs) -> List[str]:
+        try:
+            resp = self._session.get(f"{self.base_url}/v1/models", timeout=10)
+            resp.raise_for_status()
+            return [m["id"] for m in resp.json().get("data", [])]
+        except Exception:
+            return [entry["name"] for entry in _TTV_ZOO]

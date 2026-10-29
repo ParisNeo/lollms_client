@@ -1,5 +1,17 @@
 - OK Create an extract structured data that uses pydentic validators
 - OK Add actions to bindings. Each action has its own parameters and can be called by the app. Define the parameters in the yaml
 - Images must be used for decision making
-ChatMixin._stream_final_answer() got multiple values for argument 'temperature'
 - the description.yaml is not bundled with the module. fix that
+
+LOG:
+
+
+oct. 29 09:29:03 aitiana bash[444498]:   File "/data/code/prod/lollms_chat/venv/lib/python3.13/site-packages/openai/_base_client.py", line 1259, in post
+oct. 29 09:29:03 aitiana bash[444498]:     return cast(ResponseT, self.request(cast_to, opts, stream=stream, stream_cls=stream_cls))
+oct. 29 09:29:03 aitiana bash[444498]:                            ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+oct. 29 09:29:03 aitiana bash[444498]:   File "/data/code/prod/lollms_chat/venv/lib/python3.13/site-packages/openai/_base_client.py", line 1047, in request
+oct. 29 09:29:03 aitiana bash[444498]:     raise self._make_status_error_from_response(err.response) from None
+oct. 29 09:29:03 aitiana bash[444498]: openai.BadRequestError: Error code: 400 - {'error': {'message': "This model's maximum context length is 131072 tokens. However, your prompt contains at least 131073 input tokens, which exceeds this limit even without any output tokens. Please reduce the length of the input prompt. (parameter=input_tokens, value=131073)", 'type': 'BadRequestError', 'param': 'input_tokens', 'code': 400}}
+
+
+When the llm client hits an error, the final client is not receiving the real reason of that erro. make sure we forward the errors to the calling app.

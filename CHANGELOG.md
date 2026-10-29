@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-29 12:46]
+
+- chore: pin numpy version to >=2.0,<3 and update todo list
+
 ## [2026-10-28 03:25]
 
 - fix: Update version string from incomplete entry to full version; Enhance websearch binding with search API support.

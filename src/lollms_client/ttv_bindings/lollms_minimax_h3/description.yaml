@@ -1,139 +1,143 @@
-title: "MiniMax-H3 Omni TTV & I2V"
+title: "vLLM-Omni / MiniMax-H3 TTV (Self-Managed)"
 author: "ParisNeo"
-version: 1.1.0
-binding_name: "minimax_h3"
+version: 2.0.0
+binding_name: "vllm_omni_ttv"
 description: |
-  A specialized LoLLMs TTV binding for MiniMax-H3 video generation models 
-  served via vLLM-Omni. 
-
-  Supports Text-to-Video (T2VA), Single Image-to-Video (I2V), and First/Last Frame
-  Interpolation (FL2VA) using native vLLM-Omni input_reference and input_references fields.
-
-  Start your server with:
-    vllm serve ParisNeo/MiniMax-H3-FL2VA-FP8 \
-      --omni --task-type fl2va --trust-remote-code \
-      --enable-layerwise-offload --cache-backend cache_dit \
-      --port 8002
+  Dual-mode binding for vLLM-Omni and MiniMax-H3 video generation models.
+  
+  Mode 1 (remote): Connects to an external running vLLM-Omni server.
+  Mode 2 (managed): LoLLMs manages, starts, stops, and configures the local 
+  vLLM-Omni server process, virtual environment, and local HF models cache.
 
 global_input_parameters:
+  - name: "server_mode"
+    type: "str"
+    default: "remote"
+    options: ["remote", "managed"]
+    description: "'remote' to connect to an external server, 'managed' to let LoLLMs manage a local vLLM-Omni process."
+
   - name: "base_url"
     type: "str"
     default: "http://localhost:8002"
-    description: "Full base URL of the running vLLM-Omni server (e.g., http://localhost:8002)."
+    description: "URL of the vLLM-Omni server endpoint."
 
   - name: "api_key"
     type: "str"
     default: ""
-    description: "Optional Bearer token if authentication is enabled on the server."
+    description: "Optional Bearer token if authorization is required."
     is_secret: true
+
+  - name: "venv_path"
+    type: "str"
+    default: "./venv_vllm_omni"
+    description: "[Managed Mode] Path to Python virtual environment containing vllm and vllm-omni."
+
+  - name: "models_dir"
+    type: "str"
+    default: "./data/models/vllm_omni"
+    description: "[Managed Mode] Path to local directory storing downloaded Hugging Face model checkpoints."
+
+  - name: "gpus"
+    type: "str"
+    default: "0"
+    description: "[Managed Mode] CUDA_VISIBLE_DEVICES string (e.g. '0', '0,1', '2')."
+
+  - name: "gpu_memory_utilization"
+    type: "float"
+    default: 0.90
+    description: "[Managed Mode] VRAM allocation limit fraction (0.50 - 0.95)."
+
+  - name: "port"
+    type: "int"
+    default: 8002
+    description: "[Managed Mode] Port number on which to launch the local server."
+
+  - name: "auto_start_server"
+    type: "bool"
+    default: true
+    description: "[Managed Mode] Automatically launch the server if not running when a generation request is made."
 
   - name: "timeout"
     type: "int"
     default: 600
-    description: "HTTP request timeout in seconds. Video generation can take several minutes."
+    description: "HTTP request timeout in seconds."
 
 model_input_parameters:
   - name: "model"
     type: "str"
     default: "ParisNeo/MiniMax-H3-FL2VA-FP8"
-    description: "Model identifier forwarded to the server."
+    description: "Model ID or path forwarded to the server."
 
   - name: "default_aspect_ratio"
     type: "str"
     default: "16:9"
-    description: "Default aspect ratio format for T2V ('16:9', '9:16', '1:1', '4:3', '21:9')."
+    description: "Default aspect ratio ('16:9', '9:16', '1:1', '4:3', '21:9')."
 
   - name: "default_duration"
     type: "float"
     default: 4.0
-    description: "Video duration in seconds. Must be between 4.0 and 15.0."
+    description: "Video duration in seconds (4.0 to 15.0)."
 
   - name: "default_fps"
     type: "int"
     default: 24
-    description: "Frames-per-second. MiniMax-H3 output frame rate is strictly fixed at 24."
+    description: "Fixed frame rate required by MiniMax-H3 (strictly 24)."
 
   - name: "num_inference_steps"
     type: "int"
     default: 30
-    description: "Number of denoising steps (recommended: 30)."
-
-  - name: "output_format"
-    type: "str"
-    default: "mp4"
-    description: "Output container format ('mp4')."
+    description: "Denoising steps."
 
 commands:
   - name: "health_check"
-    description: "Ping the server /health endpoint to check readiness."
+    description: "Check if the target server is online."
     params: []
 
-  - name: "server_info"
-    description: "Fetch server metadata from /info or /v1/models."
+  - name: "start_server"
+    description: "[Managed Mode] Launch the local vLLM-Omni server process."
     params: []
 
-  - name: "list_models"
-    description: "Query running server for loaded models via /v1/models."
+  - name: "stop_server"
+    description: "[Managed Mode] Stop the running local server to free VRAM."
     params: []
+
+  - name: "install_environment"
+    description: "[Managed Mode] Create virtualenv and install vllm & vllm-omni."
+    params: []
+
+  - name: "pull_model"
+    description: "[Managed Mode] Download model weights from Hugging Face."
+    params:
+      - name: "model_name"
+        type: "str"
+        description: "Hugging Face repository ID (e.g., ParisNeo/MiniMax-H3-FL2VA-FP8)."
 
   - name: "generate_video"
-    description: "Text-to-video generation using MiniMax-H3."
+    description: "Text-to-Video generation."
     params:
       - name: "prompt"
         type: "str"
-        description: "Detailed text prompt describing the video."
-      - name: "negative_prompt"
-        type: "str"
-        default: ""
-        description: "Negative prompt to guide generation away from unwanted elements."
-      - name: "aspect_ratio"
-        type: "str"
-        default: "16:9"
-        description: "Aspect ratio override ('16:9', '9:16', '1:1', etc.)."
-      - name: "duration"
-        type: "float"
-        default: 4.0
-        description: "Duration in seconds (4.0 - 15.0)."
-      - name: "seed"
-        type: "int"
-        default: -1
-        description: "Random seed (-1 for random)."
+        description: "Prompt text."
 
   - name: "generate_video_from_image"
-    description: "Single image-to-video generation (FL2VA mode using input_reference)."
+    description: "Single Image-to-Video generation."
     params:
       - name: "prompt"
         type: "str"
-        description: "Motion/scene description prompt."
+        description: "Prompt text."
       - name: "image"
         type: "str"
-        description: "Path or base64 data string of the start image."
-      - name: "duration"
-        type: "float"
-        default: 4.0
-        description: "Duration in seconds (4.0 - 15.0)."
-      - name: "seed"
-        type: "int"
-        default: -1
-        description: "Random seed (-1 for random)."
+        description: "File path or base64 data string."
 
   - name: "generate_video_first_and_last_frame"
-    description: "First and last frame interpolation (FL2VA mode using input_references)."
+    description: "First & Last frame transition interpolation."
     params:
       - name: "prompt"
         type: "str"
-        description: "Motion/transition prompt."
+        description: "Prompt text."
       - name: "start_image"
         type: "str"
-        description: "Path or base64 string for the start frame."
+        description: "Path or base64 string for start frame."
       - name: "end_image"
         type: "str"
-        description: "Path or base64 string for the end frame."
-      - name: "duration"
-        type: "float"
-        default: 4.0
-        description: "Duration in seconds (4.0 - 15.0)."
-      - name: "seed"
-        type: "int"
-        default: -1
-        description: "Random seed (-1 for random)."
+        description: "Path or base64 string for end frame."
