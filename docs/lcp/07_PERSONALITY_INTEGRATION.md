@@ -161,7 +161,102 @@ tool execution through it:
 
 ---
 
-## 7. Key invariants
+## 7. Building a personality from a handbag (with extra knowledge bases)
+
+The canonical constructor is `LollmsPersonality.from_handbag(...)`. It reads
+the handbag folder (`SOUL.md`, `tools/`, `skills/`, `rag/`, `docs/`,
+`memory/`, `workspace/`) and produces a fully wired personality.
+
+### 7.1 Signature
+
+```python
+LollmsPersonality.from_handbag(
+    path: str | Path,
+    lollms_client: LollmsClient,
+    extra_knowledge_bases: None | str | Path | list[str | Path] = None,
+    # ...other optional overrides (name, capabilities, role, ...)
+)
+```
+
+### 7.2 `extra_knowledge_bases` format
+
+| Accepted value | Result |
+|---|---|
+| `None` | Only the handbag's own `rag/` and `docs/` sources are used. |
+| `"path/to/file.md"` | Single file added as an extra RAG source. |
+| `Path("path/to/dir")` | Directory added; **recursively scanned** for files. |
+| `["a.md", Path("b_dir"), "c.pdf"]` | Mixed list of files and directories. |
+
+**Rules**
+
+1. Each entry must be a `str` or `Path`. Anything else raises `TypeError`.
+2. Entries are `expanduser().resolve()`-ed and **deduplicated**.
+3. Non-existent entries are **skipped with a warning** (the handbag still
+   loads — extra KBs are optional by design).
+4. Directories are scanned recursively by the RAG layer, mirroring
+   `Handbag._load_rag_files()` semantics.
+5. Extra KBs are **merged** with the handbag's native `rag/` + `docs/`
+   sources — they never replace them.
+
+### 7.3 Declarative form (`handbag.yaml`)
+
+Extra KBs can also be declared inside the handbag manifest so they travel
+with the handbag:
+
+```yaml
+# handbag.yaml
+name: DevOpsArchitect
+extra_knowledge_bases:
+  - ../shared_runbooks
+  - ./vendor_docs/kubernetes.md
+```
+
+`Handbag` normalizes these at load time via
+`Handbag.normalize_extra_knowledge_bases(...)` and exposes them as
+`handbag.extra_knowledge_bases: list[Path]`.
+
+### 7.4 End-to-end example
+
+```python
+from pathlib import Path
+from lollms_client.lollms_config_cli_env import get_client_from_env
+from lollms_client.lollms_personality import LollmsPersonality
+
+client = get_client_from_env(create_llm=True)
+
+agent = LollmsPersonality.from_handbag(
+    path=Path("./data_workspace/devops_handbag"),
+    lollms_client=client,
+    extra_knowledge_bases=[
+        Path("./data_workspace/shared_runbooks"),   # directory → recursive
+        "./data_workspace/vendor_docs/kubernetes.md",  # single file
+    ],
+)
+
+# The agent now answers from BOTH the handbag's rag/ and the extra KBs.
+result = agent.chat("What is the P0 escalation SLA?")
+```
+
+### 7.5 What happens under the hood
+
+```
+from_handbag(path, extra_knowledge_bases=[...])
+        │
+        ├─ Handbag(path)                       # loads SOUL, tools, skills, rag, docs
+        │     └─ normalize_extra_knowledge_bases(...)   # validate + dedupe
+        │
+        ├─ _init_data_sources()                # registers rag/ + docs/ + extra KBs
+        │
+        └─ _init_tools()                       # wires LCP binding from tools/
+```
+
+The extra KBs flow through the same `RAGDataSource` pipeline as the handbag's
+native sources, so `agent.has_data`, `agent.query_data(...)`, and
+`tool_query_rag` all see them transparently.
+
+---
+
+## 8. Key invariants
 
 - The personality is the **capability owner**: flags, discovery, mounts, and
   the WCD all live here; the chat mixin consumes what it prepares.

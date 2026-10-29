@@ -34,6 +34,7 @@ Browse by category:
 - [web_search.md](web_search.md) *(covers the `internet_search` alias)*
 
 ## Tools & Security
+- [../TOOLCALLING_FORMAT.md](../TOOLCALLING_FORMAT.md) — **the tool-calling wire format** (`<tool>`, `<tool_result>`, `<done/>`, registry rules, anti-loop guards)
 - [enable_data_tools.md](enable_data_tools.md)
 - [enable_code_execution.md](enable_code_execution.md)
 - [auto_approve_python.md](auto_approve_python.md)

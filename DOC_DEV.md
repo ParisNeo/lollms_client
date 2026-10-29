@@ -191,6 +191,17 @@ These methods leverage the active LLM binding for their core AI operations.
 ### Utilities & Types
 (Content remains the same, though `lollms_functions.py` and `lollms_tasks.py` are gone)
 
+## 4.5. Knowledge Base Resolution (Handbag & `extra_knowledge_bases`)
+
+When a handbag is loaded (or when `extra_knowledge_bases` is supplied to `LollmsPersonality.from_handbag`), each knowledge-base path is resolved by extension:
+
+| Extension | Treatment |
+|-----------|-----------|
+| `.db`, `.sqlite`, `.sqlite3` | Opened as a **safe_store** datastore; queries go through `store.search()`. |
+| anything else | Ingested as a plain document and chunked into the personality's RAG index. |
+
+This applies uniformly to files discovered under the handbag's `rag/` and `doc/` folders and to paths passed explicitly via `extra_knowledge_bases`. The detection helper is `_is_safe_store_path()` in `lollms_personality.py`.
+
 ## 5. Adding New Bindings (A Practical Guide)
 
 ### General Steps for Modality Bindings (LLM, TTS, TTI, STT, TTM, TTV)

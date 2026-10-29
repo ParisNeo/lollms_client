@@ -23,6 +23,11 @@ from lollms_client.lollms_discussion import LollmsDiscussion
 from lollms_client.lollms_llm_binding import LollmsLLMBinding
 from lollms_client.lollms_types import ELF_COMPLETION_FORMAT, MSG_TYPE
 from lollms_client.lollms_utilities import encode_image
+from lollms_client.llm_bindings._dsml_utils import (
+    _DSMLStreamFilter,
+    _extract_dsml_from_text,
+    _format_tool_calls_to_lollms_xml,
+)
 
 
 BindingName = "LollmsBinding"
@@ -1102,11 +1107,15 @@ class LollmsBinding(LollmsLLMBinding):
 
                 if stream:
                     handler = _StreamThinkingHandler(streaming_callback, suppress_thinking=is_thinking_deactivated)
+                    dsml_filter = _DSMLStreamFilter(handler)
+
                     for resp in chat_completion:
                         if self.is_cancelled():
                             break
+
                         if count >= (n_predict or float("inf")):
                             break
+
                         if not resp.choices:
                             continue
 
@@ -1121,10 +1130,11 @@ class LollmsBinding(LollmsLLMBinding):
                             continue
 
                         if content:
-                            if not handler.process_content(content):
+                            if not dsml_filter.feed(content):
                                 break
                             count += 1
 
+                    dsml_filter.flush()
                     output = handler.flush()
                 else:
                     message_obj = chat_completion.choices[0].message
@@ -1377,6 +1387,9 @@ class LollmsBinding(LollmsLLMBinding):
 
             if stream:
                 handler = _StreamThinkingHandler(streaming_callback, suppress_thinking=is_thinking_deactivated)
+                dsml_filter = _DSMLStreamFilter(handler)
+                accumulated_tool_calls: Dict[int, Dict[str, Any]] = {}
+
                 for chunk in completion:
                     if self.is_cancelled():
                         break
@@ -1392,20 +1405,73 @@ class LollmsBinding(LollmsLLMBinding):
                         continue
 
                     if content:
-                        if not handler.process_content(content):
+                        if not dsml_filter.feed(content):
                             break
 
+                    if hasattr(delta, "tool_calls") and delta.tool_calls:
+                        for tc_delta in delta.tool_calls:
+                            idx = tc_delta.index
+                            if idx not in accumulated_tool_calls:
+                                accumulated_tool_calls[idx] = {
+                                    "id": tc_delta.id,
+                                    "name": tc_delta.function.name if tc_delta.function else "",
+                                    "arguments": "",
+                                }
+                            else:
+                                if tc_delta.function and tc_delta.function.name:
+                                    accumulated_tool_calls[idx]["name"] = tc_delta.function.name
+
+                            if tc_delta.function and tc_delta.function.arguments:
+                                accumulated_tool_calls[idx]["arguments"] += tc_delta.function.arguments
+
+                dsml_filter.flush()
                 output = handler.flush()
+
+                if accumulated_tool_calls:
+                    tool_xml_parts: List[str] = []
+                    for idx in sorted(accumulated_tool_calls.keys()):
+                        tc = accumulated_tool_calls[idx]
+                        try:
+                            params = json.loads(tc["arguments"]) if tc["arguments"] else {}
+                        except json.JSONDecodeError:
+                            params = {"raw": tc["arguments"]}
+                        tool_obj = {"name": tc["name"], "parameters": params}
+                        tool_xml_parts.append(f"<tool>{json.dumps(tool_obj)}</tool>")
+
+                    if tool_xml_parts:
+                        tool_xml = "\n".join(tool_xml_parts)
+                        if streaming_callback:
+                            streaming_callback(tool_xml, MSG_TYPE.MSG_TYPE_CHUNK)
+                        if output:
+                            output += "\n" + tool_xml
+                        else:
+                            output = tool_xml
             else:
                 message_obj = completion.choices[0].message
                 reasoning = extract_reasoning(message_obj)
                 content = message_obj.content or ""
+
+                # Translate any leaked DSML blocks into Lollms <tool> XML
+                content, dsml_tool_xml = _extract_dsml_from_text(content)
+
                 if is_thinking_deactivated:
                     output = re.sub(r'<(?:think|thinking)>[\s\S]*?</(?:think|thinking)>', '', content, flags=re.IGNORECASE).strip()
-                elif reasoning and not content.strip().startswith(("<think>", "<thinking>")):
-                    output = f"<think>\n{reasoning}\n</think>\n{content}"
+                elif reasoning and not content.strip().startswith((" thinking", "<think>")):
+                    output = f" thinking\n{reasoning}\n</think>\n{content}"
                 else:
                     output = content
+
+                # Translate native tool_calls into Lollms <tool> XML
+                native_tool_xml = ""
+                if hasattr(message_obj, "tool_calls") and message_obj.tool_calls:
+                    native_tool_xml = _format_tool_calls_to_lollms_xml(message_obj.tool_calls)
+
+                combined_tool_xml = "\n".join(x for x in (dsml_tool_xml, native_tool_xml) if x)
+                if combined_tool_xml:
+                    if output:
+                        output += "\n" + combined_tool_xml
+                    else:
+                        output = combined_tool_xml
 
         except Exception as e:
             trace_exception(e)

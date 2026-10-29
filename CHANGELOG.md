@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-29 15:29]
+
+- feat: add handbag examples and update personality integration documentation
+
 ## [2026-10-29 12:46]
 
 - chore: pin numpy version to >=2.0,<3 and update todo list

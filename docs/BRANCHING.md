@@ -1,4 +1,6 @@
-# Branching in `LollmsDiscussion`
+# Branching
+
+> **Note on knowledge bases**: When a branch is created, its RAG data sources are inherited from the parent discussion. Any `.db`/`.sqlite`/`.sqlite3` knowledge base (whether from a handbag's `rag/`/`doc/` folder or from `extra_knowledge_bases`) is shared by reference — the branch queries the same safe_store datastore rather than copying it. Plain documents (non-`.db` files) are likewise shared by reference through the parent's RAG index.
 
 > How conversation state is stored, forked, navigated, and regenerated in
 > `lollms_client`. This is the developer reference for the message DAG behind

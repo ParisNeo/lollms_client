@@ -146,6 +146,9 @@ def main():
     personality = LollmsPersonality.from_handbag(
         lollms_client=client,
         path=HANDBAG_PATH,
+        # extra_knowledge_bases: list[str | Path] — files or directories.
+        # Omit or pass None to use only the handbag's own rag/ + docs/ sources.
+        extra_knowledge_bases=None,
     )
     ASCIIColors.green(f"   ✅ Personality '{personality.name}' loaded.")
     ASCIIColors.cyan(f"   • Handbag tool binding: {type(personality.tools).__name__}")

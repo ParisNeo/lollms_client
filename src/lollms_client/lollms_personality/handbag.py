@@ -30,6 +30,16 @@ class Handbag:
         self.tool_files: List[Path] = self._load_tools()
         self.skills_dirs: List[Path] = [self._skills_dir.resolve()] if self._skills_dir.exists() else []
         self.rag_files: List[Path] = self._load_rag_files()
+
+        # Split extra KBs: plain files/dirs vs. safe_store .db datastores.
+        _all_extra = self._load_extra_knowledge_bases()
+        self.extra_knowledge_bases: List[Path] = [
+            p for p in _all_extra if not self._is_safe_store_db(p)
+        ]
+        self.extra_safe_stores: List[Any] = [
+            self._open_safe_store(p) for p in _all_extra if self._is_safe_store_db(p)
+        ]
+
         self.memory_db_path: Optional[str] = f"sqlite:///{self.memory_dir / 'memory.db'}" if self.memory_dir.exists() else None
         self.assets: Dict[str, str] = self._load_assets()
 
@@ -94,6 +104,115 @@ class Handbag:
             if f.is_file() and not f.name.startswith("."):
                 files.append(f.resolve())
         return files
+
+    def _load_extra_knowledge_bases(self) -> List[Path]:
+        """Reads `extra_knowledge_bases` declared in handbag.yaml (list of paths)."""
+        declared = self.manifest.get("extra_knowledge_bases") if isinstance(self.manifest, dict) else None
+        return self.normalize_extra_knowledge_bases(declared)
+
+    @staticmethod
+    def _is_safe_store_db(path: Path) -> bool:
+        """A `.db` file in extra_knowledge_bases is treated as a safe_store datastore."""
+        return path.is_file() and path.suffix.lower() == ".db"
+
+    @staticmethod
+    def _open_safe_store(db_path: Path) -> Any:
+        """
+        Opens a safe_store datastore via the SHARED vectorizer daemon so that
+        multiple processes (agents, workers, sub-agents) reuse a single
+        SentenceTransformer instance in VRAM/RAM.
+
+        Returns a `SafeStoreRAGBinding` (lazy — the underlying SafeStore is
+        instantiated on first `get_store()` call). Returns None on failure so
+        the handbag remains loadable even if a datastore is corrupt.
+        """
+        try:
+            from lollms_client.rag_bindings.safe_store import SafeStoreRAGBinding
+            binding = SafeStoreRAGBinding(
+                db_path=str(db_path),
+                vectorizer_name="st",
+                use_shared_server=True,
+                port=8765,
+            )
+            ASCIIColors.info(
+                f"[Handbag] Attached safe_store datastore (shared daemon :8765): {db_path.name}"
+            )
+            return binding
+        except Exception as e:
+            ASCIIColors.warning(
+                f"[Handbag] Failed to open safe_store datastore '{db_path}': {e}"
+            )
+            return None
+
+    def close_extra_safe_stores(self) -> None:
+        """
+        Releases any resources held by extra safe_store datastores.
+
+        Note: the shared vectorizer daemon itself is NOT shut down here — it is
+        a process-wide singleton. Call `SafeStore.shutdown_shared_vectorizer(port=8765)`
+        explicitly when terminating the host application.
+        """
+        for binding in getattr(self, "extra_safe_stores", []) or []:
+            try:
+                store = getattr(binding, "_store_instance", None)
+                if store is not None and hasattr(store, "close"):
+                    store.close()
+            except Exception:
+                pass
+        self.extra_safe_stores = []
+
+    @staticmethod
+    def normalize_extra_knowledge_bases(
+        extra_knowledge_bases: Optional[Union[str, Path, List[Union[str, Path]]]],
+    ) -> List[Path]:
+        """
+        Normalizes the `extra_knowledge_bases` parameter into a deduplicated list
+        of resolved, existing paths.
+
+        Accepted formats:
+          - None                          -> []
+          - "path/to/file_or_dir"         -> [Path(...)]
+          - Path("path/to/file_or_dir")   -> [Path(...)]
+          - ["a.md", Path("b_dir"), ...]  -> [Path(a.md), Path(b_dir), ...]
+
+        Each entry may be a file (any extension) or a directory (recursively
+        scanned by the RAG layer). Non-existent paths are silently skipped so
+        that a handbag remains loadable even when an optional KB is missing.
+
+        Special case: entries ending in `.db` are treated as safe_store
+        datastores and opened via the shared vectorizer daemon (see
+        `_open_safe_store`). They are exposed separately on
+        `handbag.extra_safe_stores` and NOT included in
+        `handbag.extra_knowledge_bases`.
+        """
+        if extra_knowledge_bases is None:
+            return []
+        if isinstance(extra_knowledge_bases, (str, Path)):
+            candidates: List[Union[str, Path]] = [extra_knowledge_bases]
+        elif isinstance(extra_knowledge_bases, (list, tuple)):
+            candidates = list(extra_knowledge_bases)
+        else:
+            raise TypeError(
+                "extra_knowledge_bases must be None, a str/Path, or a list of str/Path; "
+                f"got {type(extra_knowledge_bases).__name__}"
+            )
+
+        resolved: List[Path] = []
+        seen: set = set()
+        for entry in candidates:
+            if not isinstance(entry, (str, Path)):
+                raise TypeError(
+                    f"extra_knowledge_bases entries must be str or Path; got {type(entry).__name__}"
+                )
+            p = Path(entry).expanduser().resolve()
+            if not p.exists():
+                ASCIIColors.warning(f"extra_knowledge_bases entry not found, skipping: {p}")
+                continue
+            if p in seen:
+                continue
+            seen.add(p)
+            resolved.append(p)
+        return resolved
 
     def has_documents(self) -> bool:
         """Returns True when the handbag carries a non-empty docs/ library."""

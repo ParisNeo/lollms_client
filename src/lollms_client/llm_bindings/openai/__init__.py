@@ -31,7 +31,11 @@ from ascii_colors import ASCIIColors, trace_exception
 
 from lollms_client.lollms_llm_binding import LollmsLLMBinding
 from lollms_client.lollms_types import ELF_COMPLETION_FORMAT, MSG_TYPE
-
+from lollms_client.llm_bindings._dsml_utils import (
+    _DSMLStreamFilter,
+    _extract_dsml_from_text,
+    _format_tool_calls_to_lollms_xml,
+)
 pm.ensure_packages(["openai", "tiktoken"])
 
 BindingName = "OpenAIBinding"
@@ -1702,6 +1706,7 @@ class OpenAIBinding(LollmsLLMBinding):
 
                 if stream:
                     handler = _StreamThinkingHandler(streaming_callback, suppress_thinking=is_thinking_deactivated)
+                    dsml_filter = _DSMLStreamFilter(handler)
 
                     for resp in chat_completion:
                         if self.is_cancelled():
@@ -1724,10 +1729,11 @@ class OpenAIBinding(LollmsLLMBinding):
                             continue
 
                         if content:
-                            if not handler.process_content(content):
+                            if not dsml_filter.feed(content):
                                 break
                             count += 1
 
+                    dsml_filter.flush()
                     output = handler.flush()
 
                 else:
@@ -2020,6 +2026,8 @@ class OpenAIBinding(LollmsLLMBinding):
 
             if stream:
                 handler = _StreamThinkingHandler(streaming_callback, suppress_thinking=is_thinking_deactivated)
+                dsml_filter = _DSMLStreamFilter(handler)
+                accumulated_tool_calls = {}
 
                 for chunk in completion:
                     if self.is_cancelled():
@@ -2037,22 +2045,73 @@ class OpenAIBinding(LollmsLLMBinding):
                         continue
 
                     if content:
-                        if not handler.process_content(content):
+                        if not dsml_filter.feed(content):
                             break
 
+                    if hasattr(delta, 'tool_calls') and delta.tool_calls:
+                        for tc_delta in delta.tool_calls:
+                            idx = tc_delta.index
+                            if idx not in accumulated_tool_calls:
+                                accumulated_tool_calls[idx] = {
+                                    "id": tc_delta.id,
+                                    "name": tc_delta.function.name if tc_delta.function else "",
+                                    "arguments": ""
+                                }
+                            else:
+                                if tc_delta.function and tc_delta.function.name:
+                                    accumulated_tool_calls[idx]["name"] = tc_delta.function.name
+                            
+                            if tc_delta.function and tc_delta.function.arguments:
+                                accumulated_tool_calls[idx]["arguments"] += tc_delta.function.arguments
+
+                dsml_filter.flush()
                 output = handler.flush()
+                
+                if accumulated_tool_calls:
+                    tool_xml_parts = []
+                    for idx in sorted(accumulated_tool_calls.keys()):
+                        tc = accumulated_tool_calls[idx]
+                        try:
+                            params = json.loads(tc["arguments"]) if tc["arguments"] else {}
+                        except json.JSONDecodeError:
+                            params = {"raw": tc["arguments"]}
+                        
+                        tool_obj = {"name": tc["name"], "parameters": params}
+                        tool_xml_parts.append(f"<tool>{json.dumps(tool_obj)}</tool>")
+                    
+                    if tool_xml_parts:
+                        tool_xml = "\n".join(tool_xml_parts)
+                        
+                        # Dispatch to callback so the stream parser detects it
+                        if streaming_callback:
+                            # We send it as a chunk so the standard <tool> parser picks it up
+                            streaming_callback(tool_xml, MSG_TYPE.MSG_TYPE_CHUNK)
+                        
+                        if output:
+                            output += "\n" + tool_xml
+                        else:
+                            output = tool_xml
 
             else:
                 message_obj = completion.choices[0].message
                 reasoning = extract_reasoning(message_obj)
                 content = message_obj.content or ""
 
+                # Translate any leaked DSML blocks into Lollms <tool> XML
+                content, dsml_tool_xml = _extract_dsml_from_text(content)
+
                 if is_thinking_deactivated:
                     output = re.sub(r'<(?:think|thinking)>[\s\S]*?</(?:think|thinking)>', '', content, flags=re.IGNORECASE).strip()
-                elif reasoning and not content.strip().startswith(("<think>", "<thinking>")):
-                    output = f"<think>\n{reasoning}\n</think>\n{content}"
+                elif reasoning and not content.strip().startswith((" thinking", "<think>")):
+                    output = f" thinking\n{reasoning}\n</think>\n{content}"
                 else:
                     output = content
+
+                if dsml_tool_xml:
+                    if output:
+                        output += "\n" + dsml_tool_xml
+                    else:
+                        output = dsml_tool_xml
 
         except Exception as e:
             trace_exception(e)

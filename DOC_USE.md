@@ -388,6 +388,27 @@ except Exception as e:
 
 Refer to `examples/function_calling_with_local_custom_mcp.py` (for custom tools) and `examples/local_mcp.py` (for default tools) for more detailed examples.
 
+## 5.4. Knowledge Bases (RAG)
+
+A personality loaded from a handbag can carry knowledge bases in two forms:
+
+1. **Plain documents** — any text/markdown/PDF file placed in the handbag's `rag/` or `doc/` folder is loaded as a document and chunked into the personality's RAG index.
+2. **Pre-built safe_store datastores** — any file ending in `.db`, `.sqlite`, or `.sqlite3` found in `rag/` or `doc/` is treated as a **safe_store** database. It is queried directly via `store.search()` instead of being re-indexed.
+
+The same rule applies to the `extra_knowledge_bases` parameter of `LollmsPersonality.from_handbag()`: pass a list of paths, and each `.db`/`.sqlite`/`.sqlite3` path is opened as a safe_store datastore while every other path is ingested as a plain document.
+
+```python
+from lollms_client.lollms_personality import LollmsPersonality
+
+personality = LollmsPersonality.from_handbag(
+    "my_handbag",
+    extra_knowledge_bases=[
+        "data/company_docs.db",      # safe_store datastore
+        "data/notes.md",             # plain document
+    ],
+)
+```
+
 ## 6. `LollmsDiscussion`
 
 Manages conversation history.

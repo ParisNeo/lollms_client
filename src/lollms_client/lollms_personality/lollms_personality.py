@@ -2557,9 +2557,20 @@ class LollmsPersonality:
         path: Union[str, Path],
         lollms_client: Optional[Any] = None,
         extra_tools: Optional[List[Union[str, Path]]] = None,
-        extra_skills_dirs: Optional[List[Union[str, Path]]] = None
+        extra_skills_dirs: Optional[List[Union[str, Path]]] = None,
     ) -> 'LollmsPersonality':
-        """Factory to construct a personality from a Handbag folder."""
+        """
+        Loads a LollmsPersonality from a handbag directory.
+
+        Args:
+            path: Path to the handbag directory.
+            lollms_client: Optional LollmsClient instance.
+            extra_tools: Optional additional tool files to merge with handbag tools.
+            extra_skills_dirs: Optional additional skill directories to merge with handbag skills.
+
+        Returns:
+            A configured LollmsPersonality instance.
+        """
         hb = Handbag(path)
 
         # Parse SOUL.md

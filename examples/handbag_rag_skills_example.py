@@ -39,6 +39,24 @@ from lollms_client.lollms_types import MSG_TYPE
 # ── HANDBAG DIRECTORY ────────────────────────────────────────────────────────
 HANDBAG_PATH = PROJECT_ROOT / "data_workspace" / "devops_handbag"
 
+# ── EXTRA KNOWLEDGE BASE (outside the handbag) ───────────────────────────────
+# Demonstrates `extra_knowledge_bases`: additional RAG sources supplied at
+# construction time. Format: list[str | Path] where each entry is a file OR a
+# directory (recursively scanned). See docs/lcp/07_PERSONALITY_INTEGRATION.md §8.
+EXTRA_KB_DIR = PROJECT_ROOT / "data_workspace" / "shared_runbooks"
+
+EXTRA_KB_CONTENT = """# Shared Runbooks — On-Call Escalation
+
+## Escalation Matrix
+- P0 → page SRE lead immediately, open incident channel `#inc-p0`.
+- P1 → notify on-call engineer, 15-minute SLA.
+- P2 → ticket only, next business day.
+
+## Post-Incident
+- Blameless postmortem within 48h.
+- Action items tracked in the SRE backlog.
+"""
+
 
 # ── HANDBAG ASSETS DEFINITIONS ───────────────────────────────────────────────
 
@@ -169,7 +187,14 @@ def setup_handbag_files():
     # 6. Create Workspace directory
     (HANDBAG_PATH / "workspace").mkdir(parents=True, exist_ok=True)
 
+    # 7. Create an EXTRA knowledge base OUTSIDE the handbag
+    if EXTRA_KB_DIR.exists():
+        shutil.rmtree(EXTRA_KB_DIR, ignore_errors=True)
+    EXTRA_KB_DIR.mkdir(parents=True, exist_ok=True)
+    (EXTRA_KB_DIR / "escalation.md").write_text(EXTRA_KB_CONTENT, encoding="utf-8")
+
     ASCIIColors.success("✅ Handbag successfully created with SOUL, Skills, RAG, and Tools.")
+    ASCIIColors.info(f"   • Extra KB (outside handbag): {EXTRA_KB_DIR}")
 
 
 def streaming_callback(chunk: str, msg_type: MSG_TYPE, meta: dict = None) -> bool:
@@ -205,7 +230,10 @@ def main():
     ASCIIColors.info("\nLoading Personality from Handbag folder...")
     agent = LollmsPersonality.from_handbag(
         path=HANDBAG_PATH,
-        lollms_client=client
+        lollms_client=client,
+        # extra_knowledge_bases: list[str | Path] — files or directories.
+        # Merged with the handbag's own rag/ and docs/ sources.
+        extra_knowledge_bases=[EXTRA_KB_DIR],
     )
 
     # Configure capabilities
