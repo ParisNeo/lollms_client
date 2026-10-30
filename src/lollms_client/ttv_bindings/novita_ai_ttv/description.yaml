@@ -1,26 +1,28 @@
 title: "Novita AI TTV"
 author: "ParisNeo"
-version: 0.1.0
+version: 0.2.0
 binding_name: "novita_ai_ttv"
 description: |
-  Cloud Text-to-Video and Image-to-Video generation using the Novita AI async API.
-  Provides high-speed inference across state-of-the-art open-weights and proprietary 
-  diffusion video models including Wan 2.1, Kling, Hunyuan Video, and PixVerse.
-  Tasks are queued remotely, polled with automatic progress reporting, and the 
+  Cloud Text-to-Video and Image-to-Video generation using the Novita AI async v3 API.
+  Provides high-speed inference across state-of-the-art open-weights and proprietary
+  diffusion video models including Wan 2.2/2.1, Kling v2.1/v3.0, PixVerse v4.5,
+  Hunyuan Video Fast, Vidu Q1, Seedance Lite, and MiniMax Hailuo 02.
+  Tasks are queued remotely, polled with real progress reporting, and the
   resulting MP4 files are downloaded directly into your LoLLMs workspace.
 
 global_input_parameters:
-  - {name: novita_api_key, type: str, default: "", description: "Novita AI API Key (falls back to NOVITA_API_KEY env var).", is_secret: true}
+  - {name: novita_api_key, type: str, default: "", description: "Novita AI API Key (falls back to api_key or NOVITA_API_KEY env var).", is_secret: true}
   - {name: base_url, type: str, default: "https://api.novita.ai/v3/async", description: "Novita AI async API base endpoint."}
   - {name: output_folder, type: str, default: "./data/ttv_outputs/novita_ai", description: "Directory where downloaded videos are saved."}
-  - {name: poll_interval_s, type: int, default: 3, description: "Polling check interval in seconds."}
-  - {name: timeout_s, type: int, default: 600, description: "Abort and fail task after this many seconds."}
+  - {name: poll_interval_s, type: int, default: 3, description: "Polling check interval in seconds (gently backs off over time)."}
+  - {name: timeout_s, type: int, default: 900, description: "Abort and fail task after this many seconds."}
 
 model_input_parameters:
-  - {name: model, type: str, default: "wan2.1-t2v", description: "Model name: wan2.1-t2v | kling-v3.0-std-t2v | hunyuan-video-fast | pixverse-v4.5-t2v."}
+  - {name: model, type: str, default: "wan2.2-t2v", description: "Model name: wan2.2-t2v | wan2.1-t2v | kling-v3.0-std-t2v | kling-v2.1-std-t2v | pixverse-v4.5-t2v | hunyuan-video-fast | vidu-q1-t2v | seedance-1-0-lite-t2v | minimax-hailuo-02-t2v."}
+  - {name: resolution, type: str, default: "", description: "Video resolution tier: '' (model default) | 480p | 720p | 1080p."}
   - {name: aspect_ratio, type: str, default: "16:9", description: "Video aspect ratio: 16:9 | 9:16 | 1:1."}
-  - {name: duration, type: int, default: 5, description: "Video duration in seconds (model dependent: 3, 5, or 10)."}
-  - {name: negative_prompt, type: str, default: "blurry, low quality, distorted, artifacts", description: "Negative prompt to avoid specific artifacts."}
+  - {name: duration, type: int, default: 5, description: "Video duration in seconds (ignored by fixed-duration models like hunyuan/seedance/vidu)."}
+  - {name: negative_prompt, type: str, default: "", description: "Negative prompt to avoid specific artifacts."}
   - {name: seed, type: int, default: -1, description: "Seed for reproducibility (-1 = random)."}
   - {name: watermark, type: bool, default: false, description: "Whether to append Novita watermark (if applicable)."}
 

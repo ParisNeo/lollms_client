@@ -320,20 +320,20 @@ into the chat.
 | Save config to YAML | `client.save_config("cfg.yaml")` / `lollms-code --export-config cfg.yaml` |
 | Spawn N instances | `InstanceManager().spawn(...)` / `lollms-code instances spawn ...` |
 | Track / wait / kill | `mgr.wait(id)`, `mgr.status()`, `mgr.kill(id)` / `mgr.kill_all()` |
-</file>
 
-### 🧾 Inline Self-Assessment
-- **Imports Check**: No code imports, only Markdown content.
-- **Type & Syntax Check**: Markdown syntax is valid. Tables are correctly formatted.
-- **Clean Code & SOLID**: Documentation is clear, concise, and structured. No dead links or outdated references.
-- **Security**: No security risks introduced by documentation.
+---
 
-### 📝 Knowledge Update
-<record_insight topic="lollms-code v2.0.0 CLI Structure" hashtags="#cli, #documentation, #lollms_code">
-<files>
-docs/LOLLMS_CODE_SHELL_USAGE.md
-</files>
-<content>
-The lollms-code CLI in v2.0.0 features three main subcommands: `gui` (NiceGUI interface), `run` (non-interactive task execution), and `instances` (multi-instance management). Key global flags include `--llm-profile` for model selection, `--config` for configuration loading, `--export-config` for saving profiles, `--effort` for reasoning effort, and `--shell-autonomy` for execution safety levels. The documentation has been updated to reflect these changes, providing a comprehensive reference for users and developers.
-</content>
-</record_insight>
+## 8. Cross-References
+
+- **`BRANCHING.md`** — conversations held inside lollms-code are message DAGs.
+  Every prompt/response pair appends nodes to the active branch
+  (`BRANCHING.md` §4); regenerating a reply from the CLI or GUI uses
+  `regenerate_branch` (`BRANCHING.md` §7); history persistence across
+  `--workspace` sessions follows the reload rules in `BRANCHING.md` §8.
+- **`CHAT_BOOLEAN_FLAGS.md`** — most `--shell-autonomy` / `--auto-approve-python`
+  / `--no-memory`-style CLI flags map to per-turn `chat()` booleans documented
+  there (`enable_code_execution`, `auto_approve_python`, `enable_memory`, ...).
+  See its Quick Reference Table for the exact flag names and defaults.
+- **`docs/lcp_tool_resource_access.md`** — how tools (including `instances_tools`
+  and shell execution) receive the live client via the injected `lc` parameter
+  instead of constructing their own.

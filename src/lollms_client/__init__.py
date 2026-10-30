@@ -23,7 +23,7 @@ from lollms_client.lollms_personality.skill import Skill
 from lollms_client.lollms_personality.handbag import Handbag
 from lollms_client.lollms_utilities import PromptReshaper
 from lollms_client.lollms_tools_binding import LollmsToolBinding, LollmsTOOLBindingManager
-from lollms_client.lollms_llm_binding import LollmsLLMBindingManager
+from lollms_client.lollms_llm_binding import LollmsLLMBinding, LollmsLLMBindingManager
 from lollms_client.lollms_connection_binding import (
     LollmsConnectionBinding,
     LollmsConnectionBindingManager,
@@ -114,6 +114,7 @@ __all__ = [
     "LollmsConnectionBindingManager",
     "ConnectionSendResult",
     "ConnectionReceiveResult",
+    "LollmsLLMBinding",
     "LollmsLLMBindingManager",
     "LollmsTOOLBindingManager",
     "list_bindings",

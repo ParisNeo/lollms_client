@@ -434,6 +434,8 @@ Leaves: [A2], [A3]  →  2 branches
 
 ## 11. Cross-references & corrections
 
+- See `CHAT_BOOLEAN_FLAGS.md` for the complete reference of boolean parameters that control chat behavior. Flags such as `enable_code_execution` and `enable_artefacts` create messages and artifacts during a turn — those become ordinary DAG nodes on the active branch (see §4).
+
 - See `src/lollms_client/lollms_discussion/README.md` §"Branching &
   Versioning" for the high-level overview. This document extends it with
   verified ground truth.

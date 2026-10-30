@@ -28,3 +28,9 @@ discussion.chat(
 ## Related flags
 
 - `enable_code_execution` — the flag this one modifies.
+
+> **Note on I/O scope**: When personality tools perform I/O (e.g. saving TTI
+> outputs to the workspace), they run under the same permission scope as
+> `auto_approve_python`. The dispatcher switches CWD to the discussion
+> workspace before tool execution; returning workspace-relative paths keeps
+> generated artefacts sandboxed.

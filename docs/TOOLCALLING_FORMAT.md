@@ -223,6 +223,58 @@ def tool_long_task(duration: int = 5, tool_context=None) -> dict:
     return {"success": True, "output": "done"}
 ```
 
+### Reserved host-injected parameters
+
+Beyond `tool_context`, the dispatcher strips four reserved names from the
+AST-generated schema and injects live objects at call time. They never reach
+the LLM:
+
+| Parameter | Injected object | None when |
+| :--- | :--- | :--- |
+| `lollms_client_instance` | Active `LollmsClient` | dispatcher has no client handle |
+| `discussion_instance` | Active `LollmsDiscussion` | tool runs outside a discussion |
+| `tool_context` | Host `ToolContext` (progress/cancel) | host provides none |
+| `user_interaction_handler` | Host confirm/Q&A handler | host provides none |
+
+Using the injected client (TTI example; never construct your own client):
+
+```python
+def tool_generate_image(lollms_client_instance=None, subject: str = "") -> dict:
+    """Generate an image via the host's TTI binding.
+    Args:
+        subject (str): What to depict.
+    """
+    lc = lollms_client_instance
+    if lc is None or getattr(lc, "tti_binding", None) is None:
+        return {"success": False, "error": "No TTI binding on the client."}
+    result = lc.tti_binding.generate_image(prompt=subject)
+    out = {"success": True, "output": f"Generated '{subject}'."}
+    if isinstance(result, str):
+        out["file_name"] = result
+        out["context_files"] = [result]
+    return out
+```
+
+Accessing the current discussion (history and attached files):
+
+```python
+def tool_recall(discussion_instance=None, keyword: str = "") -> dict:
+    """Search conversation history.
+    Args:
+        keyword (str): Keyword to look for.
+    """
+    if discussion_instance is None:
+        return {"success": False, "error": "No discussion context."}
+    hits = [m.content for m in discussion_instance.messages
+            if keyword.lower() in (m.content or "").lower()]
+    files = getattr(discussion_instance, "files", []) or []
+    return {"success": True, "output": f"{len(hits)} hits, {len(files)} attached files."}
+```
+
+Declare reserved params with `=None` defaults and do NOT document them in the
+docstring's `Args:` block — they are stripped automatically and must stay
+invisible to the model.
+
 ---
 
 ## 7. Error Handling & Anti-Loop Guards

@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-30 07:53]
+
+- Fix Novita AI TTV bindings: update imports and descriptions for compatibility with newer API versions
+
 ## [2026-10-29 23:55]
 
 - feat(lollms_code): add new features to CLI and GUI

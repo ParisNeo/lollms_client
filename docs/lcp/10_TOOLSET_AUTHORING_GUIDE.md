@@ -35,8 +35,10 @@ canonical pattern is **one folder, one primary file named after the folder**.
 
 **The philosophy** (from the binding's own docstring):
 
-- Tools are **agnostic Python scripts** — they do NOT know about discussions,
-  artifacts, or clients.
+- Tools are **agnostic Python scripts** — by default they do NOT know about
+  discussions, artifacts, or clients. A tool that *opts in* by declaring the
+  optional `lc=None` parameter DOES receive the live client (see §2 and the
+  "Using the live client" section below).
 - Tools operate on **files in the current working directory** (the workspace).
 - The binding handles environment setup (CWD, sync) transparently.
 - Host-configurable parameters are **invisible to the LLM** and enforced by
@@ -83,6 +85,8 @@ def tool_find_text_in_document(file_path: str, query: str, page: int = 1):
 | Has default value | → optional (default captured into the schema) |
 | `_`-prefixed helpers | **Never** become tools — excluded |
 | `args`/`kwargs`/`discussion_instance`/`lollms_client_instance`/`tool_context`/`user_interaction_handler` | Excluded from the schema (host-injected, LLM-invisible) |
+| `lollms_client_instance=None` | Also **stripped** from the advertised schema; at dispatch the binding injects the live `LollmsClient` into it — the LLM never sees it (see "Using the live client" below) |
+| `discussion_instance=None` | Stripped from the schema; at dispatch the binding injects the active `LollmsDiscussion` (message history, attached files, discussion metadata) |
 
 **Best for**: libraries whose tools are plain functions with simple
 parameters.
@@ -136,6 +140,118 @@ documentation and exact optional flags.
 | Schema quality | Derived; good with disciplined docstrings | Exact; you control everything |
 | Output documentation | Not captured | Fully documented |
 | Reference implementations | `document_editor` | `word_tools` (the exemplar) |
+
+---
+
+## Using the live client (LLM, TTI, TTV, TTS/TTM, discussion)
+
+A toolset function can opt into the **running `LollmsClient`** by declaring the
+optional parameter `lollms_client_instance=None`. At dispatch the binding
+inspects the signature; if the parameter exists, it injects the live client.
+The confirmed reserved names (LLM-invisible, host-injected) are:
+
+| Reserved parameter | Injected object |
+|---|---|
+| `lollms_client_instance` | The active `LollmsClient` |
+| `discussion_instance` | The active `LollmsDiscussion` (history, files) |
+| `tool_context` | Host tool context object |
+| `user_interaction_handler` | Host confirmation/Q&A handler |
+
+The client parameter:
+
+- is **optional** — always default it (`lollms_client_instance=None`);
+- is **injected by the system**, never supplied by the LLM — it does not appear
+  in `params` nor in the advertised JSON schema;
+- is the **same lifecycle-managed instance** the host is using.
+
+The same rule applies to `discussion_instance=None`: declare it to receive the
+current discussion, then read `discussion_instance.messages` (history) and the
+discussion's file/artefact surface for attached files. Omit it and the tool
+simply receives nothing — it still works as a plain function.
+
+> ⚠️ **The one law: never re-instantiate.** Inside a tool you must NOT call
+> `LollmsClient(...)`, `LollmsLLMBindingManager().create_binding(...)`, or any
+> binding constructor. A rogue instance duplicates model connections, wastes
+> VRAM / API quota, and bypasses lifecycle & cancellation management.
+> **Borrow, never build.**
+
+### What the injected client gives you
+
+With `lc = lollms_client_instance` inside the function body:
+
+| Resource | Access pattern | Guard |
+|---|---|---|
+| LLM text generation | `lc.llm_binding.generate(prompt, n_predict=…)` | present when injected |
+| Multimodal LLM | `lc.llm_binding.generate_with_images(prompt, images=…)` | model must support vision |
+| TTI (image) | `lc.tti_binding.generate_image(prompt=…, negative_prompt=…)` | `if lc and getattr(lc, "tti_binding", None)` |
+| TTV (video) | `lc.ttv_binding.generate_video(prompt=…)` | same guard |
+| TTS (speech) | `lc.tts_binding.synthesize(text=…)` | same guard |
+| TTM (music) | `lc.ttm_binding.generate_music(prompt=…)` | same guard |
+| Discussion history | `discussion_instance.messages` | `if discussion_instance is not None` |
+| Attached files | `discussion_instance` file helpers / artefact surface | same guard |
+
+### Worked mini-example — styled image generation
+
+```python
+STYLES = {
+    "photoreal": "ultra realistic photograph, 85mm lens, natural lighting",
+    "anime":     "anime style, cel shaded, vibrant colors, clean lineart",
+    "isometric": "isometric 3d render, low poly, soft studio light",
+}
+
+def tool_generate_image(lollms_client_instance=None, subject: str = "", style: str = "photoreal"):
+    """Generate an image of `subject` in a named style.
+
+    Args:
+        subject (str): What to depict.
+        style (str): One of: photoreal, anime, isometric.
+    """
+    lc = lollms_client_instance  # host-injected live LollmsClient (or None)
+    try:
+        if lc is None or getattr(lc, "tti_binding", None) is None:
+            return {"success": False, "error": "No TTI binding on the client."}
+        if not subject:
+            return {"success": False, "error": "Parameter 'subject' is required."}
+        scaffold = STYLES.get(style, STYLES["photoreal"])
+        result = lc.tti_binding.generate_image(prompt=f"{scaffold}, {subject}")
+        out = {"success": True, "output": f"Generated '{subject}' ({style})."}
+        if isinstance(result, str):  # binding returned a saved path
+            out["file_name"] = result
+            out["context_files"] = [result]
+        return out
+    except Exception as ex:
+        return {"success": False, "error": f"Image generation failed: {ex}"}
+```
+
+LLM sub-generation is the same pattern:
+
+```python
+def tool_summarize(lollms_client_instance=None, discussion_instance=None, text: str = ""):
+    """Summarize a text with the host's LLM.
+
+    Args:
+        text (str): Text to summarize. If empty, summarizes the last discussion exchange.
+    """
+    lc = lollms_client_instance  # host-injected live LollmsClient (or None)
+    if lc is None or getattr(lc, "llm_binding", None) is None:
+        return {"success": False, "error": "No LLM binding available."}
+    if not text and discussion_instance is not None:
+        # fall back to the current discussion's messages
+        text = "\n".join(m.content for m in discussion_instance.messages[-4:])
+    if not text:
+        return {"success": False, "error": "Nothing to summarize."}
+    return {"success": True, "output": lc.llm_binding.generate(
+        f"Summarize in 3 bullets:\n\n{text}", n_predict=512)}
+```
+
+Seam-B `LcpTool` subclasses receive the same injection by declaring
+`lollms_client_instance=None` (and/or `discussion_instance=None`) on
+`tool_function`.
+
+> 📖 Full contract — per-modality guards, TTV surface, discussion-history
+> access patterns, the "never re-instantiate" rationale, and a complete
+> `image_studio` toolset with host-overridable style presets — see
+> [`../lcp_tool_resource_access.md`](../lcp_tool_resource_access.md).
 
 ---
 
@@ -514,6 +630,8 @@ exception.
      □  Seam B: get_tools() specs — name matches callable; output matches
         return keys; callables still named tool_*
 □  init_tools_library(config=None) defined and NEVER raises
+□  If the tool needs LLM/TTI/TTV/TTS/TTM/discussion access, declare optional
+   lc=None and use the injected client — never construct one
 □  TOOL_LIBRARY_LOAD_FLAG declared (if the library should be opt-in)
 □  Flag documented in docs/flags/<flag>.md + linked from 03 §5
 □  Result dicts use the 5 anchor keys (success/error/output/file_name/

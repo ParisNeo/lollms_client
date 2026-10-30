@@ -36,6 +36,20 @@ has no such capability.
 
 ---
 
+## Message Schema Cross-Reference
+
+The flags below operate on messages — but this document does not define the
+`LollmsMessage` entity itself. For its structure (`id`, `parent_id`, `sender`,
+`sender_type`, `content`, `images`, `active_images`, `metadata`, `created_at`),
+see **`BRANCHING.md` §3**.
+
+Note: `active_images` is a **message-level field** (a per-image list of
+activation flags living on `LollmsMessage`), not a `chat()` parameter. It is
+controlled at the message level, not per turn, and is therefore not listed in
+the table below.
+
+---
+
 ## Quick Reference Table
 
 | Flag | Default | Category | Gate / Note |
