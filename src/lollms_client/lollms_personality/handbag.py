@@ -32,13 +32,49 @@ class Handbag:
         self.rag_files: List[Path] = self._load_rag_files()
 
         # Split extra KBs: plain files/dirs vs. safe_store .db datastores.
-        _all_extra = self._load_extra_knowledge_bases()
-        self.extra_knowledge_bases: List[Path] = [
-            p for p in _all_extra if not self._is_safe_store_db(p)
-        ]
-        self.extra_safe_stores: List[Any] = [
-            self._open_safe_store(p) for p in _all_extra if self._is_safe_store_db(p)
-        ]
+        # Classification is driven by the DECLARED suffix (intent), not disk state,
+        # so a missing .db is reported (warning) instead of being silently demoted
+        # to a plain KB path. A broken/missing .db never crashes the handbag build.
+        _all_extra = self._load_extra_knowledge_bases_rich()
+        self.extra_knowledge_bases: List[Path] = []
+        self.extra_safe_stores: List[Any] = []
+        for entry in _all_extra:
+            p = entry["path"]
+            declared_name = entry.get("name")
+            declared_desc = entry.get("description")
+
+            if self._is_safe_store_db(p):
+                binding = self._open_safe_store(p)
+                if binding is not None:
+                    # Attach human-authored identity (provenance) so the personality's
+                    # tool builder can surface the real name/description to the LLM.
+                    display = declared_name or p.stem
+                    desc = declared_desc or f"Search knowledge base '{display}' (from {p.name})."
+                    try:
+                        binding._handbag_label = display
+                        binding._handbag_description = desc
+                        binding._handbag_source_path = str(p)
+                    except Exception:
+                        pass
+                    self.extra_safe_stores.append(binding)
+                    try:
+                        ASCIIColors.info(
+                            f"[Handbag] SafeStore '{display}' ← '{p.name}' "
+                            f"(description={'set' if declared_desc else 'auto'})"
+                        )
+                    except Exception:
+                        pass
+            else:
+                self.extra_knowledge_bases.append(p)
+
+        try:
+            ASCIIColors.info(
+                f"[Handbag] extra_knowledge_bases={len(self.extra_knowledge_bases)} "
+                f"plain path(s) + extra_safe_stores={len(self.extra_safe_stores)} "
+                f"auto-instantiated SafeStore(s) — handbag='{self.path.name}'"
+            )
+        except Exception:
+            pass
 
         self.memory_db_path: Optional[str] = f"sqlite:///{self.memory_dir / 'memory.db'}" if self.memory_dir.exists() else None
         self.assets: Dict[str, str] = self._load_assets()
@@ -106,27 +142,118 @@ class Handbag:
         return files
 
     def _load_extra_knowledge_bases(self) -> List[Path]:
-        """Reads `extra_knowledge_bases` declared in handbag.yaml (list of paths)."""
+        """Back-compat wrapper: returns only the resolved paths (drops name/description)."""
+        return [entry["path"] for entry in self._load_extra_knowledge_bases_rich()]
+
+    def _load_extra_knowledge_bases_rich(self) -> List[Dict[str, Any]]:
+        """
+        Reads `extra_knowledge_bases` from handbag.yaml. Each yielded item is a
+        normalised dict: {"path": Path, "name": str|None, "description": str|None}.
+
+        Accepted yaml shapes (BOTH keep working):
+            extra_knowledge_bases:
+              - "Auto design.db"                    # bare string  → name = stem
+              - "docs/notes.txt"
+              - path: "Auto design.db"              # dict form    → honours name/description
+                name: "auto_design"
+                description: "ASIC project specs."
+        """
         declared = self.manifest.get("extra_knowledge_bases") if isinstance(self.manifest, dict) else None
-        return self.normalize_extra_knowledge_bases(declared)
+        if not declared:
+            return []
+        if isinstance(declared, (str, Path)):
+            declared = [declared]
+        if not isinstance(declared, (list, tuple)):
+            return []
+
+        out: List[Dict[str, Any]] = []
+        seen: set = set()
+        for item in declared:
+            try:
+                if isinstance(item, str):
+                    raw_path = item
+                    declared_name = None
+                    declared_desc = None
+                elif isinstance(item, dict):
+                    raw_path = item.get("path")
+                    if not raw_path:
+                        continue
+                    declared_name = item.get("name")
+                    declared_desc = item.get("description")
+                elif isinstance(item, Path):
+                    raw_path = item
+                    declared_name = None
+                    declared_desc = None
+                else:
+                    ASCIIColors.warning(
+                        f"[Handbag] Skipped malformed extra_knowledge_bases entry: {item!r}"
+                    )
+                    continue
+
+                p = Path(raw_path).expanduser()
+                if not p.is_absolute():
+                    p = (self.path / p).resolve()
+                else:
+                    p = p.resolve()
+
+                if p in seen:
+                    continue
+                seen.add(p)
+
+                out.append({
+                    "path": p,
+                    "name": declared_name,
+                    "description": declared_desc,
+                })
+            except Exception as e:
+                try:
+                    ASCIIColors.warning(
+                        f"[Handbag] Skipped malformed extra_knowledge_bases entry: {item!r} ({e})"
+                    )
+                except Exception:
+                    pass
+        return out
 
     @staticmethod
     def _is_safe_store_db(path: Path) -> bool:
-        """A `.db` file in extra_knowledge_bases is treated as a safe_store datastore."""
-        return path.is_file() and path.suffix.lower() == ".db"
+        """
+        True if the declared path is intended as a safe_store datastore (a .db file).
+
+        Classification is driven by the DECLARED suffix (intent), NOT by disk state:
+        a `.db` declared in handbag.yaml that does not yet exist on disk is still
+        routed to the SafeStore auto-instantiation path, where it is reported with
+        a clear warning instead of being silently demoted to a plain KB path.
+        """
+        return path.suffix.lower() == ".db"
 
     @staticmethod
-    def _open_safe_store(db_path: Path) -> Any:
+    def _open_safe_store(db_path: Path) -> Optional[Any]:
         """
-        Opens a safe_store datastore via the SHARED vectorizer daemon so that
-        multiple processes (agents, workers, sub-agents) reuse a single
-        SentenceTransformer instance in VRAM/RAM.
+        Auto-instantiate a SafeStoreRAGBinding from a `.db` path alone.
 
-        Returns a `SafeStoreRAGBinding` (lazy — the underlying SafeStore is
-        instantiated on first `get_store()` call). Returns None on failure so
-        the handbag remains loadable even if a datastore is corrupt.
+        The `.db` file IS the source of truth for the store's configuration
+        (vectorizer, chunk size, model, encryption state) — it is read back
+        transparently by `safe_store.SafeStore(db_path=...)` inside
+        `SafeStoreRAGBinding.get_store()`. NO external RAG binding profile,
+        `lollms_client.rag` registry entry, or `rag_model_profiles_registry`
+        entry is consulted.
+
+        The binding is LAZY: `.get_store()` is deferred until the first query,
+        so no SentenceTransformer is loaded at handbag build time.
+
+        Returns:
+            The SafeStoreRAGBinding, or None if the .db file is missing or
+            safe_store cannot be imported. Never raises.
         """
         try:
+            if not db_path.exists():
+                ASCIIColors.warning(
+                    f"[Handbag] Declared safe_store '.db' not found on disk: {db_path} — "
+                    f"the store cannot be auto-instantiated. Create the file or remove "
+                    f"the declaration from handbag.yaml."
+                )
+                return None
+
             from lollms_client.rag_bindings.safe_store import SafeStoreRAGBinding
             binding = SafeStoreRAGBinding(
                 db_path=str(db_path),
@@ -134,13 +261,26 @@ class Handbag:
                 use_shared_server=True,
                 port=8765,
             )
+            # Do NOT force .get_store() here — keep the lazy contract.
             ASCIIColors.info(
-                f"[Handbag] Attached safe_store datastore (shared daemon :8765): {db_path.name}"
+                f"[Handbag] Auto-instantiated SafeStoreRAGBinding from '.db' file: {db_path} "
+                f"(vectorizer={getattr(binding, 'vectorizer_name', '?')}, "
+                f"chunk_size={getattr(binding, 'chunk_size', '?')}, "
+                f"encrypted={bool(getattr(binding, 'encryption_key', None))}) — "
+                f"config will be read from the .db on first query."
             )
             return binding
+        except ImportError as ie:
+            ASCIIColors.warning(
+                f"[Handbag] Cannot auto-instantiate SafeStore for '{db_path}': "
+                f"`safe_store` package is not installed ({ie}). "
+                f"Install it with: pip install safe_store"
+            )
+            return None
         except Exception as e:
             ASCIIColors.warning(
-                f"[Handbag] Failed to open safe_store datastore '{db_path}': {e}"
+                f"[Handbag] Failed to auto-instantiate SafeStore for '{db_path}': {e} — "
+                f"the store will be skipped for this handbag build."
             )
             return None
 

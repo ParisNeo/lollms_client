@@ -279,6 +279,97 @@ def tool_generate_plot(data_file: str) -> dict:
 
 ---
 
+## ⏱️ Tool Execution Timestamps & Metadata
+
+Every tool invocation recorded by the LCP binding carries two automatically
+maintained timestamps and a free-form JSON metadata bag. This lets host
+applications audit tool usage, correlate calls with external traces, and
+attach tenancy / identity data without touching the tool's own return value.
+
+### Timestamps
+
+| Field        | Type     | Meaning                                                     |
+|--------------|----------|-------------------------------------------------------------|
+| `created_at` | datetime | Set once when the tool call is dispatched. Never modified.   |
+| `updated_at` | datetime | Bumped automatically on **every** mutation of the call record (result write, error capture, traceback attach, metadata set/remove). |
+
+Both are stored as **UTC** datetimes. `LCPBinding.list_tool_calls()` returns
+them as first-class keys on each row, and the default ordering is
+`updated_at DESC` so the most recent calls surface first.
+
+Because SQLAlchemy's `onupdate=` hook fires on every dirty UPDATE to the row,
+any caller that persists a mutation through the normal commit path
+(`execute_tool()` result write, error capture, metadata set/remove) inherits
+the `updated_at` bump for free — **no manual timestamping required**.
+
+### Tool Call Metadata
+
+Each tool call record exposes a free-form JSON metadata bag stored on the row
+itself (`tool_calls.metadata`). External applications can embed identity,
+tenancy, tracing, or tagging data without polluting the tool's return value
+that is fed back to the LLM.
+
+```python
+from lollms_client import LollmsClient
+
+client = LollmsClient(
+    llm_binding_name="ollama",
+    tools_binding_name="lcp",
+    tools_binding_config={"tools_folders": ["./my_tools"]},
+)
+
+lcp = client.tools
+
+# --- write ---
+lcp.set_call_metadata(call_id, "tenant_id", "acme-corp")
+lcp.set_call_metadata(call_id, "trace_id", "trc_9f3a2c")
+lcp.set_call_metadata(call_id, "tags", ["support", "billing"])
+
+# --- read ---
+assert lcp.get_call_metadata(call_id, "tenant_id") == "acme-corp"
+assert lcp.get_call_metadata(call_id, "missing", default=None) is None
+
+# --- list all ---
+print(lcp.get_all_call_metadata(call_id))
+# {'tenant_id': 'acme-corp', 'trace_id': 'trc_9f3a2c', 'tags': ['support', 'billing']}
+
+# --- remove ---
+removed = lcp.remove_call_metadata(call_id, "trace_id")   # -> True
+lcp.remove_call_metadata(call_id, "trace_id")             # -> False (already gone)
+```
+
+**Semantics**
+- Values are stored as JSON — scalars, lists, dicts are all fine.
+- Every `set_call_metadata` / `remove_call_metadata` call triggers a row UPDATE
+  and therefore bumps `updated_at` automatically.
+- Metadata is **not** injected into the tool's return value or the LLM context.
+  It is application state only.
+- Setting a key to `None` stores `null` (use `remove_call_metadata` to delete it).
+
+### Migration
+
+`tool_calls.metadata`, `created_at`, and `updated_at` are added idempotently at
+startup (`LCPBinding._ensure_schema()`), so pre-existing `.db` files upgrade
+transparently — no dump/restore needed.
+
+### Legacy tool calls (pre-timestamp rows)
+
+Tool-call records created before `created_at` / `updated_at` were introduced
+are handled transparently:
+
+- On **first read**, any missing `created_at` is back-filled with the current
+  UTC time, and any missing `updated_at` is set to `created_at`. The back-fill
+  is committed once, so subsequent reads return real datetimes — no repeated
+  migration cost.
+- `list_tool_calls()` coerces any NULL timestamp to the sentinel
+  `1970-01-01T00:00:00` (naive UTC) so sorting by `updated_at DESC` never
+  raises and legacy rows sort last.
+- Any subsequent mutation (result write, error capture, metadata set/remove)
+  re-asserts both timestamps as a side-effect of the normal commit path.
+- **No user action is required** — old `.db` files just work.
+
+---
+
 ## 🔧 Configuration
 
 Configure the LCP binding inside your client parameters:

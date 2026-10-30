@@ -152,7 +152,74 @@ Beyond LLM-initiated XML tags, `LollmsMemoryManager` exposes direct Python APIs 
 
 ---
 
-## 🗃️ 6. Dual-Database Architecture
+## 🕒 6. Timestamps & Metadata
+
+### Timestamps
+
+Every memory node carries two automatically maintained timestamps:
+
+| Field        | Type     | Meaning                                                     |
+|--------------|----------|-------------------------------------------------------------|
+| `created_at` | datetime | Set once at insertion time. Never modified afterwards.       |
+| `updated_at` | datetime | Bumped automatically on **every** mutation (content edit, importance change, level promotion/demotion, tag update, graph relation add/remove, soft-delete, dream-cycle consolidation). |
+
+Both are stored as **UTC** datetimes. `LollmsMemoryManager.list_all()` returns them
+as first-class keys on each row, and the default ordering is `updated_at DESC`
+so the most recently touched memories surface first.
+
+Because SQLAlchemy's `onupdate=` hook fires on every dirty UPDATE to the row,
+any caller that persists a mutation through the normal commit path
+(`edit_memory()`, `<mem_update>` tag, `dream()` consolidation, spreading
+activation) inherits the `updated_at` bump for free — **no manual timestamping
+required**.
+
+### Memory Metadata
+
+Each memory node exposes a free-form JSON metadata bag stored on the row itself
+(`memories.metadata`). External applications can embed identity, tenancy,
+tracing, or tagging data without polluting the memory content that is rendered
+into the LLM context.
+
+```python
+from lollms_client.lollms_memory import LollmsMemoryManager
+
+mem = LollmsMemoryManager(db_path="./memory.db")
+
+# --- write ---
+mem.set_metadata_item(memory_id, "tenant_id", "acme-corp")
+mem.set_metadata_item(memory_id, "trace_id", "trc_9f3a2c")
+mem.set_metadata_item(memory_id, "tags", ["support", "billing"])
+
+# --- read ---
+assert mem.get_metadata_item(memory_id, "tenant_id") == "acme-corp"
+assert mem.get_metadata_item(memory_id, "missing", default=None) is None
+
+# --- list all ---
+print(mem.get_all_metadata(memory_id))
+# {'tenant_id': 'acme-corp', 'trace_id': 'trc_9f3a2c', 'tags': ['support', 'billing']}
+
+# --- remove ---
+removed = mem.remove_metadata_item(memory_id, "trace_id")   # -> True
+mem.remove_metadata_item(memory_id, "trace_id")             # -> False (already gone)
+```
+
+**Semantics**
+- Values are stored as JSON — scalars, lists, dicts are all fine.
+- Every `set_metadata_item` / `remove_metadata_item` call triggers a row UPDATE
+  and therefore bumps `updated_at` automatically.
+- Metadata is **not** injected into the prompt / LLM context. It is application
+  state only.
+- Setting a key to `None` stores `null` (use `remove_metadata_item` to delete it).
+
+### Migration
+
+`memories.metadata`, `created_at`, and `updated_at` are added idempotently at
+startup (`LollmsMemoryManager._ensure_schema()`), so pre-existing `.db` files
+upgrade transparently — no dump/restore needed.
+
+---
+
+## 🗃️ 7. Dual-Database Architecture
 
 To provide both private session tracking and shared project learning, the memory system utilizes a **Dual-Database Attachment** paradigm over SQLite:
 
@@ -163,7 +230,7 @@ When a `shared_db_path` is provided during initialization, the manager dynamical
 
 ---
 
-## 💤 7. The Dream Cycle (Synaptic Consolidation)
+## 💤 8. The Dream Cycle (Synaptic Consolidation)
 
 The `dream()` pass is an asynchronous consolidation routine designed to run periodically (or on-demand):
 
@@ -175,7 +242,7 @@ The `dream()` pass is an asynchronous consolidation routine designed to run peri
 
 ---
 
-## 🧩 8. SSAM Engine (Sovereign Semantic Autarkic Memory)
+## 🧩 9. SSAM Engine (Sovereign Semantic Autarkic Memory)
 
 Exported alongside the main manager is the `SSAMEngine`, a standalone, highly isolated semantic memory engine that strictly enforces LTI/STI (Long-Term Identifier / Short-Term Identifier) separation.
 

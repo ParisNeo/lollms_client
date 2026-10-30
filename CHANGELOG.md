@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-30 10:22]
+
+- feat(client): add discussion timestamps and metadata to lollms_discussion
+
 ## [2026-10-30 07:53]
 
 - Fix Novita AI TTV bindings: update imports and descriptions for compatibility with newer API versions

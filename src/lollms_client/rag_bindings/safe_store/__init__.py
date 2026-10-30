@@ -37,13 +37,49 @@ class SafeStoreRAGBinding(LollmsRAGBinding):
         self.chunk_size = int(kwargs.get("chunk_size", 128))
         self.chunk_overlap = int(kwargs.get("chunk_overlap", 16))
         self.chunking_strategy = kwargs.get("chunking_strategy", "token")
+        self.chunking_kwargs = kwargs.get("chunking_kwargs") or {}
+        self.context_enricher = kwargs.get("context_enricher")
+        self.expand_before = int(kwargs.get("expand_before", 0) or 0)
+        self.expand_after = int(kwargs.get("expand_after", 0) or 0)
         self.encryption_key = kwargs.get("encryption_key") or None
 
-        vectorizer_config = kwargs.get("vectorizer_config", {})
+        # ── Vectorizer identity resolution ──────────────────────────────────
+        # safe_store computes a vectorizer identity string from
+        # (vectorizer_name, vectorizer_config) and compares it to the identity
+        # persisted in the .db header on every open. If the .db was originally
+        # created with an explicit {"model": ...} config (the common case —
+        # safe_store default is all-MiniLM-L6-v2), opening WITHOUT a model
+        # produces 'sentense_transformer' != 'sentense_transformer:{"model":...}'
+        # → ConfigurationError. To make auto-instantiated stores just work,
+        # default the 'model' key for the known local backends when the caller
+        # did not supply one AND the .db already exists (i.e. we're re-opening).
+        vectorizer_config = dict(kwargs.get("vectorizer_config") or {})
+
         if "model" not in vectorizer_config:
             m_name = kwargs.get("model_name") or kwargs.get("model")
             if m_name and m_name != str(raw_db_path):
                 vectorizer_config["model"] = m_name
+
+        # Re-open guard: only inject a default model when the .db already
+        # exists (opening an old DB) — never mutate config for a NEW store,
+        # since that would change the identity of freshly-created databases.
+        _db_preexists = self.db_path.exists()
+        if _db_preexists and "model" not in vectorizer_config:
+            _known_default_models = {
+                "st": "all-MiniLM-L6-v2",
+                "sentence_transformer": "all-MiniLM-L6-v2",
+                "sentense_transformer": "all-MiniLM-L6-v2",
+                "sentence_transformers": "all-MiniLM-L6-v2",
+            }
+            _vf = str(self.vectorizer_name).lower()
+            _default_model = _known_default_models.get(_vf)
+            if _default_model:
+                vectorizer_config["model"] = _default_model
+                ASCIIColors.info(
+                    f"[SafeStoreRAG] Re-opening existing store '{self.db_path.name}': "
+                    f"defaulted vectorizer_config['model'] = '{_default_model}' for "
+                    f"vectorizer '{self.vectorizer_name}' to match the persisted identity."
+                )
 
         if kwargs.get("use_shared_server"):
             vectorizer_config["use_shared_server"] = True
@@ -93,16 +129,37 @@ class SafeStoreRAGBinding(LollmsRAGBinding):
             import safe_store
             llm_call = self._build_llm_callable()
 
-            self._store_instance = safe_store.SafeStore(
-                db_path=str(self.db_path),
-                vectorizer_name=self.vectorizer_name,
-                vectorizer_config=self.vectorizer_config,
-                chunk_size=self.chunk_size,
-                chunk_overlap=self.chunk_overlap,
-                chunking_strategy=self.chunking_strategy,
-                encryption_key=self.encryption_key,
-                llm_generator=llm_call,
-            )
+            try:
+                self._store_instance = safe_store.SafeStore(
+                    db_path=str(self.db_path),
+                    vectorizer_name=self.vectorizer_name,
+                    vectorizer_config=self.vectorizer_config,
+                    chunk_size=self.chunk_size,
+                    chunk_overlap=self.chunk_overlap,
+                    chunking_strategy=self.chunking_strategy,
+                    chunking_kwargs=self.chunking_kwargs,
+                    context_enricher=self.context_enricher,
+                    expand_before=self.expand_before,
+                    expand_after=self.expand_after,
+                    encryption_key=self.encryption_key,
+                    llm_generator=llm_call,
+                )
+            except TypeError as te:
+                ASCIIColors.warning(
+                    f"[SafeStoreRAG] safe_store rejected one of the extended kwargs "
+                    f"(chunking_kwargs/context_enricher/expand_before/expand_after): {te}. "
+                    f"Retrying without them."
+                )
+                self._store_instance = safe_store.SafeStore(
+                    db_path=str(self.db_path),
+                    vectorizer_name=self.vectorizer_name,
+                    vectorizer_config=self.vectorizer_config,
+                    chunk_size=self.chunk_size,
+                    chunk_overlap=self.chunk_overlap,
+                    chunking_strategy=self.chunking_strategy,
+                    encryption_key=self.encryption_key,
+                    llm_generator=llm_call,
+                )
             return self._store_instance
         except Exception as e:
             trace_exception(e)
@@ -127,6 +184,20 @@ class SafeStoreRAGBinding(LollmsRAGBinding):
             trace_exception(e)
             ASCIIColors.warning(f"[SafeStoreRAG] GraphStore initialization failed: {e}")
             return None
+
+    @property
+    def graph(self):
+        """
+        Doc-friendly accessor: `store.graph.add_node(...)`,
+        `store.graph.memory.record_episode(...)`,
+        `store.graph.check_consistency()`,
+        `store.graph.build_graph_for_all_documents()`,
+        `store.graph.get_tool_definitions()`,
+        `store.graph.query_sparql(...)` — all reachable via this property.
+
+        Returns the lazy GraphStore instance, or None if graph initialization fails.
+        """
+        return self.get_graph()
 
     # ── Retrieval Implementation ─────────────────────────────────────────────
 
@@ -169,10 +240,14 @@ class SafeStoreRAGBinding(LollmsRAGBinding):
                     top_k=top_k,
                     dense_weight=dense_weight,
                     bm25_weight=bm25_weight,
+                    rrf_k=kwargs.pop("rrf_k", 60),
                     min_relevance_percent=min_relevance_percent,
                     **kwargs
                 )
-                if reconstruct_overlapping_chunks and hasattr(store, "reconstruct_overlapping_chunks"):
+                already_reconstructed = any("chunk_seqs" in r for r in results)
+                if (not already_reconstructed
+                        and reconstruct_overlapping_chunks
+                        and hasattr(store, "reconstruct_overlapping_chunks")):
                     results = store.reconstruct_overlapping_chunks(results, add_metadata=True)
             return self._normalize_results(results)
         except Exception as e:

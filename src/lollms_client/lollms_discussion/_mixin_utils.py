@@ -5,7 +5,7 @@
 import json
 import re
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
 
 from ascii_colors import ASCIIColors, trace_exception
@@ -17,6 +17,11 @@ import ascii_colors as logging
 # Create module-level loggers for easy access
 logger = logging.getLogger(__name__)
 discussion_logger = logging.getLogger("lollms_client.lollms_discussion._mixin_utils")
+
+
+def utc_now_iso() -> str:
+    """Single source of truth for ISO-8601 UTC timestamps (seconds precision)."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 class UtilsMixin:
     """
@@ -171,7 +176,7 @@ class UtilsMixin:
             if not response or not isinstance(response, str):
                 return None
             
-            timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             entry = f"--- Memory entry from {timestamp} ---\n{response.strip()}"
             if self.memory:
                 self.memory = self.memory.rstrip() + "\n\n" + entry
@@ -435,7 +440,7 @@ class UtilsMixin:
     def add_discussion_image(self, image_b64, source="user", active=True):
         current = self.get_discussion_images()
         current.append({"data":image_b64,"source":source,"active":active,
-                         "created_at":datetime.utcnow().isoformat()})
+                         "created_at":utc_now_iso()})
         self.images = current
         self.touch()
 
@@ -445,7 +450,7 @@ class UtilsMixin:
         if isinstance(self.images[0], str):
             ASCIIColors.yellow(f"Discussion {self.id}: Upgrading legacy image format.")
             upgraded = [{"data":s,"source":"user","active":True,
-                          "created_at":datetime.utcnow().isoformat()} for s in self.images]
+                          "created_at":utc_now_iso()} for s in self.images]
             self.images = upgraded
             self.touch()
         return self.images

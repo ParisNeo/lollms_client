@@ -5,7 +5,7 @@
 import re
 import uuid
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Dict, Union, Optional
 
@@ -348,8 +348,8 @@ class CoreMixin:
         proxy.participants = {}
         proxy.active_branch_id = None
         proxy.discussion_metadata = {}
-        proxy.created_at = datetime.utcnow()
-        proxy.updated_at = datetime.utcnow()
+        proxy.created_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        proxy.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
         proxy.messages = []
         proxy.pruning_summary = None
         proxy.pruning_point_id = None
@@ -497,7 +497,13 @@ class CoreMixin:
                 flag_modified(self._db_discussion, 'discussion_metadata')
             except Exception:
                 pass
-        setattr(self._db_discussion, 'updated_at', datetime.utcnow())
+        try:
+            _dobj = getattr(self, "_db_discussion", None)
+            if _dobj is not None and getattr(_dobj, "created_at", None) is None:
+                setattr(_dobj, "created_at", datetime.now(timezone.utc).replace(tzinfo=None))
+        except Exception:
+            pass
+        setattr(self._db_discussion, 'updated_at', datetime.now(timezone.utc).replace(tzinfo=None))
         if self._is_db_backed:
             from sqlalchemy.orm.attributes import flag_modified
             try:
@@ -534,6 +540,15 @@ class CoreMixin:
                     except Exception as del_err:
                         ASCIIColors.warning(f"Message deletion error deferred: {del_err}")
                 self._messages_to_delete_from_db.clear()
+            try:
+                _dobj = getattr(self, "_db_discussion", None)
+                if _dobj is not None:
+                    if getattr(_dobj, "created_at", None) is None:
+                        _dobj.created_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                    if getattr(_dobj, "updated_at", None) is None:
+                        _dobj.updated_at = _dobj.created_at
+            except Exception:
+                pass
             try:
                 self._session.commit()
                 self._rebuild_message_index()
@@ -585,7 +600,7 @@ class CoreMixin:
                     self.participants[sender_name] = {"icon": sender_icon, "name": sender_name}
                     self.touch()
         message_data = {'id': msg_id, 'parent_id': parent_id, 'discussion_id': self.id,
-                        'created_at': datetime.utcnow(), **kwargs}
+                        'created_at': datetime.now(timezone.utc).replace(tzinfo=None), **kwargs}
         if 'metadata' in message_data:
             message_data['message_metadata'] = message_data.pop('metadata')
         if self._is_db_backed:
@@ -604,7 +619,7 @@ class CoreMixin:
             meta = wrapped_msg.metadata or {}
             if not meta.get('image_groups'):
                 groups = [{"id": str(uuid.uuid4()), "type": "upload", "indices": [i],
-                           "created_at": datetime.utcnow().isoformat(),
+                           "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                            "main_image_index": i, "is_active": True}
                           for i in range(len(images_list))]
                 meta["image_groups"] = groups
@@ -748,7 +763,7 @@ class CoreMixin:
     def add_discussion_image(self, image_b64, source="user", active=True):
         current = self.get_discussion_images()
         current.append({"data": image_b64, "source": source, "active": active,
-                         "created_at": datetime.utcnow().isoformat()})
+                         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds")})
         self.images = current
         self.touch()
 
@@ -758,7 +773,7 @@ class CoreMixin:
         if isinstance(self.images[0], str):
             ASCIIColors.yellow(f"Discussion {self.id}: Upgrading legacy image format.")
             upgraded = [{"data": s, "source": "user", "active": True,
-                          "created_at": datetime.utcnow().isoformat()} for s in self.images]
+                          "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds")} for s in self.images]
             self.images = upgraded
             self.touch()
         return self.images
