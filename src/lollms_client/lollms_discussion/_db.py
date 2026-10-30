@@ -1,7 +1,7 @@
 import base64
 import uuid
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Type, List, Dict
 
 from sqlalchemy import (Column, DateTime, Float, ForeignKey, Integer, JSON,
@@ -23,6 +23,21 @@ try:
     ENCRYPTION_AVAILABLE = True
 except ImportError:
     ENCRYPTION_AVAILABLE = False
+
+
+def utc_now() -> datetime:
+    """Naive UTC datetime using the non-deprecated API (stored as naive UTC)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+# Sentinel used when a legacy row has no timestamp (very old DBs created
+# before the created_at / updated_at columns existed).
+LEGACY_TS = datetime(1970, 1, 1, 0, 0, 0)  # naive UTC epoch
+
+
+def _coerce_ts(value):
+    """Return a datetime for NULL/legacy timestamps, else the original value."""
+    return value if isinstance(value, datetime) else LEGACY_TS
 
 
 class EncryptedString(TypeDecorator):
@@ -76,8 +91,8 @@ def create_dynamic_models(
         participants = Column(JSON, nullable=True, default=dict)
         active_branch_id = Column(String, nullable=True)
         discussion_metadata = Column(JSON, nullable=True, default=dict)
-        created_at = Column(DateTime, default=datetime.utcnow)
-        updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+        created_at = Column(DateTime, default=utc_now)
+        updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
         pruning_summary = Column(EncryptedText, nullable=True)
         pruning_point_id = Column(String, nullable=True)
 
@@ -104,7 +119,7 @@ def create_dynamic_models(
         message_metadata = Column(JSON, nullable=True, default=dict)
         images = Column(JSON, nullable=True, default=list)
         active_images = Column(JSON, nullable=True, default=list)
-        created_at = Column(DateTime, default=datetime.utcnow)
+        created_at = Column(DateTime, default=utc_now)
 
         @declared_attr
         def discussion(cls):
@@ -155,7 +170,7 @@ class LollmsDataManager:
             kwargs['sender_type'] = 'user' if kwargs.get('sender') == 'user' else 'assistant'
         message_data = {
             'id': str(uuid.uuid4()), 'parent_id': None, 'discussion_id': None,
-            'created_at': datetime.utcnow(), 'raw_content': kwargs.get('content'),
+            'created_at': utc_now(), 'raw_content': kwargs.get('content'),
             'thoughts': None, 'scratchpad': None, 'tokens': None,
             'binding_name': None, 'model_name': None, 'generation_speed': None,
             'message_metadata': {}, 'images': [], 'active_images': [],
@@ -180,6 +195,9 @@ class LollmsDataManager:
                     ('discussion_data_zone', "ALTER TABLE discussions ADD COLUMN discussion_data_zone TEXT"),
                     ('personality_data_zone',"ALTER TABLE discussions ADD COLUMN personality_data_zone TEXT"),
                     ('memory',               "ALTER TABLE discussions ADD COLUMN memory TEXT"),
+                    ('created_at',           "ALTER TABLE discussions ADD COLUMN created_at DATETIME"),
+                    ('updated_at',           "ALTER TABLE discussions ADD COLUMN updated_at DATETIME"),
+                    ('discussion_metadata',  "ALTER TABLE discussions ADD COLUMN discussion_metadata JSON"),
                 ]
                 for col, sql in migrations:
                     if col not in columns:
@@ -216,15 +234,15 @@ class LollmsDataManager:
                 self.DiscussionModel.updated_at,
                 self.DiscussionModel.active_branch_id,
                 self.DiscussionModel.discussion_metadata,
-            ).order_by(self.DiscussionModel.updated_at.desc())
+            ).order_by(text("updated_at IS NULL, updated_at DESC"))
             if limit:
                 query = query.limit(limit)
             rows = query.all()
             return [
                 {
                     "id": row.id,
-                    "created_at": row.created_at,
-                    "updated_at": row.updated_at,
+                    "created_at": _coerce_ts(row.created_at),
+                    "updated_at": _coerce_ts(row.updated_at),
                     "active_branch_id": row.active_branch_id,
                     "title": self._extract_summary_title(row.discussion_metadata),
                     "artefacts_count": len(row.discussion_metadata.get("_artefacts", []))
@@ -238,6 +256,19 @@ class LollmsDataManager:
         with self.get_session() as session:
             try:
                 db_disc = session.query(self.DiscussionModel).filter_by(id=discussion_id).one()
+                # Back-fill legacy rows BEFORE expunge — writes after detach are lost.
+                _changed = False
+                if getattr(db_disc, "created_at", None) is None:
+                    db_disc.created_at = utc_now()
+                    _changed = True
+                if getattr(db_disc, "updated_at", None) is None:
+                    db_disc.updated_at = db_disc.created_at or utc_now()
+                    _changed = True
+                if _changed:
+                    try:
+                        session.commit()
+                    except Exception:
+                        session.rollback()
                 session.expunge(db_disc)
                 return LollmsDiscussion(lollmsClient=lollms_client, db_manager=self,
                                         db_discussion_obj=db_disc,
@@ -261,8 +292,8 @@ class LollmsDataManager:
             return [
                 {
                     "id": row.id,
-                    "created_at": row.created_at,
-                    "updated_at": row.updated_at,
+                    "created_at": _coerce_ts(row.created_at),
+                    "updated_at": _coerce_ts(row.updated_at),
                     "active_branch_id": row.active_branch_id,
                     "title": self._extract_summary_title(row.discussion_metadata),
                     "artefacts_count": len(row.discussion_metadata.get("_artefacts", [])

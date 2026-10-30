@@ -16,7 +16,7 @@ import re
 import uuid
 from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING
 
-from ascii_colors import ASCIIColors
+from ascii_colors import ASCIIColors, trace_exception
 from lollms_client.lollms_artefact import ArtefactType
 
 if TYPE_CHECKING:
@@ -1196,7 +1196,7 @@ RULES:
         for t_name, t_spec in visible_tools.items():
             desc = t_spec.get("description", "")
             params_list = t_spec.get("parameters", [])
-            param_desc = ", ".join([f"{p['name']}: {p['type']}" for p in params_list])
+            param_desc = self._format_tool_parameters(params_list, t_name)
             tools_prompt += f"- {t_name}({param_desc}): {desc}\n"
 
         # ── 🛡️ PHANTOM TOOL PREVENTION PROTOCOL ──
@@ -1208,6 +1208,69 @@ RULES:
         tools_prompt += "=== END TOOLS ===\n"
         
         return tools_prompt
+
+    def _format_tool_parameters(self, params_list: Any, tool_name: str = "") -> str:
+        """
+        Normalise a tool's `parameters` field into a flat "name: type, name: type" string.
+
+        Supports TWO schemas (both appear in the wild):
+          1. Legacy list-of-dicts:  [{"name": "query", "type": "str", ...}, ...]
+          2. JSON Schema object:    {"type": "object", "properties": {...}, "required": [...]}
+
+        Never raises — malformed entries are skipped with a warning log.
+        """
+        if not params_list:
+            return ""
+
+        parts: List[str] = []
+
+        # ── Schema 1: JSON Schema object (dict with "properties") ──
+        if isinstance(params_list, dict):
+            properties = params_list.get("properties")
+            if isinstance(properties, dict):
+                required = params_list.get("required") or []
+                required_set = set(required) if isinstance(required, (list, tuple, set)) else set()
+                for p_name, p_spec in properties.items():
+                    if not isinstance(p_spec, dict):
+                        continue
+                    p_type = p_spec.get("type", "any")
+                    marker = "" if p_name in required_set else "?"
+                    parts.append(f"{p_name}{marker}: {p_type}")
+                return ", ".join(parts)
+            # Unknown dict shape — log and bail
+            ASCIIColors.warning(
+                f"[_format_tool_parameters] Tool '{tool_name}' has unrecognised dict-shaped "
+                f"parameters (keys={list(params_list.keys())}); skipping."
+            )
+            return ""
+
+        # ── Schema 2: legacy list-of-dicts ──
+        if isinstance(params_list, (list, tuple)):
+            for p in params_list:
+                if not isinstance(p, dict):
+                    ASCIIColors.warning(
+                        f"[_format_tool_parameters] Tool '{tool_name}' has non-dict parameter "
+                        f"entry {type(p).__name__}={p!r}; skipping."
+                    )
+                    continue
+                p_name = p.get("name")
+                p_type = p.get("type", "any")
+                if not p_name:
+                    ASCIIColors.warning(
+                        f"[_format_tool_parameters] Tool '{tool_name}' parameter missing 'name': {p!r}; skipping."
+                    )
+                    continue
+                optional = p.get("optional", False)
+                marker = "?" if optional else ""
+                parts.append(f"{p_name}{marker}: {p_type}")
+            return ", ".join(parts)
+
+        # ── Unknown shape ──
+        ASCIIColors.warning(
+            f"[_format_tool_parameters] Tool '{tool_name}' has unsupported parameters type "
+            f"{type(params_list).__name__}; skipping."
+        )
+        return ""
 
     def _build_form_instructions(self) -> str:
         """Instruction for rich interactive form building."""

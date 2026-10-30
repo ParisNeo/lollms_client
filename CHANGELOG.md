@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-30 10:22]
+
+- feat(client): add discussion timestamps and metadata to lollms_discussion
+
 ## [2026-10-29 23:55]
 
 - feat(lollms_code): add new features to CLI and GUI

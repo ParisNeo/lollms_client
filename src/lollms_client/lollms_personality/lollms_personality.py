@@ -95,6 +95,11 @@ _SYNTHETIC_RESPONSE_PREFIXES = (
     "[Context Window Exhausted:",
 )
 
+# Module-level cache of SafeStoreRAGBinding instances keyed by resolved .db path.
+# Prevents re-instantiating the SentenceTransformer on every tool call while
+# preserving the binding's lazy .get_store() contract.
+_SAFESTORE_BINDING_CACHE: Dict[str, Any] = {}
+
 _INTENT_ANNOUNCEMENT_RE = re.compile(
     r'(?im)(?:'
     r'^\s*(?:'
@@ -153,6 +158,148 @@ _REPEATABLE_OBSERVATION_TOOLS = {
 def _is_synthetic_agent_response(text: str) -> bool:
     stripped = (text or "").strip()
     return any(stripped.startswith(prefix) for prefix in _SYNTHETIC_RESPONSE_PREFIXES)
+
+
+def _get_or_create_safestore_binding(db_path: Path) -> Optional[Any]:
+    """
+    Return a cached SafeStoreRAGBinding for the given .db path, instantiating it
+    on first use. The binding stays lazy — .get_store() is only invoked when the
+    caller actually queries it, so no SentenceTransformer load happens here.
+
+    Returns None on any failure (missing package, invalid .db, etc.) and logs
+    under [RAG-DIAG] so the caller can surface a clear error to the LLM.
+    """
+    try:
+        key = str(Path(db_path).resolve())
+    except Exception:
+        key = str(db_path)
+
+    cached = _SAFESTORE_BINDING_CACHE.get(key)
+    if cached is not None:
+        try:
+            ASCIIColors.info(f"[RAG-DIAG] SafeStore cache HIT: {key}")
+        except Exception:
+            pass
+        return cached
+
+    try:
+        from lollms_client.rag_bindings.safe_store import SafeStoreRAGBinding
+    except ImportError as imp_err:
+        try:
+            ASCIIColors.error(f"[RAG-DIAG] safe_store package not installed: {imp_err}")
+        except Exception:
+            pass
+        return None
+
+    try:
+        binding = SafeStoreRAGBinding(db_path=key)
+        _SAFESTORE_BINDING_CACHE[key] = binding
+        try:
+            ASCIIColors.info(f"[RAG-DIAG] SafeStore auto-instantiated: {key}")
+        except Exception:
+            pass
+        return binding
+    except Exception as inst_err:
+        try:
+            ASCIIColors.error(f"[RAG-DIAG] SafeStore instantiation failed for {key}: {inst_err}")
+        except Exception:
+            pass
+        trace_exception(inst_err)
+        return None
+
+
+def _make_rag_tool_from_safestore(store: Any, *, name: str, description: str) -> Dict[str, Any]:
+    """
+    Wraps a SafeStoreRAGBinding (as produced by Handbag.extra_safe_stores) into a
+    tool dict matching the canonical RAG tool shape used elsewhere in this module:
+    {"name", "description", "parameters": [ {name,type,description,optional?} ], "callable"}.
+
+    The binding is intentionally lazy: .get_store() is only invoked inside the
+    callable, never at construction time, so the shared daemon / SentenceTransformer
+    load is deferred until the LLM actually invokes the tool.
+    """
+    store_label = getattr(store, "db_path", None) or name
+
+    def _tool_search(query: str, top_k: int = 5) -> dict:
+        try:
+            if hasattr(store, "query"):
+                raw = store.query(query, top_k=top_k)
+            elif hasattr(store, "search"):
+                raw = store.search(query, top_k=top_k)
+            elif hasattr(store, "get_store"):
+                raw = store.get_store().query(query, top_k=top_k)
+            else:
+                return {"success": False, "error": f"[{name}] Store has no query/search method."}
+
+            normalised = _normalise_raw(raw, query, str(store_label))
+            hits = normalised.get("count", 0)
+            try:
+                ASCIIColors.debug(
+                    f"[RAG-QUERY] store='{store_label}' q='{query[:60]}' top_k={top_k} -> {hits} hit(s)"
+                )
+            except Exception:
+                pass
+
+            if not normalised.get("sources"):
+                return {"success": True, "output": f"No relevant content found in '{store_label}' for query: '{query}'."}
+
+            parts = []
+            for idx, src in enumerate(normalised["sources"], 1):
+                title = src.get("title") or src.get("source") or "Document"
+                score = src.get("score")
+                score_str = f" (Score: {score:.2f})" if isinstance(score, (int, float)) else ""
+                parts.append(f"[{idx}] {title}{score_str}:\n{src.get('content', '')}")
+            return {
+                "success": True,
+                "sources_count": len(normalised["sources"]),
+                "output": "\n\n".join(parts),
+            }
+        except Exception as e:
+            return {"success": False, "error": f"[{name}] search failed: {e}"}
+
+    return {
+        "name": name,
+        "description": description,
+        "parameters": [
+            {"name": "query", "type": "str", "description": "Natural language search query."},
+            {"name": "top_k", "type": "int", "description": "Maximum excerpts to return (default 5).", "optional": True},
+        ],
+        "callable": _tool_search,
+    }
+
+def _sanitise_tool_ident(raw: str, *, fallback: str = "store") -> str:
+    """Collapse an arbitrary display name into a safe snake_case tool identifier."""
+    s = (raw or "").strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s).strip("_")
+    return s or fallback
+
+
+def _resolve_rag_tool_identity(store: Any, idx: int) -> "tuple[str, str]":
+    """
+    Resolve (tool_name, tool_description) for a handbag SafeStore binding.
+
+    Priority:
+      1. Provenance written by Handbag  (store._handbag_label / store._handbag_description)
+      2. Host-app-set attributes        (store.name / store.description)
+      3. Fallback                       (db_path stem + generic description)
+
+    The name is normalised into a snake_case identifier and prefixed with 'rag_' so
+    multiple stores never collide and the LLM sees a stable, greppable tool name.
+    """
+    raw_name = (
+        getattr(store, "_handbag_label", None)
+        or getattr(store, "name", None)
+        or getattr(getattr(store, "db_path", None), "stem", None)
+        or f"store_{idx}"
+    )
+    raw_desc = (
+        getattr(store, "_handbag_description", None)
+        or getattr(store, "description", None)
+        or f"Search the '{raw_name}' knowledge base for relevant excerpts."
+    )
+    slug = _sanitise_tool_ident(str(raw_name), fallback=f"store_{idx}")
+    return f"rag_{slug}", str(raw_desc)
+
 
 class _NullArtefactManager:
     """Null-safe stand-in for ArtefactManager when no workspace is configured."""
@@ -2232,6 +2379,8 @@ class LollmsPersonality:
         data_source: Optional[Union[str, Callable, Dict[str, Any], List[Any], RAGDataSource]] = None,
         data_sources: Optional[Union[List[Any], Dict[str, Any]]] = None,
         data_files: Optional[List[Union[str, Path]]] = None,
+        extra_knowledge_bases: Optional[List[Union[str, Path]]] = None,
+        extra_safe_stores: Optional[List[Any]] = None,
         vectorize_chunk_callback: Optional[Callable[[str, str], None]] = None,
         is_vectorized_callback: Optional[Callable[[str], bool]] = None,
         query_rag_callback: Optional[Callable] = None,
@@ -2317,6 +2466,23 @@ class LollmsPersonality:
         self.data_sources: List[RAGDataSource] = []
         self._init_data_sources(data_source, data_sources, query_rag_callback)
         self._query_data_fn = self._build_query_data_fn(data_source)
+
+        # Handbag-injected knowledge sources (never alias the handbag's lists).
+        self.extra_knowledge_bases: List[Path] = [Path(p) for p in (extra_knowledge_bases or [])]
+        self.extra_safe_stores: List[Any] = list(extra_safe_stores or [])
+        try:
+            if self.extra_safe_stores:
+                ASCIIColors.info(
+                    f"[Personality.__init__] Received {len(self.extra_safe_stores)} extra_safe_store(s) "
+                    f"from handbag: {[str(getattr(s, 'db_path', '<obj>')) for s in self.extra_safe_stores]}"
+                )
+            if self.extra_knowledge_bases:
+                ASCIIColors.info(
+                    f"[Personality.__init__] Received {len(self.extra_knowledge_bases)} extra_knowledge_base(s): "
+                    f"{[str(p) for p in self.extra_knowledge_bases]}"
+                )
+        except Exception:
+            pass
 
         self.script = script
         self.script_module = None
@@ -2558,6 +2724,8 @@ class LollmsPersonality:
         lollms_client: Optional[Any] = None,
         extra_tools: Optional[List[Union[str, Path]]] = None,
         extra_skills_dirs: Optional[List[Union[str, Path]]] = None,
+        extra_knowledge_bases: Optional[List[Union[str, Path]]] = None,
+        extra_safe_stores: Optional[List[Any]] = None,
     ) -> 'LollmsPersonality':
         """
         Loads a LollmsPersonality from a handbag directory.
@@ -2647,6 +2815,20 @@ class LollmsPersonality:
                 ASCIIColors.error(f"[Handbag] FAILED to create tool binding from {len(all_tool_files)} file(s): {tool_load_err}")
                 trace_exception(tool_load_err)
 
+        # Merge handbag-declared KBs/stores with any caller-supplied ones.
+        merged_kbs = list(hb.extra_knowledge_bases) + [Path(p) for p in (extra_knowledge_bases or [])]
+        merged_safe_stores = list(hb.extra_safe_stores) + list(extra_safe_stores or [])
+
+        try:
+            ASCIIColors.info(
+                f"[Handbag.from_handbag] handbag='{hb.path.name}' -> "
+                f"extra_knowledge_bases={len(hb.extra_knowledge_bases)}, "
+                f"extra_safe_stores={len(hb.extra_safe_stores)} "
+                f"(merged: kbs={len(merged_kbs)}, stores={len(merged_safe_stores)})"
+            )
+        except Exception:
+            pass
+
         pers = LollmsPersonality(
             name=name,
             author=author,
@@ -2662,6 +2844,8 @@ class LollmsPersonality:
             data_sources=rag_data_sources if rag_data_sources else None,
             workspace_path=hb.workspace_dir if hb.workspace_dir.exists() else None,
             lollms_client=lollms_client,
+            extra_knowledge_bases=merged_kbs,
+            extra_safe_stores=merged_safe_stores,
         )
 
         # CRITICAL: Explicitly bind the resolved handbag path to the personality instance.
@@ -2949,60 +3133,262 @@ class LollmsPersonality:
         return "\n".join(lines)
 
     def build_rag_tools(self) -> Dict[str, Dict[str, Any]]:
-        if not self.has_data:
-            return {}
+            if not self.has_data:
+                return {}
 
-        ds_descriptions = []
-        for ds in self.data_sources:
-            desc = f"'{ds.name}': {ds.description}" if ds.description else f"'{ds.name}'"
-            ds_descriptions.append(desc)
+            # --- Build a "name: description" catalog covering EVERY RAG source ---
+            catalog_lines: List[str] = []
+            safe_store_map: Dict[str, Any] = {}
+            kb_path_map: Dict[str, Path] = {}
 
-        ds_list_str = "; ".join(ds_descriptions) if ds_descriptions else "Default Knowledge Base"
+            # 1) Declarative data sources (highest priority — user-declared)
+            for ds in self.data_sources:
+                desc = ds.description or f"Data source '{ds.name}'"
+                catalog_lines.append(f"{ds.name}: {desc}")
 
-        def tool_query_rag(query: str, datasource_name: str = "") -> dict:
-            """
-            Query the attached RAG knowledge base data source(s) for relevant document excerpts, citations, or facts.
+            # 2) Handbag SafeStore bindings (.db files opened as SafeStoreRAGBinding)
+            for idx, store in enumerate(getattr(self, "extra_safe_stores", [])):
+                tool_name, tool_desc = _resolve_rag_tool_identity(store, idx)
+                db_label = tool_name[4:] if tool_name.startswith("rag_") else tool_name
+                # de-dupe against data-source names
+                base_label, n = db_label, 1
+                while db_label in safe_store_map or any(ds.name == db_label for ds in self.data_sources):
+                    n += 1
+                    db_label = f"{base_label}_{n}"
+                safe_store_map[db_label] = store
+                catalog_lines.append(f"{db_label}: {tool_desc}")
 
-            Args:
-                query (str): The search query or question to retrieve information for.
-                datasource_name (str, optional): The name of the specific data source to query. If omitted, queries available data sources.
-            """
-            try:
-                ds_target = datasource_name.strip() or None
-                res = self.query_data(query, datasource_name=ds_target)
-                if not res or not res.get("success") or not res.get("sources"):
-                    return {
-                        "success": True,
-                        "output": f"No relevant content found in RAG datasource for query: '{query}'."
-                    }
+            # 3) Plain knowledge-base paths (files/dirs — resolved via self.query_data)
+            #    This is the ONLY way a .db that failed to open as a SafeStore still
+            #    appears in the prompt (e.g. app-level fallback path).
+            #    The catalog line exposes the EXACT `datasource_name` the LLM must pass,
+            #    followed by a human description — never the filesystem path.
+            for kb in getattr(self, "extra_knowledge_bases", []):
+                p = Path(kb)
+                label = p.stem or p.name
+                base_label, n = label, 1
+                while label in safe_store_map or label in kb_path_map or any(ds.name == label for ds in self.data_sources):
+                    n += 1
+                    label = f"{base_label}_{n}"
+                kb_path_map[label] = p
+                kb_desc = (
+                    getattr(p, "_handbag_description", None)
+                    or f"Knowledge base '{label}'."
+                )
+                catalog_lines.append(f"{label}: {kb_desc}")
 
-                output_parts = []
-                for idx, src in enumerate(res.get("sources", []), 1):
-                    title = src.get("title") or src.get("source") or "Document"
-                    score_val = src.get("score")
-                    score_str = f" (Score: {score_val:.2f})" if isinstance(score_val, (int, float)) and score_val <= 1.0 else (f" (Score: {score_val})" if score_val is not None else "")
-                    output_parts.append(f"[{idx}] {title}{score_str}:\n{src.get('content')}")
+            if not catalog_lines:
+                ds_list_str = "(no databases configured)"
+            else:
+                ds_list_str = "\n".join(catalog_lines)  # ← NEWLINES, per user request
 
-                return {
-                    "success": True,
-                    "sources_count": len(res.get("sources", [])),
-                    "output": "\n\n".join(output_parts)
+            _ds_options = ", ".join(
+                list(safe_store_map.keys())
+                + list(kb_path_map.keys())
+                + [ds.name for ds in self.data_sources]
+            ) or "default"
+
+            # --- Unified callable: routes SafeStore → path-based KB → default ---
+            def _tool_query_rag_unified(query: str, datasource_name: Optional[str] = None) -> dict:
+                try:
+                    ASCIIColors.info(
+                        f"[RAG-DIAG] ENTRY query='{query[:80]}' datasource_name={datasource_name!r} "
+                        f"safe_store_keys={list(safe_store_map.keys())} "
+                        f"kb_path_keys={list(kb_path_map.keys())} "
+                        f"data_source_names={[ds.name for ds in self.data_sources]}"
+                    )
+                except Exception:
+                    pass
+
+                # Branch 1: handbag SafeStore binding
+                if datasource_name and datasource_name in safe_store_map:
+                    store = safe_store_map[datasource_name]
+                    try:
+                        ASCIIColors.info(
+                            f"[RAG-DIAG] BRANCH=SafeStore store_type={type(store).__name__} "
+                            f"has_query={hasattr(store, 'query')} has_search={hasattr(store, 'search')} "
+                            f"has_get_store={hasattr(store, 'get_store')} "
+                            f"db_path={getattr(store, 'db_path', '<none>')}"
+                        )
+                        if hasattr(store, "query"):
+                            raw = store.query(query, top_k=5)
+                        elif hasattr(store, "search"):
+                            raw = store.search(query, top_k=5)
+                        elif hasattr(store, "get_store"):
+                            raw = store.get_store().query(query, top_k=5)
+                        else:
+                            ASCIIColors.warning(f"[RAG-DIAG] Store '{datasource_name}' has no query/search/get_store method.")
+                            return {"success": False, "error": f"Store '{datasource_name}' has no query method."}
+
+                        try:
+                            ASCIIColors.info(
+                                f"[RAG-DIAG] store.query() returned type={type(raw).__name__} "
+                                f"len={len(raw) if hasattr(raw, '__len__') else 'n/a'} "
+                                f"preview={str(raw)[:300]}"
+                            )
+                        except Exception:
+                            pass
+
+                        normalised = _normalise_raw(raw, query, datasource_name)
+                        try:
+                            ASCIIColors.info(
+                                f"[RAG-DIAG] _normalise_raw -> count={normalised.get('count', 0)} "
+                                f"sources_len={len(normalised.get('sources', []))} "
+                                f"keys={list(normalised.keys())}"
+                            )
+                        except Exception:
+                            pass
+
+                        if not normalised.get("sources"):
+                            ASCIIColors.warning(
+                                f"[RAG-DIAG] SafeStore '{datasource_name}' returned 0 sources after normalisation. "
+                                f"Raw was: {str(raw)[:500]}"
+                            )
+                            return {"success": True, "output": f"No relevant content found in '{datasource_name}' for query: '{query}'."}
+                        parts = []
+                        for i, src in enumerate(normalised["sources"], 1):
+                            title = src.get("title") or src.get("source") or "Document"
+                            score = src.get("score")
+                            score_str = f" (Score: {score:.2f})" if isinstance(score, (int, float)) else ""
+                            parts.append(f"[{i}] {title}{score_str}:\n{src.get('content', '')}")
+                        ASCIIColors.success(f"[RAG-DIAG] SafeStore '{datasource_name}' -> {len(normalised['sources'])} hit(s)")
+                        return {"success": True, "sources_count": len(normalised["sources"]), "output": "\n\n".join(parts)}
+                    except Exception as e:
+                        ASCIIColors.error(f"[RAG-DIAG] SafeStore '{datasource_name}' query EXCEPTION: {e}")
+                        trace_exception(e)
+                        return {"success": False, "error": f"Store '{datasource_name}' query failed: {e}"}
+
+                # Branch 2: path-based KB or default — with .db auto-routing
+                try:
+                    # NEW: if the target path is a .db, auto-instantiate a SafeStore
+                    # and query it directly (query_data has no .db handler).
+                    _kb_path = kb_path_map.get(datasource_name) if datasource_name else None
+                    if _kb_path is not None and Path(_kb_path).suffix.lower() == ".db":
+                        ASCIIColors.info(
+                            f"[RAG-DIAG] BRANCH=db-auto datasource_name='{datasource_name}' "
+                            f"path='{_kb_path}' (kb_path_map had a .db — routing through SafeStoreRAGBinding)"
+                        )
+                        binding = _get_or_create_safestore_binding(Path(_kb_path))
+                        if binding is None:
+                            return {
+                                "success": False,
+                                "error": (
+                                    f"Could not auto-instantiate SafeStore for '{datasource_name}' "
+                                    f"({_kb_path}). Check that 'safe_store' is installed and the .db is valid."
+                                ),
+                            }
+                        try:
+                            ASCIIColors.info(
+                                f"[RAG-DIAG] SafeStore binding ready: path='{_kb_path}' id={id(binding)} "
+                                f"(store_instance={'loaded' if getattr(binding, '_store_instance', None) else 'lazy'})"
+                            )
+                            _raw = binding.query(query, top_k=5)
+                            ASCIIColors.info(
+                                f"[RAG-DIAG] SafeStore query returned type={type(_raw).__name__} "
+                                f"len={len(_raw) if hasattr(_raw, '__len__') else 'n/a'} "
+                                f"preview={str(_raw)[:300]}"
+                            )
+                            _norm = _normalise_raw(_raw, query, str(datasource_name))
+                            if not _norm.get("sources"):
+                                ASCIIColors.warning(
+                                    f"[RAG-DIAG] SafeStore '{datasource_name}' -> 0 hits after normalisation. "
+                                    f"Raw was: {str(_raw)[:500]}"
+                                )
+                                return {
+                                    "success": True,
+                                    "output": f"No relevant content found in '{datasource_name}' for query: '{query}'.",
+                                }
+                            _parts = []
+                            for _i, _src in enumerate(_norm["sources"], 1):
+                                _title = _src.get("title") or _src.get("source") or "Document"
+                                _score = _src.get("score")
+                                _score_str = f" (Score: {_score:.2f})" if isinstance(_score, (int, float)) else ""
+                                _parts.append(f"[{_i}] {_title}{_score_str}:\n{_src.get('content', '')}")
+                            ASCIIColors.success(
+                                f"[RAG-DIAG] SafeStore '{datasource_name}' -> {len(_norm['sources'])} hit(s)"
+                            )
+                            return {
+                                "success": True,
+                                "sources_count": len(_norm["sources"]),
+                                "output": "\n\n".join(_parts),
+                            }
+                        except Exception as _e:
+                            ASCIIColors.error(
+                                f"[RAG-DIAG] SafeStore '{datasource_name}' query EXCEPTION: {_e}"
+                            )
+                            trace_exception(_e)
+                            return {
+                                "success": False,
+                                "error": f"SafeStore query failed for '{datasource_name}': {_e}",
+                            }
+
+                    # Fall through: normal text KB / default datasource
+                    ASCIIColors.info(
+                        f"[RAG-DIAG] BRANCH=path/default datasource_name={datasource_name!r} "
+                        f"in_kb_path_map={(datasource_name in kb_path_map) if datasource_name else False}"
+                    )
+                    result = self.query_data(query, datasource_name=datasource_name)
+                    try:
+                        ASCIIColors.info(
+                            f"[RAG-DIAG] query_data() returned type={type(result).__name__} "
+                            f"keys={list(result.keys()) if isinstance(result, dict) else 'n/a'} "
+                            f"success={result.get('success') if isinstance(result, dict) else 'n/a'} "
+                            f"sources_len={len(result.get('sources', [])) if isinstance(result, dict) else 'n/a'} "
+                            f"preview={str(result)[:300]}"
+                        )
+                    except Exception:
+                        pass
+                    if not isinstance(result, dict):
+                        return {"success": True, "output": str(result)}
+                    if not result.get("success") or not result.get("sources"):
+                        ASCIIColors.warning(
+                            f"[RAG-DIAG] query_data() returned no sources for datasource_name={datasource_name!r}. "
+                            f"Full result: {str(result)[:500]}"
+                        )
+                        return {"success": True, "output": f"No relevant content found for query: '{query}'."}
+                    parts = []
+                    for i, src in enumerate(result.get("sources", []), 1):
+                        title = src.get("title") or src.get("source") or "Document"
+                        score = src.get("score")
+                        score_str = f" (Score: {score:.2f})" if isinstance(score, (int, float)) and (score <= 1.0) else (f" (Score: {score})" if score is not None else "")
+                        parts.append(f"[{i}] {title}{score_str}:\n{src.get('content', '')}")
+                    ASCIIColors.success(f"[RAG-DIAG] path/default -> {len(result.get('sources', []))} hit(s)")
+                    return {"success": True, "sources_count": len(result.get("sources", [])), "output": "\n\n".join(parts)}
+                except Exception as e:
+                    ASCIIColors.error(f"[RAG-DIAG] path/default query EXCEPTION: {e}")
+                    trace_exception(e)
+                    return {"success": False, "error": f"RAG query failed: {e}"}
+
+            tools: Dict[str, Dict[str, Any]] = {
+                "tool_query_rag": {
+                    "name": "tool_query_rag",
+                    "description": (
+                        "Query external RAG knowledge bases for information.\n"
+                        f"Available databases:\n{ds_list_str}\n\n"
+                        f"Pass `datasource_name` (one of: {_ds_options}) to target a specific database by name; "
+                        "omit it to query the default knowledge base."
+                    ),
+                    "parameters": [
+                        {"name": "query", "type": "str", "description": "The search query or keywords."},
+                        {"name": "datasource_name", "type": "str", "description": f"Exact database name to query. Valid values: {_ds_options}.", "optional": True},
+                    ],
+                    "callable": _tool_query_rag_unified,
                 }
-            except Exception as e:
-                return {"success": False, "error": f"RAG query failed: {e}"}
-
-        ds_names = [ds.name for ds in self.data_sources]
-        return {
-            "tool_query_rag": {
-                "name": "tool_query_rag",
-                "description": f"Query external RAG knowledge bases for information. Available data sources: {ds_list_str}",
-                "parameters": [
-                    {"name": "query", "type": "str", "description": "The search query or keywords."},
-                    {"name": "datasource_name", "type": "str", "description": f"Specific data source name to query (options: {', '.join(ds_names)}).", "optional": True}
-                ],
-                "callable": tool_query_rag
             }
-        }
+
+            try:
+                ASCIIColors.info(
+                    f"[RAG-RESOLVE] personality='{self.name}' "
+                    f"paths={len(getattr(self, 'extra_knowledge_bases', []))} "
+                    f"stores={len(getattr(self, 'extra_safe_stores', []))} "
+                    f"-> unified tool_query_rag; "
+                    f"databases={list(safe_store_map.keys()) + list(kb_path_map.keys())} "
+                    f"catalog_lines={len(catalog_lines)}"
+                )
+            except Exception:
+                pass
+
+            return tools
 
     @property
     def artefacts(self) -> Optional[ArtefactManager]:
@@ -3016,6 +3402,8 @@ class LollmsPersonality:
             or self._raw_data_source is not None
             or self.query_rag_callback is not None
             or bool(self.data_files)
+            or bool(getattr(self, "extra_knowledge_bases", []))
+            or bool(getattr(self, "extra_safe_stores", []))
             or (self.lollms_client is not None and (getattr(self.lollms_client, "rag", None) is not None or bool(getattr(self.lollms_client, "rag_model_profiles_registry", None))))
         )
 
@@ -5171,6 +5559,48 @@ JSON:"""
                 ASCIIColors.warning(
                     f"[{self.name}] Failed to mount handbag documentation tools: {doc_tools_ex}"
                 )
+
+        # ── 8. HANDBAG SAFESTORE RAG TOOLS ──
+        # Per-store tools are intentionally NOT emitted here: the unified
+        # `tool_query_rag` (built by build_rag_tools) already enumerates every
+        # handbag SafeStore AND every plain extra_knowledge_bases path in its
+        # multi-line description, and routes via `datasource_name`.
+        # Emitting both would give the LLM two competing tools for the same data.
+        _safe_stores = getattr(self, "extra_safe_stores", [])
+        _kb_paths = getattr(self, "extra_knowledge_bases", [])
+
+        # Idempotent merge: ensure the unified tool_query_rag is present even if
+        # build_rag_tools() was bypassed by the app-level fallback path.
+        if "tool_query_rag" not in active_tools and (self.has_data or _safe_stores or _kb_paths):
+            try:
+                _unified = self.build_rag_tools()
+                if "tool_query_rag" in _unified:
+                    active_tools["tool_query_rag"] = _unified["tool_query_rag"]
+            except Exception as _merge_err:
+                ASCIIColors.warning(f"[{self.name}] Failed to merge unified tool_query_rag: {_merge_err}")
+
+        if _safe_stores or _kb_paths:
+            try:
+                _db_labels = (
+                    [getattr(s, '_handbag_label', None) or getattr(getattr(s, 'db_path', None), 'stem', f'store_{i}') for i, s in enumerate(_safe_stores)]
+                    + [Path(p).stem or Path(p).name for p in _kb_paths]
+                )
+                ASCIIColors.info(
+                    f"[RAG-RESOLVE] personality='{self.name}' "
+                    f"paths={len(_kb_paths)} stores={len(_safe_stores)} "
+                    f"-> unified tool_query_rag (databases={_db_labels})"
+                )
+            except Exception:
+                pass
+        elif not any(t_name == "tool_query_rag" for t_name in active_tools):
+            try:
+                ASCIIColors.warning(
+                    f"[Personality.get_rag_tools] NO RAG tools — "
+                    f"extra_knowledge_bases={len(_kb_paths)}, "
+                    f"extra_safe_stores={len(_safe_stores)}"
+                )
+            except Exception:
+                pass
 
         if explicit_tools:
             active_tools.update(explicit_tools)

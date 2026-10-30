@@ -1015,6 +1015,89 @@ class MyBinding(LollmsTTIBinding):
     def list_models(self): ...
 ```
 
+## ⏱️ Discussion Timestamps & Metadata
+
+Every `LollmsDiscussion` carries two automatically maintained timestamps and a
+free-form JSON metadata bag. Both are stored on the discussion row itself and
+are exposed through the standard discussion API.
+
+### Timestamps
+
+| Field        | Type     | Meaning                                                     |
+|--------------|----------|-------------------------------------------------------------|
+| `created_at` | datetime | Set once at creation time. Never modified afterwards.        |
+| `updated_at` | datetime | Bumped automatically on **every** mutation (message add, delete, title change, metadata set/remove, branch switch, memory update, prune, image add/remove, etc.). |
+
+Both are stored as **UTC** datetimes. `LollmsDataManager.list_discussions()`
+returns them as first-class keys `created_at` / `updated_at` on each summary row,
+and discussions are ordered by `updated_at DESC` by default.
+
+Because SQLAlchemy's `onupdate=` hook fires on every dirty UPDATE to the row,
+any caller that persists a mutation through the normal commit path
+(`discussion.commit()`, `discussion.touch()`, `<setter>` helpers) inherits the
+`updated_at` bump for free — **no manual timestamping required**.
+
+### Discussion Metadata
+
+Discussions expose a free-form JSON metadata bag stored on the row itself
+(`discussions.discussion_metadata`). External applications can embed identity,
+tenancy, tracing, or tagging data without touching the LLM context.
+
+```python
+from lollms_client import LollmsClient, LollmsDiscussion, LollmsDataManager
+
+client = LollmsClient(llm_binding_name="ollama")
+db_manager = LollmsDataManager("sqlite:///discussion.db")
+disc = LollmsDiscussion.create_new(lollms_client=client, db_manager=db_manager)
+
+# --- write ---
+disc.set_metadata_item("tenant_id", "acme-corp")
+disc.set_metadata_item("trace_id", "trc_9f3a2c")
+disc.set_metadata_item("tags", ["support", "billing"])
+
+# --- read ---
+assert disc.metadata.get("tenant_id") == "acme-corp"
+assert disc.metadata.get("missing") is None
+
+# --- list all ---
+print(dict(disc.metadata))
+# {'tenant_id': 'acme-corp', 'trace_id': 'trc_9f3a2c', 'tags': ['support', 'billing']}
+```
+
+**Semantics**
+- Values are stored as JSON — scalars, lists, dicts are all fine.
+- Every `set_metadata_item` call triggers a row UPDATE and therefore bumps
+  `updated_at` automatically.
+- Metadata is **not** injected into the prompt / LLM context. It is application
+  state only.
+- Setting a key to `None` stores `null` (reassign the metadata dict without the
+  key to delete it).
+
+### Migration
+
+`discussions.discussion_metadata`, `created_at`, and `updated_at` are added
+idempotently at startup (`LollmsDataManager.create_and_migrate_tables()`),
+so pre-existing `.db` files upgrade transparently — no dump/restore needed.
+
+### Legacy discussions (pre-timestamp rows)
+
+Discussions created before `created_at` / `updated_at` were introduced are
+handled transparently:
+
+- On **first load** (`LollmsDataManager.get_discussion()`), any missing
+  `created_at` is back-filled with the current UTC time, and any missing
+  `updated_at` is set to `created_at`. The back-fill is committed to the
+  database once, so subsequent reads return real datetimes — no repeated
+  migration cost.
+- `list_discussions()` and `search_discussions()` coerce any NULL timestamp
+  to the sentinel `1970-01-01T00:00:00` (naive UTC) so sorting by
+  `updated_at DESC` never raises and legacy rows sort last.
+- `commit()` / `touch()` also back-fill both timestamps as a side-effect of
+  the normal mutation path, so any user edit upgrades the row automatically.
+- **No user action is required** — old `.db` files just work.
+
+---
+
 ## 🔄 Turn Checkpointing & Resumption
 
 `lollms_client` features native round-end state checkpointing across both `LollmsDiscussion` and `LollmsPersonality`.
