@@ -262,6 +262,73 @@ class SafeStoreRAGBinding(LollmsRAGBinding):
 
     # ── Retrieval Implementation ─────────────────────────────────────────────
 
+    # ── Legacy compatibility shim ────────────────────────────────────────────
+
+    def query_data(
+        self,
+        query: str,
+        top_k: int = 5,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """
+        Compatibility shim for the legacy ``LollmsRAGBinding.query_data()``
+        contract, which upstream resolvers (e.g. the deployed ``tool_query_rag``
+        path-default branch) call when ``datasource_name`` is omitted.
+
+        The base-class stub returns ``{'success': False, 'sources': [], ...}``
+        unconditionally — which is why bare ``tool_query_rag(query=...)`` calls
+        return 0 hits even though SafeStore retrieval works perfectly via
+        ``query()``. This override routes the legacy call into the real
+        SafeStore retrieval pipeline, preserving the exact return shape the
+        legacy contract expects.
+
+        Returns
+        -------
+        dict
+            ``{"success": bool, "sources": [...], "count": int, "query": str}``
+            where ``sources`` entries are the standard normalised hit dicts
+            (``content``, ``score``, ``relevance_percent``, ``source``,
+            ``title``, ``metadata``, ``store_name``, optional ``chunk_seqs``).
+            On retrieval error, returns ``success=False`` with ``error`` and
+            ``sources=[]`` — never raises.
+        """
+        try:
+            hits = self.query(query_text=query, top_k=top_k, **kwargs)
+            try:
+                _preview = ""
+                if hits:
+                    _first = hits[0]
+                    _content = _first.get("content", "") if isinstance(_first, dict) else ""
+                    _preview = str(_content)[:200].replace("\n", " ")
+                ASCIIColors.info(
+                    f"[SafeStoreRAG-DBG] query_data() RETURN "
+                    f"query='{query[:60]}' top_k={top_k} "
+                    f"hits={len(hits)} "
+                    f"first_content_len={len(hits[0].get('content', '')) if hits and isinstance(hits[0], dict) else 0} "
+                    f"first_preview='{_preview}'"
+                )
+            except Exception:
+                pass
+            return {
+                "success": True,
+                "sources": hits,
+                "count": len(hits),
+                "query": query,
+            }
+        except Exception as e:
+            trace_exception(e)
+            ASCIIColors.error(
+                f"[SafeStoreRAG] query_data() compatibility shim failed on "
+                f"{self.db_path}: {e}"
+            )
+            return {
+                "success": False,
+                "sources": [],
+                "count": 0,
+                "query": query,
+                "error": str(e),
+            }
+
     def query(
         self,
         query_text: str,
@@ -295,8 +362,12 @@ class SafeStoreRAGBinding(LollmsRAGBinding):
                 pass
             normalized = self._normalize_results(results)
             try:
+                _first_norm = normalized[0] if normalized else {}
+                _norm_content = _first_norm.get("content", "") if isinstance(_first_norm, dict) else ""
                 ASCIIColors.info(
-                    f"[SafeStore-DBG] query() normalized count={len(normalized)}"
+                    f"[SafeStore-DBG] query() normalized count={len(normalized)} "
+                    f"first_content_len={len(_norm_content)} "
+                    f"first_content_preview='{str(_norm_content)[:200].replace(chr(10), ' ')}'"
                 )
             except Exception:
                 pass

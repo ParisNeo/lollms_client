@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-31 16:50]
+
+- feat(rag, tools): add safe store functionality and enhance document editor
+
 ## [2026-10-31 15:09]
 
 - fix: correct as-is document tools implementation

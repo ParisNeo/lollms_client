@@ -812,23 +812,25 @@ def tool_annotate_document(
             for idx in matched_indices:
                 paragraph = doc.paragraphs[idx]
                 if annotation_type == "highlight":
-                    for run in paragraph.runs:
-                        if search_text in run.text or _normalize_text_for_search(search_text) in _normalize_text_for_search(run.text):
-                            rPr = run._element.get_or_create_rPr()
-                            highlight = OxmlElement('w:highlight')
-                            highlight.set(qn('w:val'), highlight_color)
-                            rPr.append(highlight)
-                            total_annot += 1
-                    if total_annot == 0 and matched_indices:
+                    try:
+                        applied = _highlight_docx_text(paragraph, search_text, highlight_color)
+                        total_annot += applied
+                    except Exception:
                         for run in paragraph.runs:
-                            rPr = run._element.get_or_create_rPr()
-                            highlight = OxmlElement('w:highlight')
-                            highlight.set(qn('w:val'), highlight_color)
-                            rPr.append(highlight)
+                            rPr = run._element.get_or_add_rPr()
+                            existing = rPr.find(qn('w:highlight'))
+                            if existing is not None:
+                                existing.set(qn('w:val'), highlight_color)
+                            else:
+                                h = OxmlElement('w:highlight')
+                                h.set(qn('w:val'), highlight_color)
+                                rPr.append(h)
                             total_annot += 1
                 else:
-                    paragraph.add_run(f" [COMMENT by {commenter_name}: {comment}]")
-                    total_annot += 1
+                    applied = _add_word_comment(
+                        doc, paragraph, search_text, comment, commenter_name
+                    )
+                    total_annot += applied
 
             if total_annot == 0:
                 return {"success": False, "error": f"Search text was found in paragraphs but no annotations could be applied. This may be due to empty runs or formatting constraints."}
@@ -970,15 +972,25 @@ def tool_batch_annotate_document(
                 for idx in matched_indices:
                     paragraph = doc.paragraphs[idx]
                     if op_type == "highlight":
-                        for run in paragraph.runs:
-                            rPr = run._element.get_or_create_rPr()
-                            highlight = OxmlElement('w:highlight')
-                            highlight.set(qn('w:val'), color_name)
-                            rPr.append(highlight)
-                            total_applied += 1
+                        try:
+                            applied = _highlight_docx_text(paragraph, search_text, color_name)
+                            total_applied += applied
+                        except Exception:
+                            for run in paragraph.runs:
+                                rPr = run._element.get_or_add_rPr()
+                                existing = rPr.find(qn('w:highlight'))
+                                if existing is not None:
+                                    existing.set(qn('w:val'), color_name)
+                                else:
+                                    h = OxmlElement('w:highlight')
+                                    h.set(qn('w:val'), color_name)
+                                    rPr.append(h)
+                                total_applied += 1
                     else:
-                        paragraph.add_run(f" [COMMENT by {commenter}: {comment}]")
-                        total_applied += 1
+                        applied = _add_word_comment(
+                            doc, paragraph, search_text, comment, commenter
+                        )
+                        total_applied += applied
             
             if total_applied == 0:
                 return {"success": False, "error": "No annotations applied. " + " | ".join(errors)}
