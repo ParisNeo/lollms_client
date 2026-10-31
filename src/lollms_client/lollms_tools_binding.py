@@ -7,6 +7,129 @@ from ascii_colors import trace_exception, ASCIIColors
 import yaml
 from lollms_client.lollms_base_binding import LollmsBaseBinding
 
+
+class Env:
+    """
+    Unified, chat-system-independent runtime context injected into LCP tools.
+
+    Replaces the legacy, mutually exclusive ``lollms_client_instance`` /
+    ``discussion_instance`` injections. Both chat systems (Discussion chat
+    mixin and Personality chat) deliver the exact same object shape.
+
+    Each modality exposes a canonical triple:
+        ``<modality>``                 active backend handle (None if unconfigured)
+        ``<modality>_model_profiles``  Dict[str, Any] of switchable profiles
+        ``<modality>_switch(profile)`` hot-swap the active backend; returns bool
+
+    Contract (normative):
+    - ``env`` itself is NEVER None.
+    - Unconfigured modalities: handle is ``None``, profiles dict is ``{}``,
+      switch returns ``False`` — never missing attributes.
+    - ``env.llm`` is the same object the host's active conversation uses;
+      switching it affects the host conversation (intentional identity).
+    - ``env.discussion`` is the Optional[LollmsDiscussion]; None under
+      personality chat. Tools must feature-check before use.
+    """
+
+    #: Supported modalities following the handle/registry/switch triple pattern.
+    _MODALITIES = ("llm", "tti", "ttv", "tts", "ttm")
+
+    def __init__(self, client: Any = None, discussion: Any = None,
+                 tool_context: Any = None, custom: Optional[Dict[str, Any]] = None):
+        self.client = client
+        self.discussion = discussion
+        self.tool_context = tool_context
+        #: App-owned free-form slot: host applications attach arbitrary payload
+        #: here before invocation; tools read it with defensive defaults.
+        self.custom: Dict[str, Any] = custom if custom is not None else {}
+        for modality in self._MODALITIES:
+            setattr(self, modality, self._resolve_backend_handle(modality))
+            setattr(self, f"{modality}_model_profiles", self._resolve_registry(modality))
+
+    # ------------------------------------------------------------------
+    # Resolution helpers (never raise)
+    # ------------------------------------------------------------------
+
+    def _resolve_backend_handle(self, modality: str) -> Any:
+        """Return the active backend handle for a modality, or None."""
+        if self.client is None:
+            return None
+        return getattr(self.client, modality, None) or getattr(self.client, f"{modality}_binding", None)
+
+    def _resolve_registry(self, modality: str) -> Dict[str, Any]:
+        """Return the modality's model-profiles registry, or an empty dict."""
+        if self.client is None:
+            return {}
+        registry = getattr(self.client, f"{modality}_model_profiles_registry", None)
+        return registry if registry is not None else {}
+
+    def _switch(self, profile: str, method_names: tuple) -> bool:
+        """Delegate a hot-swap to the first available client switch method."""
+        if self.client is None:
+            return False
+        for method_name in method_names:
+            handler = getattr(self.client, method_name, None)
+            if callable(handler):
+                try:
+                    return bool(handler(profile))
+                except Exception as exc:
+                    ASCIIColors.warning(f"Env: {method_name}('{profile}') failed: {exc}")
+                    return False
+        return False
+
+    # ------------------------------------------------------------------
+    # Hot-swap switches (one per modality; atomic, non-destructive on failure)
+    # ------------------------------------------------------------------
+
+    def llm_switch(self, profile: str) -> bool:
+        return self._switch(profile, ("switch_model", "switch_llm", "switch_llm_model"))
+
+    def tti_switch(self, profile: str) -> bool:
+        return self._switch(profile, ("switch_tti",))
+
+    def ttv_switch(self, profile: str) -> bool:
+        return self._switch(profile, ("switch_ttv",))
+
+    def tts_switch(self, profile: str) -> bool:
+        return self._switch(profile, ("switch_tts",))
+
+    def ttm_switch(self, profile: str) -> bool:
+        return self._switch(profile, ("switch_ttm",))
+
+    # ------------------------------------------------------------------
+    # Host-facing accessors (context entries carried by env)
+    # ------------------------------------------------------------------
+
+    def get_client(self) -> Any:
+        """Return the host LollmsClient instance, or None."""
+        return self.client
+
+    def get_discussion(self) -> Any:
+        """Return the Optional[LollmsDiscussion]; None under personality chat."""
+        return self.discussion
+
+    def get_tool_context(self) -> Any:
+        """Return the host tool context, or None."""
+        return self.tool_context
+
+    def set_custom(self, key: str, value: Any) -> None:
+        """Attach an arbitrary host-app payload entry readable by tools."""
+        self.custom[key] = value
+
+    def get_custom(self, key: str, default: Any = None) -> Any:
+        """Read a host-app payload entry with a defensive default."""
+        return self.custom.get(key, default)
+
+
+def build_env(client: Any = None, discussion: Any = None,
+              tool_context: Any = None, custom: Optional[Dict[str, Any]] = None) -> Env:
+    """
+    Construct the unified tool runtime context. Guaranteed to return an Env
+    instance (never None, never raises) even when no client is available.
+    """
+    return Env(client=client, discussion=discussion, tool_context=tool_context, custom=custom)
+
+
 class LollmsToolBinding(LollmsBaseBinding):
     """
     Abstract Base Class for LOLLMS Model Context Protocol (MCP) Bindings.
@@ -52,11 +175,21 @@ class LollmsToolBinding(LollmsBaseBinding):
 
     @abstractmethod
     def execute_tool(self,
-                     tool_name: str,
-                     params: Dict[str, Any],
-                     **kwargs) -> Dict[str, Any]:
+                        tool_name: str,
+                        params: Dict[str, Any],
+                        **kwargs) -> Dict[str, Any]:
         """
         Execute a specified tool with the given parameters.
+
+        The single context carrier is ``kwargs["env"]`` (an :class:`Env`),
+        always provided by the dispatch seam. All host context — client,
+        discussion, tool context, and app-owned custom data — is accessed
+        through it (``env.client`` / ``env.get_client()``,
+        ``env.discussion`` / ``env.get_discussion()``,
+        ``env.tool_context`` / ``env.get_tool_context()``,
+        ``env.custom`` / ``env.get_custom()``). Implementations should read
+        it defensively (``kwargs.get("env")``) and never assume specific
+        entries are non-None.
         """
         pass
 
@@ -128,14 +261,18 @@ class LollmsToolBinding(LollmsBaseBinding):
                         host_tool_context = kwargs.get("tool_context")
 
                         # Strip host-injected handles so the clean parameters go to the tool
-                        clean_params = {k: v for k, v in kwargs.items() if k not in ("discussion_instance", "lollms_client_instance", "tool_context")}
+                        clean_params = {k: v for k, v in kwargs.items() if k not in ("discussion_instance", "lollms_client_instance", "tool_context", "env")}
 
-                        result = self.execute_tool(
-                            tool_name, 
-                            clean_params, 
-                            discussion_instance=disc_inst,
-                            lollms_client_instance=kwargs.get("lollms_client_instance"),
+                        # Build the unified runtime context once per call; always present.
+                        env_obj = build_env(
+                            client=kwargs.get("lollms_client_instance"),
+                            discussion=disc_inst,
                             tool_context=host_tool_context
+                        )
+                        result = self.execute_tool(
+                            tool_name,
+                            clean_params,
+                            env=env_obj
                         )
                         # Normalise: always return a dict
                         if not isinstance(result, dict):

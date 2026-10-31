@@ -14,8 +14,7 @@ def init_tools_library() -> None:
 def tool_inspect_image(
     image_path: str,
     query: str = "Describe this image in detail, identify its visual subject, text, and categorize it.",
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    env: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
     Visually inspects and analyzes a local image file from the workspace using the active Vision-Language Model (VLM).
@@ -25,8 +24,9 @@ def tool_inspect_image(
         image_path (str): Relative or absolute path to the image file in the workspace (e.g. 'photo.jpg', 'media/image.png').
         query (str, optional): The visual question to ask about the image. Defaults to description and categorization.
     """
-    if not lollms_client_instance:
-        return {"success": False, "error": "LollmsClient instance not available."}
+    client = env.client if env else None
+    if not client:
+        return {"success": False, "error": "LollmsClient instance not available (env.client)."}
 
     p = Path(image_path)
     if not p.exists():
@@ -45,7 +45,7 @@ def tool_inspect_image(
         return {"success": False, "error": f"Failed to read image file '{image_path}': {ex}"}
 
     vlm = None
-    active_llm = getattr(lollms_client_instance, "llm", None)
+    active_llm = getattr(client, "llm", None)
     if active_llm and getattr(active_llm, "vision_enabled", False):
         vlm = active_llm
     elif active_llm and hasattr(active_llm, "child_bindings") and isinstance(active_llm.child_bindings, dict):
@@ -53,9 +53,9 @@ def tool_inspect_image(
             if getattr(child, "vision_enabled", False):
                 vlm = child
                 break
-    elif hasattr(lollms_client_instance, "find_available_vlm") and not hasattr(lollms_client_instance, "_mock_return_value"):
-        vlm = lollms_client_instance.find_available_vlm()
-    elif hasattr(lollms_client_instance, "has_vision_capability") and not hasattr(lollms_client_instance, "_mock_return_value") and lollms_client_instance.has_vision_capability():
+    elif hasattr(client, "find_available_vlm") and not hasattr(client, "_mock_return_value"):
+        vlm = client.find_available_vlm()
+    elif hasattr(client, "has_vision_capability") and not hasattr(client, "_mock_return_value") and client.has_vision_capability():
         vlm = active_llm
 
     if not vlm:
@@ -92,8 +92,7 @@ def tool_vlm_query(
     query: str,
     image_path: Optional[str] = None,
     image_index: int = -1,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    env: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
     Queries the Vision-Language Model (VLM) about an image file on disk or an image from the conversation.
@@ -107,15 +106,16 @@ def tool_vlm_query(
         return tool_inspect_image(
             image_path=image_path,
             query=query,
-            discussion_instance=discussion_instance,
-            lollms_client_instance=lollms_client_instance
+            env=env
         )
 
-    if not discussion_instance or not lollms_client_instance:
-        return {"success": False, "error": "System context not available."}
+    discussion_instance = env.discussion if env else None
+    client = env.client if env else None
+    if not discussion_instance or not client:
+        return {"success": False, "error": "System context not available (env.discussion / env.client)."}
 
     vlm = None
-    active_llm = getattr(lollms_client_instance, "llm", None)
+    active_llm = getattr(client, "llm", None)
     if active_llm and getattr(active_llm, "vision_enabled", False):
         vlm = active_llm
     elif active_llm and hasattr(active_llm, "child_bindings") and isinstance(active_llm.child_bindings, dict):
@@ -123,9 +123,9 @@ def tool_vlm_query(
             if getattr(child, "vision_enabled", False):
                 vlm = child
                 break
-    elif hasattr(lollms_client_instance, "find_available_vlm") and not hasattr(lollms_client_instance, "_mock_return_value"):
-        vlm = lollms_client_instance.find_available_vlm()
-    elif hasattr(lollms_client_instance, "has_vision_capability") and not hasattr(lollms_client_instance, "_mock_return_value") and lollms_client_instance.has_vision_capability():
+    elif hasattr(client, "find_available_vlm") and not hasattr(client, "_mock_return_value"):
+        vlm = client.find_available_vlm()
+    elif hasattr(client, "has_vision_capability") and not hasattr(client, "_mock_return_value") and client.has_vision_capability():
         vlm = active_llm
 
     if not vlm:

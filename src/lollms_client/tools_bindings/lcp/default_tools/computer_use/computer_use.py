@@ -121,20 +121,20 @@ def _clamp_coordinates(x: int, y: int) -> Tuple[int, int]:
 
 # ─────────────────────── Vision grounding (zero-OCR) ────────────────────────
 
-def _resolve_vision_binding(lollms_client_instance: Any) -> Optional[Any]:
+def _resolve_vision_binding(client: Any) -> Optional[Any]:
     """
     Resolves a vision-capable LLM binding from the client.
     Handles direct vision, SmartRouter-style child bindings, and fallback VLMs.
     """
-    if not lollms_client_instance:
+    if not client:
         return None
 
-    if hasattr(lollms_client_instance, "has_vision_capability") and lollms_client_instance.has_vision_capability():
-        active_llm = getattr(lollms_client_instance, "llm", None)
+    if hasattr(client, "has_vision_capability") and client.has_vision_capability():
+        active_llm = getattr(client, "llm", None)
         if active_llm:
             return active_llm
 
-    active_llm = getattr(lollms_client_instance, "llm", None)
+    active_llm = getattr(client, "llm", None)
     if active_llm and getattr(active_llm, "vision_enabled", False):
         return active_llm
 
@@ -144,8 +144,8 @@ def _resolve_vision_binding(lollms_client_instance: Any) -> Optional[Any]:
             if getattr(binding, "vision_enabled", False):
                 return binding
 
-    if hasattr(lollms_client_instance, "find_available_vlm"):
-        vlm = lollms_client_instance.find_available_vlm()
+    if hasattr(client, "find_available_vlm"):
+        vlm = client.find_available_vlm()
         if vlm:
             return vlm
 
@@ -226,7 +226,7 @@ def _extract_coordinates_with_scale(
 
 
 def _ground_element_coordinates(
-    lollms_client_instance: Any,
+    client: Any,
     screenshot_b64: str,
     element_description: str,
     screen_width: int,
@@ -236,7 +236,7 @@ def _ground_element_coordinates(
     Asks the vision model to locate an element on the screenshot and return
     its pixel coordinates. Returns ((x, y), error) — exactly one is set.
     """
-    vision_binding = _resolve_vision_binding(lollms_client_instance)
+    vision_binding = _resolve_vision_binding(client)
     if vision_binding is None:
         return None, (
             "No vision-capable LLM binding is available. Computer use tools "
@@ -302,8 +302,8 @@ def _ground_element_coordinates(
     return None, last_error or "Vision grounding failed for an unknown reason."
 
 
-def _vision_capability_ready(lollms_client_instance: Any) -> bool:
-    return _resolve_vision_binding(lollms_client_instance) is not None
+def _vision_capability_ready(client: Any) -> bool:
+    return _resolve_vision_binding(client) is not None
 
 
 # ───────────────────────────── Screenshot helpers ──────────────────────────
@@ -329,8 +329,7 @@ def _sanitize_error(text: str) -> str:
 # ──────────────────────────────── Tools ─────────────────────────────────────
 
 def tool_computer_desktop_info(
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None,
+    env: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Returns the geometry of the primary screen (width and height in pixels).
@@ -395,9 +394,7 @@ def tool_computer_screenshot(
     save_to_workspace: bool = True,
     file_name: str = "",
     show_grid: bool = True,
-    tool_context: Optional[dict] = None,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None,
+    env: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Captures a screenshot of the screen and returns it as a base64 image for visual inspection.
@@ -452,8 +449,9 @@ def tool_computer_screenshot(
             from pathlib import Path
 
             working_dir = Path.cwd()
-            if isinstance(tool_context, dict):
-                context_dir = tool_context.get("working_dir")
+            tool_ctx = env.tool_context if env else None
+            if isinstance(tool_ctx, dict):
+                context_dir = tool_ctx.get("working_dir")
                 if context_dir:
                     try:
                         candidate = Path(context_dir)
@@ -532,8 +530,7 @@ def tool_computer_click(
     button: str = "left",
     clicks: int = 1,
     description: str = "",
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None,
+    env: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Clicks at the given pixel coordinates on the screen.
@@ -562,7 +559,8 @@ def tool_computer_click(
         return {"success": False, "error": f"Invalid clicks count {clicks}. Use 1, 2, or 3."}
 
     if description and description.strip():
-        if not _vision_capability_ready(lollms_client_instance):
+        client = env.client if env else None
+        if not _vision_capability_ready(client):
             return {
                 "success": False,
                 "error": (
@@ -577,7 +575,7 @@ def tool_computer_click(
             return {"success": False, "error": _sanitize_error(str(capture_err))}
 
         coords, grounding_error = _ground_element_coordinates(
-            lollms_client_instance, screenshot_b64, description.strip(), width, height
+            client, screenshot_b64, description.strip(), width, height
         )
         if coords is None:
             return {
@@ -651,8 +649,7 @@ def tool_computer_move_cursor(
     x: int = 0,
     y: int = 0,
     description: str = "",
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None,
+    env: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Moves the mouse cursor to the given pixel coordinates without clicking.
@@ -663,7 +660,8 @@ def tool_computer_move_cursor(
         description (str): Optional natural-language description of the target element for visual grounding.
     """
     if description and description.strip():
-        if not _vision_capability_ready(lollms_client_instance):
+        client = env.client if env else None
+        if not _vision_capability_ready(client):
             return {
                 "success": False,
                 "error": (
@@ -678,7 +676,7 @@ def tool_computer_move_cursor(
             return {"success": False, "error": _sanitize_error(str(capture_err))}
 
         coords, grounding_error = _ground_element_coordinates(
-            lollms_client_instance, screenshot_b64, description.strip(), width, height
+            client, screenshot_b64, description.strip(), width, height
         )
         if coords is None:
             return {"success": False, "error": f"Visual grounding failed: {grounding_error}"}
@@ -732,8 +730,7 @@ def tool_computer_mouse_down(
     button: str = "left",
     x: int = -1,
     y: int = -1,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None,
+    env: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Presses and holds down a mouse button without releasing it.
@@ -769,8 +766,7 @@ def tool_computer_mouse_up(
     button: str = "left",
     x: int = -1,
     y: int = -1,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None,
+    env: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Releases a held mouse button. Completes drag-and-drop or text selection.
@@ -810,8 +806,7 @@ def tool_computer_drag(
     duration_ms: int = 500,
     from_description: str = "",
     to_description: str = "",
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None,
+    env: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Performs a click-and-drag from one point to another.
@@ -840,7 +835,8 @@ def tool_computer_drag(
 
     # Visual grounding if descriptions provided
     if from_description or to_description:
-        if not _vision_capability_ready(lollms_client_instance):
+        client = env.client if env else None
+        if not _vision_capability_ready(client):
             return {
                 "success": False,
                 "error": "Visual grounding requires a vision-capable model. Provide explicit coordinates.",
@@ -853,7 +849,7 @@ def tool_computer_drag(
 
         if from_description:
             f_coords, f_err = _ground_element_coordinates(
-                lollms_client_instance, screenshot_b64, from_description.strip(), width, height
+                client, screenshot_b64, from_description.strip(), width, height
             )
             if f_coords is None:
                 return {"success": False, "error": f"Grounding start location failed: {f_err}"}
@@ -861,7 +857,7 @@ def tool_computer_drag(
 
         if to_description:
             t_coords, t_err = _ground_element_coordinates(
-                lollms_client_instance, screenshot_b64, to_description.strip(), width, height
+                client, screenshot_b64, to_description.strip(), width, height
             )
             if t_coords is None:
                 return {"success": False, "error": f"Grounding destination location failed: {t_err}"}
@@ -891,8 +887,7 @@ def tool_computer_type(
     text: str,
     interval_ms: int = 20,
     press_enter: bool = False,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None,
+    env: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Types text at the current cursor position (into the currently focused element).
@@ -932,8 +927,7 @@ def tool_computer_type(
 def tool_computer_key(
     key: str,
     presses: int = 1,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None,
+    env: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Presses a keyboard key or a combination (e.g. 'enter', 'ctrl+c', 'alt+f4', 'win', 'tab').
@@ -992,8 +986,7 @@ def tool_computer_scroll(
     direction: str = "down",
     x: int = -1,
     y: int = -1,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None,
+    env: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Scrolls the mouse wheel at the current cursor position (or at given coordinates).
@@ -1038,8 +1031,7 @@ def tool_computer_scroll(
 def tool_computer_wait(
     seconds: float = 1.0,
     duration_s: Optional[float] = None,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None,
+    env: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Pauses execution briefly to allow an application to open, a webpage to load, or an animation to complete.
@@ -1064,8 +1056,7 @@ def tool_computer_wait(
 
 
 def tool_computer_cursor_position(
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None,
+    env: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Returns the current pixel coordinates of the mouse cursor.
@@ -1316,7 +1307,7 @@ def _post_action_result(action_desc: str, extra: Dict[str, Any]) -> Dict[str, An
 
 
 def _vlm_step_verdict(
-    lollms_client_instance: Any,
+    client: Any,
     screenshot_b64: str,
     step_description: str,
     last_action_desc: str,
@@ -1326,7 +1317,7 @@ def _vlm_step_verdict(
     """
     Asks the vision model whether the step is complete. Returns (is_done, reason).
     """
-    vision_binding = _resolve_vision_binding(lollms_client_instance)
+    vision_binding = _resolve_vision_binding(client)
     if vision_binding is None:
         return False, "No vision model available for step verification."
 
@@ -1360,7 +1351,7 @@ def _vlm_step_verdict(
 
 
 def _vlm_next_action(
-    lollms_client_instance: Any,
+    client: Any,
     screenshot_b64: str,
     step_description: str,
     attempt: int,
@@ -1373,7 +1364,7 @@ def _vlm_next_action(
     or {"tool": "done", "reason": "..."} when the model believes the step is complete.
     Returns None on failure.
     """
-    vision_binding = _resolve_vision_binding(lollms_client_instance)
+    vision_binding = _resolve_vision_binding(client)
     if vision_binding is None:
         return None
 
@@ -1482,8 +1473,7 @@ def _execute_single_action(action: Dict[str, Any]) -> str:
 def tool_computer_execute_step(
     step_description: str,
     max_attempts: int = 8,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None,
+    env: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Executes a single desktop automation step in an isolated child loop.
@@ -1498,15 +1488,16 @@ def tool_computer_execute_step(
     is a good step; "do something with the camera" is not.
 
     Args:
-        step_description (str): The specific, self-contained step to execute. Must be detailed enough for a fresh agent to complete without prior context.
-        max_attempts (int): Maximum action cycles before giving up. Default 8.
-    """
-    if not isinstance(step_description, str) or not step_description.strip():
-        return {"success": False, "error": "step_description is required and must be a non-empty string."}
-    if not lollms_client_instance:
-        return {"success": False, "error": "This tool requires a lollms_client_instance (host-injected)."}
-    if not _vision_capability_ready(lollms_client_instance):
-        return {"success": False, "error": "A vision-capable model is required to execute desktop steps."}
+    step_description (str): The specific, self-contained step to execute. Must be detailed enough for a fresh agent to complete without prior context.
+    max_attempts (int): Maximum action cycles before giving up. Default 8.
+"""
+if not isinstance(step_description, str) or not step_description.strip():
+    return {"success": False, "error": "step_description is required and must be a non-empty string."}
+client = env.client if env else None
+if not client:
+    return {"success": False, "error": "This tool requires a host client (host-injected via env.client)."}
+if not _vision_capability_ready(client):
+    return {"success": False, "error": "A vision-capable model is required to execute desktop steps."}
 
     try:
         max_attempts = max(1, min(int(max_attempts), 20))
@@ -1529,7 +1520,7 @@ def tool_computer_execute_step(
             }
 
         action = _vlm_next_action(
-            lollms_client_instance, b64, step_description.strip(), attempt, w, h
+            client, b64, step_description.strip(), attempt, w, h
         )
         if action is None:
             return {
@@ -1559,7 +1550,7 @@ def tool_computer_execute_step(
         time.sleep(0.4)
         b64_verify, vw, vh = _capture_annotated_b64()
         is_done, verdict_reason = _vlm_step_verdict(
-            lollms_client_instance, b64_verify, step_description.strip(),
+            client, b64_verify, step_description.strip(),
             last_action_desc, vw, vh
         )
         if is_done:
@@ -1583,8 +1574,7 @@ def tool_computer_execute_step(
 
 def tool_computer_plan(
     task: str,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None,
+    env: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Plans a multi-step desktop automation task into ordered, self-contained steps.
@@ -1599,10 +1589,11 @@ def tool_computer_plan(
     """
     if not isinstance(task, str) or not task.strip():
         return {"success": False, "error": "task is required and must be a non-empty string."}
-    if not lollms_client_instance:
-        return {"success": False, "error": "This tool requires a lollms_client_instance (host-injected)."}
+    client = env.client if env else None
+    if not client:
+        return {"success": False, "error": "This tool requires a host client (host-injected via env.client)."}
 
-    vision_binding = _resolve_vision_binding(lollms_client_instance)
+    vision_binding = _resolve_vision_binding(client)
     if vision_binding is None:
         return {"success": False, "error": "A vision-capable model is required to plan desktop tasks."}
 
@@ -1675,9 +1666,7 @@ def tool_computer_plan(
 
 def tool_computer_cursor_screenshot(
     file_name: str = "",
-    tool_context: Optional[dict] = None,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None,
+    env: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Takes a screenshot with the current mouse cursor position highlighted: a red circle with a blue center dot marks the exact pointer location.
@@ -1712,9 +1701,7 @@ def tool_computer_screenshot_zone(
     show_grid: bool = False,
     file_name: str = "",
     save_to_workspace: bool = True,
-    tool_context: Optional[dict] = None,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None,
+    env: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Captures a screenshot of a specific rectangular region (zone) of the screen.
@@ -1805,8 +1792,9 @@ def tool_computer_screenshot_zone(
             from pathlib import Path
 
             working_dir = Path.cwd()
-            if isinstance(tool_context, dict):
-                context_dir = tool_context.get("working_dir")
+            tool_ctx = env.tool_context if env else None
+            if isinstance(tool_ctx, dict):
+                context_dir = tool_ctx.get("working_dir")
                 if context_dir:
                     try:
                         candidate = Path(context_dir)

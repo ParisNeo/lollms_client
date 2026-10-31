@@ -183,10 +183,10 @@ With `lc = lollms_client_instance` inside the function body:
 |---|---|---|
 | LLM text generation | `lc.llm_binding.generate(prompt, n_predict=…)` | present when injected |
 | Multimodal LLM | `lc.llm_binding.generate_with_images(prompt, images=…)` | model must support vision |
-| TTI (image) | `lc.tti_binding.generate_image(prompt=…, negative_prompt=…)` | `if lc and getattr(lc, "tti_binding", None)` |
-| TTV (video) | `lc.ttv_binding.generate_video(prompt=…)` | same guard |
-| TTS (speech) | `lc.tts_binding.synthesize(text=…)` | same guard |
-| TTM (music) | `lc.ttm_binding.generate_music(prompt=…)` | same guard |
+| TTI (image) | `lc.tti.generate_image(prompt=…, negative_prompt=…)` | `if lc and getattr(lc, "tti", None)` |
+| TTV (video) | `lc.ttv.generate_video(prompt=…)` | same guard |
+| TTS (speech) | `lc.tts.synthesize(text=…)` | same guard |
+| TTM (music) | `lc.ttm.generate_music(prompt=…)` | same guard |
 | Discussion history | `discussion_instance.messages` | `if discussion_instance is not None` |
 | Attached files | `discussion_instance` file helpers / artefact surface | same guard |
 
@@ -208,12 +208,12 @@ def tool_generate_image(lollms_client_instance=None, subject: str = "", style: s
     """
     lc = lollms_client_instance  # host-injected live LollmsClient (or None)
     try:
-        if lc is None or getattr(lc, "tti_binding", None) is None:
+        if lc is None or getattr(lc, "tti", None) is None:
             return {"success": False, "error": "No TTI binding on the client."}
         if not subject:
             return {"success": False, "error": "Parameter 'subject' is required."}
         scaffold = STYLES.get(style, STYLES["photoreal"])
-        result = lc.tti_binding.generate_image(prompt=f"{scaffold}, {subject}")
+        result = lc.tti.generate_image(prompt=f"{scaffold}, {subject}")
         out = {"success": True, "output": f"Generated '{subject}' ({style})."}
         if isinstance(result, str):  # binding returned a saved path
             out["file_name"] = result

@@ -283,7 +283,8 @@ Each `LollmsCodeInstance` exposes: `id`, `task`, `pid`, `proc` (the `Popen`), `w
 
 An agent can orchestrate sibling lollms-code instances through the `instances_tools` LCP tool
 library (auto-discovered). It exposes `tool_instances_spawn`, `tool_instances_list`,
-`tool_instances_kill`, and `tool_instances_wait` — each injecting the host client.
+`tool_instances_kill`, and `tool_instances_wait` — each operating against the
+unified runtime object `env` (see §9) rather than chat-system-specific instances.
 
 ---
 
@@ -336,4 +337,33 @@ into the chat.
   See its Quick Reference Table for the exact flag names and defaults.
 - **`docs/lcp_tool_resource_access.md`** — how tools (including `instances_tools`
   and shell execution) receive the live client via the injected `lc` parameter
-  instead of constructing their own.
+  instead of constructing their own. **`env` (see §9)** is the unified runtime
+  object that now supersedes those per-mode injections for tool code.
+- **`docs/lcp/00_OVERVIEW.md`** — canonical definition of the `env` contract
+  (§6) and the chat-system portability rule (§7).
+
+---
+
+## 9. Tool runtime context (`env`) & migration
+
+LCP tools and code-shell snippets no longer receive two mutually exclusive
+injections (`lollms_client` in personality/raw mode, `lollms_discussion` in
+discussion mode). Both are replaced by **one always-present object, `env`**,
+identical in both chat systems. The full contract — `env.llm`,
+`env.llm_model_profiles`, `env.llm_switch(name)`, the `tti` /
+`tti_model_profiles` / `tti_switch` triple, and the optional
+`env.discussion` — is defined once in
+[`docs/lcp/00_OVERVIEW.md`](lcp/00_OVERVIEW.md) (§6–§7).
+
+**Migration table:**
+
+| Legacy | Replacement | Notes |
+|---|---|---|
+| `lollms_client.generate(...)` | `env.llm.generate(...)` | identical object in both modes |
+| `lollms_client.tti` | `env.tti` | may be `None`; guard |
+| `lollms_discussion` | `env.discussion` | `None` under personality chat |
+
+`lollms_client` and `lollms_discussion` are **still injected but deprecated**
+for one release (a `DeprecationWarning` is emitted on first attribute
+access) and are then **scheduled for removal**. New tools must use `env`
+only.

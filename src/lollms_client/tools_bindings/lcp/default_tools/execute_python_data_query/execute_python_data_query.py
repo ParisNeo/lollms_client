@@ -285,8 +285,7 @@ _build_xlsx_guard_failure = _build_office_guard_failure
 
 def tool_execute_python_data_query(
     code: str = "",
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    env: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
     Execute sandboxed Python code to analyze or modify datasets in the workspace.
@@ -307,9 +306,9 @@ def tool_execute_python_data_query(
 
     Args:
         code (str, optional): The Python code to execute, or the name of a Python file in the workspace. Defaults to empty.
-        discussion_instance (Any, optional): Active discussion session instance. Defaults to None.
-        lollms_client_instance (Any, optional): Active client instance. Defaults to None.
+        env (Any, optional): Host-injected unified runtime context (env.discussion, env.client). Defaults to None.
     """
+    discussion_instance = getattr(env, "discussion", None) if env else None
     if isinstance(code, dict):
         ASCIIColors.warning("[execute_python_data_query] Unwrapping nested dictionary parameter.")
         code = code.get("code") or code.get("sql_query") or next((v for v in code.values() if isinstance(v, str)), "")

@@ -44,6 +44,13 @@ class MCPBinding(LollmsToolBinding):
     A unified LollmsToolBinding to connect to multiple Model Context Protocol (MCP) servers.
     Supports both local subprocess servers (stdio) and remote servers (streamable HTTP).
     Tools are namespaced with 'server_alias::tool_name'.
+
+    ENV CONTRACT: compliant with the unified tool runtime (`env`) — the
+    dispatch seam calls `execute_tool(tool_name, params, env=env_obj)`.
+    `env` is accepted via **kwargs, never forwarded to remote servers, and
+    reserved host-injected names are stripped from outgoing arguments.
+    An optional per-call timeout can be supplied via `kwargs['timeout']` or
+    `env.get_custom('mcp_timeout')`.
     """
 
     def __init__(self, **kwargs: Any):
@@ -481,7 +488,21 @@ class MCPBinding(LollmsToolBinding):
         if not MCP_LIBRARY_AVAILABLE or not self._loop or not types:
             return {"error": "MCP support not available.", "status_code": 503}
 
-        timeout = float(kwargs.get('timeout', 60.0))
+        # Unified runtime context (env contract). `env` is the single context
+        # carrier injected by the dispatch seam; it is never forwarded to the
+        # remote server. Reserved host-injected names are stripped from the
+        # outgoing arguments so a model cannot leak them into the MCP schema.
+        env = kwargs.get("env")
+        RESERVED_NAMES = ("env", "discussion_instance", "lollms_client_instance", "tool_context", "user_interaction_handler")
+        clean_params = {k: v for k, v in (params or {}).items() if k not in RESERVED_NAMES}
+
+        timeout = kwargs.get('timeout')
+        if timeout is None and env is not None:
+            # Optional host-provided override via the env custom slot.
+            get_custom = getattr(env, "get_custom", None)
+            timeout = get_custom("mcp_timeout", None) if callable(get_custom) else None
+        timeout = float(timeout) if timeout is not None else 60.0
+
         parsed_name = self._parse_tool_name(tool_name)
         if not parsed_name:
             return {"error": f"Invalid tool name format: '{tool_name}'.", "status_code": 400}
@@ -501,7 +522,7 @@ class MCPBinding(LollmsToolBinding):
             return {"error": f"Failed to ensure server '{server_alias}' is initialized: {e}", "status_code": 500}
 
         try:
-            return self._run_async_task(self._execute_tool_async(server_alias, actual_tool_name, params), timeout=timeout)
+            return self._run_async_task(self._execute_tool_async(server_alias, actual_tool_name, clean_params), timeout=timeout)
         except TimeoutError:
             return {"error": f"Tool '{actual_tool_name}' on server '{server_alias}' timed out.", "status_code": 504}
         except Exception as e:

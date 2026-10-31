@@ -322,7 +322,7 @@ Use this for environment management (pip install), running tests, or interacting
 
 def tool_execute_shell_command(
     command: str,
-    tool_context: Optional[Any] = None
+    env: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
     Executes a shell command in the current workspace directory with live output streaming.
@@ -330,9 +330,11 @@ def tool_execute_shell_command(
 
     Args:
         command (str): The shell command to execute.
-        tool_context: Host-injected context for live streaming output lines to the terminal/UI.
+        env: Host-injected unified runtime context; its tool_context (when present)
+            streams output lines live to the terminal/UI.
     """
     global AUTONOMY_LEVEL
+    tool_ctx = getattr(env, "tool_context", None) if env else None
     is_windows = platform.system() == "Windows"
     autonomy_level = AUTONOMY_LEVEL
 
@@ -364,8 +366,8 @@ def tool_execute_shell_command(
                 for line in iter(proc.stdout.readline, ''):
                     stdout_lines.append(line)
                     clean_line = line.rstrip('\r\n')
-                    if clean_line and tool_context and hasattr(tool_context, "emit_progress"):
-                        tool_context.emit_progress(clean_line, {"stream": "stdout"})
+                    if clean_line and tool_ctx and hasattr(tool_ctx, "emit_progress"):
+                        tool_ctx.emit_progress(clean_line, {"stream": "stdout"})
                 proc.stdout.close()
 
         def _drain_stderr():
@@ -373,8 +375,8 @@ def tool_execute_shell_command(
                 for line in iter(proc.stderr.readline, ''):
                     stderr_lines.append(line)
                     clean_line = line.rstrip('\r\n')
-                    if clean_line and tool_context and hasattr(tool_context, "emit_progress"):
-                        tool_context.emit_progress(clean_line, {"stream": "stderr"})
+                    if clean_line and tool_ctx and hasattr(tool_ctx, "emit_progress"):
+                        tool_ctx.emit_progress(clean_line, {"stream": "stderr"})
                 proc.stderr.close()
 
         t_out = threading.Thread(target=_drain_stdout, daemon=True)

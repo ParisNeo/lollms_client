@@ -184,7 +184,80 @@ if you only read those lists, you still get the laws of the system.
 
 ---
 
-## 6. Key invariants
+## 6. Tool runtime context (`env`)
+
+Every LCP tool and code-shell snippet receives exactly **one** unified runtime
+object named **`env`**. It replaces the two legacy, mutually exclusive
+injections (`lollms_discussion` and `lollms_client`), only one of which was
+non-`None` depending on which chat system drove the host.
+
+**`env` is never `None`.** Sub-attributes that the host cannot provide are
+explicitly `None`, but `env` itself always exists.
+
+```
+env
+├── llm                    # master LLM handle (generate/chat/stream entry point); never None
+├── llm_model_profiles     # Dict[str, LLMProfile] — named profiles, LAZY-LOADED on first access
+├── llm_switch(profile: str) -> bool
+│                          # hot-swap env.llm to a named profile; returns success
+│
+├── tti                    # master text-to-image handle; None if no TTI binding configured
+├── tti_model_profiles     # Dict[str, TTIProfile] — lazy-loaded
+├── tti_switch(profile: str) -> bool
+│
+├── (open extension point — same triple pattern for future backends: tts, stt, vlm…)
+│     <backend>, <backend>_model_profiles, <backend>_switch
+│
+└── discussion             # Optional[LollmsDiscussion] — set ONLY in discussion chat mode,
+                           # otherwise None. Tools MUST feature-check, never assume.
+```
+
+**Semantics (normative):**
+
+1. **Identity** — `env.llm` is the *same object* that the active
+   `LollmsDiscussion.chat()` uses internally in discussion mode, and the same
+   object the personality runtime uses otherwise. Switching via
+   `env.llm_switch(...)` therefore affects the host conversation too — this is
+   intentional.
+2. **Lazy loading** — `*_model_profiles` are loaded on first key access or on
+   an explicit `switch`. Listing keys (names + metadata) is cheap.
+3. **Switch atomicity** — `llm_switch` / `tti_switch` either fully swap the
+   backend handle or fail (`False`/raise) leaving the previous handle
+   untouched. `env` is never left half-switched.
+4. **Explicit capability absence** — no TTI configured → `env.tti is None`
+   (not missing). Mirrors the *capability-gated* doctrine in
+   `../CHAT_BOOLEAN_FLAGS.md`: tools guard, features silently skip with a
+   console warning.
+5. **Deprecation path** — `lollms_discussion` and `lollms_client` remain
+   injected for **one release**, emitting a `DeprecationWarning` on first
+   attribute access, then are removed. New tools receive only `env`.
+
+**Canonical example:**
+
+```python
+# portable tool code — works in both chat systems
+if env.tti is not None:
+    img = env.tti.generate(prompt)
+if env.discussion is not None:           # optional discussion-only side effect
+    env.discussion.add_note("generated an image")
+env.llm_switch("fast-draft")             # lazy-loads the profile if needed
+```
+
+---
+
+## 7. Chat-system portability
+
+Tools MUST program against `env`, never against chat-system-specific
+instances. `env` is identical in shape whether the host runs
+`LollmsDiscussion` chat or personality chat — the same `env` object, the same
+attributes, the same switch functions. The only per-mode difference is
+`env.discussion`, which is `None` under personality chat and must be
+feature-checked (`if env.discussion is not None:`). Any tool that branches on
+"which chat system am I in" beyond that single check is a portability bug.
+
+---
+
+## 8. Key invariants
 
 - The LCP is the **in-process** tool binding; MCP is the remote/external one.
   Both implement the same `LollmsToolBinding` contract
@@ -204,4 +277,10 @@ if you only read those lists, you still get the laws of the system.
 - Generated media/artefacts are attached to the conversation as **USER-role
   messages only** (a hard-won fix for the "System message cannot contain
   images" 400 error).
+- A single read-only façade `env` is injected into every tool/code-shell scope
+  in **both** chat modes and is never `None`. `env.llm` is the host's active
+  conversation LLM; `env.llm_switch(name)` hot-swaps it atomically. See §6.
+- Legacy injections `lollms_discussion` and `lollms_client` are deprecated
+  (one release, with a `DeprecationWarning` on first attribute access) and
+  will then be removed; new tools receive only `env`. See §6.
 - This documentation corpus is additive only: it never modifies source files.

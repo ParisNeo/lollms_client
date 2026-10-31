@@ -34,6 +34,16 @@ required binding (vision model, TTI engine, ...), otherwise the feature is
 silently skipped (with a console warning) and the model truthfully reports it
 has no such capability.
 
+### Tool runtime context (`env`)
+
+Tool and code-shell execution always receives a single `env` object providing
+`llm`, `tti`, their `*_model_profiles`, and `*_switch` functions — independent
+of which chat system is active (see
+[`lcp/00_OVERVIEW.md`](lcp/00_OVERVIEW.md) §6–§7). Flags like
+`enable_image_generation` gate *whether TTI instructions are injected*, while
+`env.tti is None` expresses *whether a TTI backend is configured at all*.
+Both must be consulted.
+
 ---
 
 ## Message Schema Cross-Reference

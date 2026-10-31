@@ -60,7 +60,10 @@ class LCPBinding(LollmsToolBinding):
     
     PHILOSOPHY:
     - Tools are agnostic Python scripts.
-    - Tools do NOT know about discussions, artifacts, or clients.
+    - Tools receive the unified host runtime via the reserved `env` parameter — a
+never-None façade (`env.llm`, `env.tti`, `*_model_profiles`, `*_switch`,
+`env.client`, `env.discussion`, `env.tool_context`, `env.custom`) whose
+sub-attributes must be feature-checked for None.
     - Tools operate on files in the current working directory.
     - The Binding handles environment setup (CWD, sync) transparently.
     - Host-Configurable parameters are invisible to the LLM and enforced by the host app.
@@ -179,7 +182,7 @@ class LCPBinding(LollmsToolBinding):
             for param_raw in params_str.split(","):
                 param = param_raw.strip()
                 if not param or param.startswith("*") or ":" not in param:
-                    if param and param.split("=")[0].strip() and param.split("=")[0].strip() not in ("args", "kwargs", "discussion_instance", "lollms_client_instance", "tool_context", "user_interaction_handler"):
+                    if param and param.split("=")[0].strip() and param.split("=")[0].strip() not in ("args", "kwargs", "discussion_instance", "lollms_client_instance", "tool_context", "user_interaction_handler", "env"):
                         p_name = param.split("=")[0].strip()
                         properties[p_name] = {"type": "string", "description": f"Parameter '{p_name}'"}
                         if "=" not in param:
@@ -188,7 +191,7 @@ class LCPBinding(LollmsToolBinding):
 
                 p_name, p_type_raw = param.split(":", 1)
                 p_name = p_name.strip()
-                if not p_name or p_name in ("args", "kwargs", "discussion_instance", "lollms_client_instance", "tool_context", "user_interaction_handler"):
+                if not p_name or p_name in ("args", "kwargs", "discussion_instance", "lollms_client_instance", "tool_context", "user_interaction_handler", "env"):
                     continue
 
                 p_type_raw = p_type_raw.strip().lower()
@@ -249,7 +252,7 @@ class LCPBinding(LollmsToolBinding):
 
         for idx, arg in enumerate(args_list):
             arg_name = arg.arg
-            if arg.arg in ("args", "kwargs", "discussion_instance", "lollms_client_instance", "tool_context", "user_interaction_handler"):
+            if arg.arg in ("args", "kwargs", "discussion_instance", "lollms_client_instance", "tool_context", "user_interaction_handler", "env"):
                 continue
 
             arg_type = "string"
@@ -1011,12 +1014,17 @@ class LCPBinding(LollmsToolBinding):
                 if k in sig.parameters or has_var_kw:
                     clean_params[k] = v
 
-            host_tool_context = kwargs.get("tool_context") or params.get("tool_context")
+            env = kwargs.get("env") or params.get("env")
+            clean_params.pop("env", None)
+            if env is not None and ("env" in sig.parameters or has_var_kw):
+                clean_params["env"] = env
+
+            host_tool_context = getattr(env, "tool_context", None) if env is not None else None
             clean_params.pop("tool_context", None)
             if host_tool_context is not None and ("tool_context" in sig.parameters or has_var_kw):
                 clean_params["tool_context"] = host_tool_context
 
-            host_client = kwargs.get("lollms_client_instance") or params.get("lollms_client_instance")
+            host_client = getattr(env, "client", None) if env is not None else None
             clean_params.pop("lollms_client_instance", None)
             if host_client is not None and ("lollms_client_instance" in sig.parameters or has_var_kw):
                 clean_params["lollms_client_instance"] = host_client
@@ -1025,8 +1033,9 @@ class LCPBinding(LollmsToolBinding):
                 clean_params["user_interaction_handler"] = self.user_interaction_handler
 
             clean_params.pop("discussion_instance", None)
-            if discussion_instance is not None and ("discussion_instance" in sig.parameters or has_var_kw):
-                clean_params["discussion_instance"] = discussion_instance
+            host_discussion = getattr(env, "discussion", None) if env is not None else discussion_instance
+            if host_discussion is not None and ("discussion_instance" in sig.parameters or has_var_kw):
+                clean_params["discussion_instance"] = host_discussion
 
             try:
                 result = execute_function(**clean_params)
