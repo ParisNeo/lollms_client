@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-10-31 15:09]
+
+- fix: correct as-is document tools implementation
+
 ## [2026-10-31 15:07]
 
 - Fixing documentation and toolchain updates for LCP (Linguistic Core Processing) toolset integration and shell scripting enhancements.
