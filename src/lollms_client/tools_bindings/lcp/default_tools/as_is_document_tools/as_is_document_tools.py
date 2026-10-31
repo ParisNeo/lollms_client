@@ -326,6 +326,229 @@ def tool_read_document_content(
         return {"success": False, "error": f"Failed to read content from '{file_name}': {e}"}
 
 
+def _ensure_docx_comments_part(doc: Any) -> Any:
+    """Return the document's comments part, creating it when absent (idempotent)."""
+    for rel in doc.part.rels.values():
+        if "comments" in rel.reltype:
+            return rel.target_part
+
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    from docx.opc.packuri import PackURI
+    from docx.opc.part import Part
+    from docx.oxml import parse_xml
+    from docx.oxml.ns import nsdecls
+
+    comments_part = Part(
+        PackURI("/word/comments.xml"),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml",
+        parse_xml(f'<w:comments {nsdecls("w")}/>'),
+        doc.part.package,
+    )
+    doc.part.relate_to(comments_part, RT.COMMENTS)
+    return comments_part
+
+
+def _insert_word_comment(
+    doc: Any,
+    paragraph: Any,
+    text: str,
+    author: str = "Assistant",
+    run: Optional[Any] = None,
+) -> str:
+    """Insert a native OOXML comment anchored on `run` (or paragraph end). Returns the comment id."""
+    from datetime import datetime, timezone
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    comments_part = _ensure_docx_comments_part(doc)
+    comments_root = comments_part.element
+
+    existing_ids = [
+        int(c.get(qn("w:id")))
+        for c in comments_root.findall(qn("w:comment"))
+        if c.get(qn("w:id")) is not None and str(c.get(qn("w:id"))).lstrip("-").isdigit()
+    ]
+    comment_id = str(max(existing_ids) + 1 if existing_ids else 0)
+
+    initials = "".join(ch for ch in author if ch.isalpha())[:4].upper() or "AI"
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    comment_el = OxmlElement("w:comment")
+    comment_el.set(qn("w:id"), comment_id)
+    comment_el.set(qn("w:author"), author)
+    comment_el.set(qn("w:initials"), initials)
+    comment_el.set(qn("w:date"), date_str)
+
+    p_el = OxmlElement("w:p")
+    r_el = OxmlElement("w:r")
+    t_el = OxmlElement("w:t")
+    t_el.set(qn("xml:space"), "preserve")
+    t_el.text = text
+    r_el.append(t_el)
+    p_el.append(r_el)
+    comment_el.append(p_el)
+    comments_root.append(comment_el)
+
+    range_start = OxmlElement("w:commentRangeStart")
+    range_start.set(qn("w:id"), comment_id)
+    range_end = OxmlElement("w:commentRangeEnd")
+    range_end.set(qn("w:id"), comment_id)
+
+    ref_run = OxmlElement("w:r")
+    ref_el = OxmlElement("w:commentReference")
+    ref_el.set(qn("w:id"), comment_id)
+    ref_run.append(ref_el)
+
+    if run is not None:
+        run._element.addprevious(range_start)
+        run._element.addnext(range_end)
+        range_end.addnext(ref_run)
+    else:
+        paragraph._p.append(range_start)
+        paragraph._p.append(range_end)
+        paragraph._p.append(ref_run)
+
+    return comment_id
+
+
+def _find_docx_run_by_text(doc: Any, search_text: str) -> Optional[Any]:
+    """Return the first run whose text contains `search_text` (exact, then case-insensitive)."""
+    if not search_text:
+        return None
+    for paragraph in doc.paragraphs:
+        for run in paragraph.runs:
+            if search_text in run.text:
+                return run
+    needle = search_text.lower()
+    for paragraph in doc.paragraphs:
+        for run in paragraph.runs:
+            if needle in run.text.lower():
+                return run
+    return None
+
+
+def _read_docx_comments(doc: Any) -> List[Dict[str, Any]]:
+    """Extract all native comments from the document. Returns [] on any failure."""
+    from docx.oxml.ns import qn
+
+    try:
+        comments_part = None
+        for rel in doc.part.rels.values():
+            if "comments" in rel.reltype:
+                comments_part = rel.target_part
+                break
+        if comments_part is None:
+            return []
+
+        results: List[Dict[str, Any]] = []
+        for c in comments_part.element.findall(qn("w:comment")):
+            text_parts = [t.text or "" for t in c.iter(qn("w:t"))]
+            results.append({
+                "id": c.get(qn("w:id")),
+                "author": c.get(qn("w:author")),
+                "initials": c.get(qn("w:initials")),
+                "date": c.get(qn("w:date")),
+                "text": "".join(text_parts),
+            })
+        return results
+    except Exception:
+        return []
+
+
+def tool_add_word_comment(
+    file_name: str,
+    comment: str,
+    search_text: Optional[str] = None,
+    author: str = "Assistant",
+    paragraph_index: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Adds a native Word review comment (Review-pane margin box) to a .docx file.
+
+    Args:
+        file_name (str): Relative path to the .docx file in the workspace.
+        comment (str): The comment text.
+        search_text (str, optional): Text to anchor the comment on. Preferred anchor.
+        author (str, optional): Comment author name. Defaults to "Assistant".
+        paragraph_index (int, optional): 0-based index into non-empty paragraphs when search_text is absent.
+    """
+    path = Path(file_name)
+    if not path.exists():
+        return {"success": False, "error": f"File '{file_name}' not found."}
+    if path.suffix.lower() not in (".docx", ".docm"):
+        return {"success": False, "error": f"File '{file_name}' is not a Word document (.docx/.docm)."}
+
+    try:
+        import docx
+        doc = docx.Document(str(path))
+
+        target_run = _find_docx_run_by_text(doc, search_text) if search_text else None
+        target_paragraph = None
+
+        if target_run is not None:
+            target_paragraph = target_run._parent
+        else:
+            non_empty = [p for p in doc.paragraphs if p.text.strip()]
+            if not non_empty:
+                return {"success": False, "error": f"Document '{file_name}' has no non-empty paragraphs to anchor a comment on."}
+            if paragraph_index is not None:
+                if not (0 <= paragraph_index < len(non_empty)):
+                    return {"success": False, "error": f"paragraph_index {paragraph_index} out of range (0..{len(non_empty) - 1})."}
+                target_paragraph = non_empty[paragraph_index]
+            else:
+                target_paragraph = non_empty[0]
+
+        comment_id = _insert_word_comment(doc, target_paragraph, comment, author=author, run=target_run)
+        doc.save(str(path))
+
+        return {
+            "success": True,
+            "comment_id": comment_id,
+            "author": author,
+            "file_name": file_name,
+            "workspace_file": str(path.resolve()),
+            "output": f"Added native Word comment (id={comment_id}) to '{file_name}' by '{author}'.",
+        }
+    except Exception as e:
+        import traceback as _tb
+        return {"success": False, "error": f"Failed to add comment to '{file_name}': {e}", "traceback": _tb.format_exc()}
+
+
+def tool_get_word_comments(file_name: str) -> Dict[str, Any]:
+    """
+    Lists all native Word review comments in a .docx file.
+
+    Args:
+        file_name (str): Relative path to the .docx file in the workspace.
+    """
+    path = Path(file_name)
+    if not path.exists():
+        return {"success": False, "error": f"File '{file_name}' not found."}
+    if path.suffix.lower() not in (".docx", ".docm"):
+        return {"success": False, "error": f"File '{file_name}' is not a Word document (.docx/.docm)."}
+
+    try:
+        import docx
+        doc = docx.Document(str(path))
+        comments = _read_docx_comments(doc)
+        if not comments:
+            output = f"No native comments found in '{file_name}'."
+        else:
+            lines = [f"Found {len(comments)} comment(s) in '{file_name}':"]
+            for c in comments:
+                lines.append(f"  [id={c['id']}] {c['author']} ({c['date']}): {c['text']}")
+            output = "\n".join(lines)
+        return {
+            "success": True,
+            "file_name": file_name,
+            "count": len(comments),
+            "comments": comments,
+            "output": output,
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Failed to read comments from '{file_name}': {e}"}
+
+
 def tool_grep_document(
     file_name: str,
     pattern: str,
@@ -368,3 +591,92 @@ def tool_grep_document(
 
     except Exception as e:
         return {"success": False, "error": f"Grep failed on '{file_name}': {e}"}
+
+
+def get_tools() -> List[Dict[str, Any]]:
+    """Return the tool descriptors exposed by this library."""
+    return [
+        {
+            "name": "tool_inspect_document",
+            "description": "Inspects a document file to return structural metadata (format, page/sheet count, outline/headings).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_name": {"type": "string", "description": "Relative path to the document file in the workspace."},
+                },
+                "required": ["file_name"],
+            },
+            "output": {"type": "object"},
+            "callable": tool_inspect_document,
+            "_source": "as_is_document_tools",
+            "_source_file": __file__,
+        },
+        {
+            "name": "tool_read_document_content",
+            "description": "Extracts readable text content from a document (supports specific pages or sheets).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_name": {"type": "string", "description": "Relative path to the file in the workspace."},
+                    "page_or_sheet": {"type": "string", "description": "Specific page number (PDF/PPTX) or sheet name (Excel)."},
+                    "max_chars": {"type": "integer", "description": "Maximum characters to extract. Defaults to 8000."},
+                },
+                "required": ["file_name"],
+            },
+            "output": {"type": "object"},
+            "callable": tool_read_document_content,
+            "_source": "as_is_document_tools",
+            "_source_file": __file__,
+        },
+        {
+            "name": "tool_grep_document",
+            "description": "Searches for a regular expression or keyword within a document without loading the whole file into context.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_name": {"type": "string", "description": "Relative path to the file in the workspace."},
+                    "pattern": {"type": "string", "description": "Search keyword or regex pattern."},
+                    "max_matches": {"type": "integer", "description": "Maximum matching excerpts to return. Defaults to 20."},
+                },
+                "required": ["file_name", "pattern"],
+            },
+            "output": {"type": "object"},
+            "callable": tool_grep_document,
+            "_source": "as_is_document_tools",
+            "_source_file": __file__,
+        },
+        {
+            "name": "tool_add_word_comment",
+            "description": "Adds a native Word review comment (Review-pane margin box) to a .docx file, anchored on search_text or paragraph_index.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_name": {"type": "string", "description": "Relative path to the .docx file in the workspace."},
+                    "comment": {"type": "string", "description": "The comment text."},
+                    "search_text": {"type": "string", "description": "Text to anchor the comment on (preferred)."},
+                    "author": {"type": "string", "description": "Comment author name. Defaults to 'Assistant'."},
+                    "paragraph_index": {"type": "integer", "description": "0-based index into non-empty paragraphs when search_text is absent."},
+                },
+                "required": ["file_name", "comment"],
+            },
+            "output": {"type": "object"},
+            "callable": tool_add_word_comment,
+            "_source": "as_is_document_tools",
+            "_source_file": __file__,
+        },
+        {
+            "name": "tool_get_word_comments",
+            "description": "Lists all native Word review comments in a .docx file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_name": {"type": "string", "description": "Relative path to the .docx file in the workspace."},
+                },
+                "required": ["file_name"],
+            },
+            "output": {"type": "object"},
+            "callable": tool_get_word_comments,
+            "_source": "as_is_document_tools",
+            "_source_file": __file__,
+        },
+    ]
