@@ -2600,6 +2600,236 @@ class ArtefactManager:
         )
         return None
 
+    # ── TYPE-BASED ARTEFACT ROUTER ────────────────────────────────────────
+    # Saif's directive: accept <artifact type="X"> for ANY type and forward it
+    # to the right engine instead of rejecting it (which costs a full round).
+    #
+    #   image / png / jpg / jpeg / webp / gif  → TTI engine, body IS the prompt
+    #   pptx / presentation                    → presentation engine, body IS source
+    #   docx / word / document                 → word engine, body IS source
+    #   xlsx / excel / spreadsheet             → excel engine, body IS source
+    #   pdf                                    → PDF export, body IS source
+    #   everything else                        → plain artefact write (unchanged)
+    #
+    # Returns (handled, artefact_dict_or_None, error_msg_or_None).
+    # If handled=False, the caller falls through to the plain-write path.
+    _IMAGE_ATYPES = frozenset({"image", "png", "jpg", "jpeg", "webp", "gif"})
+    _PPTX_ATYPES  = frozenset({"pptx", "presentation"})
+    _DOCX_ATYPES  = frozenset({"docx", "word"})
+    _XLSX_ATYPES  = frozenset({"xlsx", "excel", "spreadsheet"})
+    _PDF_ATYPES   = frozenset({"pdf"})
+
+    def _dispatch_typed_artifact(
+        self,
+        *,
+        atype: str,
+        title: str,
+        body: str,
+        language: Optional[str] = None,
+        visibility: Optional[str] = None,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        version: int = 1,
+        auto_activate: bool = True,
+        commit_message: Optional[str] = None,
+        version_tags: Optional[List[str]] = None,
+        status: str = ArtefactStatus.STABLE,
+        extra_attrs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+        """
+        Route an <artifact type="..."> tag to the correct engine.
+
+        Returns (handled, artefact, error):
+          - handled=False  → caller should fall through to plain write
+          - handled=True, artefact!=None → success, artefact is the stored entry
+          - handled=True, artefact=None, error!=None → engine failed, error is human-readable
+        """
+        atype_l = (atype or "").strip().lower()
+        extra_attrs = extra_attrs or {}
+
+        # ── IMAGE: body IS the prompt, verbatim ──────────────────────────
+        if atype_l in self._IMAGE_ATYPES:
+            w = int(width) if width else 1280
+            h = int(height) if height else 720
+            ASCIIColors.info(
+                f"[ArtefactRouter] atype='{atype_l}' → TTI engine (size={w}x{h})"
+            )
+            try:
+                client = getattr(self._discussion, "lollmsClient", None)
+                tti = getattr(client, "tti", None) if client else None
+                if tti is None:
+                    ASCIIColors.warning(
+                        f"[ArtefactRouter] atype='{atype_l}' — no TTI binding; returning failure."
+                    )
+                    return True, None, (
+                        "No TTI (text-to-image) binding is attached to this discussion. "
+                        "Attach an image-generation binding, or use <generate_image> directly."
+                    )
+
+                # Body is the prompt — no wrapper, no prefix.
+                prompt = body.strip()
+                if not prompt:
+                    return True, None, "Image artifact body is empty — provide a prompt."
+
+                # Prefer the client's high-level generate_image if available.
+                img_b64: Optional[str] = None
+                media_type = "image/png"
+                if hasattr(tti, "generate_image"):
+                    try:
+                        result = tti.generate_image(
+                            prompt=prompt,
+                            width=w,
+                            height=h,
+                        )
+                    except TypeError:
+                        # Some bindings use `size="WxH"` instead of width/height.
+                        result = tti.generate_image(
+                            prompt=prompt,
+                            size=f"{w}x{h}",
+                        )
+                    if isinstance(result, dict):
+                        img_b64 = result.get("image") or result.get("b64_json") or result.get("data")
+                        media_type = result.get("media_type", media_type)
+                    elif isinstance(result, (bytes, bytearray)):
+                        import base64 as _b64
+                        img_b64 = _b64.b64encode(bytes(result)).decode("ascii")
+                    elif isinstance(result, str):
+                        img_b64 = result
+                elif hasattr(tti, "generate"):
+                    result = tti.generate(prompt=prompt, size=f"{w}x{h}")
+                    if isinstance(result, dict):
+                        img_b64 = result.get("image") or result.get("b64_json") or result.get("data")
+                        media_type = result.get("media_type", media_type)
+                    elif isinstance(result, (bytes, bytearray)):
+                        import base64 as _b64
+                        img_b64 = _b64.b64encode(bytes(result)).decode("ascii")
+                    elif isinstance(result, str):
+                        img_b64 = result
+                else:
+                    return True, None, (
+                        "TTI binding exposes neither generate_image() nor generate(). "
+                        "Cannot render image artifact."
+                    )
+
+                if not img_b64:
+                    return True, None, "TTI engine returned no image data."
+
+                # Strip data-URL prefix if present.
+                if isinstance(img_b64, str) and img_b64.startswith("data:"):
+                    head, _, tail = img_b64.partition(",")
+                    if ";" in head:
+                        media_type = head[5:].split(";", 1)[0] or media_type
+                    img_b64 = tail
+
+                # Store as an image artefact with the base64 payload.
+                anchor = f'<artefact_image id="{title}::0" />'
+                art = self.add(
+                    title=title,
+                    artefact_type=ArtefactType.IMAGE,
+                    content=anchor,
+                    images=[img_b64],
+                    image_media_types=[media_type],
+                    language=language,
+                    version=version,
+                    active=auto_activate,
+                    visibility=visibility,
+                    commit_message=commit_message,
+                    version_tags=version_tags,
+                    status=status,
+                    **extra_attrs,
+                )
+                return True, art, None
+            except Exception as exc:
+                trace_exception(exc)
+                return True, None, f"Image generation failed: {exc}"
+
+        # ── OFFICE / PDF: body IS the source ─────────────────────────────
+        office_kind: Optional[str] = None
+        if atype_l in self._PPTX_ATYPES:
+            office_kind = "pptx"
+        elif atype_l in self._DOCX_ATYPES:
+            office_kind = "docx"
+        elif atype_l in self._XLSX_ATYPES:
+            office_kind = "xlsx"
+        elif atype_l in self._PDF_ATYPES:
+            office_kind = "pdf"
+
+        if office_kind is not None:
+            ASCIIColors.info(
+                f"[ArtefactRouter] atype='{atype_l}' → {office_kind} engine"
+            )
+            try:
+                client = getattr(self._discussion, "lollmsClient", None)
+                # The office generators live on the client (or its tools binding).
+                # Try the canonical method names in order of preference.
+                generator = None
+                for name in (
+                    f"generate_{office_kind}",
+                    f"create_{office_kind}",
+                    f"export_{office_kind}",
+                ):
+                    if client is not None and hasattr(client, name):
+                        generator = getattr(client, name)
+                        break
+
+                if generator is None:
+                    # Fall back to storing the source as a plain artefact so the
+                    # user still gets the content — but flag it clearly.
+                    ASCIIColors.warning(
+                        f"[ArtefactRouter] atype='{atype_l}' — no {office_kind} engine attached; "
+                        f"storing source as plain artefact."
+                    )
+                    art = self.add(
+                        title=title,
+                        artefact_type=ArtefactType.DOCUMENT,
+                        content=body,
+                        language=language,
+                        version=version,
+                        active=auto_activate,
+                        visibility=visibility,
+                        commit_message=commit_message,
+                        version_tags=version_tags,
+                        status=status,
+                        **extra_attrs,
+                    )
+                    return True, art, None
+
+                # Call the generator with the body as source.
+                try:
+                    result = generator(source=body, title=title)
+                except TypeError:
+                    result = generator(body, title)
+
+                # If the generator returned bytes, store them as physical_data.
+                physical_data = None
+                if isinstance(result, (bytes, bytearray)):
+                    physical_data = bytes(result)
+                elif isinstance(result, dict):
+                    physical_data = result.get("data") or result.get("bytes")
+
+                art = self.add(
+                    title=title,
+                    artefact_type=ArtefactType.DOCUMENT,
+                    content=body,
+                    language=language,
+                    version=version,
+                    active=auto_activate,
+                    visibility=visibility,
+                    commit_message=commit_message,
+                    version_tags=version_tags,
+                    status=status,
+                    physical_data=physical_data,
+                    **extra_attrs,
+                )
+                return True, art, None
+            except Exception as exc:
+                trace_exception(exc)
+                return True, None, f"{office_kind} generation failed: {exc}"
+
+        # ── FALL THROUGH: plain artefact write ───────────────────────────
+        ASCIIColors.info(f"[ArtefactRouter] atype='{atype_l}' → plain artefact write")
+        return False, None, None
+
     def _apply_artefact_xml(
         self,
         text:          str,
@@ -2649,6 +2879,62 @@ class ArtefactManager:
             version_tags   = attrs.pop('version_tags', None)
             visibility  = ArtefactManager._resolve_tag_visibility(attrs.pop('visibility', None))
             
+            # ── TYPE-BASED ROUTER: forward image/office/pdf to their engines ──
+            # Saif's directive: accept the tag and route it, don't reject it.
+            # The router returns handled=True when it took ownership of the tag.
+            _raw_atype = (atype or "").strip().lower()
+            _width_attr  = attrs.pop("width", None)
+            _height_attr = attrs.pop("height", None)
+            try:
+                _w = int(_width_attr) if _width_attr else None
+            except (TypeError, ValueError):
+                _w = None
+            try:
+                _h = int(_height_attr) if _height_attr else None
+            except (TypeError, ValueError):
+                _h = None
+
+            _handled, _routed_art, _route_err = self._dispatch_typed_artifact(
+                atype=_raw_atype,
+                title=tag_title or f"artifact_{uuid.uuid4().hex[:8]}",
+                body=content,
+                language=language,
+                visibility=visibility,
+                width=_w,
+                height=_h,
+                version=version,
+                auto_activate=auto_activate,
+                commit_message=commit_message,
+                version_tags=version_tags,
+                status=status,
+                extra_attrs=dict(attrs),
+            )
+            if _handled:
+                existing_titles = self._all_latest_titles()
+                if _routed_art:
+                    affected.append(_routed_art)
+                    if event_callback:
+                        try:
+                            event_callback(_routed_art, True)
+                        except Exception:
+                            pass
+                tag_name = "artifact" if "artifact" in match.group(0).lower() else "artefact"
+                if _route_err:
+                    err_block = (
+                        f"[SYSTEM ERROR: <{tag_name} type=\"{_raw_atype}\"> could not be "
+                        f"dispatched to its engine. Reason: {_route_err}. "
+                        f"Fix the underlying issue (attach the engine, correct the prompt) "
+                        f"and retry, or use the direct tag (<generate_image>, "
+                        f"<generate_presentation>, etc.).]"
+                    )
+                    if event_callback:
+                        try:
+                            event_callback(None, False, err_block)
+                        except Exception:
+                            pass
+                    return err_block
+                return f'<{tag_name} {match.group(1)}>\n[content stripped, refer to the artefact for details]\n</{tag_name}>'
+
             if atype not in ArtefactType.ALL:
                 if atype in ("csv", "tsv", "excel", "xlsx", "xls", "db", "sqlite"):
                     atype = ArtefactType.DATA

@@ -2471,10 +2471,83 @@ class LollmsPersonality:
         self.extra_knowledge_bases: List[Path] = [Path(p) for p in (extra_knowledge_bases or [])]
         self.extra_safe_stores: List[Any] = list(extra_safe_stores or [])
         try:
+            ASCIIColors.info(
+                f"[Personality-DBG] __init__ received extra_knowledge_bases="
+                f"{[str(p) for p in self.extra_knowledge_bases]} "
+                f"extra_safe_stores="
+                f"{[str(getattr(s, 'db_path', s)) if not isinstance(s, dict) else s.get('db_path') for s in self.extra_safe_stores]}"
+            )
+        except Exception:
+            pass
+
+        # ── Promote .db knowledge-base paths into named safe_store entries ──
+        # The app-level Backend may pass a `.db` path via `extra_knowledge_bases`
+        # (bypassing Handbag's classification). Without this promotion, the
+        # resolver's `kb_path_map` holds the .db but `safe_store_map` is empty,
+        # so `datasource_name=None` falls through to `query_data()` (which has
+        # no .db handler) and returns 0 hits. Promote here so the resolver can
+        # route .db entries through SafeStoreRAGBinding.
+        try:
+            _promoted = 0
+            _remaining_kbs: List[Path] = []
+            _existing_store_paths = set()
+            for _s in self.extra_safe_stores:
+                if isinstance(_s, dict):
+                    _existing_store_paths.add(str(_s.get("db_path", "")))
+                else:
+                    _existing_store_paths.add(str(getattr(_s, "db_path", "")))
+            for _kb in list(self.extra_knowledge_bases):
+                if _kb.suffix.lower() == ".db":
+                    _key = _kb.stem.lower()
+                    if str(_kb) not in _existing_store_paths:
+                        self.extra_safe_stores.append({
+                            "name": _key,
+                            "db_path": str(_kb),
+                            "vectorizer_name": "st",
+                            "description": f"Knowledge base '{_key}' (from {_kb.name}).",
+                        })
+                        _promoted += 1
+                        try:
+                            ASCIIColors.info(
+                                f"[Personality-DBG] Promoted .db KB path '{_kb}' → "
+                                f"extra_safe_stores['{_key}'] (deferred config)"
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            ASCIIColors.info(
+                                f"[Personality-DBG] .db KB path '{_kb}' already in "
+                                f"extra_safe_stores — skipped promotion"
+                            )
+                        except Exception:
+                            pass
+                else:
+                    _remaining_kbs.append(_kb)
+            # Keep .db paths in extra_knowledge_bases too (for backward compat
+            # with any code that iterates it), but the resolver will now prefer
+            # the safe_store_map entry.
+            if _promoted:
+                try:
+                    ASCIIColors.info(
+                        f"[Personality-DBG] Promoted {_promoted} .db KB path(s) → "
+                        f"extra_safe_stores (total stores now {len(self.extra_safe_stores)})"
+                    )
+                except Exception:
+                    pass
+        except Exception as _promo_err:
+            try:
+                ASCIIColors.warning(
+                    f"[Personality-DBG] .db promotion failed: {_promo_err}"
+                )
+            except Exception:
+                pass
+
+        try:
             if self.extra_safe_stores:
                 ASCIIColors.info(
                     f"[Personality.__init__] Received {len(self.extra_safe_stores)} extra_safe_store(s) "
-                    f"from handbag: {[str(getattr(s, 'db_path', '<obj>')) for s in self.extra_safe_stores]}"
+                    f"from handbag: {[str(getattr(s, 'db_path', '<obj>')) if not isinstance(s, dict) else s.get('db_path') for s in self.extra_safe_stores]}"
                 )
             if self.extra_knowledge_bases:
                 ASCIIColors.info(
@@ -3147,7 +3220,22 @@ class LollmsPersonality:
                 catalog_lines.append(f"{ds.name}: {desc}")
 
             # 2) Handbag SafeStore bindings (.db files opened as SafeStoreRAGBinding)
+            try:
+                ASCIIColors.info(
+                    f"[RAG-DBG] build_rag_tools: iterating extra_safe_stores "
+                    f"(count={len(getattr(self, 'extra_safe_stores', []))})"
+                )
+            except Exception:
+                pass
             for idx, store in enumerate(getattr(self, "extra_safe_stores", [])):
+                try:
+                    ASCIIColors.info(
+                        f"[RAG-DBG] extra_safe_stores[{idx}] type={type(store).__name__} "
+                        f"db_path={getattr(store, 'db_path', store.get('db_path') if isinstance(store, dict) else '<none>')} "
+                        f"name={getattr(store, 'name', store.get('name') if isinstance(store, dict) else '<none>')}"
+                    )
+                except Exception:
+                    pass
                 tool_name, tool_desc = _resolve_rag_tool_identity(store, idx)
                 db_label = tool_name[4:] if tool_name.startswith("rag_") else tool_name
                 # de-dupe against data-source names
@@ -3157,12 +3245,25 @@ class LollmsPersonality:
                     db_label = f"{base_label}_{n}"
                 safe_store_map[db_label] = store
                 catalog_lines.append(f"{db_label}: {tool_desc}")
+                try:
+                    ASCIIColors.info(
+                        f"[RAG-DBG] Registered safe_store_map['{db_label}'] = {type(store).__name__}"
+                    )
+                except Exception:
+                    pass
 
             # 3) Plain knowledge-base paths (files/dirs — resolved via self.query_data)
             #    This is the ONLY way a .db that failed to open as a SafeStore still
             #    appears in the prompt (e.g. app-level fallback path).
             #    The catalog line exposes the EXACT `datasource_name` the LLM must pass,
             #    followed by a human description — never the filesystem path.
+            try:
+                ASCIIColors.info(
+                    f"[RAG-DBG] build_rag_tools: iterating extra_knowledge_bases "
+                    f"(count={len(getattr(self, 'extra_knowledge_bases', []))})"
+                )
+            except Exception:
+                pass
             for kb in getattr(self, "extra_knowledge_bases", []):
                 p = Path(kb)
                 label = p.stem or p.name
@@ -3176,6 +3277,13 @@ class LollmsPersonality:
                     or f"Knowledge base '{label}'."
                 )
                 catalog_lines.append(f"{label}: {kb_desc}")
+                try:
+                    ASCIIColors.info(
+                        f"[RAG-DBG] Registered kb_path_map['{label}'] = '{p}' "
+                        f"(suffix='{p.suffix}')"
+                    )
+                except Exception:
+                    pass
 
             if not catalog_lines:
                 ds_list_str = "(no databases configured)"
@@ -3200,9 +3308,55 @@ class LollmsPersonality:
                 except Exception:
                     pass
 
+                # ── AUTO-RESOLVE datasource_name from kb_path_keys ──
+                # When the LLM omits datasource_name but exactly one KB is
+                # configured, promote it so the SafeStore branch is taken.
+                if datasource_name is None and kb_path_map:
+                    _auto = next(iter(kb_path_map.keys()))
+                    try:
+                        ASCIIColors.info(
+                            f"[RAG-DBG] Auto-resolved datasource_name=None → '{_auto}' "
+                            f"(from kb_path_map keys={list(kb_path_map.keys())})"
+                        )
+                    except Exception:
+                        pass
+                    datasource_name = _auto
+
                 # Branch 1: handbag SafeStore binding
                 if datasource_name and datasource_name in safe_store_map:
                     store = safe_store_map[datasource_name]
+                    # Materialize deferred dict configs into a real SafeStoreRAGBinding.
+                    # Handbag/Personality may register a plain dict {"name","db_path",
+                    # "vectorizer_name","description"} when the .db could not be opened
+                    # eagerly. Branch 1 must build the binding on first use.
+                    if isinstance(store, dict):
+                        _deferred_db = store.get("db_path")
+                        if _deferred_db:
+                            try:
+                                ASCIIColors.info(
+                                    f"[RAG-DBG] Materializing deferred store config "
+                                    f"'{datasource_name}' → SafeStoreRAGBinding(db_path='{_deferred_db}')"
+                                )
+                            except Exception:
+                                pass
+                            _materialized = _get_or_create_safestore_binding(Path(_deferred_db))
+                            if _materialized is not None:
+                                safe_store_map[datasource_name] = _materialized
+                                store = _materialized
+                            else:
+                                return {
+                                    "success": False,
+                                    "error": (
+                                        f"Could not materialize SafeStore for '{datasource_name}' "
+                                        f"({_deferred_db}). Check that 'safe_store' is installed "
+                                        f"and the .db is valid."
+                                    ),
+                                }
+                        else:
+                            return {
+                                "success": False,
+                                "error": f"Deferred store '{datasource_name}' has no db_path.",
+                            }
                     try:
                         ASCIIColors.info(
                             f"[RAG-DIAG] BRANCH=SafeStore store_type={type(store).__name__} "
@@ -3252,7 +3406,12 @@ class LollmsPersonality:
                             score_str = f" (Score: {score:.2f})" if isinstance(score, (int, float)) else ""
                             parts.append(f"[{i}] {title}{score_str}:\n{src.get('content', '')}")
                         ASCIIColors.success(f"[RAG-DIAG] SafeStore '{datasource_name}' -> {len(normalised['sources'])} hit(s)")
-                        return {"success": True, "sources_count": len(normalised["sources"]), "output": "\n\n".join(parts)}
+                        return {
+                            "success": True,
+                            "sources_count": len(normalised["sources"]),
+                            "sources": normalised["sources"],
+                            "output": "\n\n".join(parts),
+                        }
                     except Exception as e:
                         ASCIIColors.error(f"[RAG-DIAG] SafeStore '{datasource_name}' query EXCEPTION: {e}")
                         trace_exception(e)
@@ -3263,6 +3422,14 @@ class LollmsPersonality:
                     # NEW: if the target path is a .db, auto-instantiate a SafeStore
                     # and query it directly (query_data has no .db handler).
                     _kb_path = kb_path_map.get(datasource_name) if datasource_name else None
+                    try:
+                        ASCIIColors.info(
+                            f"[RAG-DBG] Branch 2 check: datasource_name={datasource_name!r} "
+                            f"_kb_path={_kb_path} "
+                            f"suffix={Path(_kb_path).suffix if _kb_path else None}"
+                        )
+                    except Exception:
+                        pass
                     if _kb_path is not None and Path(_kb_path).suffix.lower() == ".db":
                         ASCIIColors.info(
                             f"[RAG-DIAG] BRANCH=db-auto datasource_name='{datasource_name}' "
@@ -3310,6 +3477,7 @@ class LollmsPersonality:
                             return {
                                 "success": True,
                                 "sources_count": len(_norm["sources"]),
+                                "sources": _norm["sources"],
                                 "output": "\n\n".join(_parts),
                             }
                         except Exception as _e:
@@ -3353,7 +3521,12 @@ class LollmsPersonality:
                         score_str = f" (Score: {score:.2f})" if isinstance(score, (int, float)) and (score <= 1.0) else (f" (Score: {score})" if score is not None else "")
                         parts.append(f"[{i}] {title}{score_str}:\n{src.get('content', '')}")
                     ASCIIColors.success(f"[RAG-DIAG] path/default -> {len(result.get('sources', []))} hit(s)")
-                    return {"success": True, "sources_count": len(result.get("sources", [])), "output": "\n\n".join(parts)}
+                    return {
+                        "success": True,
+                        "sources_count": len(result.get("sources", [])),
+                        "sources": result.get("sources", []),
+                        "output": "\n\n".join(parts),
+                    }
                 except Exception as e:
                     ASCIIColors.error(f"[RAG-DIAG] path/default query EXCEPTION: {e}")
                     trace_exception(e)

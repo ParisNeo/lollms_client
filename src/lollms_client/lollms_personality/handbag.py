@@ -36,6 +36,14 @@ class Handbag:
         # so a missing .db is reported (warning) instead of being silently demoted
         # to a plain KB path. A broken/missing .db never crashes the handbag build.
         _all_extra = self._load_extra_knowledge_bases_rich()
+        try:
+            ASCIIColors.info(
+                f"[Handbag-DBG] _load_extra_knowledge_bases_rich() returned "
+                f"{len(_all_extra)} entry(ies): "
+                f"{[(str(e.get('path')), e.get('name'), e.get('description')) for e in _all_extra]}"
+            )
+        except Exception:
+            pass
         self.extra_knowledge_bases: List[Path] = []
         self.extra_safe_stores: List[Any] = []
         for entry in _all_extra:
@@ -43,8 +51,24 @@ class Handbag:
             declared_name = entry.get("name")
             declared_desc = entry.get("description")
 
+            try:
+                ASCIIColors.info(
+                    f"[Handbag-DBG] Classifying entry path='{p}' "
+                    f"suffix='{p.suffix}' is_safe_store_db={self._is_safe_store_db(p)} "
+                    f"exists_on_disk={p.exists()}"
+                )
+            except Exception:
+                pass
+
             if self._is_safe_store_db(p):
                 binding = self._open_safe_store(p)
+                try:
+                    ASCIIColors.info(
+                        f"[Handbag-DBG] _open_safe_store('{p}') returned "
+                        f"{type(binding).__name__ if binding is not None else 'None'}"
+                    )
+                except Exception:
+                    pass
                 if binding is not None:
                     # Attach human-authored identity (provenance) so the personality's
                     # tool builder can surface the real name/description to the LLM.
@@ -61,6 +85,29 @@ class Handbag:
                         ASCIIColors.info(
                             f"[Handbag] SafeStore '{display}' ← '{p.name}' "
                             f"(description={'set' if declared_desc else 'auto'})"
+                        )
+                    except Exception:
+                        pass
+                else:
+                    # Fallback: the .db was declared but could not be opened
+                    # (missing file, safe_store not installed, or init failure).
+                    # Register a NAMED store config so the RAG resolver can still
+                    # address it by datasource_name — the binding will be built
+                    # lazily on first query, and any real error will surface there
+                    # with a clear message instead of being silently dropped.
+                    display = declared_name or p.stem
+                    desc = declared_desc or f"Search knowledge base '{display}' (from {p.name})."
+                    self.extra_safe_stores.append({
+                        "name": display,
+                        "db_path": str(p),
+                        "vectorizer_name": "st",
+                        "description": desc,
+                    })
+                    try:
+                        ASCIIColors.warning(
+                            f"[Handbag] SafeStore '{display}' ← '{p.name}' could not be "
+                            f"opened eagerly; registered as deferred store config "
+                            f"(will be built on first query)."
                         )
                     except Exception:
                         pass
@@ -246,6 +293,13 @@ class Handbag:
             safe_store cannot be imported. Never raises.
         """
         try:
+            ASCIIColors.info(
+                f"[Handbag-DBG] _open_safe_store ENTRY db_path='{db_path}' "
+                f"exists={db_path.exists()} suffix='{db_path.suffix}'"
+            )
+        except Exception:
+            pass
+        try:
             if not db_path.exists():
                 ASCIIColors.warning(
                     f"[Handbag] Declared safe_store '.db' not found on disk: {db_path} — "
@@ -254,7 +308,20 @@ class Handbag:
                 )
                 return None
 
+            try:
+                ASCIIColors.info(
+                    f"[Handbag-DBG] Importing SafeStoreRAGBinding from "
+                    f"lollms_client.rag_bindings.safe_store ..."
+                )
+            except Exception:
+                pass
             from lollms_client.rag_bindings.safe_store import SafeStoreRAGBinding
+            try:
+                ASCIIColors.info(
+                    f"[Handbag-DBG] SafeStoreRAGBinding imported OK: {SafeStoreRAGBinding}"
+                )
+            except Exception:
+                pass
             binding = SafeStoreRAGBinding(
                 db_path=str(db_path),
                 vectorizer_name="st",

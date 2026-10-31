@@ -2321,32 +2321,53 @@ class _StreamState:
             lang = attrs.get("language")
             is_ephemeral = attrs.get("ephemeral", "false").lower() in ("true", "1", "yes")
 
-            # ── 🖼️ IMAGE ARTIFACT GUARD ──
-            # Images are created exclusively via <generate_image>/<edit_image>, which
-            # store real base64 pixels. An <artifact type="image"> re-dispatch can
-            # only carry a markdown placeholder body — it can never recreate pixels.
-            # If an image artifact with this title already exists, reject immediately
-            # with an image-specific correction instead of the generic patch advice.
-            if atype == "image" and self.discussion.artefacts.get(title) is not None:
-                self._last_dispatch_failed = True
-                self._last_failure_kind = "image_artifact_duplicate"
-                ASCIIColors.warning(
-                    f"[StreamState] <artifact type=\"image\"> re-dispatch blocked: image "
-                    f"'{title}' already exists (created via <generate_image>)."
+            # ── 🖼️ IMAGE ARTIFACT ROUTER (ACCEPT + FORWARD) ──
+            # An <artifact type="image"> tag is accepted and its body is forwarded
+            # VERBATIM as the prompt to the SAME image engine that <generate_image>
+            # invokes. No wrapping, no prefix. width/height attrs are preserved
+            # (default 1280×720). This eliminates the wasted round caused by the
+            # former reject-and-redirect guard.
+            _IMAGE_ARTIFACT_TYPES = {"image", "png", "jpg", "jpeg", "webp", "gif"}
+            if atype.lower() in _IMAGE_ARTIFACT_TYPES:
+                _img_width = attrs.get("width", "1280")
+                _img_height = attrs.get("height", "720")
+                _img_prompt = (body or "").strip() or title
+                _synth_tag = (
+                    f'<generate_image name="{title}" '
+                    f'width="{_img_width}" height="{_img_height}">'
                 )
-                if self._processing_block_open:
-                    proc_close = (
-                        f"* ⚠️ Image '{title}' already exists in the workspace — it was created "
-                        f"by <generate_image> and its pixels are already saved. An <artifact> tag "
-                        f"cannot recreate or modify image pixels, and it can NEVER be used to view or "
-                        f"'load' an image. To VIEW it, emit `<unlock_file>{title}</unlock_file>`. "
-                        f"To reference it in your answer, use `![](./{title})`. "
-                        f"To modify it, use <edit_image>. Then finish with `<done/>`.\n"
-                        f"<!-- status:failure -->\n</processing>\n"
+                ASCIIColors.info(
+                    f"[StreamState] <artifact type=\"{atype}\"> → TTI engine "
+                    f"(name='{title}', size={_img_width}x{_img_height})."
+                )
+                _ok = self._handle_generate_image_tag(_synth_tag, _img_prompt)
+                if _ok:
+                    self._last_dispatch_failed = False
+                    self._last_failure_kind = None
+                    if self._processing_block_open:
+                        proc_close = (
+                            f"* ✅ Image '{title}' generated via the image engine.\n"
+                            f"<!-- status:success -->\n</processing>\n"
+                        )
+                        self.ai_message.content += proc_close
+                        _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        self._processing_block_open = False
+                else:
+                    self._last_dispatch_failed = True
+                    self._last_failure_kind = "image_artifact_rejected"
+                    ASCIIColors.warning(
+                        f"[StreamState] <artifact type=\"{atype}\"> — image engine "
+                        f"returned no pixels for '{title}'."
                     )
-                    self.ai_message.content += proc_close
-                    _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                    self._processing_block_open = False
+                    if self._processing_block_open:
+                        proc_close = (
+                            f"* ⚠️ Image '{title}' could not be rendered: no usable "
+                            f"image engine is available in this session.\n"
+                            f"<!-- status:failure -->\n</processing>\n"
+                        )
+                        self.ai_message.content += proc_close
+                        _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        self._processing_block_open = False
                 return True
 
             is_new = self.discussion.artefacts.get(title) is None
@@ -7998,22 +8019,21 @@ class ChatMixin:
                             "Plain-text markers like '=== TASK ===' are NOT parsed. "
                             "Do not wrap the delegation in code fences or any other tags.]"
                         )
-                    elif getattr(ss, "_last_failure_kind", None) == "image_artifact_duplicate":
-                        ASCIIColors.warning("[ChatMixin] Duplicate image artifact dispatch blocked. Injecting image-specific correction.")
+                    elif getattr(ss, "_last_failure_kind", None) in ("image_artifact_duplicate", "image_artifact_rejected"):
+                        ASCIIColors.warning("[ChatMixin] Image artifact dispatch rejected. Injecting image-specific correction.")
                         correction_body = (
-                            "[SYSTEM: Your <artifact type=\"image\"> dispatch was REJECTED — the image already exists.\n"
-                            "Images are created ONLY with <generate_image>...</generate_image> (or modified with "
-                            "<edit_image>...</edit_image>); an <artifact> tag cannot create or modify image pixels.\n"
-                            "The image is already generated and saved. Do ONE of the following:\n"
-                            "1. To VIEW the image, emit `<unlock_file>TITLE</unlock_file>` (replace TITLE with the "
-                            "image file path) — its real pixels will be attached to your next round.\n"
-                            "2. Reference it in your final answer using `![](./TITLE)` "
-                            "(replace TITLE with the image file path), then write your answer and emit `<done/>`.\n"
-                            "2. If the user asked for a DIFFERENT image, emit a new <generate_image> tag with a "
-                            "new name and prompt.\n"
-                            "3. If the user asked to MODIFY the existing image, emit <edit_image name=\"TITLE\"> "
-                            "with editing instructions.\n"
-                            "Do NOT re-emit an <artifact> tag for an image.]"
+                            "[SYSTEM: Your <artifact type=\"image\"> dispatch was REJECTED.\n"
+                            "An <artifact> tag is a TEXT channel — it writes a markdown file with a .png "
+                            "extension, NEVER real image pixels. This is why your previous attempts produced "
+                            "fake .png text files instead of images.\n\n"
+                            "Images are created ONLY with <generate_image>...</generate_image> and modified "
+                            "ONLY with <edit_image>...</edit_image>. Do ONE of the following:\n"
+                            "1. NEW image → emit `<generate_image name=\"descriptive_name.png\" width=\"1280\" height=\"720\">your prompt</generate_image>`\n"
+                            "2. EDIT existing → emit `<edit_image name=\"output.png\" sources=\"source.png\" width=\"1280\" height=\"720\">instructions</edit_image>`\n"
+                            "3. VIEW existing → emit `<unlock_file>path/to/image.png</unlock_file>`\n"
+                            "4. REFERENCE in answer → use `![](./path/to/image.png)` markdown\n\n"
+                            "Do NOT re-emit an <artifact> tag for an image. Do NOT wrap <generate_image> or "
+                            "<edit_image> inside <tool> JSON — they are direct XML tags.]"
                         )
                     elif getattr(ss, "_last_failure_kind", None) == "edit_image_missing_size":
                         ASCIIColors.warning("[ChatMixin] <edit_image> missing size attributes for a resize request. Injecting size correction.")

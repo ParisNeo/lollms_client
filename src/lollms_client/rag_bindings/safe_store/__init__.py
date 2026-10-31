@@ -19,6 +19,15 @@ class SafeStoreRAGBinding(LollmsRAGBinding):
     """
 
     def __init__(self, **kwargs: Any):
+        try:
+            ASCIIColors.info(
+                f"[SafeStore-DBG] __init__ ENTRY kwargs keys={list(kwargs.keys())} "
+                f"db_path={kwargs.get('db_path')!r} "
+                f"vectorizer_name={kwargs.get('vectorizer_name')!r} "
+                f"vectorizer_config={kwargs.get('vectorizer_config')!r}"
+            )
+        except Exception:
+            pass
         super().__init__(binding_name="safe_store", **kwargs)
 
         pm.ensure_packages(["safe_store"])
@@ -81,7 +90,9 @@ class SafeStoreRAGBinding(LollmsRAGBinding):
                     f"vectorizer '{self.vectorizer_name}' to match the persisted identity."
                 )
 
-        if kwargs.get("use_shared_server"):
+        # Shared vectorizer daemon is defaulted to True
+        _use_shared = kwargs.get("use_shared_server", True)
+        if _use_shared:
             vectorizer_config["use_shared_server"] = True
             vectorizer_config["port"] = int(kwargs.get("port", 8765))
 
@@ -91,6 +102,19 @@ class SafeStoreRAGBinding(LollmsRAGBinding):
         self._graph_instance = None
         self._llm_generator: Optional[Callable] = kwargs.get("llm_generator")
         self._lollms_client = kwargs.get("lollms_client")
+
+        try:
+            ASCIIColors.info(
+                f"[SafeStore-DBG] __init__ EXIT db_path='{self.db_path}' "
+                f"exists={self.db_path.exists()} "
+                f"vectorizer_name='{self.vectorizer_name}' "
+                f"vectorizer_config={self.vectorizer_config} "
+                f"chunk_size={self.chunk_size} chunk_overlap={self.chunk_overlap} "
+                f"chunking_strategy='{self.chunking_strategy}' "
+                f"encryption={'yes' if self.encryption_key else 'no'}"
+            )
+        except Exception:
+            pass
 
     def _build_llm_callable(self) -> Optional[Callable]:
         if self._llm_generator and callable(self._llm_generator):
@@ -123,11 +147,34 @@ class SafeStoreRAGBinding(LollmsRAGBinding):
     def get_store(self):
         """Lazily instantiates the SafeStore database connection."""
         if self._store_instance is not None:
+            try:
+                ASCIIColors.info(
+                    f"[SafeStore-DBG] get_store() cache HIT db_path='{self.db_path}'"
+                )
+            except Exception:
+                pass
             return self._store_instance
+
+        try:
+            ASCIIColors.info(
+                f"[SafeStore-DBG] get_store() ENTRY db_path='{self.db_path}' "
+                f"exists={self.db_path.exists()} "
+                f"vectorizer_name='{self.vectorizer_name}' "
+                f"vectorizer_config={self.vectorizer_config}"
+            )
+        except Exception:
+            pass
 
         try:
             import safe_store
             llm_call = self._build_llm_callable()
+            try:
+                ASCIIColors.info(
+                    f"[SafeStore-DBG] safe_store imported OK, llm_callable="
+                    f"{'set' if llm_call else 'None'}"
+                )
+            except Exception:
+                pass
 
             try:
                 self._store_instance = safe_store.SafeStore(
@@ -160,10 +207,24 @@ class SafeStoreRAGBinding(LollmsRAGBinding):
                     encryption_key=self.encryption_key,
                     llm_generator=llm_call,
                 )
+            try:
+                ASCIIColors.info(
+                    f"[SafeStore-DBG] get_store() SUCCESS db_path='{self.db_path}' "
+                    f"store_type={type(self._store_instance).__name__}"
+                )
+            except Exception:
+                pass
             return self._store_instance
         except Exception as e:
             trace_exception(e)
             ASCIIColors.error(f"[SafeStoreRAG] Failed to initialize SafeStore on {self.db_path}: {e}")
+            try:
+                ASCIIColors.error(
+                    f"[SafeStore-DBG] get_store() FAILED db_path='{self.db_path}' "
+                    f"error_type={type(e).__name__} error={e}"
+                )
+            except Exception:
+                pass
             raise
 
     def get_graph(self):
@@ -208,6 +269,13 @@ class SafeStoreRAGBinding(LollmsRAGBinding):
         reconstruct_overlapping_chunks: bool = True,
         **kwargs: Any
     ) -> List[Dict[str, Any]]:
+        try:
+            ASCIIColors.info(
+                f"[SafeStore-DBG] query() ENTRY db_path='{self.db_path}' "
+                f"query='{query_text[:80]}' top_k={top_k}"
+            )
+        except Exception:
+            pass
         store = self.get_store()
         try:
             with store:
@@ -217,9 +285,31 @@ class SafeStoreRAGBinding(LollmsRAGBinding):
                     reconstruct_overlapping_chunks=reconstruct_overlapping_chunks,
                     **kwargs
                 )
-            return self._normalize_results(results)
+            try:
+                ASCIIColors.info(
+                    f"[SafeStore-DBG] query() raw results type={type(results).__name__} "
+                    f"len={len(results) if hasattr(results, '__len__') else 'n/a'} "
+                    f"preview={str(results)[:300]}"
+                )
+            except Exception:
+                pass
+            normalized = self._normalize_results(results)
+            try:
+                ASCIIColors.info(
+                    f"[SafeStore-DBG] query() normalized count={len(normalized)}"
+                )
+            except Exception:
+                pass
+            return normalized
         except Exception as e:
             trace_exception(e)
+            try:
+                ASCIIColors.error(
+                    f"[SafeStore-DBG] query() FAILED db_path='{self.db_path}' "
+                    f"error_type={type(e).__name__} error={e}"
+                )
+            except Exception:
+                pass
             return []
 
     def hybrid_query(
