@@ -329,17 +329,19 @@ class SafeStoreRAGBinding(LollmsRAGBinding):
                 "error": str(e),
             }
 
-    def query(
+    def _query_dense_impl(
         self,
         query_text: str,
         top_k: int = 5,
+        min_relevance_percent: float = 0.0,
         reconstruct_overlapping_chunks: bool = True,
         **kwargs: Any
     ) -> List[Dict[str, Any]]:
         try:
             ASCIIColors.info(
-                f"[SafeStore-DBG] query() ENTRY db_path='{self.db_path}' "
-                f"query='{query_text[:80]}' top_k={top_k}"
+                f"[SafeStore-DBG] _query_dense_impl() ENTRY db_path='{self.db_path}' "
+                f"query='{query_text[:80]}' top_k={top_k} "
+                f"min_relevance_percent={min_relevance_percent}"
             )
         except Exception:
             pass
@@ -349,12 +351,13 @@ class SafeStoreRAGBinding(LollmsRAGBinding):
                 results = store.query(
                     query_text=query_text,
                     top_k=top_k,
+                    min_relevance_percent=min_relevance_percent,
                     reconstruct_overlapping_chunks=reconstruct_overlapping_chunks,
                     **kwargs
                 )
             try:
                 ASCIIColors.info(
-                    f"[SafeStore-DBG] query() raw results type={type(results).__name__} "
+                    f"[SafeStore-DBG] _query_dense_impl() raw results type={type(results).__name__} "
                     f"len={len(results) if hasattr(results, '__len__') else 'n/a'} "
                     f"preview={str(results)[:300]}"
                 )
@@ -365,7 +368,7 @@ class SafeStoreRAGBinding(LollmsRAGBinding):
                 _first_norm = normalized[0] if normalized else {}
                 _norm_content = _first_norm.get("content", "") if isinstance(_first_norm, dict) else ""
                 ASCIIColors.info(
-                    f"[SafeStore-DBG] query() normalized count={len(normalized)} "
+                    f"[SafeStore-DBG] _query_dense_impl() normalized count={len(normalized)} "
                     f"first_content_len={len(_norm_content)} "
                     f"first_content_preview='{str(_norm_content)[:200].replace(chr(10), ' ')}'"
                 )
@@ -376,12 +379,83 @@ class SafeStoreRAGBinding(LollmsRAGBinding):
             trace_exception(e)
             try:
                 ASCIIColors.error(
-                    f"[SafeStore-DBG] query() FAILED db_path='{self.db_path}' "
+                    f"[SafeStore-DBG] _query_dense_impl() FAILED db_path='{self.db_path}' "
                     f"error_type={type(e).__name__} error={e}"
                 )
             except Exception:
                 pass
             return []
+
+    def query(
+        self,
+        query_text: str,
+        top_k: int = 5,
+        min_relevance_percent: float = 0.0,
+        method: str = "dense",
+        **kwargs: Any
+    ) -> List[Dict[str, Any]]:
+        """
+        Unified retrieval entry point with explicit method selection and
+        relevance threshold. Dispatches to the correct SafeStore primitive.
+
+        method:
+          - "dense" / "vector" / "default"  → store.query(...)
+          - "hybrid" / "hybrid_rrf" / "rrf" → store.hybrid_query(...)
+          - "lexical" / "bm25" / "sparse"   → store.hybrid_query(dense_w=0, bm25_w=1)
+          - "graph" / "sparql"              → store.query_graph_hybrid(...)["ranked_chunks"]
+          - unknown                         → warn + fall back to dense
+        """
+        m = (method or "dense").strip().lower()
+
+        if m in ("dense", "vector", "default"):
+            return self._query_dense_impl(
+                query_text,
+                top_k=top_k,
+                min_relevance_percent=min_relevance_percent,
+                **kwargs,
+            )
+
+        if m in ("hybrid", "hybrid_rrf", "rrf"):
+            return self.hybrid_query(
+                query_text,
+                top_k=top_k,
+                min_relevance_percent=min_relevance_percent,
+                **kwargs,
+            )
+
+        if m in ("lexical", "bm25", "sparse"):
+            return self.hybrid_query(
+                query_text,
+                top_k=top_k,
+                dense_weight=0.0,
+                bm25_weight=1.0,
+                min_relevance_percent=min_relevance_percent,
+                **kwargs,
+            )
+
+        if m in ("graph", "sparql"):
+            try:
+                result = self.query_graph_hybrid(
+                    query_text=query_text,
+                    top_k=top_k,
+                    **kwargs,
+                )
+                if isinstance(result, dict):
+                    ranked = result.get("ranked_chunks", []) or []
+                    return self._normalize_results(ranked)
+            except Exception as e:
+                trace_exception(e)
+            return []
+
+        ASCIIColors.warning(
+            f"[SafeStoreRAG] Unknown query method '{method}', falling back to 'dense'."
+        )
+        return self._query_dense_impl(
+            query_text,
+            top_k=top_k,
+            min_relevance_percent=min_relevance_percent,
+            **kwargs,
+        )
 
     def hybrid_query(
         self,

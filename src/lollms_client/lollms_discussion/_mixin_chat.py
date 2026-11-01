@@ -9249,7 +9249,20 @@ class ChatMixin:
                                     "tool_search_skills",
                                     "tool_unload_skill",
                                 )
-                                if tool_output_tokens > 1500 and not tool_name.startswith("tool_doc_") and not _is_skill_tool:
+                                # ── 📚 RAG RESULTS ARE TEXT, NOT STRUCTURED DATA ──
+                                # RAG tools return a `sources` list whose `content`
+                                # fields are the retrieved document excerpts. Those
+                                # excerpts ARE the answer material the LLM must read
+                                # and cite — they must NEVER be replaced by the
+                                # structured-data stub (which tells the model the
+                                # data "was processed into the workspace" and
+                                # triggers a phantom os.listdir / "0 chunks" loop).
+                                _is_rag_result = (
+                                    isinstance(tool_res, dict)
+                                    and isinstance(tool_res.get("sources"), list)
+                                    and bool(tool_res["sources"])
+                                )
+                                if tool_output_tokens > 1500 and not tool_name.startswith("tool_doc_") and not _is_skill_tool and not _is_rag_result:
                                     is_structured = (
                                         tool_name.startswith("tool_query") or 
                                         tool_name.startswith("tool_execute_python_data") or
@@ -9304,11 +9317,21 @@ class ChatMixin:
                                     else:
                                         ui_log = f"Created/updated '{target_name}' in workspace."
                                     _cb(callback, ui_log, MSG_TYPE.MSG_TYPE_INFO, {"type": "artifact_status", "target": target_name})
-                                    safe_dump = _build_windowed_output_preview(full_dump)
+                                    safe_dump = _build_windowed_output_preview(
+                                        full_dump,
+                                        tool_name=tool_name,
+                                        discussion=self,
+                                        client=self.lollmsClient,
+                                    )
                                     details_block = f"Output Logs:\n{safe_dump}\n"
                                 else:
                                     safe_output = _build_windowed_output_preview(full_dump)
                                     details_block = f"Output Logs:\n{safe_output}\n"
+                                    ASCIIColors.info(
+                                        f"[TOOL-RESULT-DBG] tool={tool_name} branch=str "
+                                        f"raw_len={len(str(tool_res))} final_len={len(details_block)} "
+                                        f"preview={details_block[:500]!r}"
+                                    )
                         else:
                             result_str = str(tool_res) if tool_res is not None else "No output returned."
                             if "error" in result_str.lower() or "fail" in result_str.lower():
@@ -9557,6 +9580,26 @@ class ChatMixin:
                             "screen state.\n"
                             if _is_observation_tool else ""
                         )
+                        # ── 📚 RAG-SOURCE ANCHOR (ANTI-HALLUCINATION) ──
+                        # When a tool returns RAG hits (a `sources` list with `content`
+                        # excerpts), the LLM must treat those excerpts as the retrieved
+                        # data itself — NOT as a summary that was "processed into the
+                        # workspace". Without this anchor, models invent a coherence
+                        # narrative ("data was processed and stored in the workspace")
+                        # and then call execute_python_code to look for files that
+                        # never existed, producing a false "0 chunks" report.
+                        _rag_source_anchor = ""
+                        if isinstance(tool_res, dict) and isinstance(tool_res.get("sources"), list) and tool_res["sources"]:
+                            _src_count = len(tool_res["sources"])
+                            _rag_source_anchor = (
+                                f"\n📚 **RAG RETRIEVAL ANCHOR (CRITICAL)**: The `Output Logs:` block above "
+                                f"contains {_src_count} retrieved source excerpt(s) — that text IS the "
+                                f"retrieved data. It is NOT a summary, NOT a placeholder, and it was NOT "
+                                f"'processed into the workspace'. RAG hits are NEVER materialized as files: "
+                                f"do NOT call `tool_execute_python_code` or `os.listdir` to look for them. "
+                                f"Quote the excerpts directly in your answer, cite them as [1], [2], etc., "
+                                f"and finish with `<done/>`.\n"
+                            )
                         correct_behavior = (
                             "✅ RIGHT: take a fresh `tool_computer_screenshot` to VERIFY the result, then answer.\n"
                             if _is_observation_tool else
@@ -9579,6 +9622,7 @@ class ChatMixin:
                             f"   The tool already ran successfully. Calling it again is a **LOOP ERROR**.\n"
                             f"5. 🔀 If you need MORE data, call a **DIFFERENT** tool or ask a **DIFFERENT** question.\n"
                             f"{repeat_rule}"
+                            f"{_rag_source_anchor}"
                             f"6. 🏁 **TERMINATION**: When you have finished your task and written your final answer, you MUST end your generation with a `<done/>` tag on a new line.\n"
                             f"{next_step_guidance}\n"
                             f"### Example of CORRECT behavior:\n"

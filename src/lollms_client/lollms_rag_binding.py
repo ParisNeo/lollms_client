@@ -39,18 +39,103 @@ class LollmsRAGBinding(LollmsBaseBinding):
 
     # ── Core Retrieval Contract ───────────────────────────────────────────────
 
-    @abstractmethod
     def query(
         self,
         query_text: str,
         top_k: int = 5,
+        min_relevance_percent: float = 0.0,
+        method: str = "dense",
         **kwargs: Any
     ) -> List[Dict[str, Any]]:
         """
-        Executes a dense vector similarity query against the active store.
-        Returns a list of standardized chunk hit dictionaries.
+        Canonical RAG retrieval entry point with explicit method selection and
+        relevance threshold.
+
+        Parameters
+        ----------
+        query_text : str
+            The user query.
+        top_k : int
+            Maximum number of chunk hits to return.
+        min_relevance_percent : float
+            Minimum 0-100 relevance grade; hits below this are dropped.
+        method : str
+            Retrieval primitive to use:
+              - "dense" / "vector" / "default"  → dense vector search
+              - "hybrid" / "hybrid_rrf" / "rrf" → dense + BM25 fusion
+              - "lexical" / "bm25" / "sparse"   → BM25-only (dense_weight=0)
+              - "graph" / "sparql"              → knowledge-graph hybrid
+            Unknown values fall back to "dense" (fail-open).
+
+        Returns
+        -------
+        List[Dict[str, Any]]
+            Standardized chunk-hit dictionaries.
         """
-        pass
+        m = (method or "dense").strip().lower()
+
+        if m in ("dense", "vector", "default"):
+            return self._query_dense_impl(
+                query_text,
+                top_k=top_k,
+                min_relevance_percent=min_relevance_percent,
+                **kwargs,
+            )
+
+        if m in ("hybrid", "hybrid_rrf", "rrf"):
+            return self.hybrid_query(
+                query_text,
+                top_k=top_k,
+                min_relevance_percent=min_relevance_percent,
+                **kwargs,
+            )
+
+        if m in ("lexical", "bm25", "sparse"):
+            return self.hybrid_query(
+                query_text,
+                top_k=top_k,
+                dense_weight=0.0,
+                bm25_weight=1.0,
+                min_relevance_percent=min_relevance_percent,
+                **kwargs,
+            )
+
+        if m in ("graph", "sparql"):
+            result = self.query_graph_hybrid(
+                query_text=query_text,
+                top_k=top_k,
+                **kwargs,
+            )
+            if isinstance(result, dict):
+                return result.get("ranked_chunks", []) or []
+            return []
+
+        ASCIIColors.warning(
+            f"[RAG] Unknown query method '{method}', falling back to 'dense'."
+        )
+        return self._query_dense_impl(
+            query_text,
+            top_k=top_k,
+            min_relevance_percent=min_relevance_percent,
+            **kwargs,
+        )
+
+    @abstractmethod
+    def _query_dense_impl(
+        self,
+        query_text: str,
+        top_k: int = 5,
+        min_relevance_percent: float = 0.0,
+        **kwargs: Any
+    ) -> List[Dict[str, Any]]:
+        """
+        Primitive dense-vector retrieval contract every binding must implement.
+        Called by the concrete `query(...)` dispatcher when method resolves to
+        "dense" (or as a fail-open fallback for unknown methods).
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement _query_dense_impl(...)."
+        )
 
     @abstractmethod
     def hybrid_query(

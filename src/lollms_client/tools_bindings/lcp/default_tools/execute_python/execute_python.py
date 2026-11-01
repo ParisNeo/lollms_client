@@ -861,7 +861,7 @@ def _resolve_workspace_path(file_name: str, tool_ctx: Optional[Any] = None) -> O
     if not clean or ".." in Path(clean).parts:
         return None
 
-    root = _get_workspace_root(tool_context)
+    root = _get_workspace_root(tool_ctx)
     cwd = Path.cwd().resolve()
 
     search_roots = [root]

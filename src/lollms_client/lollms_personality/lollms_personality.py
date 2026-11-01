@@ -3132,11 +3132,26 @@ class LollmsPersonality:
             return self.query_data(query, **kwargs)
         return _runner
 
-    def query_data(self, query: str, datasource_name: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+    def query_data(
+        self,
+        query: str,
+        top_k: int = 5,
+        threshold: float = 0.0,
+        method: str = "dense",
+        datasource_name: Optional[str] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
         # 1. Query client RAG binding if available and no specific custom datasource was requested
         if self.lollms_client and getattr(self.lollms_client, "rag", None) and (not datasource_name or datasource_name == "rag_binding"):
             try:
-                res = self.lollms_client.query_rag(query, store_alias=datasource_name if datasource_name != "rag_binding" else None, **kwargs)
+                res = self.lollms_client.query_rag(
+                    query,
+                    store_alias=datasource_name if datasource_name != "rag_binding" else None,
+                    top_k=top_k,
+                    min_relevance_percent=threshold,
+                    method=method,
+                    **kwargs,
+                )
                 if res:
                     return {
                         "success": True,
@@ -3297,10 +3312,36 @@ class LollmsPersonality:
             ) or "default"
 
             # --- Unified callable: routes SafeStore → path-based KB → default ---
-            def _tool_query_rag_unified(query: str, datasource_name: Optional[str] = None) -> dict:
+            def _tool_query_rag_unified(
+                query: str,
+                datasource_name: Optional[str] = None,
+                top_k: int = 5,
+                threshold: float = 0.0,
+                method: str = "dense",
+            ) -> dict:
+                # Defensive casts — agents frequently emit numeric params as strings.
+                try:
+                    top_k = int(top_k) if top_k is not None else 5
+                except (TypeError, ValueError):
+                    top_k = 5
+                if top_k <= 0:
+                    top_k = 5
+                try:
+                    threshold = float(threshold) if threshold is not None else 0.0
+                except (TypeError, ValueError):
+                    threshold = 0.0
+                if threshold < 0.0:
+                    threshold = 0.0
+                elif threshold > 100.0:
+                    threshold = 100.0
+                method = str(method or "dense").strip().lower() or "dense"
+                if method not in ("dense", "hybrid", "lexical", "graph"):
+                    method = "dense"
+
                 try:
                     ASCIIColors.info(
                         f"[RAG-DIAG] ENTRY query='{query[:80]}' datasource_name={datasource_name!r} "
+                        f"top_k={top_k} threshold={threshold} method={method} "
                         f"safe_store_keys={list(safe_store_map.keys())} "
                         f"kb_path_keys={list(kb_path_map.keys())} "
                         f"data_source_names={[ds.name for ds in self.data_sources]}"
@@ -3365,11 +3406,20 @@ class LollmsPersonality:
                             f"db_path={getattr(store, 'db_path', '<none>')}"
                         )
                         if hasattr(store, "query"):
-                            raw = store.query(query, top_k=5)
+                            try:
+                                raw = store.query(
+                                    query,
+                                    top_k=top_k,
+                                    min_relevance_percent=threshold,
+                                    method=method,
+                                )
+                            except TypeError:
+                                # Legacy binding without the modern signature — fall back.
+                                raw = store.query(query, top_k=top_k)
                         elif hasattr(store, "search"):
-                            raw = store.search(query, top_k=5)
+                            raw = store.search(query, top_k=top_k)
                         elif hasattr(store, "get_store"):
-                            raw = store.get_store().query(query, top_k=5)
+                            raw = store.get_store().query(query, top_k=top_k)
                         else:
                             ASCIIColors.warning(f"[RAG-DIAG] Store '{datasource_name}' has no query/search/get_store method.")
                             return {"success": False, "error": f"Store '{datasource_name}' has no query method."}
@@ -3449,7 +3499,15 @@ class LollmsPersonality:
                                 f"[RAG-DIAG] SafeStore binding ready: path='{_kb_path}' id={id(binding)} "
                                 f"(store_instance={'loaded' if getattr(binding, '_store_instance', None) else 'lazy'})"
                             )
-                            _raw = binding.query(query, top_k=5)
+                            try:
+                                _raw = binding.query(
+                                    query,
+                                    top_k=top_k,
+                                    min_relevance_percent=threshold,
+                                    method=method,
+                                )
+                            except TypeError:
+                                _raw = binding.query(query, top_k=top_k)
                             ASCIIColors.info(
                                 f"[RAG-DIAG] SafeStore query returned type={type(_raw).__name__} "
                                 f"len={len(_raw) if hasattr(_raw, '__len__') else 'n/a'} "
@@ -3495,7 +3553,13 @@ class LollmsPersonality:
                         f"[RAG-DIAG] BRANCH=path/default datasource_name={datasource_name!r} "
                         f"in_kb_path_map={(datasource_name in kb_path_map) if datasource_name else False}"
                     )
-                    result = self.query_data(query, datasource_name=datasource_name)
+                    result = self.query_data(
+                        query,
+                        top_k=top_k,
+                        threshold=threshold,
+                        method=method,
+                        datasource_name=datasource_name,
+                    )
                     try:
                         ASCIIColors.info(
                             f"[RAG-DIAG] query_data() returned type={type(result).__name__} "
@@ -3544,6 +3608,9 @@ class LollmsPersonality:
                     "parameters": [
                         {"name": "query", "type": "str", "description": "The search query or keywords."},
                         {"name": "datasource_name", "type": "str", "description": f"Exact database name to query. Valid values: {_ds_options}.", "optional": True},
+                        {"name": "top_k", "type": "int", "description": "Maximum number of chunks to return (default 5).", "optional": True},
+                        {"name": "threshold", "type": "float", "description": "Minimum relevance percentage (0-100). Chunks scored below this are dropped. Use 0 for no filtering (default 0.0).", "optional": True},
+                        {"name": "method", "type": "str", "description": "Retrieval strategy: 'dense' (semantic vectors), 'hybrid' (vectors + BM25 fusion), 'lexical' (BM25 keywords only), 'graph' (knowledge-graph subgraph). Default 'dense'.", "optional": True},
                     ],
                     "callable": _tool_query_rag_unified,
                 }

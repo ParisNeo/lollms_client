@@ -701,18 +701,149 @@ def sanitize_tool_result(
 _sanitize_tool_result = sanitize_tool_result
 
 
-def build_windowed_output_preview(text: str) -> str:
-    """Builds a head/tail windowed preview of a tool output for UI display."""
-    if not isinstance(text, str) or len(text) <= _TOOL_UI_PREVIEW_WINDOW:
-        return text if isinstance(text, str) else str(text)
-    head = text[:_TOOL_UI_PREVIEW_HALF]
-    tail = text[-_TOOL_UI_PREVIEW_HALF:]
-    stripped_chars = len(text) - _TOOL_UI_PREVIEW_WINDOW
-    return (
-        f"{head}\n"
-        f"... [stripped for brevity — {stripped_chars} middle characters omitted] ...\n"
-        f"{tail}"
+def _resolve_workspace_data_path_internal(discussion: Any) -> "Path":
+    """
+    Resolves the discussion's workspace_data directory without importing
+    _mixin_chat (avoids circular import). Mirrors _resolve_tool_workspace_root.
+    """
+    if discussion is not None:
+        explicit = getattr(discussion, "workspace_data_path", None)
+        if explicit:
+            try:
+                return Path(explicit).resolve()
+            except Exception:
+                pass
+        base_ws = getattr(discussion, "workspace_path", None) or "./data_workspace"
+        disc_id = getattr(discussion, "id", None) or "shared"
+        try:
+            return (Path(base_ws) / str(disc_id) / "workspace_data").resolve()
+        except Exception:
+            pass
+    return Path("./data_workspace").resolve()
+
+
+def resolve_tool_spill_dir(discussion: Any) -> "Path":
+    """
+    Returns the directory where oversized tool outputs are spilled.
+
+    Primary: <workspace_data_path>/_tool_outputs (the SAME directory that
+    workspace_tools' read APIs resolve `file_name` against, so the LLM can
+    read the spill back with tool_read_lines / tool_read_chars / tool_grep_file).
+    Fallback: a temp directory when no discussion is available.
+    Never raises.
+    """
+    try:
+        spill_dir = _resolve_workspace_data_path_internal(discussion) / "_tool_outputs"
+        spill_dir.mkdir(parents=True, exist_ok=True)
+        return spill_dir
+    except Exception as ex:
+        ASCIIColors.warning(
+            f"[ToolSpill] Failed to prepare workspace spill dir ({ex}); "
+            f"falling back to temp directory."
+        )
+        try:
+            import tempfile
+            fallback = Path(tempfile.gettempdir()) / "lollms_tool_outputs"
+            fallback.mkdir(parents=True, exist_ok=True)
+            return fallback
+        except Exception:
+            return Path(".")
+
+
+def spill_tool_output_to_disk(
+    discussion: Any,
+    tool_name: str,
+    full_text: str,
+    hint_chars: int = 0,
+) -> Optional[str]:
+    """
+    Writes the FULL raw tool output to a workspace logfile and returns its
+    workspace-relative POSIX path (or None on failure).
+
+    The file lands in <workspace_data_path>/_tool_outputs/ so the LLM can read
+    it back with the existing read tools (tool_read_lines, tool_read_chars,
+    tool_grep_file, tool_inspect_document). Never raises.
+    """
+    if not isinstance(full_text, str) or not full_text:
+        return None
+    try:
+        spill_dir = resolve_tool_spill_dir(discussion)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        safe_tool = re.sub(r'[^A-Za-z0-9_\-]+', '_', (tool_name or "tool")).strip("_") or "tool"
+        digest = hashlib.md5(full_text.encode("utf-8", errors="ignore")).hexdigest()[:10]
+        filename = f"{timestamp}_{safe_tool}_{digest}.txt"
+        file_path = spill_dir / filename
+
+        file_path.write_text(full_text, encoding="utf-8", errors="ignore")
+
+        # Prefer a workspace-relative POSIX path so read tools resolve it directly.
+        try:
+            ws_root = _resolve_workspace_data_path_internal(discussion)
+            rel_path = file_path.resolve().relative_to(ws_root).as_posix()
+        except Exception:
+            rel_path = file_path.as_posix()
+
+        ASCIIColors.info(
+            f"[ToolSpill] wrote {len(full_text)} chars to '{rel_path}' "
+            f"(tool='{tool_name}', hint_chars={hint_chars})."
+        )
+        return rel_path
+    except Exception as ex:
+        ASCIIColors.warning(
+            f"[ToolSpill] Failed to spill tool output for '{tool_name}': {ex}"
+        )
+        return None
+
+
+def build_windowed_output_preview(
+    text: str,
+    tool_name: str = "",
+    discussion: Any = None,
+    client: Any = None,
+) -> str:
+    """
+    Builds a context-size-dependent head/tail preview of a tool output.
+
+    The threshold is derived from the active model's context window via
+    _calculate_dynamic_tool_char_limit(client) (25% of ctx_size × 4 chars,
+    clamped [16_000, 90_000], fallback 24_000). Outputs that fit are returned
+    unchanged. Oversized outputs are spilled verbatim to a workspace logfile
+    and the middle is replaced with a ready-to-run read-tool command so the
+    LLM can retrieve the full payload on demand.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+
+    dyn_limit = _calculate_dynamic_tool_char_limit(client)
+    if len(text) <= dyn_limit:
+        return text
+
+    half = max(1, dyn_limit // 2)
+    head = text[:half]
+    tail = text[-half:]
+    stripped_chars = len(text) - (len(head) + len(tail))
+
+    spill_path = spill_tool_output_to_disk(
+        discussion=discussion,
+        tool_name=tool_name,
+        full_text=text,
+        hint_chars=dyn_limit,
     )
+
+    if spill_path:
+        marker = (
+            f"... [output truncated to fit context — {stripped_chars} chars omitted. "
+            f"Full output saved to workspace file '{spill_path}'. "
+            f"Read it with tool_read_lines(file_name='{spill_path}', start_line=1, end_line=300) "
+            f"or search it with tool_grep_file(file_name='{spill_path}', pattern='<regex>').] ..."
+        )
+    else:
+        marker = (
+            f"... [output truncated — {stripped_chars} chars omitted; spill failed. "
+            f"Narrow your query or paginate.] ..."
+        )
+
+    return f"{head}\n{marker}\n{tail}"
 
 _build_windowed_output_preview = build_windowed_output_preview
 
