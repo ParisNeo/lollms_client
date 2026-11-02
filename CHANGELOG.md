@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-02 00:14]
+
+- fix: update image artifact persistence with fallback and broaden mimicry compaction check
+
 ## [2026-11-02 00:09]
 
 - feat: add vision/video configuration support and dynamic effort options

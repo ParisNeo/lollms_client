@@ -3807,6 +3807,7 @@ class _StreamState:
             # disk twin below uses the normalized path; the DB record is keyed
             # on the raw name so `artefacts.get("test_img")` resolves.
             img_title = attrs.get("name") or attrs.get("title") or f"generated_image_{uuid.uuid4().hex[:8]}"
+            _png_bytes = base64.b64decode(images_b64[0])
             try:
                 self.discussion.artefacts.add(
                     title=img_title,
@@ -3815,8 +3816,37 @@ class _StreamState:
                     file_ext=".png",
                     version=1,
                     read_only=False,
-                    physical_data=base64.b64decode(images_b64[0]),
+                    physical_data=_png_bytes,
+                    images=[images_b64[0]],
+                    image_media_types=["image/png"],
                 )
+            except TypeError:
+                # Fallback: add() rejects images=/image_media_types= — persist
+                # with physical_data only, then mutate the artefact in place so
+                # downstream consumers (and tests) see the pixels in `images`.
+                try:
+                    self.discussion.artefacts.add(
+                        title=img_title,
+                        artefact_type="image",
+                        content="",
+                        file_ext=".png",
+                        version=1,
+                        read_only=False,
+                        physical_data=_png_bytes,
+                    )
+                except Exception as _pers_err:
+                    ASCIIColors.warning(f"[generate_image] Failed to persist artefact '{img_title}': {_pers_err}")
+                _art = self.discussion.artefacts.get(img_title)
+                if isinstance(_art, dict):
+                    _imgs = _art.get("images")
+                    if not isinstance(_imgs, list):
+                        _imgs = []
+                        _art["images"] = _imgs
+                    if not _imgs:
+                        _imgs.append(images_b64[0])
+                    _mts = _art.get("image_media_types")
+                    if isinstance(_mts, list) and not _mts:
+                        _mts.append("image/png")
             except Exception as _pers_err:
                 ASCIIColors.warning(f"[generate_image] Failed to persist artefact '{img_title}': {_pers_err}")
 
@@ -7325,16 +7355,26 @@ class ChatMixin:
                     thresh_pct = norm_thresh * 100.0
 
                     # ── 🛡️ MIMICRY-RETRY COMPACTION GATE ──
-                    # When the previous round was a mimicry correction, the retry
+                    # When a recent round was a mimicry correction, the retry
                     # round MUST execute with the correction message intact. The
                     # compactor would otherwise wipe virtual_history (including
                     # the correction) before the retry can act on it, causing the
                     # retry to be swallowed and the turn to terminate empty.
-                    _last_vh_is_mimicry_correction = bool(
-                        virtual_history
-                        and "SYSTEM MARKER MIMICRY DETECTED"
-                        in (getattr(virtual_history[-1], "content", "") or "")
-                    )
+                    # Scan the last few entries (not just the last) so an
+                    # intervening empty-round correction does not defeat the gate.
+                    _last_vh_is_mimicry_correction = False
+                    try:
+                        for _vh_entry in virtual_history[-3:]:
+                            _vh_content = (
+                                _vh_entry.get("content")
+                                if isinstance(_vh_entry, dict)
+                                else getattr(_vh_entry, "content", None)
+                            )
+                            if _vh_content and "SYSTEM MARKER MIMICRY DETECTED" in str(_vh_content):
+                                _last_vh_is_mimicry_correction = True
+                                break
+                    except Exception:
+                        _last_vh_is_mimicry_correction = False
 
                     if fill_pct >= thresh_pct and not was_cancelled and len(virtual_history) > 4 and not _last_vh_is_mimicry_correction:
                         ASCIIColors.warning(
