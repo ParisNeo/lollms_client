@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-02 23:05]
+
+- feat: extend intent detection verbs and add video generation instructions
+
 ## [2026-11-02 22:53]
 
 - fix: correct `_TAG_STARTS` list in `_mixin_chat.py`
