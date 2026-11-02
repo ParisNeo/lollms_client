@@ -93,8 +93,48 @@ class ReplicateTTMBinding(LollmsTTMBinding):
             trace_exception(e)
             raise
 
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return False
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return True
+
+    def has_active_resources(self) -> bool:
+        return False
+
+    def get_loaded_models(self) -> List[str]:
+        return [self.model_name] if self.model_name else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        return True
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        return {"status": False, "message": "Remote API; models are managed by Stability AI."}
+
+
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return False
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return True
+
+    def has_active_resources(self) -> bool:
+        return False
+
+    def get_loaded_models(self) -> List[str]:
+        return [self.model_name] if self.model_name else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        return True
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        return {"status": False, "message": "Remote API; models are managed by Stability AI."}
+
+
 if __name__ == '__main__':
-    ASCIIColors.magenta("--- Replicate TTM Binding Test ---")
+    ASCIIColors.magenta("--- Stability AI TTM Binding Test ---")
     if "REPLICATE_API_TOKEN" not in os.environ:
         ASCIIColors.error("REPLICATE_API_TOKEN environment variable not set. Cannot run test.")
         exit(1)

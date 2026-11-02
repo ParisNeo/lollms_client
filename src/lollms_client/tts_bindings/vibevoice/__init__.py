@@ -195,3 +195,47 @@ class VibeVoiceBinding(LollmsTTSBinding):
         except Exception as e:
             ASCIIColors.error(f"Action change_voice_tone failed: {e}")
             return {"success": False}
+
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return True
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return self.is_server_running()
+
+    def has_active_resources(self) -> bool:
+        return self.is_server_running()
+
+    def get_loaded_models(self) -> List[str]:
+        return ["vibevoice"] if self.is_server_running() else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        if self.server_process and self.server_process.poll() is None:
+            self.server_process.terminate()
+            self.server_process = None
+        return True
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        return {"status": True, "message": "VibeVoice model is downloaded automatically on first use."}
+
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return True
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return self.is_server_running()
+
+    def has_active_resources(self) -> bool:
+        return self.is_server_running()
+
+    def get_loaded_models(self) -> List[str]:
+        return ["vibevoice"] if self.is_server_running() else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        if self.server_process and self.server_process.poll() is None:
+            self.server_process.terminate()
+            self.server_process = None
+        return True
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        return {"status": True, "message": "VibeVoice model is downloaded automatically on first use."}

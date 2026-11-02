@@ -898,6 +898,33 @@ class VLLMBinding(LollmsLLMBinding):
             "active_server": self.active_server_info,
         }
 
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return True
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        target = model_name or self.model_name
+        if not target:
+            return False
+        return self._get_server_info(target) is not None
+
+    def has_active_resources(self) -> bool:
+        return self.client is not None and self.active_server_info is not None
+
+    def get_loaded_models(self) -> List[str]:
+        return [self.model_name] if self.model_name and self.active_server_info else []
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        try:
+            from huggingface_hub import snapshot_download
+            target_dir = self.models_folder / model_name.replace("/", "__")
+            target_dir.mkdir(parents=True, exist_ok=True)
+            path = snapshot_download(repo_id=model_name, local_dir=target_dir, local_dir_use_symlinks=False)
+            return {"status": True, "message": f"Model installed at {path}", "path": str(path)}
+        except Exception as e:
+            trace_exception(e)
+            return {"status": False, "message": str(e)}
+
     def ps(self) -> List[Dict[str, Any]]:
         results = []
         for rf in list(self.servers_dir.glob("*.json")):

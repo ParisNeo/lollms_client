@@ -225,6 +225,25 @@ class WhisperCppSTTBinding(LollmsSTTBinding):
             if temp_input_file:
                 Path(temp_input_file.name).unlink(missing_ok=True)
 
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return True
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return self.model_path is not None and self.model_path.exists()
+
+    def has_active_resources(self) -> bool:
+        return self.model_path is not None and self.model_path.exists()
+
+    def get_loaded_models(self) -> List[str]:
+        return [self.model_path.name] if self.model_path and self.model_path.exists() else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        return True
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        return {"status": False, "message": "Whisper.cpp models must be downloaded manually as GGUF files."}
+
     def list_models(self, **kwargs) -> List[str]:
         models = []
         # 1. Add the default configured model's name

@@ -376,3 +376,43 @@ class DiffusersTTMBinding(LollmsTTMBinding):
             return "\n".join(lines[-100:])
         except Exception as e:
             return f"Failed to read logs: {e}"
+
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return True
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return self.is_server_running()
+
+    def has_active_resources(self) -> bool:
+        return self.is_server_running()
+
+    def get_loaded_models(self) -> List[str]:
+        return [self.model_name] if self.is_server_running() else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        try:
+            resp = self._session.post(f"{self.base_url}/unload_model", headers=self._get_headers(), timeout=30)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return True
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return self.is_server_running()
+
+    def has_active_resources(self) -> bool:
+        return self.is_server_running()
+
+    def get_loaded_models(self) -> List[str]:
+        return [self.model_name] if self.is_server_running() else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        try:
+            resp = self._session.post(f"{self.base_url}/unload_model", headers=self._get_headers(), timeout=30)
+            return resp.status_code == 200
+        except Exception:
+            return False

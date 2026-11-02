@@ -163,3 +163,19 @@ class MinimaxH3TTVBinding(LollmsTTVBinding):
             {"name": "H3 FL2VA pruned Q4_K_M (16G tier)", "description": "Abiray GGUF, ComfyUI only.", "size": "11.6GB", "type": "gguf", "link": "Abiray/MiniMax-H3-Pruned-GGUF"},
             {"name": "H3 FP8 torchao (42G tier)", "description": "Diffusers modular pipeline.", "size": "~32GB", "type": "safetensors", "link": "abhishekchohan/minimax-h3-fp8"},
         ]
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        try:
+            from huggingface_hub import snapshot_download
+            target_dir = self.models_path / model_name.replace("/", "__")
+            target_dir.mkdir(parents=True, exist_ok=True)
+            path = snapshot_download(repo_id=model_name, local_dir=target_dir, local_dir_use_symlinks=False)
+            return {"status": True, "message": f"Model installed at {path}", "path": str(path)}
+        except Exception as e:
+            return {"status": False, "message": str(e)}
+
+    def download_from_zoo(self, index: int, progress_callback: Optional[Callable[[dict], None]] = None) -> dict:
+        zoo = self.get_zoo()
+        if index < 0 or index >= len(zoo):
+            return {"status": False, "message": "Index out of bounds."}
+        return self.install_model(zoo[index]["link"])

@@ -41,6 +41,44 @@ class LollmsTTMBinding_Impl(LollmsTTMBinding):
         raise NotImplementedError("LOLLMS TTM generate_music client binding is not implemented yet.")
 
 
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return False
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return True
+
+    def has_active_resources(self) -> bool:
+        return False
+
+    def get_loaded_models(self) -> List[str]:
+        return []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        return True
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        return {"status": False, "message": "Remote LoLLMS server; models are managed server-side."}
+
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return False
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return True
+
+    def has_active_resources(self) -> bool:
+        return False
+
+    def get_loaded_models(self) -> List[str]:
+        return []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        return True
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        return {"status": False, "message": "Remote LoLLMS server; models are managed server-side."}
+
     def list_models(self, **kwargs) -> List[str]:
         """
         Lists available TTM models using an assumed LOLLMS /list_ttm_models endpoint. (Not Implemented)

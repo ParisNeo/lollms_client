@@ -226,3 +226,41 @@ class XTTSClientBinding(LollmsTTSBinding):
             )
             response.raise_for_status()
             return response.json()
+
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return True
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return self.is_server_running()
+
+    def has_active_resources(self) -> bool:
+        return self.is_server_running()
+
+    def get_loaded_models(self) -> List[str]:
+        return ["xtts_v2"] if self.is_server_running() else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        return self.shutdown_server()
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        return {"status": True, "message": "XTTS v2 model is downloaded automatically on first use."}
+
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return True
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return self.is_server_running()
+
+    def has_active_resources(self) -> bool:
+        return self.is_server_running()
+
+    def get_loaded_models(self) -> List[str]:
+        return ["xtts_v2"] if self.is_server_running() else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        return self.shutdown_server()
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        return {"status": True, "message": "XTTS v2 model is downloaded automatically on first use."}

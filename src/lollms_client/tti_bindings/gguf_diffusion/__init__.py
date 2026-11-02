@@ -7,6 +7,7 @@ import pipmaster as pm
 from lollms_client.lollms_tti_binding import LollmsTTIBinding
 from ascii_colors import ASCIIColors
 from filelock import FileLock
+from typing import Optional, List, Dict, Any, Callable
 
 BindingName = "GGUFDiffusion"
 
@@ -201,6 +202,50 @@ class GGUFDiffusion(LollmsTTIBinding):
         except Exception as e:
             ASCIIColors.error(f"Error calling generation server: {e}")
             return None
+
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return True
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        try:
+            requests.get(f"{self.base_url}/health", timeout=1)
+            return True
+        except Exception:
+            return False
+
+    def has_active_resources(self) -> bool:
+        return self.server_process is not None and self.server_process.poll() is None
+
+    def get_loaded_models(self) -> List[str]:
+        gguf_path = self.config.get("gguf_path", "")
+        return [gguf_path] if gguf_path else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        if self.server_process:
+            self.server_process.terminate()
+            self.server_process = None
+        return True
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        return {"status": False, "message": "Use install_flux() or install_qwen_image() to download GGUF models."}
+
+    def get_zoo(self) -> List[Dict[str, Any]]:
+        return [
+            {"name": "FLUX.1-dev Q4_0", "description": "FLUX.1-dev GGUF Q4_0", "size": "~7GB", "type": "gguf", "link": "city96/FLUX.1-dev-gguf"},
+            {"name": "Qwen-Image Q4_K_S", "description": "Qwen Image GGUF Q4_K_S", "size": "~7GB", "type": "gguf", "link": "city96/Qwen-Image-gguf"},
+        ]
+
+    def download_from_zoo(self, index: int, progress_callback: Optional[Callable[[dict], None]] = None) -> dict:
+        zoo = self.get_zoo()
+        if index < 0 or index >= len(zoo):
+            return {"status": False, "message": "Index out of bounds."}
+        item = zoo[index]
+        if "FLUX" in item["name"]:
+            return self.install_flux()
+        if "Qwen" in item["name"]:
+            return self.install_qwen_image()
+        return {"status": False, "message": "Unknown zoo entry."}
 
     def __del__(self):
         if self.server_process:

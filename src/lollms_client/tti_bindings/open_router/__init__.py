@@ -179,6 +179,25 @@ class OpenRouterTTIBinding(LollmsTTIBinding):
             self.model_name = settings["model_name"]
         return True
 
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return False
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return True
+
+    def has_active_resources(self) -> bool:
+        return False
+
+    def get_loaded_models(self) -> List[str]:
+        return [self.model_name] if self.model_name else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        return True
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        return {"status": False, "message": "Remote API; models are managed by OpenRouter."}
+
     def get_credits(self) -> Optional[Dict[str, float]]:
         """
         Get total credits purchased and used for the authenticated user.

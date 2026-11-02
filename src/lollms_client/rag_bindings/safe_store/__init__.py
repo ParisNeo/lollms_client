@@ -741,3 +741,24 @@ class SafeStoreRAGBinding(LollmsRAGBinding):
         except Exception as e:
             trace_exception(e)
         return False
+
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return True
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return self._store_instance is not None
+
+    def has_active_resources(self) -> bool:
+        return self._store_instance is not None or self._graph_instance is not None
+
+    def get_loaded_models(self) -> List[str]:
+        return [self.store_name] if self._store_instance is not None else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        self._store_instance = None
+        self._graph_instance = None
+        return True
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        return {"status": False, "message": "SafeStore does not install models; it uses local vectorizers."}

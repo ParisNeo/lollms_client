@@ -290,6 +290,18 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-02 22:04]
+
+- refactor: update lollms_client bindings and changelog
+
+## [2026-11-02 14:13]
+
+- chore: update bindings and changelog
+
+## [2026-11-02 13:43]
+
+- feat: add support for new bindings and enhance existing modules
+
 ## [2026-11-02 13:26]
 
 - fix: deduplicate dsml utils imports and correct stream thinking handler state

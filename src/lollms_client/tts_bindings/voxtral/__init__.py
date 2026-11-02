@@ -520,6 +520,60 @@ class VoxtralLocalBinding(LollmsTTSBinding):
                 "message":    f"Upload failed: {e}",
             }
 
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return True
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return self.is_server_running()
+
+    def has_active_resources(self) -> bool:
+        return self.is_server_running()
+
+    def get_loaded_models(self) -> List[str]:
+        return [self.model_name] if self.is_server_running() else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        if self._server_proc and self._server_proc.poll() is None:
+            self._server_proc.terminate()
+            self._server_proc = None
+        return True
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        try:
+            self.model_name = model_name
+            self.ensure_server_is_running()
+            return {"status": True, "message": f"Model {model_name} loaded."}
+        except Exception as e:
+            return {"status": False, "message": str(e)}
+
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return True
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return self.is_server_running()
+
+    def has_active_resources(self) -> bool:
+        return self.is_server_running()
+
+    def get_loaded_models(self) -> List[str]:
+        return [self.model_name] if self.is_server_running() else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        if self._server_proc and self._server_proc.poll() is None:
+            self._server_proc.terminate()
+            self._server_proc = None
+        return True
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        try:
+            self.model_name = model_name
+            self.ensure_server_is_running()
+            return {"status": True, "message": f"Model {model_name} loaded."}
+        except Exception as e:
+            return {"status": False, "message": str(e)}
+
     def delete_voice(self, voice_name: str) -> dict:
         """
         Delete a previously uploaded custom voice from the server.

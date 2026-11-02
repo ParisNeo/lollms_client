@@ -444,6 +444,33 @@ class HuggingFace(LollmsLLMBinding):
         except Exception as e:
             return {"status": False, "message": str(e)}
 
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return True
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        if model_name:
+            return model_name in self.loaded_models
+        return self.active_model_id is not None and self.active_model_id in self.loaded_models
+
+    def has_active_resources(self) -> bool:
+        return bool(self.loaded_models)
+
+    def get_loaded_models(self) -> List[str]:
+        return list(self.loaded_models.keys())
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        target = model_name or self.active_model_id
+        if not target or target not in self.loaded_models:
+            return False
+        self.unload_model_by_id(target)
+        if self.active_model_id == target:
+            self.active_model_id = next(iter(self.loaded_models), None)
+        return True
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        return self.pull_model(model_name, **kwargs)
+
     def ps(self) -> Dict[str, List[Dict]]:
         """
         Returns the process status of loaded models, including memory usage.

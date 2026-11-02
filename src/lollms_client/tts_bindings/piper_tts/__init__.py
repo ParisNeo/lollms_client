@@ -207,3 +207,47 @@ class PiperClientBinding(LollmsTTSBinding):
         response = self._session.post(f"{self.base_url}/set_voice", json={"voice": voice}, headers=self._get_headers(), timeout=15)
         response.raise_for_status()
         return response.json()
+
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return True
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return self.is_server_running()
+
+    def has_active_resources(self) -> bool:
+        return self.is_server_running()
+
+    def get_loaded_models(self) -> List[str]:
+        return ["piper"] if self.is_server_running() else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        return self.shutdown_server()
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        try:
+            return self.download_voice(model_name)
+        except Exception as e:
+            return {"status": False, "message": str(e)}
+
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return True
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return self.is_server_running()
+
+    def has_active_resources(self) -> bool:
+        return self.is_server_running()
+
+    def get_loaded_models(self) -> List[str]:
+        return ["piper"] if self.is_server_running() else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        return self.shutdown_server()
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        try:
+            return self.download_voice(model_name)
+        except Exception as e:
+            return {"status": False, "message": str(e)}

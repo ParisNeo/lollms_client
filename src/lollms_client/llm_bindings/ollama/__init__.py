@@ -9,12 +9,15 @@ import subprocess
 import threading
 import urllib.request
 import zipfile
+import requests
 from contextlib import contextmanager
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, Union, Dict
 
 import pipmaster as pm
 import tiktoken
 from ascii_colors import ASCIIColors, trace_exception
+import time
+
 
 pm.ensure_packages(["ollama>=0.6.2", "pillow", "tiktoken"])
 
@@ -23,6 +26,10 @@ import ollama
 from lollms_client.lollms_llm_binding import LollmsLLMBinding
 from lollms_client.lollms_types import ELF_COMPLETION_FORMAT, MSG_TYPE
 from lollms_client.lollms_utilities import ImageTokenizer
+from lollms_client.llm_bindings._dsml_utils import (
+    _extract_dsml_from_text,
+    _format_tool_calls_to_lollms_xml,
+)
 
 BindingName = "OllamaBinding"
 
@@ -321,6 +328,19 @@ class OllamaBinding(LollmsLLMBinding):
             ASCIIColors.warning(f"[{self.binding_name}] Failed to unload Ollama model '{target_model}': {e!s}")
             return False
 
+    def _postprocess_dsml(self, text: str) -> str:
+        """Extract DSML tool-call blocks from a full response and convert them to lollms XML."""
+        if not self.handle_dsml or not text:
+            return text
+        try:
+            tool_calls, cleaned = _extract_dsml_from_text(text)
+            if tool_calls:
+                xml = _format_tool_calls_to_lollms_xml(tool_calls)
+                return (cleaned or "").rstrip() + ("\n" + xml if xml else "")
+        except Exception as e:
+            trace_exception(e)
+        return text
+
     def generate_text(
         self,
         prompt: str,
@@ -521,15 +541,15 @@ class OllamaBinding(LollmsLLMBinding):
                         full_response_text += closing
                         if closing and streaming_callback:
                             streaming_callback(closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
-                    return full_response_text
+                    return self._postprocess_dsml(full_response_text)
                 else:
                     response = client.chat(**chat_kwargs)
                     full_response_text = response.message.content or ""
                     if not ollama_think:
-                        full_response_text = re.sub(r'<think>.*?</think>', '', full_response_text, flags=re.DOTALL).strip()
+                        full_response_text = re.sub(r' thinking.*?</think>', '', full_response_text, flags=re.DOTALL).strip()
                     elif response.message.thinking:
-                        full_response_text = f"\n<think>\n{response.message.thinking}\n</think>\n" + full_response_text
-                    return full_response_text
+                        full_response_text = f"\n thinking\n{response.message.thinking}\n</think>\n" + full_response_text
+                    return self._postprocess_dsml(full_response_text)
 
         except ollama.ResponseError as e:
             error_message = f"Ollama API ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code})"
@@ -678,15 +698,15 @@ class OllamaBinding(LollmsLLMBinding):
                         full_response_text += closing
                         if closing and streaming_callback:
                             streaming_callback(closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
-                    return full_response_text
+                    return self._postprocess_dsml(full_response_text)
                 else:
                     response = client.chat(**chat_kwargs)
                     full_response_text = response.message.content or ""
                     if not ollama_think:
-                        full_response_text = re.sub(r'<think>.*?</think>', '', full_response_text, flags=re.DOTALL).strip()
+                        full_response_text = re.sub(r' thinking.*?</think>', '', full_response_text, flags=re.DOTALL).strip()
                     elif response.message.thinking:
                         full_response_text = f"\n<think>\n{response.message.thinking}\n</think>\n" + full_response_text
-                    return full_response_text
+                    return self._postprocess_dsml(full_response_text)
                 
         except ollama.ResponseError as e:
             error_message = f"Ollama API ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code})"

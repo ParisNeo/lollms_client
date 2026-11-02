@@ -517,6 +517,25 @@ class OpenAITTIBinding(LollmsTTIBinding):
 
         return True
 
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return bool(self.host_address)
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return True
+
+    def has_active_resources(self) -> bool:
+        return False
+
+    def get_loaded_models(self) -> List[str]:
+        return [self.global_params.get("model", "gpt-image-1")]
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        return True
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        return {"status": False, "message": "Remote API; models are managed by the server."}
+
     def get_credits(self) -> Optional[Dict[str, float]]:
         """
         Attempt to fetch remaining credit balance.

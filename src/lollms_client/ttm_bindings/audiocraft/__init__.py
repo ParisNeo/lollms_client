@@ -207,6 +207,48 @@ class AudioCraftTTMBinding(LollmsTTMBinding):
     def list_models(self, **kwargs) -> List[str]:
         return DEFAULT_AUDIOCRAFT_MODELS.copy()
 
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return True
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return self.model is not None
+
+    def has_active_resources(self) -> bool:
+        return self.model is not None
+
+    def get_loaded_models(self) -> List[str]:
+        return [self.loaded_model_name] if self.loaded_model_name else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        if self.model is not None:
+            del self.model
+            self.model = None
+            self.loaded_model_name = None
+            if torch and hasattr(torch, "cuda") and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        return True
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        try:
+            self._load_audiocraft_model(model_name)
+            return {"status": True, "message": f"Model {model_name} loaded."}
+        except Exception as e:
+            return {"status": False, "message": str(e)}
+
+    def get_zoo(self) -> List[Dict[str, Any]]:
+        return [
+            {"name": "MusicGen Small", "description": "300M params, fast", "size": "~1.2GB", "type": "safetensors", "link": "facebook/musicgen-small"},
+            {"name": "MusicGen Medium", "description": "1.5B params", "size": "~6GB", "type": "safetensors", "link": "facebook/musicgen-medium"},
+            {"name": "MusicGen Large", "description": "3.3B params", "size": "~13GB", "type": "safetensors", "link": "facebook/musicgen-large"},
+        ]
+
+    def download_from_zoo(self, index: int, progress_callback: Optional[Callable[[dict], None]] = None) -> dict:
+        zoo = self.get_zoo()
+        if index < 0 or index >= len(zoo):
+            return {"status": False, "message": "Index out of bounds."}
+        return self.install_model(zoo[index]["link"])
+
     def __del__(self):
         if hasattr(self, 'model') and self.model is not None: # Check if model attribute exists
             del self.model

@@ -103,6 +103,25 @@ class LeonardoAITTIBinding(LollmsTTIBinding):
         ASCIIColors.warning("Leonardo.ai edit_image (inpainting/img2img) is not yet implemented in this binding.")
         raise NotImplementedError("This binding does not yet support image editing.")
 
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return False
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return True
+
+    def has_active_resources(self) -> bool:
+        return False
+
+    def get_loaded_models(self) -> List[str]:
+        return [self.model_name] if self.model_name else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        return True
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        return {"status": False, "message": "Remote API; models are managed by Leonardo.ai."}
+
 if __name__ == '__main__':
     ASCIIColors.magenta("--- Leonardo.ai TTI Binding Test ---")
     if "LEONARDO_API_KEY" not in os.environ:

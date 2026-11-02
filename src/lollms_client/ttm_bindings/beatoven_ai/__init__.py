@@ -105,6 +105,46 @@ class BeatovenAITTMBinding(LollmsTTMBinding):
             trace_exception(e)
             raise
 
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return False
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return True
+
+    def has_active_resources(self) -> bool:
+        return False
+
+    def get_loaded_models(self) -> List[str]:
+        return ["default"]
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        return True
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        return {"status": False, "message": "Remote API; models are managed by Beatoven.ai."}
+
+
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return False
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return True
+
+    def has_active_resources(self) -> bool:
+        return False
+
+    def get_loaded_models(self) -> List[str]:
+        return ["default"]
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        return True
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        return {"status": False, "message": "Remote API; models are managed by Beatoven.ai."}
+
+
 if __name__ == '__main__':
     ASCIIColors.magenta("--- Beatoven.ai TTM Binding Test ---")
     if "BEATOVEN_API_KEY" not in os.environ:

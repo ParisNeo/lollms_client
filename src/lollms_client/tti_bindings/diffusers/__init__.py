@@ -378,3 +378,26 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             return self._get_request("/ps").json()
         except Exception:
             return [{"error": "Could not connect to server to get process status."}]
+
+    # ── Resource management contract ────────────────────────────────────────
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return self.is_server_running()
+
+    def get_loaded_models(self) -> List[str]:
+        if self.is_server_running():
+            return [self.config.get("model_name", "diffusers")]
+        return []
+
+    def get_zoo(self) -> List[Dict[str, Any]]:
+        return [
+            {"name": "FLUX.1-dev", "description": "Black Forest Labs FLUX.1-dev", "size": "~24GB", "type": "safetensors", "link": "black-forest-labs/FLUX.1-dev"},
+            {"name": "FLUX.1-schnell", "description": "Fast FLUX variant", "size": "~24GB", "type": "safetensors", "link": "black-forest-labs/FLUX.1-schnell"},
+            {"name": "SDXL 1.0", "description": "Stable Diffusion XL base", "size": "~7GB", "type": "safetensors", "link": "stabilityai/stable-diffusion-xl-base-1.0"},
+            {"name": "SD 3.5 Large", "description": "Stable Diffusion 3.5 Large", "size": "~16GB", "type": "safetensors", "link": "stabilityai/stable-diffusion-3.5-large"},
+        ]
+
+    def download_from_zoo(self, index: int, progress_callback: Optional[Callable[[dict], None]] = None) -> dict:
+        zoo = self.get_zoo()
+        if index < 0 or index >= len(zoo):
+            return {"status": False, "message": "Index out of bounds."}
+        return self.pull_model(zoo[index]["link"], progress_callback=progress_callback)

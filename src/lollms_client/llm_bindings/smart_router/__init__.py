@@ -221,6 +221,67 @@ class LollmsSmartBinding(LollmsLLMBinding):
     def load_model(self, model_name): return True
     def list_models(self): return []
 
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return any(getattr(b, "is_local", lambda: False)() for b in self.child_bindings.values())
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        if model_name:
+            return model_name in self.child_bindings
+        return bool(self.child_bindings)
+
+    def has_active_resources(self) -> bool:
+        return any(
+            getattr(b, "has_active_resources", lambda: False)()
+            for b in self.child_bindings.values()
+        )
+
+    def get_loaded_models(self) -> List[str]:
+        loaded: List[str] = []
+        for alias, b in self.child_bindings.items():
+            try:
+                if getattr(b, "is_model_loaded", lambda *_: False)():
+                    loaded.append(alias)
+            except Exception:
+                pass
+        return loaded
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        if model_name:
+            binding = self.child_bindings.get(model_name)
+            if not binding:
+                return False
+            try:
+                return bool(getattr(binding, "unload_model", lambda *_: False)())
+            except Exception:
+                return False
+        ok = True
+        for b in self.child_bindings.values():
+            try:
+                if not getattr(b, "unload_model", lambda *_: True)():
+                    ok = False
+            except Exception:
+                ok = False
+        return ok
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        return {"status": False, "message": "SmartRouter does not install models directly; configure child bindings."}
+
+    def ps(self) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        for alias, b in self.child_bindings.items():
+            try:
+                child_ps = getattr(b, "ps", lambda: [])()
+                if isinstance(child_ps, dict):
+                    child_ps = child_ps.get("models", [])
+                for entry in child_ps or []:
+                    entry = dict(entry)
+                    entry["router_alias"] = alias
+                    results.append(entry)
+            except Exception:
+                pass
+        return results
+
     def embed(self, text, **kwargs): 
         if not self.child_bindings: raise RuntimeError("No child bindings available for embedding.")
         return list(self.child_bindings.values())[0].embed(text, **kwargs)

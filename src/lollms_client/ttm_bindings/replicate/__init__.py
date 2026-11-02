@@ -90,8 +90,28 @@ class StabilityAITTMBinding(LollmsTTMBinding):
             trace_exception(e)
             raise Exception(f"An unexpected error occurred: {e}")
 
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return False
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return True
+
+    def has_active_resources(self) -> bool:
+        return False
+
+    def get_loaded_models(self) -> List[str]:
+        return [self.model_version] if self.model_version else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        return True
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        return {"status": False, "message": "Remote API; models are managed by Replicate."}
+
+
 if __name__ == '__main__':
-    ASCIIColors.magenta("--- Stability AI TTM Binding Test ---")
+    ASCIIColors.magenta("--- Replicate TTM Binding Test ---")
     if "STABILITY_API_KEY" not in os.environ:
         ASCIIColors.error("STABILITY_API_KEY environment variable not set. Cannot run test.")
         exit(1)

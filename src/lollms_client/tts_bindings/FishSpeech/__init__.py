@@ -279,3 +279,81 @@ class FishSpeechClientBinding(LollmsTTSBinding):
             "fishaudio/openaudio-s1-mini",
             "fishaudio/fish-speech-1.5"
         ]
+
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return True
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return self.is_server_running()
+
+    def has_active_resources(self) -> bool:
+        return self.is_server_running()
+
+    def get_loaded_models(self) -> List[str]:
+        return [self.model_name] if self.is_server_running() else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        if self.server_process and self.server_process.poll() is None:
+            self.server_process.terminate()
+            self.server_process = None
+        return True
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        try:
+            self.model_name = model_name
+            self._download_model_weights(None)
+            return {"status": True, "message": f"Model {model_name} downloaded."}
+        except Exception as e:
+            return {"status": False, "message": str(e)}
+
+    def get_zoo(self) -> List[Dict[str, Any]]:
+        return [
+            {"name": "OpenAudio S1 Mini", "description": "Fish Speech OpenAudio S1 Mini", "size": "~1.5GB", "type": "safetensors", "link": "fishaudio/openaudio-s1-mini"},
+            {"name": "Fish Speech 1.5", "description": "Fish Speech 1.5", "size": "~2GB", "type": "safetensors", "link": "fishaudio/fish-speech-1.5"},
+        ]
+
+    def download_from_zoo(self, index: int, progress_callback: Optional[Callable[[dict], None]] = None) -> dict:
+        zoo = self.get_zoo()
+        if index < 0 or index >= len(zoo):
+            return {"status": False, "message": "Index out of bounds."}
+        return self.install_model(zoo[index]["link"])
+
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return True
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return self.is_server_running()
+
+    def has_active_resources(self) -> bool:
+        return self.is_server_running()
+
+    def get_loaded_models(self) -> List[str]:
+        return [self.model_name] if self.is_server_running() else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        if self.server_process and self.server_process.poll() is None:
+            self.server_process.terminate()
+            self.server_process = None
+        return True
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        try:
+            self.model_name = model_name
+            self._download_model_weights(None)
+            return {"status": True, "message": f"Model {model_name} downloaded."}
+        except Exception as e:
+            return {"status": False, "message": str(e)}
+
+    def get_zoo(self) -> List[Dict[str, Any]]:
+        return [
+            {"name": "OpenAudio S1 Mini", "description": "Fish Speech OpenAudio S1 Mini", "size": "~1.5GB", "type": "safetensors", "link": "fishaudio/openaudio-s1-mini"},
+            {"name": "Fish Speech 1.5", "description": "Fish Speech 1.5", "size": "~2GB", "type": "safetensors", "link": "fishaudio/fish-speech-1.5"},
+        ]
+
+    def download_from_zoo(self, index: int, progress_callback: Optional[Callable[[dict], None]] = None) -> dict:
+        zoo = self.get_zoo()
+        if index < 0 or index >= len(zoo):
+            return {"status": False, "message": "Index out of bounds."}
+        return self.install_model(zoo[index]["link"])

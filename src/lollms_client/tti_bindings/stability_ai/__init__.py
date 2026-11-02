@@ -154,6 +154,26 @@ class StabilityAITTIBinding(LollmsTTIBinding):
             except:
                 raise Exception(f"Stability AI API request failed: {e}")
 
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return False
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return True
+
+    def has_active_resources(self) -> bool:
+        return False
+
+    def get_loaded_models(self) -> List[str]:
+        return [self.model_name] if self.model_name else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        return True
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        return {"status": False, "message": "Remote API; models are managed by Stability AI."}
+
+
 if __name__ == '__main__':
     ASCIIColors.magenta("--- Stability AI TTI Binding Test ---")
     if "STABILITY_API_KEY" not in os.environ:

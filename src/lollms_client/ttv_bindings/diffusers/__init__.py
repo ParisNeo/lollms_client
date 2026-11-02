@@ -275,5 +275,51 @@ class DiffusersTTVBinding(LollmsTTVBinding):
         except Exception as e:
             return {"status": False, "message": str(e)}
 
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return True
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return self.is_server_running()
+
+    def has_active_resources(self) -> bool:
+        return self.is_server_running()
+
+    def get_loaded_models(self) -> List[str]:
+        return [self.config.get("model_name", "diffusers")] if self.is_server_running() else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        try:
+            resp = requests.post(f"{self.base_url}/unload_model", timeout=30)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        return self.pull_model(model_name=model_name, **kwargs)
+
+    # ── Resource management contract ────────────────────────────────────────
+    def is_local(self) -> bool:
+        return True
+
+    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
+        return self.is_server_running()
+
+    def has_active_resources(self) -> bool:
+        return self.is_server_running()
+
+    def get_loaded_models(self) -> List[str]:
+        return [self.config.get("model_name", "diffusers")] if self.is_server_running() else []
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        try:
+            resp = requests.post(f"{self.base_url}/unload_model", timeout=30)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    def install_model(self, model_name: str, **kwargs) -> dict:
+        return self.pull_model(model_name=model_name, **kwargs)
+
     def __del__(self):
         pass
