@@ -47,6 +47,8 @@ def init_tools_library(config: Optional[dict] = None) -> None:
     try:
         import pipmaster as pm
         pm.ensure_packages(["pyautogui", "pillow"])
+        import pyautogui
+        print("pyautogui imported")
     except Exception as e:
         ASCIIColors.warning(f"[computer_use] Could not auto-install dependencies via pipmaster: {e}")
 

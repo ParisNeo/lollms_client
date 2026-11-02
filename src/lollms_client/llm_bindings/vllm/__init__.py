@@ -229,12 +229,6 @@ class _StreamThinkingHandler:
         if not content:
             return True
 
-        if self.dedicated_reasoning_opened:
-            self.output += content
-            if self.callback:
-                return self.callback(content, MSG_TYPE.MSG_TYPE_CHUNK) is not False
-            return True
-
         text = self.buffer + content
         self.buffer = ""
 
@@ -283,6 +277,7 @@ class _StreamThinkingHandler:
                     tag = m.group(0)
                     self.output += tag
                     self.in_content_thinking = False
+                    self.dedicated_reasoning_opened = True
                     if self.callback and self.callback(tag, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK) is False:
                         return False
 

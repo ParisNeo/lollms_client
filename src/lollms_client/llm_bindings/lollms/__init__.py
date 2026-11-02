@@ -24,6 +24,9 @@ from lollms_client.lollms_llm_binding import LollmsLLMBinding
 from lollms_client.lollms_types import ELF_COMPLETION_FORMAT, MSG_TYPE
 from lollms_client.lollms_utilities import encode_image
 from lollms_client.llm_bindings._dsml_utils import (
+    _extract_dsml_from_text,
+    _format_tool_calls_to_lollms_xml,
+    _DSMLStreamFilter,
     _DSMLStreamFilter,
     _extract_dsml_from_text,
     _format_tool_calls_to_lollms_xml,

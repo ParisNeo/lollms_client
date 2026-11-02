@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-02 13:26]
+
+- fix: deduplicate dsml utils imports and correct stream thinking handler state
+
 ## [2026-11-02 00:14]
 
 - fix: update image artifact persistence with fallback and broaden mimicry compaction check
