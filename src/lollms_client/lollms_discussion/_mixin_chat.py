@@ -139,7 +139,7 @@ _TAG_STARTS = [
     "<tool>",
     "</arg_key>", "<think ",
     "<artifact", "<artefact",
-    "<generate_image", "<edit_image",
+    "<generate_image", "<edit_image", "<generate_video",
     "<note", "<skill", "<scratchpad",
     "<lollms_inline",
     "<lollms_form",
@@ -1389,7 +1389,7 @@ class _StreamState:
             inline_tag_found = False
             # CRITICAL: Check for exact opening tags (e.g., "<tool>") and tag prefixes with attributes (e.g., "<artifact ")
             # REMOVED "<lollms_inline" so the host application can handle it directly.
-            for tag_prefix in ("<artifact", "<artefact", "<tool", "<note", "<skill", "<scratchpad", "<lollms_form", "<generate_image", "<edit_image", "<unlock_file", "<lock_file", "<hide_file"):
+            for tag_prefix in ("<artifact", "<artefact", "<tool", "<note", "<skill", "<scratchpad", "<lollms_form", "<generate_image", "<edit_image", "<generate_video", "<unlock_file", "<lock_file", "<hide_file"):
                 idx = self._pending_buffer.find(tag_prefix)
                 if idx != -1:
                     # Check if it's at the absolute start of a line
@@ -1944,7 +1944,7 @@ class _StreamState:
                         full_match_text
                     )
 
-                if self._secondary_tag_name not in ("unlock_file", "lock_file", "hide_file", "agent", "generate_image", "edit_image", "lollms_form", "lollms_inline"):
+                if self._secondary_tag_name not in ("unlock_file", "lock_file", "hide_file", "agent", "generate_image", "edit_image", "generate_video", "lollms_form", "lollms_inline"):
                         if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
                             proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
                             self.ai_message.content += proc_close_tag
@@ -1972,7 +1972,7 @@ class _StreamState:
         if not is_inside_thoughts and not self._is_accumulating_secondary:
             lower_buffer = self._pending_buffer.lower()
             secondary_entered = False
-            for tag_prefix in ("<agent", "<delegate", "<skill", "<note", "<scratchpad", "<lollms_form", "<generate_image", "<edit_image"):
+            for tag_prefix in ("<agent", "<delegate", "<skill", "<note", "<scratchpad", "<lollms_form", "<generate_image", "<edit_image", "<generate_video"):
                 pattern = r'(?m)^\s*(?!`)(?!.*\|)' + re.escape(tag_prefix)
                 open_match = re.search(pattern, lower_buffer)
                 if open_match:
@@ -2141,7 +2141,7 @@ class _StreamState:
             # Include memory tags in the check so they don't leak as partial tags
             tags_to_check = [
                 "<artifact", "<artefact", "<tool", "<think", "<note", "<skill", "<scratchpad", 
-                "<generate_image", "<edit_image", "<lollms_form", "<unlock_file", "<lock_file", "<hide_file",
+                "<generate_image", "<edit_image", "<generate_video", "<lollms_form", "<unlock_file", "<lock_file", "<hide_file",
                 "<mem_new", "<mem_update", "<mem_tag", "<mem_load", "<mem_delete", "<mem_search"
             ]
 
@@ -3238,6 +3238,12 @@ class _StreamState:
 
             return True
 
+        # 5b. Video Generation (Intercepted during streaming)
+        elif tag_name == "generate_video":
+            if not self.enable_artefacts:
+                return True
+            return self._handle_generate_video_tag(attrs_str, body)
+
         # 6. Image Generation / Editing (Intercepted during streaming)
         elif tag_name in ("generate_image", "edit_image"):
             if not self.enable_artefacts:
@@ -3930,6 +3936,182 @@ class _StreamState:
             ASCIIColors.error(f"[generate_image] Failed to create image artefact: {ex}")
             return True
 
+    def _handle_generate_video_tag(self, tag_str: str, body: str) -> bool:
+        """Handles a closed <generate_video> tag: TTV call → artefact persistence.
+
+        Defensive by contract: never raises. TTV absence/failure degrades to a
+        warning + return; the stream must survive any backend shape (raw bytes,
+        base64 str, dict payload, or result object).
+        """
+        try:
+            attrs = {m.group(1): m.group(2) for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', tag_str)}
+            raw_name = attrs.get("name") or attrs.get("title")
+            if not raw_name:
+                sanitized_body = re.sub(r'[^a-zA-Z0-9_-]+', '_', (body or "").strip())[:24].strip('_')
+                raw_name = (sanitized_body or f"video_{uuid.uuid4().hex[:8]}") + ".mp4"
+            if not raw_name.lower().endswith((".mp4", ".webm", ".mov", ".gif")):
+                raw_name = raw_name + ".mp4"
+            prompt = (body or "").strip() or raw_name
+
+            disc = self.discussion
+            client = getattr(disc, "lollmsClient", None) or getattr(disc, "lollms_client", None)
+            ttv = getattr(client, "ttv", None)
+            if ttv is None or not callable(getattr(ttv, "generate_video", None)):
+                ASCIIColors.warning(
+                    "[generate_video] No usable TTV binding available — video generation skipped."
+                )
+                if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                    failure_block = (
+                        f"\n* ⚠️ Video generation requested ('{raw_name}'), but no video engine is "
+                        f"available in this session. Nothing was generated.\n"
+                        f"<!-- status:failure -->\n</processing>\n"
+                    )
+                    self.ai_message.content += failure_block
+                    _cb(self.callback, failure_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    self._processing_block_open = False
+                return True
+
+            # ── 📐 OPTIONAL PARAMETER PASS-THROUGH ──
+            # duration/width/height/fps/seed are forwarded only when present and
+            # valid; malformed values are dropped (never coerced to a default that
+            # would silently change the user's intent).
+            gen_kwargs: Dict[str, Any] = {}
+            for int_key in ("duration", "width", "height", "fps", "seed", "num_frames", "num_inference_steps"):
+                if int_key in attrs:
+                    try:
+                        gen_kwargs[int_key] = int(attrs[int_key])
+                    except (TypeError, ValueError):
+                        pass
+            if "negative_prompt" in attrs:
+                gen_kwargs["negative_prompt"] = attrs["negative_prompt"]
+
+            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                status_line = (
+                    f"* 🎬 Generating video '{raw_name}' via the video engine...\nPrompt:{prompt}\n"
+                )
+                self.ai_message.content += status_line
+                _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                self._processing_block_open = True
+
+            video_bytes: Optional[bytes] = None
+            generation_error: Optional[str] = None
+            try:
+                result = ttv.generate_video(prompt, **gen_kwargs)
+                if isinstance(result, (bytes, bytearray)):
+                    video_bytes = bytes(result)
+                elif isinstance(result, str) and result.strip():
+                    video_bytes = base64.b64decode(re.sub(r'^data:video/[^;]+;base64,', '', result.strip()))
+                elif isinstance(result, dict):
+                    for key in ("video", "video_bytes", "bytes", "data", "b64"):
+                        value = result.get(key)
+                        if isinstance(value, (bytes, bytearray)):
+                            video_bytes = bytes(value)
+                            break
+                        if isinstance(value, str) and value.strip():
+                            video_bytes = base64.b64decode(
+                                re.sub(r'^data:video/[^;]+;base64,', '', value.strip())
+                            )
+                            break
+            except Exception as gen_ex:
+                trace_exception(gen_ex)
+                generation_error = _sanitize_host_paths(str(gen_ex))
+
+            if not video_bytes:
+                if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                    reason = generation_error or "The video engine returned no data."
+                    failure_block = (
+                        f"\n* ❌ Video '{raw_name}' could not be generated. Reason: {reason}\n"
+                        f"<!-- status:failure -->\n</processing>\n"
+                    )
+                    self.ai_message.content += failure_block
+                    _cb(self.callback, failure_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    self._processing_block_open = False
+                return True
+
+            # ── 📁 AS-IS PHYSICAL PERSISTENCE ──
+            # The video lives as a physical file in the discussion workspace; the
+            # DB record is a metadata card. Pixels/frames are not stored in the DB.
+            ws_root = _resolve_tool_workspace_root(disc)
+            video_rel_path = raw_name.replace("\\", "/").strip().lstrip("/")
+            video_disk_path = ws_root / video_rel_path
+            disk_write_error = None
+            try:
+                video_disk_path.parent.mkdir(parents=True, exist_ok=True)
+                video_disk_path.write_bytes(video_bytes)
+            except Exception as write_ex:
+                disk_write_error = _sanitize_host_paths(str(write_ex))
+                ASCIIColors.warning(
+                    f"[generate_video] Failed to write video '{video_rel_path}' to disk: {disk_write_error}"
+                )
+
+            meta_card = (
+                f"### Video: `{video_rel_path}`\n\n"
+                f"Generated via the video engine.\n"
+                f"- **Type**: Video (AS-IS physical artefact)\n"
+                f"- **Prompt**: {prompt[:200]}\n"
+                f"- **Location**: `./{video_rel_path}`\n\n"
+                f"> **Action**: The video is saved in the workspace. Reference it directly in your "
+                f"answer with `[video](./{video_rel_path})` or `./{video_rel_path}` (plain path)."
+            )
+
+            art = disc.artefacts.add(
+                title=video_rel_path,
+                artefact_type="video",
+                content=meta_card,
+                file_ext=Path(video_rel_path).suffix or ".mp4",
+                version=1,
+                read_only=False,
+                physical_data=video_bytes if disk_write_error is None else None,
+                logical_content=meta_card,
+            )
+            if disk_write_error is None:
+                self._bump_workspace_revision()
+            if art:
+                if not hasattr(self, "affected_artefacts"):
+                    self.affected_artefacts = []
+                self.affected_artefacts.append(art)
+                turn_arts = getattr(disc, "_affected_artefacts_this_turn", None)
+                if isinstance(turn_arts, list):
+                    turn_arts.append(art)
+                if getattr(disc, "_turn_actions_log", None) is not None:
+                    disc._turn_actions_log.append({
+                        "action": "artifact_created",
+                        "title": video_rel_path,
+                        "type": "video",
+                        "round": getattr(disc, "_current_round", 0),
+                    })
+                if getattr(disc, "_is_db_backed", False):
+                    try:
+                        disc.commit()
+                    except Exception:
+                        pass
+
+            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                saved_to = f"`./{video_rel_path}`" if disk_write_error is None else "the artefact store (disk write failed)"
+                result_block = (
+                    f"* ✅ Video '{video_rel_path}' generated and saved to {saved_to}.\n"
+                    f"<!-- status:success -->\n</processing>\n"
+                )
+                self.ai_message.content += result_block
+                _cb(self.callback, result_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                self._processing_block_open = False
+
+            anchor = f"[🎬 {Path(video_rel_path).stem}](./{video_rel_path})"
+            self.ai_message.content += f"\n\n{anchor}\n"
+            _cb(self.callback, f"\n\n{anchor}\n", MSG_TYPE.MSG_TYPE_CHUNK)
+
+            if self.event_mode.has_callbacks:
+                _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+                    "type": "artifact_created",
+                    "title": video_rel_path,
+                    "art_type": "video",
+                })
+            return True
+        except Exception as ex:
+            trace_exception(ex)
+            ASCIIColors.error(f"[generate_video] Failed to create video artefact: {ex}")
+            return True
+
     def _hydrate_image_unlock(self, t_file: str, art: Dict[str, Any], file_ext: str, processed_files: List[str]) -> None:
         """Self-heals pixel hydration for an image artifact targeted by <unlock_file>."""
         images = list(art.get("images") or [])
@@ -4158,7 +4340,7 @@ class _StreamState:
             # Context visibility tags and image tags close their own
             # <processing> block with a status meta inside the dispatcher;
             # do not emit a duplicate close.
-            if self._secondary_tag_name not in ("unlock_file", "lock_file", "hide_file", "agent", "generate_image", "edit_image", "lollms_form", "lollms_inline"):
+            if self._secondary_tag_name not in ("unlock_file", "lock_file", "hide_file", "agent", "generate_image", "edit_image", "generate_video", "lollms_form", "lollms_inline"):
                 if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
                     proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
                     self.ai_message.content += proc_close_tag

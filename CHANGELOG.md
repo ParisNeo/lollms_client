@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-02 22:53]
+
+- fix: correct `_TAG_STARTS` list in `_mixin_chat.py`
+
 ## [2026-11-02 04:09]
 
 - `Fix client version in __init__.py: update LollmsClient from v1.21.4 to v1.21.5.`
