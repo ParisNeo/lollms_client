@@ -157,6 +157,53 @@ class LollmsModelProfile:
 | `glm_image_embedding` | `bool` | `False` | Enables GLM-style image-embedding handling |
 | `supported_reasoning_efforts` | `Optional[List[str]]` | `None` | Restricts the reasoning-effort vocabulary for thinking models (e.g. `["low", "medium", "high"]`) |
 | `video_enabled` | `bool` | `False` | Marks the model as video-input-capable; consulted by `has_video_capability()` |
+| `image_token_cost` | `int` | `256` | Approximate tokens consumed by one image for this model. Used as the recommended default when the binding exposes no `count_image_tokens` |
+| `thinking_enabled` | `bool` | `False` | Declares whether the model supports an explicit thinking / reasoning mode. When `False`, the client never requests reasoning regardless of call-site hints |
+| `default_reasoning_effort` | `Optional[str]` | `None` | Effort used when the caller says "think" but does not pick a level. Falls back to the middle of `supported_reasoning_efforts` when `None` |
+
+### 2.3 Thinking capability (reasoning effort)
+
+Each profile now declares whether the model can *think*, and which effort
+levels it accepts. The binding no longer owns this information — the profile
+is authoritative and is pushed onto the binding when it is instantiated.
+
+| Field | Type | Default |
+|---|---|---|
+| `thinking_enabled` | bool | `False` |
+| `supported_reasoning_efforts` | list[str] or comma string | `["low", "medium", "high"]` |
+| `default_reasoning_effort` | str or `None` | middle of `supported_reasoning_efforts` |
+
+Usage:
+
+```python
+llm_model_profiles={
+    "o3": {
+        "binding_profile_name": "openai",
+        "model_name": "o3",
+        "thinking_enabled": True,
+        "supported_reasoning_efforts": "low, medium, high",   # comma string is OK
+        "default_reasoning_effort": "medium",
+    },
+    "llama-plain": {
+        "binding_profile_name": "ollama",
+        "model_name": "llama3",
+        "thinking_enabled": False,       # default — no effort prompts, ever
+    },
+}
+```
+
+Semantics:
+
+- `thinking_enabled=False` short-circuits everything: any `think=True` request
+  is filtered by `LollmsLLMBinding.normalize_reasoning_effort`, and the profile
+  forwards that state to the binding so no reasoning parameter is sent to the
+  provider.
+- `supported_reasoning_efforts` accepts either a list or a comma-separated
+  string. Empty / `'none'` / `'off'` tokens are dropped. If the resulting list
+  is empty, the default triple is restored.
+- `default_reasoning_effort` is what the client uses when a caller says
+  "think" without naming a level. Omit it to use the middle of the supported
+  list.
 
 **Which fields apply to which modality?** All fields exist on every profile object (uniform dataclass), but the instantiation pipeline only *applies* the LLM-oriented flags (`vision_enabled`, `forced_context_size`, `routing_config`, `glm_image_embedding`, `supported_reasoning_efforts`, `video_enabled`) to bindings that expose the corresponding attributes — for non-LLM modalities they are simply ignored unless the binding has the attribute (see §6).
 

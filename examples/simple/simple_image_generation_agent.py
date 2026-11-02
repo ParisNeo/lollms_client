@@ -29,7 +29,7 @@ while True:
             streaming_callback=cb,
             enable_image_generation=True,
             enable_image_editing=True,
-            enforce_end_tag=True,
+            enforce_end_tag=True
         )
         print()
     except Exception as e:

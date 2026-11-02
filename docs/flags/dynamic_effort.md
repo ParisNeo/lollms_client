@@ -25,6 +25,14 @@ reasoning effort between agentic rounds.
 discussion.chat(task, dynamic_effort=True, reasoning_effort="medium")
 ```
 
+## Where the effort levels come from
+
+`dynamic_effort` switches *whether* the model is allowed to pick its own
+effort level. Which levels exist is declared on the model profile via
+`supported_reasoning_efforts` (default `low, medium, high`) and whether the
+model can think at all is `thinking_enabled`. A profile with
+`thinking_enabled=False` effectively disables this flag.
+
 ## Related flags
 
 - `think`, `reasoning_effort` (non-boolean companions).

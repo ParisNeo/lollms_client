@@ -148,6 +148,7 @@ def extract_reasoning(obj: Any) -> Optional[str]:
     candidate_keys = (
         "reasoning_content",
         "reasoning",
+        "reasoning_details",
         "thinking",
         "reasoning_text",
         "thought",
@@ -300,6 +301,9 @@ class _StreamThinkingHandler:
                     if not self.suppress_thinking:
                         self.output += tag
                     self.in_content_thinking = False
+                    # Once answer content has started, a late dedicated-reasoning
+                    # field must not reopen a  thinking block mid-answer.
+                    self.dedicated_reasoning_opened = True
                     if not self.suppress_thinking and self.callback:
                         if self.callback(tag, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK) is False:
                             return False
@@ -1302,8 +1306,9 @@ class OpenAIBinding(LollmsLLMBinding):
             if is_thinking_deactivated:
                 reasoning: Optional[Dict[str, Any]] = {"effort": "none"}
             else:
+                projected = self._project_effort(effort) or "medium"
                 reasoning = {
-                    "effort": effort if effort != "max" else "high",
+                    "effort": projected,
                     "summary": reasoning_summary or "auto",
                 }
 
@@ -1449,110 +1454,120 @@ class OpenAIBinding(LollmsLLMBinding):
 
         return params
 
+    # ── thinking / reasoning helpers ───────────────────────────────────────
+    _REASONING_MODEL_PREFIXES = ("o1", "o3", "o4", "gpt-5")
+    _EFFORT_OFF_VALUES = frozenset({"none", "off", "disabled", "false", "0", ""})
+
+    def _is_reasoning_model(self) -> bool:
+        """True for OpenAI reasoning families that accept `reasoning_effort`."""
+        model_lower = (self.model_name or "").lower()
+        return any(model_lower.startswith(p) for p in self._REASONING_MODEL_PREFIXES)
+
+    @staticmethod
+    def _normalize_effort(effort: Optional[str]) -> Optional[str]:
+        """Normalize an effort string; returns None when thinking is off."""
+        if effort is None:
+            return None
+        s = str(effort).strip().lower()
+        if s in OpenAIBinding._EFFORT_OFF_VALUES:
+            return None
+        return "high" if s == "max" else s
+
+    def _project_effort(self, effort: Optional[str]) -> Optional[str]:
+        """
+        Project an incoming effort onto the model's supported_reasoning_efforts list
+        by ordinal position (closest match). Honors the description.yaml contract.
+        """
+        norm = self._normalize_effort(effort)
+        if norm is None:
+            return None
+        supported = [str(e).strip().lower() for e in (self.supported_reasoning_efforts or []) if str(e).strip()]
+        if not supported:
+            return norm
+        if norm in supported:
+            return norm
+        # Map by ordinal position: low→first, medium→middle, high→last, max→last
+        ordinal = {"low": 0, "medium": 1, "high": 2, "max": 2}
+        idx = ordinal.get(norm, 1)
+        if idx >= len(supported):
+            idx = len(supported) - 1
+        return supported[idx]
+
     def _apply_thinking_params(
         self,
         params: dict,
         effort: Optional[str],
-        is_deactivated: bool
+        is_deactivated: bool,
     ) -> dict:
         """
-        Applies thinking / reasoning controls across OpenAI, vLLM, Z.AI/GLM, and OpenAI-compatible engines.
+        Applies thinking / reasoning controls across OpenAI, vLLM, Z.AI/GLM,
+        and OpenAI-compatible engines. Delegates to small helpers so each
+        backend's quirks stay isolated.
         """
-        model_name_lower = (self.model_name or "").lower()
-        is_glm = "glm" in model_name_lower
+        is_glm = "glm" in (self.model_name or "").lower()
         is_vllm = self.check_is_vllm()
         extra_body = params.setdefault("extra_body", {})
 
-        if is_deactivated:
-            params["reasoning_effort"] = "none"
-            extra_body["reasoning_effort"] = "none"
+        projected = None if is_deactivated else self._project_effort(effort)
+        thinking_on = projected is not None
 
-            if is_vllm:
-                if self.send_thinking_parameter and not getattr(self, "glm_image_embedding", False):
-                    ctk = extra_body.setdefault("chat_template_kwargs", {})
-                    if self.thinking_effort_keyword == "reasoning_effort":
-                        ctk["reasoning_effort"] = "none"
-                        ctk["enable_thinking"] = False
-                    else:
-                        ctk[self.thinking_effort_keyword] = False
-                        ctk["enable_thinking"] = False
-                        ctk["thinking"] = False
+        # 1) Top-level reasoning_effort — only for models that accept it.
+        if self._is_reasoning_model():
+            params["reasoning_effort"] = projected if thinking_on else "none"
+        elif thinking_on:
+            # Non-reasoning models: don't send reasoning_effort at all.
+            params.pop("reasoning_effort", None)
 
-                if is_glm:
-                    extra_body["thinking"] = {"type": "disabled"}
-                else:
-                    extra_body["thinking"] = False
-            else:
-                extra_body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
-                extra_body.setdefault("chat_template_kwargs", {})["thinking"] = False
-                if is_glm:
-                    extra_body["thinking"] = {"type": "disabled"}
-                else:
-                    extra_body["thinking"] = False
+        # 2) extra_body.reasoning_effort — for OpenAI-compatible backends.
+        extra_body["reasoning_effort"] = projected if thinking_on else "none"
+
+        # 3) Backend-specific thinking flags.
+        if is_vllm:
+            self._apply_vllm_thinking_flags(extra_body, projected, is_glm)
         else:
-            if effort is not None and str(effort).strip().lower() not in ("none", "off", "disabled", "false", "0"):
-                norm_effort = effort if effort != "max" else "high"
-                params["reasoning_effort"] = norm_effort
-                extra_body["reasoning_effort"] = norm_effort
+            self._apply_generic_thinking_flags(extra_body, projected, is_glm)
 
-                if is_vllm:
-                    if self.send_thinking_parameter and not getattr(self, "glm_image_embedding", False):
-                        ctk = extra_body.setdefault("chat_template_kwargs", {})
-                        if self.thinking_effort_keyword == "reasoning_effort":
-                            ctk["reasoning_effort"] = norm_effort
-                            ctk["enable_thinking"] = True
-                        else:
-                            ctk[self.thinking_effort_keyword] = True
-                            ctk["enable_thinking"] = True
-                            ctk["thinking"] = True
-
-                    if is_glm:
-                        extra_body["thinking"] = {"type": "enabled"}
-                    else:
-                        extra_body["thinking"] = True
-                else:
-                    extra_body.setdefault("chat_template_kwargs", {})["enable_thinking"] = True
-                    extra_body.setdefault("chat_template_kwargs", {})["thinking"] = True
-                    if is_glm:
-                        extra_body["thinking"] = {"type": "enabled"}
-                    else:
-                        extra_body["thinking"] = True
-
-                    restricted = ["o1", "o3", "o4", "gpt-5"]
-                    if any(r in model_name_lower for r in restricted):
-                        params.pop("temperature", None)
-                        params.pop("top_p", None)
-            else:
-                params["reasoning_effort"] = "none"
-                extra_body["reasoning_effort"] = "none"
-
-                if is_vllm:
-                    if self.send_thinking_parameter and not getattr(self, "glm_image_embedding", False):
-                        ctk = extra_body.setdefault("chat_template_kwargs", {})
-                        if self.thinking_effort_keyword == "reasoning_effort":
-                            ctk["reasoning_effort"] = "none"
-                            ctk["enable_thinking"] = False
-                        else:
-                            ctk[self.thinking_effort_keyword] = False
-                            ctk["enable_thinking"] = False
-                            ctk["thinking"] = False
-
-                    if is_glm:
-                        extra_body["thinking"] = {"type": "disabled"}
-                    else:
-                        extra_body["thinking"] = False
-                else:
-                    extra_body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
-                    extra_body.setdefault("chat_template_kwargs", {})["thinking"] = False
-                    if is_glm:
-                        extra_body["thinking"] = {"type": "disabled"}
-                    else:
-                        extra_body["thinking"] = False
+        # 4) Reasoning models reject temperature/top_p when thinking is on.
+        if thinking_on and self._is_reasoning_model():
+            params.pop("temperature", None)
+            params.pop("top_p", None)
 
         return params
 
+    def _apply_vllm_thinking_flags(
+        self, extra_body: dict, projected: Optional[str], is_glm: bool
+    ) -> None:
+        """vLLM-specific chat_template_kwargs + thinking flag."""
+        thinking_on = projected is not None
+        if self.send_thinking_parameter and not getattr(self, "glm_image_embedding", False):
+            ctk = extra_body.setdefault("chat_template_kwargs", {})
+            if self.thinking_effort_keyword == "reasoning_effort":
+                ctk["reasoning_effort"] = projected if thinking_on else "none"
+                ctk["enable_thinking"] = thinking_on
+            else:
+                ctk[self.thinking_effort_keyword] = thinking_on
+                ctk["enable_thinking"] = thinking_on
+                ctk["thinking"] = thinking_on
+        if is_glm:
+            extra_body["thinking"] = {"type": "enabled" if thinking_on else "disabled"}
+        else:
+            extra_body["thinking"] = thinking_on
+
+    def _apply_generic_thinking_flags(
+        self, extra_body: dict, projected: Optional[str], is_glm: bool
+    ) -> None:
+        """Generic OpenAI-compatible backend thinking flags."""
+        thinking_on = projected is not None
+        ctk = extra_body.setdefault("chat_template_kwargs", {})
+        ctk["enable_thinking"] = thinking_on
+        ctk["thinking"] = thinking_on
+        if is_glm:
+            extra_body["thinking"] = {"type": "enabled" if thinking_on else "disabled"}
+        else:
+            extra_body["thinking"] = thinking_on
+
     def _apply_vllm_thinking_kwargs(self, params: dict, effort: Optional[str]) -> dict:
-        is_deact = effort is None or str(effort).strip().lower() in ("none", "off", "disabled", "false", "0")
+        is_deact = self._normalize_effort(effort) is None
         return self._apply_thinking_params(params, effort, is_deact)
 
     def generate_text(
@@ -1583,11 +1598,8 @@ class OpenAIBinding(LollmsLLMBinding):
 
         if think is True:
             effort = self.get_effective_reasoning_effort(think=True, reasoning_effort=reasoning_effort)
-            if effort is None or str(effort).strip().lower() in ("none", "off", "disabled", "false", "0", ""):
-                is_thinking_deactivated = True
-                effort = None
-            else:
-                is_thinking_deactivated = False
+            effort = self._normalize_effort(effort)
+            is_thinking_deactivated = effort is None
         else:
             is_thinking_deactivated = True
             effort = None
@@ -1951,11 +1963,8 @@ class OpenAIBinding(LollmsLLMBinding):
 
         if think is True:
             effort = self.get_effective_reasoning_effort(think=True, reasoning_effort=reasoning_effort)
-            if effort is None or str(effort).strip().lower() in ("none", "off", "disabled", "false", "0", ""):
-                is_thinking_deactivated = True
-                effort = None
-            else:
-                is_thinking_deactivated = False
+            effort = self._normalize_effort(effort)
+            is_thinking_deactivated = effort is None
         else:
             is_thinking_deactivated = True
             effort = None

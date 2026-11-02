@@ -2321,14 +2321,58 @@ class _StreamState:
             lang = attrs.get("language")
             is_ephemeral = attrs.get("ephemeral", "false").lower() in ("true", "1", "yes")
 
+            # ── 🎨 SVG SHORT-CIRCUIT (TEXT, NOT TTI) ──
+            # SVG is a TEXT-based vector format, not a raster image. It MUST be
+            # written to disk as text content — routing it to the TTI engine
+            # would either fail or produce a rasterized PNG that destroys the
+            # vector source. Detect SVG by file extension, `language` attribute,
+            # or body content, and persist directly via artefacts.add BEFORE the
+            # image-artifact router fires.
+            is_svg = (
+                str(title).lower().endswith(".svg")
+                or str(lang or "").lower() == "svg"
+                or (isinstance(body, str) and body.lstrip().lower().startswith("<svg"))
+            )
+            if is_svg:
+                try:
+                    self.discussion.artefacts.add(
+                        title=title,
+                        artefact_type="image",
+                        content=body if isinstance(body, str) else str(body),
+                        file_ext=".svg",
+                        version=1,
+                        read_only=False,
+                    )
+                    if getattr(self, "forward_artefact_chunks", False) and self.callback:
+                        try:
+                            self.callback({"type": "artifact", "operation": "add",
+                                           "artifact_name": title, "content": body,
+                                           "mime_type": "image/svg+xml"}, MSG_TYPE.MSG_TYPE_UI_EVENT)
+                        except Exception:
+                            pass
+                    return True
+                except Exception as _svg_err:
+                    ASCIIColors.warning(f"[StreamState] Failed to persist SVG artifact '{title}': {_svg_err}")
+                    return False
+
             # ── 🖼️ IMAGE ARTIFACT ROUTER (ACCEPT + FORWARD) ──
             # An <artifact type="image"> tag is accepted and its body is forwarded
             # VERBATIM as the prompt to the SAME image engine that <generate_image>
             # invokes. No wrapping, no prefix. width/height attrs are preserved
             # (default 1280×720). This eliminates the wasted round caused by the
             # former reject-and-redirect guard.
+            #
+            # 🛑 SVG EXCLUSION (CRITICAL): SVG is a TEXT-based vector format, not a
+            # raster image. It MUST be written to disk as text content — routing it
+            # to the TTI engine would either fail or produce a rasterized PNG that
+            # destroys the vector source. Detect SVG by file extension OR by the
+            # `language` attribute and fall through to the normal text-artifact path.
             _IMAGE_ARTIFACT_TYPES = {"image", "png", "jpg", "jpeg", "webp", "gif"}
-            if atype.lower() in _IMAGE_ARTIFACT_TYPES:
+            _is_svg_artifact = (
+                Path(title).suffix.lower() == ".svg"
+                or (lang or "").strip().lower() == "svg"
+            )
+            if atype.lower() in _IMAGE_ARTIFACT_TYPES and not _is_svg_artifact:
                 _img_width = attrs.get("width", "1280")
                 _img_height = attrs.get("height", "720")
                 _img_prompt = (body or "").strip() or title
@@ -3756,6 +3800,25 @@ class _StreamState:
             if not images_b64:
                 ASCIIColors.warning("[generate_image] TTI returned no usable image data.")
                 return True
+
+            # ── 🗂️ RAW-NAME ARTEFACT REGISTRATION (TEST CONTRACT) ──
+            # The DB artefact title MUST remain the exact `name` attribute the
+            # LLM used (e.g. "test_img"), NOT a normalized workspace path. The
+            # disk twin below uses the normalized path; the DB record is keyed
+            # on the raw name so `artefacts.get("test_img")` resolves.
+            img_title = attrs.get("name") or attrs.get("title") or f"generated_image_{uuid.uuid4().hex[:8]}"
+            try:
+                self.discussion.artefacts.add(
+                    title=img_title,
+                    artefact_type="image",
+                    content="",
+                    file_ext=".png",
+                    version=1,
+                    read_only=False,
+                    physical_data=base64.b64decode(images_b64[0]),
+                )
+            except Exception as _pers_err:
+                ASCIIColors.warning(f"[generate_image] Failed to persist artefact '{img_title}': {_pers_err}")
 
             # ── 📁 AS-IS PHYSICAL PERSISTENCE (CRITICAL FIX) ──
             # The image MUST exist as a physical file in the discussion workspace.
@@ -6171,6 +6234,26 @@ class ChatMixin:
                     )
 
             if _computer_use_vision_ready and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
+                # ── PRE-AUTHORIZATION (GATE-CONTAINER WRITES) ──
+                # The computer_use library declares TOOL_LIBRARY_LOAD_FLAG =
+                # "enable_computer_use". The LCP gate reads that flag from
+                # tools_binding_config[flag] and host_tool_configs[stem][flag] —
+                # NOT from the chat() kwargs. Without these writes the mount
+                # silently produces 0 tools (fail-closed). Enable the flag in
+                # BOTH containers before mounting; also deliver it via
+                # set_session_flags for consistency with the office-family gate.
+                try:
+                    _cu_cfg = getattr(lcp_binding, "tools_binding_config", None)
+                    if isinstance(_cu_cfg, dict):
+                        _cu_cfg["enable_computer_use"] = True
+                    _cu_htc = getattr(lcp_binding, "host_tool_configs", None)
+                    if isinstance(_cu_htc, dict):
+                        _cu_htc.setdefault("computer_use", {})["enable_computer_use"] = True
+                except Exception:
+                    pass  # Best-effort; the load will warn if the gate blocks
+                if hasattr(lcp_binding, "set_session_flags"):
+                    lcp_binding.set_session_flags({"enable_computer_use": True})
+
                 lcp_binding.mount_tool_library("computer_use")
                 try:
                     lcp_tools = lcp_binding.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
@@ -7241,7 +7324,19 @@ class ChatMixin:
                     norm_thresh = context_compaction_threshold if context_compaction_threshold <= 1.0 else context_compaction_threshold / 100.0
                     thresh_pct = norm_thresh * 100.0
 
-                    if fill_pct >= thresh_pct and not was_cancelled and len(virtual_history) > 4:
+                    # ── 🛡️ MIMICRY-RETRY COMPACTION GATE ──
+                    # When the previous round was a mimicry correction, the retry
+                    # round MUST execute with the correction message intact. The
+                    # compactor would otherwise wipe virtual_history (including
+                    # the correction) before the retry can act on it, causing the
+                    # retry to be swallowed and the turn to terminate empty.
+                    _last_vh_is_mimicry_correction = bool(
+                        virtual_history
+                        and "SYSTEM MARKER MIMICRY DETECTED"
+                        in (getattr(virtual_history[-1], "content", "") or "")
+                    )
+
+                    if fill_pct >= thresh_pct and not was_cancelled and len(virtual_history) > 4 and not _last_vh_is_mimicry_correction:
                         ASCIIColors.warning(
                             f"[ChatMixin] 🚨 Context fill at {fill_pct:.1f}% >= {thresh_pct:.0f}%. "
                             "Triggering Fast Compactor Agent to lock files and compact history..."

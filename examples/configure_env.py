@@ -76,6 +76,29 @@ def main():
         config["TTI_BINDING_NAME"] = ""
         config["TTI_MODEL_NAME"] = ""
 
+    # --- Vision & Video Configuration (Optional) ---
+    print("\n--- Vision & Video Configuration (Optional) ---")
+    setup_vision = input("Do you want to configure vision/video support? (y/N): ").strip().lower()
+    if setup_vision == 'y':
+        vision_enabled = input(f"Does this model accept image input? (true/false) [{config.get('VISION_ENABLED', 'false')}]: ").strip().lower() or config.get("VISION_ENABLED", "false")
+        config["VISION_ENABLED"] = vision_enabled
+
+        video_enabled = input(f"Does this model accept video input? (true/false) [{config.get('VIDEO_ENABLED', 'false')}]: ").strip().lower() or config.get("VIDEO_ENABLED", "false")
+        config["VIDEO_ENABLED"] = video_enabled
+
+        default_img_cost = config.get("IMAGE_TOKEN_COST", "256")
+        image_token_cost = input(f"Tokens per image (int) [{default_img_cost}]: ").strip() or default_img_cost
+        try:
+            int(image_token_cost)
+        except ValueError:
+            print(f"⚠️ Invalid integer '{image_token_cost}', falling back to 256.")
+            image_token_cost = "256"
+        config["IMAGE_TOKEN_COST"] = image_token_cost
+    else:
+        config["VISION_ENABLED"] = config.get("VISION_ENABLED", "false")
+        config["VIDEO_ENABLED"] = config.get("VIDEO_ENABLED", "false")
+        config["IMAGE_TOKEN_COST"] = config.get("IMAGE_TOKEN_COST", "256")
+
     # --- Write to .env ---
     try:
         with open(ENV_FILE, "w", encoding="utf-8") as f:

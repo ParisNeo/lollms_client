@@ -2301,24 +2301,32 @@ class ArtefactManager:
         return result
 
     @staticmethod
-    def apply_aider_patch(original: str, patch_block: str) -> str:
-        if original is None:
-            original = ""
+    def _parse_patch_hunks(patch_block: str) -> Tuple[List[Dict[str, str]], bool]:
+        """
+        Parse a raw Aider-style patch block into a list of hunks.
+
+        Returns (hunks, had_sentinels) where each hunk is
+        {"search": str, "replace": str}. `had_sentinels` is True iff at least
+        one SEARCH/REPLACE sentinel pair was detected (i.e. this is a patch,
+        not full-file content).
+        """
+        if not patch_block:
+            return [], False
 
         SEARCH_RE  = re.compile(r'^\s*<{5,10}(?:\s*SEARCH\b[^\n]*)?$', re.IGNORECASE)
         SEP_RE     = re.compile(r'^\s*={5,10}\s*$')
         REPLACE_RE = re.compile(r'^\s*>{5,10}(?:\s*REPLACE\b[^\n]*)?$', re.IGNORECASE)
 
-        patch_block = patch_block.replace('\r\n', '\n').replace('\r', '\n')
-        lines = patch_block.split('\n')
+        normalized = patch_block.replace('\r\n', '\n').replace('\r', '\n')
+        lines = normalized.split('\n')
         while lines and not lines[-1].strip():
             lines.pop()
         if lines and not REPLACE_RE.match(lines[-1].rstrip()):
             lines.append('>>>>>>> REPLACE')
-        patch_block = '\n'.join(lines)
+        normalized = '\n'.join(lines)
 
-        segments: List[Tuple[str, str]] = []
-        raw_lines = patch_block.split('\n')
+        segments: List[Dict[str, str]] = []
+        raw_lines = normalized.split('\n')
         i = 0
         while i < len(raw_lines):
             line_r = raw_lines[i].rstrip()
@@ -2333,15 +2341,19 @@ class ArtefactManager:
                     i += 1
 
                 if i >= len(raw_lines):
-                    raise ValueError(f"Malformed aider patch: SEARCH block has no ======= separator.")
+                    # Malformed: SEARCH with no separator. Record as a failed hunk.
+                    segments.append({"search": '\n'.join(search_lines), "replace": ""})
+                    break
 
                 l_curr = raw_lines[i].rstrip()
                 if REPLACE_RE.match(l_curr):
-                    segments.append(('\n'.join(search_lines), ''))
+                    segments.append({"search": '\n'.join(search_lines), "replace": ""})
                     i += 1
                     continue
                 elif SEARCH_RE.match(l_curr):
-                    raise ValueError("Malformed aider patch: new <<<<<<< SEARCH encountered before ======= separator.")
+                    # New SEARCH before separator — treat prior as failed hunk.
+                    segments.append({"search": '\n'.join(search_lines), "replace": ""})
+                    continue
 
                 i += 1
                 replace_lines: List[str] = []
@@ -2350,7 +2362,6 @@ class ArtefactManager:
                     if REPLACE_RE.match(l_rep):
                         break
                     if SEARCH_RE.match(l_rep):
-                        # End of current replace block — avoid swallowing subsequent SEARCH blocks
                         break
                     replace_lines.append(raw_lines[i])
                     i += 1
@@ -2358,7 +2369,6 @@ class ArtefactManager:
                 if i < len(raw_lines) and REPLACE_RE.match(raw_lines[i].rstrip()):
                     i += 1
 
-                # Clean any leaked conflict sentinels from replace_lines
                 clean_replace = []
                 for rl in replace_lines:
                     rl_strip = rl.strip()
@@ -2366,12 +2376,87 @@ class ArtefactManager:
                         continue
                     clean_replace.append(rl)
 
-                segments.append(('\n'.join(search_lines), '\n'.join(clean_replace)))
+                segments.append({"search": '\n'.join(search_lines), "replace": '\n'.join(clean_replace)})
             else:
                 i += 1
 
-        if not segments:
-            raise ValueError("Malformed aider patch: no valid <<<<<<< SEARCH … >>>>>>> REPLACE block found.")
+        return segments, bool(segments)
+
+    @staticmethod
+    def _build_reprompt(failed: List[Dict[str, Any]], total_hunks: int) -> str:
+        """Build an LLM-actionable corrective message listing failed hunks."""
+        lines = [
+            f"{len(failed)} of {total_hunks} patch hunk(s) could not be applied.",
+            "",
+        ]
+        for f in failed:
+            idx = f.get("index", -1)
+            reason = f.get("reason", "unknown")
+            lines.append(f"### Hunk #{idx + 1} — {reason}")
+            lines.append("<<<<<<< SEARCH (this block was NOT found in the current file)")
+            lines.append(f.get("search", ""))
+            lines.append("=======")
+            lines.append(f.get("replace", ""))
+            lines.append(">>>>>>> REPLACE")
+            lines.append("")
+        lines.append(
+            "Fix the SEARCH blocks above so they match the current file content exactly "
+            "(check whitespace/indentation), then re-issue ONLY the failed hunks inside "
+            "a new artifact tag. The successfully-applied hunks do NOT need to be re-sent."
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def apply_aider_patch(original: str, patch_block: str) -> str:
+        """
+        Backward-compatible single-string entry point.
+
+        Applies all hunks that match and returns the resulting content.
+        Raises ValueError only when NO hunk could be applied (preserves the
+        legacy contract for callers that expect an exception on total failure).
+        For structured partial-success reporting, use apply_aider_patch_ex().
+        """
+        result = ArtefactManager.apply_aider_patch_ex(original, patch_block)
+        if not result["success"]:
+            raise ValueError(result.get("error") or "SEARCH text not found in artifact content.")
+        return result["content"]
+
+    @staticmethod
+    def apply_aider_patch_ex(original: str, patch_block: str) -> Dict[str, Any]:
+        """
+        Apply a multi-hunk Aider patch with partial-success semantics.
+
+        Returns a dict with keys:
+          - success: bool (True if at least one hunk applied)
+          - content: str (resulting content; original if nothing applied)
+          - applied_hunks: int
+          - failed_hunks: List[{"index","search","replace","reason"}]
+          - partial: bool (applied>0 and failed>0)
+          - reprompt: Optional[str] (LLM corrective message when failed non-empty)
+          - error: Optional[str] (set when success is False)
+        """
+        if original is None:
+            original = ""
+
+        SEARCH_RE  = re.compile(r'^\s*<{5,10}(?:\s*SEARCH\b[^\n]*)?$', re.IGNORECASE)
+        SEP_RE     = re.compile(r'^\s*={5,10}\s*$')
+        REPLACE_RE = re.compile(r'^\s*>{5,10}(?:\s*REPLACE\b[^\n]*)?$', re.IGNORECASE)
+
+        parsed_hunks, had_sentinels = ArtefactManager._parse_patch_hunks(patch_block)
+        if not had_sentinels:
+            return {
+                "success": False,
+                "content": original,
+                "applied_hunks": 0,
+                "failed_hunks": [],
+                "partial": False,
+                "reprompt": None,
+                "error": "Malformed aider patch: no valid <<<<<<< SEARCH … >>>>>>> REPLACE block found.",
+            }
+
+        segments: List[Tuple[str, str]] = [
+            (h["search"], h["replace"]) for h in parsed_hunks
+        ]
 
         def _get_indent(line: str) -> int:
             return len(line) - len(line.lstrip())
@@ -2427,10 +2512,21 @@ class ArtefactManager:
             return out
 
         result = original
+        applied_count = 0
+        failed_hunks: List[Dict[str, Any]] = []
 
         for seg_idx, (search_text, replace_text) in enumerate(segments):
             s_text = search_text.strip('\n')
             r_text = replace_text.strip('\n')
+
+            if not s_text.strip():
+                failed_hunks.append({
+                    "index": seg_idx,
+                    "search": search_text,
+                    "replace": replace_text,
+                    "reason": "Empty SEARCH block.",
+                })
+                continue
 
             res_lines = result.splitlines()
             s_lines   = s_text.splitlines()
@@ -2442,6 +2538,7 @@ class ArtefactManager:
 
             if s_text in result:
                 result = result.replace(s_text, r_text, 1)
+                applied_count += 1
                 continue
 
             for i in range(n_r - n_s + 1):
@@ -2454,6 +2551,7 @@ class ArtefactManager:
                     break
 
             if match_found:
+                applied_count += 1
                 continue
 
             best_i     = -1
@@ -2474,6 +2572,7 @@ class ArtefactManager:
                 match_found = True
 
             if match_found:
+                applied_count += 1
                 continue
 
             s_keys = [_comment_key(l) for l in s_lines]
@@ -2496,6 +2595,7 @@ class ArtefactManager:
                 match_found = True
 
             if match_found:
+                applied_count += 1
                 continue
 
             collapsed_res = _collapse_blanks(res_lines)
@@ -2530,6 +2630,7 @@ class ArtefactManager:
                 match_found = True
 
             if match_found:
+                applied_count += 1
                 continue
 
             s_lines_full = search_text.splitlines()
@@ -2552,11 +2653,15 @@ class ArtefactManager:
                     match_found = True
 
             if match_found:
+                applied_count += 1
                 continue
 
-            first_line = s_lines[0] if s_lines else ""
-            hint = _find_closest_line(first_line, result)
-            raise ValueError(f"SEARCH text not found in artifact content.")
+            failed_hunks.append({
+                "index": seg_idx,
+                "search": search_text,
+                "replace": replace_text,
+                "reason": "SEARCH block not found in current content.",
+            })
 
         # Post-patch decontamination: ensure no stray patch sentinels leaked into result
         if result:
@@ -2573,7 +2678,37 @@ class ArtefactManager:
                 cleaned_lines.append(line)
             result = '\n'.join(cleaned_lines)
 
-        return result
+        # Sentinel-in-replace guard: if a REPLACE accidentally contained a sentinel,
+        # the decontamination above strips it, but we must flag it as a failure so
+        # the LLM knows its replacement was tainted.
+        if applied_count > 0 and any(
+            tok in result for tok in ("<<<<<<< SEARCH", ">>>>>>> REPLACE")
+        ):
+            failed_hunks.append({
+                "index": -1,
+                "search": "",
+                "replace": "",
+                "reason": "Resulting content still contains patch sentinels.",
+            })
+
+        partial = applied_count > 0 and len(failed_hunks) > 0
+        all_failed = applied_count == 0 and len(failed_hunks) > 0
+
+        reprompt = None
+        if failed_hunks:
+            reprompt = ArtefactManager._build_reprompt(failed_hunks, len(segments))
+
+        result_dict: Dict[str, Any] = {
+            "success": applied_count > 0,
+            "content": result,
+            "applied_hunks": applied_count,
+            "failed_hunks": failed_hunks,
+            "partial": partial,
+            "reprompt": reprompt,
+        }
+        if all_failed:
+            result_dict["error"] = "All patch hunks failed to apply."
+        return result_dict
 
     @staticmethod
     def _resolve_tag_visibility(raw_visibility: Optional[str]) -> Optional[str]:
@@ -3000,25 +3135,32 @@ class ArtefactManager:
                         disk_path = self._resolve_confined_path(resolved_title)
                         if disk_path.exists() and disk_path.is_file():
                             disk_content = disk_path.read_text(encoding="utf-8", errors="ignore")
-                            patched = ArtefactManager.apply_aider_patch(disk_content, content)
-                            result_artefact = self.add(
-                                title=resolved_title, artefact_type=atype, content=patched,
-                                language=language, version=version, active=auto_activate,
-                                commit_message=commit_message, version_tags=version_tags,
-                                ephemeral=is_ephemeral, status=status, visibility=visibility,
-                                **attrs
-                            )
+                            patch_result = ArtefactManager.apply_aider_patch_ex(disk_content, content)
+                            if patch_result["success"]:
+                                result_artefact = self.add(
+                                    title=resolved_title, artefact_type=atype, content=patch_result["content"],
+                                    language=language, version=version, active=auto_activate,
+                                    commit_message=commit_message, version_tags=version_tags,
+                                    ephemeral=is_ephemeral, status=status, visibility=visibility,
+                                    **attrs
+                                )
+                                if patch_result.get("reprompt"):
+                                    ASCIIColors.warning(
+                                        f"[ArtefactManager] Partial patch on '{resolved_title}': "
+                                        f"{patch_result['applied_hunks']} applied, "
+                                        f"{len(patch_result['failed_hunks'])} failed."
+                                    )
                     except Exception:
                         pass
 
                 if existing is not None:
-                    try:
-                        patched = ArtefactManager.apply_aider_patch(
-                            existing.get('content', ''), content
-                        )
+                    patch_result = ArtefactManager.apply_aider_patch_ex(
+                        existing.get('content', ''), content
+                    )
+                    if patch_result["success"]:
                         result_artefact = self.update(
                             title=resolved_title,
-                            new_content=patched,
+                            new_content=patch_result["content"],
                             new_title=new_name,
                             language=language,
                             bump_version=True,
@@ -3029,9 +3171,32 @@ class ArtefactManager:
                             status=status, visibility=visibility,
                             **attrs
                         )
-                    except ValueError as e:
+                        if patch_result.get("reprompt"):
+                            ASCIIColors.warning(
+                                f"[ArtefactManager] Partial patch on '{resolved_title}': "
+                                f"{patch_result['applied_hunks']} applied, "
+                                f"{len(patch_result['failed_hunks'])} failed. Reprompting LLM."
+                            )
+                            reprompt_msg = (
+                                f"[SYSTEM NOTICE: Partial patch applied to '{resolved_title}'. "
+                                f"{patch_result['applied_hunks']} hunk(s) succeeded and were saved. "
+                                f"{len(patch_result['failed_hunks'])} hunk(s) failed:\n\n"
+                                f"{patch_result['reprompt']}]"
+                            )
+                            if event_callback:
+                                try:
+                                    event_callback(None, False, reprompt_msg)
+                                except Exception:
+                                    pass
+                    else:
                         result_artefact = None
-                        error_msg = f"[SYSTEM ERROR: SEARCH/REPLACE patch failed for '{resolved_title}'. Error: {e}. You MUST retry the patch with the exact existing content.]"
+                        error_msg = (
+                            f"[SYSTEM ERROR: SEARCH/REPLACE patch failed for '{resolved_title}'. "
+                            f"Error: {patch_result.get('error', 'no hunks matched')}. "
+                            f"You MUST retry the patch with the exact existing content.]"
+                        )
+                        if patch_result.get("reprompt"):
+                            error_msg += f"\n\n{patch_result['reprompt']}"
                         cleaned = cleaned.replace(match.group(0), error_msg)
                         if event_callback:
                             try:

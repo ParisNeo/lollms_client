@@ -87,7 +87,9 @@ def load_env_file(env_path: Optional[Union[str, Path]] = None) -> Dict[str, str]
 
 _SERIALIZATION_PROFILE_SUFFIXES = (
     "_BINDING_ALIAS", "_BINDING_NAME", "_MODEL_NAME", "_IS_DEFAULT",
-    "_VISION_ENABLED", "_FORCED_CONTEXT_SIZE", "_VERIFY_SSL_CERTIFICATE",
+    "_VISION_ENABLED", "_VIDEO_ENABLED", "_IMAGE_TOKEN_COST",
+    "_THINKING_ENABLED", "_SUPPORTED_REASONING_EFFORTS", "_DEFAULT_REASONING_EFFORT",
+    "_FORCED_CONTEXT_SIZE", "_VERIFY_SSL_CERTIFICATE",
     "_INSTANCE_NAME",
 )
 
@@ -360,9 +362,29 @@ def _extract_bindings_from_env(prefix: str, env_data: Dict[str, str]) -> Dict[st
 
 _PROFILE_KNOWN_KEYS = (
     "BINDING_ALIAS", "BINDING_NAME", "MODEL_NAME", "IS_DEFAULT",
-    "VISION_ENABLED", "FORCED_CONTEXT_SIZE", "VERIFY_SSL_CERTIFICATE",
+    "VISION_ENABLED", "VIDEO_ENABLED", "IMAGE_TOKEN_COST",
+    "THINKING_ENABLED", "SUPPORTED_REASONING_EFFORTS", "DEFAULT_REASONING_EFFORT",
+    "FORCED_CONTEXT_SIZE", "VERIFY_SSL_CERTIFICATE",
     "INSTANCE_NAME",
 )
+
+# Keys whose values must be coerced when edited via the wizard.
+_PROFILE_BOOL_KEYS = frozenset({
+    "VISION_ENABLED", "VIDEO_ENABLED", "IS_DEFAULT",
+    "VERIFY_SSL_CERTIFICATE", "THINKING_ENABLED",
+})
+_PROFILE_INT_KEYS = frozenset({"IMAGE_TOKEN_COST", "FORCED_CONTEXT_SIZE"})
+
+# Defaults backfilled into existing LLM profiles so the edit menu always
+# exposes the full set of profile-level attributes.
+_LLM_PROFILE_DEFAULTS = {
+    "VISION_ENABLED": "false",
+    "VIDEO_ENABLED": "false",
+    "IMAGE_TOKEN_COST": "256",
+    "THINKING_ENABLED": "false",
+    "SUPPORTED_REASONING_EFFORTS": "low, medium, high",
+    "DEFAULT_REASONING_EFFORT": "",
+}
 
 
 def _auto_promote_default(profiles: Dict[str, Dict[str, Any]], registry_order: List[str]) -> None:
@@ -434,6 +456,25 @@ def _extract_profiles_from_env(prefix: str, bindings: Dict[str, Dict[str, Any]],
             default_flag_counter += 1
         elif key == "VISION_ENABLED":
             profiles[p_alias]["vision_enabled"] = _convert_to_bool(v)
+        elif key == "VIDEO_ENABLED":
+            profiles[p_alias]["video_enabled"] = _convert_to_bool(v)
+        elif key == "IMAGE_TOKEN_COST":
+            try:
+                profiles[p_alias]["image_token_cost"] = int(v)
+            except (TypeError, ValueError):
+                pass
+        elif key == "THINKING_ENABLED":
+            profiles[p_alias]["thinking_enabled"] = _convert_to_bool(v)
+        elif key == "SUPPORTED_REASONING_EFFORTS":
+            raw = str(v or "").strip()
+            if raw:
+                efforts = [s.strip().lower() for s in raw.split(",") if s.strip()]
+                profiles[p_alias]["supported_reasoning_efforts"] = efforts or ["low", "medium", "high"]
+            else:
+                profiles[p_alias]["supported_reasoning_efforts"] = ["low", "medium", "high"]
+        elif key == "DEFAULT_REASONING_EFFORT":
+            sv = str(v or "").strip().lower()
+            profiles[p_alias]["default_reasoning_effort"] = sv or None
         elif key == "FORCED_CONTEXT_SIZE":
             try:
                 profiles[p_alias]["forced_context_size"] = int(v)
@@ -453,7 +494,13 @@ def _extract_profiles_from_env(prefix: str, bindings: Dict[str, Dict[str, Any]],
         b_info = bindings.get(b_alias, {}) if b_alias else {}
         binding_name = p_data.get("binding_name") or b_info.get("binding_name")
         base_b_config = b_info.get("binding_config", {})
-        profile_b_config = {k: v for k, v in p_data.items() if k not in {"binding_alias", "is_default", "vision_enabled", "forced_context_size", "model_name", "instance_name", "binding_name", "routing_config"}}
+        profile_b_config = {k: v for k, v in p_data.items() if k not in {
+            "binding_alias", "is_default",
+            "vision_enabled", "video_enabled", "image_token_cost",
+            "thinking_enabled", "supported_reasoning_efforts", "default_reasoning_effort",
+            "forced_context_size", "model_name", "instance_name",
+            "binding_name", "routing_config",
+        }}
         merged_b_config = {**base_b_config, **profile_b_config}
         if "model_name" in p_data:
             merged_b_config["model_name"] = p_data["model_name"]
@@ -474,6 +521,11 @@ def _extract_profiles_from_env(prefix: str, bindings: Dict[str, Dict[str, Any]],
             "model_name": effective_model_name,
             "is_default": p_data.get("is_default", False),
             "vision_enabled": p_data.get("vision_enabled", False),
+            "video_enabled": p_data.get("video_enabled", False),
+            "image_token_cost": p_data.get("image_token_cost", 256),
+            "thinking_enabled": p_data.get("thinking_enabled", False),
+            "supported_reasoning_efforts": p_data.get("supported_reasoning_efforts") or ["low", "medium", "high"],
+            "default_reasoning_effort": p_data.get("default_reasoning_effort") or None,
             "forced_context_size": p_data.get("forced_context_size"),
             "routing_config": p_data.get("routing_config", {})
         }
@@ -1034,7 +1086,6 @@ def _bindings_menu(b_type: str, config_map: Dict[str, str]):
         existing_aliases = _get_configured_aliases(b_type, config_map, "BINDINGS")
         for alias in existing_aliases:
             menu.add_choice(f"✏️ Edit binding: {alias}", value=lambda a=alias: _edit_keys_menu(b_type, "BINDINGS", a, config_map))
-            menu.add_choice(f"🗑️ Delete binding: {alias}", value=lambda a=alias: _delete_entry(b_type, "BINDINGS", a, config_map))
 
         menu.add_choice("↩ Back", value=_BACK_VALUE)
 
@@ -1045,6 +1096,16 @@ def _bindings_menu(b_type: str, config_map: Dict[str, str]):
             selection()
 
 def _edit_keys_menu(b_type: str, category: str, alias: str, config_map: Dict[str, str]):
+    # Backfill profile-level defaults so pre-existing profiles expose the
+    # full editable attribute set (vision/video/image_token_cost/...).
+    if category.upper() == "PROFILES" and b_type == "llm":
+        prefix_upper = f"{b_type.upper()}_{category.upper()}_{alias.upper()}_"
+        existing_upper = {k.upper() for k in config_map if k.upper().startswith(prefix_upper)}
+        for default_key, default_val in _LLM_PROFILE_DEFAULTS.items():
+            full_key = f"{prefix_upper}{default_key}"
+            if full_key not in existing_upper:
+                config_map[full_key] = default_val
+
     while True:
         prefix_upper = f"{b_type.upper()}_{category.upper()}_{alias.upper()}_"
         keys = {}
@@ -1065,6 +1126,12 @@ def _edit_keys_menu(b_type: str, category: str, alias: str, config_map: Dict[str
             if k != "BINDING_NAME": # we can't update the binding name
                 menu.add_choice(f"✏️ Edit {k}: {str(v)[:40]}", value=lambda k=k: _edit_single_key(b_type, category, alias, k, config_map))
         menu.add_choice("➕ Add custom key", value=lambda: _add_custom_key(b_type, category, alias, config_map))
+        if category.upper() == "PROFILES":
+            _is_def_key = f"{b_type.upper()}_PROFILES_{alias.upper()}_IS_DEFAULT"
+            _is_default = str(config_map.get(_is_def_key, "")).lower() in ("true", "1", "yes", "y", "on")
+            if not _is_default:
+                menu.add_choice(f"⭐ Set as default: {alias}", value="__SET_DEFAULT__")
+        menu.add_choice(f"🗑️ Delete this {label_str}", value="__DELETE_ENTRY__")
         menu.add_choice("↩ Back", value=_BACK_VALUE)
 
         selection = menu.run()
@@ -1076,6 +1143,16 @@ def _edit_keys_menu(b_type: str, category: str, alias: str, config_map: Dict[str
                 # Update the local alias loop to ensure the next UI iteration
                 # shows the new name in the title and selections
                 alias = new_alias
+        elif selection == "__SET_DEFAULT__":
+            _set_default_profile_action(b_type, alias, config_map)
+            # Re-render the edit menu so the set-default option disappears
+            # (the profile is now default) and the badge state refreshes.
+            continue
+        elif selection == "__DELETE_ENTRY__":
+            if _delete_entry(b_type, category, alias, config_map):
+                # Entry was deleted — exit the edit loop so the caller
+                # re-renders the list without the removed entry.
+                return
         elif callable(selection):
             selection()
 
@@ -1089,12 +1166,24 @@ def _edit_single_key(b_type: str, category: str, alias: str, key: str, config_ma
             break
     curr_val = config_map.get(found_key or target_key, "")
     new_val = _safe_input_or_back(f"Enter new value for {key}", curr_val)
-    if new_val is not None:
-        if found_key:
-            config_map[found_key] = new_val
-        else:
-            config_map[target_key] = new_val
-        ASCIIColors.green(f"  ✓ Updated {key}")
+    if new_val is None:
+        return
+
+    key_upper = key.upper()
+    if key_upper in _PROFILE_BOOL_KEYS:
+        new_val = _format_env_value(_convert_to_bool(new_val))
+    elif key_upper in _PROFILE_INT_KEYS:
+        try:
+            new_val = str(int(new_val))
+        except (TypeError, ValueError):
+            ASCIIColors.red(f"  ⚠ '{new_val}' is not a valid integer for {key}. Value unchanged.")
+            return
+
+    if found_key:
+        config_map[found_key] = new_val
+    else:
+        config_map[target_key] = new_val
+    ASCIIColors.green(f"  ✓ Updated {key}")
 
 def _add_custom_key(b_type: str, category: str, alias: str, config_map: Dict[str, str]):
     new_key = _safe_input_or_back("Enter the name of the new key (e.g., SERVICE_KEY)", "")
@@ -1105,45 +1194,59 @@ def _add_custom_key(b_type: str, category: str, alias: str, config_map: Dict[str
             config_map[f"{b_type.upper()}_{category.upper()}_{alias.upper()}_{new_key_clean}"] = new_val
             ASCIIColors.green(f"  ✓ Added {new_key_clean}")
 
-def _delete_entry(b_type: str, category: str, alias: str, config_map: Dict[str, str]):
+def _delete_entry(b_type: str, category: str, alias: str, config_map: Dict[str, str]) -> bool:
+    """Deletes a binding or profile and all its keys after explicit confirmation.
+
+    Returns True when the entry was deleted, False when cancelled or when no
+    matching keys were found. Callers (e.g. the edit submenu) use the return
+    value to decide whether to exit the edit loop.
+    """
     cat_upper = category.upper()
     prefix = f"{b_type.upper()}_{cat_upper}_{alias}_".upper()
     keys_to_delete = [k for k in list(config_map.keys()) if k.upper().startswith(prefix)]
 
     if not keys_to_delete:
         ASCIIColors.yellow(f"\n  ⚠️ No {category.lower()[:-1]} found with alias '{alias}'.")
-        return
+        return False
 
     label = "binding" if cat_upper == "BINDINGS" else "profile"
-    if _safe_confirm(f"Are you sure you want to delete {label} '{alias}' and all its {len(keys_to_delete)} keys?", default=False):
-        was_default = False
-        for k in keys_to_delete:
-            if k.upper().endswith("_IS_DEFAULT") and str(config_map[k]).lower() in ("true", "1", "yes", "y", "on"):
-                was_default = True
-            del config_map[k]
-        ASCIIColors.green(f"\n  🗑️ Deleted {label}: {alias}")
+    if not _safe_confirm(
+        f"Are you sure you want to delete {label} '{alias}' and all its {len(keys_to_delete)} keys?",
+        default=False,
+    ):
+        ASCIIColors.info(f"\n  ℹ️ Deletion of {label} '{alias}' cancelled. No changes were made.")
+        return False
 
-        if cat_upper == "BINDINGS":
-            # Find and delete profiles referencing this binding
-            profile_prefix = f"{b_type.upper()}_PROFILES_"
-            orphaned_profiles = []
-            for k, v in list(config_map.items()):
-                if k.upper().startswith(profile_prefix) and k.upper().endswith("_BINDING_ALIAS") and v.upper() == alias.upper():
-                    profile_alias = k[len(profile_prefix):-len("_BINDING_ALIAS")].rstrip("_")
-                    orphaned_profiles.append(profile_alias)
+    was_default = False
+    for k in keys_to_delete:
+        if k.upper().endswith("_IS_DEFAULT") and str(config_map[k]).lower() in ("true", "1", "yes", "y", "on"):
+            was_default = True
+        del config_map[k]
+    ASCIIColors.green(f"\n  🗑️ Deleted {label}: {alias}")
 
-            for profile_alias in orphaned_profiles:
-                profile_keys = [k for k in list(config_map.keys()) if k.startswith(f"{profile_prefix}{profile_alias.upper()}_")]
-                for pk in profile_keys:
-                    del config_map[pk]
-                ASCIIColors.info(f"  🗑️ Deleted associated profile: {profile_alias}")
+    if cat_upper == "BINDINGS":
+        # Find and delete profiles referencing this binding
+        profile_prefix = f"{b_type.upper()}_PROFILES_"
+        orphaned_profiles = []
+        for k, v in list(config_map.items()):
+            if k.upper().startswith(profile_prefix) and k.upper().endswith("_BINDING_ALIAS") and v.upper() == alias.upper():
+                profile_alias = k[len(profile_prefix):-len("_BINDING_ALIAS")].rstrip("_")
+                orphaned_profiles.append(profile_alias)
 
-            if was_default:
-                ASCIIColors.info("  ℹ️ Default binding deleted; first remaining binding promoted.")
-        elif cat_upper == "PROFILES":
-            _enforce_single_default_profile(b_type, config_map)
-            if was_default:
-                ASCIIColors.info("  ℹ️ Default profile deleted; first remaining profile promoted.")
+        for profile_alias in orphaned_profiles:
+            profile_keys = [k for k in list(config_map.keys()) if k.startswith(f"{profile_prefix}{profile_alias.upper()}_")]
+            for pk in profile_keys:
+                del config_map[pk]
+            ASCIIColors.info(f"  🗑️ Deleted associated profile: {profile_alias}")
+
+        if was_default:
+            ASCIIColors.info("  ℹ️ Default binding deleted; first remaining binding promoted.")
+    elif cat_upper == "PROFILES":
+        _enforce_single_default_profile(b_type, config_map)
+        if was_default:
+            ASCIIColors.info("  ℹ️ Default profile deleted; first remaining profile promoted.")
+
+    return True
 
 def _extract_model_name(m: Any) -> Optional[str]:
     """Robustly extracts model name string from raw items (string or dict)."""
@@ -1283,6 +1386,23 @@ def _configure_profile_instance(b_type: str, alias: str, config_map: Dict[str, s
     if b_type == "llm":
         if _safe_confirm(f"Does profile '{alias}' support vision?", default=False):
             temp_profile["VISION_ENABLED"] = "true"
+        if _safe_confirm(f"Does profile '{alias}' support video input?", default=False):
+            temp_profile["VIDEO_ENABLED"] = "true"
+        img_cost = _safe_input_or_back("Tokens per image (leave blank for default 256)", "")
+        if img_cost is not None and img_cost.strip():
+            temp_profile["IMAGE_TOKEN_COST"] = img_cost.strip()
+        if _safe_confirm(f"Does profile '{alias}' support thinking / reasoning mode?", default=False):
+            temp_profile["THINKING_ENABLED"] = "true"
+        efforts = _safe_input_or_back(
+            "Supported reasoning efforts (comma-separated, blank = low, medium, high)", ""
+        )
+        if efforts is not None and efforts.strip():
+            temp_profile["SUPPORTED_REASONING_EFFORTS"] = efforts.strip()
+        default_effort = _safe_input_or_back(
+            "Default reasoning effort (blank = middle of list)", ""
+        )
+        if default_effort is not None and default_effort.strip():
+            temp_profile["DEFAULT_REASONING_EFFORT"] = default_effort.strip().lower()
         ctx = _safe_input_or_back("Force context size? (leave blank for auto)", "")
         if ctx is not None and ctx.strip():
             temp_profile["FORCED_CONTEXT_SIZE"] = ctx.strip()
@@ -1393,10 +1513,7 @@ def _profiles_menu(b_type: str, config_map: Dict[str, str]):
         for alias in existing_aliases:
             is_def = config_map.get(f"{b_type.upper()}_PROFILES_{alias.upper()}_IS_DEFAULT", "").lower() in ("true", "1", "yes", "y", "on")
             def_badge = " ⭐ [DEFAULT]" if is_def else ""
-            menu.add_choice(f"✏️ Edit profile: {alias}{def_badge}", value=lambda a=alias: _edit_keys_menu(b_type, "PROFILES", a, config_map))
-            if not is_def:
-                menu.add_choice(f"⭐ Set as default: {alias}", value=lambda a=alias: _set_default_profile_action(b_type, a, config_map))
-            menu.add_choice(f"🗑️ Delete profile: {alias}", value=lambda a=alias: _delete_entry(b_type, "PROFILES", a, config_map))
+            menu.add_choice(f"{alias}{def_badge}", value=lambda a=alias: _edit_keys_menu(b_type, "PROFILES", a, config_map))
 
         menu.add_choice("↩ Back", value=_BACK_VALUE)
 
@@ -1436,7 +1553,6 @@ def _connection_modality_menu(config_map: Dict[str, str]):
         menu.add_choice("🔗 Add Connection Binding", value=lambda: _add_connection_binding_flow(config_map))
         menu.add_choice("📱 Add Instance Profile (Channel)", value=lambda: _add_connection_profile_flow(config_map))
         menu.add_choice("✏️ Edit Existing", value=lambda: _connection_edit_menu(config_map))
-        menu.add_choice("🗑️ Delete", value=lambda: _connection_delete_menu(config_map))
         menu.add_choice("↩ Back", value=_BACK_VALUE)
 
         existing = _get_configured_aliases("connection", config_map, "BINDINGS")

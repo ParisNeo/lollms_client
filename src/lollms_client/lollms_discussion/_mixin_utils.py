@@ -193,6 +193,37 @@ class UtilsMixin:
         status = self.get_context_status(branch_tip_id)
         return status["current_tokens"]
 
+    def _image_tokens_for(self, img_data: Any) -> int:
+        """
+        Best-effort image token estimate.
+
+        Uses the binding's ``count_image_tokens`` when available; otherwise falls
+        back to a conservative heuristic based on base64 payload length so that
+        image usage is never silently dropped from the context composition.
+        """
+        if not img_data:
+            return 0
+        client = self.lollmsClient
+        counter = getattr(client, "count_image_tokens", None) if client else None
+        if callable(counter):
+            try:
+                val = counter(img_data)
+                if isinstance(val, (int, float)) and val >= 0:
+                    return int(val)
+            except Exception:
+                pass
+        try:
+            if isinstance(img_data, dict):
+                raw = img_data.get("data") or img_data.get("base64") or ""
+            else:
+                raw = img_data
+            if isinstance(raw, str) and raw:
+                # ~1 vision token per 750 base64 chars (conservative tile proxy).
+                return max(1, len(raw) // 750)
+        except Exception:
+            pass
+        return 0
+
     def get_context_status(self, branch_tip_id=None) -> Dict[str, Any]:
         """
         Provides a detailed breakdown of token usage across all context zones.
@@ -332,17 +363,29 @@ class UtilsMixin:
                 img_count = len(active_imgs)
                 img_toks = 0
                 if img_count > 0:
-                    img_toks = sum(self.lollmsClient.count_image_tokens(img_data) for img_data in active_imgs)
+                    img_toks = sum(self._image_tokens_for(img_data) for img_data in active_imgs)
                     history_breakdown["image_tokens"] += img_toks
                     content += f"\n({img_count} image(s) attached)"
                 
                 msg_text = f"!@>{sender_clean}:\n{content}\n"
                 
+                # The annotation is appended to `content` above when images are
+                # present, so `msg_text` already includes it. The cached
+                # `msg.tokens` value, however, is the TEXT-ONLY count (computed
+                # without the annotation) so it stays stable across image
+                # toggles. We therefore always add the annotation delta when
+                # images are present, regardless of whether `msg.tokens` was
+                # cached or freshly computed.
+                annotation = f"\n({img_count} image(s) attached)" if img_count > 0 else ""
+                annotation_toks = tokenizer(annotation) if annotation else 0
+
                 if getattr(msg, "tokens", None) is not None and msg.tokens > 0:
-                    msg_toks = msg.tokens
+                    msg_toks = msg.tokens + annotation_toks
                 else:
-                    msg_toks = tokenizer(msg_text)
-                    msg.tokens = msg_toks
+                    # Persist text-only count so it stays stable across image toggles.
+                    text_only = f"!@>{sender_clean}:\n{msg.content}\n"
+                    msg.tokens = tokenizer(text_only)
+                    msg_toks = msg.tokens + annotation_toks
                     cache_dirty = True
                 
                 history_breakdown["text_tokens"] += msg_toks
@@ -355,12 +398,33 @@ class UtilsMixin:
 
         disc_imgs = self.get_discussion_images()
         active_disc_imgs = [i for i in disc_imgs if i.get('active', True)]
+        disc_img_tokens = 0
         if active_disc_imgs:
-            disc_img_tokens = sum(self.lollmsClient.count_image_tokens(i['data']) for i in active_disc_imgs)
+            disc_img_tokens = sum(self._image_tokens_for(i['data']) for i in active_disc_imgs)
             result["zones"]["discussion_images"] = {
                 "tokens": disc_img_tokens,
                 "count": len(active_disc_imgs)
             }
+
+        # Additive top-level image summary so any UI can surface image usage
+        # without parsing zone sub-dicts.
+        msg_img_tokens = history_breakdown.get("image_tokens", 0)
+        msg_img_count = 0
+        if branch_tip_id:
+            for _m in msgs_to_render:
+                msg_img_count += len(_m.get_active_images())
+        result["images"] = {
+            "discussion_images": {
+                "count": len(active_disc_imgs),
+                "tokens": disc_img_tokens,
+            },
+            "message_images": {
+                "count": msg_img_count,
+                "tokens": msg_img_tokens,
+            },
+            "total_images": len(active_disc_imgs) + msg_img_count,
+            "total_image_tokens": disc_img_tokens + msg_img_tokens,
+        }
 
         total_tokens = sum(z.get("tokens", 0) for z in result["zones"].values())
         result["current_tokens"] = total_tokens
@@ -442,6 +506,7 @@ class UtilsMixin:
         current.append({"data":image_b64,"source":source,"active":active,
                          "created_at":utc_now_iso()})
         self.images = current
+        self._invalidate_discussion_image_token_cache()
         self.touch()
 
     def get_discussion_images(self):
@@ -461,6 +526,7 @@ class UtilsMixin:
             raise IndexError("Discussion image index out of range.")
         current[index]["active"] = not current[index].get("active",True) if active is None else bool(active)
         self.images = current
+        self._invalidate_discussion_image_token_cache()
         self.touch()
 
     def remove_discussion_image(self, index, commit=True):
@@ -469,9 +535,18 @@ class UtilsMixin:
             raise IndexError("Discussion image index out of range.")
         del current[index]
         self.images = current
+        self._invalidate_discussion_image_token_cache()
         self.touch()
         if commit:
             self.commit()
+
+    def _invalidate_discussion_image_token_cache(self):
+        """Drops cached discussion-image token counts so the next status call recomputes."""
+        meta = dict(self.metadata or {})
+        cache = meta.get("_token_cache")
+        if isinstance(cache, dict):
+            cache.pop("discussion_images", None)
+            self.metadata = meta
 
     def fix_orphan_messages(self):
         ASCIIColors.info(f"Checking discussion {self.id} for orphans...")

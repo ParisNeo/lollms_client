@@ -1585,12 +1585,13 @@ class LollmsBinding(LollmsLLMBinding):
 
     def get_model_info(self) -> dict:
         return {
-            "name": "LoLLMs",
-            "version": "2.0",
-            "host_address": self.open_ai_host_address,
+            "name": "lollms",
             "model_name": self.model_name,
+            "host": self.host_address,
+            "vision_enabled": self.vision_enabled,
+            "video_enabled": self.video_enabled,
+            "supported_reasoning_efforts": self.supported_reasoning_efforts,
         }
-
     def _extract_models_from_payload(self, payload: Any) -> List[str]:
         if not payload:
             return []

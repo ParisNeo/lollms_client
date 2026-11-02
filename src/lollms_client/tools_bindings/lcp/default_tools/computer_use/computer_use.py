@@ -53,6 +53,96 @@ def init_tools_library(config: Optional[dict] = None) -> None:
 
 # ─────────────────────────── Backend abstraction ────────────────────────────
 
+_MODEL_MAX_EDGE = 1280  # long edge (px) of the screen as the model sees it
+
+
+class _ScaledBackend:
+    """
+    Shows the model a downscaled screen ("model space", long edge <=
+    _MODEL_MAX_EDGE) and maps every coordinate back to physical pixels.
+    Everything above this layer (screenshots, grid, clamps, grounding,
+    cursor reports) lives in model space only.
+    """
+
+    def __init__(self, raw: Any):
+        self._raw = raw
+        self._sw = self._sh = self._mw = self._mh = 1
+        self._refresh()
+
+    def _refresh(self) -> None:
+        sw, sh = self._raw.size()
+        ratio = min(1.0, _MODEL_MAX_EDGE / float(max(sw, sh)))
+        self._sw, self._sh = int(sw), int(sh)
+        self._mw = max(1, int(round(sw * ratio)))
+        self._mh = max(1, int(round(sh * ratio)))
+
+    def _px(self, x: Any, y: Any) -> Tuple[Any, Any]:
+        """Model-space point -> physical pixels (None passes through)."""
+        if x is None or y is None:
+            return x, y
+        self._refresh()
+        px = min(self._sw - 1, max(0, int(round(float(x) * self._sw / self._mw))))
+        py = min(self._sh - 1, max(0, int(round(float(y) * self._sh / self._mh))))
+        return px, py
+
+    def size(self) -> Tuple[int, int]:
+        self._refresh()
+        return self._mw, self._mh
+
+    def position(self) -> Tuple[int, int]:
+        self._refresh()
+        rx, ry = self._raw.position()
+        return (
+            int(round(rx * self._mw / self._sw)),
+            int(round(ry * self._mh / self._sh)),
+        )
+
+    def screenshot(self, region: Optional[Tuple[int, int, int, int]] = None):
+        from PIL import Image
+
+        self._refresh()
+        if region is None:
+            target = (self._mw, self._mh)
+            image = self._raw.screenshot()
+        else:
+            rx, ry, rw, rh = region
+            px, py = self._px(rx, ry)
+            pw = max(1, min(self._sw - px, int(round(rw * self._sw / self._mw))))
+            ph = max(1, min(self._sh - py, int(round(rh * self._sh / self._mh))))
+            target = (max(1, int(rw)), max(1, int(rh)))
+            image = self._raw.screenshot(region=(px, py, pw, ph))
+        if image.size != target:
+            image = image.resize(target, Image.LANCZOS)
+        return image
+
+    def click(self, x=None, y=None, **kwargs):
+        px, py = self._px(x, y)
+        return self._raw.click(x=px, y=py, **kwargs)
+
+    def moveTo(self, x=None, y=None, **kwargs):
+        px, py = self._px(x, y)
+        return self._raw.moveTo(px, py, **kwargs)
+
+    def dragTo(self, x=None, y=None, **kwargs):
+        px, py = self._px(x, y)
+        return self._raw.dragTo(px, py, **kwargs)
+
+    def mouseDown(self, x=None, y=None, **kwargs):
+        px, py = self._px(x, y)
+        return self._raw.mouseDown(x=px, y=py, **kwargs)
+
+    def mouseUp(self, x=None, y=None, **kwargs):
+        px, py = self._px(x, y)
+        return self._raw.mouseUp(x=px, y=py, **kwargs)
+
+    def scroll(self, clicks, x=None, y=None, **kwargs):
+        px, py = self._px(x, y)
+        return self._raw.scroll(clicks, x=px, y=py, **kwargs)
+
+    def __getattr__(self, name: str):
+        return getattr(self._raw, name)
+
+
 _BACKEND: Optional[Any] = None
 _BACKEND_ERROR: Optional[str] = None
 
@@ -77,7 +167,7 @@ def _resolve_backend():
         except Exception:
             pass
         pyautogui.size()
-        _BACKEND = pyautogui
+        _BACKEND = _ScaledBackend(pyautogui)
         return _BACKEND, None
     except Exception as import_err:
         _BACKEND_ERROR = (
@@ -200,6 +290,16 @@ def _extract_coordinates_with_scale(
     """
     if not text:
         return None
+
+    det_match = re.search(
+        r'<\|det\|>\s*\[\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]', text
+    )
+    if det_match:
+        x1, y1, x2, y2 = (int(g) for g in det_match.groups())
+        return _clamp_coordinates(
+            int(round(((x1 + x2) / 2.0) / 999.0 * screen_width)),
+            int(round(((y1 + y2) / 2.0) / 999.0 * screen_height)),
+        )
 
     json_blob_match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
     if json_blob_match:
@@ -1490,14 +1590,14 @@ def tool_computer_execute_step(
     Args:
     step_description (str): The specific, self-contained step to execute. Must be detailed enough for a fresh agent to complete without prior context.
     max_attempts (int): Maximum action cycles before giving up. Default 8.
-"""
-if not isinstance(step_description, str) or not step_description.strip():
-    return {"success": False, "error": "step_description is required and must be a non-empty string."}
-client = env.client if env else None
-if not client:
-    return {"success": False, "error": "This tool requires a host client (host-injected via env.client)."}
-if not _vision_capability_ready(client):
-    return {"success": False, "error": "A vision-capable model is required to execute desktop steps."}
+    """
+    if not isinstance(step_description, str) or not step_description.strip():
+        return {"success": False, "error": "step_description is required and must be a non-empty string."}
+    client = env.client if env else None
+    if not client:
+        return {"success": False, "error": "This tool requires a host client (host-injected via env.client)."}
+    if not _vision_capability_ready(client):
+        return {"success": False, "error": "A vision-capable model is required to execute desktop steps."}
 
     try:
         max_attempts = max(1, min(int(max_attempts), 20))

@@ -285,7 +285,10 @@ _build_xlsx_guard_failure = _build_office_guard_failure
 
 def tool_execute_python_data_query(
     code: str = "",
-    env: Optional[Any] = None
+    env: Optional[Any] = None,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """
     Execute sandboxed Python code to analyze or modify datasets in the workspace.
@@ -308,7 +311,8 @@ def tool_execute_python_data_query(
         code (str, optional): The Python code to execute, or the name of a Python file in the workspace. Defaults to empty.
         env (Any, optional): Host-injected unified runtime context (env.discussion, env.client). Defaults to None.
     """
-    discussion_instance = getattr(env, "discussion", None) if env else None
+    disc = discussion_instance or (getattr(env, "discussion", None) if env else None)
+    client = lollms_client_instance or (getattr(env, "client", None) if env else None)  # parity; may be unused
     if isinstance(code, dict):
         ASCIIColors.warning("[execute_python_data_query] Unwrapping nested dictionary parameter.")
         code = code.get("code") or code.get("sql_query") or next((v for v in code.values() if isinstance(v, str)), "")
@@ -482,22 +486,22 @@ def tool_execute_python_data_query(
                             auto_loaded_df_file.name, df_reason, restoration_note, redirected_output.getvalue()
                         )
 
-                if discussion_instance and hasattr(discussion_instance, "artefacts"):
+                if disc and hasattr(disc, "artefacts"):
                     art_title = auto_loaded_df_file.name
-                    existing_art = discussion_instance.artefacts.get(art_title)
+                    existing_art = disc.artefacts.get(art_title)
                     if not existing_art and auto_loaded_df_file.stem != auto_loaded_df_file.name:
-                        existing_art = discussion_instance.artefacts.get(auto_loaded_df_file.stem)
+                        existing_art = disc.artefacts.get(auto_loaded_df_file.stem)
                         if existing_art:
                             art_title = auto_loaded_df_file.stem
 
                     if existing_art:
-                        discussion_instance.artefacts.update(
+                        disc.artefacts.update(
                             title=art_title,
                             new_content=local_vars["df"].to_csv(index=False, sep=auto_loaded_sep if auto_loaded_df_file.suffix.lower() == ".csv" else ","),
                             bump_version=True,
                             active=True
                         )
-                        discussion_instance.commit()
+                        disc.commit()
             except Exception as save_err:
                 ASCIIColors.warning(f"[execute_python_data_query] Failed to persist df: {save_err}")
 
@@ -515,25 +519,25 @@ def tool_execute_python_data_query(
                 plot_path = Path(".") / plot_filename
                 fig.savefig(str(plot_path), bbox_inches='tight', facecolor=fig.get_facecolor())
 
-                if discussion_instance and hasattr(discussion_instance, "artefacts"):
+                if disc and hasattr(disc, "artefacts"):
                     try:
                         art_title = plot_filename
                         comp_title = f"{art_title}::images"
-                        existing_comp = discussion_instance.artefacts.get(comp_title)
+                        existing_comp = disc.artefacts.get(comp_title)
 
                         if existing_comp:
                             existing_imgs = existing_comp.get("images", [])
                             existing_mtypes = existing_comp.get("image_media_types", [])
                             existing_imgs.append(plot_b64)
                             existing_mtypes.append("image/png")
-                            discussion_instance.artefacts.update(
+                            disc.artefacts.update(
                                 title=comp_title,
                                 new_images=existing_imgs,
                                 new_image_media_types=existing_mtypes,
                                 active=True
                             )
                         else:
-                            discussion_instance.artefacts.add(
+                            disc.artefacts.add(
                                 title=art_title,
                                 artefact_type="image",
                                 content=f"![{art_title}]({art_title})",
@@ -542,7 +546,7 @@ def tool_execute_python_data_query(
                                 active=True,
                                 file_ext=".png"
                             )
-                        discussion_instance.commit()
+                        disc.commit()
                         ASCIIColors.info(f"[execute_python_data_query] Synced plot '{art_title}' to artefact system.")
                     except Exception as sync_err:
                         ASCIIColors.warning(f"[execute_python_data_query] Failed to sync plot to artefact system: {sync_err}")

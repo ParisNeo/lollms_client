@@ -42,6 +42,24 @@ from lollms_client.lollms_base_binding import LollmsBaseBinding
 
 from lollms_client.lollms_discussion import LollmsDiscussion
 
+_DEFAULT_EFFORTS = ("low", "medium", "high")
+_EFFORT_OFF_TOKENS = {"", "none", "off", "disabled", "false", "0", "no"}
+
+
+def _normalize_effort_list(value) -> List[str]:
+    """Accepts None, a comma-separated string, or a list. Returns a clean list."""
+    if value is None:
+        return list(_DEFAULT_EFFORTS)
+    if isinstance(value, str):
+        value = value.split(",")
+    out: List[str] = []
+    for item in value:
+        s = str(item).strip().lower()
+        if s and s not in _EFFORT_OFF_TOKENS and s not in out:
+            out.append(s)
+    return out or list(_DEFAULT_EFFORTS)
+
+
 @dataclass
 class LollmsBindingProfile:
     """
@@ -52,6 +70,21 @@ class LollmsBindingProfile:
     binding_name: str
     binding_config: Dict[str, Any] = field(default_factory=dict)
     is_default: bool = False
+    video_enabled: bool = False
+    image_token_cost: int = 256
+    thinking_enabled: bool = False
+    supported_reasoning_efforts: Optional[List[str]] = None
+    default_reasoning_effort: Optional[str] = None
+
+    def __post_init__(self):
+        self.supported_reasoning_efforts = _normalize_effort_list(
+            getattr(self, "supported_reasoning_efforts", None)
+        )
+        if self.default_reasoning_effort:
+            self.default_reasoning_effort = str(self.default_reasoning_effort).strip().lower()
+        if not self.thinking_enabled:
+            self.default_reasoning_effort = None
+
 
 @dataclass
 class LollmsModelProfile:
@@ -69,6 +102,19 @@ class LollmsModelProfile:
     glm_image_embedding: bool = False
     supported_reasoning_efforts: Optional[List[str]] = None
     video_enabled: bool = False
+    image_token_cost: int = 256
+    thinking_enabled: bool = False
+    default_reasoning_effort: Optional[str] = None
+
+    def __post_init__(self):
+        self.supported_reasoning_efforts = _normalize_effort_list(
+            getattr(self, "supported_reasoning_efforts", None)
+        )
+        if self.default_reasoning_effort:
+            self.default_reasoning_effort = str(self.default_reasoning_effort).strip().lower()
+        if not self.thinking_enabled:
+            # Capability is declared but inert when thinking is off.
+            self.default_reasoning_effort = None
 
 
 class LollmsClient():
@@ -388,7 +434,12 @@ class LollmsClient():
                         name=alias,
                         binding_name=p_data.get("binding_name"),
                         binding_config=hoisted_config,
-                        is_default=p_data.get("is_default", False)
+                        is_default=p_data.get("is_default", False),
+                        video_enabled=p_data.get("video_enabled", False),
+                        image_token_cost=p_data.get("image_token_cost", 256),
+                        thinking_enabled=p_data.get("thinking_enabled", False),
+                        supported_reasoning_efforts=p_data.get("supported_reasoning_efforts"),
+                        default_reasoning_effort=p_data.get("default_reasoning_effort"),
                     )
                 registry[alias] = profile
 
@@ -439,7 +490,10 @@ class LollmsClient():
                         routing_config=p_data.get("routing_config") or p_data.get("routing_profile"),
                         glm_image_embedding=p_data.get("glm_image_embedding", False),
                         supported_reasoning_efforts=parsed_efforts,
-                        video_enabled=p_data.get("video_enabled", False)
+                        video_enabled=p_data.get("video_enabled", False),
+                        image_token_cost=p_data.get("image_token_cost", 256),
+                        thinking_enabled=p_data.get("thinking_enabled", False),
+                        default_reasoning_effort=p_data.get("default_reasoning_effort", None)
                     )
                 registry[alias] = profile
 
@@ -560,6 +614,15 @@ class LollmsClient():
         # Base connection config from the binding profile
         b_config = binding_profile.binding_config.copy() if binding_profile.binding_config else {}
 
+        # Merge binding-profile capability fields into the binding config so they
+        # reach the binding constructor as kwargs. Model-profile values override
+        # these later via setattr.
+        b_config.setdefault("video_enabled", binding_profile.video_enabled)
+        b_config.setdefault("image_token_cost", binding_profile.image_token_cost)
+        b_config.setdefault("thinking_enabled", binding_profile.thinking_enabled)
+        b_config.setdefault("supported_reasoning_efforts", binding_profile.supported_reasoning_efforts)
+        b_config.setdefault("default_reasoning_effort", binding_profile.default_reasoning_effort)
+
         _ssl_debug = os.getenv("LOLLMS_DEBUG_SSL", "").lower() in ("1", "true", "yes")
         if _ssl_debug:
             ASCIIColors.yellow(f"[LollmsClient][SSL-DEBUG] instantiating {modality.upper()} '{alias}' from binding profile '{binding_profile.name}' (binding_name='{binding_profile.binding_name}')")
@@ -602,13 +665,23 @@ class LollmsClient():
             if binding:
                 setattr(binding, "vision_enabled", model_profile.vision_enabled or getattr(binding, "vision_enabled", False))
                 setattr(binding, "video_enabled", model_profile.video_enabled or getattr(binding, "video_enabled", False))
+                setattr(binding, "image_token_cost", int(getattr(model_profile, "image_token_cost", 256)))
                 if hasattr(binding, "forced_context_size"):
                     setattr(binding, "forced_context_size", model_profile.forced_context_size)
                 if hasattr(binding, "routing_config"):
                     setattr(binding, "routing_config", model_profile.routing_config)
                 setattr(binding, "glm_image_embedding", model_profile.glm_image_embedding or getattr(binding, "glm_image_embedding", False))
-                if model_profile.supported_reasoning_efforts is not None:
-                    setattr(binding, "supported_reasoning_efforts", model_profile.supported_reasoning_efforts)
+                # Thinking capability now flows FROM the profile TO the binding.
+                # The binding's own kwargs defaults are only a fallback for
+                # guests that construct a binding without a profile.
+                try:
+                    _efforts = list(getattr(model_profile, "supported_reasoning_efforts", None) or [])
+                    if _efforts:
+                        setattr(binding, "supported_reasoning_efforts", _efforts)
+                    setattr(binding, "thinking_enabled", bool(getattr(model_profile, "thinking_enabled", False)))
+                    setattr(binding, "default_reasoning_effort", getattr(model_profile, "default_reasoning_effort", None))
+                except Exception:
+                    pass
                 return binding
         except Exception as e:
             trace_exception(e)
@@ -2164,11 +2237,22 @@ class LollmsClient():
             raise ValueError(f"Unsupported config format: {format!r}. Only 'yaml' is supported.")
 
         def _binding_dict(p: "LollmsBindingProfile") -> Dict[str, Any]:
-            return {
+            out: Dict[str, Any] = {
                 "binding_name": p.binding_name,
                 "binding_config": dict(p.binding_config or {}),
                 "is_default": p.is_default,
             }
+            if p.video_enabled:
+                out["video_enabled"] = p.video_enabled
+            if p.image_token_cost != 256:
+                out["image_token_cost"] = p.image_token_cost
+            if p.thinking_enabled:
+                out["thinking_enabled"] = p.thinking_enabled
+            if p.supported_reasoning_efforts and p.supported_reasoning_efforts != ["low", "medium", "high"]:
+                out["supported_reasoning_efforts"] = list(p.supported_reasoning_efforts)
+            if p.default_reasoning_effort:
+                out["default_reasoning_effort"] = p.default_reasoning_effort
+            return out
 
         def _model_dict(p: "LollmsModelProfile") -> Dict[str, Any]:
             out: Dict[str, Any] = {
@@ -2187,6 +2271,12 @@ class LollmsClient():
                 out["supported_reasoning_efforts"] = list(p.supported_reasoning_efforts)
             if p.video_enabled:
                 out["video_enabled"] = p.video_enabled
+            if p.image_token_cost != 256:
+                out["image_token_cost"] = p.image_token_cost
+            if p.thinking_enabled:
+                out["thinking_enabled"] = p.thinking_enabled
+            if p.default_reasoning_effort:
+                out["default_reasoning_effort"] = p.default_reasoning_effort
             return out
 
         modality_registries = {

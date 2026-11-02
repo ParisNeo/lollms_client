@@ -133,6 +133,34 @@ class TestContextBudgetGuard(unittest.TestCase):
         self.assertTrue(ss.context_unlock_requested)
         self.assertIn("huge_data.json", ss.context_unlocked_files)
 
+    def test_context_status_counts_images(self):
+        """Verifies images loaded into a discussion are reflected in get_context_status."""
+        self.client.count_image_tokens = lambda img: 150
+        self.discussion.add_discussion_image("base64img" * 100, source="user", active=True)
+        self.discussion.add_discussion_image("base64img" * 100, source="user", active=True)
+        self.discussion.add_message(sender="User", content="look at this", sender_type="user")
+        branch = self.discussion.get_branch(self.discussion.active_branch_id)
+        branch[-1].images = [{"data": "base64img" * 100, "active": True}]
+        self.discussion.commit()
+
+        status = self.discussion.get_context_status()
+        self.assertIn("images", status)
+        self.assertEqual(status["images"]["discussion_images"]["count"], 2)
+        self.assertGreater(status["images"]["discussion_images"]["tokens"], 0)
+        self.assertGreater(status["images"]["total_image_tokens"], 0)
+        mh = status["zones"].get("message_history", {})
+        self.assertGreaterEqual(mh.get("breakdown", {}).get("image_tokens", 0), 0)
+
+    def test_context_status_without_count_image_tokens(self):
+        """Client lacking count_image_tokens must not crash get_context_status."""
+        self.client.count_image_tokens = None
+        self.discussion.add_discussion_image("x" * 1500, source="user", active=True)
+        self.discussion.commit()
+        status = self.discussion.get_context_status()
+        self.assertIn("images", status)
+        self.assertEqual(status["images"]["discussion_images"]["count"], 1)
+        self.assertGreater(status["images"]["discussion_images"]["tokens"], 0)
+
     def test_unlock_file_allowed_for_small_file(self):
         """
         Scenario: The LLM attempts to <unlock_file> a small file (<50k tokens).

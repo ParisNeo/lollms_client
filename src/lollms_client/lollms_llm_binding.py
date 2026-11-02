@@ -16,6 +16,39 @@ import yaml
 import json
 
 
+def _coerce_positive_int(value, fallback: int) -> int:
+    """Coerces a value to a positive int, falling back on bad input."""
+    try:
+        n = int(value)
+        return n if n > 0 else fallback
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _normalize_effort_list(value):
+    """Accepts None, a comma-separated string, or a list. Returns a clean list.
+
+    Delegates to the shared normalizer in ``lollms_core`` when available
+    (lazy import to avoid a circular import at module load time), and falls
+    back to an inline copy otherwise.
+    """
+    try:
+        from lollms_client.lollms_core import _normalize_effort_list as _shared
+        return _shared(value)
+    except Exception:
+        pass
+    if value is None:
+        return ["low", "medium", "high"]
+    if isinstance(value, str):
+        value = value.split(",")
+    out = []
+    for item in value:
+        s = str(item).strip().lower()
+        if s and s not in {"", "none", "off", "disabled", "false", "0", "no"} and s not in out:
+            out.append(s)
+    return out or ["low", "medium", "high"]
+
+
 @lru_cache(maxsize=1)
 def load_known_contexts() -> dict:
     """
@@ -96,13 +129,21 @@ class LollmsLLMBinding(LollmsBaseBinding):
         self.default_n_threads = kwargs.get("n_threads")
         self.default_streaming_callback = kwargs.get("streaming_callback")
         self.glm_image_embedding = kwargs.get("glm_image_embedding", False)
-        self.supported_reasoning_efforts: Optional[List[str]] = kwargs.get(
-            "supported_reasoning_efforts"
+        # ── Capability carriers (mirror LollmsModelProfile / LollmsBindingProfile) ──
+        # The model profile is authoritative; these are the fallback values that
+        # every binding instance carries so profile-less guests behave identically.
+        self.image_token_cost: int = _coerce_positive_int(kwargs.get("image_token_cost"), 256)
+        self.video_enabled: bool = bool(kwargs.get("video_enabled", False))
+        self.thinking_enabled: bool = bool(kwargs.get("thinking_enabled", False))
+        self.supported_reasoning_efforts: List[str] = _normalize_effort_list(
+            kwargs.get("supported_reasoning_efforts")
         )
-        self.video_enabled = kwargs.get("video_enabled", False)
-        self.supported_reasoning_efforts: Optional[List[str]] = kwargs.get(
-            "supported_reasoning_efforts"
+        _default_effort = kwargs.get("default_reasoning_effort")
+        self.default_reasoning_effort: Optional[str] = (
+            str(_default_effort).strip().lower() if _default_effort else None
         )
+        if not self.thinking_enabled:
+            self.default_reasoning_effort = None
 
         # Prompt Formatting defaults
         self.user_name = kwargs.get("user_name", "user")

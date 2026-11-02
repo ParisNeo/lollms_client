@@ -1316,7 +1316,13 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         return body
 
     def _stream_completion(self, completion, callback: Optional[Callable]) -> str:
-        """Drains a streaming completion and feeds chunks to *callback*."""
+        """Drains a streaming completion and feeds chunks to *callback*.
+
+        Guarantees balanced  thinking...</think> delimiters: if the stream ends
+        while still in thinking mode (no content chunk followed), the closing
+        tag is emitted at end-of-stream so downstream artefact/stream parsers
+        never see an unbalanced block.
+        """
         full = []
         in_thinking = False
         for chunk in completion:
@@ -1330,23 +1336,20 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                 if not in_thinking:
                     in_thinking = True
                     if callback:
-                        callback("<think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
-                    full.append("<think>\n")
-                if callback:
-                    callback(reasoning, MSG_TYPE.MSG_TYPE_CHUNK)
-                full.append(reasoning)
-                continue
-
-            if content:
-                if in_thinking:
-                    in_thinking = False
-                    if callback:
-                        callback("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                        callback(" thinking\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                    full.append("\n", MSG_TYPE.MSG_TYPE_CHUNK)
                     full.append("\n</think>\n")
                 full.append(content)
                 if callback:
                     if not callback(content, MSG_TYPE.MSG_TYPE_CHUNK):
                         break
+
+        # Flush any dangling think block so the accumulated output is balanced.
+        if in_thinking:
+            if callback:
+                callback("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+            full.append("\n</think>\n")
+
         return "".join(full)
 
     def _stream_raw_completion(self, completion, callback: Optional[Callable]) -> str:

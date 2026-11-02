@@ -32,6 +32,40 @@ _MAX_RESULT_CHARS = 8000
 _CHILD_AGENTS: Dict[str, Dict[str, Any]] = {}
 _REGISTRY_LOCK = threading.Lock()
 
+# ── Authoritative editable schema of an LLM model profile ───────────────────
+# One entry per field on LollmsModelProfile. Host UIs render one editor input
+# per entry, pre-populated with models[*][field["name"]] (or field["default"]).
+# Adding a new profile field requires updating ONLY this tuple.
+_MODEL_PROFILE_FIELD_SCHEMA = (
+    {"name": "name", "type": "str", "default": "", "editable": True,
+     "description": "Profile alias (unique key in the registry)."},
+    {"name": "binding_profile_name", "type": "str", "default": "", "editable": True,
+     "description": "Binding profile providing the actual connection (host, API key, binding library)."},
+    {"name": "model_name", "type": "str|null", "default": None, "editable": True,
+     "description": "Underlying model identifier passed to the binding (e.g. 'gpt-4o', 'llama3')."},
+    {"name": "is_default", "type": "bool", "default": False, "editable": True,
+     "description": "Mark this profile as the client's default model."},
+    {"name": "vision_enabled", "type": "bool", "default": False, "editable": True,
+     "description": "Model accepts image input."},
+    {"name": "video_enabled", "type": "bool", "default": False, "editable": True,
+     "description": "Model accepts video input."},
+    {"name": "glm_image_embedding", "type": "bool", "default": False, "editable": True,
+     "description": "Use GLM-style image embeddings for retrieval (advanced)."},
+    {"name": "image_token_cost", "type": "int", "default": 256, "editable": True,
+     "description": "Approximate tokens charged per image when the binding gives no count_image_tokens."},
+    {"name": "thinking_enabled", "type": "bool", "default": False, "editable": True,
+     "description": "Model supports explicit thinking / reasoning mode."},
+    {"name": "supported_reasoning_efforts", "type": "list[str]",
+     "default": ["low", "medium", "high"], "editable": True,
+     "description": "Ordered effort levels the model accepts (cheap to expensive)."},
+    {"name": "default_reasoning_effort", "type": "str|null", "default": None, "editable": True,
+     "description": "Effort used when the caller says 'think' with no level (null = middle of supported list)."},
+    {"name": "forced_context_size", "type": "int|null", "default": None, "editable": True,
+     "description": "Override the binding's context window in tokens."},
+    {"name": "routing_config", "type": "dict", "default": {}, "editable": True,
+     "description": "Autorouting settings (smart-router binding; usually empty)."},
+)
+
 
 def _require_client(lollms_client_instance) -> Any:
     if lollms_client_instance is None:
@@ -139,9 +173,10 @@ def _run_child_agent(agent_id: str, client: Any, model_alias: str, binding: Any,
 def tool_list_models(lollms_client_instance=None) -> Dict[str, Any]:
     """
     Lists every configured LLM model profile with its model name, binding profile,
-    default/active/instantiated flags, capabilities (vision, video), reasoning efforts,
-    forced context size, and autorouting settings. Use this first to discover which
-    model aliases exist before switching or spawning child agents.
+    default/active/instantiated flags, capabilities (vision, video, thinking),
+    reasoning efforts (supported + default), per-image token cost, forced context
+    size, and autorouting settings. Use this first to discover which model aliases
+    exist before switching or spawning child agents.
 
     Args:
         None
@@ -157,25 +192,35 @@ def tool_list_models(lollms_client_instance=None) -> Dict[str, Any]:
 
     if not registry:
         return {"success": True,
-                "output": "No LLM model profiles are configured on this client.",
-                "models": []}
+                "output": (
+                    "No LLM model profiles are configured on this client. "
+                    "See `field_schema` for the fields a new profile may declare."
+                ),
+                "models": [],
+                "field_schema": list(_MODEL_PROFILE_FIELD_SCHEMA)}
 
     models = []
     lines = []
     for alias, profile in registry.items():
         entry = {
             "alias": alias,
-            "model_name": profile.model_name,
-            "binding_profile": profile.binding_profile_name,
-            "is_default": bool(profile.is_default),
+            "model_name": getattr(profile, "model_name", None),
+            "binding_profile": getattr(profile, "binding_profile_name", None),
+            "is_default": bool(getattr(profile, "is_default", False)),
             "is_active": alias == active_alias,
             "is_instantiated": alias in instance_cache,
-            "vision_enabled": bool(profile.vision_enabled),
-            "video_enabled": bool(profile.video_enabled),
-            "glm_image_embedding": bool(profile.glm_image_embedding),
-            "supported_reasoning_efforts": profile.supported_reasoning_efforts or [],
-            "forced_context_size": profile.forced_context_size,
-            "routing_config": profile.routing_config or {},
+            "vision_enabled": bool(getattr(profile, "vision_enabled", False)),
+            "video_enabled": bool(getattr(profile, "video_enabled", False)),
+            "glm_image_embedding": bool(getattr(profile, "glm_image_embedding", False)),
+            "image_token_cost": int(getattr(profile, "image_token_cost", 256)),
+            "thinking_enabled": bool(getattr(profile, "thinking_enabled", False)),
+            "supported_reasoning_efforts": list(
+                getattr(profile, "supported_reasoning_efforts", None)
+                or ["low", "medium", "high"]
+            ),
+            "default_reasoning_effort": getattr(profile, "default_reasoning_effort", None),
+            "forced_context_size": getattr(profile, "forced_context_size", None),
+            "routing_config": getattr(profile, "routing_config", None) or {},
         }
         models.append(entry)
 
@@ -190,23 +235,63 @@ def tool_list_models(lollms_client_instance=None) -> Dict[str, Any]:
             flags.append("vision")
         if entry["video_enabled"]:
             flags.append("video")
+        if entry["thinking_enabled"]:
+            flags.append("thinking")
         flag_str = f" [{', '.join(flags)}]" if flags else ""
 
         lines.append(
-            f"- {alias} → {profile.binding_profile_name} / "
-            f"'{profile.model_name or 'server default'}'{flag_str}"
+            f"- {alias} → {entry['binding_profile']} / "
+            f"'{entry['model_name'] or 'server default'}'{flag_str}"
         )
         if entry["routing_config"]:
             lines.append(f"    autorouting: {entry['routing_config']}")
-        if entry["supported_reasoning_efforts"]:
+        if entry["glm_image_embedding"]:
+            lines.append("    image embedding mode: glm")
+        if entry["forced_context_size"] is not None:
+            lines.append(f"    forced context size: {entry['forced_context_size']}")
+        if entry["image_token_cost"] != 256:
+            lines.append(f"    image token cost: {entry['image_token_cost']}")
+        if entry["thinking_enabled"]:
+            efforts = ", ".join(entry["supported_reasoning_efforts"]) or "low, medium, high"
+            default_effort = entry["default_reasoning_effort"] or "(middle of list)"
             lines.append(
-                f"    reasoning efforts: {', '.join(entry['supported_reasoning_efforts'])}"
+                f"    thinking: enabled — efforts: {efforts}; default: {default_effort}"
+            )
+        else:
+            lines.append(
+                f"    thinking: disabled (declared efforts: "
+                f"{', '.join(entry['supported_reasoning_efforts'])})"
             )
 
     return {
         "success": True,
         "output": "Configured LLM models:\n" + "\n".join(lines),
         "models": models,
+        "field_schema": list(_MODEL_PROFILE_FIELD_SCHEMA),
+    }
+
+
+def tool_get_model_profile_schema() -> Dict[str, Any]:
+    """
+    Returns the complete editable schema of an LLM model profile: every field
+    name, type, default value, and description. Use this to render a profile
+    editor that exposes *all* fields — including those currently at their
+    default value (i.e. "not yet set"). This is the authoritative source of
+    truth for profile fields; do not hardcode them in the UI.
+
+    Args:
+        None
+    """
+    return {
+        "success": True,
+        "output": (
+            "Model profile editable fields:\n"
+            + "\n".join(
+                f"- {f['name']} ({f['type']}, default={f['default']!r}): {f['description']}"
+                for f in _MODEL_PROFILE_FIELD_SCHEMA
+            )
+        ),
+        "fields": list(_MODEL_PROFILE_FIELD_SCHEMA),
     }
 
 

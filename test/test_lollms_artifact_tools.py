@@ -3,6 +3,7 @@ from pathlib import Path
 from lollms_client.lollms_discussion import LollmsDiscussion, LollmsDataManager, ArtefactType
 from lollms_client.lollms_core import LollmsClient
 from lollms_client.lollms_types import LCPResult
+from lollms_client.lollms_tools_binding import build_env
 
 class DummyClient:
     def __init__(self):
@@ -346,7 +347,7 @@ class TestLollmsArtifactTools(unittest.TestCase):
         os.chdir(self.discussion.workspace_data_path)
         python_res = tool_execute_python_data_query(
             code="df['salary'] = df['salary'] + 5000",
-            discussion_instance=self.discussion
+            env=build_env(client=self.client, discussion=self.discussion)
         )
         os.chdir(original_cwd)
         self.assertTrue(python_res["success"])
