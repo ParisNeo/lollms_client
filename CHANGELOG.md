@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-02 04:09]
+
+- `Fix client version in __init__.py: update LollmsClient from v1.21.4 to v1.21.5.`
+
 ## [2026-11-02 00:14]
 
 - fix: update image artifact persistence with fallback and broaden mimicry compaction check
