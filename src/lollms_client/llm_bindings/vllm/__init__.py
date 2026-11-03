@@ -21,21 +21,15 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import pipmaster as pm
 
-pm.ensure_packages([
-    "openai",
-    "filelock",
-    "requests",
-    "psutil",
-    "tqdm",
-    "huggingface_hub"
-])
-
-import openai
-import psutil
-import requests
+# Heavy dependencies are imported lazily inside __init__ / helper methods.
+openai = None
+psutil = None
+requests = None
+FileLock = None
+hf_hub_download = None
+snapshot_download = None
+tiktoken = None
 from ascii_colors import ASCIIColors, trace_exception
-from filelock import FileLock
-from huggingface_hub import hf_hub_download, snapshot_download
 
 from lollms_client.lollms_discussion import LollmsDiscussion
 from lollms_client.lollms_llm_binding import LollmsLLMBinding
@@ -325,6 +319,23 @@ class VLLMBinding(LollmsLLMBinding):
 
     def __init__(self, **kwargs):
         super().__init__(BindingName, **kwargs)
+
+        # Lazy dependency installation/import
+        global openai, psutil, requests, FileLock, hf_hub_download, snapshot_download
+        pm.ensure_packages([
+            "openai", "filelock", "requests", "psutil", "tqdm", "huggingface_hub"
+        ])
+        import openai as _openai
+        import psutil as _psutil
+        import requests as _requests
+        from filelock import FileLock as _FileLock
+        from huggingface_hub import hf_hub_download as _hf_hub_download, snapshot_download as _snapshot_download
+        openai = _openai
+        psutil = _psutil
+        requests = _requests
+        FileLock = _FileLock
+        hf_hub_download = _hf_hub_download
+        snapshot_download = _snapshot_download
 
         # ── 1. Apply Preset if specified ──────────────────────────────────────
         self.preset_name = kwargs.get("preset")
@@ -836,6 +847,14 @@ class VLLMBinding(LollmsLLMBinding):
 
         return output
 
+    def _get_tiktoken(self):
+        global tiktoken
+        if tiktoken is None:
+            pm.ensure_packages(["tiktoken"])
+            import tiktoken as _tiktoken
+            tiktoken = _tiktoken
+        return tiktoken
+
     def tokenize(self, text: str) -> List[int]:
         if not text:
             return []
@@ -847,7 +866,7 @@ class VLLMBinding(LollmsLLMBinding):
                     return r.json().get("tokens", [])
         except Exception:
             pass
-        return list(tiktoken.get_encoding("cl100k_base").encode(text))
+        return list(self._get_tiktoken().get_encoding("cl100k_base").encode(text))
 
     def detokenize(self, tokens: List[int]) -> str:
         if not tokens:
@@ -860,7 +879,7 @@ class VLLMBinding(LollmsLLMBinding):
                     return r.json().get("prompt", "")
         except Exception:
             pass
-        return tiktoken.get_encoding("cl100k_base").decode(tokens)
+        return self._get_tiktoken().get_encoding("cl100k_base").decode(tokens)
 
     def count_tokens(self, text: str) -> int:
         return len(self.tokenize(text))

@@ -309,6 +309,36 @@ class DiffusersTTMBinding(LollmsTTMBinding):
     def generate_song_from_lyrics(self, prompt: str, lyrics: str, **kwargs) -> bytes:
         return self.generate_song(prompt=prompt, lyrics=lyrics, **kwargs)
 
+    def generate_video(self, prompt: str, **kwargs) -> bytes:
+        """
+        Generates a video from a text prompt via the shared Diffusers TTM daemon.
+
+        The daemon routes the request to a video-capable pipeline (LTX-Video,
+        CogVideoX, AnimateDiff, or a generic DiffusionPipeline). Returns raw
+        MP4 bytes.
+        """
+        self.ensure_server_is_running(True)
+        payload = {
+            "prompt": prompt,
+            "negative_prompt": kwargs.get("negative_prompt", ""),
+            "width": kwargs.get("width", 768),
+            "height": kwargs.get("height", 512),
+            "num_frames": kwargs.get("num_frames", 24),
+            "num_inference_steps": kwargs.get("num_inference_steps", 30),
+            "guidance_scale": kwargs.get("guidance_scale", 7.5),
+            "seed": kwargs.get("seed", -1),
+            "fps": kwargs.get("fps", 8),
+            "model_name": kwargs.get("model_name", self.model_name),
+        }
+        response = self._session.post(
+            f"{self.base_url}/generate_video",
+            json=payload,
+            headers=self._get_headers(),
+            timeout=1800,
+        )
+        response.raise_for_status()
+        return response.content
+
     def list_models(self, **kwargs) -> List[str]:
         self.ensure_server_is_running(True)
         try:
@@ -397,22 +427,11 @@ class DiffusersTTMBinding(LollmsTTMBinding):
         except Exception:
             return False
 
-    # ── Resource management contract ────────────────────────────────────────
-    def is_local(self) -> bool:
-        return True
+    def get_zoo(self) -> List[Dict[str, Any]]:
+        return list(DEFAULT_TTM_ZOO)
 
-    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
-        return self.is_server_running()
-
-    def has_active_resources(self) -> bool:
-        return self.is_server_running()
-
-    def get_loaded_models(self) -> List[str]:
-        return [self.model_name] if self.is_server_running() else []
-
-    def unload_model(self, model_name: Optional[str] = None) -> bool:
-        try:
-            resp = self._session.post(f"{self.base_url}/unload_model", headers=self._get_headers(), timeout=30)
-            return resp.status_code == 200
-        except Exception:
-            return False
+    def download_from_zoo(self, index: int, progress_callback: Optional[Callable[[dict], None]] = None) -> dict:
+        zoo = self.get_zoo()
+        if not (0 <= index < len(zoo)):
+            return {"status": False, "message": "Index out of bounds."}
+        return self.pull_model(zoo[index]["link"], progress_callback=progress_callback)

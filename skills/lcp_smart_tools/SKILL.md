@@ -236,7 +236,63 @@ for tool in discovered_tools:
     print(f"Properties: {list(tool['input_schema']['properties'].keys())}")
 ```
 
-## 7. Summary of Best Practices
+## 7. Multimodal Tool Orchestration (TTI + VLM Verification)
+
+When a task requires **generating an image and then verifying it**, the agent MUST emit tool calls immediately — never narrate intent first. The correct pattern is a two-step tool chain in a single turn:
+
+### Step 1 — Generate (TTI)
+Call the image generation tool exposed by the active TTI binding (e.g. `generate_image`). The tool returns a file path or base64 payload.
+
+### Step 2 — Verify (VLM)
+Immediately call `vlm_query` (or the equivalent vision tool) with the generated image path and a compliance prompt. This closes the loop and proves the image matches the request.
+
+### Canonical Example
+```python
+# Step 1: generate
+result = tool_generate_image(
+    prompt="Cyber Monalisa, neon circuitry, holographic smile, dark background",
+    width=1024,
+    height=1024,
+)
+image_path = result["image_path"]
+
+# Step 2: verify (same turn, no preamble)
+verification = tool_vlm_query(
+    image_path=image_path,
+    question="Does this image depict a cyberpunk Mona Lisa? Describe the subject, style, and any compliance issues.",
+)
+```
+
+### Anti-Preamble Rule
+- **DO NOT** write "I will now generate an image..." — emit the tool call directly.
+- **DO NOT** wait for user confirmation between generate and verify.
+- **ALWAYS** terminate the turn with `<done/>` after the verification tool returns.
+
+---
+
+## 8. llama_cpp_server Binding Pitfalls
+
+The `llama_cpp_server` binding spawns `llama-server.exe` with a set of flags. Two flags are **mutually exclusive** with chat completions and will cause the agent to receive empty responses (triggering the stall detector):
+
+### `--embedding` (DO NOT use for chat)
+When `--embedding` is passed, `llama-server` runs in **embedding-only mode**. Chat completion requests return an embedding vector (or empty content), and the agent sees no `<done/>` → stall loop.
+
+**Symptom**: `No <done/> or <end/> detected` on every round, even for `hi`.
+
+**Fix**: Remove `--embedding` from the server launch flags when the model is used for chat. Only enable it for a dedicated embedding server instance.
+
+### `--reasoning off` + `think=False`
+If the model is a reasoning model (e.g. Qwen3), passing `--reasoning off` while the binding sends `think=False` can produce empty content. Prefer letting the binding auto-detect reasoning support, or explicitly set `reasoning_effort` to a valid value.
+
+### Diagnostic Checklist
+1. Check the server launch log for `--embedding` — remove it for chat.
+2. Verify `curl http://localhost:<port>/v1/chat/completions` returns a non-empty `choices[0].message.content`.
+3. If empty, check the server's `_error.log` for context-length or template errors.
+
+---
+
+## 9. Summary of Best Practices
 - **Never nest `<artifact>` inside markdown code blocks** when writing tools, let the XML render directly.
 - **Always provide a detailed docstring** for your main tool function, as the LCP engine extracts it directly as the LLM-facing description.
 - **Use `init_tools_library()`** inside your tool scripts to run a pipmaster check ensuring all required third-party libraries (e.g. `websockets`, `pandas`, `beautifulsoup4`) are installed automatically on startup.
+- **For multimodal tasks, chain tools in a single turn** (generate → verify) and emit `<done/>` immediately after the last tool result.

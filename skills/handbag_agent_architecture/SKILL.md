@@ -166,7 +166,34 @@ if agent.memory_manager:
 
 ---
 
-## 6. Multi-Persona Crews (Coworkers)
+## 6. Multimodal Agent Workflows (Image Generation + Verification)
+
+Handbag agents with TTI and VLM tools mounted MUST follow the **generate-then-verify** doctrine. The stall detector terminates turns that emit preamble text without tool calls, so the agent must act immediately.
+
+### Required Tool Chain
+1. **Generate**: invoke the TTI tool (`generate_image`) with the user's prompt.
+2. **Verify**: invoke the VLM tool (`vlm_query`) on the returned image path.
+3. **Terminate**: emit `<done/>` after the verification result.
+
+### Example Turn
+```python
+# No preamble — go straight to the tool call
+image = tool_generate_image(prompt="Cyber Monalisa, neon circuitry, holographic smile")
+check = tool_vlm_query(
+    image_path=image["image_path"],
+    question="Describe the subject and confirm it matches 'cyber Monalisa'.",
+)
+# Then emit <done/>
+```
+
+### Why This Matters
+- The agentic loop enforces continuation when no `<done/>` is detected.
+- After 4 consecutive stalls, the turn is terminated with "LLM stuck in preamble mode".
+- Chaining tools in one turn avoids the stall entirely.
+
+---
+
+## 7. Multi-Persona Crews (Coworkers)
 
 When a Handbag contains a `coworkers/` subdirectory, the primary persona acts as a coordinator:
 

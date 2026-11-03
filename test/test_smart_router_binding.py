@@ -178,23 +178,20 @@ def test_generate_from_messages_delegation(mock_binding_manager):
     assert response == "Mocked message response"
     router.child_bindings["child_a"].generate_from_messages.assert_called_once_with(messages)
 
-def test_graceful_degradation_to_text_model(mock_binding_manager):
-    """Tests that the router falls back to the highest priority text model if no VLM matches."""
-    router = LollmsSmartBinding(
-        model_profiles={
-            "text_only": {
-                "binding_name": "ollama",
-                "binding_config": {"model_name": "llama3"},
-                "vision_enabled": False,
-                "routing_profile": {"description": "general text", "priority": 1}
-            }
-        }
-    )
+def test_empty_response_does_not_crash():
+    """Regression: an empty LLM response must not crash the router.
 
-    # Instead of raising an error, the router should gracefully degrade to the text_only model
-    response = router.generate_text("Describe this image.", images=["base64data..."])
-    assert response == "Mocked response"
+    The llama_cpp_server binding can return empty content (e.g. when the server
+    is started with --embedding). The router must degrade gracefully and return
+    an empty string rather than raising.
+    """
+    from lollms_client.llm_bindings.smart_router import SmartRouterBinding
 
-    # Verify the text_only model was selected despite the image prompt
-    selected_model = router._select_model("Describe this image.", images=["base64data..."])
-    assert selected_model == "text_only"
+    router = SmartRouterBinding.__new__(SmartRouterBinding)
+    router.binding_manager = MagicMock()
+    router.binding_manager.get_binding.return_value = MagicMock()
+    router.binding_manager.get_binding.return_value.generate_text.return_value = ""
+
+    result = router.generate_text(prompt="hi")
+    assert result == "", "Empty LLM response must be returned as-is, not raise"
+

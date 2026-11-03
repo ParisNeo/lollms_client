@@ -8,11 +8,11 @@ from ascii_colors import ASCIIColors, trace_exception
 
 import pipmaster as pm
 
-# Ensure the required packages are installed
-pm.ensure_packages(["huggingface_hub", "tiktoken"])
-
-from huggingface_hub import HfApi, InferenceClient
-import tiktoken
+# Heavy dependencies are imported lazily inside __init__ so that importing
+# this module does not trigger package installation or network access.
+HfApi = None
+InferenceClient = None
+tiktoken = None
 
 BindingName = "HuggingFaceInferenceAPIBinding"
 
@@ -35,6 +35,14 @@ class HuggingFaceInferenceAPIBinding(LollmsLLMBinding):
             service_key (str): The Hugging Face API key.
         """
         super().__init__(BindingName, **kwargs)
+
+        # Lazy dependency installation/import
+        global HfApi, InferenceClient, tiktoken
+        pm.ensure_packages(["huggingface_hub", "tiktoken"])
+        from huggingface_hub import HfApi as _HfApi, InferenceClient as _InferenceClient
+        import tiktoken as _tiktoken
+        HfApi, InferenceClient, tiktoken = _HfApi, _InferenceClient, _tiktoken
+
         self.model_name = kwargs.get("model_name")
         self.hf_api_key = kwargs.get("service_key") or os.getenv("HUGGING_FACE_HUB_TOKEN")
 

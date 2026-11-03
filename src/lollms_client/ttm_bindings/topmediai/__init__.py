@@ -91,24 +91,10 @@ class TopMediaiTTMBinding(LollmsTTMBinding):
     def install_model(self, model_name: str, **kwargs) -> dict:
         return {"status": False, "message": "Remote API; models are managed by TopMediai."}
 
+    def get_zoo(self) -> List[Dict[str, Any]]:
+        return [{"name": "default", "description": "TopMediai default music model", "size": "N/A", "type": "remote", "link": "default"}]
 
-    # ── Resource management contract ────────────────────────────────────────
-    def is_local(self) -> bool:
-        return False
-
-    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
-        return True
-
-    def has_active_resources(self) -> bool:
-        return False
-
-    def get_loaded_models(self) -> List[str]:
-        return ["default"]
-
-    def unload_model(self, model_name: Optional[str] = None) -> bool:
-        return True
-
-    def install_model(self, model_name: str, **kwargs) -> dict:
+    def download_from_zoo(self, index: int, progress_callback: Optional[Callable[[dict], None]] = None) -> dict:
         return {"status": False, "message": "Remote API; models are managed by TopMediai."}
 
 

@@ -9,12 +9,12 @@ from pathlib import Path
 from typing import Any, Dict, List, NoReturn, Optional, Tuple, Union
 
 import pipmaster as pm
-import requests
 from ascii_colors import ASCIIColors
 
 from lollms_client.lollms_tti_binding import LollmsTTIBinding, TTIGenerationResult
 
-pm.ensure_packages(["requests"])
+# requests is imported lazily inside __init__.
+requests = None
 
 BindingName = "NovitaAITTIBinding"
 
@@ -60,6 +60,12 @@ class NovitaAITTIBinding(LollmsTTIBinding):
             kwargs["model_name"] = kwargs.pop("model")
         binding_name = kwargs.pop("binding_name", BindingName)
         super().__init__(binding_name=binding_name, **kwargs)
+
+        global requests
+        pm.ensure_packages(["requests"])
+        import requests as _requests
+        requests = _requests
+
         self.config = kwargs
         self.api_key = (
             self.config.get("api_key")

@@ -1322,13 +1322,23 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         while still in thinking mode (no content chunk followed), the closing
         tag is emitted at end-of-stream so downstream artefact/stream parsers
         never see an unbalanced block.
+
+        Content chunks are ALWAYS accumulated regardless of reasoning state —
+        a model that emits reasoning first and content second must still yield
+        the content in the returned string.
         """
-        full = []
+        full: List[str] = []
         in_thinking = False
+        finish_reason: Optional[str] = None
+
         for chunk in completion:
             if not chunk.choices:
                 continue
-            delta = chunk.choices[0].delta
+            choice = chunk.choices[0]
+            delta = choice.delta
+            if getattr(choice, "finish_reason", None):
+                finish_reason = choice.finish_reason
+
             reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
             content = getattr(delta, "content", "") or ""
 
@@ -1337,7 +1347,17 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                     in_thinking = True
                     if callback:
                         callback(" thinking\n", MSG_TYPE.MSG_TYPE_CHUNK)
-                    full.append("\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                    full.append(" thinking\n")
+                full.append(reasoning)
+                if callback:
+                    if not callback(reasoning, MSG_TYPE.MSG_TYPE_CHUNK):
+                        break
+
+            if content:
+                if in_thinking:
+                    in_thinking = False
+                    if callback:
+                        callback("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
                     full.append("\n</think>\n")
                 full.append(content)
                 if callback:
@@ -1350,7 +1370,14 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                 callback("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
             full.append("\n</think>\n")
 
-        return "".join(full)
+        result = "".join(full)
+        if not result.strip():
+            ASCIIColors.warning(
+                f"[LlamaCppServerBinding] Streaming produced empty output "
+                f"(finish_reason={finish_reason!r}). The model may have hit "
+                f"max_tokens, a stop sequence, or returned no tokens."
+            )
+        return result
 
     def _stream_raw_completion(self, completion, callback: Optional[Callable]) -> str:
         """Drains a streaming raw (completions) response."""
@@ -1472,10 +1499,23 @@ class LlamaCppServerBinding(LollmsLLMBinding):
 
             if do_stream:
                 return self._stream_raw_completion(completion, cb)
-            return completion.choices[0].text
+
+            choice = completion.choices[0]
+            text = choice.text
+            if not text:
+                finish_reason = getattr(choice, "finish_reason", None)
+                raise RuntimeError(
+                    f"llama-server returned an empty completion "
+                    f"(finish_reason={finish_reason!r}, model={self.model_name!r}). "
+                    f"Check the server log via get_server_logs()."
+                )
+            return text
         except Exception as e:
             trace_exception(e)
-            return {"status": False, "error": str(e), "server_body": getattr(e, "body", None)}
+            ASCIIColors.error(
+                f"[LlamaCppServerBinding.generate_text] Generation failed: {e}"
+            )
+            raise
 
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -1531,7 +1571,10 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             )
         except Exception as e:
             trace_exception(e)
-            return {"status": False, "error": str(e)}
+            ASCIIColors.error(
+                f"[LlamaCppServerBinding.generate_from_messages] Generation failed: {e}"
+            )
+            raise
 
     # ──────────────────────────────────────────────────────────────────────────
     # Shared chat-completions inner method
@@ -1588,13 +1631,17 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         response = self._execute_with_retry(_do)
         if stream:
             return self._stream_completion(response, cb)
-        content = response.choices[0].message.content
+
+        choice = response.choices[0]
+        content = choice.message.content
+        finish_reason = getattr(choice, "finish_reason", None)
+
         if not content:
             # Fail-safe: a 0-token answer kills the discussion loop. If the
             # model emitted only reasoning (or nothing), surface the raw
             # reasoning so the turn never dies silently.
-            reasoning = getattr(response.choices[0].message, "reasoning_content", None) or getattr(
-                response.choices[0].message, "reasoning", None
+            reasoning = getattr(choice.message, "reasoning_content", None) or getattr(
+                choice.message, "reasoning", None
             )
             if reasoning:
                 ASCIIColors.warning(
@@ -1602,7 +1649,19 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                     "reasoning. Surfacing reasoning to avoid a 0-token response."
                 )
                 return str(reasoning)
-        return content or ""
+
+            # No content AND no reasoning: this is a genuine silent failure.
+            # Raise so the caller (agent loop) can surface it instead of
+            # spinning through stall rounds.
+            raise RuntimeError(
+                f"llama-server returned an empty response "
+                f"(finish_reason={finish_reason!r}, model={self.model_name!r}). "
+                f"Possible causes: max_tokens too low, stop sequence matched "
+                f"immediately, or the model failed to produce tokens. "
+                f"Check the server log via get_server_logs()."
+            )
+
+        return content
 
     # ──────────────────────────────────────────────────────────────────────────
     # Tokenize / detokenize / count_tokens

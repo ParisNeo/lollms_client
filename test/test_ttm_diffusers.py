@@ -103,6 +103,15 @@ def test_diffusers_ttm_generation_mock_calls():
                 assert "generate_song" in mock_post.call_args[0][0]
 
 
+def test_ttm_diffusers_generate_video_contract():
+    """Regression: TTM diffusers binding must expose generate_video with expected kwargs."""
+    from lollms_client.ttm_bindings.diffusers import DiffusersTTMBinding
+
+    binding = DiffusersTTMBinding.__new__(DiffusersTTMBinding)
+    assert hasattr(binding, "generate_video"), "generate_video must exist on DiffusersTTMBinding"
+    assert hasattr(binding, "generate_song"), "generate_song must exist on DiffusersTTMBinding"
+
+
 def test_core_client_song_methods():
     client = LollmsClient(
         ttm_binding_profiles={

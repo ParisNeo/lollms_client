@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-03 01:21]
+
+- docs: enhance documentation and skills for boolean flags, image tokens, and agent architecture
+
 ## [2026-11-02 23:12]
 
 - feat: enhance ttv diffusers server implementation

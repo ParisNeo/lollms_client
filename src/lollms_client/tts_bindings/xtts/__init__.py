@@ -246,21 +246,8 @@ class XTTSClientBinding(LollmsTTSBinding):
     def install_model(self, model_name: str, **kwargs) -> dict:
         return {"status": True, "message": "XTTS v2 model is downloaded automatically on first use."}
 
-    # ── Resource management contract ────────────────────────────────────────
-    def is_local(self) -> bool:
-        return True
+    def get_zoo(self) -> List[Dict[str, Any]]:
+        return [{"name": "xtts_v2", "description": "Coqui XTTS v2 multilingual TTS", "size": "~2GB", "type": "pytorch", "link": "tts_models/multilingual/multi-dataset/xtts_v2"}]
 
-    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
-        return self.is_server_running()
-
-    def has_active_resources(self) -> bool:
-        return self.is_server_running()
-
-    def get_loaded_models(self) -> List[str]:
-        return ["xtts_v2"] if self.is_server_running() else []
-
-    def unload_model(self, model_name: Optional[str] = None) -> bool:
-        return self.shutdown_server()
-
-    def install_model(self, model_name: str, **kwargs) -> dict:
+    def download_from_zoo(self, index: int, progress_callback: Optional[Callable[[dict], None]] = None) -> dict:
         return {"status": True, "message": "XTTS v2 model is downloaded automatically on first use."}

@@ -8,12 +8,9 @@ from ascii_colors import ASCIIColors, trace_exception
 
 import pipmaster as pm
 
-# Ensure the required packages are installed
-pm.ensure_packages(["mistralai", "pillow", "tiktoken"])
-
-from mistralai import Mistral
-from PIL import Image, ImageDraw
-import tiktoken
+# Heavy dependencies are imported lazily inside __init__ / helper methods.
+Mistral = None
+tiktoken = None
 
 
 BindingName = "MistralBinding"
@@ -37,6 +34,12 @@ class MistralBinding(LollmsLLMBinding):
             mistral_api_key (str): The API key for the Mistral service.
         """
         super().__init__(BindingName, **kwargs)
+
+        global Mistral
+        pm.ensure_packages(["mistralai", "tiktoken"])
+        from mistralai import Mistral as _Mistral
+        Mistral = _Mistral
+
         self.model_name = kwargs.get("model_name","mistral-large-latest")
         self.mistral_api_key = kwargs.get("service_key") or os.getenv("MISTRAL_API_KEY")
 
@@ -121,10 +124,18 @@ class MistralBinding(LollmsLLMBinding):
                         **kwargs)
 
 
+    def _get_tiktoken(self):
+        global tiktoken
+        if tiktoken is None:
+            pm.ensure_packages(["tiktoken"])
+            import tiktoken as _tiktoken
+            tiktoken = _tiktoken
+        return tiktoken
+
     def tokenize(self, text: str) -> list:
         """Tokenize text using tiktoken as a fallback."""
         try:
-            encoding = tiktoken.get_encoding("cl100k_base")
+            encoding = self._get_tiktoken().get_encoding("cl100k_base")
             return encoding.encode(text)
         except Exception:
             return list(text.encode('utf-8'))
@@ -132,7 +143,7 @@ class MistralBinding(LollmsLLMBinding):
     def detokenize(self, tokens: list) -> str:
         """Detokenize tokens using tiktoken."""
         try:
-            encoding = tiktoken.get_encoding("cl100k_base")
+            encoding = self._get_tiktoken().get_encoding("cl100k_base")
             return encoding.decode(tokens)
         except Exception:
             return bytes(tokens).decode('utf-8', errors='ignore')

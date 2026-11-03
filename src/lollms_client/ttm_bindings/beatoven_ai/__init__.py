@@ -1,5 +1,4 @@
 import os
-import requests
 import time
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -8,8 +7,8 @@ from lollms_client.lollms_ttm_binding import LollmsTTMBinding
 from ascii_colors import trace_exception, ASCIIColors
 import pipmaster as pm
 
-# Ensure required packages are installed
-pm.ensure_packages(["requests"])
+# requests is imported lazily inside __init__.
+requests = None
 
 BindingName = "BeatovenAITTMBinding"
 
@@ -21,7 +20,13 @@ class BeatovenAITTMBinding(LollmsTTMBinding):
         # Prioritize 'model_name' but accept 'model' as an alias from config files.
         if 'model' in kwargs and 'model_name' not in kwargs:
             kwargs['model_name'] = kwargs.pop('model')
-        super().__init__(binding_name=BindingName, config=kwargs)    
+        super().__init__(binding_name=BindingName, config=kwargs)
+
+        global requests
+        pm.ensure_packages(["requests"])
+        import requests as _requests
+        requests = _requests
+
         self.api_key = self.config.get("api_key") or os.environ.get("BEATOVEN_API_KEY")
         if not self.api_key:
             raise ValueError("Beatoven.ai API key is required. Please set it in config or as BEATOVEN_API_KEY env var.")

@@ -199,9 +199,45 @@ image** (that is the feature guarantee).
 | Totals don't add up | `current_tokens` invariant violated | A zone wasn't updated; check the mutator that changed state |
 | Image annotation added twice | `msg.tokens` reused incorrectly | Ensure `msg.tokens` stays text-only; annotation delta added at status only |
 
-## 10. Related docs & flags
+## 10. Mitigating image context bloat: the `SINGLE_ROUND` tier
+
+The single largest source of image-token growth over a long session is
+**generated images that stay loaded forever**. Every generated plot, chart, or
+edited image that remains `FULL` keeps its base64 payload in the context window
+on every subsequent turn.
+
+The `SINGLE_ROUND` visibility tier solves this by giving the LLM a **one-shot
+view** of each generated image:
+
+1. **Creation** — image artefacts (from `<generate_image>`, `<edit_image>`, or
+   tool-produced images) are registered with `visibility="single_round"` and
+   `active=True`. They behave exactly like `FULL` for the next context build.
+2. **First build** — `build_artefacts_context_zone()` injects the payload into
+   the `[C]` zone, and `get_context_images()` includes the pixels in the vision
+   payload. The LLM sees the image and can decide whether to edit it.
+3. **Auto-demotion** — at the *end* of that same build,
+   `_demote_single_round_artefacts()` flips the artefact to `TREE_UNLOCKABLE`
+   and `active=False`. The next turn's `get_context_status()` no longer counts
+   the image tokens.
+4. **Re-access** — the LLM can still permanently load the image via
+   `<unlock_file>` (which sets `FULL`) or by passing `visibility="full"` on a
+   subsequent write.
+
+**Effect on `get_context_status()`**: a `SINGLE_ROUND` image appears in
+`zones["artefacts"]` and `images["total_image_tokens"]` for exactly one turn
+after creation, then drops to zero. This is the intended behavior — the image
+is not lost (it remains on disk and in the artefact tree as `[U]`), only its
+context cost is released.
+
+**Opting out**: pass `visibility="full"` on the artefact tag, or emit
+`<unlock_file>` after creation, to keep an image permanently loaded. Use this
+sparingly — it re-introduces the bloat the tier was designed to prevent.
+
+## 11. Related docs & flags
 
 - [`docs/flags/suppress_images.md`](flags/suppress_images.md) — suppressing image
   injection into the prompt.
 - [`docs/BRANCHING.md`](BRANCHING.md) — the branch model that `branch_tip_id`
   walks.
+- [`src/lollms_client/lollms_artefact/README.md`](../src/lollms_client/lollms_artefact/README.md)
+  — the `SINGLE_ROUND` tier in the artefact system reference.

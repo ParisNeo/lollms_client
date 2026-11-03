@@ -5,18 +5,17 @@ import mimetypes
 import io
 from typing import Optional, Callable, List, Union, Dict
 
-import httpx
-import tiktoken
 import pipmaster as pm
-from PIL import Image
 
 from lollms_client.lollms_llm_binding import LollmsLLMBinding
 from lollms_client.lollms_types import MSG_TYPE
 from lollms_client.lollms_discussion import LollmsDiscussion
 from ascii_colors import ASCIIColors, trace_exception
 
-# Ensure required packages are installed
-pm.ensure_packages(["httpx", "tiktoken", "Pillow"])
+# Heavy dependencies are imported lazily inside __init__ / helper methods.
+httpx = None
+tiktoken = None
+Image = None
 
 BindingName = "OpenWebUIBinding"
 
@@ -145,6 +144,14 @@ def normalize_message(msg: Dict, cap_size: bool = False, max_dim: int = 2048, de
 class OpenWebUIBinding(LollmsLLMBinding):
     def __init__(self, **kwargs):
         super().__init__(BindingName, **kwargs)
+
+        global httpx, Image
+        pm.ensure_packages(["httpx", "tiktoken", "Pillow"])
+        import httpx as _httpx
+        from PIL import Image as _Image
+        httpx = _httpx
+        Image = _Image
+
         self.host_address = kwargs.get("host_address")
         self.model_name = kwargs.get("model_name")
         self.service_key = kwargs.get("service_key", os.getenv("OPENWEBUI_API_KEY"))
@@ -347,6 +354,11 @@ class OpenWebUIBinding(LollmsLLMBinding):
         return models_info
 
     def _get_encoding(self, model_name: str = None):
+        global tiktoken
+        if tiktoken is None:
+            pm.ensure_packages(["tiktoken"])
+            import tiktoken as _tiktoken
+            tiktoken = _tiktoken
         try:
             return tiktoken.encoding_for_model(model_name or self.model_name)
         except KeyError:

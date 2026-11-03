@@ -1,6 +1,6 @@
 import subprocess, sys, threading, time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Callable
 
 import requests
 from filelock import FileLock, Timeout
@@ -179,3 +179,10 @@ class MinimaxH3TTVBinding(LollmsTTVBinding):
         if index < 0 or index >= len(zoo):
             return {"status": False, "message": "Index out of bounds."}
         return self.install_model(zoo[index]["link"])
+
+    def get_zoo(self) -> List[Dict[str, Any]]:
+        return [
+            {"name": "H3 FL2VA pruned Q3_K_M (12G tier)", "description": "Abiray GGUF, ComfyUI only.", "size": "8.9GB", "type": "gguf", "link": "Abiray/MiniMax-H3-Pruned-GGUF"},
+            {"name": "H3 FL2VA pruned Q4_K_M (16G tier)", "description": "Abiray GGUF, ComfyUI only.", "size": "11.6GB", "type": "gguf", "link": "Abiray/MiniMax-H3-Pruned-GGUF"},
+            {"name": "H3 FP8 torchao (42G tier)", "description": "Diffusers modular pipeline.", "size": "~32GB", "type": "safetensors", "link": "abhishekchohan/minimax-h3-fp8"},
+        ]

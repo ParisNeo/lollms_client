@@ -2,18 +2,28 @@ import time
 import sys
 import subprocess
 from pathlib import Path
-import requests
 import pipmaster as pm
 from lollms_client.lollms_tti_binding import LollmsTTIBinding
 from ascii_colors import ASCIIColors
-from filelock import FileLock
 from typing import Optional, List, Dict, Any, Callable
+
+# Heavy dependencies are imported lazily inside __init__ / helper methods.
+requests = None
+FileLock = None
 
 BindingName = "GGUFDiffusion"
 
 class GGUFDiffusion(LollmsTTIBinding):
     def __init__(self, **kwargs):
         super().__init__(binding_name=BindingName, **kwargs)
+
+        global requests, FileLock
+        pm.ensure_packages(["requests", "filelock"])
+        import requests as _requests
+        from filelock import FileLock as _FileLock
+        requests = _requests
+        FileLock = _FileLock
+
         self.server_port = 8182
         self.base_url = f"http://localhost:{self.server_port}"
         self.server_process = None

@@ -2716,6 +2716,18 @@ class _StreamState:
                 self.ai_message.content += tool_open_tag
                 _cb(self.callback, tool_open_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
+                # ── 🏷️ TITLED PARAMETER TABLE (SINGLE RENDER) ──
+                # The UI renders the `params` attribute as a table, but without a
+                # visible title it is ambiguous which tool the table belongs to.
+                # We emit ONE titled header + ONE fenced JSON block inside the
+                # processing body. The `params` attribute is retained for
+                # structured consumers (FULL_CALLBACK_MODE) but the body no
+                # longer duplicates the parameter values, eliminating the
+                # double-table rendering seen in the transcript.
+                title_line = f"### 🔧 Tool Call: `{ui_tool_name}`\n"
+                self.ai_message.content += title_line
+                _cb(self.callback, title_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
                 status_line = f"* Calling local tool system for '{ui_tool_name}'...\n"
                 self.ai_message.content += status_line
                 _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
@@ -3437,6 +3449,9 @@ class _StreamState:
                 if disk_write_error is None:
                     # ── AS-IS REGISTRATION (NO DB PIXELS) ──
                     # Metadata card only: the physical file is the single source of truth.
+                    # SINGLE_ROUND: the LLM sees the image on the next round (to verify
+                    # the result and decide whether to edit it), then the payload is
+                    # auto-demoted to TREE_UNLOCKABLE by build_artefacts_context_zone().
                     meta_card = (
                         f"### Image: `{img_rel_path}`\n\n"
                         f"Generated via the image engine.\n"
@@ -3455,11 +3470,12 @@ class _StreamState:
                         images=[img_b64],
                         image_media_types=["image/png"],
                         active=self.auto_activate,
-                        visibility=ArtefactVisibility.TREE_UNLOCKABLE
+                        visibility=ArtefactVisibility.SINGLE_ROUND
                     )
                 else:
                     # Disk write failed: fall back to DB-pixel persistence so the
-                    # image is not lost entirely.
+                    # image is not lost entirely. SINGLE_ROUND keeps the payload
+                    # visible for one round, then frees it.
                     ASCIIColors.warning(
                         "[StreamState] Disk write failed — falling back to DB pixel persistence."
                     )
@@ -3470,7 +3486,7 @@ class _StreamState:
                         images=[img_b64],
                         image_media_types=["image/png"],
                         active=self.auto_activate,
-                        visibility=ArtefactVisibility.FULL
+                        visibility=ArtefactVisibility.SINGLE_ROUND
                     )
                 if art:
                     self.affected_artefacts.append(art)
@@ -3889,6 +3905,12 @@ class _StreamState:
                 f"To view its pixels in a later turn, emit `<unlock_file>{img_rel_path}</unlock_file>`."
             )
 
+            # ── 🖼️ SINGLE-ROUND VISIBILITY (DEFAULT FOR GENERATED IMAGES) ──
+            # The image is visible to the LLM for exactly ONE round (so it can
+            # verify the result and decide whether to edit it), then
+            # build_artefacts_context_zone() auto-demotes it to TREE_UNLOCKABLE
+            # and the base64 payload is freed from context. The LLM can still
+            # request a permanent load via <unlock_file> or visibility="full".
             art = disc.artefacts.add(
                 title=img_rel_path,
                 artefact_type=ArtefactType.IMAGE,
@@ -3896,7 +3918,7 @@ class _StreamState:
                 images=images_b64,
                 image_media_types=["image/png"],
                 active=bool(getattr(self, "auto_activate", True)),
-                visibility=ArtefactVisibility.TREE_UNLOCKABLE,
+                visibility=ArtefactVisibility.SINGLE_ROUND,
                 physical_data=img_bytes if disk_write_error is None else None,
                 logical_content=meta_card,
             )
@@ -4807,6 +4829,14 @@ class ChatMixin:
             if not should_read_content and content_placeholder:
                 if file_ext in _ML_WEIGHT_EXTS:
                     atype = "data"
+                # Tool-generated images default to SINGLE_ROUND: the LLM sees the
+                # pixels on the next round, then the payload is freed. Other
+                # binary artefacts stay TREE_UNLOCKABLE (no pixel payload).
+                _binary_visibility = (
+                    ArtefactVisibility.SINGLE_ROUND
+                    if atype == "image"
+                    else ArtefactVisibility.TREE_UNLOCKABLE
+                )
                 existing_art = self.artefacts.get(file_name)
                 _agentic_mode = bool(getattr(self, "disable_artefact_versioning", False))
                 if existing_art:
@@ -4815,7 +4845,7 @@ class ChatMixin:
                         new_content=content_placeholder,
                         new_type=atype,
                         active=False,
-                        visibility=ArtefactVisibility.TREE_UNLOCKABLE,
+                        visibility=_binary_visibility,
                         physical_data=physical_bytes,
                         logical_content=None if _agentic_mode else content_placeholder,
                         commit_message=f"Updated binary file by tool '{tool_name}'"
@@ -4826,7 +4856,7 @@ class ChatMixin:
                         artefact_type=atype,
                         content=content_placeholder,
                         active=False,
-                        visibility=ArtefactVisibility.TREE_UNLOCKABLE,
+                        visibility=_binary_visibility,
                         physical_data=physical_bytes,
                         logical_content=None if _agentic_mode else content_placeholder,
                         commit_message=f"Created by tool '{tool_name}'"
@@ -4967,6 +4997,13 @@ class ChatMixin:
                     elif file_ext in _ML_WEIGHT_EXTS:
                         atype = "data"
 
+                    # Tool-generated images default to SINGLE_ROUND: the LLM sees
+                    # the pixels on the next round, then the payload is freed.
+                    _img_visibility = (
+                        ArtefactVisibility.SINGLE_ROUND
+                        if atype == "image"
+                        else ArtefactVisibility.TREE_UNLOCKABLE
+                    )
                     existing_art = self.artefacts.get(file_name)
                     if existing_art:
                         art = self.artefacts.update(
@@ -4976,7 +5013,7 @@ class ChatMixin:
                             new_images=img_b64,
                             new_image_media_types=img_mtypes,
                             active=(atype == "image"),
-                            visibility=ArtefactVisibility.FULL if atype == "image" else ArtefactVisibility.TREE_UNLOCKABLE,
+                            visibility=_img_visibility,
                             bump_version=True,
                             physical_data=physical_bytes,
                             commit_message=f"Updated binary file reference by tool '{tool_name}'"
@@ -4989,7 +5026,7 @@ class ChatMixin:
                             images=img_b64,
                             image_media_types=img_mtypes,
                             active=(atype == "image"),
-                            visibility=ArtefactVisibility.FULL if atype == "image" else ArtefactVisibility.TREE_UNLOCKABLE,
+                            visibility=_img_visibility,
                             physical_data=physical_bytes,
                             commit_message=f"Created by tool '{tool_name}'"
                         )
@@ -7393,7 +7430,14 @@ class ChatMixin:
                 round_images = list(images) if images else []
                 affected_arts = getattr(self, "_affected_artefacts_this_turn", [])
                 for art in affected_arts:
-                    if art.get("type") == "image" and art.get("images") and art.get("visibility") == ArtefactVisibility.FULL:
+                    # SINGLE_ROUND images are visible for exactly this round (the
+                    # one immediately following their creation); build_artefacts_
+                    # context_zone() demotes them to TREE_UNLOCKABLE afterwards.
+                    if (
+                        art.get("type") == "image"
+                        and art.get("images")
+                        and art.get("visibility") in (ArtefactVisibility.FULL, ArtefactVisibility.SINGLE_ROUND)
+                    ):
                         for img_b64 in art["images"]:
                             if img_b64 not in round_images:
                                 round_images.append(img_b64)

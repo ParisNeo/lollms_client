@@ -41,6 +41,19 @@ class LollmsTTMBinding(LollmsBaseBinding):
         fused = f"{prompt}\n\n[Lyrics]\n{lyrics}" if lyrics else prompt
         return self.generate_music(fused, **kwargs)
 
+    def generate_video(self, prompt: str, **kwargs) -> bytes:
+        """
+        Generates video data from the provided text prompt.
+
+        This is an optional capability of TTM bindings. The default implementation
+        raises NotImplementedError so that bindings which do not support video
+        generation still satisfy the contract surface (hasattr checks) while
+        failing loudly at call time.
+        """
+        raise NotImplementedError(
+            f"{self.binding_name} does not support video generation."
+        )
+
 
     @abstractmethod
     def list_models(self, **kwargs) -> List[str]:

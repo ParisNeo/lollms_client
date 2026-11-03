@@ -1,5 +1,4 @@
 import os
-import requests
 import time
 import base64
 from io import BytesIO
@@ -10,8 +9,9 @@ from lollms_client.lollms_tti_binding import LollmsTTIBinding
 from ascii_colors import trace_exception, ASCIIColors
 import pipmaster as pm
 
-pm.ensure_packages(["requests", "Pillow"])
-from PIL import Image
+# Heavy dependencies are imported lazily inside __init__ / helper methods.
+requests = None
+Image = None
 
 BindingName = "LeonardoAITTIBinding"
 
@@ -33,6 +33,13 @@ class LeonardoAITTIBinding(LollmsTTIBinding):
         if 'model' in kwargs and 'model_name' not in kwargs:
             kwargs['model_name'] = kwargs.pop('model')
         super().__init__(binding_name=BindingName, config=kwargs)
+
+        global requests, Image
+        pm.ensure_packages(["requests", "Pillow"])
+        import requests as _requests
+        from PIL import Image as _Image
+        requests = _requests
+        Image = _Image
 
         self.api_key = self.config.get("api_key") or os.environ.get("LEONARDO_API_KEY")
         if not self.api_key:

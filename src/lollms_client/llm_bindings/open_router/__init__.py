@@ -9,12 +9,9 @@ from ascii_colors import ASCIIColors, trace_exception
 import pipmaster as pm
 import requests
 
-# Ensure the required packages are installed
-pm.ensure_packages(["openai", "pillow", "tiktoken"])
-
-import openai
-from PIL import Image, ImageDraw
-import tiktoken
+# Heavy dependencies are imported lazily inside __init__ / helper methods.
+openai = None
+tiktoken = None
 
 BindingName = "OpenRouterBinding"
 
@@ -39,6 +36,12 @@ class OpenRouterBinding(LollmsLLMBinding):
             service_key (str): The API key for the OpenRouter service.
         """
         super().__init__(BindingName, **kwargs)
+
+        global openai
+        pm.ensure_packages(["openai", "tiktoken"])
+        import openai as _openai
+        openai = _openai
+
         self.model_name = kwargs.get("model_name","google/gemini-flash-1.5")
         self.service_key = kwargs.get("service_key") or os.getenv("OPENROUTER_service_key")
 
@@ -125,10 +128,18 @@ class OpenRouterBinding(LollmsLLMBinding):
                         **kwargs)
 
 
+    def _get_tiktoken(self):
+        global tiktoken
+        if tiktoken is None:
+            pm.ensure_packages(["tiktoken"])
+            import tiktoken as _tiktoken
+            tiktoken = _tiktoken
+        return tiktoken
+
     def tokenize(self, text: str) -> list:
         """Tokenize text using tiktoken as a general-purpose fallback."""
         try:
-            encoding = tiktoken.get_encoding("cl100k_base")
+            encoding = self._get_tiktoken().get_encoding("cl100k_base")
             return encoding.encode(text)
         except Exception:
             return list(text.encode('utf-8'))
@@ -136,7 +147,7 @@ class OpenRouterBinding(LollmsLLMBinding):
     def detokenize(self, tokens: list) -> str:
         """Detokenize tokens using tiktoken."""
         try:
-            encoding = tiktoken.get_encoding("cl100k_base")
+            encoding = self._get_tiktoken().get_encoding("cl100k_base")
             return encoding.decode(tokens)
         except Exception:
             return bytes(tokens).decode('utf-8', errors='ignore')

@@ -3,14 +3,14 @@ from typing import Optional, List, Dict, Any, Union
 from io import BytesIO
 import base64
 import os
-import requests
 import pipmaster as pm
-pm.ensure_packages({"openai": ">=2.32.0"})
-from openai import OpenAI
-import openai
-print(openai.__version__)
 from lollms_client.lollms_tti_binding import LollmsTTIBinding
 from ascii_colors import ASCIIColors, trace_exception
+
+# Heavy dependencies are imported lazily inside __init__ / helper methods.
+requests = None
+OpenAI = None
+openai = None
 
 BindingName = "OpenAITTIBinding"
 
@@ -115,6 +115,15 @@ class OpenAITTIBinding(LollmsTTIBinding):
 
         binding_name = kwargs.pop("binding_name", BindingName)
         super().__init__(binding_name=binding_name, config=kwargs)
+
+        global requests, OpenAI, openai
+        pm.ensure_packages({"openai": ">=2.32.0", "requests": "*"})
+        import requests as _requests
+        from openai import OpenAI as _OpenAI
+        import openai as _openai
+        requests = _requests
+        OpenAI = _OpenAI
+        openai = _openai
 
         # Mirror OpenRouter's "service_key" naming while keeping "api_key" as alias.
         self.service_key = (

@@ -41,11 +41,27 @@ To maintain clean and token-efficient context budgets, every registered artifact
 
 | Visibility Tier | Symbol | Prompt Context Behavior |
 | :--- | :--- | :--- |
-| **`FULL`** | `[C]` | The content (for text) or `.lam` schema (for data) is fully injected verbatim into the active context zone. |
+| **`FULL`** | `[C]` | The content (for text) or `.lam` schema (for data) is fully injected verbatim into the active context zone. **Permanent** — stays loaded until explicitly demoted. |
+| **`SINGLE_ROUND`** | `[C]` | Fully injected for **exactly one turn**, then auto-demoted to `TREE_UNLOCKABLE` by `build_artefacts_context_zone()`. **This is the default for generated images.** |
 | **`METADATA`** | `[M]` | Only the basic metadata (such as filename, size, and type) is injected, withholding the full schema description. |
 | **`TREE_UNLOCKABLE`**| `[U]` | The file is listed only in the directory index. It is excluded from the active context but can be loaded dynamically. |
 | **`LOCKED`** | `[L]` | The file is completely excluded from the conversation context and cannot be loaded. |
 | **`HIDDEN`** | — | The artifact is completely excluded from both the directory index and the context. |
+
+### The `SINGLE_ROUND` Tier (One-Shot Unlock)
+
+`SINGLE_ROUND` solves the **image context bloat** problem: an LLM that generates an image needs to *see* it once (to verify the result and decide whether to edit it), but keeping the base64 payload in context forever exhausts the window over many rounds.
+
+**Lifecycle:**
+
+1. **Creation** — the artefact is stored with `visibility="single_round"` and `active=True`. It behaves exactly like `FULL` for the next context build.
+2. **First build** — `build_artefacts_context_zone()` injects the payload into the `[C]` zone and `get_context_images()` includes the pixels in the vision payload.
+3. **Auto-demotion** — at the *end* of that same build, `_demote_single_round_artefacts()` flips the artefact to `TREE_UNLOCKABLE` and `active=False`. The next turn's build no longer pays the token cost.
+4. **Re-access** — the LLM can still permanently load the artefact via `<unlock_file>` (which sets `FULL`) or by passing `visibility="full"` on a subsequent write.
+
+**Aliases accepted by `_resolve_tag_visibility`:** `single_round`, `next_round`, `one_round`, `single-turn`, `single_turn`.
+
+**Default for images:** `_dispatch_typed_artifact` (image branch) and `add()` (when `artefact_type == IMAGE` and no explicit visibility is given) both default to `SINGLE_ROUND`. Tool-generated images (`_sync_tool_artifacts`) follow the same contract.
 
 The LLM can dynamically promote any `[U]` file into its working memory by outputting the file-loading tag:
 ```xml
@@ -140,7 +156,7 @@ agent = Agent(
 
 The `.lam` Dual-Stream and `.versions/{uuid}/` snapshot architecture is a **discussion-mode feature**, designed for conversations with a small number of generated assets. It is **strictly disabled** in agentic mode (`disable_artefact_versioning=True`):
 
-* **No `.versions/` directory is ever created.** `_sync_to_disk_workspace` writes only the active file to the workspace root — no `…​_vN` snapshots, no UUID directories.
+* **No `.versions/` directory is ever created.** `_sync_to_disk_workspace` writes only the active file to the workspace root — no `… _vN` snapshots, no UUID directories.
 * **No `.lam` logical twins are written.** Logical metadata cards are not computed or persisted; the artifact's context text lives only in its DB record (or on-disk text).
 * **The host application owns versioning.** In agentic deployments (thousands of files), the application or external VCS (Git) manages history. LoLLMS treats the workspace as a plain live tree.
 * Export bundling with `include_versions=True` is a no-op in agentic mode (the flag is force-disabled).
@@ -234,8 +250,8 @@ Every artifact in the system is represented as a dictionary (record) with a spec
 | `type` | `str` | The category of the artifact (e.g., `ArtefactType.CODE`, `ArtefactType.DATA`). Determines how the artifact is rendered in the context zone and which tools can operate on it. |
 | `content` | `str` | The logical text content. For text/code files, this is the verbatim source code. For `DATA` artifacts, this holds the `.lam` schema description, **NOT** the raw binary bytes. |
 | `version` | `int` | The version number. Incremented automatically on `update()` if `bump_version=True`. The `get()` method returns the highest version by default. |
-| `visibility` | `str` | The context tier (`FULL`, `TREE_UNLOCKABLE`, `METADATA`, `TREE_LOCKED`, `HIDDEN`). Controls how the artifact appears in the LLM's prompt. See [Section 2: Multi-Tier Visibility Control](#-2-multi-tier-visibility-control). |
-| `active` | `bool` | A legacy boolean flag that mirrors `visibility == FULL`. It is `True` if the artifact is fully loaded in context, `False` otherwise. |
+| `visibility` | `str` | The context tier (`FULL`, `SINGLE_ROUND`, `TREE_UNLOCKABLE`, `METADATA`, `TREE_LOCKED`, `HIDDEN`). Controls how the artifact appears in the LLM's prompt. See [Section 2: Multi-Tier Visibility Control](#-2-multi-tier-visibility-control). |
+| `active` | `bool` | A legacy boolean flag that mirrors `visibility in (FULL, SINGLE_ROUND)`. It is `True` if the artifact is fully loaded in context (permanently or for the current single-round window), `False` otherwise. |
 | `language` | `str` | The programming or markup language (e.g., `python`, `html`). Used for syntax highlighting in the context zone and to infer file extensions. |
 | `file_ext` | `str` | The explicit file extension (e.g., `.csv`, `.db`). **CRITICAL for DATA artifacts**: This determines how the physical file is written to disk and prevents binary corruption. |
 | `logical_content` | `str` | Explicit storage for the `.lam` schema text of `DATA` artifacts. While usually mirrored in `content`, this field is the authoritative source for the logical twin during Dual-Stream sync operations. |
@@ -269,7 +285,9 @@ The architecture decouples the logical database key (`title`) from the unique di
 
 #### 4. Image Artifacts
 *   Image artifacts store base64 encoded strings in the `images` list and their MIME types in `image_media_types`.
-*   They are an exception to the visibility doctrine: they are always registered with `visibility=FULL` and `active=True` when generated by tools, so they can be hydrated into the LLM's vision context immediately.
+*   **Default visibility is `SINGLE_ROUND`** (not `FULL`). Generated images are visible to the LLM for exactly one round — enough to verify the result and decide whether to edit it — then auto-demoted to `TREE_UNLOCKABLE` so the base64 payload is freed from context. This is the primary mitigation against image context bloat over long sessions.
+*   To keep an image permanently loaded, the LLM (or host) must explicitly request `visibility="full"` or emit `<unlock_file>` after creation.
+*   The `active` flag is `True` for both `FULL` and `SINGLE_ROUND`, so `sync_all_active_to_disk` still heals the physical file; demotion flips it to `False` alongside the visibility change.
 
 ---
 
@@ -352,7 +370,7 @@ The reverse direction is covered too: the index sync (`_sync_index_with_disk`) r
 
 *   **`ArtefactType`**: Registry defining the supported categories (`DATA`, `CODE`, `DOCUMENT`, `IMAGE`, `PRESENTATION`, `NOTE`, `SKILL`, `TOOL`, `SCRATCHPAD`).
     *   `SKILL`: Represents persistent knowledge or behavior capsules. When created in a discussion with a Handbag personality, skills are routed to `handbag/skills/<name>/SKILL.md`. For manual/stateless personalities, they are versioned and stored directly as discussion artefacts.
-*   **`ArtefactVisibility`**: Enum-like class defining the context tiers (`FULL`, `TREE_UNLOCKABLE`, `METADATA`, `TREE_LOCKED`, `HIDDEN`).
+*   **`ArtefactVisibility`**: Enum-like class defining the context tiers (`FULL`, `SINGLE_ROUND`, `TREE_UNLOCKABLE`, `METADATA`, `TREE_LOCKED`, `HIDDEN`).
 *   **`ArtefactStatus`**: Enum-like class defining the lifecycle states (`DRAFTING`, `STABLE`, `REVISING`, `ERROR`).
 *   **`ArtefactManager`**: Orchestrates database CRUD operations, applies search-and-replace patches, manages version history squashing, and gates dynamic tool registration.
 *   **`FileImportMixin`**: Contains multi-modal parser subroutines for importing PDFs, Word documents, PowerPoint presentations, and audio files.

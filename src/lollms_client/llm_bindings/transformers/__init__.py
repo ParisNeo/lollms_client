@@ -16,30 +16,20 @@ from ascii_colors import ASCIIColors, trace_exception
 import pipmaster as pm
 
 # --- Dependencies ---
-pm.ensure_packages([
-    "torch", "transformers", "accelerate", "bitsandbytes",
-    "sentence_transformers", "pillow", "scipy", "huggingface_hub",
-    "psutil", "peft", "trl", "datasets"
-])
-
-try:
-    import torch
-    from transformers import (
-        AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer,
-        BitsAndBytesConfig, AutoConfig, AutoProcessor, 
-        LlavaForConditionalGeneration, LlavaNextForConditionalGeneration,
-        TrainingArguments
-    )
-    from peft import PeftModel, LoraConfig, get_peft_model, prepare_model_for_kbit_training
-    from trl import SFTTrainer
-    from datasets import load_dataset
-    from sentence_transformers import SentenceTransformer
-    from huggingface_hub import snapshot_download
-    from PIL import Image
-except ImportError as e:
-    ASCIIColors.error(f"Failed to import core libraries: {e}")
-    torch = None 
-    transformers = None
+# Heavy dependencies are imported lazily inside __init__ / helper methods.
+# At module import time we only probe availability without installing anything.
+torch = None
+transformers = None
+AutoTokenizer = AutoModelForCausalLM = TextIteratorStreamer = None
+BitsAndBytesConfig = AutoConfig = AutoProcessor = None
+LlavaForConditionalGeneration = LlavaNextForConditionalGeneration = None
+TrainingArguments = None
+PeftModel = LoraConfig = get_peft_model = prepare_model_for_kbit_training = None
+SFTTrainer = None
+load_dataset = None
+SentenceTransformer = None
+snapshot_download = None
+Image = None
 
 # --- Container ---
 class ModelContainer:
@@ -74,9 +64,62 @@ class HuggingFace(LollmsLLMBinding):
 
     def __init__(self, **kwargs):
         super().__init__(BindingName, **kwargs)
-        
-        if torch is None or transformers is None:
-            raise ImportError("Core libraries not available.")
+
+        # Lazy dependency installation/import
+        global torch, transformers, AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer
+        global BitsAndBytesConfig, AutoConfig, AutoProcessor
+        global LlavaForConditionalGeneration, LlavaNextForConditionalGeneration
+        global TrainingArguments, PeftModel, LoraConfig, get_peft_model, prepare_model_for_kbit_training
+        global SFTTrainer, load_dataset, SentenceTransformer, snapshot_download, Image
+
+        pm.ensure_packages([
+            "torch", "transformers", "accelerate", "bitsandbytes",
+            "sentence_transformers", "pillow", "scipy", "huggingface_hub",
+            "psutil", "peft", "trl", "datasets"
+        ])
+
+        import torch as _torch
+        import transformers as _transformers
+        from transformers import (
+            AutoTokenizer as _AutoTokenizer, AutoModelForCausalLM as _AutoModelForCausalLM,
+            TextIteratorStreamer as _TextIteratorStreamer,
+            BitsAndBytesConfig as _BitsAndBytesConfig, AutoConfig as _AutoConfig,
+            AutoProcessor as _AutoProcessor,
+            LlavaForConditionalGeneration as _LlavaForConditionalGeneration,
+            LlavaNextForConditionalGeneration as _LlavaNextForConditionalGeneration,
+            TrainingArguments as _TrainingArguments,
+        )
+        from peft import (
+            PeftModel as _PeftModel, LoraConfig as _LoraConfig,
+            get_peft_model as _get_peft_model,
+            prepare_model_for_kbit_training as _prepare_model_for_kbit_training,
+        )
+        from trl import SFTTrainer as _SFTTrainer
+        from datasets import load_dataset as _load_dataset
+        from sentence_transformers import SentenceTransformer as _SentenceTransformer
+        from huggingface_hub import snapshot_download as _snapshot_download
+        from PIL import Image as _Image
+
+        torch = _torch
+        transformers = _transformers
+        AutoTokenizer = _AutoTokenizer
+        AutoModelForCausalLM = _AutoModelForCausalLM
+        TextIteratorStreamer = _TextIteratorStreamer
+        BitsAndBytesConfig = _BitsAndBytesConfig
+        AutoConfig = _AutoConfig
+        AutoProcessor = _AutoProcessor
+        LlavaForConditionalGeneration = _LlavaForConditionalGeneration
+        LlavaNextForConditionalGeneration = _LlavaNextForConditionalGeneration
+        TrainingArguments = _TrainingArguments
+        PeftModel = _PeftModel
+        LoraConfig = _LoraConfig
+        get_peft_model = _get_peft_model
+        prepare_model_for_kbit_training = _prepare_model_for_kbit_training
+        SFTTrainer = _SFTTrainer
+        load_dataset = _load_dataset
+        SentenceTransformer = _SentenceTransformer
+        snapshot_download = _snapshot_download
+        Image = _Image
 
         self.config = {**self.DEFAULT_CONFIG_ARGS, **kwargs.get("config", {}), **kwargs}
         

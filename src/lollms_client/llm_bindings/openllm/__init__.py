@@ -6,8 +6,6 @@ import mimetypes
 import math
 from typing import Optional, Callable, List, Union, Dict
 
-import httpx
-import tiktoken
 import pipmaster as pm
 
 from lollms_client.lollms_llm_binding import LollmsLLMBinding
@@ -16,8 +14,9 @@ from lollms_client.lollms_discussion import LollmsDiscussion
 from lollms_client.lollms_utilities import encode_image
 from ascii_colors import ASCIIColors, trace_exception
 
-# Ensure required packages are installed
-pm.ensure_packages(["httpx", "tiktoken"])
+# Heavy dependencies are imported lazily inside __init__ / helper methods.
+httpx = None
+tiktoken = None
 
 BindingName = "OpenLLMBinding"
 
@@ -78,6 +77,12 @@ class OpenLLMBinding(LollmsLLMBinding):
             verify_ssl_certificate (bool): Whether to verify SSL certificates.
         """
         super().__init__(BindingName, **kwargs)
+
+        global httpx
+        pm.ensure_packages(["httpx", "tiktoken"])
+        import httpx as _httpx
+        httpx = _httpx
+
         self.host_address = kwargs.get("host_address")
         self.model_name = kwargs.get("model_name")
         self.service_key = kwargs.get("service_key", os.getenv("OPENLLM_API_KEY"))
@@ -334,6 +339,11 @@ class OpenLLMBinding(LollmsLLMBinding):
 
     def _get_encoding(self, model_name: str | None = None):
         """Fallback to tiktoken for generic tokenisation."""
+        global tiktoken
+        if tiktoken is None:
+            pm.ensure_packages(["tiktoken"])
+            import tiktoken as _tiktoken
+            tiktoken = _tiktoken
         try:
             return tiktoken.encoding_for_model(model_name or self.model_name)
         except KeyError:

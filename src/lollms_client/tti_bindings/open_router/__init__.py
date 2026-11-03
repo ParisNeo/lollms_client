@@ -1,4 +1,3 @@
-import requests
 import json
 import base64
 from pathlib import Path
@@ -6,6 +5,10 @@ from typing import Optional, List, Dict, Any, Union, Callable
 from lollms_client.lollms_tti_binding import LollmsTTIBinding
 from lollms_client.lollms_types import MSG_TYPE
 from ascii_colors import ASCIIColors, trace_exception
+import pipmaster as pm
+
+# requests is imported lazily inside __init__.
+requests = None
 
 BindingName = "OpenRouterTTIBinding"
 
@@ -19,7 +22,12 @@ class OpenRouterTTIBinding(LollmsTTIBinding):
         # we pop it and use the local BindingName constant or the passed value.
         binding_name = kwargs.pop('binding_name', BindingName)
         super().__init__(binding_name=binding_name, **kwargs)
-        
+
+        global requests
+        pm.ensure_packages(["requests"])
+        import requests as _requests
+        requests = _requests
+
         self.service_key = kwargs.get("service_key", "")
         # Default to a known stable image-capable model
         self.model_name = kwargs.get("model_name", "google/gemini-2.0-flash-exp:free")

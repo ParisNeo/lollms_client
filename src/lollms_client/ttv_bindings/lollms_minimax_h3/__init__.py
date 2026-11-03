@@ -224,6 +224,9 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
         entry = _TTV_ZOO[index]
         return self.pull_model(entry["hf_id"])
 
+    def get_zoo(self) -> List[Dict[str, Any]]:
+        return list(_TTV_ZOO)
+
     # ------------------------------------------------------------------
     # Generation Logic
     # ------------------------------------------------------------------
@@ -414,23 +417,6 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
             return [m["id"] for m in resp.json().get("data", [])]
         except Exception:
             return [entry["name"] for entry in _TTV_ZOO]
-
-    # ── Resource management contract ────────────────────────────────────────
-    def is_local(self) -> bool:
-        return True
-
-    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
-        return self.health_check()
-
-    def has_active_resources(self) -> bool:
-        return self.process is not None and self.process.poll() is None
-
-    def get_loaded_models(self) -> List[str]:
-        return [self.model] if self.health_check() else []
-
-    def unload_model(self, model_name: Optional[str] = None) -> bool:
-        result = self.stop_server()
-        return result.get("status", False)
 
     # ── Resource management contract ────────────────────────────────────────
     def is_local(self) -> bool:

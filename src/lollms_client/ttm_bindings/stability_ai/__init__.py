@@ -112,24 +112,12 @@ class ReplicateTTMBinding(LollmsTTMBinding):
     def install_model(self, model_name: str, **kwargs) -> dict:
         return {"status": False, "message": "Remote API; models are managed by Stability AI."}
 
+    def get_zoo(self) -> List[Dict[str, Any]]:
+        return list(STABILITY_AI_MODELS)
 
-    # ── Resource management contract ────────────────────────────────────────
-    def is_local(self) -> bool:
-        return False
-
-    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
-        return True
-
-    def has_active_resources(self) -> bool:
-        return False
-
-    def get_loaded_models(self) -> List[str]:
-        return [self.model_name] if self.model_name else []
-
-    def unload_model(self, model_name: Optional[str] = None) -> bool:
-        return True
-
-    def install_model(self, model_name: str, **kwargs) -> dict:
+    def download_from_zoo(self, index: int, progress_callback: Optional[Callable[[dict], None]] = None) -> dict:
+        if index < 0 or index >= len(STABILITY_AI_MODELS):
+            return {"status": False, "message": "Index out of bounds."}
         return {"status": False, "message": "Remote API; models are managed by Stability AI."}
 
 

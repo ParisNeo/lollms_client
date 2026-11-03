@@ -34,7 +34,7 @@ import platform
 import subprocess
 import requests
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Callable
 
 # ── Bootstrap filelock without requiring a pre-existing environment ──────────
 try:
@@ -559,47 +559,6 @@ class VllmOmniTTSBinding(LollmsTTSBinding):
             ASCIIColors.error(f"vLLM-Omni: Upload failed — {e}")
             return {"success": False, "voice_name": None,
                     "message": f"Upload failed: {e}"}
-
-    # ── Resource management contract ────────────────────────────────────────
-    def is_local(self) -> bool:
-        return True
-
-    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
-        return self.is_server_running()
-
-    def has_active_resources(self) -> bool:
-        return self.is_server_running()
-
-    def get_loaded_models(self) -> List[str]:
-        return [self.model_name] if self.is_server_running() else []
-
-    def unload_model(self, model_name: Optional[str] = None) -> bool:
-        if self._server_proc and self._server_proc.poll() is None:
-            self._server_proc.terminate()
-            self._server_proc = None
-        return True
-
-    def install_model(self, model_name: str, **kwargs) -> dict:
-        try:
-            self.model_name = model_name
-            self.ensure_server_is_running()
-            return {"status": True, "message": f"Model {model_name} loaded."}
-        except Exception as e:
-            return {"status": False, "message": str(e)}
-
-    def get_zoo(self) -> List[Dict[str, Any]]:
-        return [
-            {"name": "Voxtral 4B TTS", "description": "Mistral Voxtral TTS", "size": "~5GB", "type": "safetensors", "link": "mistralai/Voxtral-4B-TTS-2603"},
-            {"name": "Qwen3-TTS CustomVoice", "description": "Qwen3 TTS with preset voices", "size": "~3GB", "type": "safetensors", "link": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"},
-            {"name": "Fish Speech S2 Pro", "description": "Fish Speech S2 Pro", "size": "~8GB", "type": "safetensors", "link": "fishaudio/s2-pro"},
-            {"name": "MOSS-TTS-Nano", "description": "Tiny TTS model", "size": "~1GB", "type": "safetensors", "link": "OpenMOSS-Team/MOSS-TTS-Nano"},
-        ]
-
-    def download_from_zoo(self, index: int, progress_callback: Optional[Callable[[dict], None]] = None) -> dict:
-        zoo = self.get_zoo()
-        if index < 0 or index >= len(zoo):
-            return {"status": False, "message": "Index out of bounds."}
-        return self.install_model(zoo[index]["link"])
 
     # ── Resource management contract ────────────────────────────────────────
     def is_local(self) -> bool:

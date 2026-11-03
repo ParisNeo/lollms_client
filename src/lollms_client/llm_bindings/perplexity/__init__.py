@@ -13,10 +13,8 @@ from ascii_colors import ASCIIColors, trace_exception
 
 import pipmaster as pm
 
-# Ensure the required packages are installed
-pm.ensure_packages(["requests", "tiktoken"])
-
-import tiktoken
+# tiktoken is imported lazily inside tokenize/detokenize.
+tiktoken = None
 
 BindingName = "PerplexityBinding"
 API_BASE_URL = "https://api.perplexity.ai"
@@ -86,12 +84,20 @@ class PerplexityBinding(LollmsLLMBinding):
         if frequency_penalty is not None: params['frequency_penalty'] = frequency_penalty
         return params
 
+    def _get_tiktoken(self):
+        global tiktoken
+        if tiktoken is None:
+            pm.ensure_packages(["tiktoken"])
+            import tiktoken as _tiktoken
+            tiktoken = _tiktoken
+        return tiktoken
+
     def tokenize(self, text: str) -> list:
         """
         Tokenize the input text. Perplexity uses the same tokenizer as GPT-4.
         """
         try:
-            encoding = tiktoken.get_encoding("cl100k_base")
+            encoding = self._get_tiktoken().get_encoding("cl100k_base")
             return encoding.encode(text)
         except Exception as e:
             ASCIIColors.error(f"Could not use tiktoken, falling back to simple encoding: {e}")
@@ -102,7 +108,7 @@ class PerplexityBinding(LollmsLLMBinding):
         Detokenize a list of tokens.
         """
         try:
-            encoding = tiktoken.get_encoding("cl100k_base")
+            encoding = self._get_tiktoken().get_encoding("cl100k_base")
             return encoding.decode(tokens)
         except Exception as e:
             ASCIIColors.error(f"Could not use tiktoken, falling back to simple decoding: {e}")

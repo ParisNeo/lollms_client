@@ -1159,11 +1159,14 @@ To optimize the LLM's context window budget, the system uses a tiered visibility
 
 | Visibility Tier | Symbol | Context Behavior |
 | :--- | :--- | :--- |
-| **`FULL`** | `[C]` | Fully loaded in context (verbatim text/code/schema). |
+| **`FULL`** | `[C]` | Fully loaded in context (verbatim text/code/schema). **Permanent** until explicitly demoted. |
+| **`SINGLE_ROUND`** | `[C]` | Fully loaded for **exactly one turn**, then auto-demoted to `TREE_UNLOCKABLE`. **This is the default for generated images** (image generation, tool-produced images). |
 | **`METADATA`** | `[M]` | Only signatures, schemas, and metadata are loaded. |
-| **`TREE_UNLOCKABLE`**| `[U]` | Listed in the directory tree, but excluded from context. **This is the default state for all newly registered artifacts.** |
+| **`TREE_UNLOCKABLE`**| `[U]` | Listed in the directory tree, but excluded from context. **This is the default state for all newly registered artifacts** (except images, which default to `SINGLE_ROUND`). |
 | **`TREE_LOCKED`** | `[L]` | Excluded from context and cannot be unlocked by the LLM. |
 | **`HIDDEN`** | — | Completely excluded from both the context and the directory tree. |
+
+> **🖼️ Single-Round Image Visibility (Default)**: Generated images are registered with `SINGLE_ROUND` visibility. The LLM sees the pixels on the round immediately following creation (so it can verify the result and decide whether to edit it), then `build_artefacts_context_zone()` auto-demotes the artefact to `TREE_UNLOCKABLE` and the base64 payload is freed from context. To keep an image permanently loaded, the LLM can emit `<unlock_file>` (which sets `FULL`) or pass `visibility="full"` on a subsequent write. This is the primary mitigation against image context bloat over long sessions.
 
 #### State Transition Matrix
 
@@ -1185,6 +1188,8 @@ The system enforces a strict state machine for artifact visibility. The LLM can 
 | **`[L]` TREE_LOCKED** | **`[C]` FULL** | Host Application API | The user or host application explicitly unlocks the file for the LLM. |
 | **`[C]` FULL** | **`[U]` TREE_UNLOCKABLE** | System Auto-Prune | The context management system demotes the file to save tokens. |
 | **`[C]` FULL** | **`[M]` METADATA** | System Auto-Prune | The context management system demotes the file to metadata-only to save tokens. |
+| **`[C]` SINGLE_ROUND** | **`[U]` TREE_UNLOCKABLE** | System Auto-Demote | After the single-round window closes (end of `build_artefacts_context_zone()`), the artefact is auto-demoted so the payload is freed from context. |
+| **`[C]` SINGLE_ROUND** | **`[C]` FULL** | `<unlock_file>` tag | The LLM requests a permanent load before the window closes (or after demotion, from `[U]`). |
 
 > **Note on `[L]` (Locked)**: The LLM **cannot** unlock a `[L]` (Locked) file. Once a file is locked, it remains locked for the duration of the session unless the host application intervenes. This prevents the LLM from repeatedly locking and unlocking large files, which would waste context tokens.
 

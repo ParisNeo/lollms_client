@@ -547,32 +547,14 @@ class VoxtralLocalBinding(LollmsTTSBinding):
         except Exception as e:
             return {"status": False, "message": str(e)}
 
-    # ── Resource management contract ────────────────────────────────────────
-    def is_local(self) -> bool:
-        return True
+    def get_zoo(self) -> List[Dict[str, Any]]:
+        return [{"name": "Voxtral 4B TTS", "description": "Mistral Voxtral TTS", "size": "~5GB", "type": "safetensors", "link": DEFAULT_MODEL}]
 
-    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
-        return self.is_server_running()
-
-    def has_active_resources(self) -> bool:
-        return self.is_server_running()
-
-    def get_loaded_models(self) -> List[str]:
-        return [self.model_name] if self.is_server_running() else []
-
-    def unload_model(self, model_name: Optional[str] = None) -> bool:
-        if self._server_proc and self._server_proc.poll() is None:
-            self._server_proc.terminate()
-            self._server_proc = None
-        return True
-
-    def install_model(self, model_name: str, **kwargs) -> dict:
-        try:
-            self.model_name = model_name
-            self.ensure_server_is_running()
-            return {"status": True, "message": f"Model {model_name} loaded."}
-        except Exception as e:
-            return {"status": False, "message": str(e)}
+    def download_from_zoo(self, index: int, progress_callback: Optional[Callable[[dict], None]] = None) -> dict:
+        zoo = self.get_zoo()
+        if index < 0 or index >= len(zoo):
+            return {"status": False, "message": "Index out of bounds."}
+        return self.install_model(zoo[index]["link"])
 
     def delete_voice(self, voice_name: str) -> dict:
         """

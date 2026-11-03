@@ -7,57 +7,17 @@ from typing import Optional, List, Union, Dict, Any
 from ascii_colors import trace_exception, ASCIIColors
 
 # --- Package Management and Conditional Imports ---
+# Heavy dependencies are imported lazily inside __init__ / helper methods.
+# At module import time we only probe availability without installing anything.
 _audiocraft_installed_with_correct_torch = False
 _audiocraft_installation_error = ""
 
-try:
-    import pipmaster as pm
-    import platform # For OS detection for torch index
-
-    # Determine initial device preference to guide torch installation
-    preferred_torch_device_for_install = "cpu" # Default assumption
-    
-    # Tentatively set preference based on OS, assuming user might want GPU if available
-    if platform.system() == "Linux" or platform.system() == "Windows":
-        # On Linux/Windows, CUDA is the primary GPU acceleration for PyTorch.
-        # We will try to install a CUDA version of PyTorch.
-        preferred_torch_device_for_install = "cuda"
-    elif platform.system() == "Darwin":
-        # On macOS, MPS is the acceleration. Standard torch install usually handles this.
-        preferred_torch_device_for_install = "mps" # or keep cpu if mps detection is later
-
-    torch_pkgs = ["torch", "torchaudio","xformers"]
-    audiocraft_core_pkgs = ["audiocraft"]
-    other_deps = ["scipy", "numpy"]
-
-    torch_index_url = None
-    if preferred_torch_device_for_install == "cuda":
-        # Specify a common CUDA version index. Pip should resolve the correct torch version.
-        # As of late 2023/early 2024, cu118 or cu121 are common. Let's use cu121.
-        # Users with different CUDA setups might need to pre-install torch manually.
-        torch_index_url = "https://download.pytorch.org/whl/cu126"
-        ASCIIColors.info(f"Attempting to ensure PyTorch with CUDA support (target index: {torch_index_url})")
-        # Install torch and torchaudio first from the specific index
-        pm.ensure_packages(torch_pkgs, index_url=torch_index_url)
-        # Then install audiocraft and other dependencies; pip should use the already installed torch
-        pm.ensure_packages(audiocraft_core_pkgs + other_deps)
-    else:
-        # For CPU, MPS, or if no specific CUDA preference was determined for install
-        ASCIIColors.info("Ensuring PyTorch, AudioCraft, and dependencies using default PyPI index.")
-        pm.ensure_packages(torch_pkgs + audiocraft_core_pkgs + other_deps)
-
-    # Now, perform the actual imports
-    import torch, torchaudio
-    from audiocraft.models import MusicGen
-    from audiocraft.data.audio import audio_write # For saving to bytes
-    import numpy as np
-    import scipy.io.wavfile # For direct WAV manipulation if needed, though audio_write is preferred
-
-    _audiocraft_installed_with_correct_torch = True # If imports succeed after ensure_packages
-except Exception as e:
-    _audiocraft_installation_error = str(e)
-    # Set placeholders if imports fail
-    MusicGen, torch, audio_write, np, scipy = None, None, None, None, None
+MusicGen = None
+torch = None
+torchaudio = None
+audio_write = None
+np = None
+scipy = None
 # --- End Package Management ---
 
 from lollms_client.lollms_ttm_binding import LollmsTTMBinding
@@ -79,10 +39,54 @@ class AudioCraftTTMBinding(LollmsTTMBinding):
         # Prioritize 'model_name' but accept 'model' as an alias from config files.
         if 'model' in kwargs and 'model_name' not in kwargs:
             kwargs['model_name'] = kwargs.pop('model')
-        super().__init__(binding_name=BindingName, config=kwargs)    
+        super().__init__(binding_name=BindingName, config=kwargs)
 
-        if not _audiocraft_installed_with_correct_torch:
-            raise ImportError(f"AudioCraft TTM binding dependencies not met. Please ensure 'audiocraft', 'torch', 'torchaudio', 'scipy', 'numpy' are installed. Error: {_audiocraft_installation_error}")
+        # Lazy dependency installation/import
+        global _audiocraft_installed_with_correct_torch, _audiocraft_installation_error
+        global MusicGen, torch, torchaudio, audio_write, np, scipy
+
+        try:
+            import pipmaster as pm
+            import platform
+
+            preferred_torch_device_for_install = "cpu"
+            if platform.system() in ("Linux", "Windows"):
+                preferred_torch_device_for_install = "cuda"
+            elif platform.system() == "Darwin":
+                preferred_torch_device_for_install = "mps"
+
+            torch_pkgs = ["torch", "torchaudio", "xformers"]
+            audiocraft_core_pkgs = ["audiocraft"]
+            other_deps = ["scipy", "numpy"]
+
+            if preferred_torch_device_for_install == "cuda":
+                torch_index_url = "https://download.pytorch.org/whl/cu126"
+                ASCIIColors.info(f"Attempting to ensure PyTorch with CUDA support (target index: {torch_index_url})")
+                pm.ensure_packages(torch_pkgs, index_url=torch_index_url)
+                pm.ensure_packages(audiocraft_core_pkgs + other_deps)
+            else:
+                ASCIIColors.info("Ensuring PyTorch, AudioCraft, and dependencies using default PyPI index.")
+                pm.ensure_packages(torch_pkgs + audiocraft_core_pkgs + other_deps)
+
+            import torch as _torch, torchaudio as _torchaudio
+            from audiocraft.models import MusicGen as _MusicGen
+            from audiocraft.data.audio import audio_write as _audio_write
+            import numpy as _np
+            import scipy.io.wavfile as _scipy
+
+            torch = _torch
+            torchaudio = _torchaudio
+            MusicGen = _MusicGen
+            audio_write = _audio_write
+            np = _np
+            scipy = _scipy
+            _audiocraft_installed_with_correct_torch = True
+        except Exception as e:
+            _audiocraft_installation_error = str(e)
+            raise ImportError(
+                f"AudioCraft TTM binding dependencies not met. Please ensure 'audiocraft', "
+                f"'torch', 'torchaudio', 'scipy', 'numpy' are installed. Error: {e}"
+            )
 
         self.device = kwargs.get("device")  # "cuda", "mps", "cpu", or None for auto-detect
         if self.device is None: # Auto-detect if not specified by user

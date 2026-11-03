@@ -230,24 +230,8 @@ class PiperClientBinding(LollmsTTSBinding):
         except Exception as e:
             return {"status": False, "message": str(e)}
 
-    # ── Resource management contract ────────────────────────────────────────
-    def is_local(self) -> bool:
-        return True
+    def get_zoo(self) -> List[Dict[str, Any]]:
+        return [{"name": "piper", "description": "Piper TTS voices", "size": "~50MB per voice", "type": "onnx", "link": "piper"}]
 
-    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
-        return self.is_server_running()
-
-    def has_active_resources(self) -> bool:
-        return self.is_server_running()
-
-    def get_loaded_models(self) -> List[str]:
-        return ["piper"] if self.is_server_running() else []
-
-    def unload_model(self, model_name: Optional[str] = None) -> bool:
-        return self.shutdown_server()
-
-    def install_model(self, model_name: str, **kwargs) -> dict:
-        try:
-            return self.download_voice(model_name)
-        except Exception as e:
-            return {"status": False, "message": str(e)}
+    def download_from_zoo(self, index: int, progress_callback: Optional[Callable[[dict], None]] = None) -> dict:
+        return {"status": True, "message": "Piper voices are downloaded on demand."}

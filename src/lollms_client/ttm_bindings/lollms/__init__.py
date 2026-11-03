@@ -19,6 +19,14 @@ class LollmsTTMBinding_Impl(LollmsTTMBinding):
         ASCIIColors.warning("Please ensure your LOLLMS server has a TTM service running.")
 
 
+    def generate_video(self, prompt: str, **kwargs) -> bytes:
+        """
+        Generates video data using an assumed LOLLMS /generate_video endpoint. (Not Implemented)
+        """
+        raise NotImplementedError(
+            "LOLLMS TTM generate_video client binding is not implemented yet."
+        )
+
     def generate_music(self, prompt: str, **kwargs) -> bytes:
         """
         Generates music data using an assumed LOLLMS /generate_music endpoint. (Not Implemented)
@@ -60,23 +68,10 @@ class LollmsTTMBinding_Impl(LollmsTTMBinding):
     def install_model(self, model_name: str, **kwargs) -> dict:
         return {"status": False, "message": "Remote LoLLMS server; models are managed server-side."}
 
-    # ── Resource management contract ────────────────────────────────────────
-    def is_local(self) -> bool:
-        return False
-
-    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
-        return True
-
-    def has_active_resources(self) -> bool:
-        return False
-
-    def get_loaded_models(self) -> List[str]:
+    def get_zoo(self) -> List[Dict[str, Any]]:
         return []
 
-    def unload_model(self, model_name: Optional[str] = None) -> bool:
-        return True
-
-    def install_model(self, model_name: str, **kwargs) -> dict:
+    def download_from_zoo(self, index: int, progress_callback: Optional[Callable[[dict], None]] = None) -> dict:
         return {"status": False, "message": "Remote LoLLMS server; models are managed server-side."}
 
     def list_models(self, **kwargs) -> List[str]:

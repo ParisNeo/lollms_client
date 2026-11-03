@@ -3855,7 +3855,50 @@ class LollmsPersonality:
         return _core_take_workspace_snapshot(self._resolved_workspace)
 
     def _sync_workspace(self, files_before: Dict, files_after: Dict) -> List[Dict[str, Any]]:
-        return _core_sync_workspace_diff(files_before, files_after)
+        changes = _core_sync_workspace_diff(files_before, files_after)
+
+        # ── 🖼️ SINGLE-ROUND REGISTRATION FOR TOOL-PRODUCED IMAGES ──
+        # Tool-generated images (e.g. matplotlib plots, edited PNGs) are
+        # registered as SINGLE_ROUND artefacts so the LLM sees the pixels on
+        # the next round, then the payload is auto-demoted. Non-image files
+        # are left to the normal artefact sync path.
+        if changes and getattr(self, '_artefact_manager', None) and self._resolved_workspace:
+            _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
+            for change in changes:
+                try:
+                    change_type = change.get("type") or change.get("change_type") or ""
+                    if change_type not in ("created", "modified", "new", "updated"):
+                        continue
+                    rel_path = change.get("path") or change.get("file") or change.get("title") or ""
+                    if not rel_path:
+                        continue
+                    ext = Path(rel_path).suffix.lower()
+                    if ext not in _IMAGE_EXTS:
+                        continue
+                    abs_path = self._resolved_workspace / rel_path
+                    if not abs_path.is_file():
+                        continue
+                    raw_bytes = abs_path.read_bytes()
+                    if not raw_bytes:
+                        continue
+                    img_b64 = base64.b64encode(raw_bytes).decode("utf-8")
+                    media_type = f"image/{ext.lstrip('.')}"
+                    if ext in (".jpg", ".jpeg"):
+                        media_type = "image/jpeg"
+                    self._artefact_manager.add(
+                        title=rel_path,
+                        artefact_type="image",
+                        content=f"### Image: `{rel_path}`\n\nProduced by a tool.\n\n> Reference it with `![]({rel_path})`. To view pixels again later, emit `<unlock_file>{rel_path}</unlock_file>`.",
+                        images=[img_b64],
+                        image_media_types=[media_type],
+                        active=True,
+                        visibility=ArtefactVisibility.SINGLE_ROUND,
+                    )
+                    ASCIIColors.info(f"[{self.name}] 🖼️ Registered tool-produced image '{rel_path}' as SINGLE_ROUND artefact.")
+                except Exception as img_sync_err:
+                    ASCIIColors.warning(f"[{self.name}] Failed to register tool-produced image '{change.get('path', '?')}': {img_sync_err}")
+
+        return changes
 
     def cancel_generation(self) -> bool:
         object.__setattr__(self, '_cancel_flag', True)
@@ -4156,7 +4199,7 @@ class LollmsPersonality:
                         continue
 
                     vis = art.get("visibility")
-                    if vis in (ArtefactVisibility.FULL, ArtefactVisibility.PINNED):
+                    if vis in (ArtefactVisibility.FULL, ArtefactVisibility.PINNED, ArtefactVisibility.SINGLE_ROUND):
                         content = art.get("content", "")
                         phys_target = art.get("physical_path") or title
                         file_path = self._resolved_workspace / phys_target
@@ -4203,6 +4246,17 @@ class LollmsPersonality:
             parts.append(loaded_block)
         if sub_ws_block:
             parts.append(sub_ws_block)
+
+        # ── SINGLE-ROUND DEMOTION ────────────────────────────────────────
+        # The context above has just been assembled with SINGLE_ROUND artefacts
+        # treated as FULL. Now demote them so the NEXT round's build frees the
+        # payload. This mirrors build_artefacts_context_zone() in the discussion
+        # mixin and is the "one-shot unlock" contract for the personality loop.
+        if getattr(self, '_artefact_manager', None):
+            try:
+                self._artefact_manager._demote_single_round_artefacts()
+            except Exception as demote_err:
+                ASCIIColors.warning(f"[{self.name}] Failed to demote SINGLE_ROUND artefacts: {demote_err}")
 
         return "\n\n".join(parts)
 
@@ -5832,15 +5886,7 @@ JSON:"""
                 )
             except Exception:
                 pass
-        elif not any(t_name == "tool_query_rag" for t_name in active_tools):
-            try:
-                ASCIIColors.warning(
-                    f"[Personality.get_rag_tools] NO RAG tools — "
-                    f"extra_knowledge_bases={len(_kb_paths)}, "
-                    f"extra_safe_stores={len(_safe_stores)}"
-                )
-            except Exception:
-                pass
+
 
         if explicit_tools:
             active_tools.update(explicit_tools)
@@ -8501,6 +8547,30 @@ JSON:"""
                                     out_msg = img_res.get("output") or img_res.get("error") or "Image processed."
                                     action_reports.append(f"🎨 Image Generation: {out_msg}")
                                     actions_executed_count += 1
+
+                                    # ── 🖼️ SINGLE-ROUND IMAGE REGISTRATION ──
+                                    # Register the generated image as a SINGLE_ROUND
+                                    # artefact so the LLM sees the pixels on the next
+                                    # round (to verify / decide whether to edit), then
+                                    # the payload is auto-demoted by
+                                    # _build_workspace_context_block().
+                                    try:
+                                        img_b64 = img_res.get("image_b64") if isinstance(img_res, dict) else None
+                                        img_filename = img_res.get("image_filename") if isinstance(img_res, dict) else None
+                                        if img_b64 and img_filename and getattr(self, '_artefact_manager', None):
+                                            self._artefact_manager.add(
+                                                title=img_filename,
+                                                artefact_type="image",
+                                                content=f"### Image: `{img_filename}`\n\nGenerated via `<{tag_name}>`.\n- **Prompt**: {img_prompt[:200]}\n\n> Reference it with `![]({img_filename})`. To view pixels again later, emit `<unlock_file>{img_filename}</unlock_file>`.",
+                                                images=[img_b64],
+                                                image_media_types=["image/png"],
+                                                active=True,
+                                                visibility=ArtefactVisibility.SINGLE_ROUND,
+                                            )
+                                            ASCIIColors.info(f"[{self.name}] 🖼️ Registered '{img_filename}' as SINGLE_ROUND image artefact.")
+                                    except Exception as img_reg_err:
+                                        ASCIIColors.warning(f"[{self.name}] Failed to register generated image as artefact: {img_reg_err}")
+
                                     continue
                                 else:
                                     action_reports.append(f"❌ TTI (Image Generation) binding is not available in current configuration.")

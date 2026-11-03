@@ -45,6 +45,19 @@ class SongGenerationRequest(BaseModel):
     seed: int = Field(default=-1)
 
 
+class VideoGenerationRequest(BaseModel):
+    prompt: str = Field(..., description="Text prompt describing the video.")
+    negative_prompt: str = Field(default="", description="Negative prompt.")
+    width: int = Field(default=768)
+    height: int = Field(default=512)
+    num_frames: int = Field(default=24)
+    num_inference_steps: int = Field(default=30)
+    guidance_scale: float = Field(default=7.5)
+    seed: int = Field(default=-1)
+    fps: int = Field(default=8)
+    model_name: Optional[str] = Field(default=None)
+
+
 class PullModelRequest(BaseModel):
     model_name: str
 
@@ -168,6 +181,9 @@ class DiffusersTTMServer:
                     torch.cuda.empty_cache()
 
     def _execute_generation(self, task: str, payload: dict) -> bytes:
+        if task == "generate_video":
+            return self._execute_video_generation(payload)
+
         prompt = payload.get("prompt", "")
         lyrics = payload.get("lyrics", "")
         duration = float(payload.get("duration", 15.0))
@@ -257,6 +273,76 @@ class DiffusersTTMServer:
             sf.write(buf, audio_arr, 32000, format="WAV")
             return buf.getvalue()
 
+    def _execute_video_generation(self, payload: dict) -> bytes:
+        """Runs a video-capable pipeline and returns MP4 bytes."""
+        prompt = payload.get("prompt", "")
+        negative_prompt = payload.get("negative_prompt", "")
+        width = int(payload.get("width", 768))
+        height = int(payload.get("height", 512))
+        num_frames = int(payload.get("num_frames", 24))
+        steps = int(payload.get("num_inference_steps", 30))
+        guidance = float(payload.get("guidance_scale", 7.5))
+        seed = int(payload.get("seed", -1))
+        fps = int(payload.get("fps", 8))
+
+        generator = None
+        if seed != -1:
+            generator = torch.Generator(device=device).manual_seed(seed)
+
+        kwargs: Dict[str, Any] = {
+            "prompt": prompt,
+            "num_inference_steps": steps,
+            "guidance_scale": guidance,
+            "num_frames": num_frames,
+            "width": width,
+            "height": height,
+        }
+        if negative_prompt:
+            kwargs["negative_prompt"] = negative_prompt
+        if generator is not None:
+            kwargs["generator"] = generator
+
+        with torch.no_grad():
+            output = self.pipeline(**kwargs)
+
+        frames = getattr(output, "frames", None)
+        if frames is None:
+            raise RuntimeError("Video pipeline returned no 'frames' attribute.")
+
+        if isinstance(frames, list) and frames and isinstance(frames[0], list):
+            frames = frames[0]
+        if isinstance(frames, torch.Tensor):
+            frames = frames.cpu().numpy()
+        if isinstance(frames, np.ndarray) and frames.ndim == 4:
+            frames = list(frames)
+
+        normalized: List[np.ndarray] = []
+        for f in frames:
+            if isinstance(f, torch.Tensor):
+                f = f.cpu().numpy()
+            if isinstance(f, np.ndarray):
+                if f.dtype != np.uint8:
+                    f = np.clip(f * 255.0, 0, 255).astype(np.uint8) if f.max() <= 1.0 else f.astype(np.uint8)
+                normalized.append(f)
+            else:
+                normalized.append(np.array(f.convert("RGB")))
+
+        if not normalized:
+            raise RuntimeError("Video pipeline produced zero frames.")
+
+        import imageio
+        buf = io.BytesIO()
+        writer = imageio.get_writer(
+            buf, format="mp4", mode="I", fps=fps,
+            codec="libx264", quality=8, macro_block_size=1,
+        )
+        try:
+            for frame in normalized:
+                writer.append_data(frame)
+        finally:
+            writer.close()
+        return buf.getvalue()
+
 
 server_instance: Optional[DiffusersTTMServer] = None
 auth_token: Optional[str] = None
@@ -345,6 +431,26 @@ def generate_song(
     try:
         audio_bytes = fut.result(timeout=1200)
         return Response(content=audio_bytes, media_type="audio/wav")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/generate_video")
+def generate_video(
+    request: VideoGenerationRequest,
+    authorization: Optional[str] = Header(None),
+    x_server_token: Optional[str] = Header(None)
+):
+    verify_auth_token(authorization, x_server_token)
+    if not server_instance:
+        raise HTTPException(status_code=500, detail="Server uninitialized")
+
+    fut: Future = Future()
+    job = TTMJob(future=fut, task="generate_video", payload=request.dict())
+    server_instance.queue.put(job)
+    try:
+        video_bytes = fut.result(timeout=1800)
+        return Response(content=video_bytes, media_type="video/mp4")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

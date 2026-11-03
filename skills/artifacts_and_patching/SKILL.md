@@ -22,6 +22,20 @@ Artifacts are persistent, versioned documents (code, text, notes) stored in disc
 - Creating new: Provide 100% of the content inside `<artifact name="filename" type="type">...</artifact>`.
 - Updating existing: Use **SEARCH/REPLACE Aider-style patches** to modify targeted regions.
 
+### Visibility Control (`visibility` attribute)
+
+Every artifact accepts an optional `visibility` attribute that controls how much of it is loaded into your context:
+
+| Value | Behavior |
+| :--- | :--- |
+| `tree_unlockable` (default) | Listed in the workspace tree as `[U]`. Not loaded into context. Use `<unlock_file>` to load it. |
+| `full` | Fully loaded into context as `[C]` **permanently**. Use for files you will reference repeatedly. |
+| `single_round` | Fully loaded as `[C]` for **exactly one turn**, then auto-demoted to `[U]`. **This is the default for generated images.** |
+| `metadata` | Only signatures/schema loaded as `[M]`. |
+| `hidden` | Completely excluded from tree and context. |
+
+**🖼️ Image default — `single_round`**: When you generate an image (`<generate_image>`, `<edit_image>`, or a tool produces one), it is registered with `single_round` visibility. You will see the pixels on your **next** round (so you can verify the result and decide whether to edit it), but the payload is freed from context afterwards. If you need to keep an image loaded permanently, emit `<unlock_file>filename.png</unlock_file>` after creation, or pass `visibility="full"` on a subsequent write.
+
 ## 2. Strategic Formulation: The Coding Plan
 Before outputting any `<artifact>` update, the model must formulate a plan inside `<coding_plan>` to organize its implementation strategy:
 

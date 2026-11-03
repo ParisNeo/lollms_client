@@ -10,10 +10,9 @@ import pipmaster as pm
 from lollms_client.lollms_llm_binding import LollmsLLMBinding
 from lollms_client.lollms_types import MSG_TYPE, ELF_COMPLETION_FORMAT
 
-# Ensure required libraries are installed
-pm.ensure_packages(["openai", "tiktoken"])
-import openai
-import tiktoken
+# Heavy dependencies are imported lazily inside __init__ / helper methods.
+openai = None
+tiktoken = None
 import os
 import base64
 import mimetypes
@@ -80,6 +79,12 @@ class SGLangBinding(LollmsLLMBinding):
 
     def __init__(self, **kwargs):
         super().__init__(BindingName, **kwargs)
+
+        global openai
+        pm.ensure_packages(["openai", "tiktoken"])
+        import openai as _openai
+        openai = _openai
+
         self.host_address = kwargs.get("host_address", "http://localhost:30000/v1")
         self.model_name = kwargs.get("model_name", "default")
         self.service_key = kwargs.get("service_key", "EMPTY")
@@ -352,6 +357,11 @@ class SGLangBinding(LollmsLLMBinding):
         return output
 
     def _get_encoding(self):
+        global tiktoken
+        if tiktoken is None:
+            pm.ensure_packages(["tiktoken"])
+            import tiktoken as _tiktoken
+            tiktoken = _tiktoken
         try:
             return tiktoken.encoding_for_model(self.model_name)
         except KeyError:

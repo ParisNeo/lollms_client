@@ -15,10 +15,8 @@ except ImportError:
     print("Pipmaster not found. Please install it using 'pip install pipmaster'")
     raise
 
-# Ensure requests and tiktoken are installed
-pm.ensure_packages(["requests", "tiktoken"])
-
-import tiktoken
+# tiktoken is imported lazily inside tokenize/detokenize to keep import-time light.
+tiktoken = None
 
 BindingName = "LiteLLMBinding"
 
@@ -146,11 +144,19 @@ class LiteLLMBinding(LollmsLLMBinding):
             trace_exception(e)
             return []
 
+    def _get_tiktoken(self):
+        global tiktoken
+        if tiktoken is None:
+            pm.ensure_packages(["tiktoken"])
+            import tiktoken as _tiktoken
+            tiktoken = _tiktoken
+        return tiktoken
+
     def tokenize(self, text: str) -> list:
-        return tiktoken.model.encoding_for_model("gpt-3.5-turbo").encode(text)
+        return self._get_tiktoken().model.encoding_for_model("gpt-3.5-turbo").encode(text)
             
     def detokenize(self, tokens: list) -> str:
-        return tiktoken.model.encoding_for_model("gpt-3.5-turbo").decode(tokens)
+        return self._get_tiktoken().model.encoding_for_model("gpt-3.5-turbo").decode(tokens)
 
     def count_tokens(self, text: str) -> int:
         return len(self.tokenize(text))

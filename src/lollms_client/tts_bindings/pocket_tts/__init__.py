@@ -425,19 +425,3 @@ class PocketTTSBinding(LollmsTTSBinding):
 
     def install_model(self, model_name: str, **kwargs) -> dict:
         return self.select_model(model_name)
-
-    # ── Resource management contract ────────────────────────────────────────
-    def is_local(self) -> bool:
-        return True
-
-    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
-        return self.tts_model is not None
-
-    def has_active_resources(self) -> bool:
-        return self.tts_model is not None
-
-    def get_loaded_models(self) -> List[str]:
-        return [self.model_name] if self.tts_model is not None else []
-
-    def install_model(self, model_name: str, **kwargs) -> dict:
-        return self.select_model(model_name)

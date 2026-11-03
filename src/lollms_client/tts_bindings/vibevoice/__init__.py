@@ -218,24 +218,8 @@ class VibeVoiceBinding(LollmsTTSBinding):
     def install_model(self, model_name: str, **kwargs) -> dict:
         return {"status": True, "message": "VibeVoice model is downloaded automatically on first use."}
 
-    # ── Resource management contract ────────────────────────────────────────
-    def is_local(self) -> bool:
-        return True
+    def get_zoo(self) -> List[Dict[str, Any]]:
+        return [{"name": "vibevoice", "description": "VibeVoice real-time TTS", "size": "~1GB", "type": "pytorch", "link": "vibevoice"}]
 
-    def is_model_loaded(self, model_name: Optional[str] = None) -> bool:
-        return self.is_server_running()
-
-    def has_active_resources(self) -> bool:
-        return self.is_server_running()
-
-    def get_loaded_models(self) -> List[str]:
-        return ["vibevoice"] if self.is_server_running() else []
-
-    def unload_model(self, model_name: Optional[str] = None) -> bool:
-        if self.server_process and self.server_process.poll() is None:
-            self.server_process.terminate()
-            self.server_process = None
-        return True
-
-    def install_model(self, model_name: str, **kwargs) -> dict:
+    def download_from_zoo(self, index: int, progress_callback: Optional[Callable[[dict], None]] = None) -> dict:
         return {"status": True, "message": "VibeVoice model is downloaded automatically on first use."}

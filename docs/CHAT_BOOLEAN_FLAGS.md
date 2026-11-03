@@ -312,6 +312,13 @@ engine fails gracefully with a `status:failure` processing block.
   source).
 - Generated images are stored as image artifacts with their pixels (base64 PNG)
   plus a logical markdown twin.
+- **Default visibility is `SINGLE_ROUND`**: the LLM sees the image on the round
+  immediately following creation (to verify the result and decide whether to
+  edit it), then the artefact is auto-demoted to `TREE_UNLOCKABLE` and the
+  base64 payload is freed from context. This is the primary mitigation against
+  image context bloat over long sessions. To keep an image permanently loaded,
+  the LLM can emit `<unlock_file>` (which sets `FULL`) or pass
+  `visibility="full"` on a subsequent write.
 
 **Recovering generated stuff (images)**:
 - Artifact pixels: `art = discussion.artefacts.get(title)` →

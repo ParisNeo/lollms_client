@@ -25,8 +25,9 @@ class ArtefactVisibility:
     TREE_UNLOCKABLE = "tree_unlockable"  # Level 2: In tree, can be unlocked by LLM
     FOLDER_COLLAPSED= "folder_collapsed" # Level 2.5: Hidden because parent folder is collapsed
     FOLDER_PINNED   = "folder_pinned"
-    PINNED          = "pinned"    
+    PINNED          = "pinned"
     METADATA        = "metadata"         # Level 3: Visible with schema/signatures only
+    SINGLE_ROUND    = "single_round"     # Level 3.5: Fully loaded for ONE turn, then auto-demoted to TREE_UNLOCKABLE
     FULL            = "full"             # Level 4: Fully loaded in context
 
 
@@ -960,6 +961,11 @@ class ArtefactManager:
         elif not resolved_visibility:
             if active is not None:
                 resolved_visibility = ArtefactVisibility.FULL if active else ArtefactVisibility.HIDDEN
+            elif artefact_type == ArtefactType.IMAGE:
+                # Image artefacts default to SINGLE_ROUND: the LLM sees the
+                # image in the next turn, then the payload is freed. Explicit
+                # visibility="full" still requests a permanent load.
+                resolved_visibility = ArtefactVisibility.SINGLE_ROUND
             else:
                 resolved_visibility = ArtefactVisibility.TREE_UNLOCKABLE
 
@@ -995,7 +1001,7 @@ class ArtefactManager:
             "tags":             tags or [],
             "visibility":       resolved_visibility,
             "status":           resolved_status,
-            "active":           (resolved_visibility == ArtefactVisibility.FULL),
+            "active":           (resolved_visibility in (ArtefactVisibility.FULL, ArtefactVisibility.SINGLE_ROUND)),
             "created_at":       now,
             "updated_at":       now,
             "commit_message":   commit_message,
@@ -2062,7 +2068,7 @@ class ArtefactManager:
                     )
 
     def set_visibility(self, title: str, visibility: str, version: Optional[int] = None) -> bool:
-        if visibility not in (ArtefactVisibility.HIDDEN, ArtefactVisibility.TREE_LOCKED, ArtefactVisibility.TREE_UNLOCKABLE, ArtefactVisibility.METADATA, ArtefactVisibility.FULL):
+        if visibility not in (ArtefactVisibility.HIDDEN, ArtefactVisibility.TREE_LOCKED, ArtefactVisibility.TREE_UNLOCKABLE, ArtefactVisibility.METADATA, ArtefactVisibility.SINGLE_ROUND, ArtefactVisibility.FULL):
             raise ValueError(f"Invalid visibility tier: '{visibility}'")
         artefacts = self._get_all_raw()
         changed = False
@@ -2073,7 +2079,7 @@ class ArtefactManager:
                 changed = True
         if changed:
             self._save_all(artefacts)
-            if visibility == ArtefactVisibility.FULL:
+            if visibility in (ArtefactVisibility.FULL, ArtefactVisibility.SINGLE_ROUND):
                 active_art = self.get(title, version)
                 if active_art:
                     self._sync_to_disk_workspace(
@@ -2101,6 +2107,24 @@ class ArtefactManager:
             self._save_all(artefacts)
             return True
         return False
+
+    def _demote_single_round_artefacts(self) -> None:
+        """
+        Demote every artefact currently marked SINGLE_ROUND to TREE_UNLOCKABLE.
+
+        Called at the END of build_artefacts_context_zone(), i.e. after the
+        current turn's context has been assembled (so the LLM sees the payload
+        once) but before the next turn's build (so the payload is freed).
+        """
+        artefacts = self._get_all_raw()
+        changed = False
+        for a in artefacts:
+            if a.get("visibility") == ArtefactVisibility.SINGLE_ROUND:
+                a["visibility"] = ArtefactVisibility.TREE_UNLOCKABLE
+                a["active"] = False
+                changed = True
+        if changed:
+            self._save_all(artefacts)
 
     def build_artefacts_context_zone(self) -> str:
         all_raw = self._get_all_raw()
@@ -2149,6 +2173,7 @@ class ArtefactManager:
                 v_tier = a.get("visibility", ArtefactVisibility.FULL)
                 marker = "[L]"
                 if v_tier == ArtefactVisibility.FULL: marker = "[C]"
+                elif v_tier == ArtefactVisibility.SINGLE_ROUND: marker = "[C]"
                 elif v_tier == ArtefactVisibility.METADATA: marker = "[M]"
                 elif v_tier == ArtefactVisibility.TREE_UNLOCKABLE: marker = "[U]"
                 f_name = a.get("display_path", a.get("title", "")).split("/")[-1]
@@ -2171,7 +2196,7 @@ class ArtefactManager:
                 if not display_path.lower().endswith(item["file_ext"].lower()):
                     display_path = f"{display_path}{item['file_ext']}"
 
-            if v_tier == ArtefactVisibility.FULL:
+            if v_tier in (ArtefactVisibility.FULL, ArtefactVisibility.SINGLE_ROUND):
                 if item.get("type") == ArtefactType.DATA:
                     content_text = self._get_lam_content(item).strip()
                 else:
@@ -2228,10 +2253,11 @@ class ArtefactManager:
             "is shown in this tree and in your context after creating or editing it:",
             '  <artefact title="main.py" type="code" visibility="hidden">content</artefact>',
             "- Optional: omit it for the default visible behavior.",
-            "- Values: hidden | tree_locked | tree_unlockable | folder_collapsed | folder_pinned | pinned | metadata | full",
+            "- Values: hidden | tree_locked | tree_unlockable | folder_collapsed | folder_pinned | pinned | metadata | single_round | full",
             "- DEFAULT (omitted): tree_unlockable (visible in the workspace tree, unlockable).",
             '- visibility="hidden" saves and versions the file without displaying it in this tree.',
-            '- visibility="full" loads the file content fully into your context [C].',
+            '- visibility="full" loads the file content fully into your context [C] permanently.',
+            '- visibility="single_round" loads the content for ONE turn only, then auto-demotes to tree_unlockable [U]. This is the default for generated images.',
             '- visibility="metadata" exposes only signatures/schema [M].',
         ]
 
@@ -2239,6 +2265,12 @@ class ArtefactManager:
             context_parts.append("\n## Partial File Signatures & Metadata [M]\n" + "\n\n---\n\n".join(partial_visible_parts))
         if full_visible_parts:
             context_parts.append("\n## Fully Loaded File Contents [C]\n" + "\n\n---\n\n".join(full_visible_parts))
+
+        # ── SINGLE-ROUND DEMOTION ────────────────────────────────────────
+        # The context above has just been assembled with SINGLE_ROUND artefacts
+        # treated as FULL. Now demote them so the NEXT turn's build frees the
+        # payload. This is the "one-shot unlock" contract.
+        self._demote_single_round_artefacts()
 
         return "\n\n".join(context_parts)
     
@@ -2249,7 +2281,7 @@ class ArtefactManager:
         by_title = {a.get('title'): a for a in raw_list}
 
         for a in raw_list:
-            if a.get('visibility', ArtefactVisibility.FULL) != ArtefactVisibility.FULL:
+            if a.get('visibility', ArtefactVisibility.FULL) not in (ArtefactVisibility.FULL, ArtefactVisibility.SINGLE_ROUND):
                 continue
             imgs   = a.get('images') or []
             mtypes = a.get('image_media_types') or []
@@ -2269,7 +2301,7 @@ class ArtefactManager:
             comp_title = f"{a.get('title')}::images"
             if comp_title in by_title:
                 comp_a = by_title[comp_title]
-                if comp_a.get('visibility', ArtefactVisibility.FULL) == ArtefactVisibility.FULL:
+                if comp_a.get('visibility', ArtefactVisibility.FULL) in (ArtefactVisibility.FULL, ArtefactVisibility.SINGLE_ROUND):
                     comp_imgs = comp_a.get('images') or []
                     comp_mtypes = comp_a.get('image_media_types') or []
                     for idx, img_b64 in enumerate(comp_imgs):
@@ -2717,6 +2749,10 @@ class ArtefactManager:
         normalized = str(raw_visibility).strip().lower()
         if not normalized:
             return None
+        # Accept friendly aliases for the single-round tier.
+        if normalized in ("next_round", "one_round", "single-turn", "single_turn"):
+            normalized = ArtefactVisibility.SINGLE_ROUND
+
         valid_tiers = {
             ArtefactVisibility.HIDDEN,
             ArtefactVisibility.TREE_LOCKED,
@@ -2725,13 +2761,14 @@ class ArtefactManager:
             ArtefactVisibility.FOLDER_PINNED,
             ArtefactVisibility.PINNED,
             ArtefactVisibility.METADATA,
+            ArtefactVisibility.SINGLE_ROUND,
             ArtefactVisibility.FULL,
         }
         if normalized in valid_tiers:
             return normalized
         ASCIIColors.warning(
             f"[ArtefactManager] Ignoring invalid visibility attribute value '{raw_visibility}'. "
-            f"Valid values: hidden, tree_locked, tree_unlockable, folder_collapsed, folder_pinned, pinned, metadata, full."
+            f"Valid values: hidden, tree_locked, tree_unlockable, folder_collapsed, folder_pinned, pinned, metadata, single_round, full."
         )
         return None
 
@@ -2857,6 +2894,11 @@ class ArtefactManager:
                     img_b64 = tail
 
                 # Store as an image artefact with the base64 payload.
+                # Default visibility for generated images is SINGLE_ROUND:
+                # the LLM sees the image in the next turn (to decide whether to
+                # modify it) but the payload is freed afterwards. The LLM can
+                # still request a permanent load via visibility="full".
+                effective_visibility = visibility or ArtefactVisibility.SINGLE_ROUND
                 anchor = f'<artefact_image id="{title}::0" />'
                 art = self.add(
                     title=title,
@@ -2867,7 +2909,7 @@ class ArtefactManager:
                     language=language,
                     version=version,
                     active=auto_activate,
-                    visibility=visibility,
+                    visibility=effective_visibility,
                     commit_message=commit_message,
                     version_tags=version_tags,
                     status=status,

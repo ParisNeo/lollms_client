@@ -42,33 +42,19 @@ if _detect_os() == "Windows":
 
 
 # ── Conditional imports ──────────────────────────────────────────────────────
+# Heavy dependencies are imported lazily inside __init__ / helper methods.
+# At module import time we only probe availability without installing anything.
 try:
     _trt_already_imported = importlib.util.find_spec("tensorrt_llm") is not None
-    if not _trt_already_imported:
-        import pipmaster as pm
-        pm.ensure_packages([
-            "tensorrt_llm",
-            "torch",
-            "transformers>=4.37.0",
-            "huggingface_hub>=0.20.0",
-            "pillow",
-        ])
-
-    from tensorrt_llm import LLM, SamplingParams
-    from PIL import Image
-    import torch
-    from transformers import AutoTokenizer
-    from huggingface_hub import hf_hub_download, snapshot_download
-    import tensorrt_llm as _trt_module
-
-    _trt_deps_installed = True
+    _trt_deps_installed = _trt_already_imported
     _trt_installation_error: Optional[Exception] = None
 except Exception as e:
     _trt_deps_installed = False
     _trt_installation_error = e
-    LLM = SamplingParams = Image = None
-    torch = AutoTokenizer = hf_hub_download = snapshot_download = None
-    _trt_module = None
+
+LLM = SamplingParams = Image = None
+torch = AutoTokenizer = hf_hub_download = snapshot_download = None
+_trt_module = None
 
 
 # ── Engine manager (shared across binding instances) ────────────────────────

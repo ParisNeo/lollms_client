@@ -162,3 +162,9 @@ class LollmsTTSBinding_Impl(LollmsTTSBinding):
 
     def install_model(self, model_name: str, **kwargs) -> dict:
         return {"status": False, "message": "Remote LoLLMS server; models are managed server-side."}
+
+    def get_zoo(self) -> List[Dict[str, Any]]:
+        return []
+
+    def download_from_zoo(self, index: int, progress_callback: Optional[Callable[[dict], None]] = None) -> dict:
+        return {"status": False, "message": "Remote LoLLMS server; models are managed server-side."}

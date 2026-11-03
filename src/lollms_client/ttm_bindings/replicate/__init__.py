@@ -109,6 +109,14 @@ class StabilityAITTMBinding(LollmsTTMBinding):
     def install_model(self, model_name: str, **kwargs) -> dict:
         return {"status": False, "message": "Remote API; models are managed by Replicate."}
 
+    def get_zoo(self) -> List[Dict[str, Any]]:
+        return list(REPLICATE_MODELS)
+
+    def download_from_zoo(self, index: int, progress_callback: Optional[Callable[[dict], None]] = None) -> dict:
+        if index < 0 or index >= len(REPLICATE_MODELS):
+            return {"status": False, "message": "Index out of bounds."}
+        return {"status": False, "message": "Remote API; models are managed by Replicate."}
+
 
 if __name__ == '__main__':
     ASCIIColors.magenta("--- Replicate TTM Binding Test ---")
