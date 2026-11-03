@@ -17,4 +17,7 @@ Available bindings:
     - voxtral       : Voxtral local TTS via vLLM-Omni.
     - voxtral_cloud : Mistral Voxtral TTS cloud API.
     - xtts          : Coqui XTTS v2 (shared daemon).
+
+This package intentionally does not eagerly import any submodule; bindings are
+loaded on demand by the TTS binding manager.
 """
