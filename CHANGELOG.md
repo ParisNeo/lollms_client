@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-03 15:30]
+
+- feat: add cognitive decisions and universal profiles support
+
 ## [2026-11-03 15:06]
 
 - feat(lcp): add execute python and data query tools
