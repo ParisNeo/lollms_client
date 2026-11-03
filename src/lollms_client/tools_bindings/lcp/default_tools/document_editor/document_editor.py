@@ -69,6 +69,7 @@ def init_tools_library(config: dict = None) -> None:
             import ascii_colors
             ascii_colors.ASCIIColors.error("[Document Editor] PyMuPDF (fitz) could not be imported. PDF annotation and editing will fail.")
 
+
 def _check_file_exists(file_name: str) -> Optional[Dict[str, Any]]:
     if not Path(file_name).is_file():
         return {

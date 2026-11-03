@@ -2138,11 +2138,20 @@ class _StreamState:
         # This prevents raw XML from leaking when the LLM streams tokens with trailing spaces or partial attributes.
         def _ends_with_partial_tag(buffer: str) -> int:
             """Returns the start index of the partial tag if found, else -1."""
-            # Include memory tags in the check so they don't leak as partial tags
+            # Include memory tags in the check so they don't leak as partial tags.
+            # CRITICAL: Closing tags (</artifact>, </artefact>, </tool>, ...) MUST be
+            # included — a closing tag that streams as `</artifact` + `>` across two
+            # chunks would otherwise leak `</artifact` verbatim into the UI before
+            # the complete `>` arrives, producing exactly the trailing artefact-tag
+            # leak this parser gate exists to prevent.
             tags_to_check = [
                 "<artifact", "<artefact", "<tool", "<think", "<note", "<skill", "<scratchpad", 
                 "<generate_image", "<edit_image", "<generate_video", "<lollms_form", "<unlock_file", "<lock_file", "<hide_file",
-                "<mem_new", "<mem_update", "<mem_tag", "<mem_load", "<mem_delete", "<mem_search"
+                "<mem_new", "<mem_update", "<mem_tag", "<mem_load", "<mem_delete", "<mem_search",
+                "</artifact", "</artefact", "</tool", "</note", "</skill", "</scratchpad",
+                "</lollms_form", "</lollms_inline", "</generate_image", "</edit_image", "</generate_video",
+                "</unlock_file", "</lock_file", "</hide_file",
+                "</mem_new", "</mem_update", "</mem_tag", "</mem_load", "</mem_delete", "</mem_search", "</mem_rel",
             ]
 
             # Helper to check if the start of the line is valid for a tag
@@ -2188,9 +2197,44 @@ class _StreamState:
             self._pending_buffer = self._pending_buffer[partial_idx:]
             return True
 
-        # No partial tags, forward everything and save it
-        self.ai_message.content += self._pending_buffer
-        _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
+        # ── 🛡️ FINAL ARTEFACT-FAMILY TAG SUPPRESSION ──
+        # Defense-in-depth: an artifact-family opening/closing tag that reached
+        # default forwarding without the artifact tracker being active means it
+        # will never be dispatched (it is a stray emission). Strip it from the
+        # buffer BEFORE it is flushed into ai_message.content, so raw artifact
+        # XML can never leak into the UI stream / persisted message.
+        #
+        # IMPORTANT: The trailing `(?:/>|>)?$` allows stripping INCOMPLETE
+        # fragments (e.g. `</artifact` with no `>`) that reach this far — they
+        # can never be dispatched and must not surface in the chat transcript.
+        safe_buffer = re.sub(
+            r'(?is)<(?:artifact|artefact)\b[^>]*?(?:/>|>)?$',
+            '',
+            self._pending_buffer,
+        )
+        safe_buffer = re.sub(
+            r'(?is)<(?:artifact|artefact)\b[^>]*?(?:/>|>)',
+            '',
+            safe_buffer,
+        )
+        safe_buffer = re.sub(
+            r'(?is)</(?:artifact|artefact)\b[^>]*?(?:>)?$',
+            '',
+            safe_buffer,
+        )
+        safe_buffer = re.sub(
+            r'(?is)</(?:artifact|artefact)>',
+            '',
+            safe_buffer,
+        )
+        if safe_buffer != self._pending_buffer:
+            ASCIIColors.warning(
+                "[StreamState] Suppressed stray artifact-family tag that reached "
+                "default forwarding without an active tracker."
+            )
+        if safe_buffer:
+            self.ai_message.content += safe_buffer
+            _cb(self.callback, safe_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
         self._pending_buffer = ""
         return True
     
@@ -4530,6 +4574,16 @@ class _StreamState:
                 self.artefact_tracker.close()
             else:
                 clean_leftover = self._pending_buffer.strip()
+                # ── 🛡️ STRIP ARTEFACT-FAMILY TAGS FROM LEFTOVER ──
+                # A stray, never-dispatched artifact opening/closing tag held in
+                # the pending buffer at end-of-stream must not be persisted into
+                # ai_message.content. Remove it defensively before flushing.
+                if clean_leftover:
+                    clean_leftover = re.sub(
+                        r'(?is)</?(?:artifact|artefact)\b[^>]*?>',
+                        '',
+                        clean_leftover,
+                    ).strip()
                 if clean_leftover:
                     self.ai_message.content += clean_leftover
                     _cb(self.callback, clean_leftover, MSG_TYPE.MSG_TYPE_CHUNK)
@@ -10266,6 +10320,29 @@ class ChatMixin:
         # Strip round tags and mimicked markers from final saved message content
         ai_msg.content = re.sub(r'<round\s+id=["\'][^"\']*["\']\s*/?>\n?', '', ai_msg.content, flags=re.IGNORECASE)
         ai_msg.content = re.sub(r'\[🔒[^\]]*\]', '', ai_msg.content).strip()
+
+        # ── 🛡️ FINAL ARTEFACT-FAMILY TAG SWEEP ──
+        # The Dual-Stream Buffer is meant to keep raw artifact XML out of
+        # ai_msg.content, but partial/edge streams can slip a stray opening or
+        # closing artifact tag through. Sweep them from the persisted message so
+        # the UI never renders leaked artifact markup. Dispatched artifacts have
+        # already been rewritten into <processing> blocks by _StreamState, so a
+        # raw <artifact>/<artefact> tag here is always a leak.
+        #
+        # Incomplete trailing fragments (e.g. `<artifact` or `</artifact` with
+        # no `>`) are swept too, with the trailing `(?:>)?` — a fragment that
+        # never completed can never be dispatched and must not survive into the
+        # final message.
+        ai_msg.content = re.sub(
+            r'(?is)<(?:artifact|artefact)\b[^>]*?>.*?</(?:artifact|artefact)>',
+            '',
+            ai_msg.content,
+        )
+        ai_msg.content = re.sub(
+            r'(?is)</?(?:artifact|artefact)\b[^>]*?(?:>)?',
+            '',
+            ai_msg.content,
+        ).strip()
 
         # The Dual-Stream Buffer architecture now ensures raw <artifact> XML 
         # never enters ai_msg.content in the first place, so no post-generation

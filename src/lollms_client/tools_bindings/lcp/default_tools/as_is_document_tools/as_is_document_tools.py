@@ -19,6 +19,32 @@ TOOL_LIBRARY_ICON = "📄"
 
 _VISION_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp", ".gif"}
 
+# ---------------------------------------------------------------------------
+# PDF page-rendering defaults
+# ---------------------------------------------------------------------------
+# These constants control how `tool_render_pdf_pages` turns PDF pages into
+# vision content that the model can inspect for one single round.
+#
+# _PDF_RENDER_MAX_DIM : longest side (px) an image is downscaled to before
+#                       base64 encoding. Keeps tokens-per-image predictable
+#                       across scanned vs. vector PDFs.
+# _PDF_RENDER_DPI     : default rasterization resolution. 150 DPI is the sweet
+#                       spot for readable scanned text and legible chart axes
+#                       without exploding image-token budgets. Clamped to
+#                       [72, 300] inside the tool.
+# _PDF_RENDER_JPEG_Q  : JPEG quality for RGB pages (85 is visually lossless for
+#                       document content while keeping payloads small).
+# _MAX_RENDER_PAGES   : HARD CEILING on how many pages a single call may render.
+#                       This protects the context window from a model that asks
+#                       for "all 400 pages" of a scanned report. The model can
+#                       still iterate over a large document by narrowing the
+#                       `pages` selector across multiple calls.
+# ---------------------------------------------------------------------------
+_PDF_RENDER_MAX_DIM   = 1600
+_PDF_RENDER_DPI       = 150
+_PDF_RENDER_JPEG_Q    = 85
+_MAX_RENDER_PAGES     = 12
+
 
 def init_tools_library() -> None:
     """Ensure optional parsing dependencies are available."""
@@ -84,6 +110,351 @@ def _extract_pdf_images_for_vlm(pdf_path: Path, target_pages: List[int], max_ima
                 pass
 
     return images_b64, media_types
+
+
+def _parse_page_selector(selector: Optional[str], total_pages: int) -> List[int]:
+    """
+    Parse a 1-based page selector into a sorted list of 0-based page indices.
+
+    Accepted grammar (case-insensitive, whitespace-tolerant):
+        "3"            -> [2]                    single page
+        "2-6"          -> [1, 2, 3, 4, 5]        inclusive range
+        "1,4,9-11"     -> [0, 3, 8, 9, 10]       mixed list + ranges
+        "" / None      -> list(range(total_pages))  all pages
+
+    Behaviour:
+        * Values outside [1, total_pages] are silently clamped/dropped so a
+          hallucinated page number never raises.
+        * Reversed ranges ("6-2") are normalized to ascending order.
+        * Unparseable tokens are ignored; if every token is invalid, the
+          function falls back to "all pages" so the caller never gets an
+          empty selection unexpectedly.
+        * Output is sorted and de-duplicated for deterministic rendering.
+
+    Returns:
+        List[int]: 0-based page indices ready to feed `doc[i]`.
+    """
+    if not selector or not str(selector).strip():
+        return list(range(total_pages))
+
+    pages: set[int] = set()
+    for part in str(selector).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_s, _, end_s = part.partition("-")
+            try:
+                start = int(start_s.strip())
+                end = int(end_s.strip())
+            except ValueError:
+                continue
+            if start > end:
+                start, end = end, start
+            for p in range(max(1, start), min(total_pages, end) + 1):
+                pages.add(p - 1)
+        elif part.isdigit():
+            p = int(part)
+            if 1 <= p <= total_pages:
+                pages.add(p - 1)
+
+    return sorted(pages) if pages else list(range(total_pages))
+
+
+def _resize_and_encode_image(img_bytes: bytes, max_dim: int = _PDF_RENDER_MAX_DIM) -> tuple[str, str]:
+    """
+    Downscale an image and encode it for vision consumption.
+
+    Pipeline: Pillow open -> (mode normalize) -> LANCZOS downscale ->
+    format-specific encode -> base64-str.
+
+    Encoding rules:
+        * RGBA  -> PNG (preserves alpha for figures with transparency).
+        * other -> JPEG @ _PDF_RENDER_JPEG_Q (small payload, document-friendly).
+
+    Robustness:
+        * Any Pillow/decode failure falls back to returning the ORIGINAL bytes
+          base64-wrapped as `image/png`. This guarantees the caller always gets
+          a usable (image_b64, media_type) pair and never crashes the round on
+          an exotic image codec embedded inside a PDF.
+        * `max_dim` <= 0 is treated as "no downscale" (only re-encoding).
+
+    Returns:
+        (base64_str, media_type) where media_type is "image/jpeg" or "image/png".
+    """
+    try:
+        import io
+
+        from PIL import Image
+
+        img = Image.open(io.BytesIO(img_bytes))
+        if img.mode not in ("RGB", "L", "RGBA"):
+            img = img.convert("RGB")
+        width, height = img.size
+        if max(width, height) > max_dim:
+            ratio = max_dim / float(max(width, height))
+            img = img.resize((max(1, int(width * ratio)), max(1, int(height * ratio))), Image.LANCZOS)
+        buf = io.BytesIO()
+        if img.mode == "RGBA":
+            img.save(buf, format="PNG")
+            return base64.b64encode(buf.getvalue()).decode("utf-8"), "image/png"
+        img.save(buf, format="JPEG", quality=_PDF_RENDER_JPEG_Q)
+        return base64.b64encode(buf.getvalue()).decode("utf-8"), "image/jpeg"
+    except Exception:
+        return base64.b64encode(img_bytes).decode("utf-8"), "image/png"
+
+
+def tool_render_pdf_pages(
+    file_name: str,
+    pages: Optional[str] = None,
+    max_pages: int = _MAX_RENDER_PAGES,
+    include_embedded_figures: bool = False,
+    dpi: int = _PDF_RENDER_DPI,
+    env: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Render PDF page(s) to images for ONE-SHOT visual inspection.
+
+    PURPOSE
+    -------
+    `tool_read_document_content` returns text extracted from a PDF. That is
+    perfect for born-digital documents, but it fails on:
+
+        * Scanned pages (no selectable text / OCR noise).
+        * Mathematical curves, plots, and scientific figures.
+        * Architectural / engineering drawings.
+        * Handwriting, signatures, stamps, diagrams.
+        * Any layout where "picture = meaning".
+
+    `tool_render_pdf_pages` rasters the requested pages and returns them as
+    base64 images attached to the NEXT LLM round. A vision-capable model can
+    then literally see the page.
+
+    EPHEMERAL-BY-DESIGN
+    -------------------
+    Rendered images are NOT persisted across rounds. They live only in the
+    vision-hydration payload of the very next generation. This is deliberate:
+    a 200-page scanned PDF would otherwise permanently bloat the context.
+    The returned `prompt_injection` block explicitly tells the model to write
+    every extracted fact into the scratchpad (or an artifact) BEFORE the round
+    ends; otherwise that knowledge is lost.
+
+    WHEN TO USE
+    -----------
+        ✔ Scanned pages / image-only pages.
+        ✔ Charts, curves, plots, spectrograms, heat-maps.
+        ✔ Diagrams, flowcharts, schematics.
+        ✔ Visual verification of layout (columns, tables, forms).
+        ✘ Pure text extraction  ->  use `tool_read_document_content`.
+        ✘ Editing PDF text      ->  use `tool_edit_document_text`.
+
+    ARGUMENTS
+    ---------
+        file_name (str):
+            Relative path to the PDF file inside the workspace.
+        pages (str, optional):
+            1-based selector. Accepts "3", "2-6", "1,4,9-11".
+            Defaults to ALL pages (capped by `max_pages`).
+        max_pages (int, optional):
+            Safety cap per call. Defaults to 12, hard ceiling of 12.
+            If the selection is longer, it is truncated with a `warning`
+            key returned in the payload so the model knows to call again
+            with a narrower selector.
+        include_embedded_figures (bool, optional):
+            When True, ALSO extracts the raw raster figures embedded inside
+            each selected page (xref images). Useful when a page contains
+            high-resolution charts whose raster survives downscaling better
+            than the rendered page. Each extracted figure is appended to the
+            `images` list, so `image_count` may exceed `len(pages_rendered)`.
+        dpi (int, optional):
+            Rasterization resolution. Defaults to 150. Clamped to [72, 300].
+            Raise to 220-300 for dense scanned text; lower to 100-120 for
+            large plot overviews to save image tokens.
+        env (Any, optional):
+            Reserved for future use (workspace root override / sandbox info).
+            Currently unused.
+
+    RETURNS (dict)
+    --------------
+        success (bool)
+        file_name (str)
+        total_pages (int)         Total page count of the PDF.
+        pages_rendered (List[int]) 1-based page numbers actually rendered.
+        image_count (int)         Total images returned (pages + figures).
+        content / output (str)    Human-readable summary + per-page previews.
+        images (List[str])        Base64-encoded image payloads.
+        image_media_types (List[str]) Parallel media types ("image/jpeg"
+                                  or "image/png") for `images`.
+        ephemeral (bool)          Always True — signals one-round lifetime.
+        prompt_injection (str)    Instruction block injected into the next
+                                  model turn, telling it that the images
+                                  are ephemeral and that findings must be
+                                  persisted to the scratchpad.
+        warning (str, optional)   Present iff the selection was truncated.
+        error / traceback         Present only when `success` is False.
+
+    EXAMPLES
+    --------
+        # Look at a single scanned page to OCR it visually:
+        tool_render_pdf_pages("reports/q3_scan.pdf", pages="7")
+
+        # Inspect a 3-page batch of a scientific paper (fig. 2-4 are pages 5-7):
+        tool_render_pdf_pages("papers/attention.pdf", pages="5-7")
+
+        # Inspect a plot-heavy page AND pull the original figure rasters:
+        tool_render_pdf_pages(
+            "papers/charts.pdf",
+            pages="12",
+            include_embedded_figures=True,
+            dpi=220,
+        )
+
+        # Walk a 40-page scan in safe chunks of 10:
+        tool_render_pdf_pages("scan.pdf", pages="1-10")
+        tool_render_pdf_pages("scan.pdf", pages="11-20")
+        # ... persist findings into the scratchpad between calls.
+    """
+    path = Path(file_name)
+    if not path.exists():
+        return {"success": False, "error": f"File '{file_name}' not found."}
+    if path.suffix.lower() != ".pdf":
+        return {"success": False, "error": f"File '{file_name}' is not a PDF (got '{path.suffix}')."}
+
+    # --- clamp max_pages defensively ---
+    try:
+        max_pages = int(max_pages)
+    except (TypeError, ValueError):
+        max_pages = _MAX_RENDER_PAGES
+    max_pages = max(1, min(max_pages, _MAX_RENDER_PAGES))
+
+    # --- clamp dpi ---
+    try:
+        dpi = int(dpi)
+    except (TypeError, ValueError):
+        dpi = _PDF_RENDER_DPI
+    dpi = max(72, min(dpi, 300))
+
+    try:
+        import fitz
+    except ImportError:
+        return {
+            "success": False,
+            "error": "PyMuPDF (fitz) is required to render PDF pages. "
+                     "Install it with: pip install pymupdf",
+        }
+
+    if hasattr(fitz, "TOOLS"):
+        try:
+            fitz.TOOLS.mupdf_display_errors(False)
+            fitz.TOOLS.mupdf_display_warnings(False)
+        except Exception:
+            pass
+
+    doc = None
+    try:
+        doc = fitz.open(str(path))
+        total_pages = len(doc)
+        if total_pages == 0:
+            return {"success": False, "error": f"PDF '{file_name}' contains no pages."}
+
+        selected = _parse_page_selector(pages, total_pages)
+        if len(selected) > max_pages:
+            truncated = selected[:max_pages]
+            warning = (
+                f"Requested {len(selected)} page(s); rendering only the first "
+                f"{max_pages} to protect the context. Call again with a narrower "
+                f"'pages' selector for the rest."
+            )
+            selected = truncated
+        else:
+            warning = None
+
+        zoom = dpi / 72.0
+        matrix = fitz.Matrix(zoom, zoom)
+
+        rendered_images: List[str] = []
+        media_types: List[str] = []
+        page_summaries: List[str] = []
+
+        for page_index in selected:
+            page = doc[page_index]
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            b64, mt = _resize_and_encode_image(pix.tobytes("jpeg"))
+            rendered_images.append(b64)
+            media_types.append(mt)
+
+            snippet = (page.get_text() or "").strip().replace("\n", " ")
+            snippet = (snippet[:120] + "…") if len(snippet) > 120 else snippet
+            page_summaries.append(
+                f"- Page {page_index + 1}: rendered"
+                + (f" — text preview: \"{snippet}\"" if snippet else " — no selectable text (image-only page)")
+            )
+
+            if include_embedded_figures:
+                for img_info in page.get_images(full=True):
+                    xref = img_info[0]
+                    try:
+                        base_img = doc.extract_image(xref)
+                        raw = base_img.get("image")
+                        if not raw:
+                            continue
+                        b64_fig, mt_fig = _resize_and_encode_image(raw)
+                        rendered_images.append(b64_fig)
+                        media_types.append(mt_fig)
+                        page_summaries.append(f"  · embedded figure from page {page_index + 1}")
+                    except Exception:
+                        continue
+
+        doc.close()
+        doc = None
+
+        page_list = ", ".join(str(p + 1) for p in selected)
+        summary = (
+            f"Rendered {len(rendered_images)} image(s) covering page(s) {page_list} "
+            f"of '{file_name}' ({total_pages} page(s) total)."
+        )
+        output = summary + "\n" + "\n".join(page_summaries)
+        if warning:
+            output = warning + "\n\n" + output
+
+        result: Dict[str, Any] = {
+            "success": True,
+            "file_name": file_name,
+            "total_pages": total_pages,
+            "pages_rendered": [p + 1 for p in selected],
+            "image_count": len(rendered_images),
+            "content": output,
+            "output": output,
+            "images": rendered_images,
+            "image_media_types": media_types,
+            "ephemeral": True,
+            "prompt_injection": (
+                f"\n\n[SYSTEM: {len(rendered_images)} page/figure image(s) from "
+                f"'{file_name}' (page(s) {page_list}) have been attached as "
+                f"vision content for THIS round only. Inspect them carefully — "
+                f"read scanned text, interpret curves, charts, and diagrams. "
+                f"Before the round ends, persist every useful finding into the "
+                f"scratchpad (or an artifact) so it survives: these images will "
+                f"NOT be available in subsequent rounds.]"
+            ),
+        }
+        if warning:
+            result["warning"] = warning
+        return result
+
+    except Exception as e:
+        import traceback as _tb
+        return {
+            "success": False,
+            "error": f"Failed to render PDF pages from '{file_name}': {e}",
+            "traceback": _tb.format_exc(),
+        }
+    finally:
+        if doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
 
 
 def tool_inspect_document(file_name: str) -> Dict[str, Any]:
@@ -625,6 +996,31 @@ def get_tools() -> List[Dict[str, Any]]:
             },
             "output": {"type": "object"},
             "callable": tool_read_document_content,
+            "_source": "as_is_document_tools",
+            "_source_file": __file__,
+        },
+        {
+            "name": "tool_render_pdf_pages",
+            "description": (
+                "Renders PDF page(s) to images and attaches them as EPHEMERAL vision "
+                "content for the NEXT LLM round only — ideal for scanned pages, "
+                "curves, charts, plots, and diagrams. Optionally also extracts "
+                "embedded figures. Images are NOT persisted across rounds: save "
+                "findings into the scratchpad or an artifact before the round ends."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_name": {"type": "string", "description": "Relative path to the PDF file in the workspace."},
+                    "pages": {"type": "string", "description": "1-based page selector, e.g. '3', '2-6', '1,4,9-11'. Defaults to all pages."},
+                    "max_pages": {"type": "integer", "description": "Safety cap on pages rendered per call (default 12, hard max 12)."},
+                    "include_embedded_figures": {"type": "boolean", "description": "Also extract raw embedded raster figures/plots from the selected pages."},
+                    "dpi": {"type": "integer", "description": "Render resolution in DPI (default 150, clamped to 72-300)."},
+                },
+                "required": ["file_name"],
+            },
+            "output": {"type": "object"},
+            "callable": tool_render_pdf_pages,
             "_source": "as_is_document_tools",
             "_source_file": __file__,
         },

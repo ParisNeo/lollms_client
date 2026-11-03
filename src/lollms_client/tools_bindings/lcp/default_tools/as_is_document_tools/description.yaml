@@ -1,15 +1,90 @@
 binding_name: as_is_document_tools
 title: As-Is Document Inspection & Reading Tools
 author: ParisNeo & Lollms
-version: 1.0.0
-description: Inspect, read, and selectively search native document formats (.pdf, .docx, .xlsx, .pptx, .txt) in the workspace without prompt context bloat.
+version: 1.2.0
+description: >-
+  Inspect, read, and selectively search native document formats
+  (.pdf, .docx, .xlsx, .pptx, .txt) in the workspace without prompt-context
+  bloat. Includes an ephemeral PDF page renderer that attaches rendered pages
+  and embedded figures as one-shot vision content for scanned pages, curves,
+  charts, plots, and diagrams.
+
+use_when:
+  - "You need metadata (page count, sheet names, slide count) -> tool_inspect_document."
+  - "You need text content from a born-digital document -> tool_read_document_content."
+  - "The page is SCANNED, image-only, or contains a chart/curve/diagram -> tool_render_pdf_pages."
+  - "You need to find a keyword or regex inside a large document -> tool_grep_document."
+  - "You need to EDIT PDF/DOCX content -> use the 'document_editor' toolset instead."
+
 commands:
   - name: tool_inspect_document
     title: Inspect Document
-    description: Returns structural metadata and page/sheet counts of a workspace document.
+    description: >-
+      Returns structural metadata of a workspace document: page count for PDFs,
+      sheet names and dimensions for XLSX, slide count for PPTX, paragraph
+      count for DOCX. Use this FIRST to decide which page/sheet to read or
+      render next.
+
   - name: tool_read_document_content
     title: Read Document Content
-    description: Extracts readable text from a document or specific page/sheet up to a specified character limit.
+    description: >-
+      Extracts readable TEXT from a document, or from a specific page/sheet,
+      up to a character limit. Handles born-digital PDFs, DOCX, XLSX, PPTX, and
+      TXT. Does NOT work on scanned PDFs (returns little or no text) — in that
+      case, use tool_render_pdf_pages instead.
+
+  - name: tool_render_pdf_pages
+    title: Render PDF Pages (Vision)
+    description: >-
+      Renders one or several PDF pages to images and attaches them as
+      EPHEMERAL vision content for the NEXT LLM round only. Ideal for:
+
+        * Scanned pages (image-only, no selectable text).
+        * Mathematical curves, plots, spectrograms, heat-maps.
+        * Diagrams, flowcharts, schematics, engineering drawings.
+        * Signatures, stamps, forms, and layout verification.
+        * Any page where "picture = meaning".
+
+      Optionally also extracts embedded raster figures from each page
+      (include_embedded_figures=true), which is useful when the original
+      figure raster survives downscaling better than the rendered page.
+
+      EPHEMERAL: rendered images are NOT persisted across rounds. Persist
+      every useful finding into the scratchpad or an artifact BEFORE the
+      round ends, otherwise that knowledge is lost. For large documents,
+      iterate over narrow page selectors (e.g. "1-10", then "11-20")
+      instead of requesting all pages at once — a hard cap of 12 pages
+      per call protects the context window.
+
   - name: tool_grep_document
     title: Grep Document
-    description: Searches for keywords or regex patterns within a document without loading the entire document into prompt context.
+    description: >-
+      Searches for a keyword or regular expression inside a document without
+      loading the whole file into context. Returns match locations
+      (page numbers, sheeet/row, paragraph indices) and short surrounding
+      snippets. Use this to locate relevant pages BEFORE rendering them with
+      tool_render_pdf_pages.
+
+examples:
+  - scenario: "Scanned invoice — extract line items"
+    steps:
+      - tool_inspect_document("invoices/march_scan.pdf")   # returns total_pages
+      - tool_render_pdf_pages("invoices/march_scan.pdf", pages="2")  # visually OCR page 2
+      - "Persist parsed line items into the scratchpad before the round ends."
+
+  - scenario: "Scientific paper — inspect figure 3"
+    steps:
+      - tool_grep_document("papers/attention.pdf", pattern="Figure 3")
+      - tool_render_pdf_pages("papers/attention.pdf", pages="5-6", include_embedded_figures=true)
+      - "Describe the curve / trend and save the description into the scratchpad."
+
+  - scenario: "Plot-heavy report — inspect chart at higher DPI"
+    steps:
+      - tool_render_pdf_pages("reports/q4_charts.pdf", pages="12", dpi=220)
+      - "Read axis labels, trends, and series names; persist into the scratchpad."
+
+cross_references:
+  - toolset: document_editor
+    relation: "Use document_editor (tool_edit_document_text, tool_annotate_document) for MODIFYING documents; use as_is_document_tools for READ-ONLY inspection and visualisation."
+  - toolset: vlm_query
+    relation: "tool_vlm_query delegates to a mounted VLM to describe an existing image; tool_render_pdf_pages CREATES images from a PDF then relies on the main model's own vision. They complement each other."
