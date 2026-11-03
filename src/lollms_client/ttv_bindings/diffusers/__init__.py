@@ -23,9 +23,8 @@ import pipmaster as pm
 import requests
 from ascii_colors import ASCIIColors, trace_exception
 from filelock import FileLock, Timeout
+from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
-from urllib3.util import Retry
-
 from lollms_client.lollms_ttv_binding import LollmsTTVBinding
 
 pm.ensure_packages(["requests", "filelock"])
@@ -267,7 +266,7 @@ class DiffusersTTVBinding(LollmsTTVBinding):
         if not self.is_server_running():
             return True
         try:
-            resp = self._session.post(
+            resp = requests.post(
                 f"{self.base_url}/shutdown",
                 headers=self._get_headers(),
                 timeout=5,
@@ -303,7 +302,7 @@ class DiffusersTTVBinding(LollmsTTVBinding):
             "fps": fps,
             "model_name": kwargs.get("model_name", self.model_name),
         }
-        response = self._session.post(
+        response = requests.post(
             f"{self.base_url}/generate_video",
             json=payload,
             headers=self._get_headers(),
@@ -316,7 +315,7 @@ class DiffusersTTVBinding(LollmsTTVBinding):
     def list_models(self, **kwargs) -> List[str]:
         self.ensure_server_is_running(True)
         try:
-            resp = self._session.get(
+            resp = requests.get(
                 f"{self.base_url}/list_models",
                 headers=self._get_headers(),
                 timeout=15,
@@ -349,7 +348,7 @@ class DiffusersTTVBinding(LollmsTTVBinding):
         try:
             if progress_callback:
                 progress_callback({"status": "starting", "message": f"Downloading {model_name}..."})
-            resp = self._session.post(
+            resp = requests.post(
                 f"{self.base_url}/pull_model",
                 json={"model_name": model_name},
                 headers=self._get_headers(),
@@ -374,7 +373,7 @@ class DiffusersTTVBinding(LollmsTTVBinding):
 
     def ps(self) -> List[dict]:
         try:
-            resp = self._session.get(
+            resp = requests.get(
                 f"{self.base_url}/ps",
                 headers=self._get_headers(),
                 timeout=10,
@@ -408,7 +407,7 @@ class DiffusersTTVBinding(LollmsTTVBinding):
 
     def unload_model(self, model_name: Optional[str] = None) -> bool:
         try:
-            resp = self._session.post(
+            resp = requests.post(
                 f"{self.base_url}/shutdown",
                 headers=self._get_headers(),
                 timeout=10,

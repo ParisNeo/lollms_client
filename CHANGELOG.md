@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-03 02:11]
+
+- remove unused test
+
 ## [2026-11-03 01:57]
 
 - feat: add smart router support to all bindings
