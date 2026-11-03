@@ -153,11 +153,81 @@ never the process folder; NO `os.chdir` — ever.
   as dynamically mountable based on workspace context (data files detected).
 - Deep dive: Step 3.
 
-## 8. `as_is_document_tools`
+## 8. `as_is_document_tools` ✅ (fully verified)
 
-- **Purpose**: importing/processing documents "as-is" (verified via the
-  as-is import test surface).
-- Deep dive: Step 3.
+- **Purpose**: Inspect, read, selectively search, and _visually_ render
+  documents in the workspace without prompt-context bloat. Handles PDF,
+  DOCX, XLSX, PPTX, and plain text.
+- **Seam**: B — `get_tools()` spec dicts (6 tools).
+- **Gates**: office-family any-flag rule (`enable_office_files` /
+  `enable_powerpoint` / `enable_word` / `enable_excel`).
+- **File**: `default_tools/as_is_document_tools/as_is_document_tools.py`
+  \+ `description.yaml` (v1.2.0).
+
+### Tools
+
+| Tool | Purpose |
+|---|---|
+| `tool_inspect_document` | Returns structural metadata (page/sheet/slide/paragraph counts, headings). Call FIRST to plan the read/render. |
+| `tool_read_document_content` | Extracts readable TEXT from a document (or page/sheet range) up to a char budget. Falls back to embedded-figure extraction when a page yields no text. |
+| `tool_render_pdf_pages` | **Rasterizes PDF page(s) to images for ONE-SHOT visual inspection** — scanned pages, curves, plots, diagrams, schematics. Optionally also harvests embedded raster figures. Returns `images` + `image_media_types` + `prompt_injection` for the NEXT round only (`ephemeral=True`). |
+| `tool_grep_document` | Keyword/regex search without loading the whole file. Returns match locations + snippets. |
+| `tool_add_word_comment` | Adds a native Word review-pane comment anchored on `search_text` or `paragraph_index`. |
+| `tool_get_word_comments` | Lists all native Word review comments in a `.docx`. |
+
+### Architecture highlights — the ephemeral-render doctrine
+
+The library's renderer is governed by four well-documented rules
+(docstring + description.yaml + `prompt_injection` string):
+
+1. **Ephemeral-by-design.** Rendered images are attached to the **next
+   round only** via the vision-hydration payload. They are NOT persisted
+   across rounds. A 200-page scanned PDF would otherwise permanently bloat
+   the context; the model is explicitly told (in `prompt_injection`) to
+   persist every finding into the scratchpad or an artifact **before the
+   round ends**.
+2. **Hard-capped rendering.** `_MAX_RENDER_PAGES = 12` is a hard ceiling
+   per call. Requests for more pages are truncated with a `warning` key
+   emitted in the result — the model must iterate with narrower selectors
+   (`"1-10"`, then `"11-20"`) rather than dumping the whole document.
+3. **Predictable token cost.** Every image is downscaled to
+   `_PDF_RENDER_MAX_DIM = 1600` px on its longest side, then JPEG-encoded
+   at `_PDF_RENDER_JPEG_Q = 85`. This keeps vision-token budgets stable
+   across scanned vs. vector PDFs. `dpi` is user-tunable (clamped 72–300).
+4. **Selector-driven.** `_parse_page_selector` accepts `"3"`, `"2-6"`,
+   `"1,4,9-11"`, empty (= all pages). Out-of-range values are clamped,
+   reversed ranges normalized, unparseable tokens ignored; on garbage
+   input the function falls back to all pages so the caller never gets an
+   empty selection.
+
+**Encoding fallback** (`_resize_and_encode_image`):
+
+- RGBA  → PNG (alpha preserved).
+- RGB / L → JPEG @ `_PDF_RENDER_JPEG_Q`.
+- Pillow unavailable / decode failure → returns raw bytes as `image/png`
+  so the round never crashes on an exotic embedded codec.
+
+**Result contract** (ricks through the standard pass-through keys — see
+[10_TOOLSET_AUTHORING_GUIDE.md](./10_TOOLSET_AUTHORING_GUIDE.md) §5):
+
+```python
+{
+    "success": True,
+    "file_name": "scan.pdf",
+    "total_pages": 42,
+    "pages_rendered": [7],
+    "image_count": 1,
+    "content": "...",
+    "output": "...",
+    "images": ["<base64>"],
+    "image_media_types": ["image/jpeg"],
+    "ephemeral": True,
+    "prompt_injection": "[SYSTEM: ... persist every useful finding ...]",
+    "warning": "<present iff request was truncated>",
+}
+```
+
+Deep dive: [08_LIBRARY_DEEP_DIVES.md](./08_LIBRARY_DEEP_DIVES.md) §8.
 
 ## 9. `models_tools`
 

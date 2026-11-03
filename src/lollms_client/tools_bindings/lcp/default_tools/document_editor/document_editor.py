@@ -19,6 +19,11 @@ except ImportError:
 TOOL_LIBRARY_NAME = "Document Editor"
 TOOL_LIBRARY_DESC = "Surgically edits, annotates (batch capable), highlights, copies-pastes between documents, deletes pages, and replaces text globally in PDF, DOCX, and PPTX files. DOCX comments are REAL Word review-pane comments anchored to the matched text. Also provides read-only probes: find text, read existing comments, and report document metadata."
 TOOL_LIBRARY_ICON = "📝"
+# File types this library handles. The LCP binding auto-mounts this toolset
+# whenever one of these extensions is present in the workspace, so dropping a
+# .pdf or .docx into the workspace makes it immediately available without
+# requiring enable_office_files.
+TOOL_LIBRARY_FILE_TYPES = [".pdf", ".docx", ".docm", ".xlsx", ".xls", ".pptx"]
 
 _DEFAULT_COMMENTER = getpass.getuser()
 

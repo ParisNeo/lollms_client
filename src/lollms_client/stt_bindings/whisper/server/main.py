@@ -11,6 +11,8 @@ import argparse
 import tempfile
 import base64
 import traceback
+import pipmaster as pm
+
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple, Set
 from concurrent.futures import Future
@@ -66,7 +68,6 @@ except BaseException as _startup_error:  # noqa: BLE001 - must surface all start
     )
     traceback.print_exc()
     sys.exit(1)
-</｜DSML｜ parameter>
 _WHISPER_IMPORT_ERROR: Optional[BaseException] = None
 try:
     import whisper

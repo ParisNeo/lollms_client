@@ -230,10 +230,203 @@ chat mixin attaches the artefact as a USER-role message for the next round.
 
 ---
 
-## 8. `as_is_document_tools` — surface-level, pending deeper scouting
+## 8. `as_is_document_tools` ✅ (fully verified)
 
-- **Purpose**: importing/processing documents "as-is" (verified via the as-is
-  import test surface `test/test_as_is_import_and_tools.py`).
+- **Purpose**: Inspect, read, selectively search, and _visually_ render
+  documents in the workspace without prompt-context bloat.
+- **Seam**: B — `get_tools()` returns **6 hand-authored** spec dicts.
+- **Gate**: office-family any-flag rule (see
+  [03_SESSION_FLAGS_GATING.md](./03_SESSION_FLAGS_GATING.md)).
+- **Files**: `default_tools/as_is_document_tools/as_is_document_tools.py` +
+  `description.yaml` (v1.2.0).
+
+### 8.1 Tool inventory
+
+| Tool | Purpose | Output shape |
+|---|---|---|
+| `tool_inspect_document` | Metadata: page/sheet/slide/paragraph counts + headings. Call FIRST. | 4-key success dict. |
+| `tool_read_document_content` | Text extraction from a doc or specific page/sheet, up to a char budget. | 4-key base + optional `images`, `image_media_types`, `prompt_injection` when pages yield no text. |
+| `tool_render_pdf_pages` | **Raster-to-vision** renderer: PDF pages → base64 images for the next round only. Supports embedded-figure harvesting. | 11-key dict (see §8.3). |
+| `tool_grep_document` | Keyword/regex search without loading the whole file. | 3-key: `success`, `matches_count`, `matches`, `output`. |
+| `tool_add_word_comment` | Native Word review-pane comment anchored on `search_text` or `paragraph_index`. | 6-key incl. `comment_id`, `workspace_file`. |
+| `tool_get_word_comments` | List all native Word review comments. | 5-key incl. `count`, `comments`. |
+
+### 8.2 Internal architecture — the ephemeral PDF renderer
+
+`tool_render_pdf_pages` is the library's marquee capability and the doctrinal
+counterpart to `tool_read_document_content`. It exists to solve three cases
+text extraction cannot:
+
+- **Scanned pages** with no selectable text (or OCR noise).
+- **Curves, plots, spectrograms, heat-maps** — visual data.
+- **Layout-sensitive pages** — forms, tables, diagrams, signatures.
+
+Four documented doctrines govern it:
+
+**A. Ephemeral-by-design.** Rendered images are attached to the **next
+LLM round only** — they live in the vision-hydration payload and are
+discarded afterward. This is a deliberate context-safety decision; a
+200-page scan would otherwise blow the window permanently. The returned
+`prompt_injection` block instructs the model:
+
+> "Before the round ends, persist every useful finding into the scratchpad
+> (or an artifact) so it survives: these images will NOT be available in
+> subsequent rounds."
+
+**B. Hard cap per call** — `_MAX_RENDER_PAGES = 12`:
+
+```python
+_MAX_RENDER_PAGES = 12   # HARD CEILING per tool call
+
+# In the tool body:
+if len(selected) > max_pages:
+    truncated = selected[:max_pages]
+    warning = "Requested N pages; rendering only the first max_pages ..."
+```
+
+The `warning` key rides back to the model so it self-corrects by calling
+again with a narrower `pages` selector. Tokens per call stay bounded.
+
+**C. Predictable image tokens** — dimensions and quality are pinned:
+
+| Constant | Value | Why |
+|---|---|---|
+| `_PDF_RENDER_MAX_DIM` | `1600` px (longest side) | Token-per-image stays predictable across scanned vs. vector PDFs. |
+| `_PDF_RENDER_DPI` | `150` (clamped 72–300) | Sweet spot for readable scanned text + legible chart axes. |
+| `_PDF_RENDER_JPEG_Q` | `85` | Visually lossless for document content; small payloads. |
+
+**D. Selector grammar** — `_parse_page_selector`:
+
+```
+"3"           -> [2]
+"2-6"         -> [1, 2, 3, 4, 5]
+"1,4,9-11"    -> [0, 3, 8, 9, 10]
+"" / None     -> list(range(total_pages))
+```
+
+Robustness: out-of-range values clamped, reversed ranges normalized,
+unparseable tokens ignored, fallback to all pages on garbage input.
+
+**Encoding pipeline** — `_resize_and_encode_image`:
+
+```python
+RGBA       -> PNG @ original quality  (preserves transparency)
+RGB / L    -> JPEG @ _PDF_RENDER_JPEG_Q
+Pillow fail -> raw bytes wrapped as image/png  (never crashes the round)
+```
+
+**Embedded-figure harvesting** — `include_embedded_figures=True` walks
+`page.get_images(full=True)` per page and appends each xref raster to the
+`images` list. Every harvest is guarded by `try/except continue` so a
+single corrupt xref never aborts the batch.
+
+### 8.3 Result-dict contract for `tool_render_pdf_pages`
+
+```python
+{
+    "success": True,
+    "file_name": "reports/q3_scan.pdf",
+    "total_pages": 42,
+    "pages_rendered": [7, 8],           # 1-based, sorted
+    "image_count": 3,                    # pages + embedded figures
+    "content": "Rendered 3 image(s) covering page(s) 7, 8 ...",
+    "output":  "Rendered 3 image(s) covering page(s) 7, 8 ...",
+    "images": ["<base64>", "<base64>", "<base64>"],
+    "image_media_types": ["image/jpeg", "image/jpeg", "image/png"],
+    "ephemeral": True,                   # signals one-round lifetime
+    "prompt_injection": "[SYSTEM: ... persist findings before round end]",
+    "warning": "<present iff selection was truncated>",  # optional
+}
+```
+
+When `success=False`, the dict carries `error` (and `traceback` on
+unhandled exceptions). Documented return keys ride through the binding
+via the pass-through contract in
+[10_TOOLSET_AUTHORING_GUIDE.md](./10_TOOLSET_AUTHORING_GUIDE.md) §5:
+`image_filename`, `image_b64`, `images`, `image_media_types`,
+`prompt_injection` are all forwarded to the final result.
+
+### 8.4 Error modes + recovery
+
+| Error | Cause | Recovery |
+|---|---|---|
+| `File '{name}' not found.` | Workspace path wrong | Model calls `tool_inspect_document` first. |
+| `File '{name}' is not a PDF (got '.docx').` | Wrong format for this tool | Use `tool_read_document_content` for DOCX. |
+| `PyMuPDF (fitz) is required …` | Optional dep missing | `pip install pymupdf`. |
+| `PDF '{name}' contains no pages.` | Empty/corrupt PDF | Report to user. |
+| `Failed to render PDF pages from '{name}': <e>` | Per-page fitz failure | Traceback included for the model to reason about. |
+| `warning` present (success still True) | Selection > `max_pages` | Model calls again with a narrower selector. |
+
+### 8.5 Worked examples
+
+**Scenario 1 — scanned invoice, single page.**
+
+LLM sends:
+
+```json
+{ "file_name": "invoices/march_scan.pdf", "pages": "2" }
+```
+
+Tool returns:
+
+```json
+{
+  "success": true,
+  "file_name": "invoices/march_scan.pdf",
+  "total_pages": 3,
+  "pages_rendered": [2],
+  "image_count": 1,
+  "ephemeral": true,
+  "images": ["<base64>"],
+  "image_media_types": ["image/jpeg"],
+  "prompt_injection": "[SYSTEM: 1 page/figure image(s) from ...]"
+}
+```
+
+The vision-hydration pipeline attaches the image to the next round; the
+model reads the invoice line items and (per the injection) writes them
+to the scratchpad before the round ends.
+
+**Scenario 2 — scientific paper with a plot.**
+
+LLM sends:
+
+```json
+{
+  "file_name": "papers/attention.pdf",
+  "pages": "5-6",
+  "include_embedded_figures": true,
+  "dpi": 220
+}
+```
+
+Tool returns `image_count: 4` (2 rendered pages + 2 harvested figures),
+each at 220 DPI and downscaled to ≤1600 px. The model inspects both the
+page render AND the pristine figure raster; the higher DPI keeps axis
+labels legible.
+
+**Scenario 3 — walking a 40-page scan in chunks (context-safe).**
+
+```python
+tool_render_pdf_pages("scan.pdf", pages="1-10")   # 10 images, one round
+# ... model writes findings to scratchpad, round ends, images discarded.
+tool_render_pdf_pages("scan.pdf", pages="11-20")  # next chunk, same pattern
+```
+
+Never `pages=""` (all pages) on a 40-page scan — the hard cap of 12 will
+trigger a `warning`, and the model is expected to break the work into
+chunks proactively.
+
+### 8.6 Sibling-relationship map
+
+- `document_editor` — the WRITE-side sibling. Use
+  `tool_edit_document_text`, `tool_annotate_document`,
+  `tool_batch_annotate_document`, `tool_replace_text_globally` to
+  MODIFY documents; use `as_is_document_tools` purely to READ/INSPECT/RENDER.
+- `vlm_query` — the _delegation_ sibling. `tool_vlm_query` hands an
+  existing image to a mounted VLM for description; `tool_render_pdf_pages`
+  CREATES images from a PDF and relies on the main model's own vision.
+  They complement each other — see `docs/flags/enable_vlm_query.md`.
 
 ---
 

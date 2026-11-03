@@ -16,6 +16,11 @@ os.environ["PYMUPDF_MESSAGE"] = "fd:2"
 TOOL_LIBRARY_NAME = "As-Is Document Tools"
 TOOL_LIBRARY_DESC = "Inspect, search, and extract selective content from binary and structured workspace documents."
 TOOL_LIBRARY_ICON = "📄"
+# File types this library handles. The LCP binding auto-mounts this toolset
+# whenever one of these extensions is present in the workspace, so dropping a
+# .pdf or .docx into the workspace makes it immediately available without
+# requiring enable_office_files.
+TOOL_LIBRARY_FILE_TYPES = [".pdf", ".docx", ".docm", ".xlsx", ".xls", ".pptx"]
 
 _VISION_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp", ".gif"}
 
