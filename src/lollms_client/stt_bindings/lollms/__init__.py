@@ -26,6 +26,13 @@ class LollmsSTTBinding_Impl(LollmsSTTBinding):
             verify_ssl_certificate (bool): Whether to verify SSL certificates.
         """
         super().__init__("lollms")
+
+        global requests
+        import pipmaster as pm
+        pm.ensure_packages(["requests"])
+        import requests as _requests
+        requests = _requests
+
         self.host_address=kwargs.get("host_address")
         self.model_name=kwargs.get("model_name")
         self.service_key=kwargs.get("service_key")

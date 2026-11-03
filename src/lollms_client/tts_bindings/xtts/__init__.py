@@ -28,6 +28,19 @@ class XTTSClientBinding(LollmsTTSBinding):
             kwargs['model_name'] = kwargs.pop('model')
         super().__init__(binding_name="xtts", **kwargs)
 
+        global requests, FileLock, Timeout, HTTPAdapter, Retry
+        import pipmaster as pm
+        pm.ensure_packages(["requests", "filelock", "urllib3"])
+        import requests as _requests
+        from filelock import FileLock as _FileLock, Timeout as _Timeout
+        from requests.adapters import HTTPAdapter as _HTTPAdapter
+        from urllib3.util import Retry as _Retry
+        requests = _requests
+        FileLock = _FileLock
+        Timeout = _Timeout
+        HTTPAdapter = _HTTPAdapter
+        Retry = _Retry
+
         self.config = kwargs
         self.host = kwargs.get("host", "127.0.0.1")
         self.port = int(kwargs.get("port", 9634))

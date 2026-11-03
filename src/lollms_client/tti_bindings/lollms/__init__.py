@@ -15,6 +15,12 @@ class LollmsTTIBinding(LollmsTTIBinding):
             kwargs["model_name"] = kwargs.pop("model")
         super().__init__(BindingName, **kwargs)
 
+        global requests
+        import pipmaster as pm
+        pm.ensure_packages(["requests"])
+        import requests as _requests
+        requests = _requests
+
         host = kwargs.get("host_address", "http://localhost:9642").rstrip("/")
 
         if host.endswith("/lollms/v1"):

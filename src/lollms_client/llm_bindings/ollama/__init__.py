@@ -158,6 +158,7 @@ class OllamaBinding(LollmsLLMBinding):
         self.default_completion_format = kwargs.get("default_completion_format", ELF_COMPLETION_FORMAT.Chat)
         self.n_threads = kwargs.get("n_threads", -1)
         self.supported_reasoning_efforts = ["low", "medium", "high"]
+        self.handle_dsml = bool(kwargs.get("handle_dsml", False))
 
         if ollama is None:
             raise ImportError("Ollama library is not installed. Please run 'pip install ollama'.")
@@ -330,7 +331,7 @@ class OllamaBinding(LollmsLLMBinding):
 
     def _postprocess_dsml(self, text: str) -> str:
         """Extract DSML tool-call blocks from a full response and convert them to lollms XML."""
-        if not self.handle_dsml or not text:
+        if not getattr(self, "handle_dsml", False) or not text:
             return text
         try:
             tool_calls, cleaned = _extract_dsml_from_text(text)

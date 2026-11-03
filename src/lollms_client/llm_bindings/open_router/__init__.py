@@ -37,10 +37,12 @@ class OpenRouterBinding(LollmsLLMBinding):
         """
         super().__init__(BindingName, **kwargs)
 
-        global openai
-        pm.ensure_packages(["openai", "tiktoken"])
+        global openai, requests
+        pm.ensure_packages(["openai", "tiktoken", "requests"])
         import openai as _openai
+        import requests as _requests
         openai = _openai
+        requests = _requests
 
         self.model_name = kwargs.get("model_name","google/gemini-flash-1.5")
         self.service_key = kwargs.get("service_key") or os.getenv("OPENROUTER_service_key")

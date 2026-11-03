@@ -41,8 +41,13 @@ class NovitaAITTV(LollmsTTVBinding):
             binding_name="novita_ai_ttv",
             debug=bool(kwargs.get("debug", False))
         )
-        if requests is None:
-            raise ImportError("novita_ai_ttv requires 'requests': pip install requests")
+
+        global requests
+        import pipmaster as pm
+        pm.ensure_packages(["requests"])
+        import requests as _requests
+        requests = _requests
+
         self.config = kwargs or {}
         self.api_key = (
             self.config.get("novita_api_key")

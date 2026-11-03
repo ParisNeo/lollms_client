@@ -178,19 +178,25 @@ def test_generate_from_messages_delegation(mock_binding_manager):
     assert response == "Mocked message response"
     router.child_bindings["child_a"].generate_from_messages.assert_called_once_with(messages)
 
-def test_empty_response_does_not_crash():
+def test_empty_response_does_not_crash(mock_binding_manager):
     """Regression: an empty LLM response must not crash the router.
 
     The llama_cpp_server binding can return empty content (e.g. when the server
     is started with --embedding). The router must degrade gracefully and return
     an empty string rather than raising.
     """
-    from lollms_client.llm_bindings.smart_router import SmartRouterBinding
+    router = LollmsSmartBinding(
+        model_profiles={
+            "child_a": {
+                "binding_name": "ollama",
+                "binding_config": {"model_name": "llama3"},
+                "routing_profile": {"description": "general tasks"},
+            }
+        }
+    )
 
-    router = SmartRouterBinding.__new__(SmartRouterBinding)
-    router.binding_manager = MagicMock()
-    router.binding_manager.get_binding.return_value = MagicMock()
-    router.binding_manager.get_binding.return_value.generate_text.return_value = ""
+    # Simulate the underlying binding returning an empty string.
+    router.child_bindings["child_a"].generate_text.return_value = ""
 
     result = router.generate_text(prompt="hi")
     assert result == "", "Empty LLM response must be returned as-is, not raise"

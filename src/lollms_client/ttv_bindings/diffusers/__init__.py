@@ -416,16 +416,3 @@ class DiffusersTTVBinding(LollmsTTVBinding):
             return resp.status_code == 200
         except Exception:
             return False
-
-    def get_zoo(self) -> List[Dict[str, Any]]:
-        return list(DEFAULT_TTV_ZOO)
-
-    def download_from_zoo(
-        self,
-        index: int,
-        progress_callback: Optional[Callable[[dict], None]] = None,
-    ) -> dict:
-        zoo = self.get_zoo()
-        if not (0 <= index < len(zoo)):
-            return {"status": False, "message": "Index out of bounds."}
-        return self.pull_model(zoo[index]["link"], progress_callback=progress_callback)

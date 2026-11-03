@@ -78,10 +78,12 @@ class OpenLLMBinding(LollmsLLMBinding):
         """
         super().__init__(BindingName, **kwargs)
 
-        global httpx
-        pm.ensure_packages(["httpx", "tiktoken"])
+        global httpx, requests
+        pm.ensure_packages(["httpx", "tiktoken", "requests"])
         import httpx as _httpx
+        import requests as _requests
         httpx = _httpx
+        requests = _requests
 
         self.host_address = kwargs.get("host_address")
         self.model_name = kwargs.get("model_name")

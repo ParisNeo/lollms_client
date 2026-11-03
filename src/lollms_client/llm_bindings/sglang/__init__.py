@@ -80,10 +80,14 @@ class SGLangBinding(LollmsLLMBinding):
     def __init__(self, **kwargs):
         super().__init__(BindingName, **kwargs)
 
-        global openai
-        pm.ensure_packages(["openai", "tiktoken"])
+        global openai, httpx, requests
+        pm.ensure_packages(["openai", "tiktoken", "httpx", "requests"])
         import openai as _openai
+        import httpx as _httpx
+        import requests as _requests
         openai = _openai
+        httpx = _httpx
+        requests = _requests
 
         self.host_address = kwargs.get("host_address", "http://localhost:30000/v1")
         self.model_name = kwargs.get("model_name", "default")

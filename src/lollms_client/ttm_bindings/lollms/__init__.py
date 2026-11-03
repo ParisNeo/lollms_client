@@ -1,8 +1,10 @@
 # lollms_client/ttm_bindings/lollms/__init__.py
-import requests
 from lollms_client.lollms_ttm_binding import LollmsTTMBinding
-from typing import Optional, List
+from typing import Optional, List, Dict, Any, Callable
 from ascii_colors import trace_exception, ASCIIColors
+
+# Heavy dependencies are imported lazily inside __init__ / helper methods.
+requests = None
 
 # Defines the binding name for the manager
 BindingName = "LollmsTTMBinding_Impl"

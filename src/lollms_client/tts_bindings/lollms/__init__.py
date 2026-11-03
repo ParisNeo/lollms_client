@@ -21,6 +21,13 @@ class LollmsTTSBinding_Impl(LollmsTTSBinding):
             verify_ssl_certificate (bool): Whether to verify SSL certificates.
         """
         super().__init__("lollms")
+
+        global requests
+        import pipmaster as pm
+        pm.ensure_packages(["requests"])
+        import requests as _requests
+        requests = _requests
+
         self.host_address = kwargs.get("host_address","http://localhost:9600")
         self.model_name =  kwargs.get("model_name","main_voice")
         self.service_key =  kwargs.get("service_key",None) # This will be used as client_id

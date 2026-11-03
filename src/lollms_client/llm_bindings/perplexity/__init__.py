@@ -52,6 +52,12 @@ class PerplexityBinding(LollmsLLMBinding):
             service_key (str): Perplexity API key.
         """
         super().__init__(BindingName, **kwargs)
+
+        global requests
+        pm.ensure_packages(["requests"])
+        import requests as _requests
+        requests = _requests
+
         self.model_name = kwargs.get("model_name")
         self.service_key = kwargs.get("service_key")
 

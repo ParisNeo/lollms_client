@@ -224,9 +224,6 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
         entry = _TTV_ZOO[index]
         return self.pull_model(entry["hf_id"])
 
-    def get_zoo(self) -> List[Dict[str, Any]]:
-        return list(_TTV_ZOO)
-
     # ------------------------------------------------------------------
     # Generation Logic
     # ------------------------------------------------------------------
