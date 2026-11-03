@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-03 08:32]
+
+- fix(stt/whisper): improve error diagnostics and replace direct requests with module helpers
+
 ## [2026-11-03 02:11]
 
 - remove unused test

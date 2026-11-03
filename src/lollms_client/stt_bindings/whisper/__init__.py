@@ -109,7 +109,7 @@ class WhisperSTTBinding(LollmsSTTBinding):
     def is_server_running(self) -> bool:
         """Probes the server on loopback with a fast timeout (<= 0.5s)."""
         try:
-            resp = requests.get(
+            resp = _module_get(
                 f"{self.base_url}/status",
                 headers=self._get_headers(),
                 timeout=0.5
@@ -235,15 +235,27 @@ class WhisperSTTBinding(LollmsSTTBinding):
             start_time = time.time()
             while time.time() - start_time < timeout_s:
                 if self.server_process.poll() is not None:
-                    error_tail = "Log file is empty."
+                    # Give the log file a brief grace period to flush the final
+                    # traceback the child may have written right before exiting.
+                    time.sleep(0.3)
+                    error_tail = ""
                     try:
                         if log_file_path.exists():
                             lines = log_file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-                            error_tail = "\n".join(lines[-30:])
+                            error_tail = "\n".join(lines[-40:]).strip()
                     except Exception:
                         pass
+                    if not error_tail:
+                        error_tail = (
+                            "(daemon produced no output before exiting). "
+                            "Common causes on Linux: missing 'libgomp.so.1' "
+                            "(install libgomp1 / gcc runtime), incompatible or "
+                            "missing PyTorch build for the current Python/OS, or "
+                            "no write permission on the log file."
+                        )
                     raise RuntimeError(
                         f"Whisper server process terminated unexpectedly with code {self.server_process.returncode}.\n"
+                        f"Log file: {log_file_path}\n"
                         f"Log tail:\n{error_tail}"
                     )
 
@@ -307,42 +319,8 @@ class WhisperSTTBinding(LollmsSTTBinding):
 
         audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
 
-        payload = {
-            "audio_b64": audio_b64,
-            "model_name": model or self.config.get("model_name", "base"),
-            "language": kwargs.get("language"),
-            "task": kwargs.get("task", "transcribe"),
-            "fp16": kwargs.get("fp16"),
-            "device": kwargs.get("device"),
-            "filename": filename_hint
-        }
-
-        if isinstance(audio_source, (str, Path)):
-            audio_file = Path(audio_source)
-            if not audio_file.exists():
-                raise FileNotFoundError(f"Audio file not found at: {audio_source}")
-            audio_bytes = audio_file.read_bytes()
-            filename_hint = audio_file.name
-        elif isinstance(audio_source, bytes):
-            audio_bytes = audio_source
-            filename_hint = kwargs.get("filename")
-        else:
-            raise ValueError("audio_source must be str, Path, or bytes")
-
-        audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
-
-        payload = {
-            "audio_b64": audio_b64,
-            "model_name": model or self.config.get("model_name", "base"),
-            "language": kwargs.get("language"),
-            "task": kwargs.get("task", "transcribe"),
-            "fp16": kwargs.get("fp16"),
-            "device": kwargs.get("device"),
-            "filename": filename_hint
-        }
-
         url = f"{self.base_url}/transcribe"
-        resp = requests.post(
+        resp = _module_post(
             url,
             json=payload,
             headers=self._get_headers(),
@@ -565,7 +543,7 @@ class WhisperSTTBinding(LollmsSTTBinding):
 
     def ps(self) -> List[dict]:
         try:
-            resp = requests.get(
+            resp = _module_get(
                 f"{self.base_url}/ps",
                 headers=self._get_headers(),
                 timeout=10,

@@ -1,4 +1,5 @@
 import os
+import sys
 import gc
 import time
 import hmac
@@ -9,18 +10,63 @@ import hashlib
 import argparse
 import tempfile
 import base64
+import traceback
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple, Set
 from concurrent.futures import Future
 
-import pipmaster as pm
-pm.ensure_packages(["fastapi", "uvicorn", "ascii_colors>=0.11.10", "filelock", "pydantic", "torch", "numpy"])
+# Emit a startup marker immediately so the daemon log is never empty,
+# even if a downstream import or dependency bootstrap fails catastrophically.
+print(f"[whisper-server] bootstrap: python={sys.executable} argv={sys.argv}", flush=True)
 
-import numpy as np
-import torch
-from fastapi import FastAPI, APIRouter, HTTPException, Header
-from pydantic import BaseModel, Field
-from ascii_colors import ASCIIColors, trace_exception
+
+def _bootstrap_dependencies() -> None:
+    """Installs/validates required packages with actionable failure diagnostics."""
+    try:
+        import pipmaster as pm
+    except ImportError as exc:
+        print(
+            "[whisper-server] FATAL: 'pipmaster' is not installed in the server venv. "
+            "Install it with: pip install pipmaster",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise exc
+
+    try:
+        pm.ensure_packages([
+            "fastapi", "uvicorn", "ascii_colors>=0.11.10",
+            "filelock", "pydantic", "torch", "numpy",
+        ])
+    except Exception as exc:
+        print(
+            f"[whisper-server] FATAL: dependency bootstrap failed: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        traceback.print_exc()
+        raise
+
+
+try:
+    _bootstrap_dependencies()
+
+    import numpy as np
+    import torch
+    from fastapi import FastAPI, APIRouter, HTTPException, Header
+    from pydantic import BaseModel, Field
+    from ascii_colors import ASCIIColors, trace_exception
+except BaseException as _startup_error:  # noqa: BLE001 - must surface all startup failures
+    print(
+        "[whisper-server] FATAL: startup import failed. "
+        "On Linux, verify that libgomp / CUDA runtime libraries are installed. "
+        f"Error: {_startup_error}",
+        file=sys.stderr,
+        flush=True,
+    )
+    traceback.print_exc()
+    sys.exit(1)
+</｜DSML｜ parameter>
 _WHISPER_IMPORT_ERROR: Optional[BaseException] = None
 try:
     import whisper
