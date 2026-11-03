@@ -186,16 +186,19 @@ class TestRuntimeLayer:
                     s.close()
 
     def test_eval_blocked(self, workspace):
+        """`eval` is blocked for user-code frames — same gate as exec/compile.
+
+        The absolute `eval` is not the vector to guard: from the test frame
+        (filename `test_sandbox_python_kernel.py`) the frame gate correctly
+        declines to raise, because `eval` from a host frame is a legitimate
+        operation (CPython's `collections.namedtuple` uses it during normal
+        library imports). The exploit vector is `eval` reached from a
+        user-code frame — i.e. from `<execute_python*>` — and that is what
+        this test asserts.
+        """
         with SandboxContext(workspace_root=workspace, profile="standard"):
             with pytest.raises((SandboxPermissionError, PermissionError)):
-                eval("1+1")
-
-    def _exec_as_user(self, source: str, label: str = "<execute_python>"):
-        """Helper: run `source` with a user-code frame so guard logic engages."""
-        return _TRUE_EXEC(
-            _TRUE_COMPILE(source, label, "exec"),
-            {"__builtins__": __builtins__},
-        )
+                self._exec_as_user("eval('1+1')")
 
     def test_import_subprocess_blocked(self, workspace):
         """User-frame `import subprocess` must be blocked at runtime."""
@@ -531,8 +534,12 @@ class TestExecutePythonEndpoint:
             (_P(td) / "test").mkdir()
 
     def test_blocks_eval(self):
+        # `eval` is unconditionally rejected while the sandbox is active.
+        # The static AST layer rejects the source before the child even starts,
+        # and the runtime layer's unconditional stub covers dynamic paths.
         result = ep.tool_execute_python_code(code="print(eval('1+1'))")
         assert result["success"] is False
+        assert "eval" in result["error"].lower() or "sandbox" in result["error"].lower()
 
     def test_user_frame_ops_are_sandboxed(self, tmp_path):
         """User exec code attempting Path.mkdir outside root MUST be blocked.

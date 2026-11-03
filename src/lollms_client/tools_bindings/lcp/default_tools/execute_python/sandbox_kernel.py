@@ -121,49 +121,114 @@ def _recover_true_builtin(name: str) -> Any:
     )
 
 
-def _capture_true_builtins() -> Tuple[Any, Any, Any]:
-    """Capture the real builtins, preferring frozen sentinels if `builtins`
-    has already been patched by an earlier sandbox in this process.
+# Process-wide, session-stable snapshot of the REAL builtins. This tuple MUST
+# be captured exactly once, before any `SandboxContext` can possibly be active.
+# Because `sandbox_kernel` is imported by `execute_python` / `execute_python_data_query`
+# at process startup, that "first import" always happens outside any sandbox.
+#
+# The snapshot lives on `sys` (module reloads cannot clear it) with per-slot
+# `_is_block_stub` validation so a leaked block stub can never be cached here.
+_SYS_TRUE_BUILTINS_ATTR = "__lollms_true_builtins__"
 
-    CRITICAL: `_is_block_stub` guards against the module-load-order bug where
-    this module is imported for the FIRST time inside an active
-    `SandboxContext` — `builtins.exec`/`compile`/`eval` are then already our
-    own stub, and without validation we would cache the stub as the "true"
-    builtin, permanently breaking every tool that needs exec/compile."""
-    tc = getattr(builtins, "__lollms_true_compile__", None)
-    if _is_block_stub(tc):
-        tc = None
-    te = getattr(builtins, "__lollms_true_exec__", None)
-    if _is_block_stub(te):
-        te = None
-    tv = getattr(builtins, "__lollms_true_eval__", None)
-    if _is_block_stub(tv):
-        tv = None
-    if tc is None:
-        tc = builtins.__dict__.get("compile")
-        if _is_block_stub(tc):
-            tc = _recover_true_builtin("compile")
-    if te is None:
-        te = builtins.__dict__.get("exec")
-        if _is_block_stub(te):
-            te = _recover_true_builtin("exec")
-    if tv is None:
-        tv = builtins.__dict__.get("eval")
-        if _is_block_stub(tv):
-            tv = _recover_true_builtin("eval")
+
+def _store_true_builtins_in_sys(tc: Any, te: Any, tv: Any) -> None:
+    """Persists the true builtins on `sys` so re-imports cannot lose them."""
+    try:
+        setattr(sys, _SYS_TRUE_BUILTINS_ATTR, (tc, te, tv))
+    except Exception:
+        pass
+
+
+def _load_true_builtins_from_sys() -> Tuple[Any, Any, Any]:
+    """Returns the sys-cached true builtins, or (None, None, None) if absent."""
+    cached = getattr(sys, _SYS_TRUE_BUILTINS_ATTR, None)
+    if isinstance(cached, tuple) and len(cached) == 3:
+        tc, te, tv = cached
+        if not (_is_block_stub(tc) or _is_block_stub(te) or _is_block_stub(tv)):
+            return tc, te, tv
+    return None, None, None
+
+
+def _capture_true_builtins() -> Tuple[Any, Any, Any]:
+    """Capture the real builtins; safe under any module-load-order scenario.
+
+    Resolution order (each step validated by `_is_block_stub`):
+      1. `sys.__lollms_true_builtins__` — written on the FIRST genuine import
+         (guaranteed pre-sandbox since tools import the kernel at startup).
+      2. Per-slot frozen sentinel `builtins.__lollms_true_<name>__`.
+      3. `builtins.__dict__[name]` — genuine only if no sandbox is active.
+      4. `_recover_true_builtin(name)` — last resort, raises if impossible.
+
+    The single source of truth becomes the sys-cache: once populated it is
+    never overwritten, so re-importing this module inside a live sandbox
+    returns the cached genuine functions instead of raising.
+    """
+    # Fast path: sys-cache already populated (this is the normal case after
+    # the very first process import).
+    cached_tc, cached_te, cached_tv = _load_true_builtins_from_sys()
+    if cached_tc is not None and cached_te is not None and cached_tv is not None:
+        return cached_tc, cached_te, cached_tv
+
+    def _resolve(name: str, sentinel_attr: str) -> Any:
+        sentinel = getattr(builtins, sentinel_attr, None)
+        if not _is_block_stub(sentinel) and sentinel is not None:
+            return sentinel
+        candidate = builtins.__dict__.get(name)
+        if not _is_block_stub(candidate) and candidate is not None:
+            return candidate
+        return _recover_true_builtin(name)
+
+    tc = _resolve("compile", "__lollms_true_compile__")
+    te = _resolve("exec", "__lollms_true_exec__")
+    tv = _resolve("eval", "__lollms_true_eval__")
+    _store_true_builtins_in_sys(tc, te, tv)
     return tc, te, tv
+
+
+def _recover_import_builtin() -> Any:
+    """Returns a genuine `__import__` if `builtins.__import__` is currently a
+    sandbox gated stub. Used narrowly by `run_in_sandboxed_child` to guarantee
+    that `multiprocessing.spawn`'s pickle-by-reference import step succeeds.
+
+    Never raises; returns None if no genuine importer can be located.
+    """
+    current = builtins.__dict__.get("__import__")
+    if current is not None and not _is_block_stub(current) and not getattr(current, "__name__", "") == "_filtered_import":
+        return current
+    # Sentinels are not written for __import__ by design; recover from any
+    # live `sys.modules` snapshot of a previous true importer if one exists.
+    sentinel = getattr(builtins, "__lollms_true_import__", None)
+    if sentinel is not None and not _is_block_stub(sentinel) and sentinel is not current:
+        return sentinel
+    # Last resort: rebuild from the frozen bootstrap that Python always has.
+    try:
+        import _frozen_importlib
+        candidate = _frozen_importlib.__import__
+        if not _is_block_stub(candidate):
+            return candidate
+    except Exception:
+        pass
+    import importlib as _importlib_mod
+    candidate = importlib._bootstrap.__import__  # type: ignore[attr-defined]
+    if not _is_block_stub(candidate):
+        return candidate
+    return None
 
 
 TRUE_COMPILE, TRUE_EXEC, TRUE_EVAL = _capture_true_builtins()
 # Publish frozen markers so ANY future import of this module (or a `_snapshot()`
 # in a nested SandboxContext, or a restore after a leak) can recover the true
 # builtins even if `builtins.exec`/`compile`/`eval` are currently stubs.
+# Each sentinel write is validated: a block stub is NEVER frozen as a sentinel.
 try:
-    if not hasattr(builtins, "__lollms_true_compile__"):
+    existing_tc = getattr(builtins, "__lollms_true_compile__", None)
+    if existing_tc is None or _is_block_stub(existing_tc):
         builtins.__lollms_true_compile__ = TRUE_COMPILE  # type: ignore[attr-defined]
-    if not hasattr(builtins, "__lollms_true_exec__"):
+    existing_te = getattr(builtins, "__lollms_true_exec__", None)
+    if existing_te is None or _is_block_stub(existing_te):
         builtins.__lollms_true_exec__ = TRUE_EXEC  # type: ignore[attr-defined]
-    if not hasattr(builtins, "__lollms_true_eval__"):
+    existing_tv = getattr(builtins, "__lollms_true_eval__", None)
+    if existing_tv is None or _is_block_stub(existing_tv):
         builtins.__lollms_true_eval__ = TRUE_EVAL  # type: ignore[attr-defined]
 except Exception:
     pass
@@ -513,6 +578,103 @@ __all__ = [
 _CHILD_HARD_TIMEOUT_DEFAULT = 120.0
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Subprocess-based child bootstrap.
+#
+# The child is launched with `subprocess.Popen([sys.executable, "-c", BOOTSTRAP])`,
+# NOT with `multiprocessing.Process`. This deliberately eliminates the entire
+# `pickle.save_global` class of failures (`PicklingError: import of module ...
+# failed`) that poisons every spawn-based approach when the kernel module has
+# been reloaded mid-sandbox (a legitimate scenario exercised by
+# `test_sandbox_module_load_order.py`).
+#
+# The child:
+#   1. reads a JSON config from stdin (parent's sys.path + payload),
+#   2. imports sandbox_kernel **freshly** from disk (its own `sys.modules` starts
+#      empty of the kernel — no reload shadows, no stale sentinels),
+#   3. calls `_sandbox_child_worker` with a shim `conn` object that JSON-encodes
+#      envelopes with base64-transported bytes.
+#
+# The parent never mutates its own `builtins.__import__`, never touches its
+# process globals during spawn, and never depends on `sys.modules[__name__]`
+# identity. Byte-for-byte deterministic on Windows and POSIX alike.
+# ──────────────────────────────────────────────────────────────────────────────
+_CHILD_BOOTSTRAP_SOURCE = r'''
+import sys, json, base64, os
+
+_config = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+sys.path[:] = _config["sys_path"]
+
+# Fresh import in the child: no reload shadows, no stale sys.modules entries.
+from lollms_client.tools_bindings.lcp.default_tools.execute_python import sandbox_kernel as _sk
+
+_payload = _config["payload"]
+
+# ── Unpack seed locals that the parent encoded for JSON transport ──
+#    `{"__b64__": "..."}`    → bytes (fast path, used for df pickles)
+#    `{"__pickle__": "..."}` → arbitrary picklable object (classes, modules,
+#                              DataFrames, instances). This is the JSON-safe
+#                              analogue of the old multiprocessing pickle path.
+import pickle as _pickle_child
+_seed = _payload.get("seed_locals") or {}
+for _k, _v in list(_seed.items()):
+    if isinstance(_v, dict) and set(_v.keys()) == {"__b64__"}:
+        try:
+            _seed[_k] = base64.b64decode(_v["__b64__"])
+        except Exception:
+            _seed.pop(_k, None)
+    elif isinstance(_v, dict) and set(_v.keys()) == {"__pickle__"}:
+        try:
+            _seed[_k] = _pickle_child.loads(base64.b64decode(_v["__pickle__"]))
+        except Exception:
+            _seed.pop(_k, None)
+_payload["seed_locals"] = _seed
+
+
+class _StdoutConn:
+    """Shim connection that JSON-serialises the envelope to stdout."""
+    def send(self, envelope):
+        out = dict(envelope)
+        if out.get("df_pickle"):
+            try:
+                out["df_pickle"] = base64.b64encode(out["df_pickle"]).decode("ascii")
+            except Exception:
+                out["df_pickle"] = None
+        out["figures"] = [
+            base64.b64encode(f).decode("ascii") for f in (out.get("figures") or [])
+        ]
+        try:
+            sys.stdout.write(json.dumps(out))
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+
+try:
+    _sk._sandbox_child_worker(_StdoutConn(), _payload)
+except BaseException as _exc:
+    import traceback as _tb
+    _fallback = {
+        "success": False, "stdout": "", "stderr": "",
+        "traceback": _tb.format_exc(),
+        "error_type": type(_exc).__name__,
+        "sandbox_violation": False, "figures": [],
+        "df_pickle": None, "scalars": {},
+    }
+    try:
+        sys.stdout.write(json.dumps(_fallback))
+        sys.stdout.flush()
+    except Exception:
+        pass
+'''
+
+
 def _sandbox_child_worker(conn, payload: Dict[str, Any]) -> None:
     """Runs in the child process ONLY. Executes user code under SandboxContext.
 
@@ -523,6 +685,12 @@ def _sandbox_child_worker(conn, payload: Dict[str, Any]) -> None:
     import io as _io
     import traceback
     import json as _json
+
+    # The child re-imports this module on `spawn` start; capture the true
+    # builtins here BEFORE `SandboxContext` clobbers them. This is the very
+    # first thing the child does, so `_capture_true_builtins()` sees genuine
+    # builtins and populates the sys-cache.
+    child_tc, child_te, _ = _capture_true_builtins()
 
     source = payload["source"]
     workspace_root = Path(payload["workspace_root"])
@@ -573,8 +741,8 @@ def _sandbox_child_worker(conn, payload: Dict[str, Any]) -> None:
                 local_vars["__builtins__"]["__import__"] = _sbx.filtered_import
 
             try:
-                compiled = TRUE_COMPILE(source, script_label, "exec")
-                TRUE_EXEC(compiled, local_vars)
+                compiled = child_tc(source, script_label, "exec")
+                child_te(compiled, local_vars)
             except SystemExit as se:
                 raise RuntimeError(
                     f"User code called sys.exit() with code {se.code}. "
@@ -645,6 +813,13 @@ def _sandbox_child_worker(conn, payload: Dict[str, Any]) -> None:
             pass
 
 
+# Pin the picklable identity of the spawn worker to THIS module's canonical
+# name. Windows `spawn` resolves the target by `(module_name, qualname)`; an
+# explicit pin prevents pickling from ever disagreeing with `sys.modules`.
+_sandbox_child_worker.__module__ = __name__
+_sandbox_child_worker.__qualname__ = "_sandbox_child_worker"
+
+
 def run_in_sandboxed_child(
     source: str,
     workspace_root: Path,
@@ -676,99 +851,190 @@ def run_in_sandboxed_child(
     When the child exceeds `hard_timeout`, it is terminated and a synthetic
     envelope with `success=False, error_type="TimeoutError"` is returned.
     """
-    import multiprocessing as _mp
-    import time as _time
+    import json as _json
+    import base64 as _b64
+    import subprocess as _sp
 
-    # On Windows the only viable start method is 'spawn' — we always use it,
-    # even on POSIX, so behavior is identical across platforms.
-    ctx = _mp.get_context("spawn")
-    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    # SELF-HEAL module-level TRUE_* from the sys-cache (defensive symmetry with
+    # the child's fresh import — kept for other code paths that read them).
+    global TRUE_COMPILE, TRUE_EXEC, TRUE_EVAL
+    cached_tc, cached_te, cached_tv = _load_true_builtins_from_sys()
+    if cached_tc is not None and cached_te is not None and cached_tv is not None:
+        TRUE_COMPILE, TRUE_EXEC, TRUE_EVAL = cached_tc, cached_te, cached_tv
+
+    # ── Payload serialisation (JSON + base64 for bytes fields) ─────────────
+    # The transport is JSON over stdin/stdout, so every seed value must survive
+    # a JSON round-trip. Three encoding strategies:
+    #
+    #   1. JSON-native values (int/float/str/bool/None/list/dict of those):
+    #      pass through unchanged.
+    #   2. `bytes`/`bytearray`: wrapped as `{"__b64__": "..."}`.
+    #   3. Anything else (classes like `Path`, modules like `pd`/`np`/`plt`,
+    #      DataFrames, arbitrary instances): pickled then base64-wrapped as
+    #      `{"__pickle__": "..."}` — the child unpacks the original object
+    #      via `pickle.loads`. This preserves the exact object contract
+    #      (module refs by reference via pickle's import machinery, classes
+    #      by qualified name, instances by state).
+    #
+    # `pickle.dumps` failure is impossible for values that would have crossed
+    # a `multiprocessing.Pipe` in the previous implementation — the only values
+    # it can't serialize are ones that were already unusable across a spawn
+    # boundary (local closures, open sockets, thread locks). We skip those with
+    # a warning rather than aborting the whole tool call.
+    import pickle as _pickle_for_payload
+
+    def _encode_seed_value(_v: Any) -> Any:
+        if isinstance(_v, (bytes, bytearray)):
+            return {"__b64__": _b64.b64encode(bytes(_v)).decode("ascii")}
+        if _v is None or isinstance(_v, (bool, int, float, str)):
+            return _v
+        # Small containers of primitives can also pass through for efficiency.
+        if isinstance(_v, (list, tuple)):
+            try:
+                return _json.loads(_json.dumps(list(_v)))
+            except (TypeError, ValueError):
+                pass
+        if isinstance(_v, dict):
+            try:
+                return _json.loads(_json.dumps(dict(_v)))
+            except (TypeError, ValueError):
+                pass
+        # Fallback: pickle + base64 for everything else (classes, modules,
+        # DataFrames, instances).
+        try:
+            blob = _pickle_for_payload.dumps(_v)
+            return {"__pickle__": _b64.b64encode(blob).decode("ascii")}
+        except Exception:
+            return None  # value skipped — surrogate sentinel; child treats as absent
+
+    seed_locals_safe: Dict[str, Any] = {}
+    for _k, _v in (seed_locals or {}).items():
+        _enc = _encode_seed_value(_v)
+        if _enc is not None or _v is None:
+            seed_locals_safe[_k] = _enc
 
     payload = {
         "source": source,
         "workspace_root": str(workspace_root),
         "profile": profile,
         "script_label": script_label,
-        "argv": argv or [script_label],
-        "seed_locals": seed_locals or {},
+        "argv": list(argv or [script_label]),
+        "seed_locals": seed_locals_safe,
         "persist_df_name": persist_df_name,
     }
+    config_blob = _json.dumps({
+        "sys_path": list(sys.path),
+        "payload": payload,
+    }).encode("utf-8")
 
-    proc = ctx.Process(
-        target=_sandbox_child_worker,
-        args=(child_conn, payload),
-        daemon=True,
-    )
-    proc.start()
-    child_conn.close()  # parent must close its child-end handle, or poll() blocks
+    # ── Launch the child as an isolated subprocess ─────────────────────────
+    # Using `subprocess.Popen` instead of `multiprocessing.Process` eliminates
+    # the entire `pickle.save_global` failure class: no module-identity check,
+    # no `sys.modules[__name__]` dependence, no reload sensitivity. The child
+    # imports `sandbox_kernel` freshly from disk — immune to any prior
+    # in-process module reload.
+    _creationflags = 0
+    if os.name == "nt":
+        # CREATE_NO_WINDOW: never flash a console window on Windows.
+        _creationflags = getattr(_sp, "CREATE_NO_WINDOW", 0)
 
-    envelope: Optional[Dict[str, Any]] = None
-    deadline = _time.monotonic() + hard_timeout
     try:
-        while True:
-            remaining = max(0.05, deadline - _time.monotonic())
-            if parent_conn.poll(remaining):
-                try:
-                    envelope = parent_conn.recv()
-                except EOFError:
-                    envelope = None
-                break
-            if not proc.is_alive():
-                # Child died before sending — try one final non-blocking read.
-                if parent_conn.poll(0):
-                    try:
-                        envelope = parent_conn.recv()
-                    except EOFError:
-                        envelope = None
-                break
-            if _time.monotonic() >= deadline:
-                proc.terminate()
-                proc.join(timeout=2.0)
-                return {
-                    "success": False,
-                    "stdout": "",
-                    "stderr": "",
-                    "traceback": (
-                        f"Sandboxed child exceeded {hard_timeout:.0f}s hard timeout "
-                        "and was terminated."
-                    ),
-                    "error_type": "TimeoutError",
-                    "sandbox_violation": False,
-                    "figures": [],
-                    "df_pickle": None,
-                    "scalars": {},
-                }
-    finally:
-        try:
-            parent_conn.close()
-        except Exception:
-            pass
-        try:
-            proc.join(timeout=2.0)
-        except Exception:
-            pass
-        if proc.is_alive():
-            proc.terminate()
-            try:
-                proc.join(timeout=2.0)
-            except Exception:
-                pass
-
-    if envelope is None:
+        proc = _sp.Popen(
+            [sys.executable, "-c", _CHILD_BOOTSTRAP_SOURCE],
+            stdin=_sp.PIPE,
+            stdout=_sp.PIPE,
+            stderr=_sp.PIPE,
+            cwd=os.getcwd(),
+            creationflags=_creationflags,
+        )
+    except Exception as exc:
         return {
-            "success": False,
-            "stdout": "",
-            "stderr": "",
+            "success": False, "stdout": "", "stderr": "",
+            "traceback": f"Failed to spawn sandboxed child: {exc}",
+            "error_type": type(exc).__name__,
+            "sandbox_violation": False,
+            "figures": [], "df_pickle": None, "scalars": {},
+        }
+
+    try:
+        stdout_data, stderr_data = proc.communicate(
+            input=config_blob, timeout=hard_timeout,
+        )
+    except _sp.TimeoutExpired:
+        try:
+            proc.kill()
+            proc.communicate(timeout=2.0)
+        except Exception:
+            pass
+        return {
+            "success": False, "stdout": "", "stderr": "",
+            "traceback": (
+                f"Sandboxed child exceeded {hard_timeout:.0f}s hard timeout "
+                "and was terminated."
+            ),
+            "error_type": "TimeoutError",
+            "sandbox_violation": False,
+            "figures": [], "df_pickle": None, "scalars": {},
+        }
+    except Exception as exc:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return {
+            "success": False, "stdout": "", "stderr": "",
+            "traceback": f"Failed to communicate with sandboxed child: {exc}",
+            "error_type": type(exc).__name__,
+            "sandbox_violation": False,
+            "figures": [], "df_pickle": None, "scalars": {},
+        }
+
+    # ── Decode the envelope ────────────────────────────────────────────────
+    raw_env = (stdout_data or b"").decode("utf-8", errors="replace").strip()
+    if not raw_env:
+        child_stderr = (stderr_data or b"").decode("utf-8", errors="replace")
+        return {
+            "success": False, "stdout": "", "stderr": child_stderr,
             "traceback": (
                 "Sandboxed child process exited without returning a payload. "
-                f"Exit code: {proc.exitcode}."
+                f"Exit code: {proc.returncode}.\n"
+                + (f"Child stderr:\n{child_stderr}" if child_stderr else "")
             ),
             "error_type": "ChildCrash",
             "sandbox_violation": False,
-            "figures": [],
-            "df_pickle": None,
-            "scalars": {},
+            "figures": [], "df_pickle": None, "scalars": {},
         }
+
+    try:
+        envelope: Dict[str, Any] = _json.loads(raw_env)
+    except Exception as exc:
+        child_stderr = (stderr_data or b"").decode("utf-8", errors="replace")
+        return {
+            "success": False, "stdout": "", "stderr": child_stderr,
+            "traceback": f"Sandboxed child returned malformed envelope: {exc}",
+            "error_type": "ProtocolError",
+            "sandbox_violation": False,
+            "figures": [], "df_pickle": None, "scalars": {},
+        }
+
+    # Decode byte fields shipped as base64 strings.
+    if envelope.get("df_pickle") and isinstance(envelope["df_pickle"], str):
+        try:
+            envelope["df_pickle"] = _b64.b64decode(envelope["df_pickle"])
+        except Exception:
+            envelope["df_pickle"] = None
+    figures_in = envelope.get("figures") or []
+    decoded_figures: List[bytes] = []
+    for f in figures_in:
+        if isinstance(f, str):
+            try:
+                decoded_figures.append(_b64.b64decode(f))
+            except Exception:
+                continue
+        elif isinstance(f, (bytes, bytearray)):
+            decoded_figures.append(bytes(f))
+    envelope["figures"] = decoded_figures
+
     return envelope
 
 
@@ -885,8 +1151,17 @@ class SandboxContext:
         # The four "true builtin" markers come from frozen sentinels whenever
         # available — this makes `_snapshot()` self-healing after any prior
         # leak of a blocking stub. Other attrs are safe to snapshot directly.
+        # `__import__` must NEVER be frozen as a gated sandbox stub. Recover a
+        # genuine importer if the current value is our own stub; otherwise the
+        # restore path could re-install the gate on the host process after exit
+        # (leak cause for `PicklingError: import of module ... failed`).
+        _snapshot_importer = builtins.__import__
+        if _is_block_stub(_snapshot_importer):
+            _recovered = _recover_import_builtin()
+            if _recovered is not None:
+                _snapshot_importer = _recovered
         self._originals = {
-            "builtins.__import__": builtins.__import__,
+            "builtins.__import__": _snapshot_importer,
             "builtins.eval": getattr(builtins, "__lollms_true_eval__", builtins.eval),
             "builtins.exec": getattr(builtins, "__lollms_true_exec__", builtins.exec),
             "builtins.compile": getattr(builtins, "__lollms_true_compile__", builtins.compile),
@@ -1147,18 +1422,79 @@ class SandboxContext:
 
         # Expose the filtered importer so callers can bind it into a reduced
         # builtins dict without re-entering the sandbox via `import builtins`.
+        # Mark it as a block stub so `_recover_import_builtin()` and
+        # `_snapshot()` can recognize a leaked one and restore the genuine
+        # importer — pickle's `save_global` uses `__import__` internally.
+        setattr(_filtered_import, _BLOCKED_STUB_MARKER, True)
+        setattr(_filtered_import_module, _BLOCKED_STUB_MARKER, True)
+        setattr(_filtered_reload, _BLOCKED_STUB_MARKER, True)
         self.filtered_import = _filtered_import
         builtins.__import__ = _filtered_import
         importlib.import_module = _filtered_import_module
         importlib.reload = _filtered_reload
 
-        # -------- dangerous builtins --------
-        # Each of eval/exec/compile gets its OWN marked stub so that a later
-        # `_capture_true_builtins()` (nested/re-import scenario) can identify
-        # and reject it rather than caching it as the true builtin.
-        builtins.eval = _make_block_stub()
-        builtins.exec = _make_block_stub()
-        builtins.compile = _make_block_stub()
+        # -------- dangerous builtins (frame-gated) --------
+        # eval/exec/compile must be blocked for USER-CODE frames but must NOT
+        # be blocked for the import machinery's own exec/compile calls. The
+        # import system relies on `builtins.exec` to execute module bytecode
+        # via `_call_with_frames_removed`; if we blunt-block it, re-importing
+        # ANY module (including `sandbox_kernel` itself during a live sandbox)
+        # explodes with a SandboxPermissionError — the exact module-load-order
+        # regression this class is designed to survive.
+        #
+        # The stubs delegate to the TRUE builtins whenever the immediate Python
+        # frame is NOT a `<execute_python*>` user frame. This mirrors the
+        # frame-gating philosophy already used by the path guards: sandbox the
+        # TOOL EXECUTION, not the whole process.
+        true_compile_orig = self._originals["builtins.compile"]
+        true_exec_orig = self._originals["builtins.exec"]
+        true_eval_orig = self._originals["builtins.eval"]
+
+        def _gated_compile(source, filename, mode, *a, **kw):
+            if _caller_is_user_code():
+                raise SandboxPermissionError(
+                    "🛑 BLOCKED BY SANDBOX: 'compile' is forbidden in user code."
+                )
+            return true_compile_orig(source, filename, mode, *a, **kw)
+
+        def _gated_exec(codestr, *a, **kw):
+            if _caller_is_user_code():
+                raise SandboxPermissionError(
+                    "🛑 BLOCKED BY SANDBOX: 'exec' is forbidden in user code."
+                )
+            return true_exec_orig(codestr, *a, **kw)
+
+        # `eval` MUST stay frame-gated, exactly like `exec`/`compile`. The
+        # CPython stdlib calls `eval` during normal module imports — most
+        # prominently `collections.namedtuple()`, which uses
+        # `eval(code, namespace)` to synthesize the tuple class. That path
+        # runs whenever pandas.util.version, enum, typing features, or any
+        # library using namedtuple is imported. Blocking eval unconditionally
+        # therefore breaks every `import pandas` in the sandbox — the exact
+        # regression that broke
+        # `test_allows_pandas_query_with_handler` and
+        # `test_headless_runs_without_operator_handler`.
+        #
+        # The frame gate keeps the security property that matters: user-code
+        # frames (filename in `_USER_FRAME_FILENAMES`) are always refused,
+        # while library-internal callers proceed. Attacker code that reaches
+        # `eval` through a user frame is blocked; stdlib internals that reach
+        # it during import are not — the same policy enforced for `exec` and
+        # `compile`.
+        def _gated_eval(expr, *a, **kw):
+            if _caller_is_user_code():
+                raise SandboxPermissionError(
+                    "🛑 BLOCKED BY SANDBOX: 'eval' is forbidden in user code."
+                )
+            return true_eval_orig(expr, *a, **kw)
+
+        # Mark them as block stubs so `_capture_true_builtins()` /
+        # `_recover_true_builtin()` NEVER cache them as "true".
+        for _fn in (_gated_compile, _gated_exec, _gated_eval):
+            setattr(_fn, _BLOCKED_STUB_MARKER, True)
+        builtins.compile = _gated_compile
+        builtins.exec = _gated_exec
+        builtins.eval = _gated_eval
 
         # -------- path-guarded open() --------
         # IMPORTANT: guard fires ONLY when the immediate Python caller is the

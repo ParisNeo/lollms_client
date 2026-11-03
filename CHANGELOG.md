@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-03 17:41]
+
+- fix(sandbox): resolve kernel evaluation and test issues
+
 ## [2026-11-03 15:30]
 
 - feat: add cognitive decisions and universal profiles support
