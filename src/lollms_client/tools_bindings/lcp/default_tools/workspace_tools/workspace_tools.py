@@ -4,6 +4,13 @@ import fnmatch
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
+# Windows reserved device names that can trigger special I/O behavior.
+_WIN_DEVICE_NAMES = {
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+}
+
 TOOL_LIBRARY_NAME = "Workspace Tools"
 TOOL_LIBRARY_DESC = "Tools for reading, writing, listing, finding, and grepping files in the agent's workspace."
 TOOL_LIBRARY_ICON = "📁"
@@ -32,13 +39,60 @@ def init_tools_library(config: dict = None) -> None:
     pass
 
 
+def _is_within_base(candidate: Path, base: Path) -> bool:
+    """Case-aware containment check that matches the host filesystem semantics."""
+    try:
+        candidate.relative_to(base)
+        return True
+    except ValueError:
+        # On case-insensitive filesystems (Windows, macOS default) perform a
+        # normalized comparison so that differing casing of the workspace root
+        # is not incorrectly rejected.
+        if os.name == "nt" or (hasattr(os, "uname") and os.uname().sysname == "Darwin"):
+            cand_parts = [p.lower() for p in candidate.parts]
+            base_parts = [p.lower() for p in base.parts]
+            if len(cand_parts) >= len(base_parts):
+                return cand_parts[: len(base_parts)] == base_parts
+        return False
+
+
+def _assert_within_base(candidate: Path, base: Path, original: str) -> None:
+    """Raises PermissionError when candidate escapes base. Used as defense in depth."""
+    if not _is_within_base(candidate, base):
+        raise PermissionError(
+            f"Path traversal detected: '{original}' attempts to escape workspace."
+        )
+
+
+def _reject_dangerous_names(file_name: str) -> None:
+    """Rejects embedded NULs, control characters, and Windows device names."""
+    if "\x00" in file_name:
+        raise PermissionError("Rejected file name: null byte.")
+    stripped = file_name.strip()
+    if not stripped:
+        return
+    # Reject pure Windows device names (e.g. "CON", "NUL", "COM1") at the leaf level.
+    leaf = stripped.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    leaf_stem = leaf.split(".")[0].lower() if leaf else ""
+    if leaf_stem in _WIN_DEVICE_NAMES:
+        raise PermissionError(f"Rejected file name: reserved device name '{leaf}'.")
+
+
 def _resolve_safe_path(file_name: str) -> Path:
     """
     Sanitizes the file name and resolves it safely within the current working directory.
-    Prevents path traversal attacks (e.g., ../../etc/passwd).
+    Blocks path traversal attacks (e.g., ../../etc/passwd, symlinks escaping the workspace,
+    Windows device names, embedded NUL bytes).
     """
     base_path = Path.cwd().resolve()
-    
+
+    if file_name is None:
+        raise PermissionError("Rejected file name: None.")
+    if not isinstance(file_name, str):
+        raise PermissionError(f"Rejected file name: expected str, got {type(file_name).__name__}.")
+
+    _reject_dangerous_names(file_name)
+
     if not file_name or file_name.strip() in (".", "./", ".\\"):
         return base_path
 
@@ -46,22 +100,24 @@ def _resolve_safe_path(file_name: str) -> Path:
     if raw_path.is_absolute():
         try:
             target_path = raw_path.resolve()
-            target_path.relative_to(base_path)
-            return target_path
-        except ValueError:
-            raise PermissionError(f"Path traversal detected: '{file_name}' attempts to escape workspace.")
+        except (OSError, RuntimeError) as exc:
+            raise PermissionError(f"Could not resolve path '{file_name}': {exc}")
+        _assert_within_base(target_path, base_path, file_name)
+        return target_path
+
+    # Reject home-directory expansion attempts at the leaf: agents should pass
+    # workspace-relative paths, never `~/...`.
+    if raw_path.parts and raw_path.parts[0] == "~":
+        raise PermissionError(f"Path traversal detected: '{file_name}' uses home expansion.")
 
     clean_name = file_name.replace("\\", "/")
+    # Strip Windows drive prefix like "C:file" (relative drive form).
     if len(clean_name) > 1 and clean_name[1] == ":":
         clean_name = clean_name[2:]
     clean_name = clean_name.lstrip("/")
-    
+
     target_path = (base_path / clean_name).resolve()
-    try:
-        target_path.relative_to(base_path)
-    except ValueError:
-        raise PermissionError(f"Path traversal detected: '{file_name}' attempts to escape workspace.")
-        
+    _assert_within_base(target_path, base_path, file_name)
     return target_path
 
 
@@ -76,6 +132,8 @@ def tool_write_file(file_name: str, content: str) -> Dict[str, Any]:
     try:
         target_path = _resolve_safe_path(file_name)
         target_path.parent.mkdir(parents=True, exist_ok=True)
+        # Re-verify containment after parent creation (defense in depth).
+        _assert_within_base(target_path.resolve(), Path.cwd().resolve(), file_name)
         target_path.write_text(content, encoding="utf-8")
         return {"success": True, "output": f"File '{file_name}' written successfully."}
     except PermissionError as pe:
@@ -98,6 +156,10 @@ def tool_read_file(file_name: str) -> Dict[str, Any]:
             return {"success": False, "error": f"File '{file_name}' not found."}
         if not target_path.is_file():
             return {"success": False, "error": f"Path '{file_name}' is not a file."}
+
+        # Re-verify containment after resolution (defense in depth against TOCTOU
+        # and symlink swaps between _resolve_safe_path and this read).
+        _assert_within_base(target_path.resolve(), Path.cwd().resolve(), file_name)
 
         ext = target_path.suffix.lower()
         if ext in _GREP_BINARY_EXTS:
@@ -152,16 +214,19 @@ def tool_list_files(directory: str = ".", recursive: bool = False) -> Dict[str, 
             return {"success": True, "files": entries, "output": output_str}
 
         base_path = Path.cwd().resolve()
-        for root, dirs, files in os.walk(target_path):
+        for root, dirs, files in os.walk(target_path, followlinks=False):
             dirs[:] = [d for d in dirs if d not in _IGNORED_DIRS and not d.startswith(".")]
             for filename in files:
                 if Path(filename).suffix.lower() in _COMPILED_EXTS or filename.startswith("."):
                     continue
                 try:
-                    rel_path = Path(root, filename).resolve().relative_to(base_path)
+                    resolved = Path(root, filename).resolve()
+                    if not _is_within_base(resolved, base_path):
+                        continue
+                    rel_path = resolved.relative_to(base_path)
                     entries.append(str(rel_path).replace("\\", "/"))
-                except ValueError:
-                    entries.append(filename)
+                except (ValueError, OSError):
+                    continue
 
         entries.sort()
         output_str = "\n".join(entries) if entries else "Directory is empty."
@@ -196,15 +261,18 @@ def tool_find_files(pattern: str, path: str = ".", max_results: int = 50) -> Dic
 
         base_path = Path.cwd().resolve()
         matches: List[str] = []
-        for root, dirs, files in os.walk(search_dir):
+        for root, dirs, files in os.walk(search_dir, followlinks=False):
             dirs[:] = [d for d in dirs if d not in _IGNORED_DIRS and not d.startswith('.')]
 
             for filename in files:
                 if fnmatch.fnmatch(filename, pattern):
                     try:
-                        rel_path = os.path.relpath(os.path.join(root, filename), str(base_path))
+                        resolved = Path(root, filename).resolve()
+                        if not _is_within_base(resolved, base_path):
+                            continue
+                        rel_path = os.path.relpath(str(resolved), str(base_path))
                         matches.append(rel_path.replace("\\", "/"))
-                    except ValueError:
+                    except (ValueError, OSError):
                         pass
 
             if len(matches) >= max_results:
@@ -310,6 +378,92 @@ def tool_grep_files(
         else:
             return {"success": False, "error": f"Invalid search_mode: '{search_mode}'. Must be 'exact', 'case_sensitive', 'case_insensitive', 'fuzzy', or 'words'."}
 
+        for root_str, dirs, filenames in os.walk(cwd, followlinks=False):
+            # Prune ignored / hidden directories at the top of each walk.
+            dirs[:] = [d for d in dirs if d not in _IGNORED_DIRS and not d.startswith(".")]
+
+            root_path = Path(root_str)
+            for filename in filenames:
+                file_path = root_path / filename
+
+                if file_path.suffix.lower() in _GREP_BINARY_EXTS:
+                    continue
+
+                if file_extension and file_extension != "*":
+                    if not file_path.name.lower().endswith(file_extension.lower()):
+                        continue
+
+                # Defense in depth: verify the resolved path stays inside the
+                # workspace (blocks symlink-planted escape attempts).
+                try:
+                    resolved = file_path.resolve()
+                except (OSError, RuntimeError):
+                    continue
+                if not _is_within_base(resolved, cwd):
+                    continue
+                if not resolved.is_file():
+                    continue
+
+                files_scanned += 1
+                try:
+                    with open(resolved, 'r', encoding='utf-8', errors='ignore') as f:
+                        for line_num, line in enumerate(f, 1):
+                            match = regex.search(line)
+                            if match:
+                                score = 1.0
+                                if use_fuzzy_scoring:
+                                    score = _calculate_fuzzy_score(line, keywords)
+                                    if mode == "words" and score < 1.0:
+                                        continue
+
+                                try:
+                                    rel = resolved.relative_to(cwd)
+                                except ValueError:
+                                    continue
+                                results.append({
+                                    "file": str(rel).replace("\\", "/"),
+                                    "line_number": line_num,
+                                    "text": line.strip()[:500],
+                                    "score": round(score, 4)
+                                })
+                                if len(results) >= max_results * 2:
+                                    break
+                except Exception:
+                    continue
+
+                if len(results) >= max_results * 2:
+                    break
+
+            if len(results) >= max_results * 2:
+                break
+
+        if False:  # unreachable placeholder to preserve indentation history
+            pass
+        if sort_by_relevance and use_fuzzy_scoring:
+            results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+
+        final_results = results[:max_results]
+
+        output_text = f"Found {len(final_results)} match(es) for pattern '{pattern}' (mode: {mode}) across {files_scanned} file(s).\n\n"
+        for res in final_results:
+            score_str = f" (Score: {res['score']:.2f})" if use_fuzzy_scoring else ""
+            output_text += f"[{res['file']}:{res['line_number']}]{score_str} {res['text']}\n"
+
+        return {
+            "success": True,
+            "matches_count": len(final_results),
+            "files_scanned": files_scanned,
+            "results": final_results,
+            "output": output_text
+        }
+
+    except re.error as re_err:
+        return {"success": False, "error": f"Invalid regex pattern: {re_err}"}
+    except Exception as e:
+        return {"success": False, "error": f"An unexpected error occurred during grep: {str(e)}"}
+
+    # Legacy block below is intentionally left unreachable; kept only for review.
+    if False:
         for file_path in cwd.rglob("*"):
             if not file_path.is_file():
                 continue

@@ -19,28 +19,67 @@ from ascii_colors import ASCIIColors, trace_exception
 BindingName = "LCPBinding"
 
 # ── OFFICE-FAMILY LIBRARY GATE (fail-closed) ──
-# These library stems are office-family: without an explicit session flag they
-# are EXCLUDED from discovery/mounting. This prevents office toolsets from
-# auto-appearing in every session (the as_is leak class).
+# Per-software toolsets: without their explicit session flag they are EXCLUDED
+# from discovery/mounting. This prevents office toolsets from auto-appearing in
+# every session (the as_is leak class).
 _OFFICE_LIBRARY_STEMS = frozenset({
-    "as_is_document_tools", "document_editor",
     "pptx_builder", "docx_mastery", "pptx_mastery", "xlsx_mastery",
     "powerpoint_tools", "word_tools", "excel_tools",
+    # PDF toolset — same explicit-flag gating contract as the OOXML toolsets.
+    # Registration in both this set and _PER_SOFTWARE_GATES means the mount
+    # is refused unless enable_pdf is delivered via set_session_flags().
+    "pdf_tools",
 })
 # Per-software stems gate on their OWN flag only (fail-closed when absent).
 _PER_SOFTWARE_GATES = {
     "powerpoint_tools": ("enable_powerpoint",),
     "word_tools": ("enable_word",),
     "excel_tools": ("enable_excel",),
+    # PDF toolkit — same fail-closed per-software contract as the OOXML toolsets.
+    # The chat layer drives enable_pdf from the explicit chat flag AND from
+    # file-type auto-detection (.pdf found in workspace/artefacts).
+    "pdf_tools": ("enable_pdf",),
 }
+
+# ── DOCUMENT-FAMILY LIBRARY GATE (file-type aware) ──
+# Document-family toolsets (as_is_document_tools, document_editor) are admitted
+# based on which file types are ACTUALLY PRESENT in the workspace. Dropping a
+# PDF into the workspace mounts the PDF-capable document toolset automatically —
+# no enable_office_files flag required. The library declares the extensions it
+# handles via a module-level attribute:
+#
+#     TOOL_LIBRARY_FILE_TYPES = [".pdf", ".docx", ".xlsx", ".pptx"]
+#
+# When a stem in this family declares file types AND at least one of those
+# extensions is found in the workspace, it is admitted. When a stem in this
+# family does NOT declare file types, it falls back to the legacy office gate
+# (enable_office_files), preserving backward compatibility.
+_DOCUMENT_LIBRARY_STEMS = frozenset({
+    "as_is_document_tools", "document_editor",
+    # `pdf_tools` shares the file-type gate: declares TOOL_LIBRARY_FILE_TYPES
+    # = [".pdf"] in step 2 and is admitted only when a PDF is present (or
+    # enable_pdf / enable_office_files are set).
+    "pdf_tools",
+    # `classic_document_tools` (step 2) declares the classic text extensions
+    # (.txt/.md/.py/.js/... etc.) and auto-mounts when any is present. No flag
+    # is required — file presence is the entire admission criterion.
+    "classic_document_tools",
+})
+
+# Directory names skipped while scanning the workspace for file-type detection.
+_SKIP_SCAN_DIRS = frozenset({
+    ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv",
+    "venv", ".mypy_cache", ".pytest_cache", "dist", "build", ".tox",
+})
+# Ceiling on how deep the workspace scan goes (safety for very large trees).
+_WORKSPACE_SCAN_MAX_DEPTH = 4
 
 
 def _office_library_admitted(stem: str, session_flags: Optional[Dict[str, Any]]) -> bool:
-    """Resolves office-family admission for a library stem against session flags.
+    """Resolves office-family admission for a per-software library stem.
 
     Per-software stems (powerpoint_tools/word_tools/excel_tools) require their
-    own flag. Legacy office stems are admitted when ANY office-family flag is
-    truthy. Unknown/missing flags are fail-closed (excluded).
+    own flag. Unknown/missing flags are fail-closed (excluded).
     """
     if stem not in _OFFICE_LIBRARY_STEMS:
         return True
@@ -52,6 +91,41 @@ def _office_library_admitted(stem: str, session_flags: Optional[Dict[str, Any]])
         bool(flags.get(g)) for gates in _PER_SOFTWARE_GATES.values() for g in gates
     )
     return office_enabled
+
+
+def _document_library_admitted(
+    stem: str,
+    session_flags: Optional[Dict[str, Any]],
+    workspace_file_types: Optional[Any],
+    declared_file_types: Optional[List[str]],
+) -> bool:
+    """Resolves document-family admission for a library stem.
+
+    Admission rules (any one suffices):
+      1. `enable_office_files` is truthy (backward-compat escape hatch).
+      2. The library declares `TOOL_LIBRARY_FILE_TYPES` AND at least one of
+         those extensions is present in the workspace.
+
+    When the library does not declare any file types, this falls back to the
+    legacy office gate so existing behaviour is preserved.
+    """
+    if stem not in _DOCUMENT_LIBRARY_STEMS:
+        return True
+
+    flags = session_flags if isinstance(session_flags, dict) else {}
+    if bool(flags.get("enable_office_files")):
+        return True
+
+    declared = {
+        f".{str(t).lower().lstrip('.')}"
+        for t in (declared_file_types or [])
+        if t
+    }
+    if not declared:
+        return _office_library_admitted(stem, session_flags)
+
+    present = {str(t).lower() for t in (workspace_file_types or set())}
+    return bool(declared & present)
 
 
 class LCPBinding(LollmsToolBinding):
@@ -103,18 +177,43 @@ sub-attributes must be feature-checked for None.
         self._load_flag_kwargs: Dict[str, Any] = kwargs
 
         # Session flags (set by the host chat layer via set_session_flags).
-        # Office-family libraries are gated against these; absent flags are
-        # fail-closed.
+        # Office-family and document-family libraries are gated against these;
+        # absent flags are fail-closed.
         self.session_flags: Dict[str, Any] = {}
+
+        # Workspace folders used for file-type detection. Document-family
+        # toolsets mount themselves when a matching file is found (e.g.
+        # as_is_document_tools auto-loads when a .pdf exists). Defaults to CWD,
+        # overridable via `workspace_paths` / `workspace_path` kwargs.
+        self.workspace_paths: List[Path] = self._resolve_workspace_paths(kwargs)
+
+        # Cached set of lowercase extensions (".pdf", ".docx", ...) detected
+        # in the workspace. Populated eagerly here and refreshed on every
+        # set_session_flags() call.
+        self._workspace_file_types: set = set()
+        self._refresh_workspace_file_types()
 
         self.discovered_tools: List[Dict[str, Any]] = []
         self._dynamic_tool_modules: Dict[str, types.ModuleType] = {}
         self._discover_local_tools()
 
     def set_session_flags(self, flags: Optional[Dict[str, Any]]) -> None:
-        """Registers session feature flags and re-runs discovery so office-family
-        libraries are admitted/excluded per the new flag state."""
+        """Registers session feature flags and re-runs discovery so office- and
+        document-family libraries are admitted/excluded per the new flag state.
+
+        The workspace is re-scanned first because document-family admission is
+        driven by file presence (e.g. a .pdf in the workspace auto-mounts the
+        PDF-capable document toolset).
+        """
         self.session_flags = dict(flags) if isinstance(flags, dict) else {}
+        self._refresh_workspace_file_types()
+        self._discover_local_tools()
+
+    def refresh_workspace_file_types(self) -> None:
+        """Public hook: re-scans the workspace and re-runs discovery so newly
+        added/removed files trigger mount/unmount of document-family toolsets
+        without requiring a flag change."""
+        self._refresh_workspace_file_types()
         self._discover_local_tools()
 
     @property
@@ -326,6 +425,101 @@ sub-attributes must be feature-checked for None.
         )
         return match.group(1) if match else None
 
+    def _read_library_file_types(self, py_file: Path) -> List[str]:
+        """Returns the extensions a library declares via TOOL_LIBRARY_FILE_TYPES.
+
+        Example declaration inside a library module:
+
+            TOOL_LIBRARY_FILE_TYPES = [".pdf", ".docx"]
+
+        Returns an empty list when the library is not file-type-gated.
+        """
+        try:
+            code_text = py_file.read_text(encoding="utf-8")
+        except Exception:
+            return []
+        match = re.search(
+            r'^TOOL_LIBRARY_FILE_TYPES\s*=\s*([\[\(].*?[\]\)])',
+            code_text,
+            re.MULTILINE | re.DOTALL,
+        )
+        if not match:
+            return []
+        return [ext.lower() for ext in re.findall(r'["\']([^"\']+)["\']', match.group(1))]
+
+    def _resolve_workspace_paths(self, kwargs: Dict[str, Any]) -> List[Path]:
+        """Resolves the folders to scan for workspace file-type detection."""
+        raw = kwargs.get("workspace_paths") or kwargs.get("workspace_path")
+        candidates: List[Path] = []
+        if isinstance(raw, (str, Path)):
+            candidates.append(Path(raw))
+        elif isinstance(raw, (list, tuple)):
+            for entry in raw:
+                try:
+                    candidates.append(Path(entry))
+                except Exception:
+                    continue
+        if not candidates:
+            candidates.append(Path.cwd())
+        return [p.resolve() for p in candidates if p.exists() and p.is_dir()]
+
+    def _refresh_workspace_file_types(self) -> None:
+        """(Re-)populates `_workspace_file_types` by scanning workspace folders.
+
+        Bounded by depth and VCS/cache-directory exclusions so huge trees do
+        not slow down discovery.
+        """
+        detected: set = set()
+        for root in self.workspace_paths:
+            try:
+                self._scan_workspace_for_file_types(root, depth=0, detected=detected)
+            except Exception:
+                continue
+        self._workspace_file_types = detected
+
+    def _scan_workspace_for_file_types(self, folder: Path, depth: int, detected: set) -> None:
+        """Recursive helper for `_refresh_workspace_file_types`. Never raises."""
+        if depth > _WORKSPACE_SCAN_MAX_DEPTH:
+            return
+        try:
+            for entry in folder.iterdir():
+                try:
+                    if entry.is_dir():
+                        if entry.name in _SKIP_SCAN_DIRS or entry.name.startswith("."):
+                            continue
+                        self._scan_workspace_for_file_types(entry, depth + 1, detected)
+                    elif entry.is_file() and entry.suffix:
+                        detected.add(entry.suffix.lower())
+                except OSError:
+                    continue
+        except OSError:
+            return
+
+    def _is_library_admitted(self, py_file: Path) -> bool:
+        """Combines office- and document-family admission for a single library
+        file. Returns True when the library may be loaded/mounted."""
+        stem = py_file.stem
+
+        if not _office_library_admitted(stem, self.session_flags):
+            if stem in _OFFICE_LIBRARY_STEMS:
+                ASCIIColors.debug(
+                    f"[LCP] Library '{stem}' skipped: office session flag not enabled."
+                )
+            return False
+
+        if stem in _DOCUMENT_LIBRARY_STEMS:
+            declared = self._read_library_file_types(py_file)
+            if not _document_library_admitted(
+                stem, self.session_flags, self._workspace_file_types, declared
+            ):
+                ASCIIColors.debug(
+                    f"[LCP] Library '{stem}' skipped: no matching workspace "
+                    f"file type (declared={declared}, "
+                    f"detected={sorted(self._workspace_file_types)})."
+                )
+                return False
+        return True
+
     @staticmethod
     def _normalize_name(raw: str) -> str:
         normalized = re.sub(r"[\s\-]+", "_", (raw or "").strip().lower())
@@ -431,12 +625,11 @@ sub-attributes must be feature-checked for None.
     def _load_tool_file(self, py_file: Path) -> int:
         file_stem = py_file.stem
 
-        # ── OFFICE-FAMILY SESSION GATE (fail-closed) ──
-        # Office libraries are excluded unless their session flag is set.
-        if not _office_library_admitted(file_stem, self.session_flags):
-            ASCIIColors.debug(
-                f"[LCP] Library '{file_stem}' skipped: office-family session flag not enabled."
-            )
+        # ── OFFICE + DOCUMENT SESSION GATE (fail-closed) ──
+        # Office per-software toolsets require their own flag. Document-family
+        # toolsets are admitted when their declared file types are present in
+        # the workspace (see _document_library_admitted).
+        if not self._is_library_admitted(py_file):
             return 0
 
         if not self._is_library_permitted(py_file):
@@ -608,12 +801,16 @@ sub-attributes must be feature-checked for None.
 
     def mount_tool_library(self, library_name: str) -> bool:
         resolved_name = self._resolve_library_name(library_name)
-        if resolved_name and not _office_library_admitted(resolved_name, self.session_flags):
-            ASCIIColors.warning(
-                f"[LCP Mount] Library '{library_name}' is office-family gated and its "
-                "session flag is not enabled. Mount refused (fail-closed)."
-            )
-            return False
+        _gate_dir = self._find_library_dir(resolved_name or library_name)
+        if _gate_dir and _gate_dir.is_dir():
+            _gate_py = _gate_dir / f"{_gate_dir.name}.py"
+            if _gate_py.exists() and not self._is_library_admitted(_gate_py):
+                ASCIIColors.warning(
+                    f"[LCP Mount] Library '{library_name}' is gated and its "
+                    "session flag/file-type trigger is not satisfied. "
+                    "Mount refused (fail-closed)."
+                )
+                return False
         if resolved_name and resolved_name != library_name.strip():
             ASCIIColors.info(f"[LCP Mount] Resolving toolkit '{library_name}' -> '{resolved_name}'.")
         lib_path = self._find_library_dir(resolved_name or library_name)

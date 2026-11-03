@@ -3306,6 +3306,19 @@ class ArtefactManager:
             return f'<{tag_name} {match.group(1)}>\n[content stripped, refer to the artefact for details]\n</{tag_name}>'
 
         cleaned = artefact_pattern.sub(handle_artefact, cleaned)
+
+        # ── ORPHAN CLOSING-TAG GUARD ─────────────────────────────────────
+        # If the model emitted a closing tag without a matched opening tag
+        # (streaming split, malformed tag, or a scratchpad body that happens
+        # to contain the literal text `</artefact`), strip the orphan closer
+        # so it can never leak to the user-visible surface.
+        orphan_close_re = re.compile(r'</art[ei]fact\s*>', re.IGNORECASE)
+        if orphan_close_re.search(cleaned):
+            ASCIIColors.warning(
+                "[ArtefactManager] Stripping orphan artefact closing tag leaked to surface."
+            )
+            cleaned = orphan_close_re.sub('', cleaned)
+
         revert_pattern = re.compile(r'^[ \t]*<revert_art[ei]fact\s([^>]+)/?>', re.IGNORECASE | re.MULTILINE)
 
         def handle_revert(match: re.Match) -> str:

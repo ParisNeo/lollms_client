@@ -4615,6 +4615,165 @@ class ChatMixin:
 
     _WORKSPACE_SCAN_CACHE_KEY = "_workspace_scan_cache"
 
+    # ── 🔎 AUTO-DETECTION: TURN-LEVEL TOOLSET ADMISSION ──
+    # Extension → tool-library feed. The chat layer inspects the discussion
+    # workspace (physical files) plus artefacts (in-memory titles) and drives
+    # the LCP binding's session-flag / file-type gates from what is ACTUALLY
+    # present. This is the single source of truth for auto-admitting toolsets
+    # when the user activates them implicitly by dropping a file in the
+    # workspace. Explicit enable_* flags remain sovereign overrides.
+    _OFFICE_EXT_TO_LIBRARY = {
+        ".pptx": ("powerpoint_tools", "enable_powerpoint"),
+        ".pptm": ("powerpoint_tools", "enable_powerpoint"),
+        ".docx": ("word_tools", "enable_word"),
+        ".docm": ("word_tools", "enable_word"),
+        ".xlsx": ("excel_tools", "enable_excel"),
+        ".xlsm": ("excel_tools", "enable_excel"),
+        ".pdf": ("pdf_tools", "enable_pdf"),
+    }
+
+    # Classic text-family extensions that auto-admit the (step-2) unified
+    # classic document toolset. Kept narrow on purpose: only text formats
+    # that the classic read/write/grep tools can actually handle byte-for-byte.
+    _CLASSIC_DOC_EXTENSIONS = frozenset({
+        ".txt", ".md", ".markdown", ".rst",
+        ".json", ".jsonl", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
+        ".xml", ".html", ".htm", ".xhtml", ".svg",
+        ".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs",
+        ".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".hh",
+        ".cs", ".java", ".kt", ".go", ".rs", ".rb", ".php", ".swift",
+        ".sh", ".bash", ".zsh", ".ps1", ".bat", ".cmd",
+        ".sql", ".graphql", ".gql",
+        ".css", ".scss", ".sass", ".less",
+        ".tex", ".bib",
+        ".csv", ".tsv",
+        ".log", ".env",
+    })
+
+    def _collect_turn_file_types(self, workspace_dir: Path) -> set:
+        """Collects every file extension this turn will be asked to handle.
+
+        Unions:
+          1. Physical files discovered by the cached workspace scan
+             (respects `_workspace_write_revision` invalidation, so it is O(1)
+             on repeated calls within the same turn).
+          2. Artefact titles registered in the DB (files that may live only in
+             the artefact store or in a versioned twin on disk).
+
+        Returns a lowercase, dotted extension set: {".pdf", ".docx", ...}.
+        Extensions with no suffix are excluded.
+        """
+        detected: set = set()
+
+        try:
+            all_files, _, _ = self._cached_workspace_file_scan(workspace_dir)
+            for f in all_files:
+                try:
+                    if f.is_file() and f.suffix:
+                        detected.add(f.suffix.lower())
+                except OSError:
+                    continue
+        except Exception:
+            pass
+
+        art_manager = getattr(self, "artefacts", None)
+        if art_manager is not None:
+            raw_arts: List[Dict[str, Any]] = []
+            try:
+                if hasattr(art_manager, "_get_all_raw"):
+                    raw_arts = list(art_manager._get_all_raw() or [])
+                elif hasattr(art_manager, "discover"):
+                    raw_arts = list(art_manager.discover() or [])
+            except Exception:
+                raw_arts = []
+            for art in raw_arts:
+                title = (art.get("title") or "") if isinstance(art, dict) else ""
+                if not title:
+                    continue
+                try:
+                    suffix = Path(title).suffix.lower()
+                except Exception:
+                    suffix = ""
+                if suffix:
+                    detected.add(suffix)
+
+        return detected
+
+    def _resolve_toolset_admission(
+        self,
+        workspace_dir: Path,
+        enable_powerpoint: bool,
+        enable_word: bool,
+        enable_excel: bool,
+        enable_pdf: bool,
+        enable_office_files: bool,
+    ) -> Dict[str, Any]:
+        """Merges explicit flags with file-type auto-detection into one plan.
+
+        Returns a dict the chat layer and the LCP binding both consume:
+
+          • session_flags: full flag dict to deliver via set_session_flags().
+          • workspace_file_types: detected extensions for file-type gates.
+          • office_requests: ordered, de-duplicated list of
+              (library_stem, enable_flag_name, admission_set_name)
+            to mount unconditionally this turn. Explicit flags and
+            file-type detection both feed this list.
+          • classic_doc_needed: True when any classic text extension is
+            present (feeds the classic document toolset in step 2).
+
+        Precedence: an explicit flag is always on; auto-detection can only
+        ADD libraries — never remove ones activated by a flag.
+        """
+        detected = self._collect_turn_file_types(workspace_dir)
+
+        explicit_flag_state: Dict[str, bool] = {
+            "enable_powerpoint": bool(enable_powerpoint),
+            "enable_word": bool(enable_word),
+            "enable_excel": bool(enable_excel),
+            "enable_pdf": bool(enable_pdf),
+            "enable_office_files": bool(enable_office_files),
+        }
+
+        office_requests: Dict[str, str] = {}
+        if enable_powerpoint:
+            office_requests["powerpoint_tools"] = "enable_powerpoint"
+        if enable_word:
+            office_requests["word_tools"] = "enable_word"
+        if enable_excel:
+            office_requests["excel_tools"] = "enable_excel"
+        if enable_pdf:
+            office_requests["pdf_tools"] = "enable_pdf"
+
+        auto_admitted: List[str] = []
+        for ext, (library_stem, flag_name) in self._OFFICE_EXT_TO_LIBRARY.items():
+            if ext in detected and library_stem not in office_requests:
+                office_requests[library_stem] = flag_name
+                auto_admitted.append(library_stem)
+
+        classic_doc_needed = bool(self._CLASSIC_DOC_EXTENSIONS & detected)
+
+        session_flags = dict(explicit_flag_state)
+        for library_stem, flag_name in office_requests.items():
+            session_flags[flag_name] = True
+
+        if auto_admitted:
+            _dbg(
+                f"[ChatMixin] File-type auto-admission: {sorted(auto_admitted)} "
+                f"(detected={sorted(detected)})"
+            )
+        if classic_doc_needed:
+            _dbg(
+                "[ChatMixin] Classic document extensions present — classic doc "
+                "toolset will be requested (step 2 implementation)."
+            )
+
+        return {
+            "session_flags": session_flags,
+            "workspace_file_types": detected,
+            "office_requests": list(office_requests.items()),
+            "classic_doc_needed": classic_doc_needed,
+        }
+
     def _cached_workspace_file_scan(self, workspace_dir: Path):
         """
         Cached workspace file classification.
@@ -5526,6 +5685,8 @@ class ChatMixin:
         enable_powerpoint: bool = False,
         enable_word: bool = False,
         enable_excel: bool = False,
+        enable_pdf: bool = False,
+        enable_office_files: bool = False,
         allow_computer_use: Optional[bool] = None,
         **kwargs: Any,
     ) -> Dict[str, Dict[str, Any]]:
@@ -5672,24 +5833,42 @@ class ChatMixin:
             if enable_code_execution:
                 lcp_binding.mount_tool_library_if_absent("execute_python")
 
-            # ── 1b. OFFICE FAMILY SESSION FLAGS (FAIL-CLOSED GATE) ──
-            # The LCP binding's office-family gate reads self.session_flags
-            # (populated via set_session_flags), NOT host_tool_configs.
-            # Deliver the per-software flags through the real mechanism so
-            # mount_tool_library_if_absent succeeds when chat() requests the
-            # mount later. Fail-closed is preserved: absent flags still refuse.
-            if enable_powerpoint or enable_word or enable_excel:
-                if hasattr(lcp_binding, "set_session_flags"):
-                    lcp_binding.set_session_flags({
-                        "enable_powerpoint": enable_powerpoint,
-                        "enable_word": enable_word,
-                        "enable_excel": enable_excel,
-                    })
-                else:
-                    ASCIIColors.warning(
-                        "[ChatMixin] LCP binding lacks set_session_flags(); "
-                        "office-family mounts will be refused (fail-closed)."
+            # ── 1b. TOOLSET ADMISSION (EXPLICIT FLAGS + FILE-TYPE AUTO-DETECT) ──
+            # Delegates the whole decision to _resolve_toolset_admission(), which
+            # unions explicit enable_* flags with detected workspace/artefact
+            # extensions. The resulting session_flags dict is delivered to the
+            # LCP binding so its fail-closed gate admits every library we plan
+            # to mount later this turn.
+            _admission_plan = self._resolve_toolset_admission(
+                workspace_dir=workspace_dir,
+                enable_powerpoint=enable_powerpoint,
+                enable_word=enable_word,
+                enable_excel=enable_excel,
+                enable_pdf=enable_pdf,
+                enable_office_files=enable_office_files,
+            )
+            object.__setattr__(self, "_turn_toolset_admission", _admission_plan)
+
+            # Feed the binding the exact file-type set we computed so the
+            # document-family gate agrees with our decision (avoids divergent
+            # scans between the chat layer and the binding).
+            if hasattr(lcp_binding, "_workspace_file_types"):
+                try:
+                    lcp_binding._workspace_file_types = set(
+                        _admission_plan["workspace_file_types"]
                     )
+                except Exception:
+                    pass
+
+            if hasattr(lcp_binding, "set_session_flags"):
+                lcp_binding.set_session_flags(_admission_plan["session_flags"])
+            elif any(
+                enable_powerpoint, enable_word, enable_excel, enable_pdf
+            ):
+                ASCIIColors.warning(
+                    "[ChatMixin] LCP binding lacks set_session_flags(); "
+                    "office/pdf-family mounts will be refused (fail-closed)."
+                )
 
             # ── 2. CONTEXTUAL MOUNTING: ONLY WHEN MATCHING FILES EXIST ──
             if enable_data_tools and has_data_files:
@@ -5802,6 +5981,8 @@ class ChatMixin:
         enable_powerpoint:            bool = False,
         enable_word:                  bool = False,
         enable_excel:                 bool = False,
+        enable_pdf:                   bool = False,
+        enable_office_files:          bool = False,
         enable_artefacts:             bool = True,
         enable_memory:                bool = False,
         enable_episodic_memory:       bool = False,  # 🆕 NEW: Control episodic memory saving
@@ -5902,6 +6083,16 @@ class ChatMixin:
                 .xlsx/.xlsm workbooks via sandboxed openpyxl recipe code. Computed
                 values MUST be formulas (SUM/AVERAGE/IF/VLOOKUP...), never manual
                 results. Default False.
+            enable_pdf (bool): Mount the PDF toolset — read, inspect and annotate
+                PDF documents. When False the toolset still auto-admits if a
+                .pdf file is present in the workspace or in the discussion's
+                artefacts (file-type auto-detection). Default False.
+            enable_office_files (bool): Legacy umbrella flag for the office
+                document family (as_is_document_tools / document_editor). Kept
+                for backward compatibility; individual per-software flags
+                (enable_powerpoint / enable_word / enable_excel / enable_pdf)
+                are preferred and are auto-admitted by file presence. Default
+                False.
             event_mode (EventMode): Event reporting mode. Default PROCESSING_TAG_MODE.
             think (Optional[bool]): Legacy flag to toggle reasoning/thinking output. If True, maps to reasoning_effort='high'. If False, disables reasoning. Default None.
             reasoning_effort (Optional[str]): Level of reasoning effort for reasoning/thinking models ('low', 'medium', 'high', 'max'). Overrides `think`. Default None.
@@ -6413,6 +6604,8 @@ class ChatMixin:
             enable_powerpoint=enable_powerpoint,
             enable_word=enable_word,
             enable_excel=enable_excel,
+            enable_pdf=enable_pdf,
+            enable_office_files=enable_office_files,
             allow_computer_use=allow_computer_use,
             **kwargs,
         )

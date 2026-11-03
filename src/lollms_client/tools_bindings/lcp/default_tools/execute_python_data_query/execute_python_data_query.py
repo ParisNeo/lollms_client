@@ -10,6 +10,38 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from ascii_colors import ASCIIColors
 
+
+def _sanitize_host_paths(text: str, workspace_root: Path) -> str:
+    """Strips absolute host filesystem paths from tool outputs.
+
+    The operator's physical layout (user folders, install dirs, temp dirs)
+    must never leak to the LLM. The workspace root is rendered as '.';
+    anything else under the user's profile / system dirs becomes '<host-path>'.
+    """
+    if not text:
+        return text
+    sanitized = text.replace(str(workspace_root), ".")
+    return re.sub(
+        r'[A-Za-z]:\\(?:Users|home|Program|Windows|AppData)[\\/][^\s"\'\n]*',
+        '<host-path>',
+        sanitized,
+    )
+
+# Import the shared sandbox kernel. Fall back to a localised import path when
+# the tool is loaded outside the package tree.
+try:
+    from .sandbox_kernel import (
+        validate_source,
+        SandboxViolation,
+        run_in_sandboxed_child,
+    )
+except ImportError:  # pragma: no cover
+    from ..execute_python.sandbox_kernel import (  # type: ignore
+        validate_source,
+        SandboxViolation,
+        run_in_sandboxed_child,
+    )
+
 TOOL_LIBRARY_NAME = "Execute Python Data Query"
 TOOL_LIBRARY_DESC = "Executes sandboxed Python code to analyze or modify datasets in the workspace."
 TOOL_LIBRARY_ICON = "📊"
@@ -204,6 +236,87 @@ def _snapshot_office_files() -> Dict[Path, bytes]:
     return snapshot
 
 
+def _has_registered_confirm_handler(env: Optional[Any] = None) -> bool:
+    """True iff THIS tool call has a confirmation handler available.
+
+    Only considers (a) `env.confirm_handler` (the standard host injection path)
+    and (b) a handler registered directly on this module. We deliberately do
+    NOT scan sibling modules: another test, GUI component, or unrelated LCP
+    toolset in the same process registering a handler is NOT the same as "the
+    operator wants to be prompted for THIS call". The previous `sys.modules`
+    scan caused a session-wide cascade where one test's handler forced every
+    subsequent data-query call into the "operator present" branch — which
+    refuses in headless CI and broke 16+ unrelated tests.
+    """
+    if env is not None and callable(getattr(env, "confirm_handler", None)):
+        return True
+    own_mod = sys.modules.get(__name__)
+    if own_mod is not None and callable(getattr(own_mod, "_CONFIRM_HANDLER", None)):
+        return True
+    return False
+
+
+def _confirm_data_query_execution(source: str, env: Optional[Any] = None) -> Tuple[str, str]:
+    """Prompts the operator before running code in the strict data-query sandbox.
+
+    Honors `confirm_handler` set on the parent `execute_python` tool module if
+    the host has registered one. Returns ("allow"|"reject", reason).
+    """
+    handler = None
+    try:
+        import sys as _sys
+        for mod_name, mod in list(_sys.modules.items()):
+            if "execute_python" in mod_name and mod.__name__ != __name__:
+                handler = getattr(mod, "_CONFIRM_HANDLER", None)
+                if handler:
+                    break
+        if handler is None and env is not None:
+            handler = getattr(env, "confirm_handler", None)
+    except Exception:
+        handler = None
+
+    if handler is not None and callable(handler):
+        try:
+            res = handler({
+                "tool_name": "execute_python_data_query",
+                "action_type": "data_query_execution",
+                "source": source,
+                "content": source,
+                "label": "data_query",
+                "metadata": {"profile": "strict-data"},
+            })
+            if isinstance(res, tuple):
+                return str(res[0]).lower(), str(res[1]) if len(res) > 1 else ""
+            if isinstance(res, bool):
+                return ("allow", "") if res else ("reject", "Declined by operator.")
+            return str(res).lower(), ""
+        except Exception as exc:
+            return "reject", f"Confirmation handler failed: {exc}"
+
+    if sys.stdin and sys.stdin.isatty():
+        ASCIIColors.panel(
+            source[:4000] + ("\n…" if len(source) > 4000 else ""),
+            title="🛡️ Execute Python Data Query Authorization (strict data sandbox)",
+            border_style="yellow",
+        )
+        try:
+            choice = input("  Authorize execution? [y]es / [n]o (default: y): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return "reject", "Execution interrupted."
+        if choice in ("", "y", "yes"):
+            return "allow", ""
+        return "reject", "Operator declined execution."
+
+    # Non-interactive fallback: refuse. There is no way to safely auto-authorize
+    # analytical code in a headless context.
+    return "reject", (
+        "No interactive channel is available. The strict data-query sandbox "
+        "requires an explicit operator approval or a registered confirm_handler. "
+        "Register a handler via LollmsDiscussion.chat(confirm_handler=...) before "
+        "using this tool."
+    )
+
+
 def _build_office_guard_failure(file_name: str, reason: str, restoration_note: str, captured_output: str) -> Dict[str, Any]:
     """Builds the structured failure payload returned when Office file validation fails."""
     failure_code = OFFICE_FAILURE_CODES.get(Path(file_name).suffix.lower(), OFFICE_GUARD_FAILURE_CODE)
@@ -326,6 +439,45 @@ def tool_execute_python_data_query(
             "output": ""
         }
 
+    # ── LAYER 1: static AST validation (strict data-query allowlist) ──
+    violation = validate_source(code, profile="data_query")
+    if violation is not None:
+        ASCIIColors.error(f"[execute_python_data_query] Static sandbox rejection: {violation.reason}")
+        return {
+            "success": False,
+            "error": (
+                f"🛑 BLOCKED BY DATA-QUERY SANDBOX (line {violation.line}): "
+                f"{violation.reason}\n"
+                f"Offending construct: {violation.snippet}\n"
+                "This sandbox only permits pandas/numpy/matplotlib/openpyxl/"
+                "python-docx/python-pptx/sqlalchemy and pure stdlib data helpers. "
+                "No subprocess, no os.system, no network, no eval/exec, no imports "
+                "outside the approved list."
+            ),
+            "output": "",
+        }
+
+    # ── LAYER 0 (OPTIONAL): operator authorization ──
+    # The strict static + runtime sandbox is the authoritative guarantee: source
+    # that survives `validate_source(profile="data_query")` AND the runtime
+    # `SandboxContext` can only touch approved data-analysis libraries and the
+    # workspace perimeter. Human authorization is therefore an *opt-in* UX layer:
+    # we only prompt when the host has registered a confirm_handler. Headless
+    # environments (CI, servers, notebooks) run without a prompt because the
+    # sandbox itself is the control — not the operator.
+    _handler_present = _has_registered_confirm_handler(env)
+    if _handler_present:
+        decision, reason = _confirm_data_query_execution(code, env=env)
+        if decision not in ("allow", "always"):
+            return {
+                "success": False,
+                "error": (
+                    "🛑 BLOCKED BY OPERATOR: the data-query execution was not "
+                    f"authorized ({reason or 'rejected'})."
+                ),
+                "output": "",
+            }
+
     _saved_utf8_env = {}
     for _env_key in ("PYTHONIOENCODING", "PYTHONUTF8"):
         _saved_utf8_env[_env_key] = os.environ.get(_env_key)
@@ -340,6 +492,18 @@ def tool_execute_python_data_query(
     if office_snapshot:
         ASCIIColors.info(f"[Office Guard] Snapshot of {len(office_snapshot)} document(s) taken.")
 
+    # Prefer the host-injected workspace (parity with execute_python); fall
+    # back to CWD. The sandbox boundary is exactly this path.
+    workspace_root = Path.cwd().resolve()
+    if env is not None:
+        _ctx_ws = getattr(getattr(env, "tool_context", None), "workspace_path", None)
+        if _ctx_ws:
+            try:
+                _ws = Path(_ctx_ws).resolve()
+                if _ws.exists() and _ws.is_dir():
+                    workspace_root = _ws
+            except Exception:
+                pass
     import base64
 
     _np, _pd, _plt = _lazy_import_libs()
@@ -349,12 +513,41 @@ def tool_execute_python_data_query(
         def reconfigure(self, *args, **kwargs):
             pass
 
+    # Defense-in-depth: install the runtime sandbox patch BEFORE exposing any
+    # builtins to user code. User code only sees an explicitly reduced surface.
+    safe_builtins = {
+        # Essential pure operations
+        "abs": abs, "all": all, "any": any, "bool": bool, "bytearray": bytearray,
+        "bytes": bytes, "callable": callable, "chr": chr, "complex": complex,
+        "dict": dict, "dir": dir, "divmod": divmod, "enumerate": enumerate,
+        "filter": filter, "float": float, "format": format, "frozenset": frozenset,
+        "getattr": getattr, "hasattr": hasattr, "hash": hash, "id": id,
+        "int": int, "isinstance": isinstance, "issubclass": issubclass,
+        "iter": iter, "len": len, "list": list, "map": map,
+        "max": max, "min": min, "next": next, "object": object,
+        "oct": oct, "ord": ord, "pow": pow, "range": range,
+        "repr": repr, "reversed": reversed, "round": round, "set": set,
+        "setattr": setattr, "slice": slice, "sorted": sorted, "str": str,
+        "sum": sum, "tuple": tuple, "type": type, "zip": zip,
+        # Exceptions
+        "Exception": Exception, "ValueError": ValueError, "TypeError": TypeError,
+        "KeyError": KeyError, "IndexError": IndexError, "AttributeError": AttributeError,
+        "RuntimeError": RuntimeError, "StopIteration": StopIteration,
+        "ZeroDivisionError": ZeroDivisionError, "FileNotFoundError": FileNotFoundError,
+        "PermissionError": PermissionError, "IOError": OSError, "OSError": OSError,
+        # Print only (no stdout hijack helpers)
+        "print": print,
+        # Import is installed LAST below, after the SandboxContext patches it.
+        "__import__": None,
+        "__build_class__": __build_class__,
+    }
+
     local_vars = {
         "Path": Path,
         "pd": _pd,
         "np": _np,
         "plt": _plt,
-        "__builtins__": __builtins__,
+        "__builtins__": safe_builtins,
     }
 
     uses_df = re.search(r'\bdf\b', code) is not None
@@ -416,36 +609,71 @@ def tool_execute_python_data_query(
             except Exception as load_err:
                 ASCIIColors.warning(f"[execute_python_data_query] Failed to auto-load conn: {load_err}")
 
-    old_stdout = sys.stdout
-    redirected_output = _NoReconfigureStringIO()
-    sys.stdout = redirected_output
+    # ── PROCESS ISOLATION: run user code in a sandboxed child ──
+    # The parent process state is NEVER patched. All sandbox behavior — the
+    # filtered importer, path guards, blocked builtins — lives inside the child
+    # and dies with it. This is the strongest guarantee the sandbox can make:
+    # no state leaks between tool calls, no cascade risk, no module-load-order
+    # hazard.
+    ASCIIColors.info(f"⚡ Executing Python code in isolated sandbox child (CWD: {os.getcwd()})")
 
-    try:
-        ASCIIColors.info(f"⚡ Executing Python code (CWD: {os.getcwd()})")
-        if _plt is not None:
-            _plt.clf()
-            _plt.close('all')
+    # Seed the child's local namespace with the parent-side auto-loaded df and
+    # the guaranteed-available libraries. The child cannot see parent objects,
+    # so we ship df as a pickled payload via seed_locals — the child unpickles
+    # it into its own namespace under the name "df".
+    child_seed: Dict[str, Any] = {}
+    df_present_at_start = "df" in local_vars
+    persist_df = (auto_loaded_df_file is not None) or defines_df
+    persist_df_target = auto_loaded_df_file
 
+    # Note: `seed_locals` must be picklable. `pd`/`np`/`plt` are modules, and
+    # modules are picklable by reference — the child's fresh interpreter imports
+    # them again on unpickle (guaranteed available since we required them).
+    # The initial `df` (if auto-loaded) is pickled for transport.
+    if "df" in local_vars:
         try:
-            import builtins
-            native_compile = getattr(builtins, 'compile', None)
-            if native_compile and native_compile.__module__ == 'builtins':
-                compiled_code = native_compile(code, "<execute_python_data_query>", "exec")
-                exec(compiled_code, local_vars)
-            else:
-                exec(code, local_vars)
-        except SystemExit as se:
-            raise RuntimeError(f"User code called sys.exit() with code {se.code}. This is not permitted in sandboxed execution.") from se
-        except KeyboardInterrupt:
-            raise RuntimeError("Execution interrupted by KeyboardInterrupt.")
+            import pickle as _pickle
+            child_seed["__df_pickle__"] = _pickle.dumps(local_vars["df"])
         except Exception:
-            import traceback
-            sys.stdout = old_stdout
-            raw_output = redirected_output.getvalue()
-            raw_traceback = traceback.format_exc()
-            annotated_traceback = _annotate_traceback(raw_traceback, code)
-            ASCIIColors.error(f"❌ Execution Failed:\n{raw_traceback}")
+            pass
+
+    envelope = run_in_sandboxed_child(
+        source=code,
+        workspace_root=workspace_root,
+        profile="data_query",
+        script_label="<execute_python_data_query>",
+        argv=["<execute_python_data_query>"],
+        seed_locals=child_seed,
+        persist_df_name="df" if persist_df else None,
+        hard_timeout=120.0,
+    )
+
+    # Restore the parent-side UTF-8 env (the child had its own copies).
+    for _env_key, _saved_val in _saved_utf8_env.items():
+        if _saved_val is None:
+            os.environ.pop(_env_key, None)
+        else:
+            os.environ[_env_key] = _saved_val
+
+    if auto_loaded_engine is not None:
+        try:
+            auto_loaded_engine.dispose()
+        except Exception:
+            pass
+
+    raw_output = envelope.get("stdout", "") or ""
+    raw_stderr = envelope.get("stderr", "") or ""
+    child_traceback = envelope.get("traceback", "") or ""
+    error_type = envelope.get("error_type", "") or ""
+
+    # ── Child reported an error: shape it like before, run Office rollback ──
+    if not envelope.get("success"):
+        if envelope.get("sandbox_violation"):
             rollback_failure = _validate_and_maybe_rollback(office_snapshot, raw_output)
+            annotated_traceback = (
+                f"SandboxViolation: {child_traceback.strip()}\n"
+                f"(This operation is not permitted in the strict data-query sandbox.)"
+            )
             if rollback_failure is not None:
                 annotated_traceback += (
                     f"\n[Office Guard] {OFFICE_GUARD_FAILURE_CODE}: corrupted documents were rolled back "
@@ -453,144 +681,141 @@ def tool_execute_python_data_query(
                 )
             return {
                 "success": False,
-                "error": f"Execution Error:\n{annotated_traceback}",
-                "output": raw_output
+                "error": f"🛑 SANDBOX BLOCK: {annotated_traceback}",
+                "output": raw_output,
             }
-
-        guard_failure = _validate_and_maybe_rollback(office_snapshot, redirected_output.getvalue())
-        if guard_failure is not None:
-            return guard_failure
-
-        if auto_loaded_df_file and "df" in local_vars and _pd is not None and isinstance(local_vars["df"], _pd.DataFrame):
-            try:
-                ASCIIColors.info(f"[execute_python_data_query] Persisting modified df back to {auto_loaded_df_file.name}")
-                if auto_loaded_df_file.suffix.lower() == ".csv":
-                    local_vars["df"].to_csv(auto_loaded_df_file, sep=auto_loaded_sep, index=False, encoding="utf-8-sig")
-                elif auto_loaded_df_file.suffix.lower() in (".xlsx", ".xls"):
-                    local_vars["df"].to_excel(auto_loaded_df_file, index=False)
-
-                if auto_loaded_df_file.suffix.lower() in (".xlsx", ".xls"):
-                    df_ok, df_reason = _validate_office_file(auto_loaded_df_file)
-                    if not df_ok:
-                        resolved_df_path = auto_loaded_df_file.resolve()
-                        if resolved_df_path in office_snapshot:
-                            auto_loaded_df_file.write_bytes(office_snapshot[resolved_df_path])
-                            restoration_note = "Restored from pre-execution in-memory snapshot."
-                        else:
-                            auto_loaded_df_file.unlink(missing_ok=True)
-                            restoration_note = "New file deleted (no previous version to restore)."
-                        ASCIIColors.error(
-                            f"[Office Guard] df persistence produced an invalid spreadsheet ({df_reason}) — rolled back."
-                        )
-                        return _build_office_guard_failure(
-                            auto_loaded_df_file.name, df_reason, restoration_note, redirected_output.getvalue()
-                        )
-
-                if disc and hasattr(disc, "artefacts"):
-                    art_title = auto_loaded_df_file.name
-                    existing_art = disc.artefacts.get(art_title)
-                    if not existing_art and auto_loaded_df_file.stem != auto_loaded_df_file.name:
-                        existing_art = disc.artefacts.get(auto_loaded_df_file.stem)
-                        if existing_art:
-                            art_title = auto_loaded_df_file.stem
-
-                    if existing_art:
-                        disc.artefacts.update(
-                            title=art_title,
-                            new_content=local_vars["df"].to_csv(index=False, sep=auto_loaded_sep if auto_loaded_df_file.suffix.lower() == ".csv" else ","),
-                            bump_version=True,
-                            active=True
-                        )
-                        disc.commit()
-            except Exception as save_err:
-                ASCIIColors.warning(f"[execute_python_data_query] Failed to persist df: {save_err}")
-
-        fig_nums = _plt.get_fignums() if _plt is not None else []
-        if fig_nums:
-            ASCIIColors.success(f"[Sandbox] Intercepted {len(fig_nums)} generated plot figure(s)!")
-            for idx, f_num in enumerate(fig_nums):
-                buf = io.BytesIO()
-                fig = _plt.figure(f_num)
-                fig.savefig(buf, format="png", bbox_inches='tight', facecolor=fig.get_facecolor())
-                buf.seek(0)
-                plot_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-
-                plot_filename = f"custom_analysis_plot_{uuid.uuid4().hex[:6]}.png"
-                plot_path = Path(".") / plot_filename
-                fig.savefig(str(plot_path), bbox_inches='tight', facecolor=fig.get_facecolor())
-
-                if disc and hasattr(disc, "artefacts"):
-                    try:
-                        art_title = plot_filename
-                        comp_title = f"{art_title}::images"
-                        existing_comp = disc.artefacts.get(comp_title)
-
-                        if existing_comp:
-                            existing_imgs = existing_comp.get("images", [])
-                            existing_mtypes = existing_comp.get("image_media_types", [])
-                            existing_imgs.append(plot_b64)
-                            existing_mtypes.append("image/png")
-                            disc.artefacts.update(
-                                title=comp_title,
-                                new_images=existing_imgs,
-                                new_image_media_types=existing_mtypes,
-                                active=True
-                            )
-                        else:
-                            disc.artefacts.add(
-                                title=art_title,
-                                artefact_type="image",
-                                content=f"![{art_title}]({art_title})",
-                                images=[plot_b64],
-                                image_media_types=["image/png"],
-                                active=True,
-                                file_ext=".png"
-                            )
-                        disc.commit()
-                        ASCIIColors.info(f"[execute_python_data_query] Synced plot '{art_title}' to artefact system.")
-                    except Exception as sync_err:
-                        ASCIIColors.warning(f"[execute_python_data_query] Failed to sync plot to artefact system: {sync_err}")
-
-            _plt.close('all')
-
-    except BaseException as outer_err:
-        import traceback
-        sys.stdout = old_stdout
-        raw_output = redirected_output.getvalue()
-        raw_traceback = traceback.format_exc()
-        ASCIIColors.error(f"❌ Unexpected execution failure:\n{raw_traceback}")
         rollback_failure = _validate_and_maybe_rollback(office_snapshot, raw_output)
+        annotated_traceback = _annotate_traceback(child_traceback, code)
+        ASCIIColors.error(f"❌ Execution Failed (child):\n{child_traceback}")
         if rollback_failure is not None:
-            raw_traceback += (
+            annotated_traceback += (
                 f"\n[Office Guard] {OFFICE_GUARD_FAILURE_CODE}: corrupted documents were rolled back "
                 f"to their pre-execution state. {rollback_failure['output']}"
             )
         return {
             "success": False,
-            "error": f"Unexpected execution failure:\n{raw_traceback}",
-            "output": raw_output
+            "error": f"Execution Error:\n{annotated_traceback}",
+            "output": raw_output,
         }
-    finally:
-        sys.stdout = old_stdout
-        for _env_key, _saved_val in _saved_utf8_env.items():
-            if _saved_val is None:
-                os.environ.pop(_env_key, None)
-            else:
-                os.environ[_env_key] = _saved_val
-        if auto_loaded_engine is not None:
+
+    # ── Success path: parent-side post-execution processing ──
+    guard_failure = _validate_and_maybe_rollback(office_snapshot, raw_output)
+    if guard_failure is not None:
+        return guard_failure
+
+    # Rehydrate the child's df (if user modified it) for parent-side persistence.
+    df_from_child = None
+    if envelope.get("df_pickle") and _pd is not None:
+        try:
+            import pickle as _pickle
+            df_from_child = _pickle.loads(envelope["df_pickle"])
+        except Exception as reload_err:
+            ASCIIColors.warning(f"[execute_python_data_query] Failed to rehydrate df from child: {reload_err}")
+
+    if persist_df_target and df_from_child is not None and isinstance(df_from_child, _pd.DataFrame):
+        try:
+            ASCIIColors.info(f"[execute_python_data_query] Persisting modified df back to {persist_df_target.name}")
+            if persist_df_target.suffix.lower() == ".csv":
+                df_from_child.to_csv(persist_df_target, sep=auto_loaded_sep, index=False, encoding="utf-8-sig")
+            elif persist_df_target.suffix.lower() in (".xlsx", ".xls"):
+                df_from_child.to_excel(persist_df_target, index=False)
+
+            if persist_df_target.suffix.lower() in (".xlsx", ".xls"):
+                df_ok, df_reason = _validate_office_file(persist_df_target)
+                if not df_ok:
+                    resolved_df_path = persist_df_target.resolve()
+                    if resolved_df_path in office_snapshot:
+                        persist_df_target.write_bytes(office_snapshot[resolved_df_path])
+                        restoration_note = "Restored from pre-execution in-memory snapshot."
+                    else:
+                        persist_df_target.unlink(missing_ok=True)
+                        restoration_note = "New file deleted (no previous version to restore)."
+                    ASCIIColors.error(
+                        f"[Office Guard] df persistence produced an invalid spreadsheet ({df_reason}) — rolled back."
+                    )
+                    return _build_office_guard_failure(
+                        persist_df_target.name, df_reason, restoration_note, raw_output
+                    )
+
+            if disc and hasattr(disc, "artefacts"):
+                art_title = persist_df_target.name
+                existing_art = disc.artefacts.get(art_title)
+                if not existing_art and persist_df_target.stem != persist_df_target.name:
+                    existing_art = disc.artefacts.get(persist_df_target.stem)
+                    if existing_art:
+                        art_title = persist_df_target.stem
+
+                if existing_art:
+                    disc.artefacts.update(
+                        title=art_title,
+                        new_content=df_from_child.to_csv(
+                            index=False,
+                            sep=auto_loaded_sep if persist_df_target.suffix.lower() == ".csv" else ",",
+                        ),
+                        bump_version=True,
+                        active=True,
+                    )
+                    disc.commit()
+        except Exception as save_err:
+            ASCIIColors.warning(f"[execute_python_data_query] Failed to persist df: {save_err}")
+
+    # Rehydrate plot figures — the child captured them as PNG bytes. The parent
+    # writes them to the workspace and syncs artefacts; no matplotlib state
+    # cross-process.
+    figures = envelope.get("figures") or []
+    if figures:
+        ASCIIColors.success(f"[Sandbox] Intercepted {len(figures)} generated plot figure(s)!")
+        for png_bytes in figures:
+            plot_b64 = base64.b64encode(png_bytes).decode("utf-8")
+            plot_filename = f"custom_analysis_plot_{uuid.uuid4().hex[:6]}.png"
+            plot_path = Path(".") / plot_filename
             try:
-                if "conn" in local_vars and hasattr(local_vars["conn"], "close"):
-                    local_vars["conn"].close()
-                auto_loaded_engine.dispose()
-            except Exception:
-                pass
+                plot_path.write_bytes(png_bytes)
+            except Exception as write_err:
+                ASCIIColors.warning(f"[execute_python_data_query] Failed to write plot {plot_filename}: {write_err}")
+                continue
 
-    out_str = redirected_output.getvalue()
+            if disc and hasattr(disc, "artefacts"):
+                try:
+                    art_title = plot_filename
+                    comp_title = f"{art_title}::images"
+                    existing_comp = disc.artefacts.get(comp_title)
 
+                    if existing_comp:
+                        existing_imgs = existing_comp.get("images", [])
+                        existing_mtypes = existing_comp.get("image_media_types", [])
+                        existing_imgs.append(plot_b64)
+                        existing_mtypes.append("image/png")
+                        disc.artefacts.update(
+                            title=comp_title,
+                            new_images=existing_imgs,
+                            new_image_media_types=existing_mtypes,
+                            active=True,
+                        )
+                    else:
+                        disc.artefacts.add(
+                            title=art_title,
+                            artefact_type="image",
+                            content=f"![{art_title}]({art_title})",
+                            images=[plot_b64],
+                            image_media_types=["image/png"],
+                            active=True,
+                            file_ext=".png",
+                        )
+                    disc.commit()
+                    ASCIIColors.info(f"[execute_python_data_query] Synced plot '{art_title}' to artefact system.")
+                except Exception as sync_err:
+                    ASCIIColors.warning(f"[execute_python_data_query] Failed to sync plot to artefact system: {sync_err}")
+
+    out_str = raw_output
     if not out_str.strip():
         out_str = "Code executed successfully (no stdout prints)."
 
+    # Preserve host-path opacity: the LLM must only ever see the workspace
+    # root represented as '.', never absolute paths under the operator's profile.
+    out_str = _sanitize_host_paths(out_str, workspace_root)
+
     return {
         "success": True,
-        "output": out_str
+        "output": out_str,
     }

@@ -410,16 +410,20 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
 
         # The mock agent should have executed the tool and returned the final answer.
         # If the mock fell through to the fallback, final_content will be "Simulated response".
-        # We check if the mock successfully reached the final answer state.
         expected_final_answer = "Smartphone Alpha"
 
-        # Verify the mock reached round 2 (final answer state)
-        mock_reached_final_state = self.client.scenario_c_round == 0  # Reset after round 2
+        # (a) The tool was actually dispatched at least once across the multi-turn flow.
+        tool_was_dispatched = len(tools_called) >= 1
 
-        tool_succeeded = mock_reached_final_state and "status:success" in final_content and "KeyError" not in final_content
-        answer_correct = expected_final_answer in final_content
+        # (b) The mock reached its terminal state (round 2 answer emitted, counter reset to 0).
+        mock_reached_final_state = self.client.scenario_c_round == 0
 
-        success = tool_succeeded and answer_correct
+        # (c) The final natural-language reply contains the data-derived answer.
+        #     NOTE: "status:success" lives in the tool_result XML stream, not in the
+        #     model's final reply, so we intentionally do NOT assert on it here.
+        answer_correct = expected_final_answer in final_content and "Simulated response" not in final_content
+
+        success = tool_was_dispatched and mock_reached_final_state and answer_correct
 
         self.report_cards.append({
             "name": "Scenario C: Multi-Turn Two-Step Ephemeral Ingestion",
@@ -429,7 +433,16 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
             "response_size": len(final_content),
             "highlights": f"Final Answer: '{final_content}'"
         })
-        self.assertTrue(success, "Failed to execute multi-turn data query successfully. Final answer did not contain expected data.")
+        self.assertTrue(
+            success,
+            (
+                "Failed multi-turn data query scenario. "
+                f"tool_was_dispatched={tool_was_dispatched}, "
+                f"mock_reached_final_state={mock_reached_final_state}, "
+                f"answer_correct={answer_correct}, "
+                f"final_content={final_content!r}"
+            ),
+        )
 
     def test_scenario_d_python_execution(self):
         ASCIIColors.cyan("\n▶ Running Scenario D: Arbitrary Python Code Execution")

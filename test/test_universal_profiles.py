@@ -3,36 +3,77 @@ from unittest.mock import MagicMock, patch
 from pathlib import Path
 import sys
 
+# Import LollmsClient at module level so patch.object can resolve it in the fixture.
+
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from lollms_client.lollms_core import LollmsClient, LollmsBindingProfile, LollmsModelProfile
+from lollms_client.lollms_core import LollmsClient, LollmsBindingProfile, LollmsModelProfile  # noqa: E402
 
 @pytest.fixture
 def mock_all_binding_managers():
-    """Mocks all modality binding managers to prevent real instantiation."""
-    with patch("lollms_client.lollms_core.LollmsLLMBindingManager") as llm_mgr, \
-         patch("lollms_client.lollms_core.LollmsTTIBindingManager") as tti_mgr, \
-         patch("lollms_client.lollms_core.LollmsTTSBindingManager") as tts_mgr, \
-         patch("lollms_client.lollms_core.LollmsSTTBindingManager") as stt_mgr, \
-         patch("lollms_client.lollms_core.LollmsTTVBindingManager") as ttv_mgr, \
-         patch("lollms_client.lollms_core.LollmsTTMBindingManager") as ttm_mgr:
-        
-        def create_side_effect(binding_name, **kwargs):
-            mock = MagicMock()
-            mock.binding_name = binding_name
-            mock.model_name = kwargs.get("model_name", "test-model")
-            mock.reset_cancel = MagicMock()
-            mock.vision_enabled = kwargs.get("vision_enabled", False)
-            return mock
-        
-        for mgr in [llm_mgr, tti_mgr, tts_mgr, stt_mgr, ttv_mgr, ttm_mgr]:
-            mgr.return_value.create_binding.side_effect = create_side_effect
-            
-        yield {
-            "llm": llm_mgr, "tti": tti_mgr, "tts": tts_mgr,
-            "stt": stt_mgr, "ttv": ttv_mgr, "ttm": ttm_mgr
-        }
+    """Mocks *all nine* modality binding managers to prevent real instantiation.
+
+    Why all nine and not just the six "obvious" modals?
+
+    ``LollmsClient.__init__`` constructs every manager eagerly, and each real
+    manager scans its on-disk binding directory and imports every discovered
+    binding module. ``tools_bindings/`` contains ~25 nested toolsets,
+    ``connection_bindings/`` pulls in Discord/Slack/Telegram/WhatsApp SDKs, and
+    ``rag_bindings/`` can drag in ``torch`` / ``sentence_transformers``. When
+    those three managers were left unmocked, every single ``LollmsClient()``
+    call paid that full import/scan cost — which is what made this file feel
+    pathologically slow. Mocking them is both correct (unit isolation) and
+    dramatically faster.
+
+    The factory additionally configures each mock to behave like a *remote*
+    binding (``is_local() -> False``, ``is_model_loaded() -> True``) so the
+    client's VRAM-management / model-reload code paths short-circuit.
+    """
+    patches = [
+        patch("lollms_client.lollms_core.LollmsLLMBindingManager"),
+        patch("lollms_client.lollms_core.LollmsTTIBindingManager"),
+        patch("lollms_client.lollms_core.LollmsTTSBindingManager"),
+        patch("lollms_client.lollms_core.LollmsSTTBindingManager"),
+        patch("lollms_client.lollms_core.LollmsTTVBindingManager"),
+        patch("lollms_client.lollms_core.LollmsTTMBindingManager"),
+        patch("lollms_client.lollms_core.LollmsTOOLBindingManager"),
+        patch("lollms_client.lollms_core.LollmsConnectionBindingManager"),
+        patch("lollms_client.lollms_core.LollmsRAGBindingManager"),
+    ]
+    started = [p.start() for p in patches]
+
+    def create_side_effect(binding_name, **kwargs):
+        mock = MagicMock()
+        mock.binding_name = binding_name
+        mock.model_name = kwargs.get("model_name", "test-model")
+        mock.reset_cancel = MagicMock()
+        mock.vision_enabled = kwargs.get("vision_enabled", False)
+        # Remote-binding behaviour: skip ensure_model_loaded / VRAM reclaim.
+        mock.is_local = MagicMock(return_value=False)
+        mock.is_model_loaded = MagicMock(return_value=True)
+        mock.has_active_resources = MagicMock(return_value=False)
+        mock.get_loaded_models = MagicMock(return_value=[])
+        mock.load_model = MagicMock(return_value=True)
+        mock.unload_model = MagicMock(return_value=True)
+        return mock
+
+    for mgr in started:
+        mgr.return_value.create_binding.side_effect = create_side_effect
+
+    # Safety net: never touch ~/.lollms_client/config.yaml during unit tests.
+    with patch.object(LollmsClient, "_save_single_default_profiles_to_disk", return_value=None):
+        try:
+            llm_mgr, tti_mgr, tts_mgr, stt_mgr, ttv_mgr, ttm_mgr, tools_mgr, conn_mgr, rag_mgr = started
+            yield {
+                "llm": llm_mgr, "tti": tti_mgr, "tts": tts_mgr,
+                "stt": stt_mgr, "ttv": ttv_mgr, "ttm": ttm_mgr,
+                "tools": tools_mgr, "connection": conn_mgr, "rag": rag_mgr,
+            }
+        finally:
+            for p in reversed(patches):
+                p.stop()
+
 
 def test_lollms_binding_and_model_profile_dataclasses():
     """Tests the two-tier profile dataclasses."""
@@ -218,73 +259,45 @@ def test_invalid_modality_switch(mock_all_binding_managers):
 
 def test_tools_profiles_and_switching(mock_all_binding_managers):
     """Tests tools binding/model profile registration, lazy loading, switching, and eager instantiation."""
-    manager_patch = patch("lollms_client.lollms_core.LollmsTOOLBindingManager")
-    tools_mgr_mock = manager_patch.start()
+    client = LollmsClient(
+        tools_binding_profiles={
+            "mcp_main": LollmsBindingProfile(name="mcp_main", binding_name="mcp", binding_config={"host": "127.0.0.1"})
+        },
+        tools_model_profiles={
+            "default_tools": LollmsModelProfile(name="default_tools", binding_profile_name="mcp_main", model_name="web-tools", is_default=True),
+            "secondary_tools": LollmsModelProfile(name="secondary_tools", binding_profile_name="mcp_main", model_name="filesystem")
+        }
+    )
 
-    def tools_create_side_effect(binding_name, **kwargs):
-        m = MagicMock()
-        m.binding_name = binding_name
-        m.model_name = kwargs.get("model_name")
-        return m
+    assert "default_tools" in client.toolss
+    assert "secondary_tools" not in client.toolss
+    assert client.tools is not None
+    assert client._active_tools_alias == "default_tools"
 
-    tools_mgr_mock.return_value.create_binding.side_effect = tools_create_side_effect
+    res = client.switch_tools("secondary_tools")
+    assert res is True
+    assert "secondary_tools" in client.toolss
+    assert client._active_tools_alias == "secondary_tools"
+    assert client.tools == client.toolss["secondary_tools"]
 
-    try:
-        client = LollmsClient(
-            tools_binding_profiles={
-                "mcp_main": LollmsBindingProfile(name="mcp_main", binding_name="mcp", binding_config={"host": "127.0.0.1"})
-            },
-            tools_model_profiles={
-                "default_tools": LollmsModelProfile(name="default_tools", binding_profile_name="mcp_main", model_name="web-tools", is_default=True),
-                "secondary_tools": LollmsModelProfile(name="secondary_tools", binding_profile_name="mcp_main", model_name="filesystem")
-            }
-        )
-
-        assert "default_tools" in client.toolss
-        assert "secondary_tools" not in client.toolss
-        assert client.tools is not None
-        assert client._active_tools_alias == "default_tools"
-
-        res = client.switch_tools("secondary_tools")
-        assert res is True
-        assert "secondary_tools" in client.toolss
-        assert client._active_tools_alias == "secondary_tools"
-        assert client.tools == client.toolss["secondary_tools"]
-
-        first_inst = client.toolss["secondary_tools"]
-        client.switch_tools("default_tools")
-        client.switch_tools("secondary_tools")
-        assert client.toolss["secondary_tools"] is first_inst
-    finally:
-        manager_patch.stop()
+    first_inst = client.toolss["secondary_tools"]
+    client.switch_tools("default_tools")
+    client.switch_tools("secondary_tools")
+    assert client.toolss["secondary_tools"] is first_inst
 
 def test_update_tools_binding_replaces_master(mock_all_binding_managers):
-    manager_patch = patch("lollms_client.lollms_core.LollmsTOOLBindingManager")
-    tools_mgr_mock = manager_patch.start()
+    client = LollmsClient(
+        tools_binding_name="mcp",
+        tools_binding_config={"model_name": "web-tools"}
+    )
+    assert "master" in client.tools_binding_profiles_registry
+    assert client._active_tools_alias == "master"
 
-    def tools_create_side_effect(binding_name, **kwargs):
-        m = MagicMock()
-        m.binding_name = binding_name
-        m.model_name = kwargs.get("model_name")
-        return m
-
-    tools_mgr_mock.return_value.create_binding.side_effect = tools_create_side_effect
-
-    try:
-        client = LollmsClient(
-            tools_binding_name="mcp",
-            tools_binding_config={"model_name": "web-tools"}
-        )
-        assert "master" in client.tools_binding_profiles_registry
-        assert client._active_tools_alias == "master"
-
-        client.update_tools_binding("lcp", {"model_name": "filesystem"})
-        assert client.tools_binding_profiles_registry["master"].binding_name == "lcp"
-        assert client.tools_binding_profiles_registry["master"].binding_config["model_name"] == "filesystem"
-        assert "master" in client.toolss
-        assert client._active_tools_alias == "master"
-    finally:
-        manager_patch.stop()
+    client.update_tools_binding("lcp", {"model_name": "filesystem"})
+    assert client.tools_binding_profiles_registry["master"].binding_name == "lcp"
+    assert client.tools_binding_profiles_registry["master"].binding_config["model_name"] == "filesystem"
+    assert "master" in client.toolss
+    assert client._active_tools_alias == "master"
 
 def test_update_tti_binding_replaces_master(mock_all_binding_managers):
     """Tests updating a modality binding replaces the master profile and reinstantiates."""

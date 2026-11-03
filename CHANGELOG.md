@@ -290,6 +290,18 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-03 15:06]
+
+- feat(lcp): add execute python and data query tools
+
+## [2026-11-03 15:05]
+
+- docs(flags): expand related tools section for enable_vlm_query
+
+## [2026-11-03 14:35]
+
+- chore(whisper): add pipmaster import and remove stray text
+
 ## [2026-11-03 11:05]
 
 - fix: enhance DSML parsing and update document tools
