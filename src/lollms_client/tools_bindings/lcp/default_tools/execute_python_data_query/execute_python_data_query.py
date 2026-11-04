@@ -11,6 +11,294 @@ from typing import Any, Dict, List, Optional, Tuple
 from ascii_colors import ASCIIColors
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Dependency inventory — declarative, sandbox-safe.
+#
+# Why this exists: the previous `init_tools_library()` called
+# `pipmaster.ensure_packages([...])` at import time. `pipmaster` internally
+# imports subprocess/pip/importlib/reload and triggers network + host-process
+# activity. When the LCP toolset is initialized *after* a sandboxed child has
+# touched process globals (or when the host wraps tool init in a scoped
+# sandbox), the filtered importer rejects pipmaster's imports and the TOOL
+# ITSELF fails to initialize — permanently blocking every later data-query call.
+#
+# The declarative model below is importable under ANY sandbox: it only uses
+# importlib.util.find_spec() (pure metadata lookup, no code execution). Tools
+# and hosts decide what to do with the result explicitly.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Required packages (import_name → pip_package_name). A package is "available"
+# iff its import_name resolves via importlib.util.find_spec().
+_REQUIRED_PACKAGES: Dict[str, str] = {
+    "pandas":      "pandas",
+    "numpy":       "numpy",
+    "matplotlib":  "matplotlib",
+    "openpyxl":    "openpyxl",
+    "docx":        "python-docx",
+    "pptx":        "python-pptx",
+    "sqlalchemy":  "sqlalchemy",
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Trust levels for LCP tool initialization.
+#
+# The LCP `init_tools_library()` hook is the *trusted* place where a toolset
+# declares and ensures its dependencies. For first-party (builtin) tools, we
+# trust the tool code itself — it ships with the package and its only job here
+# is to make the tool usable. The security boundary is the *code the tool
+# executes from its parameters*, not the tool's own initialization.
+#
+# Therefore: pip installation is allowed at init *when the toolset is trusted*,
+# and refused at init *when the toolset is user-supplied/untrusted*. Runtime
+# code (tool parameters) NEVER auto-installs under any trust level.
+# ──────────────────────────────────────────────────────────────────────────────
+
+TRUSTED_BUILTIN: str = "trusted_builtin"   # shipped with lollms_client
+TRUSTED_SIGNED: str = "trusted_signed"     # third-party but cryptographically signed
+UNTRUSTED_USER: str = "untrusted_user"     # user-supplied toolset — no auto-install
+
+_TRUSTED_LEVELS: frozenset[str] = frozenset({TRUSTED_BUILTIN, TRUSTED_SIGNED})
+
+# This tool ships with the package — it is a builtin, first-party toolset.
+TOOLSET_TRUST_LEVEL: str = TRUSTED_BUILTIN
+
+
+def _resolve_trust_level(config: Optional[dict]) -> str:
+    """Determines the effective trust level for this toolset's init call.
+
+    Precedence: explicit `config["trust_level"]` > module constant >
+    trusted default. Unknown values are coerced to UNTRUSTED_USER so a typo
+    or hostile caller can never *raise* trust accidentally.
+    """
+    if isinstance(config, dict):
+        declared = config.get("trust_level")
+        if isinstance(declared, str) and declared in (TRUSTED_BUILTIN, TRUSTED_SIGNED, UNTRUSTED_USER):
+            return declared
+        if declared is not None:
+            # Unknown value → fail-closed (do not auto-install).
+            return UNTRUSTED_USER
+    return TOOLSET_TRUST_LEVEL
+
+
+class MissingDependency(RuntimeError):
+    """Raised by tool code when user code needs a library that is not installed.
+
+    The message is actionable (names the pip package) and never mentions
+    the host's filesystem layout — it's safe to surface verbatim to the LLM.
+    """
+
+
+def check_dependencies() -> Dict[str, List[str]]:
+    """Returns {"available": [...import_names], "missing": [...pip_names]}.
+
+    Sandbox-safe: uses `importlib.util.find_spec` only — no module code is
+    executed. This can be called at any time, from any context, without
+    triggering imports of the target libraries.
+    """
+    import importlib.util as _ilu
+    available: List[str] = []
+    missing: List[str] = []
+    for import_name, pip_name in _REQUIRED_PACKAGES.items():
+        try:
+            spec = _ilu.find_spec(import_name)
+        except (ImportError, ValueError):
+            spec = None
+        if spec is not None:
+            available.append(import_name)
+        else:
+            missing.append(pip_name)
+    return {"available": available, "missing": missing}
+
+
+def install_missing_dependencies(packages: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Explicit, host-side installation of missing packages. **NEVER** called automatically.
+
+    Contract:
+      - Runs OUTSIDE any sandbox. The host invokes this only when it decides
+        that auto-installing is acceptable (a user opts in, an installer runs,
+        CI provisions the env, etc.).
+      - `packages` (optional) selects a subset of pip names; when omitted, all
+        packages from `_REQUIRED_PACKAGES` that are currently missing are
+        installed.
+      - Returns a structured report: {"ok": bool, "installed": [...], "missing": [...], "error": str|None}.
+      - If pipmaster is unavailable, an actionable error is returned (never
+        raised) so callers can log and continue with degraded functionality.
+
+    This separation is the security property that matters: the tool's *runtime
+    surface* (what runs in the sandbox) never triggers a package install.
+    Only an explicit host call does.
+    """
+    report: Dict[str, Any] = {"ok": False, "installed": [], "missing": [], "error": None}
+    inventory = check_dependencies()
+    report["missing"] = list(inventory["missing"])
+    if not report["missing"] and packages is None:
+        report["ok"] = True
+        return report
+
+    target_packages = list(packages) if packages is not None else list(report["missing"])
+    # Normalize: accept either import or pip names, map to pip names.
+    normalized: List[str] = []
+    for name in target_packages:
+        normalized.append(_REQUIRED_PACKAGES.get(name, name))
+    report["missing"] = normalized
+
+    try:
+        import pipmaster as pm
+    except ImportError as exc:
+        report["error"] = (
+            f"pipmaster is not installed ({exc}). Install it in the host "
+            "environment: `pip install pipmaster`. The data-query tool itself "
+            "still works for packages that are already present."
+        )
+        return report
+
+    try:
+        pm.ensure_packages(normalized)
+        report["ok"] = True
+        report["installed"] = list(normalized)
+        report["missing"] = [p for p in check_dependencies()["missing"]]
+        return report
+    except Exception as exc:
+        report["error"] = f"pipmaster failed to install {normalized}: {exc}"
+        return report
+
+
+def init_tools_library(config: dict = None) -> None:
+    """Ensures the tool's dependencies and configures the plotting backend.
+
+    LCP contract: `init_tools_library()` is the *trusted* place where a toolset
+    declares and ensures what it needs. For a trusted toolset (builtin first-
+    party, or signed third-party), missing dependencies are installed here via
+    pipmaster — this is what makes a fresh `pip install lollms-client` just work
+    on first tool use. For an untrusted (user-supplied) toolset, we do NOT
+    install: missing libraries surface as a per-call `MissingDependency` error
+    instead, so the host operator stays in control.
+
+    HARD INVARIANTS (unchanged from the earlier hardening):
+      1. This function MUST NOT raise, whatever pipmaster/matplotlib does.
+      2. This function MUST be idempotent (`ensure_packages` no-ops on present
+         packages; matplotlib.use is idempotent per backend).
+      3. This function MUST NOT be called from inside a `SandboxContext`
+         (see `_inside_sandbox()` guard below); the runtime path never calls it.
+
+    The security boundary is the *code the tool executes from its parameters*,
+    not the tool's own initialization. Runtime code never auto-installs, at any
+    trust level — that separation is enforced by the execution path, which
+    contains no pipmaster reference at all.
+    """
+    trust_level = _resolve_trust_level(config)
+
+    # Configure the non-interactive matplotlib backend if present. Guarded so
+    # a missing matplotlib never breaks initialization.
+    try:
+        global matplotlib
+        import matplotlib
+        matplotlib.use("Agg", force=False)
+    except Exception:
+        pass
+
+    # Guard against a caller misusing the hook inside a sandbox. Tool init must
+    # never fire inside a sandbox — it is a *host* responsibility, executed with
+    # full host permissions at tool-load time. When this invariant is violated
+    # (e.g. a caller wraps init in a SandboxContext for defence-in-depth), we
+    # refuse to install and log — never raise, never trigger pip in that scope.
+    if _inside_sandbox():
+        try:
+            inventory = check_dependencies()
+            if inventory["missing"]:
+                ASCIIColors.warning(
+                    "[execute_python_data_query] init_tools_library() invoked "
+                    "inside an active SandboxContext. Skipping dependency "
+                    "installation (that is a host responsibility, not a "
+                    f"sandbox one). Missing: {', '.join(inventory['missing'])}. "
+                    "Call `install_missing_dependencies()` from host code."
+                )
+        except Exception:
+            pass
+        return
+
+    if trust_level not in _TRUSTED_LEVELS:
+        # Untrusted toolset: respect the host boundary. Do NOT auto-install.
+        try:
+            inventory = check_dependencies()
+            if inventory["missing"]:
+                ASCIIColors.warning(
+                    "[execute_python_data_query] Untrusted toolset "
+                    f"(trust_level={trust_level!r}): missing dependencies "
+                    f"{', '.join(inventory['missing'])} were NOT installed. "
+                    "A trusted toolset (trusted_builtin/trusted_signed) would "
+                    "install them; the operator can install explicitly via "
+                    "`install_missing_dependencies([...])`."
+                )
+        except Exception:
+            pass
+        return
+
+    # Trusted toolset: install missing deps. `install_missing_dependencies`
+    # already swallows pipmaster errors and returns a structured report — the
+    # only failure surface left is `check_dependencies`, which we guard below.
+    try:
+        report = install_missing_dependencies()
+        if not report.get("ok") and report.get("error"):
+            ASCIIColors.warning(
+                f"[execute_python_data_query] Dependency installation failed: "
+                f"{report['error']}"
+            )
+    except Exception as exc:
+        # Defense-in-depth: init must never raise, whatever pipmaster does.
+        # Do NOT swallow the fact that we failed to install — just log it.
+        ASCIIColors.warning(
+            f"[execute_python_data_query] init_tools_library() caught an "
+            f"unexpected error while ensuring dependencies: {exc}"
+        )
+
+
+def _inside_sandbox() -> bool:
+    """True iff a `SandboxContext` is currently active in this process.
+
+    Detected by checking the builtins sentinels written by the kernel's
+    `_install()` — the sandbox patches `builtins.exec`/`compile` to stubs that
+    are tagged with `__lollms_blocked_builtin__`. We never call sandbox internals
+    or import them; the sentinel attribute is the stable contract.
+    """
+    try:
+        import builtins as _b
+        for name in ("exec", "compile"):
+            fn = getattr(_b, name, None)
+            if fn is not None and getattr(fn, "__lollms_blocked_builtin__", False):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _require(import_name: str) -> Any:
+    """Import a required package or raise a scene-appropriate MissingDependency.
+
+    Used by the execution path when user code references a library that is
+    not installed — the error names the pip package and never leaks host paths.
+    Note: for a trusted toolset the missing package would normally already be
+    installed by `init_tools_library()`; this path therefore only fires when
+    init was refused (untrusted toolset, sandbox scope, or install failure).
+    """
+    try:
+        return __import__(import_name, fromlist=["_"])
+    except ImportError as exc:
+        pip_name = _REQUIRED_PACKAGES.get(import_name, import_name)
+        trust_note = (
+            "This toolset is trusted; init normally installs it. Re-run "
+            "`init_tools_library()` in a host context (not inside a sandbox), "
+            "or install via `pip install " + pip_name + "`."
+            if TOOLSET_TRUST_LEVEL in _TRUSTED_LEVELS
+            else "This toolset is untrusted; the operator must install it."
+        )
+        raise MissingDependency(
+            f"Package '{import_name}' is required for this call but is not "
+            f"installed. {trust_note} "
+            f"Underlying error: {exc}"
+        ) from exc
+
+
 def _sanitize_host_paths(text: str, workspace_root: Path) -> str:
     """Strips absolute host filesystem paths from tool outputs.
 
@@ -87,18 +375,14 @@ XLSX_SNAPSHOT_MAX_BYTES = OFFICE_SNAPSHOT_MAX_BYTES
 XLSX_GUARD_FAILURE_CODE = OFFICE_FAILURE_CODES[".xlsx"]
 XLSX_GUARD_GUIDANCE = OFFICE_GUARD_GUIDANCE
 
-def init_tools_library(config: dict = None) -> None:
-    try:
-        import pipmaster as pm
-        pm.ensure_packages(["pandas", "numpy", "matplotlib", "openpyxl", "python-docx", "python-pptx", "sqlalchemy"])
-        global matplotlib
-        import matplotlib
-        matplotlib.use('Agg')
-    except Exception as e:
-        import ascii_colors
-        ascii_colors.ASCIIColors.warning(f"[execute_python_data_query] Failed to ensure all dependencies: {e}")
 
 def _lazy_import_libs():
+    """Best-effort import of numpy/matplotlib/pandas; missing libs return None.
+
+    Libraries that are absent are simply unavailable — user code that needs
+    them will raise MissingDependency only when it references them, keeping
+    unrelated executions (e.g. docx-only code) working in a minimal env.
+    """
     _np = None
     _pd = None
     _plt = None
@@ -118,7 +402,11 @@ def _lazy_import_libs():
         import pandas as _pd_mod
         _pd = _pd_mod
     except Exception:
-        ASCIIColors.warning("[execute_python_data_query] pandas unavailable — df auto-load and CSV persistence disabled.")
+        ASCIIColors.warning(
+            "[execute_python_data_query] pandas unavailable — df auto-load and "
+            "CSV persistence disabled. Install with: `pip install pandas`, or "
+            "call `install_missing_dependencies(['pandas'])` from host code."
+        )
     return _np, _pd, _plt
 
 def _annotate_traceback(raw_traceback: str, source_code: str) -> str:
@@ -626,16 +914,30 @@ def tool_execute_python_data_query(
     persist_df = (auto_loaded_df_file is not None) or defines_df
     persist_df_target = auto_loaded_df_file
 
-    # Note: `seed_locals` must be picklable. `pd`/`np`/`plt` are modules, and
-    # modules are picklable by reference — the child's fresh interpreter imports
-    # them again on unpickle (guaranteed available since we required them).
-    # The initial `df` (if auto-loaded) is pickled for transport.
+    # Modules MUST NOT go through the pickle seed transport: pickling a module
+    # stores it "by reference" (module_name + qualname), and unpickling in the
+    # child re-imports it through the stdlib. For extension modules (numpy's
+    # `_multiarray_umath`, pandas' C extensions, matplotlib's compiled backend)
+    # that round-trip is fragile — it either silently drops the binding
+    # (NameError: name 'pd' is not defined) or, worse, crashes the child mid-
+    # import on Windows (exit code 0xFFFFFFFF / ACCESS_VIOLATION). The honest
+    # contract is: modules are IMPORTED by the child from its own interpreter,
+    # before the sandbox is entered, at the exact module path the parent
+    # succeeded with. Only data VALUES (the DataFrame) travel via pickle.
+    #
+    # `seed_imports` is that declarative map: {alias_in_namespace: module_path}.
+    # The kernel resolves it in the child with a plain `__import__` — no
+    # pickle, no module identity games — which is deterministic on every
+    # platform.
+    seed_imports: Dict[str, str] = {}
+    if local_vars.get("pd") is not None:
+        seed_imports["pd"] = "pandas"
+    if local_vars.get("np") is not None:
+        seed_imports["np"] = "numpy"
+    if local_vars.get("plt") is not None:
+        seed_imports["plt"] = "matplotlib.pyplot"
     if "df" in local_vars:
-        try:
-            import pickle as _pickle
-            child_seed["__df_pickle__"] = _pickle.dumps(local_vars["df"])
-        except Exception:
-            pass
+        child_seed["df"] = local_vars["df"]
 
     envelope = run_in_sandboxed_child(
         source=code,
@@ -644,6 +946,7 @@ def tool_execute_python_data_query(
         script_label="<execute_python_data_query>",
         argv=["<execute_python_data_query>"],
         seed_locals=child_seed,
+        seed_imports=seed_imports,
         persist_df_name="df" if persist_df else None,
         hard_timeout=120.0,
     )

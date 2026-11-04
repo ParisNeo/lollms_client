@@ -87,10 +87,188 @@ def set_confirm_handler(handler: Optional[Any]) -> None:
                 pass
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Dependency inventory + trust model for LCP tool initialization.
+#
+# The LCP `init_tools_library()` hook is the *trusted* place where a toolset
+# declares and ensures its dependencies. For first-party (builtin) tools, we
+# trust the tool code itself — it ships with the package and its only job here
+# is to make the tool usable. The security boundary is the *code the tool
+# executes from its parameters*, not the tool's own initialization.
+#
+# Therefore: pip installation is allowed at init *when the toolset is trusted*,
+# and refused at init *when the toolset is user-supplied/untrusted*. Runtime
+# code (tool parameters) NEVER auto-installs under any trust level.
+#
+# NOTE: `pipmaster` is NOT in the inventory. Auto-installing the installer from
+# inside a process that lacks the installer is not a legitimate bootstrap —
+# when pipmaster is unavailable, `install_missing_dependencies()` returns an
+# actionable error and the tool continues with whatever is already present.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Required packages at INIT time (import_name → pip_package_name).
+# pandas/numpy/seaborn/sklearn/scipy are resolved lazily at runtime by
+# `_ensure_import()` and must NOT gate initialization: `print(2+2)` has no
+# business failing because scipy is not installed.
+_REQUIRED_PACKAGES: Dict[str, str] = {
+    "matplotlib": "matplotlib",
+}
+
+TRUSTED_BUILTIN: str = "trusted_builtin"   # shipped with lollms_client
+TRUSTED_SIGNED: str = "trusted_signed"     # third-party but cryptographically signed
+UNTRUSTED_USER: str = "untrusted_user"     # user-supplied toolset — no auto-install
+
+_TRUSTED_LEVELS: frozenset[str] = frozenset({TRUSTED_BUILTIN, TRUSTED_SIGNED})
+
+# This tool ships with the package — it is a builtin, first-party toolset.
+TOOLSET_TRUST_LEVEL: str = TRUSTED_BUILTIN
+
+
+def _resolve_trust_level(config: Optional[dict]) -> str:
+    """Determines the effective trust level for this toolset's init call.
+
+    Precedence: explicit `config["trust_level"]` > module constant >
+    trusted default. Unknown values are coerced to UNTRUSTED_USER so a typo
+    or hostile caller can never *raise* trust accidentally.
+    """
+    if isinstance(config, dict):
+        declared = config.get("trust_level")
+        if isinstance(declared, str) and declared in (TRUSTED_BUILTIN, TRUSTED_SIGNED, UNTRUSTED_USER):
+            return declared
+        if declared is not None:
+            return UNTRUSTED_USER
+    return TOOLSET_TRUST_LEVEL
+
+
+class MissingDependency(RuntimeError):
+    """Raised by tool code when user code needs a library that is not installed.
+
+    The message is actionable (names the pip package) and never mentions
+    the host's filesystem layout — it's safe to surface verbatim to the LLM.
+    """
+
+
+def check_dependencies() -> Dict[str, List[str]]:
+    """Returns {"available": [...import_names], "missing": [...pip_names]}.
+
+    Sandbox-safe: uses `importlib.util.find_spec` only — no module code is
+    executed. This can be called at any time, from any context.
+    """
+    import importlib.util as _ilu
+    available: List[str] = []
+    missing: List[str] = []
+    for import_name, pip_name in _REQUIRED_PACKAGES.items():
+        try:
+            spec = _ilu.find_spec(import_name)
+        except (ImportError, ValueError):
+            spec = None
+        if spec is not None:
+            available.append(import_name)
+        else:
+            missing.append(pip_name)
+    return {"available": available, "missing": missing}
+
+
+def install_missing_dependencies(packages: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Explicit, host-side installation of missing packages.
+
+    Contract:
+      - Runs OUTSIDE any sandbox. The host invokes this — either directly or
+        via the trusted-toolset path inside `init_tools_library()`.
+      - `packages` (optional) selects a subset of pip names; when omitted, all
+        packages from `_REQUIRED_PACKAGES` that are currently missing are
+        installed.
+      - Returns a structured report: {"ok": bool, "installed": [...], "missing": [...], "error": str|None}.
+      - If pipmaster is unavailable, an actionable error is returned (never
+        raised) so callers can log and continue with degraded functionality.
+
+    The tool's *runtime* surface (what runs in the sandbox) never triggers
+    a package install. Only an explicit call (or trusted init) does.
+    """
+    report: Dict[str, Any] = {"ok": False, "installed": [], "missing": [], "error": None}
+    inventory = check_dependencies()
+    report["missing"] = list(inventory["missing"])
+    if not report["missing"] and packages is None:
+        report["ok"] = True
+        return report
+
+    target_packages = list(packages) if packages is not None else list(report["missing"])
+    normalized: List[str] = []
+    for name in target_packages:
+        normalized.append(_REQUIRED_PACKAGES.get(name, name))
+    report["missing"] = normalized
+
+    try:
+        import pipmaster as pm
+    except ImportError as exc:
+        report["error"] = (
+            f"pipmaster is not installed ({exc}). Install it in the host "
+            "environment: `pip install pipmaster`. The execute_python tool "
+            "itself still works for packages that are already present."
+        )
+        return report
+
+    try:
+        pm.ensure_packages(normalized)
+        report["ok"] = True
+        report["installed"] = list(normalized)
+        report["missing"] = [p for p in check_dependencies()["missing"]]
+        return report
+    except Exception as exc:
+        report["error"] = f"pipmaster failed to install {normalized}: {exc}"
+        return report
+
+
+def _inside_sandbox() -> bool:
+    """True iff a `SandboxContext` is currently active in this process.
+
+    Detected by checking the builtins sentinels written by the kernel's
+    `_install()` — the sandbox patches `builtins.exec`/`compile` to stubs that
+    are tagged with `__lollms_blocked_builtin__`. We never call sandbox
+    internals or import them; the sentinel attribute is the stable contract.
+    """
+    try:
+        import builtins as _b
+        for name in ("exec", "compile"):
+            fn = getattr(_b, name, None)
+            if fn is not None and getattr(fn, "__lollms_blocked_builtin__", False):
+                return True
+    except Exception:
+        return False
+    return False
+
+
 def init_tools_library(config: dict = None) -> None:
+    """Ensures the tool's dependencies and configures the plotting backend.
+
+    LCP contract: `init_tools_library()` is the *trusted* place where a toolset
+    declares and ensures what it needs. For a trusted toolset (builtin first-
+    party, or signed third-party), missing dependencies are installed here via
+    pipmaster — this is what makes a fresh `pip install lollms-client` just work
+    on first tool use. For an untrusted (user-supplied) toolset, we do NOT
+    install: missing libraries surface as a per-call `MissingDependency` error
+    instead, so the host operator stays in control.
+
+    HARD INVARIANTS:
+      1. This function MUST NOT raise, whatever pipmaster/matplotlib does.
+      2. This function MUST be idempotent.
+      3. This function MUST NOT push a pip install through a live
+         `SandboxContext` (see the `_inside_sandbox()` guard below).
+
+    The security boundary is the *code the tool executes from its parameters*,
+    not the tool's own initialization. Runtime code never auto-installs at any
+    trust level — that separation is enforced by the execution path, whose
+    only package-install reference is the pre-existing `_ensure_import()`.
+
+    The autonomy configuration block below is the tool's own decided feature
+    (see `_prompt_user_validation`); it is unchanged and runs regardless of
+    trust level.
+    """
     global AUTONOMY_LEVEL, _AUTO_APPROVE_PYTHON, _CONFIRM_HANDLER
+
+    # ── Autonomy configuration (existing feature, trust-neutral) ──
     if config and isinstance(config, dict):
-        autonomy = config.get("autonomy_level", "safe").lower().strip()
+        autonomy = str(config.get("autonomy_level", "safe")).lower().strip()
         if autonomy in ("strict", "safe", "full_access"):
             AUTONOMY_LEVEL = autonomy
             ASCIIColors.info(f"[execute_python] Configured autonomy level: {AUTONOMY_LEVEL}")
@@ -103,15 +281,62 @@ def init_tools_library(config: dict = None) -> None:
     else:
         AUTONOMY_LEVEL = "safe"
 
+    # ── Plotting backend (harmless, always attempted) ──
     try:
-        import pipmaster as pm
-        pm.ensure_packages(["matplotlib", "pipmaster"])
         global matplotlib
         import matplotlib
-        matplotlib.use('Agg')
-    except Exception as e:
-        import ascii_colors
-        ascii_colors.ASCIIColors.warning(f"[execute_python] Failed to ensure dependencies: {e}")
+        matplotlib.use("Agg", force=False)
+    except Exception:
+        pass
+
+    trust_level = _resolve_trust_level(config)
+
+    # ── Refuse install inside a live sandbox (host responsibility) ──
+    if _inside_sandbox():
+        try:
+            inventory = check_dependencies()
+            if inventory["missing"]:
+                ASCIIColors.warning(
+                    "[execute_python] init_tools_library() invoked inside an "
+                    "active SandboxContext. Skipping dependency installation "
+                    "(that is a host responsibility, not a sandbox one). "
+                    f"Missing: {', '.join(inventory['missing'])}. "
+                    "Call `install_missing_dependencies()` from host code."
+                )
+        except Exception:
+            pass
+        return
+
+    # ── Untrusted toolsets: refuse auto-install, log, defer to runtime ──
+    if trust_level not in _TRUSTED_LEVELS:
+        try:
+            inventory = check_dependencies()
+            if inventory["missing"]:
+                ASCIIColors.warning(
+                    "[execute_python] Untrusted toolset "
+                    f"(trust_level={trust_level!r}): missing dependencies "
+                    f"{', '.join(inventory['missing'])} were NOT installed. "
+                    "A trusted toolset (trusted_builtin/trusted_signed) would "
+                    "install them; the operator can install explicitly via "
+                    "`install_missing_dependencies([...])`."
+                )
+        except Exception:
+            pass
+        return
+
+    # ── Trusted toolsets: install missing deps (never raise) ──
+    try:
+        report = install_missing_dependencies()
+        if not report.get("ok") and report.get("error"):
+            ASCIIColors.warning(
+                f"[execute_python] Dependency installation failed: "
+                f"{report['error']}"
+            )
+    except Exception as exc:
+        ASCIIColors.warning(
+            f"[execute_python] init_tools_library() caught an unexpected "
+            f"error while ensuring dependencies: {exc}"
+        )
 
 
 def _can_prompt_interactive() -> bool:
@@ -320,6 +545,29 @@ def _sanitize_host_paths(text: str) -> str:
     root = str(Path.cwd().resolve())
     sanitized = text.replace(root, ".")
     return re.sub(r'[A-Za-z]:\\(?:Users|home)[\\/][^\s"\']*', '<host-path>', sanitized)
+
+
+def _annotate_traceback(raw_traceback: str, source_code: str, script_label: str) -> str:
+    """Appends the failing source line to a sandboxed-code traceback.
+
+    Matches data_query's contract: when the child traceback names a frame in
+    `script_label` at line N, we append `    >>> LINE N: <source>` immediately
+    after that line. The LLM can then fix its own code without recounting
+    lines. Never raises.
+    """
+    if not raw_traceback:
+        return raw_traceback
+    code_lines = source_code.splitlines()
+    pattern = re.compile(r'File "' + re.escape(script_label) + r'", line (\d+)')
+    annotated: List[str] = []
+    for line in raw_traceback.splitlines():
+        annotated.append(line)
+        match = pattern.search(line)
+        if match:
+            line_no = int(match.group(1))
+            if 1 <= line_no <= len(code_lines):
+                annotated.append(f"    >>> LINE {line_no}: {code_lines[line_no - 1]}")
+    return "\n".join(annotated)
 
 
 def _window_output(text: str) -> str:
@@ -742,24 +990,25 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
 
     # ── Child reported an error ──
     if not envelope.get("success"):
+        annotated_traceback = _annotate_traceback(child_traceback, source, script_label)
         if envelope.get("sandbox_violation"):
             return {
                 "success": False,
-                "error": f"🛑 SANDBOX BLOCK: {child_traceback.strip()}",
+                "error": f"🛑 SANDBOX BLOCK: {annotated_traceback.strip()}",
                 "output": _sanitize_host_paths(_window_output(raw_output)),
                 "stderr": _sanitize_host_paths(_window_output(raw_error)),
             }
         if error_type == "TimeoutError":
             return {
                 "success": False,
-                "error": child_traceback.strip() or "Execution timed out.",
+                "error": annotated_traceback.strip() or "Execution timed out.",
                 "output": _sanitize_host_paths(_window_output(raw_output)),
                 "stderr": _sanitize_host_paths(_window_output(raw_error)),
             }
         ASCIIColors.error(f"❌ Execution Failed (child):\n{child_traceback}")
         return {
             "success": False,
-            "error": f"Execution Error:\n{_sanitize_host_paths(child_traceback)}",
+            "error": f"Execution Error:\n{_sanitize_host_paths(annotated_traceback)}",
             "output": _sanitize_host_paths(_window_output(raw_output)),
             "stderr": _sanitize_host_paths(_window_output(raw_error)),
         }

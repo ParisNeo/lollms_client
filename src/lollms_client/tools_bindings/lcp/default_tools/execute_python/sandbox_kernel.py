@@ -348,6 +348,53 @@ _SANDBOX_CACHE_ENV_MAP: Dict[str, str] = {
 _SANDBOX_CACHE_READY: set = set()
 
 
+def _compute_trusted_read_roots() -> frozenset:
+    """Directories whose contents may be READ by any frame without a path check.
+
+    Library assets — `matplotlib/mpl-data/matplotlibrc`, `matplotlib` font
+    `.ttf` files, `numpy` data files, `pandas` template data — live under the
+    interpreter's installation tree. Blocking reads of those breaks
+    `import matplotlib.pyplot` inside the sandbox (its rcParams load) and
+    font loading during plotting, while providing no real safety: the user's
+    home directory and arbitrary files remain fully sandboxed. The trusted
+    read whitelist is what distinguishes "the interpreter's own installation"
+    from "some file on the operator's disk".
+    """
+    roots: set = set()
+    for attr in ("prefix", "base_prefix", "exec_prefix"):
+        p = getattr(sys, attr, None)
+        if p:
+            try:
+                roots.add(Path(p).resolve())
+            except Exception:
+                pass
+    try:
+        import sysconfig as _sysconfig
+        for key in ("purelib", "platlib", "stdlib", "platstdlib"):
+            try:
+                p = _sysconfig.get_path(key)
+                if p:
+                    roots.add(Path(p).resolve())
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return frozenset(roots)
+
+
+_TRUSTED_READ_ROOTS: frozenset = _compute_trusted_read_roots()
+
+
+def _is_read_only_open_mode(mode: Any) -> bool:
+    """True iff `mode` is a pure read (`r`, `rb`, `rt`, ...) — no write/append/+."""
+    if not isinstance(mode, str):
+        return False
+    m = mode.lower()
+    if any(c in m for c in ("w", "a", "x", "+")):
+        return False
+    return "r" in m
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Layer A — AST static validation
 # ──────────────────────────────────────────────────────────────────────────────
@@ -610,13 +657,54 @@ from lollms_client.tools_bindings.lcp.default_tools.execute_python import sandbo
 
 _payload = _config["payload"]
 
-# ── Unpack seed locals that the parent encoded for JSON transport ──
-#    `{"__b64__": "..."}`    → bytes (fast path, used for df pickles)
-#    `{"__pickle__": "..."}` → arbitrary picklable object (classes, modules,
-#                              DataFrames, instances). This is the JSON-safe
-#                              analogue of the old multiprocessing pickle path.
-import pickle as _pickle_child
+# ── Bind seed modules by IMPORT, never by pickle ──
+#    `seed_imports = {alias: import_path}`. Modules are imported through the
+#    child's own stdlib `__import__` BEFORE `SandboxContext` is entered — no
+#    pickle-by-reference (which is fragile for extension modules and crashes
+#    the child on Windows for numpy/pandas/matplotlib), no module-identity
+#    games. Optional deps (e.g. `plt` when matplotlib is absent) fail
+#    non-fatally: the user code will simply not see the alias.
 _seed = _payload.get("seed_locals") or {}
+_seed_imports = _payload.get("seed_imports") or {}
+for _alias, _modpath in _seed_imports.items():
+    try:
+        _seed[_alias] = __import__(_modpath)
+        # `__import__("matplotlib.pyplot")` returns the top-level `matplotlib`
+        # package, not `.pyplot`. Resolve the leaf explicitly.
+        if "." in _modpath:
+            _leaf = _modpath.rsplit(".", 1)[1]
+            _seed[_alias] = getattr(_seed[_alias], _leaf, _seed[_alias])
+    except Exception:
+        # Non-fatal: leave the alias unbound. User code that references it
+        # gets a clean NameError (or, in strict mode, the AST + runtime
+        # filter will have already produced a more precise diagnostic).
+        pass
+
+# ── Force matplotlib Agg backend in the child ──
+# CRITICAL: this must happen in the child process, BEFORE Pyplot is first
+# rendered. The parent process may have loaded a GUI-capable Qt binding
+# (PySide6/PyQt/Playwright), and matplotlib's auto-backend-picker can pick
+# QtAgg or another interactive backend even in a headless subprocess. A
+# `savefig` on a non-Agg backend in a headless child crashes the interpreter
+# at the C level (`AccessViolation`, exit code 0xFFFFFFFF on Windows) BEFORE
+# the worker can send its envelope — the exact failure mode this block fixes.
+#
+# `force=True` rebinds the backend even if `matplotlib.pyplot` was already
+# imported (which it has been, via `seed_imports` above). Guarded so a
+# missing/broken matplotlib never blocks execution.
+try:
+    import matplotlib as _mpl_child
+    _mpl_child.use("Agg", force=True)
+except Exception:
+    pass
+_payload["seed_locals"] = _seed
+
+# ── Unpack seed values that the parent encoded for JSON transport ──
+#    `{"__b64__": "..."}`    → bytes (fast path, used for df pickles)
+#    `{"__pickle__": "..."}` → picklable VALUES only (DataFrames, instances of
+#                              pure-Python classes). Extension modules MUST
+#                              travel via `seed_imports` above, not here.
+import pickle as _pickle_child
 for _k, _v in list(_seed.items()):
     if isinstance(_v, dict) and set(_v.keys()) == {"__b64__"}:
         try:
@@ -780,6 +868,13 @@ def _sandbox_child_worker(conn, payload: Dict[str, Any]) -> None:
                     break
 
             try:
+                # Defensive re-bind: even if user code switched backends or
+                # this module somehow bypassed the bootstrap force (edge
+                # cases, exotic loads), rendering MUST go through the
+                # non-interactive Agg backend — anything else crashes the
+                # child natively on headless systems.
+                import matplotlib as _mpl_harvest
+                _mpl_harvest.use("Agg", force=True)
                 import matplotlib.pyplot as _plt_child
                 for _fnum in _plt_child.get_fignums():
                     _fig = _plt_child.figure(_fnum)
@@ -829,8 +924,19 @@ def run_in_sandboxed_child(
     seed_locals: Optional[Dict[str, Any]] = None,
     persist_df_name: Optional[str] = None,
     hard_timeout: float = _CHILD_HARD_TIMEOUT_DEFAULT,
+    seed_imports: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Executes `source` in a sandboxed child process. Returns the envelope.
+
+    `seed_imports` is a `{alias: import_path}` map: for each entry the child
+    imports `import_path` via its own raw `__import__` (before the sandbox is
+    entered) and binds the result under `alias` in the user namespace. Use this
+    for **modules** — never pickle modules through `seed_locals`: pickling them
+    stores by reference and re-imports in the child with fragile semantics for
+    extension modules (numpy/pandas/matplotlib), which on Windows can either
+    silently drop the binding (NameError) or crash the child mid-import
+    (0xFFFFFFFF / ACCESS_VIOLATION). Only **data values** belong in
+    `seed_locals`, where pickle is the correct transport.
 
     The parent process is NEVER patched. Everything that happens between the
     child's first byte and last byte lives in that child's address space and
@@ -913,6 +1019,10 @@ def run_in_sandboxed_child(
         if _enc is not None or _v is None:
             seed_locals_safe[_k] = _enc
 
+    # `seed_imports` is passed verbatim — it contains only str→str pairs and
+    # travels through JSON trivially. The child resolves each one with its own
+    # `__import__` before entering `SandboxContext`, avoiding the fragile
+    # pickle-by-reference round-trip that extension modules cannot survive.
     payload = {
         "source": source,
         "workspace_root": str(workspace_root),
@@ -920,6 +1030,7 @@ def run_in_sandboxed_child(
         "script_label": script_label,
         "argv": list(argv or [script_label]),
         "seed_locals": seed_locals_safe,
+        "seed_imports": dict(seed_imports or {}),
         "persist_df_name": persist_df_name,
     }
     config_blob = _json.dumps({
@@ -1079,44 +1190,52 @@ def _caller_is_user_code() -> bool:
     return False
 
 
-def _resolve_within(root: Path, target: Any) -> Path:
+def _resolve_within(root: Path, target: Any, allow_trusted_read: bool = False) -> Path:
     """Fast path-guard: returns the resolved target, raises if outside `root`.
 
+    `allow_trusted_read=True` extends the accepted roots to `_TRUSTED_READ_ROOTS`
+    (the interpreter's own installation tree). It is set ONLY for read-only
+    file opens — writes into system directories remain forbidden. This is what
+    lets `import matplotlib.pyplot` read its `matplotlibrc` and load its own
+    fonts inside the sandbox, without opening any hole for user-supplied
+    paths (`~/secret.csv`, `/etc/passwd`, `%TEMP%/victim.csv`) — those live
+    outside both `root` and the trusted roots and stay blocked.
+
     PERFORMANCE: We avoid the expensive `Path.resolve()` on every call.
-    `Path.resolve()` performs symlink expansion + multiple `os.stat` syscalls.
-    For relative paths that contain no `..` and are not absolute, they are
-    guaranteed to be under the CWD already — the caller (sandbox) guarantees
-    CWD == root at install time. We only fall back to full resolution for:
-      - absolute paths (must be sub-path of root)
-      - paths containing `..` (traversal check required)
-      - Windows drive-qualified paths
+    Relative paths without `..` are guaranteed under the CWD (== root).
     """
     try:
         if isinstance(target, int):
             # Already an open file descriptor — no path to check, pass through.
-            # FDs are only obtainable via os.open() which is already path-guarded.
-            return Path.cwd()  # arbitrary in-root placeholder; caller ignores
-        # PERF: avoid os.fspath() syscalls for the common `str` case.
+            return Path.cwd()
         if isinstance(target, str):
             target_str = target
         else:
             target_str = os.fspath(target)
             if not isinstance(target_str, str):
                 target_str = str(target_str)
-        # Fast path: relative & no traversal segment → inherently inside root.
         if (
             target_str
             and not os.path.isabs(target_str)
             and ".." not in target_str.replace("\\", "/").split("/")
         ):
             return Path(root) / target_str
-        # Slow path: absolute or contains traversal → full resolution.
         p = Path(target_str)
         if not p.is_absolute():
             p = Path.cwd() / p
         resolved = p.resolve(strict=False)
-        resolved.relative_to(root)
-        return resolved
+        try:
+            resolved.relative_to(root)
+            return resolved
+        except ValueError:
+            if allow_trusted_read:
+                for trusted_root in _TRUSTED_READ_ROOTS:
+                    try:
+                        resolved.relative_to(trusted_root)
+                        return resolved
+                    except ValueError:
+                        continue
+            raise
     except (ValueError, OSError) as exc:
         raise SandboxPermissionError(
             f"🛑 BLOCKED BY SANDBOX: path '{target}' resolves outside the workspace."
@@ -1512,11 +1631,11 @@ class SandboxContext:
         # 5-frame pandas call to open() slipped through) and unstable (it
         # flipped allow/deny based on library call-stack depth).
         def _guarded_open(file, mode="r", *args, **kwargs):
-            _resolve_within(root, file)
+            _resolve_within(root, file, allow_trusted_read=_is_read_only_open_mode(mode))
             return orig_open(file, mode, *args, **kwargs)
 
         def _guarded_io_open(file, mode="r", *args, **kwargs):
-            _resolve_within(root, file)
+            _resolve_within(root, file, allow_trusted_read=_is_read_only_open_mode(mode))
             return orig_io_open(file, mode, *args, **kwargs)
 
         builtins.open = _guarded_open
@@ -1674,29 +1793,21 @@ class SandboxContext:
         to succeed inside `.sandbox_cache/`.
         """
         def guard(this, *args, **kwargs):
-            # PERF: sub-millisecond "relative & no .." check is the ONLY thing
-            # done for well-behaved paths. `resolve(strict=False).relative_to`
-            # is only paid when the argument is absolute OR contains '..'.
-            try:
-                ts = str(this)
-                if ts and not os.path.isabs(ts) and ".." not in ts.replace("\\", "/").split("/"):
-                    pass  # Fast path: relative sub-path (sandbox CWD == root).
-                else:
-                    Path(this).resolve(strict=False).relative_to(root)
-            except (ValueError, OSError) as exc:
-                raise SandboxPermissionError(
-                    f"🛑 BLOCKED BY SANDBOX: Path.{method_name}() target "
-                    f"'{this}' resolves outside the workspace."
-                ) from exc
+            # `Path.open(mode)` is the one mutating-method surface that can be
+            # a pure read — allow it to consult trusted read roots, exactly
+            # like `_guarded_open`. Every other method in the set is a write
+            # and keeps the strict workspace boundary.
+            allow_read = (
+                method_name == "open"
+                and bool(args)
+                and _is_read_only_open_mode(args[0])
+            )
+            ts = str(this)
+            if not (ts and not os.path.isabs(ts) and ".." not in ts.replace("\\", "/").split("/")):
+                _resolve_within(root, this, allow_trusted_read=allow_read)
             if method_name in ("rename", "replace", "symlink_to", "hardlink_to", "link_to") and args:
-                try:
-                    ds = str(args[0])
-                    if not (ds and not os.path.isabs(ds) and ".." not in ds.replace("\\", "/").split("/")):
-                        Path(args[0]).resolve(strict=False).relative_to(root)
-                except (ValueError, OSError) as exc:
-                    raise SandboxPermissionError(
-                        f"🛑 BLOCKED BY SANDBOX: Path.{method_name}() destination "
-                        f"'{args[0]}' resolves outside the workspace."
-                    ) from exc
+                ds = str(args[0])
+                if not (ds and not os.path.isabs(ds) and ".." not in ds.replace("\\", "/").split("/")):
+                    _resolve_within(root, args[0])
             return orig_method(this, *args, **kwargs)
         return guard

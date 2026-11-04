@@ -186,3 +186,8 @@ critic.md
 compare.md
 
 MagicMock
+.sandbox_cache
+.lollms_metadata
+.vscode
+
+lollms_code_test

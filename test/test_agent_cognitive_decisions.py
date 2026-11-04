@@ -7,6 +7,7 @@ Comprehensive Cognitive Decision-Making & Multi-Turn Tool Chaining Test Suite.
 """
 
 import sys
+import re
 import json
 import unittest
 from pathlib import Path
@@ -22,15 +23,29 @@ from ascii_colors import ASCIIColors
 
 
 class _ToolDispatchRecorder:
-    """Records tool dispatches via the engine's real event stream.
+    """Records tool dispatches across ALL event modes.
 
-    The ChatMixin never emits MSG_TYPE_TOOL_CALL; it emits
-    MSG_TYPE_TOOL_START when a tool begins execution and
-    MSG_TYPE_TOOL_END when it completes. This recorder listens to both
-    so tests can assert on the actual event contract.
+    The engine has THREE disjoint dispatch-event channels depending on
+    ``event_mode``:
+
+      * ``FULL_CALLBACK_MODE`` / ``MIXED_MODE`` → ``MSG_TYPE_TOOL_START`` +
+        ``MSG_TYPE_TOOL_END`` are emitted directly on the callback.
+      * ``PROCESSING_TAG_MODE`` (the default) → neither event fires; instead
+        the dispatch is rendered as a ``<processing type="tool">`` block in
+        ``ai_message.content``.
+      * Regardless of mode → ``ai_message.metadata["tool_calls"]`` is
+        populated by ``_persist_round_state``.
+
+    This recorder captures the callback events (when the mode emits them),
+    and ``dispatched_from_result()`` reads the authoritative metadata +
+    processing-block signals from the returned message — so tests work
+    under every ``event_mode``.
     """
 
-    _DISPATCH_EVENTS = (MSG_TYPE.MSG_TYPE_TOOL_START, MSG_TYPE.MSG_TYPE_TOOL_END)
+    _TOOL_PROCESSING_RE = re.compile(
+        r'<processing\s+type=["\']tool["\']\s+title=["\']Tool Execution:\s*([^"\']+)["\']',
+        re.IGNORECASE,
+    )
 
     def __init__(self) -> None:
         self.dispatched: List[str] = []
@@ -40,13 +55,39 @@ class _ToolDispatchRecorder:
         meta = meta or {}
         if msg_type == MSG_TYPE.MSG_TYPE_TOOL_START:
             name = meta.get("tool_name") or meta.get("tool")
-            if name:
+            if name and name not in ("memory_search", "tool_refused"):
                 self.dispatched.append(name)
         elif msg_type == MSG_TYPE.MSG_TYPE_TOOL_END:
             name = meta.get("tool_name") or meta.get("tool")
             if name:
                 self.finished.append(name)
         return True
+
+    def dispatched_from_result(self, ai_message) -> List[str]:
+        """Returns tool names dispatched this turn, mode-independent.
+
+        Combines three sources in priority order:
+          1. Callback events captured during the turn (FULL/MIXED modes).
+          2. ``ai_message.metadata["tool_calls"]`` (populated by the engine
+             in every event_mode).
+          3. ``<processing type="tool" title="Tool Execution: NAME">`` blocks
+             left in ``ai_message.content`` (PROCESSING_TAG_MODE).
+        """
+        names: List[str] = list(self.dispatched)
+
+        meta = getattr(ai_message, "metadata", None) or {}
+        for call in meta.get("tool_calls", []) or []:
+            name = call.get("name") if isinstance(call, dict) else None
+            if name and name not in names:
+                names.append(name)
+
+        content = getattr(ai_message, "content", "") or ""
+        for m in self._TOOL_PROCESSING_RE.finditer(content):
+            name = m.group(1).strip()
+            if name and name not in names:
+                names.append(name)
+
+        return names
 
 
 class MockGemmaAgentClient:
@@ -325,7 +366,7 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
             enable_artefacts=True
         )
 
-        tools_called = recorder.dispatched
+        tools_called = recorder.dispatched_from_result(res.get("ai_message"))
         success = len(tools_called) == 0
         self.report_cards.append({
             "name": "Scenario A: Conversational Intent Classification",
@@ -359,7 +400,7 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
             enable_memory=False,
             enable_artefacts=True
         )
-        tools_called = recorder.dispatched
+        tools_called = recorder.dispatched_from_result(res.get("ai_message"))
 
         updated_art = self.discussion.artefacts.get("math_ops.py")
         success = (
@@ -423,7 +464,7 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
         )
 
         self.client.tools = original_tools_binding
-        tools_called = recorder.dispatched
+        tools_called = recorder.dispatched_from_result(res.get("ai_message"))
 
         final_content = res.get("ai_message").content or ""
 
@@ -494,7 +535,7 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
         )
 
         self.client.tools = original_tools_binding
-        tools_called = recorder.dispatched
+        tools_called = recorder.dispatched_from_result(res.get("ai_message"))
 
         final_content = res.get("ai_message").content or ""
 
