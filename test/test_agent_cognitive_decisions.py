@@ -21,6 +21,34 @@ from lollms_client.lollms_types import MSG_TYPE
 from ascii_colors import ASCIIColors
 
 
+class _ToolDispatchRecorder:
+    """Records tool dispatches via the engine's real event stream.
+
+    The ChatMixin never emits MSG_TYPE_TOOL_CALL; it emits
+    MSG_TYPE_TOOL_START when a tool begins execution and
+    MSG_TYPE_TOOL_END when it completes. This recorder listens to both
+    so tests can assert on the actual event contract.
+    """
+
+    _DISPATCH_EVENTS = (MSG_TYPE.MSG_TYPE_TOOL_START, MSG_TYPE.MSG_TYPE_TOOL_END)
+
+    def __init__(self) -> None:
+        self.dispatched: List[str] = []
+        self.finished: List[str] = []
+
+    def __call__(self, chunk, msg_type, meta=None) -> bool:
+        meta = meta or {}
+        if msg_type == MSG_TYPE.MSG_TYPE_TOOL_START:
+            name = meta.get("tool_name") or meta.get("tool")
+            if name:
+                self.dispatched.append(name)
+        elif msg_type == MSG_TYPE.MSG_TYPE_TOOL_END:
+            name = meta.get("tool_name") or meta.get("tool")
+            if name:
+                self.finished.append(name)
+        return True
+
+
 class MockGemmaAgentClient:
     """
     High-fidelity Mock Client simulating Gemma's cognitive tokens
@@ -288,19 +316,16 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
         
         user_message = "Hello Lollms! I hope you are having an amazing day."
         
-        tools_called = []
-        def relay(chunk, msg_type, meta=None):
-            if msg_type == MSG_TYPE.MSG_TYPE_TOOL_CALL:
-                tools_called.append(meta.get("tool"))
-            return True
+        recorder = _ToolDispatchRecorder()
 
         res = self.discussion.chat(
             user_message=user_message,
-            streaming_callback=relay,
+            streaming_callback=recorder,
             enable_memory=False,
             enable_artefacts=True
         )
 
+        tools_called = recorder.dispatched
         success = len(tools_called) == 0
         self.report_cards.append({
             "name": "Scenario A: Conversational Intent Classification",
@@ -326,18 +351,15 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
 
         user_message = "Please update math_ops.py to add a safe_divide(a, b) function."
 
-        tools_called = []
-        def relay(chunk, msg_type, meta=None):
-            if msg_type == MSG_TYPE.MSG_TYPE_TOOL_CALL:
-                tools_called.append(meta.get("tool"))
-            return True
+        recorder = _ToolDispatchRecorder()
 
         res = self.discussion.chat(
             user_message=user_message,
-            streaming_callback=relay,
+            streaming_callback=recorder,
             enable_memory=False,
             enable_artefacts=True
         )
+        tools_called = recorder.dispatched
 
         updated_art = self.discussion.artefacts.get("math_ops.py")
         success = (
@@ -389,15 +411,11 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
             }
         }
 
-        tools_called = []
-        def relay(chunk, msg_type, meta=None):
-            if msg_type == MSG_TYPE.MSG_TYPE_TOOL_CALL:
-                tools_called.append(meta.get("tool"))
-            return True
+        recorder = _ToolDispatchRecorder()
 
         res = self.discussion.chat(
             user_message=user_message,
-            streaming_callback=relay,
+            streaming_callback=recorder,
             tools=active_tools,
             enable_memory=False,
             enable_artefacts=True,
@@ -405,6 +423,7 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
         )
 
         self.client.tools = original_tools_binding
+        tools_called = recorder.dispatched
 
         final_content = res.get("ai_message").content or ""
 
@@ -463,15 +482,11 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
             }
         }
 
-        tools_called = []
-        def relay(chunk, msg_type, meta=None):
-            if msg_type == MSG_TYPE.MSG_TYPE_TOOL_CALL:
-                tools_called.append(meta.get("tool"))
-            return True
+        recorder = _ToolDispatchRecorder()
 
         res = self.discussion.chat(
             user_message=user_message,
-            streaming_callback=relay,
+            streaming_callback=recorder,
             tools=active_tools,
             enable_memory=False,
             enable_artefacts=True,
@@ -479,6 +494,7 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
         )
 
         self.client.tools = original_tools_binding
+        tools_called = recorder.dispatched
 
         final_content = res.get("ai_message").content or ""
 

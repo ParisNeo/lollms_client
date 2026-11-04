@@ -12,12 +12,18 @@ from pathlib import Path
 
 import pytest
 
-# Make the module importable regardless of working directory.
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+# Make the *inner* `src/` directory importable so `lollms_client` resolves
+# directly. We deliberately do NOT put the repo root on sys.path and do NOT
+# import via `src.lollms_client`: the top-level name `src` is hijackable by an
+# unrelated PyPI package of the same name (`site-packages/src/__init__.py`),
+# which would shadow the repo tree and crash on its own missing deps
+# (`ModuleNotFoundError: No module named 'VirtEnv'`). See scripts/verify_sandbox.py
+# and test/test_workspace_persistence.py for the canonical import pattern.
+_SRC_DIR = Path(__file__).resolve().parent.parent / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
 
-from src.lollms_client.tools_bindings.lcp.default_tools.workspace_tools import workspace_tools as wt
+from lollms_client.tools_bindings.lcp.default_tools.workspace_tools import workspace_tools as wt
 
 
 @pytest.fixture
