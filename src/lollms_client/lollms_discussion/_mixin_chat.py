@@ -1383,45 +1383,60 @@ class _StreamState:
         # ── 🛡️ INLINE TAG QUARANTINE (CRITICAL FIX) ──
         # If a functional tag appears in the buffer but is NOT at the absolute start
         # of a line (ignoring whitespace), it is conversational prose and MUST NOT
-        # be intercepted. We flush all text before it, then consume the tag and
-        # emit it directly to the UI as raw text.
+        # be intercepted. The tag and its surrounding prose MUST pass through
+        # VERBATIM to the UI/DB — the parser must NOT consume or strip ANY part of
+        # the tag (not even the opening `<artifact` prefix), because doing so
+        # corrupts the user-visible text and breaks code-fence/inline demos.
+        #
+        # Implementation contract:
+        #   • When EVERY functional-tag prefix in the buffer is either absent or
+        #     occurs strictly inline (not at line start), we simply SKIP all
+        #     further interception and fall through to the default forwarding
+        #     path, which emits the raw text (including the full tag) unchanged.
+        #   • When a functional-tag prefix IS found at line start, we do NOT
+        #     intervene here — normal tag interception handles it downstream.
+        #
+        # This replaces a previous "flush + consume the prefix" strategy that
+        # split the tag (leaving ` name="..." >body` without the opener) and
+        # destroyed the message text.
         if not is_inside_thoughts and not self._is_accumulating_tool and not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_secondary and not self._in_code_fence:
             inline_tag_found = False
-            # CRITICAL: Check for exact opening tags (e.g., "<tool>") and tag prefixes with attributes (e.g., "<artifact ")
-            # REMOVED "<lollms_inline" so the host application can handle it directly.
+            line_start_tag_found = False
             for tag_prefix in ("<artifact", "<artefact", "<tool", "<note", "<skill", "<scratchpad", "<lollms_form", "<generate_image", "<edit_image", "<generate_video", "<unlock_file", "<lock_file", "<hide_file"):
                 idx = self._pending_buffer.find(tag_prefix)
-                if idx != -1:
-                    # Check if it's at the absolute start of a line
-                    is_at_line_start = True
-                    i = idx - 1
-                    while i >= 0 and self._pending_buffer[i] != '\n':
-                        if not self._pending_buffer[i].isspace():
-                            is_at_line_start = False
-                            break
-                        i -= 1
+                if idx == -1:
+                    continue
+                # Check if it's at the absolute start of a line
+                is_at_line_start = True
+                i = idx - 1
+                while i >= 0 and self._pending_buffer[i] != '\n':
+                    if not self._pending_buffer[i].isspace():
+                        is_at_line_start = False
+                        break
+                    i -= 1
+                if is_at_line_start:
+                    line_start_tag_found = True
+                else:
+                    inline_tag_found = True
 
-                    if not is_at_line_start:
-                        # It's an inline tag! Flush text before it, then emit the tag raw.
-                        text_before = self._pending_buffer[:idx]
-                        if text_before:
-                            self.ai_message.content += text_before
-                            _cb(self.callback, text_before, MSG_TYPE.MSG_TYPE_CHUNK)
-
-                        # Emit the tag itself directly to the UI
-                        self.ai_message.content += tag_prefix
-                        _cb(self.callback, tag_prefix, MSG_TYPE.MSG_TYPE_CHUNK)
-
-                        # Consume the processed parts from the pending buffer
-                        self._pending_buffer = self._pending_buffer[idx + len(tag_prefix):]
-                        inline_tag_found = True
-                        break # Restart the feed loop for the rest of the buffer
-
-            if inline_tag_found:
+            # If any inline occurrence exists AND no line-start occurrence exists,
+            # skip ALL interception: the whole buffer is conversational prose that
+            # must be forwarded verbatim (including the full functional tag text).
+            # If a line-start occurrence exists, let normal interception handle it.
+            if inline_tag_found and not line_start_tag_found:
+                # Forward the ENTIRE pending buffer verbatim and clear it.
+                self.ai_message.content += self._pending_buffer
+                _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
+                self._pending_buffer = ""
                 return True
 
         # ── Handle <artifact> Streaming (State-Driven Dual-Stream) ──
-        if not is_inside_thoughts:
+        # CRITICAL: While inside a markdown code fence, artifact detection MUST
+        # NOT run. Otherwise an `<artifact …>` demo shown inside ```xml … ``` is
+        # intercepted as a live functional tag (the fence buffer's `elif`
+        # catch is what should own this chunk). The guard below makes the
+        # blocker structural, not order-dependent.
+        if not is_inside_thoughts and not self._in_code_fence:
             # State 1: We are already inside an artifact (tracker is active)
             if self.artefact_tracker.is_inside_artefact:
                 # Track if we received actual content (for heartbeat suppression)
@@ -1737,7 +1752,9 @@ class _StreamState:
                         return True
 
         # ── Handle <tool> Streaming ──
-        if not is_inside_thoughts:
+        # CRITICAL: Skip when inside a code fence so tool-tag examples in
+        # ```…``` blocks are preserved verbatim, never dispatched.
+        if not is_inside_thoughts and not self._in_code_fence:
             # STRICT WHITELIST: Only match if the <tool> tag starts at the absolute beginning of a line (ignoring whitespace).
             # CRITICAL FIX: Exclude lines that start with markdown table/code characters (` or |)
             open_tool_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<tool>', self._pending_buffer, re.IGNORECASE)
@@ -10514,32 +10531,24 @@ class ChatMixin:
         ai_msg.content = re.sub(r'<round\s+id=["\'][^"\']*["\']\s*/?>\n?', '', ai_msg.content, flags=re.IGNORECASE)
         ai_msg.content = re.sub(r'\[🔒[^\]]*\]', '', ai_msg.content).strip()
 
-        # ── 🛡️ FINAL ARTEFACT-FAMILY TAG SWEEP ──
-        # The Dual-Stream Buffer is meant to keep raw artifact XML out of
-        # ai_msg.content, but partial/edge streams can slip a stray opening or
-        # closing artifact tag through. Sweep them from the persisted message so
-        # the UI never renders leaked artifact markup. Dispatched artifacts have
-        # already been rewritten into <processing> blocks by _StreamState, so a
-        # raw <artifact>/<artefact> tag here is always a leak.
+        # ── 🛡️ DOCTRINE: NO POST-GENERATION ARTIFACT TAG SWEEP ──
+        # The Dual-Stream Buffer is the SOLE owner of artifact tag lifecycle:
+        #   • A live dispatch is intercepted in the stream parser and rewritten
+        #     into a <processing type="artefact" …> block — the raw tag NEVER
+        #     reaches ai_msg.content.
+        #   • An inline occurrence (surrounded by prose, not at line-start)
+        #     and any occurrence inside a ```…``` fence are EXPLICITLY
+        #     preserved verbatim as user-visible transcript text.
+        # Any raw <artifact>/<artefact> tag that reaches this point therefore
+        # belongs to one of those legitimate-preservation paths, and MUST be
+        # kept byte-for-byte. A blunt regex sweep here would silently rewrite
+        # the user-visible message (fenced demos, inline documentation), which
+        # is exactly the corruption this contract forbids.
         #
-        # Incomplete trailing fragments (e.g. `<artifact` or `</artifact` with
-        # no `>`) are swept too, with the trailing `(?:>)?` — a fragment that
-        # never completed can never be dispatched and must not survive into the
-        # final message.
-        ai_msg.content = re.sub(
-            r'(?is)<(?:artifact|artefact)\b[^>]*?>.*?</(?:artifact|artefact)>',
-            '',
-            ai_msg.content,
-        )
-        ai_msg.content = re.sub(
-            r'(?is)</?(?:artifact|artefact)\b[^>]*?(?:>)?',
-            '',
-            ai_msg.content,
-        ).strip()
-
-        # The Dual-Stream Buffer architecture now ensures raw <artifact> XML 
-        # never enters ai_msg.content in the first place, so no post-generation
-        # regex cleanup is required.
+        # Defense-in-depth for stray live-dispatch leaks remains inside the
+        # stream parser itself (_FINAL ARTEFACT-FAMILY TAG SUPPRESSION on the
+        # pending buffer before default forwarding), where fence/prose context
+        # is still available to decide correctly. No second sweep is needed.
 
         # ── 🛡️ AUTO-CORRECT HALLUCINATED FILENAMES ──
         # Scan through the tool executions of this turn and fix any mismatched filenames
