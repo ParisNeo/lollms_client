@@ -39,7 +39,14 @@ _MAX_SCREENSHOT_BASE64_CHARS = 6_000_000
 _GROUNDING_MAX_RETRIES = 2
 _VLM_N_PREDICT = 600
 _GRID_STEP = 100
-_POST_ACTION_SETTLE_S = 0.4
+# Post-action settle time before the verification screenshot is captured.
+# 0.4s was too short for real UIs (Chrome page loads, Windows Start menu
+# animations, dropdown transitions, app launches): the model received a
+# screenshot of a half-loaded UI, concluded its click had failed, and
+# re-clicked — diverging the loop. 1.0s is a safer default; tools that
+# trigger known-slow transitions (page loads, app launches) request a
+# longer settle via the `settle` parameter of `_post_action_result`.
+_POST_ACTION_SETTLE_S = 1.0
 
 
 def init_tools_library(config: Optional[dict] = None) -> None:
@@ -744,6 +751,7 @@ def tool_computer_click(
         f"({x}, {y}) on the grid — if the red circle is NOT on the intended "
         f"element, re-estimate coordinates from the grid labels and click again.",
         {"x": x, "y": y},
+        settle_s=1.5,
     )
 
 
@@ -1020,9 +1028,13 @@ def tool_computer_type(
         return {"success": False, "error": _sanitize_error(f"Typing failed: {type_err}")}
 
     enter_note = " Enter pressed." if press_enter else ""
+    # Typing often triggers autocomplete / search-as-you-type / form
+    # validation, so allow a slightly longer settle so the verification
+    # screenshot reflects the settled state.
     return _post_action_result(
         f"Typed {len(text)} characters.{enter_note}",
         {"typed_chars": len(text)},
+        settle_s=1.5,
     )
 
 
@@ -1077,9 +1089,12 @@ def tool_computer_key(
     except Exception as key_err:
         return {"success": False, "error": _sanitize_error(f"Key press failed: {key_err}")}
 
+    # Key presses frequently trigger navigation / app launches / dialogs.
+    # Give them a longer settle so the verification screenshot is meaningful.
     return _post_action_result(
         f"Pressed '{key_normalized}' {presses} time(s).",
         {},
+        settle_s=2.0,
     )
 
 
@@ -1136,7 +1151,19 @@ def tool_computer_wait(
     env: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
-    Pauses execution briefly to allow an application to open, a webpage to load, or an animation to complete.
+    Pauses execution to let an application open, a webpage load, or an
+    animation complete — then returns a FRESH screenshot of the settled state.
+
+    This is the canonical "wait then look" primitive. Use it whenever the
+    previous action triggered a slow transition (app launch, page load, menu
+    animation, dialog fade-in) and the current screenshot does not yet show
+    the expected change. Do NOT blindly re-click the same target when a
+    transition is still in progress — call this tool instead. It returns a
+    fresh, grid-annotated screenshot in the same result so you can see the
+    settled state without a second `tool_computer_screenshot` call.
+
+    The requested delay is honored EXACTLY (no extra settle is added before
+    the verification screenshot — the caller already specified the delay).
 
     Args:
         seconds (float): Seconds to wait (clamped between 0.1 and 10.0 seconds). Default 1.0.
@@ -1149,9 +1176,19 @@ def tool_computer_wait(
         dur = 1.0
 
     time.sleep(dur)
+    # Explicit wait: the caller already specified the delay, so no additional
+    # settle is needed before the verification screenshot. The screenshot IS
+    # the point of this tool — the model needs to SEE the settled state, not
+    # just read "I waited". Without the fresh pixels attached, the model
+    # keeps reasoning over the STALE screenshot from the previous action and
+    # concludes "the screen appears unchanged" — the exact failure mode that
+    # wedges the OBSERVE→ACT→VERIFY loop.
     result = _post_action_result(
-        f"Waited {dur:.2f} seconds for the system/UI to settle.",
+        f"Waited {dur:.2f} seconds for the system/UI to settle. "
+        f"The attached screenshot shows the CURRENT screen state after the wait — "
+        f"inspect it to confirm the transition completed before acting again.",
         {"seconds": dur},
+        settle_s=0.0,
     )
     result["duration_s"] = dur
     return result
@@ -1338,18 +1375,34 @@ def _capture_annotated_b64(
     return b64, width, height
 
 
-def _post_action_result(action_desc: str, extra: Dict[str, Any]) -> Dict[str, Any]:
+def _post_action_result(
+    action_desc: str,
+    extra: Dict[str, Any],
+    settle_s: Optional[float] = None,
+) -> Dict[str, Any]:
     """
     Builds the result of a desktop action: waits briefly for the UI to settle,
     captures a grid-annotated, cursor-highlighted verification screenshot, saves
     it to the workspace, and reports the cursor position alongside the action.
     The LLM sees the immediate consequence of its action on the next turn.
 
+    Args:
+        action_desc: Human-readable description of what was just done.
+        extra: Extra key/value pairs to merge into the result dict.
+        settle_s: Optional override for the pre-screenshot settle wait.
+            When None, uses ``_POST_ACTION_SETTLE_S`` (1.0s). Actions that
+            trigger known-slow transitions (page loads, app launches) pass a
+            larger value (e.g. 2.0–3.0s) so the verification screenshot shows
+            the settled UI, not a half-loaded one.
+
     NOTE: The verification screenshot ALWAYS has the grid (show_grid=True) to
     preserve the vision-grounding contract for subsequent actions.
     """
+    effective_settle = (
+        max(0.0, float(settle_s)) if settle_s is not None else _POST_ACTION_SETTLE_S
+    )
     try:
-        time.sleep(_POST_ACTION_SETTLE_S)
+        time.sleep(effective_settle)
         backend = _require_backend()
         cursor_x, cursor_y = int(backend.position()[0]), int(backend.position()[1])
     except Exception:
@@ -1360,8 +1413,14 @@ def _post_action_result(action_desc: str, extra: Dict[str, Any]) -> Dict[str, An
         "output": action_desc
         + (
             f" Cursor is now at ({cursor_x}, {cursor_y}). "
+            f"(Settled {effective_settle:.2f}s before capture.) "
             "Verify on the attached screenshot that the cursor is on the "
-            "intended target and the UI shows the expected change."
+            "intended target and the UI shows the expected change. "
+            "⚠️ If the expected change is NOT yet visible (app still loading, "
+            "menu still animating, page still rendering), do NOT re-click the "
+            "same target — call `tool_computer_wait` with a longer delay "
+            "(e.g. 2-3 seconds). It returns a FRESH screenshot of the settled "
+            "state so you can verify before acting again."
         ),
     }
     result.update(extra)

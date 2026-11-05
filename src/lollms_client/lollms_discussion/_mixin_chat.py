@@ -33,6 +33,7 @@ from lollms_client.lollms_artefact import ArtefactType, make_image_id, ArtefactV
 from lollms_client.lollms_memory import FailureMemory
 from lollms_client.lollms_chat_core import _is_tool_binding
 from lollms_client.lollms_artefact import ArtefactVisibility, ArtefactType
+from lollms_client.llm_bindings._tool_loop import _MAX_TOOL_ROUNDS_CEILING
 from ._context_sanitizer import scrub_processing_and_status_blocks
 
 _MAX_BRACKET_BUF = 256
@@ -397,6 +398,64 @@ _REPEATABLE_OBSERVATION_TOOLS = {
     "tool_computer_cursor_position",
     "tool_computer_wait",
 }
+
+# ── 🚀 TOOLS WITHOUT FILE SIDE EFFECTS (SNAPSHOT SKIP LIST) ──
+# The chat loop takes a before/after workspace snapshot around every tool
+# call to detect newly created or modified files, then registers them as
+# artifacts. That snapshot is a full `rglob("*")` walk + per-file stat,
+# which is cheap — BUT the diff is guaranteed empty for tools that never
+# touch the workspace. For the computer-use family (screenshot, click,
+# type, key, scroll, drag, move, mouse down/up, wait, desktop_info,
+# cursor_position), the snapshot is pure overhead that doubles the
+# per-call latency and makes the OBSERVE→ACT→VERIFY loop feel sluggish.
+#
+# This set is an OPTIMIZATION allowlist, not a correctness gate: any tool
+# NOT listed here still gets the full before/after snapshot. Adding a
+# tool here is safe ONLY when the tool is documented to never write to
+# the workspace CWD.
+_TOOLS_WITHOUT_FILE_SIDE_EFFECTS = frozenset({
+    # Computer-use observation + action tools (desktop automation).
+    "tool_computer_screenshot",
+    "tool_computer_desktop_info",
+    "tool_computer_cursor_position",
+    "tool_computer_wait",
+    "tool_computer_click",
+    "tool_computer_move_cursor",
+    "tool_computer_mouse_down",
+    "tool_computer_mouse_up",
+    "tool_computer_drag",
+    "tool_computer_type",
+    "tool_computer_key",
+    "tool_computer_scroll",
+    # Pure read-only inspection tools that never write to the workspace.
+    "tool_list_files",
+    "tool_find_files",
+    "tool_grep_files",
+    "tool_read_file",
+    "tool_read_lines",
+    "tool_read_chars",
+    "tool_grep_file",
+    "tool_inspect_text",
+    "tool_inspect_document",
+    "tool_read_document_content",
+    "tool_pptx_info",
+    "tool_view_slides",
+    "tool_get_table_schema",
+    # Memory / skill introspection tools (no workspace writes).
+    "tool_list_skills",
+    "tool_search_skills",
+    "tool_load_skill",
+    "tool_unload_skill",
+    "tool_vlm_query",
+})
+
+
+def _tool_may_write_files(tool_name: str) -> bool:
+    """True when the tool may create/modify workspace files (so a before/after
+    snapshot is meaningful). False for the known read-only / observation
+    allowlist, where the snapshot diff is guaranteed empty and would only
+    add per-call latency."""
+    return tool_name not in _TOOLS_WITHOUT_FILE_SIDE_EFFECTS
 
 
 def _canonicalize_tool_params(params: Any) -> str:
@@ -2463,7 +2522,7 @@ class _StreamState:
         title: str,
         extra_attrs: str = "",
     ) -> bool:
-        """Guarantees a `<processing>` block is open before emitting status lines.
+        """Guarantees a `<processing>` block is open AND carries visible content.
 
         Single-owner contract: the dispatcher is authoritative for the block
         lifecycle. Some code paths reach `_dispatch_closed_tag` WITHOUT the
@@ -2476,20 +2535,69 @@ class _StreamState:
         save notes with NO `<processing>` block in the transcript — the action
         happens "under the radar" and the user has no visual indication.
 
+        VISIBILITY GUARANTEE (fixes "processing tags not showing at start of
+        discussion"): the block MUST contain at least one status line. An
+        empty `<processing></processing>` block is collapsed/hidden by most
+        markdown renderers, which is exactly the observed symptom when the
+        first artifact of a discussion is short and reaches the flush path.
+
+        STRUCTURED EVENT PARITY: in `FULL_CALLBACK_MODE` / `MIXED_MODE` the
+        block is NOT written into `ai_msg.content` (by design — those modes
+        render from structured events). The flush path previously emitted
+        NEITHER the block NOR the structured events, so FULL_CALLBACK_MODE
+        apps saw nothing. We now emit the matching *_START event so those
+        apps get the same signal the streaming path already provides.
+
         Returns True when the block was newly opened (so the caller knows the
         block was NOT already open at entry). Returns False when a block was
         already open (the caller's existing close logic owns it).
         """
         if self._processing_block_open:
             return False
-        if self.event_mode not in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
-            # Non-processing-tag modes render status via structured events;
-            # the block latch is irrelevant there.
+
+        is_tag_mode = self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE)
+        is_callback_mode = self.event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE)
+
+        # ── STRUCTURED EVENT PARITY (FULL_CALLBACK_MODE / MIXED_MODE) ──
+        # Emit the matching *_START event so callback-only apps receive the
+        # same signal the streaming path already provides. This is the fix
+        # for "processing tags not showing" in FULL_CALLBACK_MODE.
+        if is_callback_mode and not self.event_mode.is_silent:
+            _status_event_map = {
+                "artefact": MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START,
+                "artifact": MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_START,
+                "tool": MSG_TYPE.MSG_TYPE_TOOL_START,
+            }
+            _start_event = _status_event_map.get(tag_type)
+            if _start_event is not None:
+                _event_meta: Dict[str, Any] = {"title": title}
+                if tag_type in ("artefact", "artifact"):
+                    _lang_match = re.search(r'language="([^"]*)"', extra_attrs or "")
+                    _event_meta["art_type"] = "artefact"
+                    _event_meta["language"] = _lang_match.group(1) if _lang_match else None
+                    _event_meta["stream_complete"] = False
+                _cb(self.callback, "", _start_event, _event_meta)
+
+        if not is_tag_mode:
+            # Non-processing-tag modes render status via structured events only;
+            # the content latch is irrelevant there.
             return False
+
         attrs_part = f" {extra_attrs}" if extra_attrs else ""
         proc_open = f'\n<processing type="{tag_type}" title="{title}"{attrs_part}>\n'
-        self.ai_message.content += proc_open
+
+        # ── VISIBILITY GUARANTEE: never emit an empty block ──
+        # A bare `<processing></processing>` pair is collapsed by markdown
+        # renderers and appears as "nothing" in the UI. Emit a type-specific
+        # status line so the block is always visibly rendered, even when the
+        # downstream dispatcher adds no further content (fast replicas, empty
+        # bodies, truncated streams).
+        _status_line = _ARTEFACT_TYPE_MESSAGES.get(tag_type, f"✨ Processing {tag_type}...")
+        proc_body = f"{_status_line}\n"
+
+        self.ai_message.content += proc_open + proc_body
         _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+        _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
         self._processing_block_open = True
         return True
 
@@ -7424,6 +7532,14 @@ class ChatMixin:
                 "`tool_computer_scroll`, or `tool_computer_drag` to interact with the screen.\n"
                 "3. **VERIFY**: After EVERY action, take a fresh screenshot to confirm the result before "
                 "proceeding. Never assume an action succeeded without visual confirmation.\n"
+                "4. **WAIT (CRITICAL — use this when the UI is still transitioning)**: If your last action "
+                "triggered a slow transition (app launch, page load, menu animation, dialog fade-in) and the "
+                "current screenshot does NOT yet show the expected change, DO NOT re-click the same target. "
+                "Instead call `tool_computer_wait` with a delay of 2–3 seconds. It returns a FRESH, "
+                "grid-annotated screenshot of the settled state in the SAME result — no second "
+                "`tool_computer_screenshot` call is needed. Repeating the same click on an unchanged "
+                "(stale) screenshot is a LOOP ERROR: the underlying UI may already be transitioning, "
+                "and a second click can land on the wrong element or dismiss the menu you were waiting for.\n"
                 "The screenshot file `computer_use_screenshot.png` is OVERWRITTEN on every recapture — "
                 "each new screenshot shows the CURRENT screen state. Re-screenshotting is ALWAYS allowed "
                 "and is never a duplicate-call error.\n"
@@ -8143,11 +8259,21 @@ class ChatMixin:
                 tool_params: Dict[str, Any],
                 tool_call_id: str,
             ) -> Dict[str, Any]:
-                """Execute one native tool call and return ``{"tool_results": [...]}``."""
+                """Execute one native tool call and return ``{"tool_results": [...]}``.
+
+                PROCESSING-TAG PARITY: in PROCESSING_TAG_MODE / MIXED_MODE this
+                helper writes a full ``<processing type="tool">`` block into
+                ``ai_msg.content`` — the SAME lifecycle the XML ``<tool>`` path
+                emits (open → "Executing" → result → close with status meta).
+                Without this, native tool-calling turns produced ZERO visible
+                processing blocks in the transcript, which is the "no processing
+                shown during computer use" symptom.
+                """
                 tool_res: Any = None
                 tool_success = False
                 clean_result_str = ""
                 details_block = ""
+                _is_tag_mode = event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE)
 
                 # ── Cancellation guard ──
                 if self.is_generation_cancelled():
@@ -8167,6 +8293,14 @@ class ChatMixin:
                         f"Available tools: {available_str}."
                     )
                     ASCIIColors.warning(f"[ChatMixin][native] Phantom tool call: {tool_name}")
+                    if _is_tag_mode:
+                        _phantom_block = (
+                            f'\n<processing type="tool" title="Tool Execution: {tool_name}">\n'
+                            f"* ❌ Tool call blocked: '{tool_name}' is not registered in this session.\n"
+                            f"<!-- status:failure -->\n</processing>\n\n"
+                        )
+                        ai_msg.content += _phantom_block
+                        _cb(callback, _phantom_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                     if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
                         _cb(callback, "", MSG_TYPE.MSG_TYPE_TOOL_END, {
                             "tool_name": tool_name,
@@ -8179,7 +8313,17 @@ class ChatMixin:
                         "content": json.dumps({"success": False, "error": err}),
                     }]}
 
-                # ── Emit UI start event ──
+                # ── Emit UI start events (tag mode writes the block, callback mode emits structured) ──
+                if _is_tag_mode:
+                    _escaped_params = html.escape(json.dumps(tool_params, default=str))
+                    _tool_open = (
+                        f'\n<processing type="tool" title="Tool Execution: {tool_name}" '
+                        f'params="{_escaped_params}">\n'
+                        f"### 🔧 Tool Call: `{tool_name}`\n"
+                        f"* ⏳ Executing '{tool_name}'...\n"
+                    )
+                    ai_msg.content += _tool_open
+                    _cb(callback, _tool_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                 if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
                     _cb(callback, "", MSG_TYPE.MSG_TYPE_TOOL_START, {
                         "tool_name": tool_name,
@@ -8205,7 +8349,10 @@ class ChatMixin:
                                     self.artefacts.sync_all_active_to_disk()
                                 except Exception:
                                     pass
-                                _files_before = _snapshot_workspace(Path(_ws.resolve()))
+                                _files_before = (
+                                    _snapshot_workspace(Path(_ws.resolve()))
+                                    if _tool_may_write_files(tool_name) else {}
+                                )
                                 exec_kwargs: Dict[str, Any] = {}
                                 try:
                                     sig = inspect.signature(_lcp.execute_tool)
@@ -8219,11 +8366,12 @@ class ChatMixin:
                                 except (ValueError, TypeError):
                                     pass
                                 tool_res = _lcp.execute_tool(tool_name, tool_params, **exec_kwargs)
-                                _files_after = _snapshot_workspace(Path(_ws.resolve()))
-                                try:
-                                    self._sync_tool_artifacts(tool_name, _files_before, _files_after, callback)
-                                except Exception as sync_ex:
-                                    trace_exception(sync_ex)
+                                if _tool_may_write_files(tool_name):
+                                    _files_after = _snapshot_workspace(Path(_ws.resolve()))
+                                    try:
+                                        self._sync_tool_artifacts(tool_name, _files_before, _files_after, callback)
+                                    except Exception as sync_ex:
+                                        trace_exception(sync_ex)
                             finally:
                                 os.chdir(_old_cwd)
                         else:
@@ -8246,7 +8394,10 @@ class ChatMixin:
                         _ws.mkdir(parents=True, exist_ok=True)
                         try:
                             os.chdir(str(_ws.resolve()))
-                            _files_before = _snapshot_workspace(Path(_ws.resolve()))
+                            _files_before = (
+                                _snapshot_workspace(Path(_ws.resolve()))
+                                if _tool_may_write_files(tool_name) else {}
+                            )
                             call_kwargs = dict(tool_params)
                             try:
                                 _sig = inspect.signature(active_tools[tool_name]["callable"])
@@ -8263,11 +8414,12 @@ class ChatMixin:
                             except (ValueError, TypeError):
                                 pass
                             tool_res = active_tools[tool_name]["callable"](**call_kwargs)
-                            _files_after = _snapshot_workspace(Path(_ws.resolve()))
-                            try:
-                                self._sync_tool_artifacts(tool_name, _files_before, _files_after, callback)
-                            except Exception as sync_ex:
-                                trace_exception(sync_ex)
+                            if _tool_may_write_files(tool_name):
+                                _files_after = _snapshot_workspace(Path(_ws.resolve()))
+                                try:
+                                    self._sync_tool_artifacts(tool_name, _files_before, _files_after, callback)
+                                except Exception as sync_ex:
+                                    trace_exception(sync_ex)
                         finally:
                             os.chdir(_old_cwd)
                 except Exception as exec_ex:
@@ -8326,7 +8478,25 @@ class ChatMixin:
                 except Exception:
                     pass
 
-                # ── Emit UI end event ──
+                # ── Emit UI end events (tag mode closes the block, callback mode emits structured) ──
+                if _is_tag_mode:
+                    _status_meta = "success" if tool_success else "failure"
+                    _status_line = (
+                        f"* ✅ Completed execution of '{tool_name}' successfully.\n"
+                        if tool_success else
+                        f"* ❌ Tool '{tool_name}' failed.\n"
+                    )
+                    _preview = _build_windowed_output_preview(clean_result_str or "")
+                    if _preview:
+                        _details = f"Output Logs:\n{_preview}\n"
+                    else:
+                        _details = ""
+                    _tool_close = (
+                        f"{_status_line}{_details}"
+                        f"<!-- status:{_status_meta} -->\n</processing>\n\n"
+                    )
+                    ai_msg.content += _tool_close
+                    _cb(callback, _tool_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                 if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
                     _cb(callback, "", MSG_TYPE.MSG_TYPE_TOOL_END, {
                         "tool_name": tool_name,
@@ -8343,23 +8513,59 @@ class ChatMixin:
                 }]}
 
             def _snapshot_workspace(root: Path) -> Dict[str, Any]:
-                """Lightweight workspace snapshot for artifact diffing during native tool calls."""
+                """Fast workspace snapshot for artifact diffing.
+
+                Uses `os.scandir`-based recursion with `stat()` only — it
+                NEVER reads file contents. The change-detection key is
+                `(size, mtime_ns)`, the same O(1)-per-file technique used by
+                rsync / git-status / watchman. This makes the snapshot cost
+                proportional to the NUMBER of files, not their total byte
+                size — the previous `read_text()` approach loaded every
+                multi-MB screenshot or artifact into memory on every tool
+                call, which is the dominant latency source in computer-use
+                loops.
+
+                Internal directories (`.versions`, `_debug_dumps`) are
+                skipped: they are artifact-version mirrors and debug dumps,
+                never tool-produced workspace files.
+
+                The returned dict preserves the previous shape
+                (`{rel_path: {"hash", "mtime", "path", "content"}}`) so all
+                downstream consumers keep working unchanged. `content` is
+                always `None` (never read); `hash` is the `(size, mtime_ns)`
+                tuple, which is exactly what the diff needs.
+                """
                 snap: Dict[str, Any] = {}
                 if not root.exists():
                     return snap
-                for f in root.rglob("*"):
-                    if not f.is_file():
-                        continue
+
+                _SKIP_DIR_NAMES = frozenset({".versions", "_debug_dumps"})
+                _stack: List[Path] = [root]
+                while _stack:
+                    current = _stack.pop()
                     try:
-                        rel = f.relative_to(root)
-                        content = f.read_text(encoding="utf-8", errors="ignore")
-                        snap[rel] = {"hash": hash(content), "mtime": f.stat().st_mtime, "path": f, "content": content}
-                    except Exception:
-                        try:
-                            rel = f.relative_to(root)
-                            snap[rel] = {"hash": None, "mtime": f.stat().st_mtime, "path": f, "content": None}
-                        except Exception:
-                            pass
+                        with os.scandir(current) as it:
+                            for entry in it:
+                                try:
+                                    if entry.is_dir(follow_symlinks=False):
+                                        if entry.name in _SKIP_DIR_NAMES:
+                                            continue
+                                        _stack.append(Path(entry.path))
+                                        continue
+                                    if not entry.is_file(follow_symlinks=False):
+                                        continue
+                                    st = entry.stat(follow_symlinks=False)
+                                    rel = Path(entry.path).relative_to(root)
+                                    snap[rel] = {
+                                        "hash": (st.st_size, st.st_mtime_ns),
+                                        "mtime": st.st_mtime,
+                                        "path": Path(entry.path),
+                                        "content": None,
+                                    }
+                                except OSError:
+                                    continue
+                    except OSError:
+                        continue
                 return snap
 
             def _inline_relay(chunk, msg_type=None, meta=None):
@@ -8601,6 +8807,24 @@ class ChatMixin:
                 if native_tools_enabled and native_tools_schema:
                     _native_call_kwargs["tools"] = native_tools_schema
                     _native_call_kwargs["tool_choice"] = "auto"
+                    # ── 🔁 FORWARD THE CHAT-LEVEL ROUND BUDGET TO THE NATIVE LOOP ──
+                    # The binding's internal tool loop (openai, lollms, and any
+                    # other binding that overrides generate_from_messages) is
+                    # bounded by resolve_max_tool_rounds(...). Without this
+                    # forward, the binding falls back to MAX_TOOL_ROUNDS = 8 —
+                    # the exact reason computer-use turns stopped mid-task even
+                    # though the outer chat() loop allows 50 rounds.
+                    #
+                    # The chat budget is `resolved_max_rounds` (from
+                    # max_nb_rounds / max_reasoning_steps, default 20). When the
+                    # user requested infinite rounds (<=0 or float('inf')),
+                    # forward the binding-side hard ceiling instead: a truly
+                    # infinite native loop cannot be honored inside a binding,
+                    # and resolve_max_tool_rounds clamps to that ceiling anyway.
+                    if is_infinite_rounds:
+                        _native_call_kwargs["max_tool_rounds"] = _MAX_TOOL_ROUNDS_CEILING
+                    else:
+                        _native_call_kwargs["max_tool_rounds"] = int(resolved_max_rounds)
                 gen_res = self.lollmsClient.generate_from_messages(
                     messages=messages_list,
                     images=round_images if round_images else None,
@@ -10254,31 +10478,14 @@ class ChatMixin:
                                     trace_exception(sync_ex)
 
                                 # ── Take BEFORE Snapshot (LCP Path) ──
-                                _lcp_files_before = {}
+                                # Skipped entirely for tools with no file side
+                                # effects (computer-use, pure readers): the diff
+                                # is guaranteed empty, so the walk is pure
+                                # latency. See _TOOLS_WITHOUT_FILE_SIDE_EFFECTS.
+                                _lcp_files_before: Dict[Any, Any] = {}
                                 _lcp_cwd = Path(_lcp_workspace_str)
-                                if _lcp_cwd.exists():
-                                    for f in _lcp_cwd.rglob("*"):
-                                        if f.is_file():
-                                            try:
-                                                rel_path = f.relative_to(_lcp_cwd)
-                                                content = f.read_text(encoding="utf-8", errors="ignore")
-                                                _lcp_files_before[rel_path] = {
-                                                    "hash": hash(content),
-                                                    "mtime": f.stat().st_mtime,
-                                                    "path": f,
-                                                    "content": content
-                                                }
-                                            except Exception:
-                                                try:
-                                                    rel_path = f.relative_to(_lcp_cwd)
-                                                    _lcp_files_before[rel_path] = {
-                                                        "hash": None,
-                                                        "mtime": f.stat().st_mtime,
-                                                        "path": f,
-                                                        "content": None
-                                                    }
-                                                except Exception:
-                                                    pass
+                                if _tool_may_write_files(tool_name) and _lcp_cwd.exists():
+                                    _lcp_files_before = _snapshot_workspace(_lcp_cwd)
 
                                 try:
                                     exec_kwargs = {
@@ -10309,32 +10516,11 @@ class ChatMixin:
                                 _lcp_executed = True
 
                                 # ── Take AFTER Snapshot & Auto-Sync Artifacts (LCP Path) ──
-                                _lcp_files_after = {}
-                                if _lcp_cwd.exists():
-                                    for f in _lcp_cwd.rglob("*"):
-                                        if f.is_file():
-                                            try:
-                                                rel_path = f.relative_to(_lcp_cwd)
-                                                content = f.read_text(encoding="utf-8", errors="ignore")
-                                                _lcp_files_after[rel_path] = {
-                                                    "hash": hash(content),
-                                                    "mtime": f.stat().st_mtime,
-                                                    "path": f,
-                                                    "content": content
-                                                }
-                                            except Exception:
-                                                try:
-                                                    rel_path = f.relative_to(_lcp_cwd)
-                                                    _lcp_files_after[rel_path] = {
-                                                        "hash": None,
-                                                        "mtime": f.stat().st_mtime,
-                                                        "path": f,
-                                                        "content": None
-                                                    }
-                                                except Exception:
-                                                    pass
-
-                                self._sync_tool_artifacts(tool_name, _lcp_files_before, _lcp_files_after, callback)
+                                # Mirror of the BEFORE guard: skip the walk when
+                                # the tool cannot have written files.
+                                if _tool_may_write_files(tool_name) and _lcp_cwd.exists():
+                                    _lcp_files_after = _snapshot_workspace(_lcp_cwd)
+                                    self._sync_tool_artifacts(tool_name, _lcp_files_before, _lcp_files_after, callback)
                             finally:
                                 # 🛑 CRITICAL: Always restore CWD to prevent workspace corruption
                                 os.chdir(_old_cwd_lcp)
@@ -10486,32 +10672,12 @@ class ChatMixin:
                                             f"not accepted by tool '{tool_name}'."
                                         )
 
-                                # ── Take BEFORE Snapshot ──
-                                files_before = {}
+                                # ── Take BEFORE Snapshot (Direct-Callable Path) ──
+                                # Skipped for tools with no file side effects.
+                                files_before: Dict[Any, Any] = {}
                                 current_cwd = Path(workspace_dir_str)
-                                if current_cwd.exists():
-                                    for f in current_cwd.rglob("*"):
-                                        if f.is_file():
-                                            try:
-                                                rel_path = f.relative_to(current_cwd)
-                                                content = f.read_text(encoding="utf-8", errors="ignore")
-                                                files_before[rel_path] = {
-                                                    "hash": hash(content),
-                                                    "mtime": f.stat().st_mtime,
-                                                    "path": f,
-                                                    "content": content
-                                                }
-                                            except Exception:
-                                                try:
-                                                    rel_path = f.relative_to(current_cwd)
-                                                    files_before[rel_path] = {
-                                                        "hash": None,
-                                                        "mtime": f.stat().st_mtime,
-                                                        "path": f,
-                                                        "content": None
-                                                    }
-                                                except Exception:
-                                                    pass
+                                if _tool_may_write_files(tool_name) and current_cwd.exists():
+                                    files_before = _snapshot_workspace(current_cwd)
 
                                 # Execute directly (no thread) - LCP handles CWD internally
                                 # The signature check above already safely injected
@@ -10521,32 +10687,10 @@ class ChatMixin:
                                 tool_res = active_tools[tool_name]["callable"](**call_kwargs)
 
                                 # ── Take AFTER Snapshot and Auto-Sync Artifacts ──
-                                files_after = {}
-                                if current_cwd.exists():
-                                    for f in current_cwd.rglob("*"):
-                                        if f.is_file():
-                                            try:
-                                                rel_path = f.relative_to(current_cwd)
-                                                content = f.read_text(encoding="utf-8", errors="ignore")
-                                                files_after[rel_path] = {
-                                                    "hash": hash(content),
-                                                    "mtime": f.stat().st_mtime,
-                                                    "path": f,
-                                                    "content": content
-                                                }
-                                            except Exception:
-                                                try:
-                                                    rel_path = f.relative_to(current_cwd)
-                                                    files_after[rel_path] = {
-                                                        "hash": None,
-                                                        "mtime": f.stat().st_mtime,
-                                                        "path": f,
-                                                        "content": None
-                                                    }
-                                                except Exception:
-                                                    pass
-
-                                self._sync_tool_artifacts(tool_name, files_before, files_after, callback)
+                                # Mirror of the BEFORE guard.
+                                if _tool_may_write_files(tool_name) and current_cwd.exists():
+                                    files_after = _snapshot_workspace(current_cwd)
+                                    self._sync_tool_artifacts(tool_name, files_before, files_after, callback)
                             finally:
                                 os.chdir(old_cwd)
 
@@ -11612,6 +11756,30 @@ class ChatMixin:
 
         # Unconditionally commit the final message and discussion state to the database
         _persist_round_state(status_override="completed" if not was_cancelled else "cancelled")
+
+        # ── 🔔 TURN-COMPLETE SIGNAL ──
+        # Emit a terminal event AFTER the final commit so the client app can
+        # re-render the completed message (final content, artefact cards,
+        # turn status). Without this, apps that stream incrementally have no
+        # signal that the turn is truly finished and may leave the message in
+        # a "streaming" visual state. Uses the existing ARTEFACTS_STATE_CHANGED
+        # channel with type="turn_complete" so no new MSG_TYPE is required.
+        try:
+            if event_mode.has_callbacks and not event_mode.is_silent:
+                _cb(callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+                    "type": "turn_complete",
+                    "message_id": ai_msg.id,
+                    "was_cancelled": was_cancelled,
+                    "round_count": round_count,
+                    "tool_calls_count": len(tool_calls_this_turn),
+                    "artefacts_modified": [
+                        a.get("title") for a in (ss.affected_artefacts if ss else []) if isinstance(a, dict)
+                    ],
+                })
+        except Exception as turn_complete_err:
+            ASCIIColors.warning(
+                f"[ChatMixin] Failed to emit turn_complete event: {turn_complete_err}"
+            )
 
         self.scratchpad = ""
         object.__setattr__(self, '_active_callback', None)

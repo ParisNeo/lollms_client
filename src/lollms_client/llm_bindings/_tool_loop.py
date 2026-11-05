@@ -29,12 +29,88 @@ they can be exercised without a live model.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
-# Maximum number of consecutive tool-call rounds a single generate_* call may
-# spawn. Prevents runaway models from looping on tool executions indefinitely.
+# Default maximum number of consecutive tool-call rounds a single generate_*
+# call may spawn. Prevents runaway models from looping on tool executions
+# indefinitely. This is only the DEFAULT — callers can raise it per-call via
+# ``tool_rounds_budget(n)`` (ambient, flows through the opaque binding stack)
+# or per-invocation via an explicit ``max_tool_rounds`` kwarg. The chat mixin
+# uses the ambient contextvar so its configured budget (e.g. 50) is honored by
+# every binding without touching a single provider file.
 MAX_TOOL_ROUNDS = 8
+
+# Hard ceiling to prevent a misconfigured caller from exhausting memory or
+# triggering a runaway loop. Well above any realistic agentic budget.
+_MAX_TOOL_ROUNDS_CEILING = 1000
+
+# Ambient per-call override. ``None`` means "use MAX_TOOL_ROUNDS". Set via
+# ``tool_rounds_budget()`` by the caller (chat mixin) so the budget flows
+# through the binding's opaque call stack without every provider binding
+# needing to forward it explicitly.
+_MAX_TOOL_ROUNDS_OVERRIDE: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+    "lollms_max_tool_rounds_override", default=None
+)
+
+
+@contextlib.contextmanager
+def tool_rounds_budget(rounds: Optional[int]) -> Iterator[None]:
+    """Ambiently set the max tool-call rounds for the duration of the block.
+
+    The chat mixin wraps the binding's ``generate_from_messages`` call in this
+    context manager so the binding's internal native-tool-calling loop honors
+    the chat-level budget (e.g. 50) instead of the module default (8). The
+    previous value is restored on exit, so nesting is safe.
+
+    Passing ``None`` or a non-positive value clears the override (falls back
+    to ``MAX_TOOL_ROUNDS``). Values above ``_MAX_TOOL_ROUNDS_CEILING`` are
+    clamped to the ceiling.
+    """
+    previous = _MAX_TOOL_ROUNDS_OVERRIDE.get()
+    if rounds is None:
+        _MAX_TOOL_ROUNDS_OVERRIDE.set(None)
+    else:
+        try:
+            normalized = int(rounds)
+        except (TypeError, ValueError):
+            normalized = None
+        if normalized is None or normalized <= 0:
+            _MAX_TOOL_ROUNDS_OVERRIDE.set(None)
+        else:
+            _MAX_TOOL_ROUNDS_OVERRIDE.set(min(normalized, _MAX_TOOL_ROUNDS_CEILING))
+    try:
+        yield
+    finally:
+        _MAX_TOOL_ROUNDS_OVERRIDE.set(previous)
+
+
+def resolve_max_tool_rounds(explicit: Optional[int] = None) -> int:
+    """Resolve the effective max tool-call rounds for the current call.
+
+    Precedence (highest first):
+      1. ``explicit`` argument (a binding that reads ``max_tool_rounds`` from
+         ``**kwargs`` and forwards it here).
+      2. Ambient ``tool_rounds_budget()`` contextvar (set by the chat mixin).
+      3. Module default ``MAX_TOOL_ROUNDS`` (8).
+
+    Always returns a positive int, clamped to ``_MAX_TOOL_ROUNDS_CEILING``.
+    """
+    if explicit is not None:
+        try:
+            normalized = int(explicit)
+        except (TypeError, ValueError):
+            normalized = None
+        if normalized is not None and normalized > 0:
+            return min(normalized, _MAX_TOOL_ROUNDS_CEILING)
+
+    ambient = _MAX_TOOL_ROUNDS_OVERRIDE.get()
+    if ambient is not None and ambient > 0:
+        return ambient
+
+    return MAX_TOOL_ROUNDS
 
 
 def normalize_callback_result(result: Any) -> Tuple[bool, Optional[List[Dict[str, str]]]]:

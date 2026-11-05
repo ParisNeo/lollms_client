@@ -36,6 +36,7 @@ from lollms_client.llm_bindings._tool_loop import (
     emit_callback_safe,
     extract_native_tool_calls,
     normalize_callback_result,
+    resolve_max_tool_rounds,
 )
 
 BindingName = "LollmsBinding"
@@ -2095,7 +2096,15 @@ class LollmsBinding(LollmsLLMBinding):
         accumulated_outputs: List[str] = []
         last_output: Union[str, dict] = ""
 
-        for round_index in range(MAX_TOOL_ROUNDS):
+        # Resolve the effective round budget: explicit ``max_tool_rounds``
+        # kwarg > ambient ``tool_rounds_budget(...)`` contextvar > module
+        # default (8). This is what lets a 50-round agentic budget flow
+        # through the binding without every provider re-declaring it.
+        effective_max_rounds = resolve_max_tool_rounds(
+            extra_kwargs.get("max_tool_rounds")
+        )
+
+        for round_index in range(effective_max_rounds):
             result, tool_results = self._generate_one_round(
                 conversation,
                 n_predict=n_predict,
@@ -2176,8 +2185,10 @@ class LollmsBinding(LollmsLLMBinding):
             conversation.extend(build_tool_result_messages(matched))
         else:
             ASCIIColors.warning(
-                f"[LollmsBinding] Tool-call loop reached MAX_TOOL_ROUNDS="
-                f"{MAX_TOOL_ROUNDS}; returning last partial result."
+                f"[LollmsBinding] Tool-call loop reached the effective round "
+                f"budget ({effective_max_rounds}); returning last partial "
+                f"result. Pass a larger `max_tool_rounds` kwarg or set the "
+                f"ambient `tool_rounds_budget(...)` context to raise it."
             )
 
         if len(accumulated_outputs) > 1:
