@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-05 03:29]
+
+- fix(openai): add client lifecycle management for OpenAIBinding
+
 ## [2026-11-05 03:06]
 
 - feat(tool_loop): enhance tool execution loop and integrate bindings

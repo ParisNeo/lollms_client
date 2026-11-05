@@ -1208,6 +1208,58 @@ class OpenAIBinding(LollmsLLMBinding):
             )
         self.completion_format = ELF_COMPLETION_FORMAT.Chat
 
+    # ── client lifecycle ───────────────────────────────────────────────────
+    def _ensure_client(self) -> None:
+        """
+        Lazily (re)create the OpenAI SDK client.
+
+        ``cancel()`` / ``close()`` dispose the underlying ``httpx.Client``;
+        long-lived daemons that reuse the binding must be able to re-issue
+        requests afterwards. This mirrors ``LollmsBinding._ensure_client``.
+
+        In OAuth mode ``self.client`` is intentionally ``None`` (inference
+        goes through ``_oauth_openai_client()``); nothing to rebuild here.
+        """
+        if self.auth_method == "oauth":
+            return
+        http_client = getattr(self.client, "_client", None) if self.client is not None else None
+        if self.client is None or (http_client is not None and getattr(http_client, "is_closed", False)):
+            self.client = openai.OpenAI(
+                api_key=self.service_key or "EMPTY",
+                base_url=self.open_ai_host_address,
+                http_client=httpx.Client(
+                    verify=self._httpx_verify,
+                    timeout=300.0,
+                ),
+            )
+
+    def cancel(self) -> None:
+        """Dispose the SDK / OAuth HTTP clients and signal cancellation."""
+        try:
+            if self.client is not None:
+                with contextlib.suppress(Exception):
+                    self.client.close()
+        except Exception:
+            pass
+        if self._oauth_client_cache is not None:
+            with contextlib.suppress(Exception):
+                self._oauth_client_cache[1].close()
+            self._oauth_client_cache = None
+        super().cancel()
+
+    def reset_cancel(self) -> None:
+        super().reset_cancel()
+        self._ensure_client()
+
+    def close(self) -> None:
+        self.cancel()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
     # ── OAuth public helpers ───────────────────────────────────────────────
     def oauth_login(
         self,
