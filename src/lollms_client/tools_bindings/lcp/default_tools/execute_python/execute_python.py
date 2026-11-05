@@ -37,20 +37,56 @@ from typing import Any, Dict, List, Optional, Tuple
 from ascii_colors import ASCIIColors
 
 # Shared defense-in-depth sandbox kernel (AST + runtime layers).
-try:
-    from .sandbox_kernel import (
-        validate_source as _sandbox_validate_source,
-        SandboxViolation as _SandboxViolation,
-        SandboxPermissionError as _SandboxPermissionError,
-        run_in_sandboxed_child as _run_in_sandboxed_child,
+#
+# Import resolution strategy (robust across all load contexts):
+#   1. Relative import  — works when this module is loaded as part of the package
+#                          (the normal LCP toolset load path).
+#   2. Absolute import  — works when the toolset is loaded by file path via
+#                          importlib without a registered parent package, but
+#                          `lollms_client` is installed (the runtime case that
+#                          previously failed with `No module named 'src'`).
+#   3. `src.lollms_client.*` — dev-checkout fallback for repos where the package
+#                          is NOT pip-installed and `src/` is on sys.path.
+#
+# The previous fallback ONLY tried `src.lollms_client.*`, which is not a valid
+# module path in any installed environment — producing the observed
+# `No module named 'src'` lazy-init failure.
+def _import_sandbox_kernel():
+    """Resolves `sandbox_kernel` across relative / installed / dev-checkout contexts."""
+    errors = []
+    # Tier 1: relative (canonical package load).
+    try:
+        from . import sandbox_kernel as _sk  # type: ignore
+        return _sk
+    except ImportError as exc:
+        errors.append(f"relative: {exc}")
+    # Tier 2: canonical installed path.
+    try:
+        from lollms_client.tools_bindings.lcp.default_tools.execute_python import (  # type: ignore
+            sandbox_kernel as _sk,
+        )
+        return _sk
+    except ImportError as exc:
+        errors.append(f"lollms_client: {exc}")
+    # Tier 3: dev-checkout fallback (repo's `src/` on sys.path).
+    try:
+        from src.lollms_client.tools_bindings.lcp.default_tools.execute_python import (  # type: ignore
+            sandbox_kernel as _sk,
+        )
+        return _sk
+    except ImportError as exc:
+        errors.append(f"src.lollms_client: {exc}")
+    raise ImportError(
+        "Could not import sandbox_kernel from any known location. "
+        f"Attempts: {'; '.join(errors)}"
     )
-except ImportError:  # pragma: no cover
-    from src.lollms_client.tools_bindings.lcp.default_tools.execute_python.sandbox_kernel import (  # type: ignore
-        validate_source as _sandbox_validate_source,
-        SandboxViolation as _SandboxViolation,
-        SandboxPermissionError as _SandboxPermissionError,
-        run_in_sandboxed_child as _run_in_sandboxed_child,
-    )
+
+
+_sandbox_kernel = _import_sandbox_kernel()
+_sandbox_validate_source = _sandbox_kernel.validate_source
+_SandboxViolation = _sandbox_kernel.SandboxViolation
+_SandboxPermissionError = _sandbox_kernel.SandboxPermissionError
+_run_in_sandboxed_child = _sandbox_kernel.run_in_sandboxed_child
 
 TOOL_LIBRARY_NAME = "Execute Python"
 TOOL_LIBRARY_DESC = (
@@ -673,51 +709,67 @@ def _detect_risky_operations(source: str) -> Optional[str]:
     return None
 
 
-def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]] = None, tool_ctx: Optional[Any] = None) -> Dict[str, Any]:
+def _run_python_source(
+    source: str,
+    script_label: str,
+    argv: Optional[List[Any]] = None,
+    tool_ctx: Optional[Any] = None,
+    pre_authorized: bool = False,
+) -> Dict[str, Any]:
     """
     Executes the given Python source string in a sandboxed namespace with
     user validation, stdout/stderr capture, sys.argv override, safety enforcement, and matplotlib interception.
-    
+
     If tool_ctx is provided, stdout lines are streamed to the UI in real-time
     via tool_ctx.emit_progress() for immediate feedback on long-running scripts.
+
+    `pre_authorized=True` skips the user prompt (the caller — e.g.
+    `tool_create_and_execute_python_file` — already solicited authorization
+    for the same source). The static profile is then selected from the
+    `pre_authorized` state: "authorized" if risky, "standard" otherwise.
+    This avoids double-prompting the user for write+execute flows.
     """
     global _AUTO_APPROVE_PYTHON
 
-    # ── LAYER 1: static AST validation (denylist profile) ──
-    # Rejects forbidden imports / calls BEFORE any byte runs. Runs under every
-    # autonomy level; there is no bypass even under full_access because these
-    # primitives (ctypes, subprocess, socket) can escape the runtime layer.
-    static_violation = _sandbox_validate_source(source, profile="standard")
-    if static_violation is not None:
-        ASCIIColors.warning(
-            f"[execute_python] Static sandbox rejection: {static_violation.reason}"
-        )
-        return {
-            "success": False,
-            "error": (
-                f"🛑 BLOCKED BY SANDBOX (line {static_violation.line}): "
-                f"{static_violation.reason}\n"
-                f"Offending construct: {static_violation.snippet}\n"
-                "This primitive has no safe alternative inside the sandbox — even "
-                "in 'full_access' mode it cannot be reached from Python code. "
-                "Use the system_shell tool if you legitimately need host commands."
-            ),
-            "output": "",
-            "stderr": "static_sandbox_rejection",
-        }
+    # Emit an initial status so the UI shows a "processing" indicator the
+    # instant the tool is invoked — before AST validation, before the child
+    # spawns, before any user code runs. Without this, long-running executions
+    # leave the UI silent for the whole duration.
+    _progress_tc = tool_ctx if (tool_ctx is not None and hasattr(tool_ctx, "emit_progress")) else None
+    if _progress_tc is not None:
+        try:
+            _progress_tc.emit_progress(
+                f"⏳ Executing Python ({script_label})…",
+                {"stream": "status", "phase": "starting"},
+            )
+        except Exception:
+            pass
 
-    # ── AUTONOMY LEVEL DECISION MATRIX ──
-    # 1. STRICT: Prompts operator on EVERY execution turn.
-    # 2. SAFE (Default): Auto-approves benign code (algorithms, data science, docx/pptx/pdf/xlsx, matplotlib/seaborn).
-    #    Prompts user / blocks when risky operations (process spawning, subprocess/os.system, network calls) are detected.
-    # 3. FULL ACCESS: Executes everything without confirmation prompts.
+    # ── AUTONOMY LEVEL DECISION MATRIX (runs BEFORE static validation) ──
+    # Order matters: the user's consent must be solicited BEFORE the static
+    # validator decides whether to block. The old order (static-first) meant
+    # that in "safe" mode a risky operation was hard-blocked with
+    # "BLOCKED BY SANDBOX" and the user was NEVER asked — the prompt code was
+    # unreachable. The user's explicit instruction: "in safe mode (not strict
+    # mode), I need to get notified and asked to validate or not instead of
+    # always blocking."
+    #
+    # Decision matrix:
+    #   1. STRICT:      prompt operator on EVERY execution turn.
+    #   2. SAFE (default): auto-approve benign code; when a risky operation is
+    #                    detected, PROMPT the user. On approval, run with the
+    #                    "authorized" profile (permits the risky surface while
+    #                    still blocking C-level escapes like ctypes/winreg).
+    #                    On rejection, return a clear blocked error.
+    #   3. FULL_ACCESS: no prompt; run with "authorized" profile if risky,
+    #                    "standard" otherwise.
     risky_reason = _detect_risky_operations(source)
 
     requires_user_prompt = False
     prompt_label = script_label
-    user_authorized_risky = False
+    user_authorized_risky = pre_authorized
 
-    if not _AUTO_APPROVE_PYTHON:
+    if not pre_authorized and not _AUTO_APPROVE_PYTHON:
         if AUTONOMY_LEVEL == "strict":
             requires_user_prompt = True
             prompt_label = f"[STRICT] {script_label}"
@@ -744,6 +796,39 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
             ASCIIColors.success("[execute_python] 🔓 Auto-approval enabled for this session.")
         elif decision == "allow":
             user_authorized_risky = True
+
+    # ── LAYER 1: static AST validation ──
+    # Profile selection:
+    #   - "authorized" when the user explicitly approved a risky operation
+    #     (permits subprocess/socket/urllib/requests; still blocks ctypes,
+    #     winreg, os.system/exec*, eval/exec).
+    #   - "authorized" also under full_access when risky (the operator has
+    #     opted out of prompts — the same surface is permitted).
+    #   - "standard" otherwise (unchanged: best posture for benign code).
+    _static_profile = "standard"
+    if (user_authorized_risky or AUTONOMY_LEVEL == "full_access") and risky_reason:
+        _static_profile = "authorized"
+
+    static_violation = _sandbox_validate_source(source, profile=_static_profile)
+    if static_violation is not None:
+        ASCIIColors.warning(
+            f"[execute_python] Static sandbox rejection ({_static_profile}): "
+            f"{static_violation.reason}"
+        )
+        return {
+            "success": False,
+            "error": (
+                f"🛑 BLOCKED BY SANDBOX (line {static_violation.line}): "
+                f"{static_violation.reason}\n"
+                f"Offending construct: {static_violation.snippet}\n"
+                "This primitive has no safe alternative inside the sandbox — even "
+                "with user authorization it cannot be reached from Python code "
+                "because it can escape the sandbox at the native level. "
+                "Use the system_shell tool if you legitimately need host commands."
+            ),
+            "output": "",
+            "stderr": "static_sandbox_rejection",
+        }
 
     _np = None
     _plt = None
@@ -946,10 +1031,14 @@ def _run_python_source(source: str, script_label: str, argv: Optional[List[Any]]
     # `argv` must be a list of strings for sys.argv in the child.
     child_argv = list(argv) if argv is not None else [script_label]
 
+    # The child runtime MUST use the same profile the AST validator used —
+    # otherwise the user's authorization is silently overridden at exec time
+    # (AST permits subprocess, runtime still blocks it → "BLOCKED BY SANDBOX"
+    # after the user clicked "yes"). This was the exact bug reported.
     envelope = _run_in_sandboxed_child(
         source=source,
         workspace_root=workspace_root,
-        profile="standard",
+        profile=_static_profile,
         script_label=script_label,
         argv=child_argv,
         seed_locals=child_seed,
@@ -1324,6 +1413,9 @@ def tool_create_and_execute_python_file(
         }
 
     # Authorize BEFORE writing so a rejection leaves no dangling file behind.
+    # Same decision matrix as `_run_python_source` — the user must be prompted
+    # for risky code in safe mode, and their approval must select the
+    # "authorized" profile so the runtime doesn't re-block what they approved.
     global _AUTO_APPROVE_PYTHON
     risky_reason = _detect_risky_operations(code_str)
     requires_user_prompt = False
@@ -1369,7 +1461,13 @@ def tool_create_and_execute_python_file(
         }
 
     argv = _normalize_argv(clean_name, args)
-    result = _run_python_source(code_str, clean_name, argv=argv, tool_ctx=tool_ctx)
+    # `pre_authorized=True`: this function already solicited authorization
+    # above. Passing it through avoids a second prompt for the same source
+    # (which would be confusing UX and, worse, would let a user authorize on
+    # the write prompt then get re-blocked by the exec prompt's static check).
+    result = _run_python_source(
+        code_str, clean_name, argv=argv, tool_ctx=tool_ctx, pre_authorized=True,
+    )
 
     if isinstance(result, dict):
         result["file_path"] = clean_name

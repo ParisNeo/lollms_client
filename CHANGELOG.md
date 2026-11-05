@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-05 02:26]
+
+- feat: enhance LLM bindings and execute_python tools
+
 ## [2026-11-04 15:52]
 
 - `fix: update client version to 1.21.7 for minor release compatibility`

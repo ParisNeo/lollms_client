@@ -1231,6 +1231,7 @@ class LollmsBinding(LollmsLLMBinding):
 
                 if stream:
                     handler = _StreamThinkingHandler(streaming_callback, suppress_thinking=is_thinking_deactivated)
+                    accumulated_stream_tool_calls: Dict[int, Dict[str, Any]] = {}
 
                     for resp in chat_completion:
                         if self.is_cancelled():
@@ -1246,6 +1247,16 @@ class LollmsBinding(LollmsLLMBinding):
                         reasoning = extract_reasoning(delta)
                         content = getattr(delta, "content", "") or ""
 
+                        # Accumulate tool-call deltas even when tools were not
+                        # requested: some OpenAI-compatible backends emit
+                        # unsolicited tool_calls. They are synthesized into
+                        # <tool> XML below when native tools are disabled.
+                        delta_tool_calls = getattr(delta, "tool_calls", None)
+                        if delta_tool_calls:
+                            accumulate_streamed_tool_deltas(
+                                accumulated_stream_tool_calls, delta_tool_calls
+                            )
+
                         if reasoning:
                             if not handler.process_reasoning(reasoning):
                                 break
@@ -1258,6 +1269,34 @@ class LollmsBinding(LollmsLLMBinding):
                             count += 1
 
                     output = self._finalize_stream_output(handler, streaming_callback)
+
+                    if accumulated_stream_tool_calls:
+                        synthesized = []
+                        for idx in sorted(accumulated_stream_tool_calls.keys()):
+                            tc = accumulated_stream_tool_calls[idx]
+                            name = (tc.get("name") or "").strip()
+                            if not name:
+                                continue
+                            tc_id = tc.get("id") or f"call_{idx}"
+                            raw_args = tc.get("arguments") or ""
+                            try:
+                                tool_args = json.loads(raw_args) if raw_args else {}
+                            except (json.JSONDecodeError, TypeError):
+                                tool_args = {"raw": raw_args}
+                            synthesized.append(
+                                {
+                                    "id": tc_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": json.dumps(tool_args),
+                                    },
+                                }
+                            )
+                        if synthesized:
+                            output = self._synthesize_tool_xml_if_needed(
+                                output, synthesized
+                            )
                 else:
                     message_obj = chat_completion.choices[0].message
                     reasoning = extract_reasoning(message_obj)
@@ -1267,6 +1306,12 @@ class LollmsBinding(LollmsLLMBinding):
                         output = f"<think>\n{reasoning}\n</think>\n\n{content}"
                     else:
                         output = content
+
+                    # Synthesize <tool> XML when native tool calling is not
+                    # advertised but the backend still returned tool_calls.
+                    output = self._synthesize_tool_xml_if_needed(
+                        output, getattr(message_obj, "tool_calls", None)
+                    )
 
                     has_native_tool_calls = bool(
                         getattr(message_obj, "tool_calls", None)
@@ -1865,6 +1910,43 @@ class LollmsBinding(LollmsLLMBinding):
             return {"status": "error", "message": err_msg, "server_body": getattr(e, "body", None)}
 
         return output
+
+    def _synthesize_tool_xml_if_needed(
+        self,
+        content: str,
+        native_tool_calls: Optional[List[Any]],
+    ) -> str:
+        """
+        When native tool calling is NOT advertised by this binding
+        (``native_tools_enabled is False``) but the backend still emits
+        native ``tool_calls`` (some OpenAI-compatible servers do this
+        unsolicited), translate them into the Lollms ``<tool>{json}</tool>``
+        XML protocol so the XML tooling layer can pick them up.
+
+        The XML block is appended on a NEW LINE after the visible content.
+        When ``native_tools_enabled`` is True the native lifecycle already
+        owns the tool calls, so this is a no-op.
+        """
+        if getattr(self, "native_tools_enabled", False):
+            return content
+        if not native_tool_calls:
+            return content
+
+        try:
+            xml = LollmsLLMBinding.tool_calls_to_lollms_xml(native_tool_calls)
+        except Exception as e:
+            ASCIIColors.warning(
+                f"[LollmsBinding] Failed to synthesize <tool> XML from native "
+                f"tool_calls: {e}"
+            )
+            return content
+
+        if not xml:
+            return content
+
+        if content and content.strip():
+            return f"{content}\n{xml}"
+        return xml
 
     def _finalize_stream_output(
         self,

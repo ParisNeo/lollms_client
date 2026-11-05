@@ -315,20 +315,51 @@ def _sanitize_host_paths(text: str, workspace_root: Path) -> str:
         sanitized,
     )
 
-# Import the shared sandbox kernel. Fall back to a localised import path when
-# the tool is loaded outside the package tree.
-try:
-    from .sandbox_kernel import (
-        validate_source,
-        SandboxViolation,
-        run_in_sandboxed_child,
+# Import the shared sandbox kernel from `execute_python/sandbox_kernel.py`.
+#
+# Resolution strategy (robust across all load contexts):
+#   1. Relative `..execute_python.sandbox_kernel` — works when this module is
+#                          loaded as part of the package (normal LCP load).
+#   2. Absolute `lollms_client.*` — works when the toolset is loaded by file
+#                          path via importlib without a registered parent
+#                          package, but `lollms_client` is installed.
+#   3. `src.lollms_client.*` — dev-checkout fallback for repos where the
+#                          package is NOT pip-installed and `src/` is on sys.path.
+def _import_sandbox_kernel():
+    """Resolves the shared `sandbox_kernel` across all load contexts."""
+    errors = []
+    # Tier 1: relative (canonical package load).
+    try:
+        from ..execute_python import sandbox_kernel as _sk  # type: ignore
+        return _sk
+    except ImportError as exc:
+        errors.append(f"relative: {exc}")
+    # Tier 2: canonical installed path.
+    try:
+        from lollms_client.tools_bindings.lcp.default_tools.execute_python import (  # type: ignore
+            sandbox_kernel as _sk,
+        )
+        return _sk
+    except ImportError as exc:
+        errors.append(f"lollms_client: {exc}")
+    # Tier 3: dev-checkout fallback.
+    try:
+        from src.lollms_client.tools_bindings.lcp.default_tools.execute_python import (  # type: ignore
+            sandbox_kernel as _sk,
+        )
+        return _sk
+    except ImportError as exc:
+        errors.append(f"src.lollms_client: {exc}")
+    raise ImportError(
+        "Could not import sandbox_kernel from any known location. "
+        f"Attempts: {'; '.join(errors)}"
     )
-except ImportError:  # pragma: no cover
-    from ..execute_python.sandbox_kernel import (  # type: ignore
-        validate_source,
-        SandboxViolation,
-        run_in_sandboxed_child,
-    )
+
+
+_sandbox_kernel = _import_sandbox_kernel()
+validate_source = _sandbox_kernel.validate_source
+SandboxViolation = _sandbox_kernel.SandboxViolation
+run_in_sandboxed_child = _sandbox_kernel.run_in_sandboxed_child
 
 TOOL_LIBRARY_NAME = "Execute Python Data Query"
 TOOL_LIBRARY_DESC = "Executes sandboxed Python code to analyze or modify datasets in the workspace."
@@ -714,6 +745,20 @@ def tool_execute_python_data_query(
     """
     disc = discussion_instance or (getattr(env, "discussion", None) if env else None)
     client = lollms_client_instance or (getattr(env, "client", None) if env else None)  # parity; may be unused
+    tool_ctx = getattr(env, "tool_context", None) if env else None
+
+    # Emit an initial status so the UI shows a "processing" indicator the
+    # instant the tool is invoked — before AST validation, before the child
+    # spawns. Without this, long-running analytical code leaves the UI silent.
+    if tool_ctx is not None and hasattr(tool_ctx, "emit_progress"):
+        try:
+            tool_ctx.emit_progress(
+                "⏳ Executing Python data query…",
+                {"stream": "status", "phase": "starting"},
+            )
+        except Exception:
+            pass
+
     if isinstance(code, dict):
         ASCIIColors.warning("[execute_python_data_query] Unwrapping nested dictionary parameter.")
         code = code.get("code") or code.get("sql_query") or next((v for v in code.values() if isinstance(v, str)), "")

@@ -529,23 +529,71 @@ def _tools_specs_to_openai_schema(active_tools: Dict[str, Dict[str, Any]]) -> Li
     return schema
 
 
+_NATIVE_TOOL_ATTR_PROBES = (
+    # Common capability flags used by OpenAI-compatible bindings.
+    "supports_native_tools",
+    "native_tool_calling",
+    "tools_supported",
+    "chat_template_supports_tools",
+    # vLLM / llama.cpp server-side tool parsers.
+    "tool_call_parser",
+    "tool_parser",
+)
+
+
 def _binding_supports_native_tools(binding: Any) -> bool:
     """
-    Heuristic: True when the active binding overrides
-    ``LollmsLLMBinding.generate_from_messages``.
+    Heuristic: True when the active binding can drive native tool calls.
 
-    The base class provides a stub that returns ``{"status": "error"}``; any
-    concrete binding that supports native tool calls overrides it. Comparing
-    the bound method against the base implementation is a reliable, zero-cost
-    capability probe that requires no new binding-side flag.
+    Two independent signals are checked (either is sufficient):
+
+    1. **Override probe**: the binding overrides
+       ``LollmsLLMBinding.generate_from_messages``. The base class provides a
+       stub that returns ``{"status": "error"}``; any concrete binding that
+       supports native tool calls overrides it. This is the strongest signal
+       — it means the binding itself drives the tool sub-loop.
+
+    2. **Attribute probe**: the binding advertises native tool support via
+       a capability flag (``supports_native_tools``, ``native_tool_calling``,
+       ``tools_supported``, ``chat_template_supports_tools``) or via a
+       server-side parser attribute (``tool_call_parser``, ``tool_parser``).
+       This covers bindings that pass ``tools=[…]`` straight through to the
+       server (vLLM with ``--tool-call-parser``, llama.cpp with a tool-capable
+       chat template, Ollama, Groq, …) WITHOUT overriding
+       ``generate_from_messages`` — the model runs its own tool loop inside
+       the server, so the mixin must forward the schema and must NOT force
+       an XML ``<tool>`` emission.
+
+    Both probes are zero-cost, side-effect-free, and never raise.
     """
     if binding is None:
         return False
+
+    # Probe 1: override of generate_from_messages.
     try:
         from lollms_client.lollms_llm_binding import LollmsLLMBinding
-        return type(binding).generate_from_messages is not LollmsLLMBinding.generate_from_messages
+        if type(binding).generate_from_messages is not LollmsLLMBinding.generate_from_messages:
+            return True
     except Exception:
-        return False
+        pass
+
+    # Probe 2: capability / parser attributes.
+    for attr_name in _NATIVE_TOOL_ATTR_PROBES:
+        try:
+            value = getattr(binding, attr_name, None)
+        except Exception:
+            value = None
+        if value is None or value is False:
+            continue
+        # A non-empty string (e.g. tool_call_parser="hermes") or a truthy
+        # boolean both indicate native tool support.
+        if isinstance(value, str):
+            if value.strip():
+                return True
+        elif bool(value):
+            return True
+
+    return False
 
 
 _DOC_SOURCE_BANNER_RE = re.compile(
@@ -1616,10 +1664,15 @@ class _StreamState:
                         return False
 
                     # Close the processing block cleanly with status metadata INSIDE the block.
-                    if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                    # Guarded by `_processing_block_open`: the artifact dispatcher may
+                    # have ALREADY emitted its own close (e.g. the redundant-rewrite
+                    # rejection path). Emitting a second `</processing>` produces the
+                    # double-close leak observed in the transcript.
+                    if self._processing_block_open and self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
                         proc_close_tag = '\n<!-- status:finished -->\n</processing>\n'
                         self.ai_message.content += proc_close_tag
                         _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        self._processing_block_open = False
 
                     # Keep any text that came after the closing tag
                     self._pending_buffer = self._artefact_buffer[close_idx+len(closing_tag):]
@@ -1800,6 +1853,7 @@ class _StreamState:
                         if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
                             proc_tag = f'\n<processing type="artefact" title="{title}" language="{lang or ""}" operation="{operation_type}">\n'
                             self.ai_message.content += proc_tag
+                            self._processing_block_open = True
                             _cb(self.callback, proc_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True, "operation": operation_type, "is_patch": is_patch_start})
 
                         # Start the heartbeat in case the artifact body is slow/empty
@@ -1846,12 +1900,15 @@ class _StreamState:
                                 return False
 
                             # Close the processing block cleanly with status metadata.
-                            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                            # Guarded by `_processing_block_open` (see State 1): the
+                            # dispatcher may have already closed the block on failure.
+                            if self._processing_block_open and self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
                                 proc_close_tag = f'\n</processing>\n'
                                 status_comment = f'<!-- status:finished -->\n'
                                 self.ai_message.content += proc_close_tag + status_comment
                                 _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                                 _cb(self.callback, status_comment, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                self._processing_block_open = False
 
                             self._artefact_buffer = ""
                             # Keep any text after the closing tag in the pending buffer
@@ -2371,6 +2428,19 @@ class _StreamState:
             '',
             safe_buffer,
         )
+        # ── 🛡️ PARTIAL CLOSING TAG AT LINE START ──
+        # The model sometimes truncates the closing artifact tag to `</artifact`
+        # (missing the `>`). When that fragment sits on its OWN line (followed by
+        # a newline or end-of-buffer), it can never complete and MUST be stripped
+        # before default forwarding — otherwise it leaks verbatim into the chat
+        # transcript (the `</artifact` leak observed after successful dispatches).
+        # The `^` anchor + `$` line-end anchor ensure we ONLY strip fragments that
+        # occupy an entire line, never legitimate inline documentation.
+        safe_buffer = re.sub(
+            r'(?im)^[ \t]*</(?:artifact|artefact)\b[^>]*[ \t]*$',
+            '',
+            safe_buffer,
+        )
         if safe_buffer != self._pending_buffer:
             ASCIIColors.warning(
                 "[StreamState] Suppressed stray artifact-family tag that reached "
@@ -2386,6 +2456,42 @@ class _StreamState:
     def _note_informational_step(self) -> None:
         """Records an informational step that legitimizes a subsequent scratchpad write."""
         object.__setattr__(self.discussion, "_scratchpad_write_streak", 0)
+
+    def _ensure_processing_block_open(
+        self,
+        tag_type: str,
+        title: str,
+        extra_attrs: str = "",
+    ) -> bool:
+        """Guarantees a `<processing>` block is open before emitting status lines.
+
+        Single-owner contract: the dispatcher is authoritative for the block
+        lifecycle. Some code paths reach `_dispatch_closed_tag` WITHOUT the
+        normal `feed()` State-2 pre-open emission — specifically:
+          • `flush_remaining_buffer()` truncated-artifact recovery
+          • `flush_remaining_buffer()` parked-artifact recovery
+          • Any future direct dispatch path added by a caller
+
+        Without this guard, those paths create artefacts / execute tools /
+        save notes with NO `<processing>` block in the transcript — the action
+        happens "under the radar" and the user has no visual indication.
+
+        Returns True when the block was newly opened (so the caller knows the
+        block was NOT already open at entry). Returns False when a block was
+        already open (the caller's existing close logic owns it).
+        """
+        if self._processing_block_open:
+            return False
+        if self.event_mode not in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+            # Non-processing-tag modes render status via structured events;
+            # the block latch is irrelevant there.
+            return False
+        attrs_part = f" {extra_attrs}" if extra_attrs else ""
+        proc_open = f'\n<processing type="{tag_type}" title="{title}"{attrs_part}>\n'
+        self.ai_message.content += proc_open
+        _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+        self._processing_block_open = True
+        return True
 
     def _hydrate_single_image_source(self, ref: str) -> Optional[str]:
         """
@@ -2504,6 +2610,21 @@ class _StreamState:
             if not self.enable_artefacts:
                 return True
             title = attrs.get("name") or attrs.get("title") or f"artifact_{uuid.uuid4().hex[:8]}"
+
+            # ── 🛡️ ENSURE PROCESSING BLOCK IS OPEN ──
+            # The normal feed() State-2 path opens the block BEFORE calling
+            # this dispatcher. But flush_remaining_buffer() (truncated/parked
+            # artifact recovery) calls this dispatcher DIRECTLY — without the
+            # block open. Without this guard, a truncated artifact creates
+            # silently (no <processing> in the transcript) and the user never
+            # sees the action. This is the "artifact went under the radar" bug.
+            atype_for_open = attrs.get("type", "document")
+            lang_for_open = attrs.get("language", "") or ""
+            self._ensure_processing_block_open(
+                tag_type="artefact",
+                title=title,
+                extra_attrs=f'language="{lang_for_open}"',
+            )
 
             atype = attrs.get("type", "document")
             lang = attrs.get("language")
@@ -2663,6 +2784,9 @@ class _StreamState:
                             )
                             self.ai_message.content += proc_close
                             _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                            # Mark the processing block as CLOSED so the caller does
+                            # not emit a second `</processing>` (double-close leak).
+                            self._processing_block_open = False
                         return True
 
             if is_patch and not is_new:
@@ -2686,6 +2810,9 @@ class _StreamState:
                         _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                         _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                         _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        # Mark the processing block as CLOSED so the caller does
+                        # not emit a second `</processing>` (double-close leak).
+                        self._processing_block_open = False
                     else:
                         self.ai_message.content = self.ai_message.content.replace(full_match_text, "")
                     return True
@@ -2903,6 +3030,13 @@ class _StreamState:
                 tool_open_tag = f'\n<processing type="tool" title="Tool Execution: {ui_tool_name}" params="{escaped_params}">\n'
                 self.ai_message.content += tool_open_tag
                 _cb(self.callback, tool_open_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                # ── 🛡️ SET THE BLOCK LATCH ──
+                # The chat loop's close emission is NOT guarded by the latch
+                # (it always emits the close after execution), but downstream
+                # dispatchers that consult `_processing_block_open` need to see
+                # the block as open. Without this, a subsequent artifact dispatch
+                # in the same turn could re-open a second block.
+                self._processing_block_open = True
 
                 # ── 🏷️ TITLED PARAMETER TABLE (SINGLE RENDER) ──
                 # The UI renders the `params` attribute as a table, but without a
@@ -2934,6 +3068,16 @@ class _StreamState:
             if not self.enable_notes:
                 return True
             title = attrs.get("title") or attrs.get("name") or f"note_{uuid.uuid4().hex[:8]}"
+
+            # ── 🛡️ ENSURE PROCESSING BLOCK IS OPEN ──
+            # Same rationale as the artifact branch: flush_remaining_buffer()
+            # can dispatch a truncated note directly without the feed() State-2
+            # pre-open emission. Guarantee the block is open so the user sees
+            # the note being captured.
+            self._ensure_processing_block_open(
+                tag_type="note",
+                title=title,
+            )
 
             is_patch = "<<<<<<< SEARCH" in body
             if is_patch:
@@ -2995,6 +3139,13 @@ class _StreamState:
             if not self.enable_artefacts:
                 return True
             title = attrs.get("title") or attrs.get("name") or "scratchpad"
+
+            # ── 🛡️ ENSURE PROCESSING BLOCK IS OPEN ──
+            # Flush-path scratchpad dispatches must also be visible to the user.
+            self._ensure_processing_block_open(
+                tag_type="scratchpad",
+                title=title,
+            )
 
             is_patch = "<<<<<<< SEARCH" in body
             existing_scratchpad = self.discussion.artefacts.get(title)
@@ -3126,6 +3277,13 @@ class _StreamState:
             if not self.enable_skills:
                 return True
             title = attrs.get("title") or attrs.get("name") or f"skill_{uuid.uuid4().hex[:8]}"
+
+            # ── 🛡️ ENSURE PROCESSING BLOCK IS OPEN ──
+            # Flush-path skill dispatches must also be visible to the user.
+            self._ensure_processing_block_open(
+                tag_type="skill",
+                title=title,
+            )
             desc = attrs.get("description", "")
             cat = attrs.get("category", "")
             tags_attr = attrs.get("tags", "")
@@ -3312,6 +3470,18 @@ class _StreamState:
         # 5. Multi-tier Context Visibility Management
         elif tag_name in ("unlock_file", "lock_file", "hide_file"):
             self._note_informational_step()
+
+            # ── 🛡️ ENSURE PROCESSING BLOCK IS OPEN ──
+            # Context tag dispatches from the flush path must be visible.
+            _ctx_action_verb = {
+                "unlock_file": "Unlocking",
+                "lock_file": "Locking",
+                "hide_file": "Hiding",
+            }.get(tag_name, "Updating")
+            self._ensure_processing_block_open(
+                tag_type="context_update",
+                title=f"{_ctx_action_verb} context files",
+            )
 
             # ── CONTEXT BUDGET GUARD ──
             # Maximum tokens allowed for a single file to be unlocked into context.
@@ -4606,12 +4776,30 @@ class _StreamState:
                     continue
                 self.processed_tags.add(full_match_text)
                 opening_tag_end = full_match_text.index('>') + 1
+                _parked_tag_name = parked_match.group(1).lower()
+                # ── 🛡️ ENSURE PROCESSING BLOCK IS OPEN (PARKED PATH) ──
+                # Parked tags bypass the normal feed() pre-open emission. Open
+                # the block here so the user sees the action instead of a
+                # silent artifact/note/skill creation.
+                _parked_attrs_str = full_match_text[:opening_tag_end]
+                _parked_title_match = re.search(r'(?:name|title)=["\']([^"\']+)["\']', _parked_attrs_str, re.IGNORECASE)
+                _parked_title = _parked_title_match.group(1) if _parked_title_match else _parked_tag_name
+                self._ensure_processing_block_open(
+                    tag_type="artefact" if _parked_tag_name in ("artifact", "artefact") else _parked_tag_name,
+                    title=_parked_title,
+                )
                 self._dispatch_closed_tag(
-                    parked_match.group(1).lower(),
-                    full_match_text[:opening_tag_end],
+                    _parked_tag_name,
+                    _parked_attrs_str,
                     parked_match.group(3).strip(),
                     full_match_text,
                 )
+                # Close the block (guarded — the dispatcher may have already closed it).
+                if self._processing_block_open and self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                    _parked_close = '\n<!-- status:finished -->\n</processing>\n'
+                    self.ai_message.content += _parked_close
+                    _cb(self.callback, _parked_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    self._processing_block_open = False
                 self._action_dispatched = True
             if parked_matches:
                 self._pending_buffer = complete_tag_re.sub('', self._pending_buffer)
@@ -4650,6 +4838,18 @@ class _StreamState:
                     if end_of_open_tag != -1:
                         opening_tag = self._artefact_buffer[open_idx:end_of_open_tag+1]
                         body_content = self._artefact_buffer[end_of_open_tag+1:]
+                        # ── 🛡️ STRIP PARTIAL CLOSING TAG FROM BODY ──
+                        # The model sometimes truncates the closing tag to
+                        # `</artifact` (no `>`). When flush synthesizes the close,
+                        # that fragment would otherwise be baked INTO the body and
+                        # then leak into the transcript on the next default-forward
+                        # pass. Strip any trailing partial closing artifact tag
+                        # (with optional whitespace) before dispatch.
+                        body_content = re.sub(
+                            r'(?is)\s*</(?:artifact|artefact)\b[^>]*$',
+                            '',
+                            body_content,
+                        )
                         closing_tag = "</artifact>"
                         full_match_text = opening_tag + body_content + closing_tag
 
@@ -4693,6 +4893,27 @@ class _StreamState:
                         if full_match_text not in self.processed_tags:
                             self.processed_tags.add(full_match_text)
                             ASCIIColors.warning("[StreamState] Detected truncated artifact. Attempting best-effort dispatch.")
+                            # ── 🛡️ ENSURE PROCESSING BLOCK IS OPEN (FLUSH PATH) ──
+                            # The normal feed() State-2 path opens the block before
+                            # dispatching. This flush path bypasses that — without
+                            # this guard, the truncated artifact creates silently
+                            # (no <processing> in the transcript) and the user
+                            # never sees the action ("artifact went under the radar").
+                            _trunc_title = "artifact"
+                            _trunc_match = re.search(r'(?:name|title)=["\']([^"\']+)["\']', opening_tag, re.IGNORECASE)
+                            if _trunc_match:
+                                _trunc_title = _trunc_match.group(1)
+                            _trunc_lang_match = re.search(r'language=["\']([^"\']*)["\']', opening_tag, re.IGNORECASE)
+                            _trunc_lang = _trunc_lang_match.group(1) if _trunc_lang_match else ""
+                            self._ensure_processing_block_open(
+                                tag_type="artefact",
+                                title=_trunc_title,
+                                extra_attrs=f'language="{_trunc_lang}"',
+                            )
+                            # Emit an opening status line so the block is not empty.
+                            _trunc_status = f"💻 Writing code... (recovered from truncated stream)\n"
+                            self.ai_message.content += _trunc_status
+                            _cb(self.callback, _trunc_status, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                             self._dispatch_closed_tag(
                                 "artifact",
                                 opening_tag,
@@ -4700,10 +4921,13 @@ class _StreamState:
                                 full_match_text
                             )
 
-                        # Close the processing block
-                        proc_close_tag = '\n<!-- status:finished -->\n</processing>\n'
-                        self.ai_message.content += proc_close_tag
-                        _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        # Close the processing block (guarded by the latch — the
+                        # dispatcher may have already closed it on failure paths).
+                        if self._processing_block_open:
+                            proc_close_tag = '\n<!-- status:finished -->\n</processing>\n'
+                            self.ai_message.content += proc_close_tag
+                            _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                            self._processing_block_open = False
 
                         # Mark that an action was dispatched so the loop continues correctly
                         self._action_dispatched = True
@@ -8479,6 +8703,78 @@ class ChatMixin:
                     if is_conn_dict:
                         round_connection_error = conn_reason_dict
 
+                # ── 🛠️ HARVEST NATIVE TOOL CALLS FROM THE BINDING RESPONSE ──
+                # When the binding runs its own tool loop (or forwards tools to a
+                # server that does), the executed calls do NOT surface as XML
+                # <tool> tags in the stream. They arrive in the structured
+                # response as `tool_calls` (OpenAI Chat Completions shape) or
+                # under `choices[0].message.tool_calls`. Record them for the UI
+                # and turn telemetry so the user sees what actually ran.
+                if native_tools_enabled and isinstance(gen_res, dict):
+                    _native_tcs: List[Dict[str, Any]] = []
+                    _direct_tcs = gen_res.get("tool_calls")
+                    if isinstance(_direct_tcs, list):
+                        _native_tcs.extend(_direct_tcs)
+                    try:
+                        _choices = gen_res.get("choices")
+                        if isinstance(_choices, list) and _choices:
+                            _msg = _choices[0].get("message") if isinstance(_choices[0], dict) else None
+                            if isinstance(_msg, dict):
+                                _msg_tcs = _msg.get("tool_calls")
+                                if isinstance(_msg_tcs, list):
+                                    _native_tcs.extend(_msg_tcs)
+                    except Exception:
+                        pass
+
+                    for _tc in _native_tcs:
+                        if not isinstance(_tc, dict):
+                            continue
+                        _fn = _tc.get("function") if isinstance(_tc.get("function"), dict) else {}
+                        _tc_name = str(_fn.get("name") or _tc.get("name") or "").strip()
+                        if not _tc_name:
+                            continue
+                        _tc_args_raw = _fn.get("arguments") or _tc.get("arguments") or {}
+                        if isinstance(_tc_args_raw, str):
+                            try:
+                                _tc_args = json.loads(_tc_args_raw) if _tc_args_raw.strip() else {}
+                            except Exception:
+                                _tc_args = {"_raw_arguments": _tc_args_raw}
+                        elif isinstance(_tc_args_raw, dict):
+                            _tc_args = _tc_args_raw
+                        else:
+                            _tc_args = {}
+
+                        tool_calls_this_turn.append({
+                            "name": _tc_name,
+                            "params": _tc_args,
+                            "result": {"output": "", "success": True, "source": "native"},
+                        })
+                        turn_actions_log.append({
+                            "action": "tool_call",
+                            "tool_name": _tc_name,
+                            "success": True,
+                            "round": round_count,
+                        })
+                        if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                            _cb(callback, "", MSG_TYPE.MSG_TYPE_TOOL_START, {
+                                "tool_name": _tc_name,
+                                "parameters": _tc_args,
+                                "source": "native",
+                            })
+                            _cb(callback, "", MSG_TYPE.MSG_TYPE_TOOL_END, {
+                                "tool_name": _tc_name,
+                                "parameters": _tc_args,
+                                "success": True,
+                                "output": "",
+                                "error": None,
+                                "source": "native",
+                            })
+                    if _native_tcs:
+                        _dbg(
+                            f"[ChatMixin] Harvested {len(_native_tcs)} native tool call(s) "
+                            f"from binding response (round {round_count})."
+                        )
+
                 _t_gen_end = time.perf_counter()
                 _dbg(f"[Trace] Generation round {round_count} stream completed in {(_t_gen_end - _t_gen_start):.2f} s.")
             except Exception as gen_err:
@@ -10073,6 +10369,45 @@ class ChatMixin:
                     # We MUST NOT emit it again here, or the UI will render duplicate blocks.
                     # We simply proceed directly to tool execution.
 
+                    # ── ⏳ EMIT "EXECUTING" STATUS BEFORE THE TOOL RUNS ──
+                    # The <processing> block was opened by the stream parser with
+                    # "* Calling local tool system for '...'...". That line is
+                    # misleading: the tool has NOT started yet — the stream just
+                    # closed. Emit an explicit "Executing..." line NOW, BEFORE
+                    # the tool callable is invoked, so the client app renders a
+                    # live "processing" indicator for the ENTIRE execution window
+                    # (which can be seconds for sandboxed Python, shell commands,
+                    # or data queries). Without this line, the client only sees
+                    # "Calling..." then jumps straight to "Completed..." — the
+                    # user has no visual feedback that the tool is actually
+                    # running, and long executions appear frozen.
+                    #
+                    # SAFETY RE-OPEN: if the <processing> block was closed by
+                    # some earlier path (e.g. a dispatcher failure branch that
+                    # closed it prematurely), re-open it here so the "Executing"
+                    # line and the eventual "Completed" line render inside a
+                    # valid block. Without this, the client app would render an
+                    # orphaned "Executing..." line that the user cannot visually
+                    # associate with a tool call.
+                    if event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                        if not getattr(ss, "_processing_block_open", False):
+                            _reopen_tag = f'\n<processing type="tool" title="Tool Execution: {tool_name}">\n'
+                            ai_msg.content += _reopen_tag
+                            _cb(callback, _reopen_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                            try:
+                                ss._processing_block_open = True
+                            except Exception:
+                                pass
+                        exec_start_line = f"* ⏳ Executing '{tool_name}'...\n"
+                        ai_msg.content += exec_start_line
+                        _cb(callback, exec_start_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                        _cb(callback, "", MSG_TYPE.MSG_TYPE_INFO, {
+                            "type": "tool_execution_started",
+                            "tool_name": tool_name,
+                            "parameters": tool_params,
+                        })
+
                     # Execute the tool sequentially
                     try:
                         if self.is_generation_cancelled():
@@ -10757,19 +11092,76 @@ class ChatMixin:
                         )
                         virtual_history[-1].content += progress_summary
                     else:
-                        user_part = (
-                            f'<tool_result name="{tool_name}" status="FAILED">\n'
-                            f"{clean_result_str}\n"
-                            f"</tool_result>\n\n"
-                            f"⚠️ **Tool Execution Failed — SELF-CORRECTION MANDATE (LONG-HORIZON MODE).**\n"
-                            f"The tool '{tool_name}' failed. The turn is NOT over. You MUST fix the problem yourself:\n"
-                            f"1. **DIAGNOSE**: Read the error/traceback above and identify the EXACT offending line or parameter.\n"
-                            f"2. **FIX**: If the error is in a workspace file you previously created, emit a corrected `<artifact>` tag (full rewrite or SEARCH/REPLACE patch) with the fix applied. If the parameters were wrong, re-emit a corrected `<tool>` call.\n"
-                            f"3. **RETRY**: Re-run the tool to verify the fix.\n"
-                            f"4. **ITERATE**: Repeat diagnose→fix→retry until success or until you determine the approach is truly impossible.\n"
-                            f"5. Only after the task genuinely succeeds, or you have exhausted reasonable fixes, write your final analysis to the user and emit `<done/>` on a new line.\n"
-                            f"Do NOT end your response with prose only. Do NOT claim the task is complete while errors remain unverified."
+                        # ── 🛠️ TOOL-INITIALIZATION FAILURE DETECTION ──
+                        # A "Tool initialization failed" error means the toolset
+                        # itself could not be built (missing dependency, sandbox
+                        # backend down, LCP library refused to load). This is an
+                        # INFRASTRUCTURE failure, not a parameter error — retrying
+                        # the SAME tool is futile. The model must either switch to
+                        # an ALTERNATE tool that can perform the same task, or
+                        # report the infrastructure failure to the user with the
+                        # exact error. Without this branch, small models see the
+                        # generic self-correction mandate, retry the same broken
+                        # tool, and then "give up" in prose — the exact failure
+                        # pattern observed in the transcript.
+                        _init_failure_markers = (
+                            "tool initialization failed",
+                            "initialization failed",
+                            "not initialized",
+                            "failed to initialize",
+                            "toolset could not be loaded",
                         )
+                        _result_lower = (clean_result_str or "").lower()
+                        _is_init_failure = any(
+                            marker in _result_lower for marker in _init_failure_markers
+                        )
+
+                        if _is_init_failure:
+                            _alternates = ", ".join(
+                                f"`{t}`" for t in (
+                                    "tool_execute_python_code",
+                                    "tool_execute_python_file",
+                                    "tool_create_and_execute_python_file",
+                                ) if active_tools and t in active_tools
+                            ) or "none of the Python execution tools are mounted"
+                            user_part = (
+                                f'<tool_result name="{tool_name}" status="FAILED" '
+                                f'failure_kind="initialization">\n'
+                                f"{clean_result_str}\n"
+                                f"</tool_result>\n\n"
+                                f"⚠️ **TOOL INITIALIZATION FAILURE — NOT A PARAMETER ERROR.**\n"
+                                f"The tool '{tool_name}' could not be INITIALIZED. This is an "
+                                f"INFRASTRUCTURE failure (the toolset backend is unavailable), "
+                                f"NOT a problem with your parameters or your code. Retrying the "
+                                f"SAME tool with different parameters WILL fail identically.\n\n"
+                                f"**MANDATORY NEXT STEP — choose exactly ONE:**\n"
+                                f"1. **SWITCH TOOLS**: If another tool can perform the same task, "
+                                f"emit a `<tool>` call for it now. Alternate execution tools "
+                                f"available in this session: {_alternates}.\n"
+                                f"2. **REPORT THE INFRASTRUCTURE FAILURE**: If no alternate tool "
+                                f"can perform the task, write your final answer to the user "
+                                f"stating clearly that the '{tool_name}' backend failed to "
+                                f"initialize (quote the exact error above) and that the task "
+                                f"cannot proceed until the environment is fixed. Then emit "
+                                f"`<done/>` on a new line.\n\n"
+                                f"🚫 **FORBIDDEN**: Do NOT re-call '{tool_name}' with the same "
+                                f"or different parameters — it will fail identically. Do NOT "
+                                f"claim the task succeeded."
+                            )
+                        else:
+                            user_part = (
+                                f'<tool_result name="{tool_name}" status="FAILED">\n'
+                                f"{clean_result_str}\n"
+                                f"</tool_result>\n\n"
+                                f"⚠️ **Tool Execution Failed — SELF-CORRECTION MANDATE (LONG-HORIZON MODE).**\n"
+                                f"The tool '{tool_name}' failed. The turn is NOT over. You MUST fix the problem yourself:\n"
+                                f"1. **DIAGNOSE**: Read the error/traceback above and identify the EXACT offending line or parameter.\n"
+                                f"2. **FIX**: If the error is in a workspace file you previously created, emit a corrected `<artifact>` tag (full rewrite or SEARCH/REPLACE patch) with the fix applied. If the parameters were wrong, re-emit a corrected `<tool>` call.\n"
+                                f"3. **RETRY**: Re-run the tool to verify the fix.\n"
+                                f"4. **ITERATE**: Repeat diagnose→fix→retry until success or until you determine the approach is truly impossible.\n"
+                                f"5. Only after the task genuinely succeeds, or you have exhausted reasonable fixes, write your final analysis to the user and emit `<done/>` on a new line.\n"
+                                f"Do NOT end your response with prose only. Do NOT claim the task is complete while errors remain unverified."
+                            )
                         virtual_history.append(SimpleNamespace(
                             sender_type="user",
                             content=user_part
@@ -10874,9 +11266,36 @@ class ChatMixin:
 
                 _dbg("[ChatMixin] Text-only round without <done/>. Continuing loop until explicit termination.")
                 noncompliance_streak += 1
-                if _detect_intent_only_round(raw_round_text):
+
+                # ── 🛠️ NATIVE-TOOL BINDINGS ARE EXEMPT FROM INTENT-ONLY FORCING ──
+                # When the active binding drives native tool calls (either by
+                # overriding generate_from_messages or by advertising a
+                # capability/parser attribute), the model executes its tools
+                # INSIDE its own loop and returns a final answer as plain prose.
+                # That prose is a LEGITIMATE final answer, not an announced-but-
+                # unexecuted action. Forcing an XML <tool> emission here would
+                # demand a syntax the model cannot produce, wedging the turn.
+                # Treat the round as a clean conversational finish instead.
+                if native_tools_enabled:
+                    _dbg(
+                        "[ChatMixin] Native tool-calling binding active — treating "
+                        "text-only round as a legitimate final answer (no intent-only forcing)."
+                    )
+                    clean_history_text = scrub_processing_and_status_blocks(raw_round_text)
+                    if clean_history_text.strip():
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="assistant",
+                            content=clean_history_text.strip()
+                        ))
+                    _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="conversational")
+                    _persist_round_state()
+                    break
+
+                _intent_only = _detect_intent_only_round(raw_round_text)
+                if _intent_only:
                     ASCIIColors.warning(
-                        "[ChatLoop] Intent-only round detected: action announced without any functional tag."
+                        "[ChatLoop] Intent-only round detected: action announced without any functional tag. "
+                        "Injecting hard corrective envelope (tool emission REQUIRED, <done/> forbidden this round)."
                     )
                 clean_history_text = scrub_processing_and_status_blocks(raw_round_text)
                 if clean_history_text.strip():
@@ -10884,22 +11303,66 @@ class ChatMixin:
                         sender_type="assistant",
                         content=clean_history_text.strip()
                     ))
-                virtual_history.append(SimpleNamespace(
-                    sender_type="user",
-                    content=(
-                        "[SYSTEM: TERMINATION PROTOCOL]\n"
-                        "Your last message contained no action and no `<done/>` tag.\n"
-                        "You have exactly two valid moves:\n"
-                        "1. EMIT a functional tag now (`<tool>{...}</tool>`, "
-                        "`<artifact name=\"...\">...</artifact>`, `<agent>...</agent>`, "
-                        "`<unlock_file>...</unlock_file>`, etc.) to perform the work.\n"
-                        "2. FINISH: if your previous message ALREADY contains your complete "
-                        "final answer to the user, emit ONLY the `<done/>` tag — do not repeat "
-                        "or rephrase your answer. If you have NOT yet answered, write your "
-                        "final answer and then emit `<done/>` on a new line.\n"
-                        "Announcing an action in prose performs nothing. Choose now."
-                    )
-                ))
+
+                if _intent_only:
+                    # ── 🛑 FORCED-ACTION CORRECTION (INTENT-ONLY ROUND) ──
+                    # A round that ANNOUNCES an action but emits no functional tag
+                    # must be corrected with a HARD forcing function, not the
+                    # generic termination nudge. The generic nudge offers
+                    # "<done/>" as an escape hatch, which a small model will take
+                    # by simply re-emitting prose — that is exactly how the
+                    # announced action is silently dropped. Here we:
+                    #   • FORBID <done/> for this round (the announced action is
+                    #     not yet performed, so the turn cannot legitimately end);
+                    #   • Name the concrete tool families that can execute the
+                    #     announced verb, so the model has a target to emit;
+                    #   • Require a `<tool>` block as the ONLY acceptable output.
+                    _available_tool_names = ", ".join(
+                        f"`{t}`" for t in list(active_tools.keys())[:12]
+                    ) if active_tools else "none mounted"
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content=(
+                            "[SYSTEM: ACTION ANNOUNCED BUT NOT EXECUTED — CORRECTION REQUIRED]\n"
+                            "Your last message announced an action ('I will…', 'Let me…', "
+                            "'I'll…') but contained NO functional tag. Announcing an action "
+                            "in prose performs NOTHING. The announced action has NOT happened.\n\n"
+                            "MANDATORY FOR THIS ROUND:\n"
+                            "1. `<done/>` is FORBIDDEN this round — you have not yet executed "
+                            "the announced action, so the turn cannot end.\n"
+                            "2. You MUST emit a `<tool>{...}</tool>` block that performs the "
+                            "action you just described, OR a `<artifact name=\"...\">...</artifact>` "
+                            "if the action is a file write.\n"
+                            "3. If you do not know the exact tool name, choose the closest one "
+                            f"from the mounted tools: {_available_tool_names}.\n"
+                            "4. Do NOT re-announce the action in prose. Emit the tag directly.\n\n"
+                            "Example — announced 'I will run a Python script':\n"
+                            "<tool>{\"name\": \"tool_execute_python_code\", \"parameters\": "
+                            "{\"code\": \"print('Hello, World!')\"}}</tool>\n"
+                            "Example — announced 'I will write hello.py':\n"
+                            "<tool>{\"name\": \"tool_create_and_execute_python_file\", "
+                            "\"parameters\": {\"file_name\": \"hello.py\", \"code\": "
+                            "\"print('Hello, World!')\"}}</tool>\n"
+                            "Emit the tag NOW."
+                        )
+                    ))
+                else:
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content=(
+                            "[SYSTEM: TERMINATION PROTOCOL]\n"
+                            "Your last message contained no action and no `<done/>` tag.\n"
+                            "You have exactly two valid moves:\n"
+                            "1. EMIT a functional tag now (`<tool>{...}</tool>`, "
+                            "`<artifact name=\"...\">...</artifact>`, `<agent>...</agent>`, "
+                            "`<unlock_file>...</unlock_file>`, etc.) to perform the work.\n"
+                            "2. FINISH: if your previous message ALREADY contains your complete "
+                            "final answer to the user, emit ONLY the `<done/>` tag — do not repeat "
+                            "or rephrase your answer. If you have NOT yet answered, write your "
+                            "final answer and then emit `<done/>` on a new line.\n"
+                            "Announcing an action in prose performs nothing. Choose now."
+                        )
+                    ))
                 _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="action")
                 _persist_round_state()
                 continue

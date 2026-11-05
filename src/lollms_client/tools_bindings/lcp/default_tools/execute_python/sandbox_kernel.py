@@ -267,6 +267,38 @@ FORBIDDEN_MODULES: frozenset[str] = frozenset({
     "signal", "resource",
 })
 
+# Modules that are FORBIDDEN in "standard" but PERMITTED in "authorized".
+# The "authorized" profile is selected ONLY after the user explicitly approves
+# a risky operation (via the confirm handler / TTY prompt) in "safe" mode, or
+# under "full_access". It represents "the operator consented to this specific
+# class of operation" — network access, subprocess spawning, package-manager
+# helpers — while STILL blocking the primitives that can escape the sandbox
+# entirely at the C level (ctypes, winreg, os.exec*, os.system).
+#
+# Rationale: a user who says "yes, ping google" has authorized *network I/O
+# and process spawning*. They have NOT authorized "arbitrary host code
+# execution via ctypes" or "escape the sandbox via os.exec*". The two sets are
+# deliberately disjoint from `AUTHORIZED_STILL_FORBIDDEN_MODULES` below.
+AUTHORIZED_MODULES: frozenset[str] = frozenset({
+    "subprocess", "pty", "commands", "multiprocessing", "concurrent",
+    "socket", "ssl", "requests", "urllib", "urllib2", "urllib3",
+    "http", "httpx", "aiohttp", "ftplib", "smtplib", "telnetlib",
+    "paramiko", "fabric", "psutil", "webbrowser",
+    "importlib", "imp", "pkgutil", "runpy", "zipimport",
+})
+
+# Modules that remain FORBIDDEN even under the "authorized" profile. These
+# primitives can escape the sandbox at the C level (ctypes), corrupt the host
+# registry (winreg), or interact with OS signals/resources in ways that no
+# user-consent gate can make safe. If a user genuinely needs these, they must
+# use a different tool (system_shell, or a host script) — not execute_python.
+AUTHORIZED_STILL_FORBIDDEN_MODULES: frozenset[str] = frozenset({
+    "ctypes", "cffi", "cryptography",
+    "winreg", "win32api", "win32con", "win32com", "pythoncom",
+    "signal", "resource",
+    "antigravity", "this",
+})
+
 # Modules explicitly allowed in the strict data-query profile.
 DATA_QUERY_ALLOWED_MODULES: frozenset[str] = frozenset({
     # Analysis core
@@ -346,6 +378,37 @@ _SANDBOX_CACHE_ENV_MAP: Dict[str, str] = {
 # the resolved workspace path. Without this, every tool call recreates 13
 # subdirectories (13 × mkdir syscalls) — the source of the 600s regression.
 _SANDBOX_CACHE_READY: set = set()
+
+# Roots (outside the workspace) that the sandbox's path guard permits WRITES
+# into. Populated by `SandboxContext._redirect_cache_env()` so that library
+# caches (matplotlib fontlist, pip wheel cache, tempfile) can land in a real
+# writable directory WITHOUT polluting the user's workspace. Cleared on
+# `_restore_cache_env()` — the set only ever contains directories belonging to
+# currently-active sandbox contexts.
+#
+# Why not use the workspace itself? The user's project tree must stay pristine:
+# a visible `.sandbox_cache/` folder in the workspace is a UX bug (it shows up
+# in file trees, gets committed, and the artefact-sync layer mistakes its
+# matplotlib fontlist for a user artefact). Redirecting to a system temp dir
+# keeps library caches functional and invisible.
+_SANDBOX_WRITE_ROOTS: set = set()
+
+
+def _compute_sandbox_cache_root(workspace_root: Path) -> Path:
+    """Returns a stable per-workspace sandbox cache directory under the system temp.
+
+    Layout: `<tempdir>/lollms_sandbox_cache/<sha1(workspace)>/`. Using a hash of
+    the workspace path keeps concurrent sandboxes for different workspaces
+    isolated while allowing cache reuse across repeated calls into the SAME
+    workspace (matplotlib fontlist build is expensive — build it once).
+    """
+    import hashlib
+    import tempfile as _tf
+    try:
+        ws_key = hashlib.sha1(str(workspace_root).encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        ws_key = "default"
+    return Path(_tf.gettempdir()) / "lollms_sandbox_cache" / ws_key
 
 
 def _compute_trusted_read_roots() -> frozenset:
@@ -569,9 +632,92 @@ def _validate_standard(tree: ast.AST) -> Optional[SandboxViolation]:
     return None
 
 
+def _validate_authorized(tree: ast.AST) -> Optional[SandboxViolation]:
+    """Authorized profile: permit user-approved network/process primitives.
+
+    This profile is selected ONLY after the user explicitly authorized a risky
+    operation. It permits `subprocess`, `socket`, `urllib`, `requests`, etc. —
+    the classes of operation the user consented to. It STILL blocks:
+
+      - `ctypes`, `winreg`, `win32*`, `signal`, `resource` — C-level sandbox
+        escapes that consent cannot make safe.
+      - Direct `os.system` / `os.popen` / `os.spawn*` / `os.exec*` / `os.kill*`
+        calls from user code — process-level escapes. (Note: `subprocess.*`
+        is permitted; subprocess internally reaches os.exec* through its own
+        non-user frames, which the runtime layer correctly exempts.)
+      - `eval` / `exec` / `compile` / `__import__` — dynamic code execution.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0].lower()
+                if root in AUTHORIZED_STILL_FORBIDDEN_MODULES:
+                    return SandboxViolation(
+                        reason=(
+                            f"Import of '{alias.name}' is forbidden even under "
+                            "user authorization — this primitive can escape the "
+                            "sandbox at the native level. Use a dedicated tool "
+                            "(e.g. system_shell) for legitimate host access."
+                        ),
+                        snippet=_describe(node),
+                        line=getattr(node, "lineno", 0),
+                    )
+        elif isinstance(node, ast.ImportFrom):
+            mod = (node.module or "").split(".")[0].lower()
+            if mod in AUTHORIZED_STILL_FORBIDDEN_MODULES:
+                return SandboxViolation(
+                    reason=(
+                        f"'from {node.module} import ...' is forbidden even under "
+                        "user authorization — this primitive can escape the "
+                        "sandbox at the native level."
+                    ),
+                    snippet=_describe(node),
+                    line=getattr(node, "lineno", 0),
+                )
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute):
+                attr = func.attr
+                target = func.value
+                if isinstance(target, ast.Name) and target.id == "os":
+                    if attr in DANGEROUS_OS_ATTRS:
+                        return SandboxViolation(
+                            reason=(
+                                f"Call to 'os.{attr}' is forbidden even under user "
+                                "authorization — use 'subprocess' for process "
+                                "spawning, which the runtime layer audits."
+                            ),
+                            snippet=_describe(node),
+                            line=getattr(node, "lineno", 0),
+                        )
+                if isinstance(target, ast.Name) and target.id == "shutil":
+                    if attr in DANGEROUS_SHUTIL_ATTRS:
+                        return SandboxViolation(
+                            reason=f"Call to 'shutil.{attr}' is forbidden in the sandbox.",
+                            snippet=_describe(node),
+                            line=getattr(node, "lineno", 0),
+                        )
+            if isinstance(func, ast.Name) and func.id in ("eval", "exec", "compile"):
+                return SandboxViolation(
+                    reason=f"Call to builtin '{func.id}' is forbidden in the sandbox.",
+                    snippet=_describe(node),
+                    line=getattr(node, "lineno", 0),
+                )
+    return None
+
+
 def validate_source(source: str, profile: str) -> Optional[SandboxViolation]:
-    """Parses `source` and returns a `SandboxViolation` if it fails the profile."""
-    if profile not in ("data_query", "standard"):
+    """Parses `source` and returns a `SandboxViolation` if it fails the profile.
+
+    Profiles:
+      - "data_query": strict allowlist (pandas/numpy/matplotlib/office/sqlalchemy).
+      - "standard":   denylist (blocks the dangerous surface only).
+      - "authorized": denylist minus the user-approved surface (subprocess,
+                      socket, urllib, requests, etc. are permitted; ctypes,
+                      winreg, os.system/exec* remain blocked). Selected ONLY
+                      after the user explicitly authorizes a risky operation.
+    """
+    if profile not in ("data_query", "standard", "authorized"):
         raise ValueError(f"Unknown sandbox profile: {profile!r}")
     try:
         tree = ast.parse(source)
@@ -580,6 +726,8 @@ def validate_source(source: str, profile: str) -> Optional[SandboxViolation]:
         return None
     if profile == "data_query":
         return _validate_data_query(tree)
+    if profile == "authorized":
+        return _validate_authorized(tree)
     return _validate_standard(tree)
 
 
@@ -1228,6 +1376,16 @@ def _resolve_within(root: Path, target: Any, allow_trusted_read: bool = False) -
             resolved.relative_to(root)
             return resolved
         except ValueError:
+            # Writes/reads into the sandbox's own cache root (system temp) are
+            # legitimate: matplotlib fontlist, pip wheel cache, tempfile mkstemp
+            # all land there. The cache lives OUTSIDE the workspace on purpose
+            # so the user's project tree stays pristine.
+            for cache_root_str in _SANDBOX_WRITE_ROOTS:
+                try:
+                    resolved.relative_to(Path(cache_root_str))
+                    return resolved
+                except (ValueError, OSError):
+                    continue
             if allow_trusted_read:
                 for trusted_root in _TRUSTED_READ_ROOTS:
                     try:
@@ -1397,7 +1555,14 @@ class SandboxContext:
 
     # ---------- cache-env redirection ----------
     def _redirect_cache_env(self) -> None:
-        """Point cache/temp-dir env vars at `<workspace>/.sandbox_cache/*`.
+        """Point cache/temp-dir env vars at a system-temp sandbox cache.
+
+        The cache root lives OUTSIDE the user's workspace (under the OS temp
+        directory, keyed by a hash of the workspace path). This keeps library
+        cache writes functional (matplotlib fontlist, pip wheel cache, tempfile
+        mkstemp) while leaving the user's project tree pristine. The path guard
+        is extended via `_SANDBOX_WRITE_ROOTS` so writes into this directory
+        succeed even though it is outside `workspace_root`.
 
         PERF: uses raw `os.makedirs` (bypassing the patched `Path.mkdir`) and
         memoizes the directory set in `_SANDBOX_CACHE_READY` so the 13 mkdirs
@@ -1406,8 +1571,22 @@ class SandboxContext:
         600s regression.
         """
         import tempfile as _tf
-        root = self.workspace_root.resolve()
-        sandbox_cache = root / ".sandbox_cache"
+        workspace_root = self.workspace_root.resolve()
+        sandbox_cache = _compute_sandbox_cache_root(workspace_root)
+
+        # Migration cleanup: earlier versions wrote the cache INSIDE the
+        # workspace as `<workspace>/.sandbox_cache/`. That polluted the user's
+        # project tree and caused the artefact-sync layer to mistake matplotlib
+        # fontlist JSON for a user artefact. Remove any stale workspace-local
+        # cache so the tree is pristine from the next tool call onward.
+        stale_workspace_cache = workspace_root / ".sandbox_cache"
+        if stale_workspace_cache.is_dir():
+            _raw_rmtree = self._originals.get("shutil.rmtree") or shutil.rmtree
+            try:
+                _raw_rmtree(str(stale_workspace_cache), ignore_errors=True)
+            except Exception:
+                pass
+            _SANDBOX_CACHE_READY.discard(str(stale_workspace_cache))
 
         if str(sandbox_cache) not in _SANDBOX_CACHE_READY:
             # Use raw os.makedirs to avoid re-entering our own Path.mkdir guard.
@@ -1422,6 +1601,14 @@ class SandboxContext:
                 except Exception:
                     pass
             _SANDBOX_CACHE_READY.add(str(sandbox_cache))
+
+        # Register the cache root as a permitted WRITE root for the duration of
+        # this sandbox. `_resolve_within` consults `_SANDBOX_WRITE_ROOTS` in
+        # addition to `workspace_root` when writes land in the cache.
+        try:
+            _SANDBOX_WRITE_ROOTS.add(str(sandbox_cache.resolve()))
+        except Exception:
+            pass
 
         for env_key, subdir in _SANDBOX_CACHE_ENV_MAP.items():
             self._cache_env_backup[env_key] = os.environ.get(env_key)
@@ -1455,6 +1642,15 @@ class SandboxContext:
                 pass
             self._tempfile_was_set = False
             self._tempfile_backup = None
+        # Drop this workspace's cache root from the permitted-write set. The
+        # set is process-wide, so we only remove OUR entry — other concurrent
+        # sandbox contexts (nested/threaded) keep theirs.
+        try:
+            _SANDBOX_WRITE_ROOTS.discard(
+                str(_compute_sandbox_cache_root(self.workspace_root.resolve()).resolve())
+            )
+        except Exception:
+            pass
 
     # ---------- install ----------
     def __enter__(self) -> "SandboxContext":
@@ -1480,6 +1676,14 @@ class SandboxContext:
     def _install(self) -> None:
         root = self.workspace_root.resolve()
         is_strict = (self.profile == "data_query")
+        # "authorized" = user explicitly consented to risky operations
+        # (network / subprocess). The runtime layer must NOT re-block what the
+        # AST layer permitted, otherwise the user's consent is silently
+        # overridden at exec time (the bug: "I clicked yes but it still says
+        # BLOCKED BY SANDBOX"). The truly-unsafe primitives (ctypes, winreg,
+        # os.system/exec*) remain blocked at the AST layer, which is where
+        # they belong — the runtime layer never patched ctypes/winreg anyway.
+        is_authorized = (self.profile == "authorized")
         orig_import = self._originals["builtins.__import__"]
         orig_open = self._originals["builtins.open"]
         orig_io_open = self._originals["io.open"]
@@ -1499,10 +1703,20 @@ class SandboxContext:
         def _filtered_import(name, globals=None, locals=None, fromlist=(), level=0):
             if _caller_is_user_code():
                 root_mod = name.split(".")[0].lower()
-                if root_mod in FORBIDDEN_MODULES:
-                    raise SandboxPermissionError(
-                        f"🛑 BLOCKED BY SANDBOX: importing '{name}' is forbidden."
-                    )
+                # "authorized" profile: permit AUTHORIZED_MODULES (user consented
+                # to network / subprocess) but STILL block the truly-unsafe set.
+                if is_authorized:
+                    if root_mod in AUTHORIZED_STILL_FORBIDDEN_MODULES:
+                        raise SandboxPermissionError(
+                            f"🛑 BLOCKED BY SANDBOX: importing '{name}' is forbidden "
+                            "even under user authorization — this primitive can "
+                            "escape the sandbox at the native level."
+                        )
+                else:
+                    if root_mod in FORBIDDEN_MODULES:
+                        raise SandboxPermissionError(
+                            f"🛑 BLOCKED BY SANDBOX: importing '{name}' is forbidden."
+                        )
                 if is_strict and not _module_allowed_in_data_query(name):
                     raise SandboxPermissionError(
                         f"🛑 BLOCKED BY DATA-QUERY SANDBOX: importing '{name}' is "
@@ -1513,10 +1727,17 @@ class SandboxContext:
         def _filtered_import_module(name, package=None):
             if _caller_is_user_code():
                 root_mod = name.split(".")[0].lower()
-                if root_mod in FORBIDDEN_MODULES:
-                    raise SandboxPermissionError(
-                        f"🛑 BLOCKED BY SANDBOX: importing '{name}' is forbidden."
-                    )
+                if is_authorized:
+                    if root_mod in AUTHORIZED_STILL_FORBIDDEN_MODULES:
+                        raise SandboxPermissionError(
+                            f"🛑 BLOCKED BY SANDBOX: importing '{name}' is forbidden "
+                            "even under user authorization."
+                        )
+                else:
+                    if root_mod in FORBIDDEN_MODULES:
+                        raise SandboxPermissionError(
+                            f"🛑 BLOCKED BY SANDBOX: importing '{name}' is forbidden."
+                        )
                 if is_strict and not _module_allowed_in_data_query(name):
                     raise SandboxPermissionError(
                         f"🛑 BLOCKED BY DATA-QUERY SANDBOX: importing '{name}' is "
@@ -1746,29 +1967,45 @@ class SandboxContext:
         if self._originals.get("shutil.copy2"): shutil.copy2 = _bounded_shutil_copy2
         if self._originals.get("shutil.copytree"): shutil.copytree = _bounded_shutil_copytree
 
-        # -------- subprocess hard block --------
-        for name in ("run", "Popen", "call", "check_output"):
-            if self._originals.get(f"subprocess.{name}") is not None:
-                setattr(subprocess, name, _blocked)
-        # Also block `subprocess.Popen` alias used internally by other entries.
-        try:
-            subprocess.check_call = _blocked
-            subprocess.check_output = _blocked
-        except Exception:
-            pass
+        # -------- subprocess hard block (SKIPPED under "authorized") --------
+        # Under "authorized", the user explicitly consented to process spawning
+        # (e.g. "run ping", "call curl"). Blocking subprocess here would
+        # silently override that consent at exec time — the exact bug where
+        # the user clicks "yes" and still sees "BLOCKED BY SANDBOX".
+        #
+        # Note: `os.system` / `os.popen` / `os.exec*` / `os.spawn*` remain
+        # blocked above (they are the process-ESCAPE surface, not the
+        # process-SPAWN surface). `subprocess` internally reaches os.exec*
+        # through its own non-user frames, which `_caller_is_user_code()`
+        # correctly exempts — so subprocess works end-to-end while direct
+        # user-code `os.exec*` calls stay blocked.
+        if not is_authorized:
+            for name in ("run", "Popen", "call", "check_output"):
+                if self._originals.get(f"subprocess.{name}") is not None:
+                    setattr(subprocess, name, _blocked)
+            # Also block `subprocess.Popen` alias used internally by other entries.
+            try:
+                subprocess.check_call = _blocked
+                subprocess.check_output = _blocked
+            except Exception:
+                pass
 
-        # -------- network hard block --------
-        def _blocked_net(*_a, **_kw):
-            raise SandboxPermissionError(
-                "🛑 BLOCKED BY SANDBOX: outbound network access is forbidden."
-            )
-        socket.socket.connect = _blocked_net
-        if self._originals.get("socket.socket.connect_ex") is not None:
-            socket.socket.connect_ex = _blocked_net
-        if self._originals.get("socket.create_connection") is not None:
-            socket.create_connection = _blocked_net
-        if self._originals.get("socket.getaddrinfo") is not None:
-            socket.getaddrinfo = _blocked_net
+        # -------- network hard block (SKIPPED under "authorized") --------
+        # Same rationale: the user authorized network access. Blocking socket
+        # here would defeat the authorization — the user's "yes, ping google"
+        # would still produce "BLOCKED BY SANDBOX: outbound network access".
+        if not is_authorized:
+            def _blocked_net(*_a, **_kw):
+                raise SandboxPermissionError(
+                    "🛑 BLOCKED BY SANDBOX: outbound network access is forbidden."
+                )
+            socket.socket.connect = _blocked_net
+            if self._originals.get("socket.socket.connect_ex") is not None:
+                socket.socket.connect_ex = _blocked_net
+            if self._originals.get("socket.create_connection") is not None:
+                socket.create_connection = _blocked_net
+            if self._originals.get("socket.getaddrinfo") is not None:
+                socket.getaddrinfo = _blocked_net
 
         # -------- pathlib guarded methods --------
         # Patch the concrete Path class attributes so `.write_text()` etc. are
