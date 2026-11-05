@@ -421,6 +421,133 @@ def _canonicalize_tool_params(params: Any) -> str:
         return str(sorted(cleaned.items())) if isinstance(cleaned, dict) else str(cleaned)
 
 
+# ── Native tool-calling bridge ───────────────────────────────────────────────
+# The LLM bindings now support OpenAI Chat Completions native tool calls:
+#   • The caller passes ``tools=[...]`` (JSON Schema) and ``tool_choice="auto"``.
+#   • The binding translates native ``tool_calls`` into ``<tool>{json}</tool>``
+#     XML and dispatches each one to ``streaming_callback`` with
+#     ``meta={"tool_call_id": ..., "tool_name": ...}``.
+#   • If the callback returns ``{"tool_results": [{"tool_call_id": ..., "content": ...}]}``,
+#     the binding appends the results and re-invokes the model (bounded by
+#     ``MAX_TOOL_ROUNDS``), preserving the KV-cache across rounds.
+#   • If the callback returns ``True``, the binding streams the XML and stops
+#     (legacy mode — the caller must drive the loop itself).
+#
+# The helpers below let the chat mixin opt into the native path when the active
+# binding supports it, while preserving the XML fallback for bindings that do
+# not. Non-tool XML tags (<artifact>, <agent>, <unlock_file>, …) are ALWAYS
+# handled by the mixin's outer loop — the native path only accelerates the
+# tool-call sub-loop.
+
+#: Python type names accepted by the flat tool-parameter format → JSON Schema.
+_PY_TO_JSON_SCHEMA_TYPE = {
+    "str": "string",
+    "string": "string",
+    "int": "integer",
+    "integer": "integer",
+    "float": "number",
+    "number": "number",
+    "bool": "boolean",
+    "boolean": "boolean",
+    "list": "array",
+    "array": "array",
+    "dict": "object",
+    "object": "object",
+    "any": "string",
+}
+
+
+def _tools_specs_to_openai_schema(active_tools: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Convert the mixin's flat tool registry into OpenAI Chat Completions
+    ``tools=[...]`` JSON Schema format.
+
+    Input shape (per tool)::
+
+        {"name": str, "description": str,
+         "parameters": [{"name": str, "type": str, "description": str,
+                         "optional": bool, "default": Any}, ...]}
+
+    Output shape (per tool)::
+
+        {"type": "function",
+         "function": {"name": str, "description": str,
+                      "parameters": {"type": "object",
+                                     "properties": {<name>: {"type": <json>, "description": <str>}},
+                                     "required": [<name>, ...]}}}
+
+    Parameters with ``optional=True`` (or a ``default``) are excluded from
+    ``required``. Unknown Python type names degrade to ``"string"``. Tools
+    without a name are skipped. This function NEVER raises.
+    """
+    schema: List[Dict[str, Any]] = []
+    for tool_name, spec in (active_tools or {}).items():
+        if not isinstance(tool_name, str) or not tool_name:
+            continue
+        if not isinstance(spec, dict):
+            continue
+
+        properties: Dict[str, Dict[str, Any]] = {}
+        required: List[str] = []
+
+        for param in spec.get("parameters") or []:
+            if not isinstance(param, dict):
+                continue
+            p_name = param.get("name")
+            if not isinstance(p_name, str) or not p_name:
+                continue
+
+            py_type = str(param.get("type", "string") or "string").strip().lower()
+            json_type = _PY_TO_JSON_SCHEMA_TYPE.get(py_type, "string")
+
+            prop: Dict[str, Any] = {"type": json_type}
+            p_desc = param.get("description")
+            if isinstance(p_desc, str) and p_desc:
+                prop["description"] = p_desc
+            if "default" in param:
+                prop["default"] = param["default"]
+
+            properties[p_name] = prop
+
+            is_optional = bool(param.get("optional", False)) or ("default" in param)
+            if not is_optional:
+                required.append(p_name)
+
+        fn_schema: Dict[str, Any] = {
+            "name": tool_name,
+            "description": str(spec.get("description", "") or ""),
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+            },
+        }
+        if required:
+            fn_schema["parameters"]["required"] = required
+
+        schema.append({"type": "function", "function": fn_schema})
+
+    return schema
+
+
+def _binding_supports_native_tools(binding: Any) -> bool:
+    """
+    Heuristic: True when the active binding overrides
+    ``LollmsLLMBinding.generate_from_messages``.
+
+    The base class provides a stub that returns ``{"status": "error"}``; any
+    concrete binding that supports native tool calls overrides it. Comparing
+    the bound method against the base implementation is a reliable, zero-cost
+    capability probe that requires no new binding-side flag.
+    """
+    if binding is None:
+        return False
+    try:
+        from lollms_client.lollms_llm_binding import LollmsLLMBinding
+        return type(binding).generate_from_messages is not LollmsLLMBinding.generate_from_messages
+    except Exception:
+        return False
+
+
 _DOC_SOURCE_BANNER_RE = re.compile(
     r"=== SOURCE(?: GROUP)?: (docs/\S+?) \(Document: \"([^\"]*)\" \u2014 ([^)]*?)\) ==="
 )
@@ -7128,6 +7255,35 @@ class ChatMixin:
             self._failure_memory._signatures.clear()
             ASCIIColors.info("[ChatMixin] FailureMemory cleared for new turn.")
 
+        # ── 🛠️ NATIVE TOOL-CALLING CAPABILITY PROBE ──
+        # The chat mixin opts into the binding's native tool-calling loop when
+        # the active binding overrides generate_from_messages. In that mode the
+        # binding drives the tool sub-loop internally (KV-cache preserving),
+        # and _inline_relay executes each tool call inline, returning
+        # {"tool_results": [...]} to let the binding re-invoke the model.
+        # All OTHER functional XML tags (<artifact>, <agent>, <unlock_file>,
+        # <generate_image>, memory searches, …) remain owned by the mixin's
+        # outer loop — the native path only accelerates tool calls.
+        _active_llm_binding = getattr(self.lollmsClient, "llm", None) if self.lollmsClient else None
+        native_tools_enabled = (
+            _binding_supports_native_tools(_active_llm_binding)
+            and bool(active_tools)
+        )
+        native_tools_schema: Optional[List[Dict[str, Any]]] = (
+            _tools_specs_to_openai_schema(active_tools) if native_tools_enabled else None
+        )
+        if native_tools_enabled:
+            ASCIIColors.info(
+                f"[ChatMixin] Native tool-calling enabled via binding "
+                f"'{getattr(_active_llm_binding, 'binding_name', '?')}' "
+                f"({len(native_tools_schema or [])} tool schema(s) forwarded)."
+            )
+        elif active_tools:
+            _dbg(
+                f"[ChatMixin] Binding does not override generate_from_messages — "
+                f"falling back to XML tool protocol ({len(active_tools)} tool(s))."
+            )
+
         # ── 8. Active Deliberation Loop ──
         _t_branch_start = time.perf_counter()
         current_branch_tip = branch_tip_id or self.active_branch_id
@@ -7745,6 +7901,243 @@ class ChatMixin:
                 remove_thinking_blocks=remove_thinking_blocks
             )
 
+            # ── 🛠️ NATIVE TOOL-CALL EXECUTION CORE ──
+            # Compact executor used ONLY by the native tool-calling path
+            # (_inline_relay). It mirrors the essential behavior of the outer
+            # loop's XML <tool> handler — LCP/direct-callable dispatch, artifact
+            # sync, source extraction, bookkeeping — WITHOUT the outer-loop
+            # guards (repetition, environment epoch, mimicry detection). Those
+            # guards are unnecessary here: the binding's internal loop is
+            # bounded by MAX_TOOL_ROUNDS, and each tool call arrives exactly
+            # once per round from the server.
+            #
+            # The XML <tool> handler in the outer loop is intentionally kept
+            # untouched for backward compatibility with bindings that do not
+            # override generate_from_messages.
+            def _execute_native_tool_call(
+                tool_name: str,
+                tool_params: Dict[str, Any],
+                tool_call_id: str,
+            ) -> Dict[str, Any]:
+                """Execute one native tool call and return ``{"tool_results": [...]}``."""
+                tool_res: Any = None
+                tool_success = False
+                clean_result_str = ""
+                details_block = ""
+
+                # ── Cancellation guard ──
+                if self.is_generation_cancelled():
+                    return {"tool_results": [{
+                        "tool_call_id": tool_call_id,
+                        "content": json.dumps({
+                            "success": False,
+                            "error": "Execution aborted by user cancellation.",
+                        }),
+                    }]}
+
+                # ── Phantom tool guard ──
+                if not active_tools or tool_name not in active_tools:
+                    available_str = ", ".join(f"`{t}`" for t in active_tools.keys()) if active_tools else "none"
+                    err = (
+                        f"Tool '{tool_name}' is not registered in this session. "
+                        f"Available tools: {available_str}."
+                    )
+                    ASCIIColors.warning(f"[ChatMixin][native] Phantom tool call: {tool_name}")
+                    if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                        _cb(callback, "", MSG_TYPE.MSG_TYPE_TOOL_END, {
+                            "tool_name": tool_name,
+                            "success": False,
+                            "output": "",
+                            "error": err,
+                        })
+                    return {"tool_results": [{
+                        "tool_call_id": tool_call_id,
+                        "content": json.dumps({"success": False, "error": err}),
+                    }]}
+
+                # ── Emit UI start event ──
+                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                    _cb(callback, "", MSG_TYPE.MSG_TYPE_TOOL_START, {
+                        "tool_name": tool_name,
+                        "parameters": tool_params,
+                    })
+
+                # ── Execute: LCP path or direct-callable path ──
+                _lcp = getattr(self.lollmsClient, "tools", None) if self.lollmsClient else None
+                try:
+                    if "callable" not in active_tools[tool_name]:
+                        # LCP binding execution
+                        if _lcp and hasattr(_lcp, "execute_tool"):
+                            _old_cwd = os.getcwd()
+                            if getattr(self, "workspace_data_path", None):
+                                _ws = Path(self.workspace_data_path)
+                            else:
+                                _base_ws = Path(self.workspace_path) if getattr(self, "workspace_path", None) else Path("./data_workspace")
+                                _ws = _base_ws / self.id / "workspace_data"
+                            _ws.mkdir(parents=True, exist_ok=True)
+                            try:
+                                os.chdir(str(_ws.resolve()))
+                                try:
+                                    self.artefacts.sync_all_active_to_disk()
+                                except Exception:
+                                    pass
+                                _files_before = _snapshot_workspace(Path(_ws.resolve()))
+                                exec_kwargs: Dict[str, Any] = {}
+                                try:
+                                    sig = inspect.signature(_lcp.execute_tool)
+                                    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+                                    if "tool_context" in sig.parameters or has_var_kw:
+                                        exec_kwargs["tool_context"] = _tool_context
+                                    if "lollms_client_instance" in sig.parameters or has_var_kw:
+                                        exec_kwargs["lollms_client_instance"] = self.lollmsClient
+                                    if "discussion_instance" in sig.parameters or has_var_kw:
+                                        exec_kwargs["discussion_instance"] = self
+                                except (ValueError, TypeError):
+                                    pass
+                                tool_res = _lcp.execute_tool(tool_name, tool_params, **exec_kwargs)
+                                _files_after = _snapshot_workspace(Path(_ws.resolve()))
+                                try:
+                                    self._sync_tool_artifacts(tool_name, _files_before, _files_after, callback)
+                                except Exception as sync_ex:
+                                    trace_exception(sync_ex)
+                            finally:
+                                os.chdir(_old_cwd)
+                        else:
+                            tool_res = {
+                                "success": False,
+                                "error": f"Tool '{tool_name}' has no callable and no LCP binding is available.",
+                            }
+                    else:
+                        # Direct-callable execution
+                        try:
+                            self.artefacts.sync_all_active_to_disk()
+                        except Exception:
+                            pass
+                        _old_cwd = os.getcwd()
+                        if getattr(self, "workspace_data_path", None):
+                            _ws = Path(self.workspace_data_path)
+                        else:
+                            _base_ws = Path(self.workspace_path) if getattr(self, "workspace_path", None) else Path("./data_workspace")
+                            _ws = _base_ws / self.id / "workspace_data"
+                        _ws.mkdir(parents=True, exist_ok=True)
+                        try:
+                            os.chdir(str(_ws.resolve()))
+                            _files_before = _snapshot_workspace(Path(_ws.resolve()))
+                            call_kwargs = dict(tool_params)
+                            try:
+                                _sig = inspect.signature(active_tools[tool_name]["callable"])
+                                _has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in _sig.parameters.values())
+                                if "discussion_instance" in _sig.parameters or _has_var_kw:
+                                    call_kwargs["discussion_instance"] = self
+                                if "lollms_client_instance" in _sig.parameters or _has_var_kw:
+                                    call_kwargs["lollms_client_instance"] = self.lollmsClient
+                                if "tool_context" in _sig.parameters or _has_var_kw:
+                                    call_kwargs["tool_context"] = _tool_context
+                                if not _has_var_kw:
+                                    accepted = set(_sig.parameters.keys())
+                                    call_kwargs = {k: v for k, v in call_kwargs.items() if k in accepted}
+                            except (ValueError, TypeError):
+                                pass
+                            tool_res = active_tools[tool_name]["callable"](**call_kwargs)
+                            _files_after = _snapshot_workspace(Path(_ws.resolve()))
+                            try:
+                                self._sync_tool_artifacts(tool_name, _files_before, _files_after, callback)
+                            except Exception as sync_ex:
+                                trace_exception(sync_ex)
+                        finally:
+                            os.chdir(_old_cwd)
+                except Exception as exec_ex:
+                    trace_exception(exec_ex)
+                    tool_res = {
+                        "success": False,
+                        "error": _sanitize_host_paths(str(exec_ex)),
+                        "traceback": _sanitize_host_paths(traceback.format_exc()),
+                    }
+
+                # ── Normalize result ──
+                if tool_res is None:
+                    tool_res = {"success": False, "error": f"Tool '{tool_name}' produced no result."}
+
+                is_failure = False
+                if isinstance(tool_res, dict):
+                    is_failure = (
+                        tool_res.get("success") is False
+                        or bool(tool_res.get("error"))
+                        or tool_res.get("status_code", 200) not in (200, 201)
+                    )
+                tool_success = not is_failure
+
+                try:
+                    clean_result_str = _sanitize_tool_result(tool_res, client=self.lollmsClient)
+                except Exception:
+                    clean_result_str = str(tool_res)
+
+                # ── Extract sources ──
+                try:
+                    for t_src in _extract_sources_from_tool_result(tool_name, tool_params, tool_res):
+                        if not any(
+                            (t_src.get("url") and t_src["url"] == cs.get("url"))
+                            or (t_src.get("title") == cs.get("title") and t_src.get("snippet") == cs.get("snippet"))
+                            for cs in collected_sources
+                        ):
+                            t_src["id"] = len(collected_sources) + 1
+                            t_src["index"] = t_src["id"]
+                            collected_sources.append(t_src)
+                except Exception:
+                    pass
+
+                # ── Bookkeeping ──
+                try:
+                    tool_calls_this_turn.append({
+                        "name": tool_name,
+                        "params": tool_params,
+                        "result": {"output": _sanitize_host_paths(clean_result_str), "success": tool_success},
+                    })
+                    turn_actions_log.append({
+                        "action": "tool_call",
+                        "tool_name": tool_name,
+                        "success": tool_success,
+                        "round": round_count,
+                    })
+                except Exception:
+                    pass
+
+                # ── Emit UI end event ──
+                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                    _cb(callback, "", MSG_TYPE.MSG_TYPE_TOOL_END, {
+                        "tool_name": tool_name,
+                        "parameters": tool_params,
+                        "success": tool_success,
+                        "output": clean_result_str,
+                        "error": tool_res.get("error") if isinstance(tool_res, dict) else None,
+                    })
+
+                # ── Return tool_results for the binding's internal loop ──
+                return {"tool_results": [{
+                    "tool_call_id": tool_call_id,
+                    "content": clean_result_str,
+                }]}
+
+            def _snapshot_workspace(root: Path) -> Dict[str, Any]:
+                """Lightweight workspace snapshot for artifact diffing during native tool calls."""
+                snap: Dict[str, Any] = {}
+                if not root.exists():
+                    return snap
+                for f in root.rglob("*"):
+                    if not f.is_file():
+                        continue
+                    try:
+                        rel = f.relative_to(root)
+                        content = f.read_text(encoding="utf-8", errors="ignore")
+                        snap[rel] = {"hash": hash(content), "mtime": f.stat().st_mtime, "path": f, "content": content}
+                    except Exception:
+                        try:
+                            rel = f.relative_to(root)
+                            snap[rel] = {"hash": None, "mtime": f.stat().st_mtime, "path": f, "content": None}
+                        except Exception:
+                            pass
+                return snap
+
             def _inline_relay(chunk, msg_type=None, meta=None):
                 # Check cancellation on EVERY token chunk
                 if self.is_generation_cancelled():
@@ -7760,6 +8153,41 @@ class ChatMixin:
                         ttft = time.perf_counter() - _t_gen_start
                         _dbg(f"[TTFT] First token received in {ttft:.3f} s.")
                         object.__setattr__(self, "_ttft_logged", True)
+
+                    # ── 🛠️ NATIVE TOOL-CALL INTERCEPTION ──
+                    # When the binding translates a native tool_call into
+                    # <tool>{json}</tool> XML and dispatches it with
+                    # meta={"tool_call_id":...}, we execute it inline and return
+                    # {"tool_results": [...]} so the binding can continue its
+                    # own multi-round loop. The mixin's outer loop does NOT see
+                    # this tool call (no ss.feed, no tool_trigger, no
+                    # _action_dispatched) — the binding owns the history.
+                    tool_call_id = (meta or {}).get("tool_call_id") if isinstance(meta, dict) else None
+                    if native_tools_enabled and tool_call_id:
+                        stripped = chunk.strip()
+                        if stripped.startswith("<tool>") and stripped.endswith("</tool>"):
+                            try:
+                                payload = json.loads(stripped[6:-7])
+                            except json.JSONDecodeError:
+                                ASCIIColors.warning(
+                                    f"[ChatMixin][native] Malformed tool payload from binding: {stripped[:200]!r}"
+                                )
+                                return {"tool_results": [{
+                                    "tool_call_id": tool_call_id,
+                                    "content": json.dumps({"success": False, "error": "Malformed tool payload"}),
+                                }]}
+                            tool_name = str(payload.get("name", "")).strip()
+                            tool_params = payload.get("parameters") or {}
+                            if not isinstance(tool_params, dict):
+                                tool_params = {}
+                            return _execute_native_tool_call(tool_name, tool_params, tool_call_id)
+                        # Binding sent a tool_call_id but not a <tool> payload —
+                        # treat as opaque text (should not happen with conformant
+                        # bindings; log and pass through).
+                        ASCIIColors.warning(
+                            f"[ChatMixin][native] tool_call_id={tool_call_id} received without <tool> payload. "
+                            "Falling back to stream feed."
+                        )
 
                     if meta and meta.get("was_processed"):
                         return True
@@ -7945,12 +8373,17 @@ class ChatMixin:
             round_connection_error = None
 
             try:
+                _native_call_kwargs: Dict[str, Any] = {}
+                if native_tools_enabled and native_tools_schema:
+                    _native_call_kwargs["tools"] = native_tools_schema
+                    _native_call_kwargs["tool_choice"] = "auto"
                 gen_res = self.lollmsClient.generate_from_messages(
                     messages=messages_list,
                     images=round_images if round_images else None,
                     stream=True,
                     temperature=round_temperature,
                     streaming_callback=_inline_relay,
+                    **_native_call_kwargs,
                     **gen_kwargs
                 )
 

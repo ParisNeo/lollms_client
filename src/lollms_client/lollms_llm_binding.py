@@ -425,13 +425,92 @@ class LollmsLLMBinding(LollmsBaseBinding):
                     think: Optional[bool] = False,
                     reasoning_effort: Optional[str] = None,
                     reasoning_summary: Optional[str] = None,
+                    tools: Optional[List[Dict]] = None,
+                    tool_choice: Optional[Union[str, Dict]] = None,
                     **kwargs
                     ) -> Union[str, dict]:
         """
-        Generate text using the active LLM binding, using instance defaults if parameters are not provided.
-        """
-        ASCIIColors.red("This binding does not support generate_from_messages")
+        Generate text from an OpenAI-style message list.
 
+        The ``tools`` / ``tool_choice`` parameters follow the OpenAI Chat
+        Completions contract: bindings that support them forward them to the
+        provider without alteration. Bindings that do not MUST at minimum
+        preserve the wire state of any assistant/tool messages (``tool_calls``,
+        ``tool_call_id``, ``name``) so a caller-driven multi-round loop can
+        continue.
+
+        The return value is the assistant's text response. Any tool call
+        produced by the model — whether native ``tool_calls`` or leaked
+        textual DSML — is translated into Lollms ``<tool>{"name":...,
+        "parameters":{...}}</tool>`` XML and appended to the response.
+        """
+        binding_name = getattr(self, "binding_name", "unknown")
+        message = (
+            f"Binding '{binding_name}' does not implement generate_from_messages(). "
+            "Switch the model profile to a binding that supports tool calling "
+            "(lollms, openai, vllm, ollama, or llama_cpp_server)."
+        )
+        ASCIIColors.error(f"[{binding_name}] {message}")
+        return {"status": "error", "message": message}
+
+
+    @staticmethod
+    def _has_tool_dialogue(messages: List[Dict]) -> bool:
+        """True if any message carries OpenAI-compatible tool wire state."""
+        for m in messages or []:
+            if not isinstance(m, dict):
+                continue
+            if m.get("tool_calls"):
+                return True
+            if str(m.get("role", "")).lower() in ("tool", "function"):
+                return True
+        return False
+
+    def _normalize_tool_messages(self, messages: List[Dict]) -> List[Dict]:
+        """
+        Preserve OpenAI tool wire state (``tool_calls``, ``tool_call_id``,
+        ``name``) while merging leading system prompts.
+
+        Tool-role messages and assistant messages that carry ``tool_calls``
+        are deliberately NOT merged and NOT forced into user/assistant
+        alternation — the OpenAI wire protocol already guarantees a valid
+        order once tools participate. This keeps a caller-driven loop
+        round-trippable through the binding.
+        """
+        system_parts: List[str] = []
+        start = 0
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "system":
+                c = msg.get("content")
+                if isinstance(c, str) and c.strip():
+                    system_parts.append(c.strip())
+                start = i + 1
+            else:
+                break
+
+        normalized: List[Dict] = []
+        if system_parts:
+            normalized.append({"role": "system", "content": "\n\n".join(system_parts)})
+
+        for msg in messages[start:]:
+            role = str(msg.get("role", "user") or "user").lower()
+            content = msg.get("content", "")
+
+            entry: Dict[str, Any] = {"role": role, "content": content}
+            if msg.get("tool_calls"):
+                entry["tool_calls"] = msg["tool_calls"]
+                if entry["content"] in (None, ""):
+                    entry["content"] = None  # OpenAI permits null with tool_calls
+            if msg.get("tool_call_id"):
+                entry["tool_call_id"] = msg["tool_call_id"]
+            if msg.get("name"):
+                entry["name"] = msg["name"]
+            if msg.get("images"):
+                entry["images"] = list(msg["images"])
+
+            normalized.append(entry)
+
+        return normalized
 
     def clean_and_alternate_messages(self, messages: List[Dict]) -> List[Dict]:
         """
@@ -442,9 +521,17 @@ class LollmsLLMBinding(LollmsBaseBinding):
           3. Consecutive messages of the same role (e.g., user/user or assistant/assistant) are merged
              into a single message of that role with a double newline separator.
           4. The conversation must strictly alternate: system (optional), user, assistant, user, assistant...
+
+        When the message list contains OpenAI-style tool wire state
+        (``tool_calls`` / ``role="tool"``), normalisation is bypassed in favour
+        of ``_normalize_tool_messages`` — the wire protocol is preserved
+        verbatim and no alternation is enforced.
         """
         if not messages:
             return []
+
+        if self._has_tool_dialogue(messages):
+            return self._normalize_tool_messages(messages)
 
         # 1. Extract and merge all initial system messages
         system_contents = []
@@ -724,6 +811,181 @@ class LollmsLLMBinding(LollmsBaseBinding):
         Load a specific model.
         """
         pass
+
+    # ── OpenAI-compatible tool helpers (shared by all bindings) ─────────
+    # These thin wrappers de-duplicate the DSML / native tool-call plumbing
+    # that every provider binding must perform. They are pure functions
+    # (no instance state) and safe to call from any binding subclass.
+
+    # Known OpenAI-compatible server misconfiguration signatures, mapped to
+    # actionable remediation hints. Populated by ``_classify_tool_server_error``
+    # so every binding surfaces the SAME diagnostic for the SAME root cause.
+    _TOOL_SERVER_ERROR_SIGNATURES: List[Tuple[str, str]] = [
+        (
+            '"auto" tool choice requires --enable-auto-tool-choice',
+            (
+                "vLLM was launched WITHOUT tool-calling support. "
+                "Relaunch the vLLM server with:\n"
+                "    --enable-auto-tool-choice --tool-call-parser <family>\n"
+                "where <family> matches the model (e.g. `deepseek_v3` for "
+                "DeepSeek, `hermes` for Qwen/Hermes-style, `mistral` for "
+                "Mistral, `llama3_json` for Llama-3). Without these flags "
+                "vLLM rejects any request that sets tool_choice=\"auto\"."
+            ),
+        ),
+        (
+            "requires --enable-auto-tool-choice and --tool-call-parser",
+            (
+                "vLLM was launched WITHOUT tool-calling support. "
+                "Relaunch the vLLM server with:\n"
+                "    --enable-auto-tool-choice --tool-call-parser <family>\n"
+                "where <family> matches the model (e.g. `deepseek_v3`, "
+                "`hermes`, `mistral`, `llama3_json`)."
+            ),
+        ),
+        (
+            "tool-call-parser",
+            (
+                "The OpenAI-compatible server rejected the request because "
+                "no tool-call parser is configured. For vLLM add "
+                "`--enable-auto-tool-choice --tool-call-parser <family>`; "
+                "for llama.cpp / Ollama load a tool-capable chat template."
+            ),
+        ),
+        (
+            "Model returned an empty response with tools enabled",
+            (
+                "The server returned an EMPTY response when tools were "
+                "requested. Two likely causes:\n"
+                "  1. vLLM launched without "
+                "`--enable-auto-tool-choice --tool-call-parser <family>`.\n"
+                "  2. The model's chat template does not expose the tools "
+                "array (llama.cpp / Ollama need a tool-capable template).\n"
+                "Check the server log for the actual tool-parsing messages."
+            ),
+        ),
+    ]
+
+    @staticmethod
+    def _classify_tool_server_error(error_or_body: Any) -> Optional[str]:
+        """Return an actionable remediation string for known server-side
+        tool-calling misconfigurations, or ``None`` if unrecognised.
+
+        Accepts an exception, an error dict (``{"error": {"message": ...}}``),
+        a plain string, or the ``server_body`` attribute of an
+        ``openai.BadRequestError`` / ``openai.APIError``.
+        """
+        if error_or_body is None:
+            return None
+
+        # Flatten the error into a searchable string.
+        text_parts: List[str] = []
+        if isinstance(error_or_body, str):
+            text_parts.append(error_or_body)
+        elif isinstance(error_or_body, dict):
+            err = error_or_body.get("error")
+            if isinstance(err, dict):
+                text_parts.append(str(err.get("message", "")))
+                text_parts.append(str(err.get("code", "")))
+            text_parts.append(str(error_or_body.get("message", "")))
+        else:
+            text_parts.append(str(error_or_body))
+            body = getattr(error_or_body, "body", None)
+            if body is not None:
+                text_parts.append(str(body))
+            text_parts.append(str(getattr(error_or_body, "message", "")))
+
+        haystack = " ".join(t for t in text_parts if t).lower()
+        if not haystack.strip():
+            return None
+
+        for needle, hint in LollmsLLMBinding._TOOL_SERVER_ERROR_SIGNATURES:
+            if needle.lower() in haystack:
+                return hint
+        return None
+
+    @staticmethod
+    def tool_calls_to_lollms_xml(tool_calls: List[Any]) -> str:
+        """Convert OpenAI-native ``tool_calls`` objects to Lollms ``<tool>`` XML."""
+        if not tool_calls:
+            return ""
+        parts: List[str] = []
+        for tc in tool_calls:
+            if isinstance(tc, dict):
+                fn = tc.get("function") or {}
+                name = fn.get("name", "") or ""
+                raw_args = fn.get("arguments", "") or ""
+            else:
+                fn = getattr(tc, "function", None)
+                name = getattr(fn, "name", "") if fn is not None else ""
+                raw_args = getattr(fn, "arguments", "") if fn is not None else ""
+                name = name or ""
+                raw_args = raw_args or ""
+            if not name:
+                continue
+            try:
+                tool_args = json.loads(raw_args) if raw_args else {}
+            except (json.JSONDecodeError, TypeError):
+                tool_args = {"raw": raw_args}
+            parts.append(f"<tool>{json.dumps({'name': name, 'parameters': tool_args})}</tool>")
+        return "\n".join(parts)
+
+    @staticmethod
+    def accumulated_tool_calls_to_lollms_xml(accumulated: Dict[int, Dict]) -> str:
+        """Convert accumulated streamed tool-call deltas to Lollms ``<tool>`` XML."""
+        if not accumulated:
+            return ""
+        parts: List[str] = []
+        for idx in sorted(accumulated.keys()):
+            tc = accumulated[idx] or {}
+            name = (tc.get("name") or "").strip()
+            if not name:
+                continue
+            raw_args = tc.get("arguments") or ""
+            try:
+                tool_args = json.loads(raw_args) if raw_args else {}
+            except (json.JSONDecodeError, TypeError):
+                tool_args = {"raw": raw_args}
+            parts.append(f"<tool>{json.dumps({'name': name, 'parameters': tool_args})}</tool>")
+        return "\n".join(parts)
+
+    @staticmethod
+    def collect_streamed_tool_deltas(accumulated: Dict[int, Dict], delta_tool_calls: Any) -> None:
+        """Accumulate OpenAI-compatible streamed tool_call deltas by index."""
+        if not delta_tool_calls:
+            return
+        for delta_tc in delta_tool_calls:
+            if isinstance(delta_tc, dict):
+                idx = delta_tc.get("index", 0) or 0
+                tc_id = delta_tc.get("id")
+                fn = delta_tc.get("function") or {}
+                name_frag = fn.get("name") or ""
+                args_frag = fn.get("arguments") or ""
+            else:
+                idx = getattr(delta_tc, "index", 0) or 0
+                tc_id = getattr(delta_tc, "id", None)
+                fn = getattr(delta_tc, "function", None)
+                name_frag = getattr(fn, "name", "") if fn is not None else ""
+                args_frag = getattr(fn, "arguments", "") if fn is not None else ""
+                name_frag = name_frag or ""
+                args_frag = args_frag or ""
+
+            slot = accumulated.setdefault(idx, {"id": None, "name": "", "arguments": ""})
+            if tc_id and not slot.get("id"):
+                slot["id"] = tc_id
+            if name_frag:
+                slot["name"] = (slot.get("name") or "") + name_frag
+            if args_frag:
+                slot["arguments"] = (slot.get("arguments") or "") + args_frag
+
+    @staticmethod
+    def extract_native_tool_calls(message_obj: Any) -> List[Any]:
+        """Extract native ``tool_calls`` from a non-streaming message object or dict."""
+        if message_obj is None:
+            return []
+        if isinstance(message_obj, dict):
+            return list(message_obj.get("tool_calls") or [])
+        return list(getattr(message_obj, "tool_calls", None) or [])
 
     def split_discussion(self, lollms_prompt_string: str, system_keyword="!@>system:", user_keyword="!@>user:", ai_keyword="!@>assistant:") -> list:
         """

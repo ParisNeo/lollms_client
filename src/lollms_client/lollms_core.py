@@ -75,6 +75,7 @@ class LollmsBindingProfile:
     thinking_enabled: bool = False
     supported_reasoning_efforts: Optional[List[str]] = None
     default_reasoning_effort: Optional[str] = None
+    native_tools_enabled: bool = False
 
     def __post_init__(self):
         self.supported_reasoning_efforts = _normalize_effort_list(
@@ -105,6 +106,7 @@ class LollmsModelProfile:
     image_token_cost: int = 256
     thinking_enabled: bool = False
     default_reasoning_effort: Optional[str] = None
+    native_tools_enabled: bool = False
 
     def __post_init__(self):
         self.supported_reasoning_efforts = _normalize_effort_list(
@@ -440,6 +442,9 @@ class LollmsClient():
                         thinking_enabled=p_data.get("thinking_enabled", False),
                         supported_reasoning_efforts=p_data.get("supported_reasoning_efforts"),
                         default_reasoning_effort=p_data.get("default_reasoning_effort"),
+                        native_tools_enabled=bool(
+                            p_data.get("native_tools_enabled", p_data.get("native_tools", False))
+                        ),
                     )
                 registry[alias] = profile
 
@@ -493,7 +498,10 @@ class LollmsClient():
                         video_enabled=p_data.get("video_enabled", False),
                         image_token_cost=p_data.get("image_token_cost", 256),
                         thinking_enabled=p_data.get("thinking_enabled", False),
-                        default_reasoning_effort=p_data.get("default_reasoning_effort", None)
+                        default_reasoning_effort=p_data.get("default_reasoning_effort", None),
+                        native_tools_enabled=bool(
+                            p_data.get("native_tools_enabled", p_data.get("native_tools", False))
+                        ),
                     )
                 registry[alias] = profile
 
@@ -622,6 +630,7 @@ class LollmsClient():
         b_config.setdefault("thinking_enabled", binding_profile.thinking_enabled)
         b_config.setdefault("supported_reasoning_efforts", binding_profile.supported_reasoning_efforts)
         b_config.setdefault("default_reasoning_effort", binding_profile.default_reasoning_effort)
+        b_config.setdefault("native_tools_enabled", binding_profile.native_tools_enabled)
 
         _ssl_debug = os.getenv("LOLLMS_DEBUG_SSL", "").lower() in ("1", "true", "yes")
         if _ssl_debug:
@@ -680,6 +689,16 @@ class LollmsClient():
                         setattr(binding, "supported_reasoning_efforts", _efforts)
                     setattr(binding, "thinking_enabled", bool(getattr(model_profile, "thinking_enabled", False)))
                     setattr(binding, "default_reasoning_effort", getattr(model_profile, "default_reasoning_effort", None))
+                except Exception:
+                    pass
+                # Native tool calling: the profile flag is a capability hint.
+                # The binding's own capability probe (e.g. server --jinja,
+                # provider tool API) may downgrade it — we OR with whatever
+                # the binding already exposes so the binding stays authoritative.
+                try:
+                    _profile_flag = bool(getattr(model_profile, "native_tools_enabled", False))
+                    _binding_flag = bool(getattr(binding, "native_tools_enabled", False))
+                    setattr(binding, "native_tools_enabled", _profile_flag or _binding_flag)
                 except Exception:
                     pass
                 return binding
@@ -1095,6 +1114,50 @@ class LollmsClient():
 
         return False
 
+    def has_native_tools_capability(self, binding: Optional[Any] = None) -> bool:
+        """
+        Checks if the specified binding (or the currently active LLM) supports
+        native tool calling (OpenAI-style ``tools=`` / ``tool_choice=``).
+
+        Resolution order (mirrors ``has_vision_capability``):
+          1. ``binding.native_tools_enabled`` (set by ``_instantiate_binding_from_profile``
+             from the model profile's ``native_tools_enabled`` hint ORed with the
+             binding's own capability probe).
+          2. ``binding.supports_native_tools`` (optional alternative attribute some
+             bindings may expose).
+          3. Router child bindings (``child_bindings`` dict) — True if any child
+             exposes the capability.
+          4. The active model profile's ``native_tools_enabled`` flag (fallback
+             for bindings that do not expose the attribute themselves).
+
+        Callers (chat mixin, agents) SHOULD prefer this accessor over introspecting
+        ``type(binding).generate_from_messages`` — the binding is the single source
+        of truth for the *resolved* capability.
+        """
+        target_binding = binding or self.llm
+        if not target_binding:
+            return False
+
+        if getattr(target_binding, "native_tools_enabled", False) is True:
+            return True
+        if getattr(target_binding, "supports_native_tools", False) is True:
+            return True
+
+        child_bindings = getattr(target_binding, "child_bindings", None)
+        if isinstance(child_bindings, dict):
+            return any(
+                getattr(child, "native_tools_enabled", False)
+                or getattr(child, "supports_native_tools", False)
+                for child in child_bindings.values()
+            )
+
+        if hasattr(self, "_active_llm_alias") and self._active_llm_alias in self.llm_model_profiles_registry:
+            active_profile = self.llm_model_profiles_registry[self._active_llm_alias]
+            if getattr(active_profile, "native_tools_enabled", False):
+                return True
+
+        return False
+
     def has_video_capability(self, binding: Optional[Any] = None) -> bool:
         """
         Checks if the specified binding (or the currently active LLM) has video input capabilities.
@@ -1281,7 +1344,15 @@ class LollmsClient():
 
         return sanitized_messages
 
-    def generate_text(self, *args, **kwargs) -> Union[str, dict]:
+    def generate_text(self, *args,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict]] = None,
+        **kwargs
+    ) -> Union[str, dict]:
+        if tools is not None:
+            kwargs["tools"] = tools
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
         self._cooperative_unload_except("llm")
         if not self.llm:
             raise RuntimeError("LLM binding not initialized. Cannot use generate_text.")
@@ -1345,10 +1416,22 @@ class LollmsClient():
 
         return self.llm.generate_text(*args, **kwargs)  # type: ignore
 
-    def generate(self, *args, **kwargs) -> Union[str, dict]:
-        return self.generate_text(*args, **kwargs)
+    def generate(self, *args,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict]] = None,
+        **kwargs
+    ) -> Union[str, dict]:
+        return self.generate_text(*args, tools=tools, tool_choice=tool_choice, **kwargs)
 
-    def generate_from_messages(self, *args, **kwargs) -> Union[str, dict]:
+    def generate_from_messages(self, *args,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict]] = None,
+        **kwargs
+    ) -> Union[str, dict]:
+        if tools is not None:
+            kwargs["tools"] = tools
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
         self._cooperative_unload_except("llm")
         if not self.llm:
             raise RuntimeError("LLM binding not initialized. Cannot use generate_from_messages.")
@@ -2252,6 +2335,8 @@ class LollmsClient():
                 out["supported_reasoning_efforts"] = list(p.supported_reasoning_efforts)
             if p.default_reasoning_effort:
                 out["default_reasoning_effort"] = p.default_reasoning_effort
+            if p.native_tools_enabled:
+                out["native_tools_enabled"] = p.native_tools_enabled
             return out
 
         def _model_dict(p: "LollmsModelProfile") -> Dict[str, Any]:
@@ -2277,6 +2362,8 @@ class LollmsClient():
                 out["thinking_enabled"] = p.thinking_enabled
             if p.default_reasoning_effort:
                 out["default_reasoning_effort"] = p.default_reasoning_effort
+            if p.native_tools_enabled:
+                out["native_tools_enabled"] = p.native_tools_enabled
             return out
 
         modality_registries = {

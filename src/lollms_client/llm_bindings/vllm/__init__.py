@@ -34,6 +34,17 @@ from ascii_colors import ASCIIColors, trace_exception
 from lollms_client.lollms_discussion import LollmsDiscussion
 from lollms_client.lollms_llm_binding import LollmsLLMBinding
 from lollms_client.lollms_types import ELF_COMPLETION_FORMAT, MSG_TYPE
+from lollms_client.llm_bindings._tool_loop import (
+    MAX_TOOL_ROUNDS,
+    accumulate_streamed_tool_deltas,
+    build_assistant_tool_calls_message,
+    build_tool_call_callback_payloads,
+    build_tool_result_messages,
+    emit_callback_safe,
+    extract_native_tool_calls,
+    normalize_callback_result,
+)
+
 
 BindingName = "VLLMBinding"
 DEFAULT_MODELS_FOLDER = Path.home() / ".lollms" / "bindings_models" / "vllm_models"
@@ -649,83 +660,51 @@ class VLLMBinding(LollmsLLMBinding):
         think: Optional[bool] = False,
         reasoning_effort: Optional[str] = "low",
         reasoning_summary: Optional[str] = "auto",
+        tools: Optional[List[Dict]] = None,
+        tool_choice: Optional[Union[str, Dict]] = None,
+        execute_tool_loop: bool = False,
         **kwargs,
     ) -> Union[str, dict]:
+        """
+        Generate text from a single prompt.
+
+        ``tools`` / ``tool_choice`` are forwarded to the server verbatim
+        (OpenAI Chat Completions schema). The server is the sole authority
+        for tool parsing: it emits native ``tool_calls`` in the OpenAI wire
+        format and the binding forwards them to the consumer via the
+        streaming callback's ``meta`` dict as ``{"tool_call_id": ...,
+        "tool_name": ..., "parameters": {...}}`` events.
+
+        Caller-side loop control: set ``execute_tool_loop=True`` to have the
+        binding re-prompt the model every time the callback returns
+        ``{"tool_results": [{"tool_call_id": ..., "content": ...}]}``. When
+        ``execute_tool_loop`` is left at its default (``False``), this
+        method makes a SINGLE request per call and returns the assistant
+        text (possibly with ``tool_calls`` recorded on ``self._last_tool_calls``
+        for the caller to inspect).
+
+        No client-side DSML filtering is applied; if the server leaks
+        markup into ``content``, it is returned as-is so the caller can
+        decide how to handle it.
+        """
         if not self.client:
             raise RuntimeError("vLLM model server is not loaded. Call load_model() first.")
 
-        effort = self.get_effective_reasoning_effort(think=think, reasoning_effort=reasoning_effort)
-        messages = [{"role": "system", "content": system_prompt or "You are a helpful assistant."}]
-
-        media_blocks = []
-        if images:
-            media_blocks.extend([normalize_image_input(img, glm_format=self.glm_image_embedding) for img in images])
-        if videos:
-            media_blocks.extend([normalize_video_input(vid) for vid in videos])
-
-        if media_blocks:
-            if split:
-                messages += self.split_discussion(prompt, user_keyword=user_keyword, ai_keyword=ai_keyword)
-                last = messages[-1]
-                last["content"] = [{"type": "text", "text": last["content"]}] + media_blocks
-            else:
-                messages.append({"role": "user", "content": [{"type": "text", "text": prompt}] + media_blocks})
-        else:
-            if split:
-                messages += self.split_discussion(prompt, user_keyword=user_keyword, ai_keyword=ai_keyword)
-            else:
-                messages.append({"role": "user", "content": [{"type": "text", "text": prompt}]})
-
-        params: Dict[str, Any] = {
-            "model": self.model_name,
-            "messages": messages,
-            "max_tokens": n_predict or 2048,
-            "temperature": temperature if temperature is not None else 0.7,
-            "top_p": top_p if top_p is not None else 0.95,
-            "stream": stream if stream is not None else (streaming_callback is not None),
-        }
-        if seed is not None:
-            params["seed"] = seed
-
-        if effort is not None and not self.glm_image_embedding:
-            params.setdefault("extra_body", {}).setdefault("chat_template_kwargs", {})["enable_thinking"] = True
-
-        output = ""
-        try:
-            if params["stream"]:
-                handler = _StreamThinkingHandler(streaming_callback)
-                stream_res = self.client.chat.completions.create(**params)
-                for chunk in stream_res:
-                    if self.is_cancelled():
-                        break
-                    if not chunk.choices:
-                        continue
-                    delta = chunk.choices[0].delta
-                    r_text = extract_reasoning(delta)
-                    c_text = getattr(delta, "content", None)
-
-                    if r_text:
-                        if not handler.process_reasoning(r_text):
-                            break
-                        continue
-                    if c_text:
-                        if not handler.process_content(c_text):
-                            break
-                output = handler.flush()
-            else:
-                resp = self.client.chat.completions.create(**params)
-                msg_obj = resp.choices[0].message
-                r_text = extract_reasoning(msg_obj)
-                c_text = msg_obj.content or ""
-                if r_text and not c_text.strip().startswith(("<think>", "<thinking>")):
-                    output = f"<think>\n{r_text}\n</think>\n{c_text}"
-                else:
-                    output = c_text
-        except Exception as e:
-            trace_exception(e)
-            return {"status": "error", "message": f"vLLM API error: {e}"}
-
-        return output
+        messages = self._prompt_to_messages(prompt, images, videos, system_prompt, split, user_keyword, ai_keyword)
+        return self._run_chat_round(
+            messages,
+            n_predict=n_predict,
+            stream=stream,
+            temperature=temperature,
+            top_p=top_p,
+            seed=seed,
+            streaming_callback=streaming_callback,
+            think=think,
+            reasoning_effort=reasoning_effort,
+            tools=tools,
+            tool_choice=tool_choice,
+            execute_tool_loop=execute_tool_loop,
+        )
 
     def generate_from_messages(
         self,
@@ -740,8 +719,34 @@ class VLLMBinding(LollmsLLMBinding):
         think: Optional[bool] = False,
         reasoning_effort: Optional[str] = "low",
         reasoning_summary: Optional[str] = "auto",
+        tools: Optional[List[Dict]] = None,
+        tool_choice: Optional[Union[str, Dict]] = None,
+        execute_tool_loop: bool = True,
         **kwargs,
     ) -> Union[str, dict]:
+        """
+        Generate text from a full OpenAI-style message list.
+
+        ``tools`` uses the OpenAI Chat Completions schema and is forwarded to
+        the vLLM server verbatim. The server (with ``--tool-call-parser``) is
+        the sole authority on tool-call parsing: it emits native
+        ``tool_calls`` in the wire format.
+
+        When tools are provided and the callback returns
+        ``{"tool_results": [{"tool_call_id": ..., "content": ...}]}``, the
+        binding appends the assistant tool-call turn + ``role="tool"``
+        messages and re-invokes the model (bounded by ``MAX_TOOL_ROUNDS``).
+        Set ``execute_tool_loop=False`` to make a single request and let the
+        caller drive the loop manually.
+
+        Callback contract::
+
+            True / None                       → continue (backward compat)
+            False                             → abort
+            {"tool_results": [
+                {"tool_call_id": "...", "content": "..."}
+            ]}                                → append and re-invoke
+        """
         if not self.client:
             raise RuntimeError("vLLM model server is not loaded. Call load_model() first.")
 

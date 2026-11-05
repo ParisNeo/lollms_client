@@ -23,17 +23,50 @@ from lollms_client.lollms_discussion import LollmsDiscussion
 from lollms_client.lollms_llm_binding import LollmsLLMBinding
 from lollms_client.lollms_types import ELF_COMPLETION_FORMAT, MSG_TYPE
 from lollms_client.lollms_utilities import encode_image
-from lollms_client.llm_bindings._dsml_utils import (
-    _extract_dsml_from_text,
-    _format_tool_calls_to_lollms_xml,
-    _DSMLStreamFilter,
-    _DSMLStreamFilter,
-    _extract_dsml_from_text,
-    _format_tool_calls_to_lollms_xml,
+from lollms_client.lollms_discussion import LollmsDiscussion
+from lollms_client.lollms_llm_binding import LollmsLLMBinding
+from lollms_client.lollms_types import ELF_COMPLETION_FORMAT, MSG_TYPE
+from lollms_client.lollms_utilities import encode_image
+from lollms_client.llm_bindings._tool_loop import (
+    MAX_TOOL_ROUNDS,
+    accumulate_streamed_tool_deltas,
+    build_assistant_tool_calls_message,
+    build_tool_call_callback_payloads,
+    build_tool_result_messages,
+    emit_callback_safe,
+    extract_native_tool_calls,
+    normalize_callback_result,
 )
 
-
 BindingName = "LollmsBinding"
+
+
+def _wire_shape(native: List[Any]) -> List[Dict[str, Any]]:
+    """Normalize native tool_calls objects into OpenAI wire shape.
+
+    Local helper used by ``LollmsBinding._generate_one_round`` when persisting
+    the assistant tool-call turn for the next round. Kept private to this
+    module to avoid importing the OpenAIBinding internals.
+    """
+    out: List[Dict[str, Any]] = []
+    for tc in native or []:
+        if isinstance(tc, dict):
+            out.append(tc)
+            continue
+        try:
+            out.append(
+                {
+                    "id": getattr(tc, "id", None),
+                    "type": "function",
+                    "function": {
+                        "name": getattr(getattr(tc, "function", None), "name", ""),
+                        "arguments": getattr(getattr(tc, "function", None), "arguments", ""),
+                    },
+                }
+            )
+        except Exception:
+            continue
+    return out
 
 _NIM_FUNCTION_NAME_PLACEHOLDER = "23d4f03a-b8a6-4adb-a183-7daa083a09cc"
 
@@ -284,10 +317,16 @@ class _StreamThinkingHandler:
         self.in_content_thinking = False
         self.buffer = ""
         self.output = ""
+        # Reasoning is captured even when suppressed so the caller can rescue
+        # a reasoning-only response (e.g. deepseek-reasoner with think=False)
+        # instead of returning an empty string to the user.
+        self._reasoning_capture: List[str] = []
 
     def process_reasoning(self, reasoning: str) -> bool:
         if not reasoning:
             return True
+
+        self._reasoning_capture.append(reasoning)
 
         if self.suppress_thinking:
             return True
@@ -299,7 +338,10 @@ class _StreamThinkingHandler:
 
         self.output += reasoning
         if self.callback:
-            if self.callback(reasoning, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK) is False:
+            from lollms_client.llm_bindings._tool_loop import emit_callback_safe
+            if emit_callback_safe(
+                self.callback, reasoning, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK, {}
+            ) is False:
                 return False
 
         return True
@@ -309,6 +351,10 @@ class _StreamThinkingHandler:
             self.in_dedicated_reasoning = False
             self.output += "\n</think>\n"
         return True
+
+    def reasoning_snapshot(self) -> str:
+        """Returns all reasoning text captured, including suppressed chunks."""
+        return "".join(self._reasoning_capture)
 
     def process_content(self, content: str) -> bool:
         if not self._close_dedicated_reasoning():
@@ -320,7 +366,10 @@ class _StreamThinkingHandler:
         if self.dedicated_reasoning_opened:
             self.output += content
             if self.callback:
-                return self.callback(content, MSG_TYPE.MSG_TYPE_CHUNK) is not False
+                from lollms_client.llm_bindings._tool_loop import emit_callback_safe
+                return emit_callback_safe(
+                    self.callback, content, MSG_TYPE.MSG_TYPE_CHUNK, {}
+                ) is not False
             return True
 
         text = self.buffer + content
@@ -336,7 +385,10 @@ class _StreamThinkingHandler:
                     pre = text[:m.start()]
                     if pre:
                         self.output += pre
-                        if self.callback and self.callback(pre, MSG_TYPE.MSG_TYPE_CHUNK) is False:
+                        from lollms_client.llm_bindings._tool_loop import emit_callback_safe
+                        if self.callback and emit_callback_safe(
+                            self.callback, pre, MSG_TYPE.MSG_TYPE_CHUNK, {}
+                        ) is False:
                             return False
 
                     tag = m.group(0)
@@ -344,7 +396,10 @@ class _StreamThinkingHandler:
                         self.output += tag
                     self.in_content_thinking = True
                     if not self.suppress_thinking and self.callback:
-                        if self.callback(tag, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK) is False:
+                        from lollms_client.llm_bindings._tool_loop import emit_callback_safe
+                        if emit_callback_safe(
+                            self.callback, tag, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK, {}
+                        ) is False:
                             return False
 
                     text = text[m.end():]
@@ -358,7 +413,10 @@ class _StreamThinkingHandler:
 
                     if text:
                         self.output += text
-                        if self.callback and self.callback(text, MSG_TYPE.MSG_TYPE_CHUNK) is False:
+                        from lollms_client.llm_bindings._tool_loop import emit_callback_safe
+                        if self.callback and emit_callback_safe(
+                            self.callback, text, MSG_TYPE.MSG_TYPE_CHUNK, {}
+                        ) is False:
                             return False
                     break
             else:
@@ -367,7 +425,10 @@ class _StreamThinkingHandler:
                     thought_part = text[:m.start()]
                     if thought_part and not self.suppress_thinking:
                         self.output += thought_part
-                        if self.callback and self.callback(thought_part, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK) is False:
+                        from lollms_client.llm_bindings._tool_loop import emit_callback_safe
+                        if self.callback and emit_callback_safe(
+                            self.callback, thought_part, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK, {}
+                        ) is False:
                             return False
 
                     tag = m.group(0)
@@ -375,7 +436,10 @@ class _StreamThinkingHandler:
                         self.output += tag
                     self.in_content_thinking = False
                     if not self.suppress_thinking and self.callback:
-                        if self.callback(tag, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK) is False:
+                        from lollms_client.llm_bindings._tool_loop import emit_callback_safe
+                        if emit_callback_safe(
+                            self.callback, tag, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK, {}
+                        ) is False:
                             return False
 
                     text = text[m.end():]
@@ -389,7 +453,10 @@ class _StreamThinkingHandler:
 
                     if text:
                         self.output += text
-                        if self.callback and self.callback(text, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK) is False:
+                        from lollms_client.llm_bindings._tool_loop import emit_callback_safe
+                        if self.callback and emit_callback_safe(
+                            self.callback, text, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK, {}
+                        ) is False:
                             return False
                     break
 
@@ -402,7 +469,8 @@ class _StreamThinkingHandler:
             msg_type = MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK if self.in_content_thinking else MSG_TYPE.MSG_TYPE_CHUNK
             self.output += self.buffer
             if self.callback:
-                self.callback(self.buffer, msg_type)
+                from lollms_client.llm_bindings._tool_loop import emit_callback_safe
+                emit_callback_safe(self.callback, self.buffer, msg_type, {})
             self.buffer = ""
 
         if self.in_content_thinking:
@@ -411,7 +479,10 @@ class _StreamThinkingHandler:
                 close_tag = "\n</think>\n"
                 self.output += close_tag
                 if self.callback:
-                    self.callback(close_tag, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                    from lollms_client.llm_bindings._tool_loop import emit_callback_safe
+                    emit_callback_safe(
+                        self.callback, close_tag, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK, {}
+                    )
 
         return self.output
 
@@ -601,95 +672,73 @@ class LollmsBinding(LollmsLLMBinding):
         is_deactivated: bool
     ) -> dict:
         """
-        Applies thinking / reasoning controls across LoLLMs, OpenAI, vLLM, Z.AI/GLM, and OpenAI-compatible engines.
+        Applies thinking / reasoning controls across LoLLMs, OpenAI, vLLM,
+        Z.AI/GLM, and OpenAI-compatible engines.
+
+        When thinking is deactivated (``think`` not True, or an explicit
+        "off" effort), all reasoning / thinking controls are *omitted*
+        entirely rather than set to ``False`` / ``"none"``. Several
+        OpenAI-compatible endpoints (notably DeepSeek V4.1) forward
+        ``chat_template_kwargs`` and validate them server-side — any
+        non-conforming key there triggers a 400. Omission is the portable
+        signal.
         """
         model_name_lower = (self.model_name or "").lower()
         is_glm = "glm" in model_name_lower
+        is_reasoner_family = any(fam in model_name_lower for fam in ("o1", "o3", "o4", "gpt-5"))
         is_vllm = self.check_is_vllm()
         extra_body = params.setdefault("extra_body", {})
 
-        if is_deactivated:
-            params["reasoning_effort"] = "none"
-            extra_body["reasoning_effort"] = "none"
+        normalized_effort = None
+        if effort is not None:
+            candidate = str(effort).strip().lower()
+            if candidate not in ("none", "off", "disabled", "false", "0", ""):
+                normalized_effort = "high" if candidate == "max" else candidate
 
-            if is_vllm:
-                if self.send_thinking_parameter and not getattr(self, "glm_image_embedding", False):
-                    ctk = extra_body.setdefault("chat_template_kwargs", {})
-                    if self.thinking_effort_keyword == "reasoning_effort":
-                        ctk["reasoning_effort"] = "none"
-                        ctk["enable_thinking"] = False
-                    else:
-                        ctk[self.thinking_effort_keyword] = False
-                        ctk["enable_thinking"] = False
-                        ctk["thinking"] = False
-                if is_glm:
-                    extra_body["thinking"] = {"type": "disabled"}
-                else:
-                    extra_body["thinking"] = False
-            else:
-                extra_body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
-                extra_body.setdefault("chat_template_kwargs", {})["thinking"] = False
-                if is_glm:
-                    extra_body["thinking"] = {"type": "disabled"}
-                else:
-                    extra_body["thinking"] = False
+        thinking_active = (not is_deactivated) and (normalized_effort is not None)
+
+        if not thinking_active:
+            # Omit every reasoning / thinking control. Servers use their
+            # default behaviour, which is exactly what "no thinking controls"
+            # means. Explicitly setting "none"/False breaks DeepSeek V4.1.
+            params.pop("reasoning_effort", None)
+            extra_body.pop("reasoning_effort", None)
+            extra_body.pop("thinking", None)
+            extra_body.pop("chat_template_kwargs", None)
         else:
-            if effort is not None and str(effort).strip().lower() not in ("none", "off", "disabled", "false", "0"):
-                norm_effort = effort if effort != "max" else "high"
-                params["reasoning_effort"] = norm_effort
-                extra_body["reasoning_effort"] = norm_effort
-
-                if is_vllm:
-                    if self.send_thinking_parameter and not getattr(self, "glm_image_embedding", False):
-                        ctk = extra_body.setdefault("chat_template_kwargs", {})
-                        if self.thinking_effort_keyword == "reasoning_effort":
-                            ctk["reasoning_effort"] = norm_effort
-                            ctk["enable_thinking"] = True
-                        else:
-                            ctk[self.thinking_effort_keyword] = True
-                            ctk["enable_thinking"] = True
-                            ctk["thinking"] = True
-                    if is_glm:
-                        extra_body["thinking"] = {"type": "enabled"}
-                    else:
-                        extra_body["thinking"] = True
-                else:
-                    extra_body.setdefault("chat_template_kwargs", {})["enable_thinking"] = True
-                    extra_body.setdefault("chat_template_kwargs", {})["thinking"] = True
-                    if is_glm:
-                        extra_body["thinking"] = {"type": "enabled"}
-                    else:
-                        extra_body["thinking"] = True
-
-                    restricted = ["o1", "o3", "o4", "gpt-5"]
-                    if any(r in model_name_lower for r in restricted):
-                        params.pop("temperature", None)
-                        params.pop("top_p", None)
+            # Only OpenAI-native reasoning families and vLLM accept a
+            # top-level reasoning_effort; forwarding it to other
+            # OpenAI-compatible endpoints 400s.
+            if is_vllm or is_reasoner_family:
+                params["reasoning_effort"] = normalized_effort
+                extra_body["reasoning_effort"] = normalized_effort
             else:
-                params["reasoning_effort"] = "none"
-                extra_body["reasoning_effort"] = "none"
+                params.pop("reasoning_effort", None)
+                extra_body.pop("reasoning_effort", None)
 
-                if is_vllm:
-                    if self.send_thinking_parameter and not getattr(self, "glm_image_embedding", False):
-                        ctk = extra_body.setdefault("chat_template_kwargs", {})
-                        if self.thinking_effort_keyword == "reasoning_effort":
-                            ctk["reasoning_effort"] = "none"
-                            ctk["enable_thinking"] = False
-                        else:
-                            ctk[self.thinking_effort_keyword] = False
-                            ctk["enable_thinking"] = False
-                            ctk["thinking"] = False
-                    if is_glm:
-                        extra_body["thinking"] = {"type": "disabled"}
-                    else:
-                        extra_body["thinking"] = False
+            if self.send_thinking_parameter and not getattr(self, "glm_image_embedding", False):
+                ctk = extra_body.setdefault("chat_template_kwargs", {})
+                if self.thinking_effort_keyword == "reasoning_effort":
+                    ctk["reasoning_effort"] = normalized_effort
+                    ctk["enable_thinking"] = True
                 else:
-                    extra_body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
-                    extra_body.setdefault("chat_template_kwargs", {})["thinking"] = False
-                    if is_glm:
-                        extra_body["thinking"] = {"type": "disabled"}
-                    else:
-                        extra_body["thinking"] = False
+                    ctk[self.thinking_effort_keyword] = True
+                    ctk["enable_thinking"] = True
+                    ctk["thinking"] = True
+
+            if is_glm:
+                extra_body["thinking"] = {"type": "enabled"}
+            else:
+                extra_body["thinking"] = True
+
+            if is_reasoner_family:
+                params.pop("temperature", None)
+                params.pop("top_p", None)
+
+        # Never send an empty extra_body: some servers 400 on it and every
+        # path below assumes the dict is meaningful only when non-empty.
+        if not extra_body:
+            params.pop("extra_body", None)
 
         return params
 
@@ -1026,8 +1075,59 @@ class LollmsBinding(LollmsLLMBinding):
         think: Optional[bool] = False,
         reasoning_effort: Optional[str] = None,
         reasoning_summary: Optional[str] = None,
+        tools: Optional[List[Dict]] = None,
+        tool_choice: Optional[Union[str, Dict]] = None,
         **kwargs,
     ) -> Union[str, dict]:
+        """
+        Generate text from a single prompt (chat-completions endpoint).
+
+        ``tools`` follows the OpenAI Chat Completions schema::
+
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_current_weather",
+                        "description": "Get current weather for a location",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "location": {"type": "string"},
+                                "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+                            },
+                            "required": ["location"],
+                        },
+                    },
+                }
+            ]
+
+        ``tool_choice`` may be ``"auto"``, ``"none"``, ``"required"``, or a
+        ``{"type": "function", "function": {"name": "..."}}`` dict.
+
+        When ``tools`` is provided, the call is routed through the shared
+        tool-calling loop which:
+          1. Forwards any ``tool_calls`` (native or DSML-leaked) to the
+             callback as ``<tool>{"name":..., "parameters":{...}}</tool>`` XML.
+          2. If the callback returns ``{"tool_results": [...]}``, appends the
+             assistant tool-call turn + matching ``role="tool"`` messages and
+             re-invokes the model.
+          3. Repeats until no more tool calls are requested, the callback
+             returns ``False``, or ``MAX_TOOL_ROUNDS`` (8) is reached.
+
+        Callback contract::
+
+            True / None                          → continue
+            False                                → abort
+            {"tool_results": [                   → append tool results and
+                {"tool_call_id": "call_abc",        re-invoke the model
+                 "content": "{\\"temp\\":22}"},
+                ...
+            ]}
+
+        Each ``tool_results`` entry MUST carry a ``tool_call_id`` matching a
+        ``tool_call.id`` from the previous assistant turn.
+        """
         if not self.model_name:
             return {"status": "error", "message": "[LollmsBinding] No model_name resolved. Please configure a model profile or set model_name in binding config."}
 
@@ -1075,6 +1175,27 @@ class LollmsBinding(LollmsLLMBinding):
             else:
                 messages.append({"role": "user", "content": [{"type": "text", "text": prompt}]})
 
+        # ── Tool-aware path: route through the shared loop so the callback
+        # can return tool results and expect the binding to re-invoke.
+        if tools:
+            return self._run_tool_loop(
+                messages,
+                n_predict=n_predict,
+                stream=stream,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repeat_penalty=repeat_penalty,
+                seed=seed,
+                streaming_callback=streaming_callback,
+                think=think,
+                reasoning_effort=reasoning_effort,
+                reasoning_summary=reasoning_summary,
+                tools=tools,
+                tool_choice=tool_choice,
+                extra_kwargs=kwargs,
+            )
+
         try:
             if self.completion_format == ELF_COMPLETION_FORMAT.Chat:
                 params = self._build_openai_params(
@@ -1110,7 +1231,6 @@ class LollmsBinding(LollmsLLMBinding):
 
                 if stream:
                     handler = _StreamThinkingHandler(streaming_callback, suppress_thinking=is_thinking_deactivated)
-                    dsml_filter = _DSMLStreamFilter(handler)
 
                     for resp in chat_completion:
                         if self.is_cancelled():
@@ -1124,7 +1244,7 @@ class LollmsBinding(LollmsLLMBinding):
 
                         delta = resp.choices[0].delta
                         reasoning = extract_reasoning(delta)
-                        content = getattr(delta, "content", None)
+                        content = getattr(delta, "content", "") or ""
 
                         if reasoning:
                             if not handler.process_reasoning(reasoning):
@@ -1133,22 +1253,71 @@ class LollmsBinding(LollmsLLMBinding):
                             continue
 
                         if content:
-                            if not dsml_filter.feed(content):
+                            if not handler.process_content(content):
                                 break
                             count += 1
 
-                    dsml_filter.flush()
-                    output = handler.flush()
+                    output = self._finalize_stream_output(handler, streaming_callback)
                 else:
                     message_obj = chat_completion.choices[0].message
                     reasoning = extract_reasoning(message_obj)
                     content = message_obj.content or ""
-                    if is_thinking_deactivated:
-                        output = re.sub(r'<(?:think|thinking)>[\s\S]*?</(?:think|thinking)>', '', content, flags=re.IGNORECASE).strip()
-                    elif reasoning and not content.strip().startswith(("<think>", "<thinking>")):
-                        output = f"<think>\n{reasoning}\n</think>\n{content}"
+
+                    if reasoning and not content.strip().startswith((" thinking", "<thinking>")):
+                        output = f"<think>\n{reasoning}\n</think>\n\n{content}"
                     else:
                         output = content
+
+                    has_native_tool_calls = bool(
+                        getattr(message_obj, "tool_calls", None)
+                    )
+                    if not output.strip() and not has_native_tool_calls:
+                        try:
+                            fallback_text, fallback_acc = self._stream_fallback_non_streaming(
+                                params, streaming_callback, is_thinking_deactivated
+                            )
+                            if fallback_text.strip():
+                                ASCIIColors.warning(
+                                    "[LollmsBinding.generate_text] Non-streaming "
+                                    "response was empty; streaming fallback "
+                                    "produced content."
+                                )
+                                output = fallback_text
+                            if fallback_acc:
+                                promoted = []
+                                for idx in sorted(fallback_acc.keys()):
+                                    tc = fallback_acc[idx]
+                                    name = (tc.get("name") or "").strip()
+                                    if not name:
+                                        continue
+                                    tc_id = tc.get("id") or f"call_{idx}"
+                                    raw_args = tc.get("arguments") or ""
+                                    try:
+                                        tool_args = json.loads(raw_args) if raw_args else {}
+                                    except (json.JSONDecodeError, TypeError):
+                                        tool_args = {"raw": raw_args}
+                                    promoted.append(
+                                        {
+                                            "id": tc_id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": name,
+                                                "arguments": json.dumps(tool_args),
+                                            },
+                                        }
+                                    )
+                                if promoted:
+                                    native_tool_xml = LollmsLLMBinding.tool_calls_to_lollms_xml(promoted)
+                                    if native_tool_xml:
+                                        if output:
+                                            output += "\n" + native_tool_xml
+                                        else:
+                                            output = native_tool_xml
+                        except Exception as fb_err:
+                            ASCIIColors.warning(
+                                f"[LollmsBinding.generate_text] Non-streaming "
+                                f"fallback failed: {fb_err}"
+                            )
             else:
                 params = self._build_openai_params(
                     prompt=prompt,
@@ -1187,15 +1356,137 @@ class LollmsBinding(LollmsLLMBinding):
 
         except openai.BadRequestError as e:
             ASCIIColors.error(f"[LollmsBinding] Request rejected 400: {e}")
+            # Surface the actionable remediation for known server-side
+            # tool-calling misconfigurations (vLLM missing --tool-call-parser,
+            # etc.) so the caller never sees a bare "model does not support
+            # tools" message when the real cause is a server launch flag.
+            hint = self._classify_tool_server_error(e)
+            if hint:
+                return {
+                    "status": "error",
+                    "message": f"Server misconfiguration detected: {hint}",
+                    "server_body": getattr(e, "body", None),
+                }
             raise
         except Exception as e:
             trace_exception(e)
             err_msg = f"An error occurred with the OpenAI API: {e}"
+            hint = self._classify_tool_server_error(e)
+            if hint:
+                err_msg = f"{err_msg}\n\n{hint}"
             if streaming_callback:
-                streaming_callback(err_msg, MSG_TYPE.MSG_TYPE_EXCEPTION)
+                emit_callback_safe(streaming_callback, err_msg, MSG_TYPE.MSG_TYPE_EXCEPTION, {})
             return {"status": "error", "message": err_msg, "server_body": getattr(e, "body", None)}
 
         return output
+
+    def _run_generate_once(
+        self,
+        params: dict,
+        *,
+        stream: Optional[bool],
+        n_predict: Optional[int],
+        is_thinking_deactivated: bool,
+        streaming_callback: Optional[Callable[[str, MSG_TYPE], None]],
+        count_ref: Optional[List[int]] = None,
+    ) -> Union[str, dict]:
+        """
+        Execute a single chat-completions request (as used by
+        ``generate_text``'s thinking ladder) and drain its response. Never
+        raises; returns the answer string (possibly ``""``) or an error dict.
+        """
+        count_ref = count_ref if count_ref is not None else [0]
+        try:
+            try:
+                chat_completion = self.client.chat.completions.create(**params)
+            except Exception:
+                if "max_tokens" in params:
+                    params["max_completion_tokens"] = params.pop("max_tokens")
+                params.pop("top_p", None)
+                params.pop("frequency_penalty", None)
+                params.pop("reasoning_effort", None)
+                if "extra_body" in params and isinstance(params["extra_body"], dict):
+                    params["extra_body"].pop("chat_template_kwargs", None)
+                    params["extra_body"].pop("reasoning_effort", None)
+                    params["extra_body"].pop("thinking", None)
+                    if not params["extra_body"]:
+                        params.pop("extra_body", None)
+                if is_thinking_deactivated:
+                    params["temperature"] = 1
+                chat_completion = self.client.chat.completions.create(**params)
+
+            if stream:
+                handler = _StreamThinkingHandler(
+                    streaming_callback, suppress_thinking=is_thinking_deactivated
+                )
+                for resp in chat_completion:
+                    if self.is_cancelled():
+                        break
+                    if count_ref[0] >= (n_predict or float("inf")):
+                        break
+                    if not resp.choices:
+                        continue
+                    delta = resp.choices[0].delta
+                    reasoning = extract_reasoning(delta)
+                    content = getattr(delta, "content", "") or ""
+                    if reasoning:
+                        if not handler.process_reasoning(reasoning):
+                            break
+                        count_ref[0] += 1
+                        continue
+                    if content:
+                        if not handler.process_content(content):
+                            break
+                        count_ref[0] += 1
+                return self._finalize_stream_output(handler, streaming_callback)
+
+            message_obj = chat_completion.choices[0].message
+            reasoning = extract_reasoning(message_obj)
+            content = message_obj.content or ""
+            output = self.finalize_non_stream_output(
+                content, reasoning, is_thinking_deactivated
+            )
+
+            # Some OpenAI-compatible deployments only populate streaming
+            # responses; when the non-streaming twin yields an empty body we
+            # retry the exact same payload in streaming mode.
+            if not output.strip():
+                try:
+                    fallback_text, _ = self._stream_fallback_non_streaming(
+                        params, streaming_callback, is_thinking_deactivated
+                    )
+                    if fallback_text.strip():
+                        ASCIIColors.warning(
+                            "[LollmsBinding._run_generate_once] Non-streaming "
+                            "response was empty; streaming fallback produced "
+                            "content."
+                        )
+                        output = fallback_text
+                except Exception as fb_err:
+                    ASCIIColors.warning(
+                        f"[LollmsBinding._run_generate_once] Non-streaming "
+                        f"fallback failed: {fb_err}"
+                    )
+
+            if not output.strip():
+                return {
+                    "status": "error",
+                    "message": (
+                        "Model returned an empty non-streaming response and "
+                        "the streaming fallback also produced no content. "
+                        "The endpoint may be rejecting this request shape."
+                    ),
+                }
+            return output
+        except openai.BadRequestError as e:
+            ASCIIColors.error(f"[LollmsBinding] Request rejected 400: {e}")
+            return {"status": "error", "message": str(e), "server_body": getattr(e, "body", None)}
+        except Exception as e:
+            trace_exception(e)
+            err_msg = f"An error occurred with the OpenAI API: {e}"
+            if streaming_callback:
+                emit_callback_safe(streaming_callback, err_msg, MSG_TYPE.MSG_TYPE_EXCEPTION, {})
+            return {"status": "error", "message": err_msg, "server_body": getattr(e, "body", None)}
 
     def generate_from_messages(
         self,
@@ -1211,8 +1502,72 @@ class LollmsBinding(LollmsLLMBinding):
         think: Optional[bool] = False,
         reasoning_effort: Optional[str] = None,
         reasoning_summary: Optional[str] = None,
+        tools: Optional[List[Dict]] = None,
+        tool_choice: Optional[Union[str, Dict]] = None,
         **kwargs,
     ) -> Union[str, dict]:
+        """
+        Generate text from a full OpenAI-style message list, using the
+        OpenAI Chat Completions tool-calling lifecycle.
+
+        ``tools`` follows the OpenAI Chat Completions schema::
+
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_current_weather",
+                        "description": "Get current weather for a location",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "location": {"type": "string"},
+                                "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+                            },
+                            "required": ["location"],
+                        },
+                        "strict": True,
+                    },
+                }
+            ]
+
+        ``tool_choice`` may be ``"auto"``, ``"none"``, ``"required"``, or a
+        ``{"type": "function", "function": {"name": "..."}}`` dict. When
+        ``tools`` is provided and ``tool_choice`` is omitted, ``"auto"`` is
+        used.
+
+        Lifecycle (complying with the documented OpenAI protocol):
+
+        1. Model evaluates the conversation and may return ``tool_calls``.
+           DSML-leaked blocks (``<｜DSML｜ invoke>...</｜DSML｜>``) are
+           translated to ``<tool>{"name":..., "parameters":{...}}</tool>``
+           XML and treated identically to native tool calls.
+        2. Each call is forwarded to the callback as
+           ``<tool>{"name":..., "parameters":{...}}</tool>`` XML.
+        3. If the callback returns ``{"tool_results": [...]}``, the binding
+           appends the assistant tool-call turn + a matching ``role="tool"``
+           message per result, then re-invokes the model for the next round.
+        4. The loop terminates when the model emits no tool calls, the
+           callback returns ``False``, or ``MAX_TOOL_ROUNDS`` (8) is reached.
+
+        Callback contract::
+
+            True / None                          → continue; output unchanged
+            False                                → abort the call
+            {"tool_results": [                   → binding appends the tool
+                {"tool_call_id": "call_abc",        results and re-invokes
+                 "content": "{\\"temp\\":22}"},            the model
+                ...
+            ]}
+
+        Tool results MUST carry a ``tool_call_id`` matching one of the
+        ``tool_calls`` returned by the previous assistant turn. Entries
+        without a ``tool_call_id`` are dropped. ``content`` may be any
+        serializable value; it is coerced to a JSON string when not already
+        a string.
+
+        Backward compatible: callbacks returning ``bool`` keep working.
+        """
         if not self.model_name:
             return {"status": "error", "message": "[LollmsBinding] No model_name resolved. Please configure a model profile or set model_name in binding config."}
 
@@ -1285,7 +1640,7 @@ class LollmsBinding(LollmsLLMBinding):
         # user message before the wire call.
         openai_messages = _sanitize_system_images(openai_messages)
 
-        raw_tools = kwargs.get("tools")
+        raw_tools = tools
         sanitized_tools = None
         if raw_tools and isinstance(raw_tools, list):
             sanitized_tools = []
@@ -1355,6 +1710,27 @@ class LollmsBinding(LollmsLLMBinding):
         if reasoning_summary and reasoning_summary != "auto" and not is_thinking_deactivated:
             params.setdefault("extra_body", {})["reasoning_summary"] = reasoning_summary
 
+        # ── Tool-aware path: route through the shared loop so the callback
+        # can return tool results and expect the binding to re-invoke.
+        if tools:
+            return self._run_tool_loop(
+                messages,
+                n_predict=n_predict,
+                stream=stream,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repeat_penalty=repeat_penalty,
+                seed=seed,
+                streaming_callback=streaming_callback,
+                think=think,
+                reasoning_effort=reasoning_effort,
+                reasoning_summary=reasoning_summary,
+                tools=tools,
+                tool_choice=tool_choice,
+                extra_kwargs=kwargs,
+            )
+
         output = ""
 
         try:
@@ -1384,14 +1760,14 @@ class LollmsBinding(LollmsLLMBinding):
                         params["extra_body"].pop("chat_template_kwargs", None)
                         params["extra_body"].pop("reasoning_effort", None)
                         params["extra_body"].pop("thinking", None)
+                        if not params["extra_body"]:
+                            params.pop("extra_body", None)
                     if effort is None or is_thinking_deactivated:
                         params["temperature"] = 1
                     completion = self.client.chat.completions.create(**params)
 
             if stream:
                 handler = _StreamThinkingHandler(streaming_callback, suppress_thinking=is_thinking_deactivated)
-                dsml_filter = _DSMLStreamFilter(handler)
-                accumulated_tool_calls: Dict[int, Dict[str, Any]] = {}
 
                 for chunk in completion:
                     if self.is_cancelled():
@@ -1400,7 +1776,7 @@ class LollmsBinding(LollmsLLMBinding):
                         continue
                     delta = chunk.choices[0].delta
                     reasoning = extract_reasoning(delta)
-                    content = getattr(delta, "content", None)
+                    content = getattr(delta, "content", "") or ""
 
                     if reasoning:
                         if not handler.process_reasoning(reasoning):
@@ -1408,73 +1784,78 @@ class LollmsBinding(LollmsLLMBinding):
                         continue
 
                     if content:
-                        if not dsml_filter.feed(content):
+                        if not handler.process_content(content):
                             break
 
-                    if hasattr(delta, "tool_calls") and delta.tool_calls:
-                        for tc_delta in delta.tool_calls:
-                            idx = tc_delta.index
-                            if idx not in accumulated_tool_calls:
-                                accumulated_tool_calls[idx] = {
-                                    "id": tc_delta.id,
-                                    "name": tc_delta.function.name if tc_delta.function else "",
-                                    "arguments": "",
-                                }
-                            else:
-                                if tc_delta.function and tc_delta.function.name:
-                                    accumulated_tool_calls[idx]["name"] = tc_delta.function.name
-
-                            if tc_delta.function and tc_delta.function.arguments:
-                                accumulated_tool_calls[idx]["arguments"] += tc_delta.function.arguments
-
-                dsml_filter.flush()
-                output = handler.flush()
-
-                if accumulated_tool_calls:
-                    tool_xml_parts: List[str] = []
-                    for idx in sorted(accumulated_tool_calls.keys()):
-                        tc = accumulated_tool_calls[idx]
-                        try:
-                            params = json.loads(tc["arguments"]) if tc["arguments"] else {}
-                        except json.JSONDecodeError:
-                            params = {"raw": tc["arguments"]}
-                        tool_obj = {"name": tc["name"], "parameters": params}
-                        tool_xml_parts.append(f"<tool>{json.dumps(tool_obj)}</tool>")
-
-                    if tool_xml_parts:
-                        tool_xml = "\n".join(tool_xml_parts)
-                        if streaming_callback:
-                            streaming_callback(tool_xml, MSG_TYPE.MSG_TYPE_CHUNK)
-                        if output:
-                            output += "\n" + tool_xml
-                        else:
-                            output = tool_xml
+                output = self._finalize_stream_output(handler, streaming_callback)
             else:
                 message_obj = completion.choices[0].message
                 reasoning = extract_reasoning(message_obj)
                 content = message_obj.content or ""
 
-                # Translate any leaked DSML blocks into Lollms <tool> XML
-                content, dsml_tool_xml = _extract_dsml_from_text(content)
-
                 if is_thinking_deactivated:
                     output = re.sub(r'<(?:think|thinking)>[\s\S]*?</(?:think|thinking)>', '', content, flags=re.IGNORECASE).strip()
-                elif reasoning and not content.strip().startswith((" thinking", "<think>")):
-                    output = f" thinking\n{reasoning}\n</think>\n{content}"
+                elif reasoning and not content.strip().startswith((" thinking", "<thinking>")):
+                    output = f"<think>\n{reasoning}\n</think>\n\n{content}"
                 else:
                     output = content
 
-                # Translate native tool_calls into Lollms <tool> XML
-                native_tool_xml = ""
                 if hasattr(message_obj, "tool_calls") and message_obj.tool_calls:
-                    native_tool_xml = _format_tool_calls_to_lollms_xml(message_obj.tool_calls)
+                    native_tool_xml = LollmsLLMBinding.tool_calls_to_lollms_xml(message_obj.tool_calls)
+                    if native_tool_xml:
+                        if output:
+                            output += "\n" + native_tool_xml
+                        else:
+                            output = native_tool_xml
 
-                combined_tool_xml = "\n".join(x for x in (dsml_tool_xml, native_tool_xml) if x)
-                if combined_tool_xml:
-                    if output:
-                        output += "\n" + combined_tool_xml
-                    else:
-                        output = combined_tool_xml
+                if not output.strip() and not (
+                    hasattr(message_obj, "tool_calls") and message_obj.tool_calls
+                ):
+                    try:
+                        fallback_text, fallback_acc = self._stream_fallback_non_streaming(
+                            params, streaming_callback, is_thinking_deactivated
+                        )
+                        if fallback_text.strip():
+                            ASCIIColors.warning(
+                                "[LollmsBinding.generate_from_messages] Non-streaming "
+                                "response was empty; streaming fallback produced content."
+                            )
+                            output = fallback_text
+                        if fallback_acc:
+                            promoted = []
+                            for idx in sorted(fallback_acc.keys()):
+                                tc = fallback_acc[idx]
+                                name = (tc.get("name") or "").strip()
+                                if not name:
+                                    continue
+                                tc_id = tc.get("id") or f"call_{idx}"
+                                raw_args = tc.get("arguments") or ""
+                                try:
+                                    tool_args = json.loads(raw_args) if raw_args else {}
+                                except (json.JSONDecodeError, TypeError):
+                                    tool_args = {"raw": raw_args}
+                                promoted.append(
+                                    {
+                                        "id": tc_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": name,
+                                            "arguments": json.dumps(tool_args),
+                                        },
+                                    }
+                                )
+                            if promoted:
+                                native_tool_xml = LollmsLLMBinding.tool_calls_to_lollms_xml(promoted)
+                                if native_tool_xml:
+                                    if output:
+                                        output += "\n" + native_tool_xml
+                                    else:
+                                        output = native_tool_xml
+                    except Exception as fb_err:
+                        ASCIIColors.warning(
+                            f"[LollmsBinding.generate_from_messages] Non-streaming "
+                            f"fallback failed: {fb_err}"
+                        )
 
         except Exception as e:
             trace_exception(e)
@@ -1484,6 +1865,790 @@ class LollmsBinding(LollmsLLMBinding):
             return {"status": "error", "message": err_msg, "server_body": getattr(e, "body", None)}
 
         return output
+
+    def _finalize_stream_output(
+        self,
+        handler: "_StreamThinkingHandler",
+        streaming_callback: Optional[Callable[[str, MSG_TYPE], None]],
+    ) -> str:
+        """
+        Returns the accumulated streaming output. When the model produced only
+        reasoning while thinking was deactivated (e.g. deepseek-reasoner with
+        think=False), the visible content chunk stream is empty; in that case
+        the captured reasoning is surfaced as a CHUNK so the turn never dies
+        silently.
+        """
+        output = handler.flush()
+        if output and output.strip():
+            return output
+
+        reasoning = handler.reasoning_snapshot()
+        if reasoning and reasoning.strip():
+            ASCIIColors.warning(
+                "[LollmsBinding] Model produced reasoning-only output while "
+                "thinking was deactivated. Surfacing reasoning to avoid an "
+                "empty response. Enable think=True for proper thought streaming."
+            )
+            if streaming_callback:
+                try:
+                    streaming_callback(reasoning, MSG_TYPE.MSG_TYPE_CHUNK)
+                except Exception:
+                    pass
+            return reasoning
+
+        return output
+
+    def _non_stream_fallback_for_streamed_tools(
+        self,
+        params: dict,
+        is_thinking_deactivated: bool,
+    ) -> Optional[Tuple[str, List[Any], Optional[str]]]:
+        """
+        Retry a streamed + tools round in NON-streaming mode.
+
+        Some OpenAI-compatible proxies silently return an empty stream when a
+        request mixes ``stream=true`` with a ``tools`` array. The symmetric
+        non-streaming request frequently returns the answer — either as
+        native ``tool_calls`` (the intended path) or as plain content (when
+        the model chose not to invoke a tool, which is valid under
+        ``tool_choice="auto"``).
+
+        Returns ``(content, native_tool_calls, reasoning)`` on success, or
+        ``None`` when the retry was rejected/raised and the caller must fall
+        back to its own empty handling. Never raises.
+        """
+        retry_params = dict(params)
+        retry_params["stream"] = False
+        retry_params.pop("stream_options", None)
+
+        try:
+            completion = self.client.chat.completions.create(**retry_params)
+            message_obj = completion.choices[0].message
+            content = message_obj.content or ""
+            native_calls = extract_native_tool_calls(message_obj)
+            reasoning = extract_reasoning(message_obj)
+
+            if is_thinking_deactivated:
+                content = re.sub(
+                    r'<(?:think|thinking)>[\s\S]*?</(?:think|thinking)>',
+                    '', content, flags=re.IGNORECASE,
+                ).strip()
+
+            return content, native_calls, reasoning
+        except Exception as e:
+            ASCIIColors.warning(
+                f"[LollmsBinding._non_stream_fallback_for_streamed_tools] "
+                f"Retry rejected: {e}"
+            )
+            return None
+
+    def _stream_fallback_non_streaming(
+        self,
+        params: dict,
+        streaming_callback: Optional[Callable[[str, MSG_TYPE], None]],
+        is_thinking_deactivated: bool,
+    ) -> Tuple[str, Dict[int, Dict[str, Any]]]:
+        """
+        Retry an identical request in streaming mode when its non-streaming
+        twin produced no visible content. Some LoLLMS proxy deployments only
+        populate streaming responses (verified against
+        ``DeepSeekV4.1Flash`` behind vLLM). Returns
+        ``(text, accumulated_tool_calls)``.
+        """
+        stream_params = dict(params)
+        stream_params["stream"] = True
+        stream_params.pop("stream_options", None)
+
+        handler = _StreamThinkingHandler(
+            streaming_callback, suppress_thinking=is_thinking_deactivated
+        )
+        accumulated: Dict[int, Dict[str, Any]] = {}
+        completion = self.client.chat.completions.create(**stream_params)
+        for chunk in completion:
+            if self.is_cancelled():
+                break
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            reasoning = extract_reasoning(delta)
+            content = getattr(delta, "content", "") or ""
+            delta_tool_calls = getattr(delta, "tool_calls", None)
+            if delta_tool_calls:
+                accumulate_streamed_tool_deltas(accumulated, delta_tool_calls)
+            if reasoning:
+                if not handler.process_reasoning(reasoning):
+                    break
+                continue
+            if content:
+                if not handler.process_content(content):
+                    break
+        return self._finalize_stream_output(handler, streaming_callback), accumulated
+
+    def _run_tool_loop(
+        self,
+        messages: List[Dict],
+        *,
+        n_predict: Optional[int],
+        stream: Optional[bool],
+        temperature: Optional[float],
+        top_k: Optional[int],
+        top_p: Optional[float],
+        repeat_penalty: Optional[float],
+        seed: Optional[int],
+        streaming_callback: Optional[Callable[[str, MSG_TYPE], None]],
+        think: Optional[bool],
+        reasoning_effort: Optional[str],
+        reasoning_summary: Optional[str],
+        tools: Optional[List[Dict]],
+        tool_choice: Optional[Union[str, Dict]],
+        extra_kwargs: Dict[str, Any],
+    ) -> Union[str, dict]:
+        """
+        Execute one chat round, and (when a callback returns a structured tool
+        result) re-invoke the model with the tool outputs until either no more
+        tool calls are requested, the callback returns ``False``, or the
+        iteration cap (``MAX_TOOL_ROUNDS``) is reached.
+        """
+        conversation = list(messages)
+        accumulated_outputs: List[str] = []
+        last_output: Union[str, dict] = ""
+
+        for round_index in range(MAX_TOOL_ROUNDS):
+            result, tool_results = self._generate_one_round(
+                conversation,
+                n_predict=n_predict,
+                stream=stream,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repeat_penalty=repeat_penalty,
+                seed=seed,
+                streaming_callback=streaming_callback,
+                think=think,
+                reasoning_effort=reasoning_effort,
+                reasoning_summary=reasoning_summary,
+                tools=tools,
+                tool_choice=tool_choice,
+                extra_kwargs=extra_kwargs,
+            )
+
+            if isinstance(result, dict) and result.get("status") == "error":
+                return result
+
+            last_output = result
+            if isinstance(result, str) and result:
+                accumulated_outputs.append(result)
+
+            if not tool_results:
+                # When tools were requested but the round produced NO tool
+                # results (callback never returned {"tool_results": [...]}),
+                # there is nothing to continue: appending nothing and
+                # re-sending the identical payload cannot make progress.
+                # Every plausible cause (server missing --tool-call-parser,
+                # tool-capable chat template not loaded, model family does
+                # not emit wire tool_calls, reasoning-only response under
+                # think=False) requires a SERVER-side fix surfaced by the
+                # diagnostic at the end of this method. Bail NOW, on every
+                # round, unconditionally. Re-iterating is pure latency/cost
+                # waste: the model can never advance from a round that
+                # emits neither content nor tool_calls.
+                if tools:
+                    if not isinstance(result, str) or not result.strip():
+                        ASCIIColors.warning(
+                            "[LollmsBinding] Tool round returned no content "
+                            "and no tool_calls. Aborting tool loop — the "
+                            "server must be configured to emit native "
+                            "tool_calls (e.g. `--tool-call-parser <family>` "
+                            "for vLLM)."
+                        )
+                break
+
+            assistant_msg = getattr(self, "_last_assistant_tool_message", None)
+            self._last_assistant_tool_message = None
+            if not assistant_msg:
+                ASCIIColors.warning(
+                    "[LollmsBinding] Callback returned tool_results but no "
+                    "assistant tool-call message was captured for this round. "
+                    "Discarding the tool results and terminating the loop."
+                )
+                break
+
+            requested_ids = {
+                tc.get("id") for tc in assistant_msg.get("tool_calls", []) if tc.get("id")
+            }
+            matched = [r for r in tool_results if r.get("tool_call_id") in requested_ids]
+            if not matched:
+                ASCIIColors.warning(
+                    "[LollmsBinding] All provided tool_results had tool_call_id "
+                    "values that did not match any tool_calls in the previous "
+                    "assistant turn. Terminating the loop."
+                )
+                break
+            if len(matched) != len(tool_results):
+                ASCIIColors.warning(
+                    f"[LollmsBinding] Dropped {len(tool_results) - len(matched)} "
+                    f"tool_results with unmatched tool_call_id."
+                )
+
+            conversation.append(assistant_msg)
+            conversation.extend(build_tool_result_messages(matched))
+        else:
+            ASCIIColors.warning(
+                f"[LollmsBinding] Tool-call loop reached MAX_TOOL_ROUNDS="
+                f"{MAX_TOOL_ROUNDS}; returning last partial result."
+            )
+
+        if len(accumulated_outputs) > 1:
+            return "\n".join(accumulated_outputs)
+        if accumulated_outputs:
+            return accumulated_outputs[-1]
+
+        # Never return a bare empty string: a silent "" leaves the caller
+        # unable to distinguish "endpoint returned nothing" from "loop
+        # exited cleanly". Surface a diagnostic error so the root cause is
+        # visible instead of swallowed by the example's final print.
+        if isinstance(last_output, str) and not last_output.strip():
+            return {
+                "status": "error",
+                "message": (
+                    "[LollmsBinding] Tool loop completed with an EMPTY final "
+                    "answer (no content, no reasoning, and no native "
+                    "tool_calls were emitted). Two likely causes:\n"
+                    "  1. The server does not emit OpenAI-format "
+                    "`tool_calls`. For vLLM, launch with "
+                    "`--enable-auto-tool-choice --tool-call-parser <family>` "
+                    "(e.g. `deepseek_v3`, `hermes`, `internlm`, `mistral`, "
+                    "`llama3_json`); for llama.cpp / Ollama use a chat "
+                    "template that exposes the tools array to the model. "
+                    "Check the server log for the actual tool-parsing "
+                    "messages.\n"
+                    "  2. The model never emits visible content (reasoning-"
+                    "only responses under think=False); try think=True."
+                ),
+            }
+        return last_output
+
+    def _generate_one_round(
+        self,
+        conversation: List[Dict],
+        *,
+        n_predict: Optional[int],
+        stream: Optional[bool],
+        temperature: Optional[float],
+        top_k: Optional[int],
+        top_p: Optional[float],
+        repeat_penalty: Optional[float],
+        seed: Optional[int],
+        streaming_callback: Optional[Callable[[str, MSG_TYPE], None]],
+        think: Optional[bool],
+        reasoning_effort: Optional[str],
+        reasoning_summary: Optional[str],
+        tools: Optional[List[Dict]],
+        tool_choice: Optional[Union[str, Dict]],
+        extra_kwargs: Dict[str, Any],
+    ) -> Tuple[Union[str, dict], Optional[List[Dict[str, str]]]]:
+        """
+        Single round of the tool loop. Sends the conversation to
+        /v1/chat/completions (with or without tools), parses the response
+        (streaming or not), translates any DSML blocks or native tool_calls
+        to Lollms ``<tool>`` XML, forwards to the callback, and returns
+        ``(output, tool_results)`` where ``tool_results`` is ``None`` unless
+        the callback opted into the structured contract.
+        """
+        _ROLE_MAP = {
+            "system": "system", "developer": "developer", "user": "user",
+            "assistant": "assistant", "tool": "tool", "function": "function",
+            "admin": "system", "root": "system", "manager": "system",
+            "supervisor": "system", "controller": "system", "orchestrator": "system",
+            "planner": "system", "critic": "assistant", "refiner": "assistant",
+            "reviewer": "assistant", "validator": "assistant", "executor": "assistant",
+            "worker": "assistant", "agent": "assistant", "bot": "assistant",
+            "ai": "assistant", "human": "user", "guest": "user",
+            "client": "user", "customer": "user", "operator": "user",
+        }
+
+        def normalize_message(msg: Dict) -> Dict:
+            raw_role = msg.get("role", "user") or "user"
+            role = _ROLE_MAP.get(raw_role.lower(), "user")
+            content = msg.get("content", "")
+            text_parts: List[str] = []
+            images: List[str] = []
+            videos: List[str] = []
+
+            if isinstance(content, str):
+                text_parts.append(content)
+            elif isinstance(content, list):
+                for item in content:
+                    if item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                    elif item.get("type") in ("input_image", "image_url"):
+                        val = item.get("image_url")
+                        if isinstance(val, dict):
+                            val = val.get("url") or val.get("base64")
+                        if isinstance(val, str) and val:
+                            images.append(val)
+                    elif item.get("type") in ("video_url", "video", "input_video"):
+                        val = item.get("video_url") or item.get("video")
+                        if isinstance(val, dict):
+                            val = val.get("url") or val.get("base64")
+                        if isinstance(val, str) and val:
+                            videos.append(val)
+
+            if "images" in msg and msg["images"]:
+                images.extend(msg["images"])
+            if "videos" in msg and msg["videos"]:
+                videos.extend(msg["videos"])
+
+            text_content = "\n".join(p for p in text_parts if p.strip())
+
+            # OpenAI native tool wire state preservation
+            if role == "assistant" and msg.get("tool_calls"):
+                return {
+                    "role": "assistant",
+                    "content": text_content if text_content else None,
+                    "tool_calls": msg["tool_calls"],
+                }
+            if role == "tool":
+                tool_entry: Dict[str, Any] = {"role": "tool", "content": text_content}
+                if msg.get("tool_call_id"):
+                    tool_entry["tool_call_id"] = msg["tool_call_id"]
+                if msg.get("name"):
+                    tool_entry["name"] = msg["name"]
+                return tool_entry
+
+            if not images and not videos:
+                return {"role": role, "content": text_content}
+
+            openai_content: List[Dict[str, Any]] = []
+            if text_content:
+                openai_content.append({"type": "text", "text": text_content})
+            for img in images:
+                openai_content.append(normalize_image_input(img, glm_format=self.glm_image_embedding))
+            for vid in videos:
+                openai_content.append(normalize_video_input(vid))
+            return {"role": role, "content": openai_content}
+
+        openai_messages = [normalize_message(m) for m in conversation]
+        openai_messages = _sanitize_system_images(openai_messages)
+
+        # Sanitize caller-provided tools (drop stray UUID ids, force strict=False
+        # for NIM compatibility, and neutralize the placeholder name).
+        sanitized_tools: Optional[List[Dict]] = None
+        if tools and isinstance(tools, list):
+            sanitized_tools = []
+            for tool in tools:
+                if not isinstance(tool, dict):
+                    continue
+                if "id" in tool and len(str(tool["id"])) == 36 and "-" in str(tool["id"]):
+                    tool.pop("id", None)
+                if "function" in tool and isinstance(tool["function"], dict):
+                    func_def = tool["function"]
+                    func_def.setdefault("strict", False)
+                    name = func_def.get("name")
+                    if isinstance(name, str):
+                        func_def["name"] = name.replace(
+                            _NIM_FUNCTION_NAME_PLACEHOLDER, "lcp_tool"
+                        )
+                sanitized_tools.append(tool)
+
+        # Resolve thinking
+        if think is True:
+            effort = self.get_effective_reasoning_effort(think=True, reasoning_effort=reasoning_effort)
+            if effort is None or str(effort).strip().lower() in ("none", "off", "disabled", "false", "0", ""):
+                is_thinking_deactivated = True
+                effort = None
+            else:
+                is_thinking_deactivated = False
+        else:
+            is_thinking_deactivated = True
+            effort = None
+
+        params: Dict[str, Any] = {
+            "model": self.model_name,
+            "messages": openai_messages,
+            "max_tokens": n_predict,
+            "n": 1,
+            "temperature": temperature,
+            "top_p": top_p,
+            "frequency_penalty": repeat_penalty,
+            "stream": stream,
+        }
+        if seed is not None:
+            params["seed"] = seed
+
+        if sanitized_tools:
+            params["tools"] = sanitized_tools
+            params["tool_choice"] = tool_choice if tool_choice is not None else "auto"
+
+        if extra_kwargs.get("extra_body") and isinstance(extra_kwargs["extra_body"], dict):
+            params.setdefault("extra_body", {}).update(extra_kwargs["extra_body"])
+
+        if self.check_is_vllm():
+            extra_body = params.setdefault("extra_body", {})
+            effective_top_k = top_k if top_k is not None else extra_kwargs.get("top_k")
+            if effective_top_k is not None:
+                extra_body.setdefault("top_k", effective_top_k)
+            if repeat_penalty is not None:
+                extra_body.setdefault("repetition_penalty", repeat_penalty)
+            if extra_kwargs.get("min_tokens") is not None:
+                extra_body.setdefault("min_tokens", extra_kwargs["min_tokens"])
+
+        params = {k: v for k, v in params.items() if v is not None}
+
+        self._apply_thinking_params(params, effort, is_thinking_deactivated)
+        if reasoning_summary and reasoning_summary != "auto" and not is_thinking_deactivated:
+            params.setdefault("extra_body", {})["reasoning_summary"] = reasoning_summary
+
+        output = ""
+        tool_results: Optional[List[Dict[str, str]]] = None
+
+        # ── Single attempt (no double-create) ─────────────────────────────
+        # The request is issued exactly ONCE. If the caller's thinking
+        # configuration is rejected by the server we retry once without
+        # reasoning params — never more. Earlier revisions issued two
+        # back-to-back ``create(**params)`` calls (one whose generator was
+        # discarded and one whose generator was drained), wasting one full
+        # HTTP round-trip per tool round and inflating payload traces.
+        last_err_dict: Optional[dict] = None
+        accumulated_any = False
+
+        try:
+            try:
+                completion = self.client.chat.completions.create(**params)
+            except Exception as ex:
+                trace_exception(ex)
+                if (
+                    isinstance(ex, openai.NotFoundError)
+                    and "Function" in str(ex)
+                    and "Not found for account" in str(ex)
+                ):
+                    ASCIIColors.warning(
+                        "[NIM Strict Validation] Intercepted 404 Function Not Found. "
+                        "Retrying without tools array."
+                    )
+                    params.pop("tools", None)
+                    params.pop("tool_choice", None)
+                    completion = self.client.chat.completions.create(**params)
+                else:
+                    if "max_tokens" in params:
+                        params["max_completion_tokens"] = params.pop("max_tokens")
+                    params.pop("top_p", None)
+                    params.pop("frequency_penalty", None)
+                    params.pop("presence_penalty", None)
+                    params.pop("reasoning_effort", None)
+                    if "extra_body" in params and isinstance(params["extra_body"], dict):
+                        params["extra_body"].pop("chat_template_kwargs", None)
+                        params["extra_body"].pop("reasoning_effort", None)
+                        params["extra_body"].pop("thinking", None)
+                        if not params["extra_body"]:
+                            params.pop("extra_body", None)
+                    if effort is None or is_thinking_deactivated:
+                        params["temperature"] = 1
+                    completion = self.client.chat.completions.create(**params)
+
+            attempt_deactivated = is_thinking_deactivated
+            attempt_eff = effort
+
+            if stream:
+                    handler = _StreamThinkingHandler(
+                        streaming_callback, suppress_thinking=attempt_deactivated
+                    )
+                    accumulated: Dict[int, Dict[str, Any]] = {}
+                    for chunk in completion:
+                        if self.is_cancelled():
+                            break
+                        if not chunk.choices:
+                            continue
+                        delta = chunk.choices[0].delta
+                        reasoning = extract_reasoning(delta)
+                        content = getattr(delta, "content", "") or ""
+                        delta_tool_calls = getattr(delta, "tool_calls", None)
+                        if delta_tool_calls:
+                            accumulate_streamed_tool_deltas(accumulated, delta_tool_calls)
+                        if reasoning:
+                            if not handler.process_reasoning(reasoning):
+                                break
+                            continue
+                        if content:
+                            if not handler.process_content(content):
+                                break
+
+                    if sanitized_tools and not accumulated and not handler.output.strip():
+                        try:
+                            retry_fallback = self._non_stream_fallback_for_streamed_tools(
+                                params, attempt_deactivated
+                            )
+                        except Exception as fb_err:
+                            ASCIIColors.warning(
+                                f"[LollmsBinding._generate_one_round] Streamed-tool "
+                                f"non-stream retry failed: {fb_err}"
+                            )
+                            retry_fallback = None
+
+                        if retry_fallback is not None:
+                            (retry_content, retry_native_calls,
+                             retry_reasoning) = retry_fallback
+
+                            # ── 1. Native tool_calls returned non-streamed ──
+                            # Promote to the standard native-tool-call path
+                            # so the round emits <tool> XML through the
+                            # documented callback lifecycle.
+                            if retry_native_calls:
+                                output = retry_content or ""
+                                native_tool_calls = retry_native_calls
+                                self._last_assistant_tool_message = {
+                                    "role": "assistant",
+                                    "content": retry_content or None,
+                                    "tool_calls": _wire_shape(native_tool_calls),
+                                }
+                                native_payloads: List[Tuple[str, str, str]] = []
+                                for tc in native_tool_calls:
+                                    if isinstance(tc, dict):
+                                        fn = tc.get("function") or {}
+                                        name = fn.get("name", "") or ""
+                                        raw_args = fn.get("arguments", "") or ""
+                                        tc_id = tc.get("id") or f"call_{len(native_payloads)}"
+                                    else:
+                                        name = getattr(getattr(tc, "function", None), "name", "") or ""
+                                        raw_args = getattr(getattr(tc, "function", None), "arguments", "") or ""
+                                        tc_id = getattr(tc, "id", None) or f"call_{len(native_payloads)}"
+                                    if not name:
+                                        continue
+                                    try:
+                                        tool_args = json.loads(raw_args) if raw_args else {}
+                                    except (json.JSONDecodeError, TypeError):
+                                        tool_args = {"raw": raw_args}
+                                    xml = f"<tool>{json.dumps({'name': name, 'parameters': tool_args})}</tool>"
+                                    native_payloads.append((tc_id, name, xml))
+
+                                collected: List[Dict[str, str]] = []
+                                for tc_id, tc_name, tc_xml in native_payloads:
+                                    cb_continue_call = True
+                                    cb_payload_call: Optional[List[Dict[str, str]]] = None
+                                    if streaming_callback:
+                                        cb_result = emit_callback_safe(
+                                            streaming_callback, tc_xml,
+                                            MSG_TYPE.MSG_TYPE_CHUNK,
+                                            {"tool_call_id": tc_id, "tool_name": tc_name},
+                                        )
+                                        cb_continue_call, cb_payload_call = normalize_callback_result(cb_result)
+                                    if cb_continue_call:
+                                        if output:
+                                            output += "\n" + tc_xml
+                                        else:
+                                            output = tc_xml
+                                    if cb_payload_call:
+                                        collected.extend(cb_payload_call)
+                                    if not cb_continue_call:
+                                        break
+                                if collected:
+                                    tool_results = collected
+                                ASCIIColors.warning(
+                                    "[LollmsBinding._generate_one_round] Streamed "
+                                    "tool round was empty; non-streaming retry "
+                                    "produced native tool_calls."
+                                )
+                                return output, tool_results
+
+                            # ── 2. Plain content returned non-streamed ──
+                            # The model answered without tools (perfectly
+                            # valid — the tool_choice is "auto"). Accept it.
+                            if retry_content and retry_content.strip():
+                                ASCIIColors.warning(
+                                    "[LollmsBinding._generate_one_round] Streamed "
+                                    "tool round was empty; non-streaming retry "
+                                    "produced plain content (no tool_calls)."
+                                )
+                                output = retry_content
+                                return output, tool_results
+
+                            # ── 3. Reasoning-only non-stream rescue ──
+                            if retry_reasoning and retry_reasoning.strip():
+                                # Reasoning-only with tools requested cannot
+                                # advance the loop; the diagnostic is far more
+                                # actionable than a silently-mangled turn.
+                                ASCIIColors.warning(
+                                    "[LollmsBinding._generate_one_round] Streamed "
+                                    "tool round was empty AND non-streaming "
+                                    "retry produced reasoning only (no tool_calls). "
+                                    "Bailing out of the tool round."
+                                )
+
+                        return "", None
+
+                    output = self._finalize_stream_output(handler, streaming_callback)
+
+                    if accumulated:
+                        accumulated_any = True
+                        self._last_assistant_tool_message = build_assistant_tool_calls_message(output, accumulated)
+                        collected: List[Dict[str, str]] = []
+                        for tc_id, tc_name, tc_xml in build_tool_call_callback_payloads(accumulated):
+                            cb_continue_call = True
+                            cb_payload_call: Optional[List[Dict[str, str]]] = None
+                            if streaming_callback:
+                                cb_result = emit_callback_safe(
+                                    streaming_callback,
+                                    tc_xml,
+                                    MSG_TYPE.MSG_TYPE_CHUNK,
+                                    {"tool_call_id": tc_id, "tool_name": tc_name},
+                                )
+                                cb_continue_call, cb_payload_call = normalize_callback_result(cb_result)
+                            if cb_continue_call:
+                                if output and tc_xml not in output:
+                                    output += "\n" + tc_xml
+                                elif not output:
+                                    output = tc_xml
+                            if cb_payload_call:
+                                collected.extend(cb_payload_call)
+                            if not cb_continue_call:
+                                break
+                        if collected:
+                            tool_results = collected
+                        return output, tool_results
+
+                    if output.strip():
+                        return output, tool_results
+                    # Empty: no further escalation options for the streaming
+                    # path (the tool-aware guard above already bailed).
+
+            else:
+                message_obj = completion.choices[0].message
+                reasoning = extract_reasoning(message_obj)
+                content = message_obj.content or ""
+                output = self.finalize_non_stream_output(
+                    content, reasoning, attempt_deactivated
+                )
+                native_tool_calls = extract_native_tool_calls(message_obj)
+
+                if not output.strip() and not native_tool_calls:
+                    try:
+                        fallback_text, fallback_acc = self._stream_fallback_non_streaming(
+                            params, streaming_callback, attempt_deactivated
+                        )
+                        if fallback_text.strip():
+                            ASCIIColors.warning(
+                                "[LollmsBinding._generate_one_round] Non-streaming "
+                                "round returned no content; streaming fallback "
+                                "produced content."
+                            )
+                            output = fallback_text
+                        if fallback_acc:
+                            promoted: List[Dict[str, Any]] = []
+                            for idx in sorted(fallback_acc.keys()):
+                                tc = fallback_acc[idx]
+                                name = (tc.get("name") or "").strip()
+                                if not name:
+                                    continue
+                                tc_id = tc.get("id") or f"call_{idx}"
+                                raw_args = tc.get("arguments") or ""
+                                try:
+                                    tool_args = json.loads(raw_args) if raw_args else {}
+                                except (json.JSONDecodeError, TypeError):
+                                    tool_args = {"raw": raw_args}
+                                promoted.append(
+                                    {
+                                        "id": tc_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": name,
+                                            "arguments": json.dumps(tool_args),
+                                        },
+                                    }
+                                )
+                            if promoted:
+                                native_tool_calls = promoted
+                    except Exception as fb_err:
+                        ASCIIColors.warning(
+                            f"[LollmsBinding._generate_one_round] Non-streaming "
+                            f"fallback failed: {fb_err}"
+                        )
+
+                # When tools were requested but the round returned no
+                # native tool_calls AND no visible content, do NOT accept
+                # the reasoning rescue (or stream fallback) as a valid
+                # answer. Re-issuing the identical payload cannot make
+                # the model suddenly emit tool_calls; the diagnostic is
+                # surfaced by _run_tool_loop. Bail now.
+                if sanitized_tools and not native_tool_calls and not output.strip():
+                    return "", None
+
+                if native_tool_calls:
+                    accumulated_any = True
+                    self._last_assistant_tool_message = {
+                        "role": "assistant",
+                        "content": message_obj.content or None,
+                        "tool_calls": _wire_shape(native_tool_calls),
+                    }
+                    native_payloads: List[Tuple[str, str, str]] = []
+                    for tc in native_tool_calls:
+                        if isinstance(tc, dict):
+                            fn = tc.get("function") or {}
+                            name = fn.get("name", "") or ""
+                            raw_args = fn.get("arguments", "") or ""
+                            tc_id = tc.get("id") or f"call_{len(native_payloads)}"
+                        else:
+                            name = getattr(getattr(tc, "function", None), "name", "") or ""
+                            raw_args = getattr(getattr(tc, "function", None), "arguments", "") or ""
+                            tc_id = getattr(tc, "id", None) or f"call_{len(native_payloads)}"
+                        if not name:
+                            continue
+                        try:
+                            tool_args = json.loads(raw_args) if raw_args else {}
+                        except (json.JSONDecodeError, TypeError):
+                            tool_args = {"raw": raw_args}
+                        xml = f"<tool>{json.dumps({'name': name, 'parameters': tool_args})}</tool>"
+                        native_payloads.append((tc_id, name, xml))
+
+                    collected: List[Dict[str, str]] = []
+                    for tc_id, tc_name, tc_xml in native_payloads:
+                        cb_continue_call = True
+                        cb_payload_call: Optional[List[Dict[str, str]]] = None
+                        if streaming_callback:
+                            cb_result = emit_callback_safe(
+                                streaming_callback,
+                                tc_xml,
+                                MSG_TYPE.MSG_TYPE_CHUNK,
+                                {"tool_call_id": tc_id, "tool_name": tc_name},
+                            )
+                            cb_continue_call, cb_payload_call = normalize_callback_result(cb_result)
+                        if cb_continue_call:
+                            if output:
+                                output += "\n" + tc_xml
+                            else:
+                                output = tc_xml
+                        if cb_payload_call:
+                            collected.extend(cb_payload_call)
+                        if not cb_continue_call:
+                            break
+                    if collected:
+                        tool_results = collected
+                    return output, tool_results
+
+                if output.strip():
+                    return output, tool_results
+                # Empty: no further escalation options.
+
+            if last_err_dict is not None and not accumulated_any:
+                return last_err_dict, None
+
+            if accumulated_any:
+                return output, tool_results
+            return "", None
+
+        except Exception as e:
+            trace_exception(e)
+            err_msg = f"An error occurred with the OpenAI API: {e}"
+            # vLLM rejects tool_choice="auto" with a 400 when launched
+            # without --enable-auto-tool-choice / --tool-call-parser. Surface
+            # the exact remediation instead of the generic message.
+            hint = self._classify_tool_server_error(e)
+            if hint:
+                err_msg = f"{err_msg}\n\n{hint}"
+            if streaming_callback:
+                emit_callback_safe(streaming_callback, err_msg, MSG_TYPE.MSG_TYPE_EXCEPTION, {})
+            return {"status": "error", "message": err_msg, "server_body": getattr(e, "body", None)}, None
+
+        return output, tool_results
 
     def embed(self, text: str | list[str], normalize: bool = False, **kwargs) -> list:
         """

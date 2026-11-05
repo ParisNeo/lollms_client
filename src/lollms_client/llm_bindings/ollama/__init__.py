@@ -26,10 +26,6 @@ import ollama
 from lollms_client.lollms_llm_binding import LollmsLLMBinding
 from lollms_client.lollms_types import ELF_COMPLETION_FORMAT, MSG_TYPE
 from lollms_client.lollms_utilities import ImageTokenizer
-from lollms_client.llm_bindings._dsml_utils import (
-    _extract_dsml_from_text,
-    _format_tool_calls_to_lollms_xml,
-)
 
 BindingName = "OllamaBinding"
 
@@ -158,7 +154,6 @@ class OllamaBinding(LollmsLLMBinding):
         self.default_completion_format = kwargs.get("default_completion_format", ELF_COMPLETION_FORMAT.Chat)
         self.n_threads = kwargs.get("n_threads", -1)
         self.supported_reasoning_efforts = ["low", "medium", "high"]
-        self.handle_dsml = bool(kwargs.get("handle_dsml", False))
 
         if ollama is None:
             raise ImportError("Ollama library is not installed. Please run 'pip install ollama'.")
@@ -496,12 +491,13 @@ class OllamaBinding(LollmsLLMBinding):
                         # If thinking is deactivated, suppress thoughts completely
                         if not ollama_think:
                             if chunk_thinking:
+                                suppressed_reasoning_parts.append(chunk_thinking)
                                 continue
 
                             if chunk_content:
-                                if "<think>" in chunk_content:
+                                if " thinking" in chunk_content:
                                     in_raw_think_content = True
-                                    before_think, _, after_think = chunk_content.partition("<think>")
+                                    before_think, _, after_think = chunk_content.partition(" thinking")
                                     if before_think:
                                         full_response_text += before_think
                                         if streaming_callback:
@@ -542,15 +538,37 @@ class OllamaBinding(LollmsLLMBinding):
                         full_response_text += closing
                         if closing and streaming_callback:
                             streaming_callback(closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
-                    return self._postprocess_dsml(full_response_text)
+                    elif not full_response_text.strip() and suppressed_reasoning_parts:
+                        reasoning_text = "".join(suppressed_reasoning_parts)
+                        if reasoning_text.strip():
+                            ASCIIColors.warning(
+                                "[OllamaBinding] Reasoning-only response with think=False; "
+                                "surfacing reasoning to avoid an empty turn. "
+                                "Enable think=True for proper thought streaming."
+                            )
+                            if streaming_callback:
+                                try:
+                                    streaming_callback(reasoning_text, MSG_TYPE.MSG_TYPE_CHUNK)
+                                except Exception:
+                                    pass
+                            full_response_text = reasoning_text
+                    return full_response_text
                 else:
                     response = client.chat(**chat_kwargs)
                     full_response_text = response.message.content or ""
                     if not ollama_think:
                         full_response_text = re.sub(r' thinking.*?</think>', '', full_response_text, flags=re.DOTALL).strip()
+                        if not full_response_text.strip():
+                            raw_reasoning = getattr(response.message, "thinking", None)
+                            if raw_reasoning and str(raw_reasoning).strip():
+                                ASCIIColors.warning(
+                                    "[OllamaBinding] Reasoning-only response with think=False; "
+                                    "surfacing reasoning to avoid an empty turn."
+                                )
+                                full_response_text = str(raw_reasoning)
                     elif response.message.thinking:
                         full_response_text = f"\n thinking\n{response.message.thinking}\n</think>\n" + full_response_text
-                    return self._postprocess_dsml(full_response_text)
+                    return full_response_text
 
         except ollama.ResponseError as e:
             error_message = f"Ollama API ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code})"
@@ -632,6 +650,7 @@ class OllamaBinding(LollmsLLMBinding):
                     response_stream = client.chat(**chat_kwargs)
                     tracker = _ThinkingStreamTracker()
                     in_raw_think_content = False
+                    suppressed_reasoning_parts = []
 
                     for chunk in response_stream:
                         if self.is_cancelled():
@@ -652,12 +671,13 @@ class OllamaBinding(LollmsLLMBinding):
                         # If thinking is deactivated, suppress thoughts completely
                         if not ollama_think:
                             if chunk_thinking:
+                                suppressed_reasoning_parts.append(chunk_thinking)
                                 continue
 
                             if chunk_content:
-                                if "<think>" in chunk_content:
+                                if " thinking" in chunk_content:
                                     in_raw_think_content = True
-                                    before_think, _, after_think = chunk_content.partition("<think>")
+                                    before_think, _, after_think = chunk_content.partition(" thinking")
                                     if before_think:
                                         full_response_text += before_think
                                         if streaming_callback:
@@ -667,7 +687,7 @@ class OllamaBinding(LollmsLLMBinding):
                                 if in_raw_think_content:
                                     if "</think>" in chunk_content:
                                         in_raw_think_content = False
-                                        _, _, after_think = chunk_content.partition("</think>")
+                                        _, _, after_think = chunk_content.partition(" response")
                                         chunk_content = after_think
                                     else:
                                         continue
@@ -699,16 +719,30 @@ class OllamaBinding(LollmsLLMBinding):
                         full_response_text += closing
                         if closing and streaming_callback:
                             streaming_callback(closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
-                    return self._postprocess_dsml(full_response_text)
+                    elif not full_response_text.strip() and suppressed_reasoning_parts:
+                        reasoning_text = "".join(suppressed_reasoning_parts)
+                        if reasoning_text.strip():
+                            ASCIIColors.warning(
+                                "[OllamaBinding] Reasoning-only response with think=False; "
+                                "surfacing reasoning to avoid an empty turn. "
+                                "Enable think=True for proper thought streaming."
+                            )
+                            if streaming_callback:
+                                try:
+                                    streaming_callback(reasoning_text, MSG_TYPE.MSG_TYPE_CHUNK)
+                                except Exception:
+                                    pass
+                            full_response_text = reasoning_text
+                    return full_response_text
                 else:
                     response = client.chat(**chat_kwargs)
                     full_response_text = response.message.content or ""
                     if not ollama_think:
                         full_response_text = re.sub(r' thinking.*?</think>', '', full_response_text, flags=re.DOTALL).strip()
                     elif response.message.thinking:
-                        full_response_text = f"\n<think>\n{response.message.thinking}\n</think>\n" + full_response_text
-                    return self._postprocess_dsml(full_response_text)
-                
+                        full_response_text = f"\n thinking\n{response.message.thinking}\n</think>\n" + full_response_text
+                    return full_response_text
+
         except ollama.ResponseError as e:
             error_message = f"Ollama API ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code})"
             ASCIIColors.error(error_message)

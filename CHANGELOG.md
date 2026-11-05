@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-04 23:36]
+
+- refactor(llm): streamline DSML utils and update binding configurations
+
 ## [2026-11-04 15:20]
 
 - fix(lollms_discussion): update stream handling in _mixin_chat

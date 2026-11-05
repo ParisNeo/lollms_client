@@ -209,7 +209,40 @@ _office_library_admitted(...)                         # admission gate
 
 ---
 
-## 8. Key invariants
+## 8. Native tool calling — the binding decides, not the caller
+
+The LCP binding participates in the **profile-driven native tool-calling
+contract** (see [`docs/UNIVERSAL_MODEL_PROFILES.md` §2.4](../UNIVERSAL_MODEL_PROFILES.md#24-native-tool-calling-native_tools_enabled)).
+The rule is identical to `vision_enabled`:
+
+- The **model profile** declares `native_tools_enabled: True` as a capability
+  hint.
+- The **binding** combines that hint with its own backend capability probe
+  (for LCP this is a no-op today — LCP itself is transport-agnostic and
+  delegates native `tools=` forwarding to the underlying LLM binding — but
+  the flag is still resolved and exposed for uniformity).
+- The **binding exposes** the resolved value as `binding.native_tools_enabled`
+  (a plain bool, populated by `_instantiate_binding_from_profile`).
+
+**Callers MUST query `binding.native_tools_enabled`** — never introspect
+`type(binding).generate_from_messages` or any other method-override heuristic.
+The chat mixin, agents, and any future consumer read this attribute to decide
+whether to pass `tools=` / `tool_choice="auto"` to `generate_from_messages`
+(native path, KV-cache preserving) or fall back to the XML `<tool>` protocol
+(legacy path, one round-trip per tool call).
+
+**Why the binding decides:** the LCP binding may be composed with any LLM
+binding underneath (llama_cpp_server, openai, ollama, …), and each of those
+has different native-tool capabilities (server `--jinja` flag, provider tool
+API availability, model template support). Only the composed binding knows
+whether the resolved backend can honour the profile's `native_tools_enabled=True`
+hint, so only the composed binding can resolve the final boolean. Downgrades
+are silent (logged at warning level) so callers see a consistent contract
+regardless of the underlying backend.
+
+---
+
+## 9. Key invariants
 
 - `_lazy_import_tools_file` imports every library under the persistent module
   name `lollms_client.tools_bindings.lcp.persistent_<library_key>` — module
@@ -229,3 +262,8 @@ _office_library_admitted(...)                         # admission gate
 - The binding implements the same `discover_tools` / `list_tools` /
   `execute_tool` contract as every other `LollmsToolBinding` — the LLM-facing
   interface is transport-agnostic.
+- The binding exposes `binding.native_tools_enabled` — the **resolved**
+  native tool-calling capability derived from the model profile's
+  `native_tools_enabled` hint and the composed LLM binding's own probe. This
+  is the single source of truth callers (chat mixin, agents) read to choose
+  between the native `tools=` path and the XML `<tool>` fallback.

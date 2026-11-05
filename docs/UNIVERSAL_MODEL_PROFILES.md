@@ -160,6 +160,7 @@ class LollmsModelProfile:
 | `image_token_cost` | `int` | `256` | Approximate tokens consumed by one image for this model. Used as the recommended default when the binding exposes no `count_image_tokens` |
 | `thinking_enabled` | `bool` | `False` | Declares whether the model supports an explicit thinking / reasoning mode. When `False`, the client never requests reasoning regardless of call-site hints |
 | `default_reasoning_effort` | `Optional[str]` | `None` | Effort used when the caller says "think" but does not pick a level. Falls back to the middle of `supported_reasoning_efforts` when `None` |
+| `native_tools_enabled` | `bool` | `False` | Declares whether the **binding** should advertise native tool calling (OpenAI `tools=` / `tool_choice=`) to this model. The binding is authoritative: it combines this flag with its own capability probe (e.g. server `--jinja` support, provider tool API) and exposes the resolved state as `binding.native_tools_enabled`. Callers (chat mixin, agents) MUST query the binding, never introspect the profile directly — see §2.4 |
 
 ### 2.3 Thinking capability (reasoning effort)
 
@@ -205,7 +206,47 @@ Semantics:
   "think" without naming a level. Omit it to use the middle of the supported
   list.
 
-**Which fields apply to which modality?** All fields exist on every profile object (uniform dataclass), but the instantiation pipeline only *applies* the LLM-oriented flags (`vision_enabled`, `forced_context_size`, `routing_config`, `glm_image_embedding`, `supported_reasoning_efforts`, `video_enabled`) to bindings that expose the corresponding attributes — for non-LLM modalities they are simply ignored unless the binding has the attribute (see §6).
+### 2.4 Native tool calling (`native_tools_enabled`)
+
+`native_tools_enabled` is a **capability hint** on the model profile, resolved
+by the binding — exactly like `vision_enabled`. The profile declares *intent*
+("this model can use native tool calls"); the binding decides whether it can
+honour it (server supports `--jinja`, provider exposes a `tools=` parameter,
+etc.).
+
+**Resolution rule (binding is authoritative):**
+
+```
+profile.native_tools_enabled  ──┐
+                                ├──►  binding.native_tools_enabled  (bool, final)
+binding's own capability probe ─┘
+```
+
+- `profile.native_tools_enabled=False` → binding **never** advertises native
+  tools, even if it could. The chat mixin falls back to the XML `<tool>`
+  protocol.
+- `profile.native_tools_enabled=True` **and** binding capable → binding
+  advertises `tools=` to the backend, translates native `tool_calls` into
+  `<tool>{json}</tool>` XML, dispatches them to the streaming callback with
+  `meta={"tool_call_id": ..., "tool_name": ...}`, and drives the multi-round
+  loop internally (KV-cache preserving).
+- `profile.native_tools_enabled=True` **but** binding incapable → binding
+  silently downgrades to `binding.native_tools_enabled=False` and logs a
+  warning. Callers see the XML fallback transparently.
+
+**Why the binding decides, not the caller:** capability depends on the
+*backend*, not the profile. A `qwen3-4b` profile marked `native_tools_enabled=True`
+behaves natively on a `llama_cpp_server` started with `--jinja`, but must fall
+back to XML on an Ollama server without a tool template. Only the binding knows
+the backend's runtime capabilities, so only the binding can resolve the flag.
+
+**How callers consume it:** query `binding.native_tools_enabled` (a plain
+bool, populated at instantiation time by `_instantiate_binding_from_profile`).
+Do **not** introspect `type(binding).generate_from_messages` or any other
+method-override heuristic — that was the legacy detection path and is now
+deprecated in favour of the profile-driven flag.
+
+**Which fields apply to which modality?** All fields exist on every profile object (uniform dataclass), but the instantiation pipeline only *applies* the LLM-oriented flags (`vision_enabled`, `video_enabled`, `native_tools_enabled`, `forced_context_size`, `routing_config`, `glm_image_embedding`, `supported_reasoning_efforts`) to bindings that expose the corresponding attributes — for non-LLM modalities they are simply ignored unless the binding has the attribute (see §6).
 
 ---
 
@@ -296,6 +337,7 @@ If you pass plain dicts, `_register_model_profiles` converts them using **lenien
 | `glm_image_embedding` | `glm_image_embedding` | bool |
 | `supported_reasoning_efforts` | `supported_reasoning_efforts` **or** `reasoning_efforts` | **List** or comma-separated **string** (e.g. `"low,medium,high"` → parsed to a list) |
 | `video_enabled` | `video_enabled` | bool |
+| `native_tools_enabled` | `native_tools_enabled` **or** `native_tools` | bool — resolved by the binding (see §2.4) |
 
 For **binding profiles** passed as dicts, `_register_binding_profiles` accepts `binding_name`, `binding_config` and `is_default` — and additionally **hoists** the SSL keys `verify_ssl_certificate` / `certificate_file_path` from the top level of the dict into `binding_config` if they were not already there (a convenience for flattened configs).
 
@@ -834,6 +876,7 @@ LLM_PROFILES_<ALIAS>_INSTANCE_NAME
 LLM_PROFILES_<ALIAS>_IS_DEFAULT
 LLM_PROFILES_<ALIAS>_VISION_ENABLED
 LLM_PROFILES_<ALIAS>_VIDEO_ENABLED
+LLM_PROFILES_<ALIAS>_NATIVE_TOOLS_ENABLED
 LLM_PROFILES_<ALIAS>_GLM_IMAGE_EMBEDDING
 LLM_PROFILES_<ALIAS>_SUPPORTED_REASONING_EFFORTS
 LLM_PROFILES_<ALIAS>_FORCED_CONTEXT_SIZE
@@ -915,7 +958,7 @@ ttm:
 | `load_config_map(conf_file, conf_dict, global_config, local_env)` | Loads the flat map from YAML/JSON/`.env` sources with precedence |
 | `get_binding_params(map, modality, alias)` / `get_profile_params(...)` | Reads one binding/model profile's entries |
 | `set_binding_params(map, modality, alias, binding_name, params)` | Writes a binding profile |
-| `set_profile_params(map, modality, alias, binding_alias, model_name, instance_name, is_default, vision_enabled, video_enabled, glm_image_embedding, supported_reasoning_efforts, forced_context_size, routing_config)` | Writes a model profile |
+| `set_profile_params(map, modality, alias, binding_alias, model_name, instance_name, is_default, vision_enabled, video_enabled, native_tools_enabled, glm_image_embedding, supported_reasoning_efforts, forced_context_size, routing_config)` | Writes a model profile |
 | `set_default_profile(...)` | **Exclusive** default setter (clears other defaults — the invariant) |
 | `delete_binding(...)` / `delete_profile(...)` | Removes entries; deleting the default auto-promotes the next one |
 | `save_config_map(map, ...)` | Serializes to yaml / json / env |
@@ -1264,7 +1307,18 @@ class LollmsModelProfile:
     supported_reasoning_efforts: Optional[List[str]] = None
     video_enabled: bool = False
     supported_reasoning_efforts: Optional[List[str]] = None
+    # Capability hints resolved by the binding (see §2.3 and §2.4):
+    thinking_enabled: bool = False
+    default_reasoning_effort: Optional[str] = None
+    image_token_cost: int = 256
+    native_tools_enabled: bool = False
 ```
+
+> **`native_tools_enabled` resolution**: the profile flag is *advisory*; the
+> instantiated binding exposes the **resolved** value as
+> `binding.native_tools_enabled`. Callers MUST read the binding's attribute,
+> never the profile's flag — the binding may downgrade a `True` to `False`
+> when the backend cannot honour it (see §2.4).
 
 ### Constructor kwargs
 
