@@ -1219,16 +1219,23 @@ class OpenAIBinding(LollmsLLMBinding):
 
         In OAuth mode ``self.client`` is intentionally ``None`` (inference
         goes through ``_oauth_openai_client()``); nothing to rebuild here.
+
+        Defensive: uses ``getattr`` for every attribute set during
+        ``__init__`` so a partially-initialized instance (e.g. ``__init__``
+        raised after ``super().__init__`` but before ``_httpx_verify`` was
+        assigned) can still recover its client instead of cascading an
+        ``AttributeError``.
         """
-        if self.auth_method == "oauth":
+        if getattr(self, "auth_method", "api_key") == "oauth":
             return
-        http_client = getattr(self.client, "_client", None) if self.client is not None else None
-        if self.client is None or (http_client is not None and getattr(http_client, "is_closed", False)):
+        client = getattr(self, "client", None)
+        http_client = getattr(client, "_client", None) if client is not None else None
+        if client is None or (http_client is not None and getattr(http_client, "is_closed", False)):
             self.client = openai.OpenAI(
-                api_key=self.service_key or "EMPTY",
-                base_url=self.open_ai_host_address,
+                api_key=getattr(self, "service_key", None) or "EMPTY",
+                base_url=getattr(self, "open_ai_host_address", None),
                 http_client=httpx.Client(
-                    verify=self._httpx_verify,
+                    verify=getattr(self, "_httpx_verify", True),
                     timeout=300.0,
                 ),
             )
@@ -1236,14 +1243,16 @@ class OpenAIBinding(LollmsLLMBinding):
     def cancel(self) -> None:
         """Dispose the SDK / OAuth HTTP clients and signal cancellation."""
         try:
-            if self.client is not None:
+            client = getattr(self, "client", None)
+            if client is not None:
                 with contextlib.suppress(Exception):
-                    self.client.close()
+                    client.close()
         except Exception:
             pass
-        if self._oauth_client_cache is not None:
+        cache = getattr(self, "_oauth_client_cache", None)
+        if cache is not None:
             with contextlib.suppress(Exception):
-                self._oauth_client_cache[1].close()
+                cache[1].close()
             self._oauth_client_cache = None
         super().cancel()
 
@@ -2101,6 +2110,45 @@ class OpenAIBinding(LollmsLLMBinding):
 
         return output
 
+    @staticmethod
+    def _is_auto_tool_choice_unsupported(ex: Exception) -> bool:
+        """
+        True when the server rejected the request because it was launched
+        without vLLM's tool-call parser flags. vLLM returns HTTP 400 with a
+        message like::
+
+            '"auto" tool choice requires --enable-auto-tool-choice and
+             --tool-call-parser to be set'
+
+        In that case the correct client-side fallback is to retry the SAME
+        payload with ``tools`` / ``tool_choice`` stripped: the model will
+        answer normally, tool calling is simply unavailable on this server.
+        """
+        if not isinstance(ex, openai.BadRequestError):
+            return False
+        text = str(ex).lower()
+        return (
+            "tool choice requires" in text
+            and (
+                "--enable-auto-tool-choice" in text
+                or "--tool-call-parser" in text
+            )
+        )
+
+    def _warn_auto_tool_choice_once(self) -> None:
+        if getattr(self, "_auto_tool_choice_warned", False):
+            return
+        self._auto_tool_choice_warned = True
+        ASCIIColors.error(
+            "[OpenAIBinding] Server rejected tool_choice='auto': vLLM was "
+            "launched without --enable-auto-tool-choice / --tool-call-parser. "
+            "Native tool calling is DISABLED for this session; the request "
+            "will be retried without the tools array. To enable tool calling, "
+            "relaunch vLLM with e.g. "
+            "`--enable-auto-tool-choice --tool-call-parser hermes` "
+            "(or `deepseek_v3`, `internlm`, `mistral`, `llama3_json`)."
+        )
+
     def _synthesize_tool_xml_if_needed(
         self,
         content: str,
@@ -2602,7 +2650,16 @@ class OpenAIBinding(LollmsLLMBinding):
             except Exception as ex:
                 trace_exception(ex)
 
-                if (
+                if self._is_auto_tool_choice_unsupported(ex):
+                    # vLLM without --enable-auto-tool-choice: native tool
+                    # calling is unavailable. Retry the SAME payload without
+                    # tools/tool_choice so the model answers normally.
+                    self._warn_auto_tool_choice_once()
+                    params.pop("tools", None)
+                    params.pop("tool_choice", None)
+                    sanitized_tools = None
+                    completion = self.client.chat.completions.create(**params)
+                elif (
                     isinstance(ex, openai.NotFoundError)
                     and "Function" in str(ex)
                     and "Not found for account" in str(ex)
