@@ -6,6 +6,8 @@ import yaml
 import inspect
 from ascii_colors import ASCIIColors
 
+from lollms_client.lollms_paths import get_data_folder as _resolve_default_data_folder
+
 class LollmsBaseBinding(ABC):
     """
     Base class for all LOLLMS bindings (LLM, TTI, TTS, STT, TTM, TTV, MCP).
@@ -26,6 +28,22 @@ class LollmsBaseBinding(ABC):
         self.debug = debug
         self.config = kwargs
         self._last_error: Optional[str] = None
+
+        # 📂 Client-wide data folder. Resolved via the centralized policy in
+        # ``lollms_paths``: the app-provided kwarg wins, then the permanent
+        # ``$LOLLMS_DATA_FOLDER`` env override, then the shared default
+        # ``~/.lollms/data``. This keeps storage on a machine-wide, user-scoped
+        # location so apps do not depend on where the code tree lives.
+        _data_kwarg = kwargs.get("lollms_data_folder")
+        try:
+            self.lollms_data_folder = _resolve_default_data_folder(_data_kwarg)
+        except (TypeError, ValueError, OSError):
+            # Absolute last-resort fallback: never let path resolution crash init.
+            self.lollms_data_folder = (Path.home() / ".lollms" / "data").resolve()
+            try:
+                self.lollms_data_folder.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
 
         # Optional override for bindings root/cwd. If not provided, defaults to Path(".") (current directory)
         base_override = (
@@ -67,6 +85,14 @@ class LollmsBaseBinding(ABC):
         if p.is_absolute():
             return p.resolve()
         return (self.system_dir / p).resolve()
+
+    def get_data_folder(self) -> Path:
+        """Returns the client-wide data folder forwarded to this binding."""
+        return self.lollms_data_folder
+
+    def resolve_data_path(self, *parts: Union[str, Path]) -> Path:
+        """Resolves a path under the client-wide data folder (created lazily)."""
+        return self.lollms_data_folder.joinpath(*parts).resolve()
         
     def _get_binding_dir(self) -> Path:
         """

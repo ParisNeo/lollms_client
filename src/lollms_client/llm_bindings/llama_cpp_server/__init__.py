@@ -227,6 +227,14 @@ class LlamaCppServerBinding(LollmsLLMBinding):
     # ──────────────────────────────────────────────────────────────────────────
 
     def __init__(self, **kwargs):
+        # The description.yaml declares launch-related knobs (ctx_size,
+        # n_gpu_layers, n_threads, n_parallel, batch_size, flash_attn, mmap,
+        # mlock, rope_*, tensor_split, main_gpu, cache_type_k/v, multimodal,
+        # reasoning, reasoning_budget) under `model_profiles_input_parameters`,
+        # so per-profile values flow here inside `binding_config` and land in
+        # `kwargs` unchanged. Binding-level defaults (from the global tier)
+        # remain valid as fallbacks for callers that bypass profiles entirely.
+        # We read the ones that exist in kwargs with their historical defaults.
         super().__init__(BindingName, **kwargs)
         self.config = kwargs
 
@@ -277,8 +285,10 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         self.multimodal: bool = bool(val_multi) if val_multi is not None else True
 
 
+        # Reasoning mode defaults come from the per-profile declaration now;
+        # callers on the legacy binding-tier path get the same fallbacks.
         self.reasoning = kwargs.get("reasoning", "off")
-        self.reasoning_budget: int = kwargs.get("reasoning_budget", 0)
+        self.reasoning_budget: int = to_int(kwargs.get("reasoning_budget"), 0)
 
 
         self.rope_scale: Optional[float] = _clean(kwargs.get("rope_scale"), float)

@@ -1,0 +1,46 @@
+binding_name: markdown_tools
+title: Markdown Structure & Section Tools
+author: ParisNeo & Lollms
+version: 1.0.0
+description: >-
+  Scout the heading hierarchy of a Markdown file and load individual sections
+  (chapters, sections, subsections) with their full nested content. Auto-mounts
+  whenever a .md or .markdown file is present in the workspace.
+
+use_when:
+  - "You need an outline of a Markdown document -> tool_get_markdown_structure."
+  - "You need the full body of a specific chapter/section/subsection -> tool_load_markdown_section."
+  - "You need to read the whole file verbatim -> use workspace_tools.tool_read_file instead."
+
+commands:
+  - name: tool_get_markdown_structure
+    title: Get Markdown Structure
+    description: >-
+      Parses ATX headings (#, ##, ###, ...) while ignoring '#' characters
+      inside fenced code blocks. Returns a nested outline (title / chapters /
+      sections / subsections) with line ranges, plus a flat list for easy
+      lookup. Use this FIRST to scout a document before loading sections.
+
+  - name: tool_load_markdown_section
+    title: Load Markdown Section
+    description: >-
+      Loads the full content of a single section identified by its heading
+      title. Loading a chapter (##) returns the chapter body INCLUDING all
+      nested sections (###) and subsections (####) beneath it, up to the next
+      heading of equal-or-higher level. Loading a subsection (###) returns
+      only that subsection's body. Title matching is case-insensitive: exact
+      match preferred, then substring match.
+
+examples:
+  - scenario: "Scout a long README, then read one chapter"
+    steps:
+      - tool_get_markdown_structure("README.md")
+      - tool_load_markdown_section("README.md", "Installation")
+
+  - scenario: "Read a subsection only"
+    steps:
+      - tool_load_markdown_section("docs/guide.md", "Windows Setup")
+
+cross_references:
+  - toolset: workspace_tools
+    relation: "Use workspace_tools.tool_read_file for the raw full file; use markdown_tools for structured navigation."

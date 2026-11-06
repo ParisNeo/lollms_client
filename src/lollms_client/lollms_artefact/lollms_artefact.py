@@ -49,11 +49,15 @@ class ArtefactType:
     DOCUMENT      = "document"
     IMAGE         = "image"
     PRESENTATION  = "presentation"
-    DATA          = "data"
     TOOL          = "tool"
     SCRATCHPAD    = "scratchpad"
 
-    ALL = {FILE, SEARCH_RESULT, NOTE, SKILL, CODE, DOCUMENT, IMAGE, PRESENTATION, DATA, TOOL, SCRATCHPAD}
+    # NOTE: `DATA` was intentionally removed. Data files (.csv/.db/.xlsx/...)
+    # are now registered as regular FILE artefacts. Their schema descriptor is
+    # co-written as a sibling ".lam" file (also a FILE artefact). Data-scouting
+    # tools are auto-attached at chat time when SQLite files are present in the
+    # workspace — no dedicated artefact type is needed anymore.
+    ALL = {FILE, SEARCH_RESULT, NOTE, SKILL, CODE, DOCUMENT, IMAGE, PRESENTATION, TOOL, SCRATCHPAD}
 
     LABELS = {
         FILE:          "File",
@@ -64,7 +68,6 @@ class ArtefactType:
         DOCUMENT:      "Document",
         IMAGE:         "Image",
         PRESENTATION:  "Presentation",
-        DATA:          "Data Interface",
         TOOL:          "Tool",
         SCRATCHPAD:    "Scratchpad"
     }
@@ -190,15 +193,6 @@ def _extract_file_metadata_and_signature(art: Dict[str, Any]) -> str:
         f"### {title}",
         f"- Type: {atype.upper()} {f'({lang})' if lang else ''}"
     ]
-
-    if atype == ArtefactType.DATA:
-        schema_lines = []
-        for line in content.splitlines()[:20]:
-            schema_lines.append(line)
-        if len(content.splitlines()) > 20:
-            schema_lines.append("\n  ... [remaining schema lines truncated]")
-        summary.append("\n".join(schema_lines))
-        return "\n".join(summary)
 
     if lang == "html" or atype == "presentation":
         soup_headings = re.findall(r'<h[1-3][^>]*>(.*?)</h[1-3]>|<section\s+class="slide[^"]*"[^>]*data-notes="([^"]*)"', content, re.I)
@@ -366,14 +360,14 @@ def is_binary_content(content: str) -> bool:
     return False
 
 def is_lam_content(content: Any, logical_content: Optional[str] = None, atype: Optional[str] = None) -> bool:
-    """Returns True if the content is .lam / virtual metadata rather than physical file bytes."""
+    """Returns True if the content is .lam / virtual metadata rather than physical file bytes.
+
+    Note: `ARTEFACT_TYPE.DATA` was removed from the type system. .lam detection is now
+    driven purely by content indicators and the `logical_content` mirroring contract.
+    """
     if not isinstance(content, str) or not content:
         return False
     if logical_content and content == logical_content:
-        return True
-    if atype == ArtefactType.DATA and (
-        logical_content or content.startswith(("# Data Interface:", "# SQLite Database:", "# Data Bundle:", "### Data File"))
-    ):
         return True
     lam_indicators = (
         "# Data Interface:",
@@ -457,6 +451,16 @@ class ArtefactManager:
 
     def _get_versions_root(self) -> Path:
         return self._get_workspace_root() / ".versions"
+
+    def _is_versioning_enabled(self) -> bool:
+        """Chat-mixin flag gate: True when .versions/ snapshots and .lam twins are allowed.
+
+        When the discussion sets ``disable_artefact_versioning=True`` (agentic mode
+        with potentially millions of workspace files), the ArtefactManager must
+        never create, read, or sync the ``.versions/`` folder. The host application
+        (or external Git) owns versioning there.
+        """
+        return not getattr(self._discussion, "disable_artefact_versioning", False)
 
     def _resolve_confined_path(self, relative_path: str, ensure_parent: bool = False) -> Path:
         """
@@ -609,14 +613,14 @@ class ArtefactManager:
             if not ext:
                 type_map = {
                     "code": ".py", "document": ".md", "note": ".txt",
-                    "skill": ".md", "data": ".csv", "presentation": ".html",
+                    "skill": ".md", "presentation": ".html",
                     "tool": ".py"
                 }
                 ext = type_map.get(atype, ".txt")
         elif atype:
             type_map = {
                 "code": ".py", "document": ".md", "note": ".txt",
-                "skill": ".md", "data": ".csv", "presentation": ".html",
+                "skill": ".md", "presentation": ".html",
                 "tool": ".py"
             }
             ext = type_map.get(atype, "")
@@ -640,9 +644,7 @@ class ArtefactManager:
             # may be synced. Writing .versions/{uuid}/ snapshots and .lam twins per
             # file is prohibitively costly. The host application (or external Git)
             # owns versioning there. We write ONLY the active file, nothing else.
-            versioning_enabled = not getattr(
-                self._discussion, "disable_artefact_versioning", False
-            )
+            versioning_enabled = self._is_versioning_enabled()
             if versioning_enabled:
                 versions_root.mkdir(parents=True, exist_ok=True)
 
@@ -690,9 +692,7 @@ class ArtefactManager:
             # may be synced. Writing .versions/{uuid}/ snapshots and .lam twins per
             # file is prohibitively costly. The host application (or external Git)
             # owns versioning there. We write ONLY the active file, nothing else.
-            versioning_enabled = not getattr(
-                self._discussion, "disable_artefact_versioning", False
-            )
+            versioning_enabled = self._is_versioning_enabled()
 
             file_basename = Path(filename).name
             file_stem = Path(filename).stem
@@ -724,9 +724,7 @@ class ArtefactManager:
             # Regardless of file type or whether the file is empty (0 bytes), .lam content
             # MUST NEVER be written into active_file_path.
             is_virtual_lam = is_lam_content(content, logical_content, atype)
-
-            is_virtual_lam = is_lam_content(content, logical_content, atype)
-
+            
             # ── UNIVERSAL ANTI-CONTAMINATION GUARD ──
             # Never write raw Aider patch sentinels into physical files on disk!
             if isinstance(content, str) and not is_virtual_lam:
@@ -770,7 +768,7 @@ class ArtefactManager:
                 lam_path = art_version_dir / lam_filename
 
                 lam_to_write = logical_content if logical_content else (content if is_virtual_lam else None)
-                if not lam_to_write and (atype in (ArtefactType.DATA, ArtefactType.IMAGE, ArtefactType.FILE) or active_file_path.suffix.lower() in _EXPLICIT_BINARY_EXTS):
+                if not lam_to_write and (atype in (ArtefactType.IMAGE, ArtefactType.FILE) or active_file_path.suffix.lower() in _EXPLICIT_BINARY_EXTS):
                     lam_to_write = f"# Artefact Metadata: {filename}\n- **Type**: {atype}\n- **Version**: {version}\n- **Physical Path**: {filename}\n\n"
 
                 if lam_to_write:
@@ -882,7 +880,9 @@ class ArtefactManager:
             elif artefact_type == ArtefactType.DOCUMENT and not has_suffix and not is_dotfile and not is_known_extensionless:
                 file_ext = ".md"
                 extra_data["file_ext"] = file_ext
-            elif artefact_type == ArtefactType.DATA:
+            elif artefact_type == ArtefactType.FILE:
+                # FILE artefacts preserve the on-disk extension verbatim — this is
+                # the path used for as-is binaries (SQLite DBs, images, documents).
                 file_ext = Path(physical_path).suffix.lower() if Path(physical_path).suffix else ""
                 extra_data["file_ext"] = file_ext
             else:
@@ -901,7 +901,7 @@ class ArtefactManager:
             raise ValueError(f"Unknown artefact type '{artefact_type}'.")
         artefacts = self._get_all_raw()
 
-        disable_versioning = getattr(self._discussion, "disable_artefact_versioning", False)
+        disable_versioning = not self._is_versioning_enabled()
 
         if disable_versioning:
             existing_art = None
@@ -1085,9 +1085,16 @@ class ArtefactManager:
             raise ValueError(f"Cannot update .lam for non-existent artefact '{title}'.")
 
         atype = latest.get("type", ArtefactType.DOCUMENT)
-        is_data = (atype == ArtefactType.DATA)
+        file_ext = (latest.get("file_ext") or "").lower()
+        title_ext = Path(title).suffix.lower()
+        is_binary_payload = (
+            atype == ArtefactType.FILE
+            and (file_ext in _EXPLICIT_BINARY_EXTS or title_ext in _EXPLICIT_BINARY_EXTS)
+        )
 
-        if is_data:
+        if is_binary_payload:
+            # Binary FILE artefacts (SQLite DBs, images, archives): the payload
+            # lives on disk; new_lam_content describes it. Never overwrite bytes.
             updated_art = self.update(
                 title=title,
                 logical_content=new_lam_content,
@@ -1199,33 +1206,26 @@ class ArtefactManager:
         logical_content = merged_extra.pop("logical_content", latest.get("logical_content"))
         physical_data = merged_extra.pop("physical_data", latest.get("physical_data"))
 
-        # 🛑 CRITICAL FIX: Content-First Update Doctrine (All DATA Artifacts).
-        if physical_data is None and latest.get("type") == ArtefactType.DATA:
+        # As-is binary files (SQLite DBs, images, documents) must never be
+        # rewritten with schema text. When no explicit `physical_data` is
+        # supplied for an existing FILE artefact whose on-disk twin is binary,
+        # rehydrate the raw bytes from disk and keep them intact.
+        if physical_data is None and latest.get("type") == ArtefactType.FILE:
             file_ext = latest.get("file_ext", "")
-            _BINARY_DB_EXTS = {".db", ".sqlite", ".sqlite3"}
+            _BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".docx", ".pptx",
+                            ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg",
+                            ".zip", ".tar", ".gz", ".7z"}
             _artifact_file_ext = (latest.get("file_ext") or "").lower()
             _artifact_title_ext = Path(latest.get("title", "")).suffix.lower()
-            _is_binary_db = _artifact_file_ext in _BINARY_DB_EXTS or _artifact_title_ext in _BINARY_DB_EXTS
+            _is_binary = _artifact_file_ext in _BINARY_EXTS or _artifact_title_ext in _BINARY_EXTS
 
-            is_raw_data_update = (
-                new_content is not None
-                and isinstance(new_content, str)
-                and (logical_content is None or new_content != logical_content)
-                and not _is_binary_db
-            )
-
-            if is_raw_data_update:
-                try:
-                    physical_data = new_content.encode("utf-8")
-                    ASCIIColors.info(f"[ArtefactManager] Encoded new_content to physical bytes for '{latest.get('title')}' ({len(physical_data)} bytes)")
-                except Exception as e:
-                    ASCIIColors.warning(f"[ArtefactManager] Failed to encode new_content to bytes: {e}")
-            elif _is_binary_db and new_content is not None and isinstance(new_content, str):
+            if _is_binary and new_content is not None and isinstance(new_content, str):
+                # For binary FILE artefacts, new_content is a descriptor — mirror into logical_content,
+                # do not attempt to write it as the physical payload.
                 logical_content = new_content
                 use_content = new_content
-                ASCIIColors.info(f"[ArtefactManager] Binary DB artifact '{latest.get('title')}': treating new_content as .lam schema, preserving physical bytes from disk.")
 
-            if physical_data is None:
+            if _is_binary and physical_data is None:
                 try:
                     if getattr(self._discussion, "workspace_data_path", None):
                         ws_data_dir = Path(self._discussion.workspace_data_path)
@@ -1237,17 +1237,10 @@ class ArtefactManager:
                     clean_path = self._sanitize_path_segments(phys_path.replace("workspace/", "").replace("data_workspace/", ""))
                     filename = self._get_filename_with_ext(clean_path, latest.get("type"), latest.get("language"), file_ext)
                     active_physical_path = ws_data_dir / filename
-
                     if active_physical_path.exists():
                         physical_data = active_physical_path.read_bytes()
-                        ASCIIColors.info(f"[ArtefactManager] Rehydrated physical bytes for data artifact '{latest.get('title')}' from {active_physical_path}")
-                    elif not _is_binary_db and new_content is not None and isinstance(new_content, str):
-                        physical_data = new_content.encode("utf-8")
-                        ASCIIColors.info(f"[ArtefactManager] Encoded new_content to physical bytes for '{latest.get('title')}' ({len(physical_data)} bytes)")
-                    elif _is_binary_db:
-                        ASCIIColors.error(f"[ArtefactManager] CRITICAL: Cannot rehydrate binary DB '{latest.get('title')}' — physical file missing at {active_physical_path}. Refusing to write schema text as binary data.")
                 except Exception as e:
-                    ASCIIColors.warning(f"[ArtefactManager] Failed to rehydrate physical bytes for data artifact: {e}")
+                    ASCIIColors.warning(f"[ArtefactManager] Failed to rehydrate physical bytes for FILE artefact: {e}")
 
         result = self.add(
             title             = target_title,
@@ -1676,8 +1669,10 @@ class ArtefactManager:
         atype = ArtefactType.DOCUMENT
         if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql"):
             atype = ArtefactType.CODE
-        elif file_ext in (".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"):
-            atype = ArtefactType.DATA
+        elif file_ext in (".csv", ".tsv", ".db", ".sqlite", ".sqlite3", ".sqlconn",
+                          ".xlsx", ".xls", ".parquet", ".ttl", ".rdf"):
+            # Data files are as-is FILE artefacts (no dedicated DATA type).
+            atype = ArtefactType.FILE
         elif file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
             atype = ArtefactType.IMAGE
 
@@ -1781,8 +1776,14 @@ class ArtefactManager:
         Filesystem-as-Source-of-Truth Synchronization.
         Scans the workspace root and purges database records for files that no longer exist on disk.
         Preserves relative subfolder paths accurately.
+
+        GATED: When the discussion disables artefact versioning (agentic mode with
+        potentially millions of workspace files), we MUST NOT walk the workspace.
+        The host application (or external Git) owns disk-state reconciliation there.
         """
         purged: List[str] = []
+        if not self._is_versioning_enabled():
+            return purged
         try:
             ws_root = self._get_workspace_root()
             if not ws_root.exists():
@@ -1972,9 +1973,7 @@ class ArtefactManager:
         # user-facing bidirectional sync (sync_workspace_to_artefacts), where
         # disk is the source of truth. Purging here would erase the artifact
         # before the heal pass can restore it.
-        versioning_enabled = not getattr(
-            self._discussion, "disable_artefact_versioning", False
-        )
+        versioning_enabled = self._is_versioning_enabled()
 
         active_arts = self.list(active_only=True)
         workspace_dir = self._get_workspace_root()
@@ -1986,31 +1985,6 @@ class ArtefactManager:
 
         for art in active_arts:
             if not art.get("active", False) or art.get("visibility") == ArtefactVisibility.HIDDEN:
-                continue
-
-            if art.get("type") == "data":
-                file_ext = art.get("file_ext", "")
-                version = art.get("version", 1)
-                title = art["title"]
-                clean_path = self._sanitize_path_segments(title)
-                art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_path))
-
-                filename = self._get_filename_with_ext(
-                    clean_path, art.get("type", "data"), art.get("language"), file_ext
-                )
-                name_part, _ = os.path.splitext(filename) if '.' in filename else (filename, "")
-                versioned_data = self._get_versions_root() / art_id / f"{name_part}_v{version}{file_ext if file_ext else (os.path.splitext(filename)[1] if '.' in filename else '')}"
-                dest = self._resolve_confined_path(filename)
-
-                if not dest.exists():
-                    if versioning_enabled and versioned_data.exists():
-                        import shutil
-                        shutil.copy(str(versioned_data), str(dest))
-                    elif file_ext.lower() not in (".db", ".sqlite", ".sqlite3") and isinstance(art.get("content"), str) and art["content"] and not art["content"].startswith("#"):
-                        dest.write_text(art["content"], encoding="utf-8", errors="ignore")
-
-                if dest.exists() and str(dest.resolve()) not in synced_files:
-                    synced_files.append(str(dest.resolve()))
                 continue
 
             content_to_sync = self._read_content_from_disk(art) or art.get("content", "")
@@ -2144,9 +2118,6 @@ class ArtefactManager:
 
         for a in visible_artifacts:
             display_path = a.get("physical_path") or a["title"]
-            if a.get("type") == "data" and a.get("file_ext"):
-                if not display_path.lower().endswith(a["file_ext"].lower()):
-                    display_path = f"{display_path}{a['file_ext']}"
 
             parts = display_path.split("/")
             curr = root_node
@@ -2192,18 +2163,12 @@ class ArtefactManager:
             lang = item.get("language")
 
             display_path = item.get("physical_path") or item["title"]
-            if atype == ArtefactType.DATA and item.get("file_ext"):
-                if not display_path.lower().endswith(item["file_ext"].lower()):
-                    display_path = f"{display_path}{item['file_ext']}"
 
             if v_tier in (ArtefactVisibility.FULL, ArtefactVisibility.SINGLE_ROUND):
-                if item.get("type") == ArtefactType.DATA:
-                    content_text = self._get_lam_content(item).strip()
+                if item.get("content_source") == "disk":
+                    content_text = self._read_content_from_disk(item).strip()
                 else:
-                    if item.get("content_source") == "disk":
-                        content_text = self._read_content_from_disk(item).strip()
-                    else:
-                        content_text = (item.get("content") or "").strip()
+                    content_text = (item.get("content") or "").strip()
 
                 if not content_text:
                     content_text = self._read_content_from_disk(item).strip()
@@ -2232,13 +2197,10 @@ class ArtefactManager:
                 if display_path in deactivated_contents:
                     seq_summaries = getattr(self._discussion, "sequential_summaries", {})
                     summary_text = seq_summaries.get(display_path, "Detailed summary not available.")
-                    full_visible_parts.append(f"{header}\n[SEQUENTIAL COMPRESSED DATA DUE TO BUDGET CONSTRAINTS]:\n{summary_text}\n</file>")
+                    full_visible_parts.append(f"{header}\n[SEQUENTIAL COMPRESSED DATA DUE TO BUDGET CONSTRAINTS]:\n{summary_text}\n</file>\n")
                 else:
-                    if atype == ArtefactType.DATA:
-                        schema_desc = f"**FILENAME FOR TOOLS:** `{display_path}`\n\n{content_text}"
-                        full_visible_parts.append(f"{header}\n{schema_desc}\n</file>")
-                    else:
-                        full_visible_parts.append(f"{header}\n{content_text}\n</file>")
+                    full_visible_parts.append(f"{header}\n{content_text}\n</file>\n")
+
 
             elif v_tier == ArtefactVisibility.METADATA:
                 partial_desc = _extract_file_metadata_and_signature(item)
@@ -3113,8 +3075,10 @@ class ArtefactManager:
                 return f'<{tag_name} {match.group(1)}>\n[content stripped, refer to the artefact for details]\n</{tag_name}>'
 
             if atype not in ArtefactType.ALL:
-                if atype in ("csv", "tsv", "excel", "xlsx", "xls", "db", "sqlite"):
-                    atype = ArtefactType.DATA
+                if atype in ("csv", "tsv", "excel", "xlsx", "xls", "db", "sqlite",
+                             "sqlite3", "parquet", "ttl", "rdf"):
+                    # Data files are as-is FILE artefacts — no dedicated DATA type.
+                    atype = ArtefactType.FILE
                 elif atype in ("text", "txt", "markdown", "md"):
                     atype = ArtefactType.DOCUMENT
                 else:
@@ -3604,9 +3568,7 @@ class ArtefactManager:
         if not paths:
             raise ValueError("Cannot export an empty bundle. Provide a list of file or folder paths.")
 
-        versioning_enabled = not getattr(
-            self._discussion, "disable_artefact_versioning", False
-        )
+        versioning_enabled = self._is_versioning_enabled()
         if include_versions and not versioning_enabled:
             include_versions = False
 
@@ -3693,8 +3655,10 @@ class ArtefactManager:
                 atype = "document"
                 if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql"):
                     atype = "code"
-                elif file_ext in (".csv", ".db", ".sqlite", ".sqlite3", ".xlsx"):
-                    atype = "data"
+                elif file_ext in (".csv", ".tsv", ".db", ".sqlite", ".sqlite3",
+                                  ".sqlconn", ".xlsx", ".xls", ".parquet", ".ttl", ".rdf"):
+                    # Data files are as-is FILE artefacts — no dedicated DATA type.
+                    atype = ArtefactType.FILE
                 elif file_ext in (".png", ".jpg", ".jpeg", ".gif", ".svg"):
                     atype = "image"
 
@@ -3789,9 +3753,7 @@ class ArtefactManager:
             }
 
         artefact_type = ArtefactType.DOCUMENT
-        if ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3", ".sqlconn", ".ttl", ".rdf", ".parquet"):
-            artefact_type = ArtefactType.DATA
-        elif ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir", ".net", ".op"):
+        if ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir", ".net", ".op"):
             artefact_type = ArtefactType.CODE
         elif ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
             artefact_type = ArtefactType.IMAGE
@@ -3799,6 +3761,11 @@ class ArtefactManager:
             artefact_type = ArtefactType.DOCUMENT
         elif ext in (".pdf", ".docx", ".pptx", ".odt"):
             artefact_type = ArtefactType.DOCUMENT
+        elif ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3", ".sqlconn", ".ttl", ".rdf", ".parquet"):
+            # Data files are as-is FILE artefacts; the schema as a companion .lam
+            # is generated by the caller when needed. The DB itself is a binary
+            # physical file (tools inspect it on disk).
+            artefact_type = ArtefactType.FILE
 
         try:
             physical_data = path.read_bytes()
@@ -3806,27 +3773,27 @@ class ArtefactManager:
             physical_data = None
 
         content = ""
-        if artefact_type == ArtefactType.DATA:
+        if artefact_type == ArtefactType.FILE and ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3", ".sqlconn", ".ttl", ".rdf", ".parquet"):
+            # Data file → store as-is FILE. Schema descriptor is generated
+            # alongside as a '.lam' companion (import pipeline handles it).
+            file_size = path.stat().st_size if path.exists() else 0
+            content = (
+                f"# Data File: {title}\n"
+                f"- **Filename**: `{title}`\n"
+                f"- **Type**: {ext.upper().lstrip('.')} (Data File)\n"
+                f"- **Size**: {file_size:,} bytes\n\n"
+                f"> Use data-scouting tools (`execute_sql_query`, `execute_python_data_query`) to inspect."
+            )
             if parse_data_schema:
                 try:
                     from lollms_client.lollms_artefact.data_files import _parse_data_file
-                    schema_result = _parse_data_file(path, title, version=1)
+                    schema_result = _parse_data_file(path, title, version=1, skip_sidecar_write=True)
                     if len(schema_result) == 3:
                         content, _, _ = schema_result
                     else:
                         content, _ = schema_result
-                except Exception as e:
-                    content = f"# Data Interface: {title}\n"
-            else:
-                # Lightweight indexing for autonomous agents without eager library loading
-                file_size = path.stat().st_size if path.exists() else 0
-                content = (
-                    f"# Data Interface: {title}\n"
-                    f"- **Filename**: `{title}`\n"
-                    f"- **Type**: {ext.upper().lstrip('.')} (Data File)\n"
-                    f"- **Size**: {file_size:,} bytes\n\n"
-                    f"> To inspect table schemas, column names, and statistics on demand, use `tool_get_table_schema`."
-                )
+                except Exception:
+                    pass
         elif artefact_type == ArtefactType.IMAGE:
             content = f"### Image: `{title}{ext}`\n\n<artefact_image id=\"{title}{ext}::0\" />"
         elif ext == ".pdf":

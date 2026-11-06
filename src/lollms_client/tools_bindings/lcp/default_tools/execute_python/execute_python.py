@@ -386,26 +386,29 @@ def _can_prompt_interactive() -> bool:
 
 
 def _is_headless_environment() -> bool:
-    """True when `input()` must never be called.
+    """True ONLY when we are provably inside an automated test/CI context.
 
-    Windows CI frequently reports `sys.stdin.isatty() == True` even when stdin
-    is a pipe with no reader — a raw `input()` then blocks indefinitely and
-    hangs the entire test suite (this was the source of the ~500s extra
-    runtime in the previous CI run). We treat pytest, CI, and unwrapped stdin
-    as headless and skip the interactive prompt entirely. When the caller
-    genuinely wants a prompt, they must register a `confirm_handler`; that is
-    the sole supported interactive channel and it always wins.
+    IMPORTANT: this function must NOT use `sys.stdin.isatty()` as a proxy for
+    "headless". A non-TTY stdin is extremely common in real interactive
+    sessions — GUI apps (NiceGUI, Electron), VS Code's integrated terminal
+    wrapper, Jupyter kernels, and Windows services all report
+    `isatty() == False` while a human is very much present and expecting a
+    prompt. Treating those as headless caused the reported bug: in `safe`
+    mode, risky code was silently auto-approved instead of prompting.
+
+    The correct contract:
+      - pytest / CI  → headless (no human to prompt; sandbox is the control).
+      - everything else → NOT headless. If no TTY is available, the caller
+        falls through to the explicit "no interactive channel" rejection
+        branch in `_prompt_user_validation()`, which tells the operator how
+        to register a `confirm_handler` or switch to `full_access`. That is
+        the safe default: refuse rather than silently allow.
     """
     if "pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST"):
         return True
     if os.environ.get("CI"):
         return True
-    if not sys.stdin:
-        return True
-    try:
-        return not sys.stdin.isatty()
-    except Exception:
-        return True
+    return False
 
 
 def _prompt_user_validation(source: str, script_label: str, argv: Optional[List[Any]] = None) -> Tuple[str, str]:
@@ -455,11 +458,17 @@ def _prompt_user_validation(source: str, script_label: str, argv: Optional[List[
             ASCIIColors.warning(f"[execute_python] Confirm handler failed: {handler_err}")
             return "reject", f"Confirmation handler failed: {handler_err}"
 
-    # 2. Headless (pytest / CI / no reader) — the sandbox IS the control.
+    # 2. Headless (pytest / CI) — the sandbox IS the control.
     # The static AST validator and SandboxContext already block the dangerous
     # surface (subprocess, os.system, socket, ctypes, path escapes). A human
     # prompt cannot add safety where the runtime is authoritative; skipping
     # it here is correct and prevents the input() hang seen in Windows CI.
+    #
+    # NOTE: this branch fires ONLY for pytest/CI. A non-TTY stdin in a real
+    # interactive session (GUI app, VS Code terminal, Jupyter) is NOT headless
+    # — it falls through to the explicit rejection below so the operator is
+    # told how to register a handler instead of having risky code silently
+    # auto-approved.
     if _is_headless_environment():
         return "allow", ""
 
@@ -523,7 +532,10 @@ def _prompt_user_validation(source: str, script_label: str, argv: Optional[List[
 
     # 3. Fallback for non-interactive environments without an attached handler.
     # We cannot block indefinitely without a user channel, so we reject with a
-    # clear, actionable message that instructs the LLM on how to proceed.
+    # clear, actionable message that instructs the operator on how to proceed.
+    # This is the SAFE default: refuse rather than silently allow. The previous
+    # behavior (silently returning "allow" via an over-eager headless check)
+    # was the reported bug — risky code ran without ever asking the operator.
     return "reject", (
         "No interactive channel available (no TTY, no confirm_handler registered). "
         "To authorize this execution, either: "
@@ -606,6 +618,19 @@ def _annotate_traceback(raw_traceback: str, source_code: str, script_label: str)
     return "\n".join(annotated)
 
 
+def _ensure_workspace_subdir(workspace_root: Path, *parts: str) -> Path:
+    """Creates (if needed) and returns a subdirectory under the workspace root.
+
+    Centralizes the "don't pollute the root" policy: any tool artifact that is
+    not a first-class user file (execution logs, captured plots, screenshots)
+    must live in a dedicated subfolder. Never raises for the producer — the
+    caller is expected to wrap in its own try/except.
+    """
+    target = workspace_root.joinpath(*parts)
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
 def _window_output(text: str) -> str:
     """
     Builds a head/tail windowed preview of an execution output.
@@ -628,17 +653,23 @@ def _window_output(text: str) -> str:
 
 def _persist_full_output(text: str, script_label: str, tool_ctx: Optional[Any] = None) -> Optional[str]:
     """
-    Persists the full captured output to a uniquely named .log file in the
-    workspace root. Returns the file name on success, None on failure.
+    Persists the full captured output to a uniquely named .log file INSIDE
+    the workspace's ``logs/`` folder. Returns the workspace-relative path
+    (e.g. "logs/exec_output_script_20250101_120000_ab12cd.log") on success,
+    None on failure.
+
+    Routing into ``logs/`` keeps the workspace root clean — execution logs
+    are ephemeral diagnostic artifacts, not user files.
     """
     try:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_label = re.sub(r'[^A-Za-z0-9_.-]+', '_', Path(script_label).stem)[:40] or "script"
         log_name = f"exec_output_{safe_label}_{stamp}_{uuid.uuid4().hex[:6]}.log"
-        log_path = _get_workspace_root(tool_ctx) / log_name
+        log_dir = _ensure_workspace_subdir(_get_workspace_root(tool_ctx), "logs")
+        log_path = log_dir / log_name
         with open(log_path, "w", encoding="utf-8", errors="ignore") as f:
             f.write(text)
-        return log_name
+        return f"logs/{log_name}"
     except Exception as write_err:
         ASCIIColors.warning(f"[execute_python] Failed to persist full output: {write_err}")
         return None
@@ -692,6 +723,12 @@ def _detect_risky_operations(source: str) -> Optional[str]:
                 for alias in node.names:
                     if alias.name.lower() in forbidden_os_process_attrs:
                         return f"Executing system/process command via 'os.{alias.name}'"
+            # `from subprocess import run` / `from socket import socket` etc.
+            # must be caught even when the module root is not in the process
+            # set — the imported NAME itself is the risky primitive.
+            if root_mod in ("subprocess", "socket", "urllib", "requests",
+                            "http", "httpx", "aiohttp", "ctypes"):
+                return f"Importing risky primitive from '{mod}'"
 
         # 3. Direct call expressions
         elif isinstance(node, ast.Call):
@@ -705,6 +742,14 @@ def _detect_risky_operations(source: str) -> Optional[str]:
                     mod_name = node.args[0].value.split(".")[0].lower()
                     if mod_name in forbidden_process_modules or mod_name in risky_system_modules:
                         return f"Dynamic import of '{node.args[0].value}'"
+            # `getattr(os, 'system')(...)` / `getattr(subprocess, 'run')(...)`
+            # — dynamic attribute access to a risky primitive must be flagged
+            # so the operator is prompted in safe mode.
+            elif isinstance(node.func, ast.Call) and isinstance(node.func.func, ast.Name) and node.func.func.id == "getattr":
+                if len(node.func.args) >= 2 and isinstance(node.func.args[1], ast.Constant):
+                    attr_name = str(node.func.args[1].value).lower()
+                    if attr_name in forbidden_os_process_attrs:
+                        return f"Dynamic access to risky attribute '{attr_name}' via getattr"
 
     return None
 
@@ -1106,10 +1151,14 @@ def _run_python_source(
     figures = envelope.get("figures") or []
     if figures:
         ASCIIColors.success(f"[Sandbox] Intercepted {len(figures)} generated plot figure(s)!")
+        try:
+            plots_dir = _ensure_workspace_subdir(_get_workspace_root(tool_ctx), "logs", "plots")
+        except Exception:
+            plots_dir = Path(".")  # last-resort fallback: never lose the figure
         for png_bytes in figures:
             plot_filename = f"code_exec_plot_{uuid.uuid4().hex[:6]}.png"
             try:
-                (Path(".") / plot_filename).write_bytes(png_bytes)
+                (plots_dir / plot_filename).write_bytes(png_bytes)
             except Exception as write_err:
                 ASCIIColors.warning(
                     f"[execute_python] Failed to write plot {plot_filename}: {write_err}"

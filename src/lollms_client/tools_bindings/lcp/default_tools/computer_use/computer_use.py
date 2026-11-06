@@ -435,6 +435,20 @@ def _sanitize_error(text: str) -> str:
     return re.sub(r'[A-Za-z]:\\(?:Users|home)[\\/][^\s"\']*', "<host-path>", text or "")
 
 
+def _screenshots_dir(workspace_root: "Path") -> "Path":
+    """Creates (if needed) and returns ``<workspace>/logs/screenshots``.
+
+    All computer-use screenshots land in a dedicated subfolder so the workspace
+    root stays free of auto-generated PNGs. The folder is created lazily on the
+    first screenshot; nothing is written until an actual capture happens.
+    """
+    from pathlib import Path as _Path
+
+    target = _Path(str(workspace_root)) / "logs" / "screenshots"
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
 # ──────────────────────────────── Tools ─────────────────────────────────────
 
 def tool_computer_desktop_info(
@@ -570,7 +584,7 @@ def tool_computer_screenshot(
                         pass
 
             saved_file_name = _sanitize_screenshot_filename(file_name) or "computer_use_screenshot.png"
-            target_path = working_dir / saved_file_name
+            target_path = _screenshots_dir(working_dir) / saved_file_name
             target_path.write_bytes(base64.b64decode(screenshot_b64))
             workspace_file = str(target_path.resolve())
         except Exception as persist_err:
@@ -1448,7 +1462,7 @@ def _post_action_result(
 
         working_dir = Path.cwd()
         saved_file_name = "computer_use_screenshot.png"
-        target_path = working_dir / saved_file_name
+        target_path = _screenshots_dir(working_dir) / saved_file_name
         target_path.write_bytes(base64.b64decode(b64))
         workspace_file = str(target_path.resolve())
     except Exception as persist_err:
@@ -1965,7 +1979,7 @@ def tool_computer_screenshot_zone(
                         pass
 
             saved_file_name = _sanitize_screenshot_filename(file_name) or "computer_use_zone.png"
-            target_path = working_dir / saved_file_name
+            target_path = _screenshots_dir(working_dir) / saved_file_name
             target_path.write_bytes(base64.b64decode(b64))
             workspace_file = str(target_path.resolve())
         except Exception as persist_err:

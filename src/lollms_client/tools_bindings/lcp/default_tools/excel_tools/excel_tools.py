@@ -968,16 +968,127 @@ def tool_excel_from_markdown(
         }
 
 
+def _extract_xlsx_body_text(
+    wb: Any,
+    sheet_name: Optional[str] = None,
+    include_formulas: bool = True,
+) -> Tuple[str, int, int]:
+    """Extracts the body text of a workbook (or one sheet) as tab-separated rows.
+
+    Returns (body_text, total_rows, total_cols). When `sheet_name` is None,
+    every sheet is rendered with a `### Sheet: <name>` header. Formulas are
+    rendered as their source string (e.g. `=SUM(B2:E2)`) when `include_formulas`
+    is True; otherwise the cached value is used (may be None for openpyxl-authored
+    workbooks).
+    """
+    target_sheets = [sheet_name] if sheet_name else list(wb.sheetnames)
+    parts: List[str] = []
+    total_rows = 0
+    total_cols = 0
+    for name in target_sheets:
+        if name not in wb.sheetnames:
+            continue
+        ws = wb[name]
+        rows_md: List[str] = []
+        for row in ws.iter_rows(values_only=False):
+            cells: List[str] = []
+            for cell in row:
+                value = cell.value
+                if value is None:
+                    cells.append("")
+                elif isinstance(value, str) and value.startswith("=") and not include_formulas:
+                    cells.append("")
+                else:
+                    cells.append(str(value))
+            if any(cells):
+                rows_md.append("\t".join(cells))
+                total_cols = max(total_cols, len(cells))
+        if rows_md:
+            if not sheet_name:
+                parts.append(f"### Sheet: {name}")
+            parts.append("\n".join(rows_md))
+            total_rows += len(rows_md)
+    return "\n\n".join(parts), total_rows, total_cols
+
+
+def _extract_xlsx_images_metadata(wb: Any) -> List[Dict[str, Any]]:
+    """Returns metadata for every embedded image in the workbook (no bytes loaded).
+
+    Each entry: sheet, anchor (cell coordinate if available), filename, size_bytes.
+    """
+    images: List[Dict[str, Any]] = []
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        try:
+            for image in getattr(ws, "_images", []) or []:
+                try:
+                    anchor = getattr(image, "anchor", None)
+                    anchor_cell = None
+                    if anchor is not None:
+                        try:
+                            anchor_cell = anchor._from.col if hasattr(anchor, "_from") else None
+                        except Exception:
+                            anchor_cell = None
+                    images.append({
+                        "sheet": sheet_name,
+                        "anchor": anchor_cell,
+                        "filename": getattr(image, "path", None) or getattr(image, "ref", None) or "(embedded)",
+                        "size_bytes": len(getattr(image, "_data", b"") or b""),
+                    })
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return images
+
+
+def _parse_sheet_selector(selector: Optional[str], sheet_names: List[str]) -> Optional[str]:
+    """Returns the sheet name to read, or None for all sheets.
+
+    Accepts an exact sheet name, a 0-based index ("0", "1"), or None/"" for all.
+    """
+    if not selector or not str(selector).strip():
+        return None
+    raw = str(selector).strip()
+    if raw in sheet_names:
+        return raw
+    if raw.isdigit():
+        idx = int(raw)
+        if 0 <= idx < len(sheet_names):
+            return sheet_names[idx]
+    return None
+
+
 def tool_read_excel(
     file: str,
+    mode: str = "text",
+    sheet: Optional[str] = None,
+    offset: int = 0,
+    limit: int = 0,
+    include_formulas: bool = True,
     discussion_instance: Optional[Any] = None,
     lollms_client_instance: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Reads an existing Excel workbook (.xlsx/.xlsm) and returns a markdown inventory.
+    """Reads an Excel workbook (.xlsx/.xlsm) with explicit read modes.
 
-    Returns sheets, dimensions, cell previews and the formulas present in the
-    first rows. Validates the file first; corrupt files return a structured
-    failure instead of a crash. No recipe is executed and nothing is saved.
+    MODES
+    -----
+    - "text"      : full body text (all sheets, or one sheet via `sheet`).
+    - "peek"      : first `limit` rows only (default 20) — cheap preview.
+    - "chunk"     : rows [offset : offset+limit] of the body (default 100 rows).
+    - "inventory" : markdown inventory (sheets, dimensions, formulas, preview).
+
+    Every response includes `total_rows`, `total_cols`, `total_sheets`,
+    `sheet_names`, and `images` metadata (embedded pictures) so the caller can
+    plan chunked reads without re-inspecting the file.
+
+    Args:
+        file: Existing .xlsx/.xlsm file (relative to workspace or absolute).
+        mode: "text" | "peek" | "chunk" | "inventory". Defaults to "text".
+        sheet: Sheet name or 0-based index. None = all sheets.
+        offset: 0-based ROW offset for mode="chunk".
+        limit: Max ROWS to return. 0 = no limit (text) / 20 (peek) / 100 (chunk).
+        include_formulas: Render formula cells as their source string (default True).
     """
     try:
         if not file or not str(file).strip():
@@ -1007,12 +1118,118 @@ def tool_read_excel(
                 ),
             }
 
-        inventory = _read_xlsx(file_path)
+        normalized_mode = (mode or "text").strip().lower()
+        if normalized_mode not in ("text", "peek", "chunk", "inventory"):
+            return {
+                "success": False,
+                "error": f"Invalid mode '{mode}'. Use 'text', 'peek', 'chunk', or 'inventory'.",
+            }
+
+        from openpyxl import load_workbook
+        wb = load_workbook(str(file_path), data_only=False)
+        sheet_names = list(wb.sheetnames)
+        total_sheets = len(sheet_names)
+        images = _extract_xlsx_images_metadata(wb)
+
+        if normalized_mode == "inventory":
+            inventory = _read_xlsx(file_path)
+            return {
+                "success": True,
+                "mode": "inventory",
+                "file_name": file_path.name,
+                "workspace_file": str(file_path.resolve()),
+                "inventory": inventory,
+                "total_sheets": total_sheets,
+                "sheet_names": sheet_names,
+                "images": images,
+                "image_count": len(images),
+            }
+
+        selected_sheet = _parse_sheet_selector(sheet, sheet_names)
+        body_text, total_rows, total_cols = _extract_xlsx_body_text(
+            wb, sheet_name=selected_sheet, include_formulas=include_formulas,
+        )
+        total_chars = len(body_text)
+        body_lines = body_text.splitlines()
+
+        if normalized_mode == "text":
+            return {
+                "success": True,
+                "mode": "text",
+                "file_name": file_path.name,
+                "workspace_file": str(file_path.resolve()),
+                "text": body_text,
+                "content": body_text,
+                "output": body_text,
+                "total_chars": total_chars,
+                "total_rows": total_rows,
+                "total_cols": total_cols,
+                "total_sheets": total_sheets,
+                "sheet_names": sheet_names,
+                "sheet": selected_sheet,
+                "images": images,
+                "image_count": len(images),
+            }
+
+        if normalized_mode == "peek":
+            peek_limit = limit if limit and limit > 0 else 20
+            snippet_lines = body_lines[:peek_limit]
+            snippet = "\n".join(snippet_lines)
+            return {
+                "success": True,
+                "mode": "peek",
+                "file_name": file_path.name,
+                "workspace_file": str(file_path.resolve()),
+                "text": snippet,
+                "content": snippet,
+                "output": snippet,
+                "total_chars": total_chars,
+                "returned_rows": len(snippet_lines),
+                "total_rows": total_rows,
+                "total_cols": total_cols,
+                "total_sheets": total_sheets,
+                "sheet_names": sheet_names,
+                "sheet": selected_sheet,
+                "has_more": len(body_lines) > len(snippet_lines),
+                "next_offset": len(snippet_lines) if len(body_lines) > len(snippet_lines) else None,
+                "images": images,
+                "image_count": len(images),
+            }
+
+        # mode == "chunk"
+        try:
+            start = max(0, int(offset))
+        except (TypeError, ValueError):
+            start = 0
+        try:
+            chunk_limit = int(limit) if limit else 100
+        except (TypeError, ValueError):
+            chunk_limit = 100
+        if chunk_limit <= 0:
+            chunk_limit = 100
+        end = min(len(body_lines), start + chunk_limit)
+        chunk_lines = body_lines[start:end]
+        chunk = "\n".join(chunk_lines)
         return {
             "success": True,
+            "mode": "chunk",
             "file_name": file_path.name,
             "workspace_file": str(file_path.resolve()),
-            "inventory": inventory,
+            "text": chunk,
+            "content": chunk,
+            "output": chunk,
+            "offset": start,
+            "returned_rows": len(chunk_lines),
+            "total_rows": total_rows,
+            "total_cols": total_cols,
+            "total_chars": total_chars,
+            "total_sheets": total_sheets,
+            "sheet_names": sheet_names,
+            "sheet": selected_sheet,
+            "has_more": end < len(body_lines),
+            "next_offset": end if end < len(body_lines) else None,
+            "images": images,
+            "image_count": len(images),
         }
     except Exception as unexpected_err:
         return {
@@ -1106,9 +1323,15 @@ def get_tools() -> List[Dict[str, Any]]:
         {
             "name": "tool_read_excel",
             "description": (
-                "Reads an existing Excel workbook (.xlsx/.xlsm) and returns a markdown inventory "
-                "(sheets, dimensions, cell previews, formulas). Validates the file first; corrupt "
-                "files return a structured failure."
+                "Reads an Excel workbook (.xlsx/.xlsm) with explicit read modes. "
+                "MODES: 'text' (full body, all sheets or one via `sheet`), "
+                "'peek' (first N rows — cheap preview), 'chunk' (rows [offset:offset+limit] "
+                "for large workbooks), 'inventory' (sheets, dimensions, formulas, preview). "
+                "Every response includes total_rows, total_cols, total_sheets, sheet_names, "
+                "and images metadata (embedded pictures) so you can plan chunked reads "
+                "without re-inspecting the file. Use 'peek' first, then 'chunk' with "
+                "next_offset to walk the workbook. `sheet` accepts a sheet name or a "
+                "0-based index; None = all sheets."
             ),
             "parameters": [
                 {
@@ -1116,10 +1339,53 @@ def get_tools() -> List[Dict[str, Any]]:
                     "type": "str",
                     "description": "Existing .xlsx/.xlsm file to read (relative to workspace or absolute path).",
                 },
+                {
+                    "name": "mode",
+                    "type": "str",
+                    "description": "'text' (full body) | 'peek' (first N rows) | 'chunk' (offset+limit rows) | 'inventory' (sheets + formulas + preview). Defaults to 'text'.",
+                    "optional": True,
+                },
+                {
+                    "name": "sheet",
+                    "type": "str",
+                    "description": "Sheet name or 0-based index. None = all sheets.",
+                    "optional": True,
+                },
+                {
+                    "name": "offset",
+                    "type": "int",
+                    "description": "0-based ROW offset for mode='chunk'. Defaults to 0.",
+                    "optional": True,
+                },
+                {
+                    "name": "limit",
+                    "type": "int",
+                    "description": "Max ROWS to return. 0 = no limit (text) / 20 (peek) / 100 (chunk).",
+                    "optional": True,
+                },
+                {
+                    "name": "include_formulas",
+                    "type": "bool",
+                    "description": "Render formula cells as their source string (default True).",
+                    "optional": True,
+                },
             ],
             "output": [
                 {"name": "success", "type": "bool", "description": "Whether the operation succeeded."},
-                {"name": "inventory", "type": "str", "description": "Markdown inventory of the workbook contents."},
+                {"name": "mode", "type": "str", "description": "The mode that was executed."},
+                {"name": "text", "type": "str", "description": "The extracted text (for text/peek/chunk modes)."},
+                {"name": "inventory", "type": "str", "description": "Markdown inventory (for inventory mode)."},
+                {"name": "total_chars", "type": "int", "description": "Total body text length in chars."},
+                {"name": "returned_rows", "type": "int", "description": "Rows returned in this call (peek/chunk modes)."},
+                {"name": "total_rows", "type": "int", "description": "Total non-empty rows across the selected scope."},
+                {"name": "total_cols", "type": "int", "description": "Max column count across the selected scope."},
+                {"name": "total_sheets", "type": "int", "description": "Total sheet count."},
+                {"name": "sheet_names", "type": "list", "description": "All sheet names."},
+                {"name": "sheet", "type": "str", "description": "The sheet that was read (None = all)."},
+                {"name": "has_more", "type": "bool", "description": "True if more rows remain (peek/chunk modes)."},
+                {"name": "next_offset", "type": "int", "description": "Offset to pass to the next chunk call (peek/chunk modes)."},
+                {"name": "images", "type": "list", "description": "Per-image metadata (sheet, anchor, filename, size_bytes)."},
+                {"name": "image_count", "type": "int", "description": "Number of embedded images."},
                 {"name": "file_name", "type": "str", "description": "Name of the file read."},
                 {"name": "workspace_file", "type": "str", "description": "Absolute path to the file."},
                 {"name": "error", "type": "str", "description": "Error message if failed."},

@@ -2791,28 +2791,7 @@ class LollmsPersonality:
         res = self.generate_with_tools(prompt=prompt, tools=tools, **kwargs)
         return res.get("response", "")
 
-    @staticmethod
-    def from_handbag(
-        path: Union[str, Path],
-        lollms_client: Optional[Any] = None,
-        extra_tools: Optional[List[Union[str, Path]]] = None,
-        extra_skills_dirs: Optional[List[Union[str, Path]]] = None,
-        extra_knowledge_bases: Optional[List[Union[str, Path]]] = None,
-        extra_safe_stores: Optional[List[Any]] = None,
-    ) -> 'LollmsPersonality':
-        """
-        Loads a LollmsPersonality from a handbag directory.
 
-        Args:
-            path: Path to the handbag directory.
-            lollms_client: Optional LollmsClient instance.
-            extra_tools: Optional additional tool files to merge with handbag tools.
-            extra_skills_dirs: Optional additional skill directories to merge with handbag skills.
-
-        Returns:
-            A configured LollmsPersonality instance.
-        """
-        hb = Handbag(path)
 
         # Parse SOUL.md
         soul_content = hb.soul_path.read_text(encoding="utf-8", errors="ignore") if hb.soul_path.exists() else ""
@@ -2836,7 +2815,7 @@ class LollmsPersonality:
                 if resolved.exists() and resolved not in all_skills_dirs:
                     all_skills_dirs.append(resolved)
             
-        sm = SkillsManager(skills_dirs=all_skills_dirs, mode=skills_mode) if all_skills_dirs else None
+
 
         # Initialize RAG data sources from handbag rag/ folder
         rag_data_sources: List[RAGDataSource] = []
@@ -2921,10 +2900,7 @@ class LollmsPersonality:
             extra_safe_stores=merged_safe_stores,
         )
 
-        # CRITICAL: Explicitly bind the resolved handbag path to the personality instance.
-        # This guarantees that downstream systems (like _StreamState in _mixin_chat.py)
-        # can access the physical handbag directory for tool/skill file updates.
-        object.__setattr__(pers, 'handbag_path', hb.path.resolve())
+
 
         # Persist extra tools and skills for inline refresh capability
         object.__setattr__(pers, '_extra_tool_files', [Path(t).resolve() for t in (extra_tools or []) if Path(t).resolve().exists()])
@@ -4849,6 +4825,117 @@ JSON:"""
         self._sync_base_context_artifacts(base_conversation, evicted_history)
 
         return surviving_history
+
+    @property
+    def builtin_skills(self) -> Dict[str, str]:
+        """
+        Returns a ``{skill_title: skill_file_path}`` map for every skill that is
+        shipped natively with this personality's handbag.
+
+        A skill is "builtin" when its ``SKILL.md`` resides under a handbag-native
+        skills directory (``<handbag>/skills`` or any dir registered via
+        ``Handbag.register_skills_dir``).
+
+        A skill with no physical backing file (e.g. an in-memory skill created
+        without a handbag) is stored with the sentinel string ``"internal"``.
+
+        Returns ``{}`` when the personality has no handbag bound.
+        """
+        if not self.skills_manager:
+            return {}
+        handbag_roots: List[Path] = []
+        if self.handbag_path:
+            try:
+                hb = Handbag(self.handbag_path)
+                handbag_roots = list(hb.skills_dirs)
+            except Exception:
+                handbag_roots = []
+        if not handbag_roots:
+            return {}
+        classified = self.skills_manager.get_skills_by_source(
+            builtin_dirs=handbag_roots,
+            extra_dirs=None,
+        )
+        return classified.get("builtin", {})
+
+    @property
+    def extra_skills(self) -> Dict[str, str]:
+        """
+        Returns a ``{skill_title: skill_file_path}`` map for every skill that was
+        **not** shipped natively with the handbag — i.e. skills supplied through
+        the caller-provided ``skills_dir`` / ``extra_skills_dirs`` arguments to
+        ``from_handbag``, or any custom/global skills.
+
+        A skill with no physical backing file is stored with the sentinel string
+        ``"internal"``.
+
+        Returns ``{}`` when there are no skills at all.
+        """
+        if not self.skills_manager:
+            return {}
+        handbag_roots: List[Path] = []
+        if self.handbag_path:
+            try:
+                hb = Handbag(self.handbag_path)
+                handbag_roots = list(hb.skills_dirs)
+            except Exception:
+                handbag_roots = []
+        extra_roots: List[Path] = list(getattr(self, '_extra_skills_dirs', []) or [])
+        classified = self.skills_manager.get_skills_by_source(
+            builtin_dirs=handbag_roots,
+            extra_dirs=extra_roots,
+        )
+        return classified.get("extra", {})
+
+    def get_skills_by_source(self) -> Dict[str, Dict[str, str]]:
+        """
+        Returns the personality's full skill inventory partitioned by provenance.
+
+        The returned dict ALWAYS has exactly two keys:
+
+            {
+                "builtin": {title: "/abs/path/to/SKILL.md" | "internal"},
+                "extra":   {title: "/abs/path/to/SKILL.md" | "internal"},
+            }
+
+        Classification
+        --------------
+        * ``"builtin"`` — skill file lives under a handbag-native skills directory
+          (``<handbag>/skills`` or a dir registered via
+          ``Handbag.register_skills_dir``).
+        * ``"extra"`` — skill file lives anywhere else (app-supplied
+          ``skills_dir=`` / ``extra_skills_dirs=`` or custom/global).
+        * ``"internal"`` — the skill has **no physical backing file** (e.g. built
+          purely in memory without a handbag). The string ``"internal"`` is used
+          as the value in place of a file path.
+
+        Example
+        -------
+            >>> inventory = personality.get_skills_by_source()
+            >>> for title, path in inventory["builtin"].items():
+            ...     print(f"[handbag]  {title:32s} -> {path}")
+            >>> for title, path in inventory["extra"].items():
+            ...     print(f"[app-extra] {title:32s} -> {path}")
+
+        Returns empty sub-dicts (not ``None``) when no skills are registered.
+        """
+        if not self.skills_manager:
+            return {"builtin": {}, "extra": {}}
+
+        handbag_roots: List[Path] = []
+        if self.handbag_path:
+            try:
+                hb = Handbag(self.handbag_path)
+                handbag_roots = list(hb.skills_dirs)
+            except Exception:
+                handbag_roots = []
+
+        extra_roots: List[Path] = list(getattr(self, '_extra_skills_dirs', []) or [])
+
+        return self.skills_manager.get_skills_by_source(
+            builtin_dirs=handbag_roots,
+            extra_dirs=extra_roots,
+        )
 
     def list_skills_structured(self, include_content: bool = False) -> List[Dict[str, Any]]:
         """

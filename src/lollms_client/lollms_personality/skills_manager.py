@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
+
+from ascii_colors import ASCIIColors
 
 from .skill import Skill, parse_skill_md
 
@@ -28,6 +30,7 @@ class SkillsManager:
         max_visible_skills: int = 3,
         max_visible_tokens: int = 1200,
         allow_llm_skill_writing: bool = True,
+        skills_output_path: Optional[Union[str, Path]] = None,
     ):
         self.mode = mode
         self.max_visible_skills = max_visible_skills
@@ -36,6 +39,13 @@ class SkillsManager:
         self.active_tool_names: Optional[set] = None
         self.tool_availability_checker: Optional[Callable[[str], bool]] = None
         self.tool_loader: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None
+
+        # Explicit output path for newly created skills. When None, new skills are
+        # written to the first registered skills directory (legacy behavior).
+        self._skills_output_path: Optional[Path] = (
+            Path(skills_output_path).resolve() if skills_output_path else None
+        )
+
         self._skills_dirs: List[Path] = []
         if skills_dirs:
             for d in skills_dirs:
@@ -49,6 +59,15 @@ class SkillsManager:
 
         self.skills: Dict[str, Skill] = {}
         self.reload()
+
+    @property
+    def skills_output_path(self) -> Optional[Path]:
+        """Returns the configured output directory for newly created skills, if any."""
+        return self._skills_output_path
+
+    @skills_output_path.setter
+    def skills_output_path(self, value: Optional[Union[str, Path]]) -> None:
+        self._skills_output_path = Path(value).resolve() if value else None
 
     # ─────────────────────────────────────────────────────────── tier helpers
 
@@ -109,6 +128,7 @@ class SkillsManager:
             seen_paths.add(direct_skill.resolve())
             skill = parse_skill_md(direct_skill, default_visibility=self.mode)
             if skill:
+                self._reconcile_skill_metadata(skill)
                 skill.visibility = self._resolve_visibility(skill)
                 self.skills[skill.title.lower()] = skill
             return
@@ -120,6 +140,7 @@ class SkillsManager:
                     seen_paths.add(skill_file.resolve())
                     skill = parse_skill_md(skill_file, default_visibility=self.mode)
                     if skill:
+                        self._reconcile_skill_metadata(skill)
                         skill.visibility = self._resolve_visibility(skill)
                         self.skills[skill.title.lower()] = skill
                         # Also index by directory slug name (e.g. "file_organization")
@@ -129,9 +150,78 @@ class SkillsManager:
                     seen_paths.add(item.resolve())
                     skill = parse_skill_md(item, default_visibility=self.mode)
                     if skill:
+                        self._reconcile_skill_metadata(skill)
                         skill.visibility = self._resolve_visibility(skill)
                         self.skills[skill.title.lower()] = skill
                         self.skills[item.stem.lower()] = skill
+
+    def _reconcile_skill_metadata(self, skill: Skill) -> None:
+        """
+        Ensures a freshly loaded skill's YAML frontmatter declares an explicit
+        ``modifiable:`` key.
+
+        Contract
+        --------
+        * A skill whose file **omitted** ``modifiable:`` is treated as
+          **read-only** (``skill.modifiable = False``). To make that decision
+          durable and stop re-migrating on every load, this helper injects a
+          literal ``modifiable: false`` line into the frontmatter — a metadata
+          normalisation that never touches the skill body.
+
+        * A skill that already declares ``modifiable:`` (true or false) is left
+          with its file untouched — the declared value is authoritative.
+
+        * A skill with no frontmatter at all is skipped: it is a legacy free-form
+          markdown skill with no YAML contract to reconcile.
+
+        On any write failure the in-memory state remains correct (read-only),
+        only the on-disk normalisation is skipped.
+        """
+        if skill.modifiable_field_present:
+            return
+        if not skill.has_metadata or skill.file_path is None:
+            return
+
+        try:
+            raw = skill.file_path.read_text(encoding="utf-8")
+        except Exception:
+            return
+
+        if not raw.startswith("---"):
+            return
+
+        fm_match = re.match(r'^---(\r?\n)(.*?)(\r?\n---)', raw, re.DOTALL)
+        if not fm_match:
+            return
+
+        prefix, fm_body, suffix = fm_match.group(1), fm_match.group(2), fm_match.group(3)
+        rest = raw[fm_match.end():]
+        # Preserve original newline style for the injected line.
+        newline = "\r\n" if "\r\n" in prefix else "\n"
+
+        # Skip if a modifiable key is already present in the frontmatter block
+        # (defensive: parse_skill_md should have caught this, but re-check).
+        for line in fm_body.splitlines():
+            if line.strip().lower().startswith("modifiable:"):
+                skill.modifiable_field_present = True
+                return
+
+        new_fm_body = fm_body.rstrip("\r\n") + newline + "modifiable: false"
+        new_raw = f"---{prefix}{new_fm_body}{suffix}{rest}"
+
+        try:
+            skill.file_path.write_text(new_raw, encoding="utf-8")
+            skill.modifiable_field_present = True
+            skill.modifiable = False
+            ASCIIColors.info(
+                f"[SkillsManager] Normalised '{skill.title}': added explicit "
+                f"`modifiable: false` (absent flag ⇒ read-only)."
+            )
+        except Exception as ex:
+            ASCIIColors.warning(
+                f"[SkillsManager] Could not persist `modifiable: false` for "
+                f"'{skill.title}' ({ex}). In-memory state stays read-only."
+            )
 
     def _sanitize_title(self, title: str) -> str:
         safe_title = re.sub(r'[^\w\-]', '_', title).strip('_')
@@ -157,15 +247,28 @@ class SkillsManager:
             )
         return normalized
 
-    def _ensure_writable_dir(self) -> Path:
-        if not self._skills_dirs:
-            default_p = Path("./skills").resolve()
-            default_p.mkdir(parents=True, exist_ok=True)
-            self._skills_dirs.append(default_p)
-        target_dir = self._skills_dirs[0]
+    def _ensure_writable_dir(self, output_path: Optional[Union[str, Path]] = None) -> Path:
+        """
+        Resolves the destination directory for a newly created skill.
+
+        Priority:
+            1. Explicit `output_path` argument (per-call override).
+            2. `self._skills_output_path` (configured at construction time).
+            3. First registered skills directory (legacy fallback).
+        """
+        if output_path is not None:
+            target_dir = Path(output_path).resolve()
+        elif self._skills_output_path is not None:
+            target_dir = self._skills_output_path
+        else:
+            if not self._skills_dirs:
+                default_p = Path("./skills").resolve()
+                default_p.mkdir(parents=True, exist_ok=True)
+                self._skills_dirs.append(default_p)
+            target_dir = self._skills_dirs[0].resolve()
+
         target_dir.mkdir(parents=True, exist_ok=True)
-        self._skills_dirs[0] = target_dir.resolve()
-        return self._skills_dirs[0]
+        return target_dir
 
     def create_skill(
         self,
@@ -174,9 +277,10 @@ class SkillsManager:
         description: str = "",
         category: str = "",
         tags: Optional[List[str]] = None,
-        visibility: str = "loadable"
+        visibility: str = "loadable",
+        output_path: Optional[Union[str, Path]] = None,
     ) -> Optional[Skill]:
-        target_dir = self._ensure_writable_dir()
+        target_dir = self._ensure_writable_dir(output_path=output_path)
         safe_title = self._sanitize_title(title)
 
         skill_dir = target_dir / safe_title
@@ -184,6 +288,11 @@ class SkillsManager:
         skill_path = skill_dir / "SKILL.md"
 
         tags_str = ", ".join(tags) if tags else ""
+
+        # IMPORTANT: pass ``visibility`` through the tier resolver so the file
+        # reflects the mode the skill was created in (loadable/searchable/etc.),
+        # not a hardcoded "loadable".
+        normalized_visibility = self._validate_visibility(visibility)
 
         frontmatter = "---\n"
         frontmatter += f"title: \"{title}\"\n"
@@ -193,7 +302,11 @@ class SkillsManager:
             frontmatter += f"category: \"{category}\"\n"
         if tags_str:
             frontmatter += f"tags: [{tags_str}]\n"
-        frontmatter += f"visibility: {visibility}\n"
+        frontmatter += f"visibility: {normalized_visibility}\n"
+        # Newly authored skills are agent-generated and MUST be overwritable in
+        # place by ``update_skill`` / ``tool_update_skill`` — emit the flag
+        # explicitly so the read/write contract survives every round-trip.
+        frontmatter += "modifiable: true\n"
         frontmatter += "---\n\n"
 
         clean_content = self._strip_functional_tags(content)
@@ -211,13 +324,15 @@ class SkillsManager:
         tags: Optional[List[str]] = None,
         visibility: str = "loadable",
         overwrite: bool = False,
+        output_path: Optional[Union[str, Path]] = None,
     ) -> Skill:
         """
         Application-grade entry point for hosting apps to register a custom skill.
 
         Validates the visibility tier, sanitizes the title and content, persists
-        the skill as a SKILL.md file inside the manager's primary skills
-        directory, and reloads the registry.
+        the skill as a SKILL.md file inside the target directory (explicit
+        `output_path` > `self.skills_output_path` > primary skills directory),
+        and reloads the registry.
 
         Args:
             title: Human-readable skill name (sanitized for the filesystem).
@@ -227,6 +342,7 @@ class SkillsManager:
             tags: Optional list of search keywords.
             visibility: One of "visible", "loadable", "searchable".
             overwrite: When False, raises if a skill with the same title exists.
+            output_path: Optional per-call override for the destination folder.
 
         Returns:
             The persisted Skill object.
@@ -253,6 +369,7 @@ class SkillsManager:
             category=category,
             tags=tags,
             visibility=normalized_visibility,
+            output_path=output_path,
         )
 
     @staticmethod
@@ -262,6 +379,14 @@ class SkillsManager:
         t = text.lower().replace("_", " ").replace("-", " ")
         t = re.sub(r'[^\w\s]', '', t)
         return " ".join(t.split())
+
+    def get_skill_file_path(self, title: str) -> Optional[Path]:
+        """
+        Returns the absolute source file path of a skill, if resolvable.
+        Useful for host applications that need to display or edit the backing file.
+        """
+        skill = self.get_skill(title)
+        return skill.file_path if skill else None
 
     def get_skill(self, title: str) -> Optional[Skill]:
         """Retrieves a skill by exact, slug, or fuzzy normalized title matching."""
@@ -367,12 +492,18 @@ class SkillsManager:
         if not skill or not skill.file_path:
             return None
 
+        # The read/write contract is driven by the ``modifiable:`` flag parsed
+        # from the YAML frontmatter. Absent ⇒ read-only (safe default). A
+        # read-only skill refuses every in-place content rewrite.
         if not skill.modifiable:
             return None
 
-        target_dir = skill.file_path.parent
-        target_dir.mkdir(parents=True, exist_ok=True)
+        # Rewrite the ACTUAL backing SKILL.md in place — wherever it lives
+        # (handbag skills/, an app-supplied skills_dir, or an extra_skills_dirs
+        # folder). Never clone into ``skills_output_path`` here: that folder is
+        # the destination for *newly created* skills only.
         skill_path = skill.file_path
+        skill_path.parent.mkdir(parents=True, exist_ok=True)
 
         tags_str = ", ".join(tags) if tags else (", ".join(skill.tags) if skill.tags else "")
 
@@ -387,6 +518,8 @@ class SkillsManager:
         if tags_str:
             frontmatter += f"tags: [{tags_str}]\n"
         frontmatter += f"visibility: {skill.visibility}\n"
+        # Preserve the declared read/write flag verbatim so a read-only skill
+        # stays read-only and a generated skill stays overwritable.
         frontmatter += f"modifiable: {'true' if skill.modifiable else 'false'}\n"
         frontmatter += "---\n\n"
 
@@ -648,6 +781,94 @@ class SkillsManager:
     def list_skills(self) -> List[Dict[str, Any]]:
         return [s.to_dict() for s in self.get_unique_skills()]
 
+    # ─────────────────────────────────────────────────────────── source inventory
+
+    def get_skills_by_source(
+        self,
+        builtin_dirs: Optional[List[Union[str, Path]]] = None,
+        extra_dirs: Optional[List[Union[str, Path]]] = None,
+    ) -> Dict[str, Dict[str, str]]:
+        """
+        Classifies every registered skill into two provenance buckets and returns
+        a two-field dict of ``{title: skill_file_path}`` maps.
+
+        Classification contract
+        -----------------------
+        * ``"builtin"`` — the skill lives under one of ``builtin_dirs`` (the
+          personality's handbag-provided skills folders).
+        * ``"extra"`` — the skill lives under one of ``extra_dirs`` (the app's
+          caller-supplied ``skills_dir`` / ``extra_skills_dirs``), or falls
+          outside both sets (custom/global skills).
+        * A skill with **no physical backing file** — e.g. an in-memory skill
+          created without a handbag, or one whose ``file_path`` is unresolvable
+          — is stored with the literal sentinel string ``"internal"`` as its
+          value, in whichever bucket it would otherwise fall into.
+
+        Both keys are ALWAYS present so callers can iterate unconditionally:
+
+            >>> skills_by_source = manager.get_skills_by_source(...)
+            >>> skills_by_source["builtin"]  # {title: "/abs/path/SKILL.md" | "internal"}
+            >>> skills_by_source["extra"]    # {title: "/abs/path/SKILL.md" | "internal"}
+
+        Args:
+            builtin_dirs: Directories considered "handbag builtin" provenance.
+            extra_dirs:   Directories considered "app-supplied extra" provenance.
+
+        Returns:
+            ``{"builtin": {...}, "extra": {...}}`` — never ``None``, may be empty.
+        """
+        builtin_roots: List[Path] = []
+        for d in builtin_dirs or []:
+            try:
+                builtin_roots.append(Path(d).resolve())
+            except Exception:
+                continue
+
+        extra_roots: List[Path] = []
+        for d in extra_dirs or []:
+            try:
+                extra_roots.append(Path(d).resolve())
+            except Exception:
+                continue
+
+        def _is_under(path: Path, roots: List[Path]) -> bool:
+            for root in roots:
+                try:
+                    path.relative_to(root)
+                    return True
+                except ValueError:
+                    continue
+            return False
+
+        builtin: Dict[str, str] = {}
+        extra: Dict[str, str] = {}
+
+        for skill in self.get_unique_skills():
+            title = skill.title
+            fp = skill.file_path
+
+            # Determine the sentinel / path value to store
+            path_str: str
+            resolved_fp: Optional[Path] = None
+            try:
+                if fp is not None and Path(fp).exists():
+                    resolved_fp = Path(fp).resolve()
+                    path_str = str(resolved_fp)
+                else:
+                    path_str = "internal"
+            except Exception:
+                path_str = "internal"
+
+            # Decide bucket: builtin dirs take precedence over extra dirs,
+            # and any skill outside both is classified as extra (the caller's
+            # externally-provided bucket).
+            if resolved_fp is not None and _is_under(resolved_fp, builtin_roots):
+                builtin[title] = path_str
+            else:
+                extra[title] = path_str
+
+        return {"builtin": builtin, "extra": extra}
+
     # ─────────────────────────────────────────────────────────── tool building
 
     def build_skill_tools(self) -> Dict[str, Dict[str, Any]]:
@@ -875,7 +1096,8 @@ class SkillsManager:
             description: str = "",
             category: str = "",
             tags: str = "",
-            visibility: str = "loadable"
+            visibility: str = "loadable",
+            output_path: str = "",
         ) -> dict:
             """
             Create a new persistent skill (SKILL.md) that survives across sessions.
@@ -888,6 +1110,7 @@ class SkillsManager:
                 category (str, optional): A category for grouping. Defaults to "".
                 tags (str, optional): Comma-separated tags for searchability. Defaults to "".
                 visibility (str, optional): "visible", "loadable", or "searchable". Defaults to "loadable".
+                output_path (str, optional): Optional folder to write the skill into (overrides the default skills dir).
             """
             tags_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
             try:
@@ -899,8 +1122,14 @@ class SkillsManager:
                     tags=tags_list,
                     visibility=visibility,
                     overwrite=True,
+                    output_path=output_path or None,
                 )
-                return {"success": True, "output": f"Skill '{skill.title}' created successfully with visibility '{skill.visibility}'."}
+                target = skill.file_path if skill else "?"
+                return {
+                    "success": True,
+                    "output": f"Skill '{skill.title}' created successfully with visibility '{skill.visibility}' at {target}.",
+                    "file_path": str(skill.file_path) if skill and skill.file_path else None,
+                }
             except ValueError as ex:
                 return {"success": False, "error": str(ex)}
 
@@ -913,7 +1142,8 @@ class SkillsManager:
                 {"name": "description", "type": "str", "description": "A one-sentence summary.", "optional": True},
                 {"name": "category", "type": "str", "description": "A category for grouping.", "optional": True},
                 {"name": "tags", "type": "str", "description": "Comma-separated tags for searchability.", "optional": True},
-                {"name": "visibility", "type": "str", "description": "Visibility tier: 'visible', 'loadable', or 'searchable'.", "optional": True}
+                {"name": "visibility", "type": "str", "description": "Visibility tier: 'visible', 'loadable', or 'searchable'.", "optional": True},
+                {"name": "output_path", "type": "str", "description": "Optional folder to write the skill into (overrides the default skills directory).", "optional": True},
             ],
             "callable": tool_create_skill,
         }
@@ -957,7 +1187,12 @@ class SkillsManager:
                 tags=tags_list
             )
             if updated_skill:
-                return {"success": True, "output": f"Skill '{title}' updated successfully."}
+                target = updated_skill.file_path if updated_skill else "?"
+                return {
+                    "success": True,
+                    "output": f"Skill '{title}' updated successfully in-place at {target}.",
+                    "file_path": str(updated_skill.file_path) if updated_skill and updated_skill.file_path else None,
+                }
             return {"success": False, "error": "Failed to update skill."}
 
         tools["tool_update_skill"] = {

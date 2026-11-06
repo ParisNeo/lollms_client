@@ -132,6 +132,167 @@ custom_tools = LCPBinding(tools_folders=["./app_tools"])
 agent.attach_tool_binding(custom_tools)
 ```
 
+### D. Creating a Personality from a Handbag (End-to-End)
+
+A **handbag** is a self-contained folder that packages everything a personality
+needs: its soul (`soul.md`), skills, tools, RAG documents, assets and a
+`handbag.yaml` manifest. Loading a handbag produces a fully-wired
+`LollmsPersonality` agent.
+
+#### 1. Minimal handbag layout
+
+```text
+my_agent_handbag/
+├── handbag.yaml          # manifest (see below)
+├── soul.md               # personality instructions / system prompt
+├── skills/               # optional: SKILL.md subfolders
+│   └── my_skill/
+│       └── SKILL.md
+├── tools/                # optional: LCP tool .py files
+│   └── my_tool.py
+├── rag/                  # optional: documents to index
+│   └── manual.pdf
+├── assets/               # optional: images / extra files
+└── memory/               # optional: persistent memory db
+```
+
+#### 2. `handbag.yaml` manifest
+
+```yaml
+name: "Research Assistant"
+description: "A focused research agent."
+soul: "soul.md"
+skills_mode: "loadable"          # visible | loadable | searchable
+skills_output_path: "skills"     # where NEW skills are written (optional)
+tools_output_path: "tools"       # where NEW tools are written (optional)
+```
+
+- `skills_mode` controls how the LLM sees skills (always in context, load-on-demand, or searchable-only).
+- `skills_output_path` / `tools_output_path` are resolved **relative to the handbag root** when not absolute. If omitted, new artifacts go into the handbag's default `skills/` and `tools/` folders.
+
+#### 3. Load the personality
+
+```python
+from lollms_client.lollms_personality import LollmsPersonality
+from lollms_client import LollmsClient
+
+client = LollmsClient("ollama", model_name="qwen2.5:7b")
+agent = LollmsPersonality.from_handbag(
+    "./my_agent_handbag",
+    lollms_client=client,
+)
+
+response = agent.generate("Summarise the manual in 5 bullet points.")
+print(response)
+```
+
+`from_handbag()` will:
+1. Parse `handbag.yaml` and `soul.md`.
+2. Register the handbag's `skills/` folder with a `SkillsManager`.
+3. Load LCP tools from `tools/` and attach them as a tool binding.
+4. Index RAG documents (if any) and expose them as data sources.
+5. Read `skills_output_path` / `tools_output_path` and configure the manager accordingly.
+
+#### 4. Supplying extra skills / tools from outside the handbag
+
+You can attach directories that live outside the handbag — useful when several
+personalities share a common skill library:
+
+```python
+agent = LollmsPersonality.from_handbag(
+    "./my_agent_handbag",
+    lollms_client=client,
+    extra_skills_dirs=["./shared_skills"],
+    extra_tools=["./shared_tools"],
+)
+```
+
+**Important**: externally-supplied skills are **updated in place** — when the
+LLM calls `tool_update_skill` or `tool_append_to_skill` on a skill that came
+from `./shared_skills`, the file at its original path is rewritten, never a
+copy inside the handbag.
+
+#### 5. Building a handbag programmatically (PersonalityStudio)
+
+If you'd rather construct a handbag from code:
+
+```python
+from lollms_client.lollms_personality import PersonalityStudio
+
+studio = PersonalityStudio("./my_agent_handbag")
+studio.set_soul("You are a meticulous research assistant.")
+studio.add_skill("citation_style", "Always use APA 7th edition.")
+studio.add_tool("./tools/arxiv_search.py")
+studio.add_document("./rag/manual.pdf")
+studio.set_manifest({
+    "name": "Research Assistant",
+    "skills_mode": "loadable",
+    "skills_output_path": "skills",
+    "tools_output_path": "tools",
+})
+studio.build()
+```
+
+#### 6. Redirecting new skill / tool output at runtime
+
+Even after loading, you can override where new artifacts land:
+
+```python
+# Force new skills into an external folder
+agent.skills_manager.skills_output_path = "./external_skills"
+
+# Or per-call via the LLM tool
+# <tool>{"name": "tool_create_skill", "parameters": {
+#   "title": "My Skill", "content": "...", "output_path": "./external_skills"
+# }}</tool>
+```
+
+Precedence for **skill creation**:
+1. Per-call `output_path` argument (highest priority).
+2. `skills_output_path` configured on the `SkillsManager` (from manifest or setter).
+3. First registered skills directory (legacy fallback).
+
+Precedence for **tool creation** (`tool_tool_maker`):
+1. Per-call `tools_output_path` argument.
+2. Discussion workspace (`workspace_data_path / "lcp_tools"`).
+3. `tools_dir` fallback (default `./lcp_tools`).
+
+### E. Redirecting Skill / Tool Creation Output
+
+When a handbag is loaded with `extra_skills_dirs` (externally-supplied skills),
+the agent's `tool_create_skill` and `tool_tool_maker` will default to writing
+into the handbag's own `skills/` and `tools/` folders — NOT into the external
+directories. To force new artifacts into a specific folder (e.g. the external
+skills directory the user originally supplied), declare them in `handbag.yaml`:
+
+```yaml
+# handbag.yaml
+skills_output_path: "skills"        # relative to handbag root, or absolute
+tools_output_path: "tools"
+```
+
+Or set them programmatically after loading:
+
+```python
+agent.skills_manager.skills_output_path = "./my_external_skills"
+```
+
+At runtime, `tool_create_skill` also accepts a per-call `output_path` argument
+that overrides the configured default:
+
+```xml
+<tool>{"name": "tool_create_skill", "parameters": {
+  "title": "My Skill",
+  "content": "...",
+  "output_path": "./external_skills"
+}}</tool>
+```
+
+**In-place updates**: `tool_update_skill` and `tool_append_to_skill` ALWAYS
+write back to the skill's original `file_path` (recorded at load time), so
+externally-supplied skills are modified where they live — no copy is created
+in the handbag.
+
 ---
 
 ## 5. Introspection, Telemetry & Visualization APIs

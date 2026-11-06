@@ -195,6 +195,33 @@ class TestAgenticModeNoVersions(unittest.TestCase):
             "be force-disabled in agentic mode.",
         )
 
+    def test_agentic_sync_workspace_enumeration_is_noop(self):
+        """Agentic mode MUST NOT enumerate the workspace during sync.
+
+        With a custom workspace that may contain millions of files, blind
+        enumeration would kill the session. The flag must short-circuit
+        `sync_workspace_to_artefacts()` before any `rglob` runs.
+        """
+        discussion, ws_data_dir = self._make_discussion(agentic=True)
+        self._discussion = discussion
+        self._tmp_workspace = str(ws_data_dir.parent)
+
+        # Seed many files on disk — none of them should be ingested.
+        for i in range(50):
+            (ws_data_dir / f"external_{i}.txt").write_text(f"data {i}", encoding="utf-8")
+
+        report = discussion.sync_workspace_to_artefacts()
+
+        self.assertEqual(report["new_artefacts"], 0)
+        self.assertEqual(report["updated_artefacts"], 0)
+        self.assertEqual(report["deleted_artefacts"], 0)
+        self.assertEqual(
+            len(discussion.artefacts.list()), 0,
+            "AGENTIC MODE VIOLATION: workspace files were ingested while "
+            "`disable_artefact_versioning=True`.",
+        )
+        self._assert_no_version_artifacts(ws_data_dir)
+
     def test_discussion_mode_still_creates_versions(self):
         """Regression guard: discussion mode keeps the Dual-Stream snapshot behavior."""
         discussion, ws_data_dir = self._make_discussion(agentic=False)

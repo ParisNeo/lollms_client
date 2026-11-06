@@ -148,11 +148,23 @@ def _dataframe_to_markdown(df: Any) -> str:
         return "\n".join(lines)
 
 
-def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: Optional[Callable[[str], None]] = None) -> Tuple[str, List[Tuple[str, str]], Optional[bytes]]:
+def _parse_data_file(
+    path: Path,
+    art_title: str,
+    version: int = 1,
+    progress_cb: Optional[Callable[[str], None]] = None,
+    skip_sidecar_write: bool = False,
+) -> Tuple[str, List[Tuple[str, str]], Optional[bytes]]:
     """
     Parses a data file (CSV, Excel, SQLite, etc.) and returns a rich Markdown schema (.lam content)
     along with the raw physical bytes for tool execution.
     Checks persistent cache first (based on path, mtime, and size) to avoid re-parsing unchanged files.
+
+    When `skip_sidecar_write` is True, the function returns only the parsed schema and raw bytes
+    without writing the `_v<n>` / active twin files into the workspace. This is required when the
+    source file ALREADY lives in the workspace at the intended destination name (e.g. native
+    SQLite files preserved 1:1 during a data_bundle import) — otherwise we would either duplicate
+    the on-disk artefact or overwrite ourselves with a renamed copy.
     """
     resolved_path = str(path.resolve())
     try:
@@ -406,6 +418,17 @@ def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: 
     ASCIIColors.info(f"[DataFiles] Indexed and cached schema for '{path.name}' ({len(final_schema)} chars).")
 
     # ── WRITE VERSIONED AND ACTIVE FILES TO WORKSPACE ──
+    # When the caller signals that the source file is already the intended
+    # on-disk artefact (bundle-import of a native SQLite DB), we MUST NOT
+    # write sidecar twins — that is precisely what produces the visible
+    # "file.db" + "file" duplication in the workspace tree.
+    if skip_sidecar_write:
+        ASCIIColors.info(
+            f"[DataFiles] skip_sidecar_write=True for '{path.name}' — "
+            f"preserving as-is artefact, no versioned/active twins written."
+        )
+        return final_schema, [], raw_physical_data
+
     try:
         workspace_dir = path.parent
         file_ext = path.suffix

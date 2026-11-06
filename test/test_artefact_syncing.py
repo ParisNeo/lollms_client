@@ -259,6 +259,26 @@ class TestArtefactSyncing(unittest.TestCase):
         self.assertEqual(len(synced_files), 0)
         self.assertTrue(workspace_dir.exists())
 
+    def test_versioning_disabled_skips_workspace_enumeration(self):
+        """Chat-mixin flag OFF ⇒ sync_workspace_to_artefacts() is a pure no-op.
+
+        This guards the "custom workspace with millions of files" scenario: the
+        flag must short-circuit BEFORE any rglob walk.
+        """
+        object.__setattr__(self.discussion, "disable_artefact_versioning", True)
+
+        for i in range(20):
+            (self.ws_data_dir / f"ext_{i}.txt").write_text(f"x{i}", encoding="utf-8")
+
+        report = self.discussion.sync_workspace_to_artefacts()
+
+        self.assertEqual(report, {
+            "new_artefacts": 0,
+            "updated_artefacts": 0,
+            "deleted_artefacts": 0,
+        })
+        self.assertEqual(len(self.discussion.artefacts.list()), 0)
+
     def test_text_based_data_artifact_restoration(self):
         """Verify text-based data artifacts (CSV) are restored to disk if missing."""
         csv_content = "name,age\nAlice,30\nBob,25"

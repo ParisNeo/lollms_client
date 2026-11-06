@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-06 17:58]
+
+- feat(handbags): enhance documentation and update skill definitions
+
 ## [2026-11-05 03:29]
 
 - fix(openai): add client lifecycle management for OpenAIBinding

@@ -1067,6 +1067,72 @@ discussion.chat(user_message="Refactor the utils file.", personality=autonomous_
 
 The **Handbag** is a self-contained, portable folder that carries ALL of a personality's resources. It allows you to package multiple personas, tools, skills, RAG knowledge, memory, and multimodal assets (like 3D models or voice samples) into a single directory.
 
+#### Skill Provenance Inventory (`builtin_skills` / `extra_skills`)
+
+After `from_handbag()` returns, the app can recover **which skill belongs to which source** without re-parsing directories:
+
+| Member | Type | Meaning |
+| :--- | :--- | :--- |
+| `personality.builtin_skills` | `Dict[str, str]` | `{title: absolute SKILL.md path}` — skills shipped **natively** with the handbag (under `<handbag>/skills` plus any folder added via `register_skills_dir()`). |
+| `personality.extra_skills` | `Dict[str, str]` | Same shape — everything else: app-supplied `skills_dir=` / `extra_skills_dirs=` entries and any custom/global skill. |
+| `personality.get_skills_by_source()` | `Dict[str, Dict[str, str]]` | The full two-bucket partition: `{"builtin": {...}, "extra": {...}}`. Both keys are always present. |
+
+**The `"internal"` sentinel** — when a skill has **no physical backing file** (e.g. a skill created purely in memory without a handbag, or whose `file_path` is unresolvable), the string `"internal"` is stored as the path value. The skill still appears in its bucket — only the path is replaced.
+
+```python
+from lollms_client.lollms_personality import LollmsPersonality
+
+personality = LollmsPersonality.from_handbag(
+    "./my_agent_handbag",
+    skills_dir="./app_extras/skills",   # optional privileged output folder
+)
+
+inventory = personality.get_skills_by_source()
+
+for title, path in inventory["builtin"].items():
+    print(f"[handbag]    {title:32s} -> {path}")
+
+for title, path in inventory["extra"].items():
+    print(f"[app-extra]  {title:32s} -> {path}")
+```
+
+#### Privileged output folders for agent-generated artefacts
+
+`from_handbag()` accepts two optional privileged output folders so a host application can force every agent-generated artefact into a folder it controls:
+
+```python
+personality = LollmsPersonality.from_handbag(
+    "./my_agent_handbag",
+    skills_dir="./app_skills_runtime",   # where the agent CREATES / UPDATES skills
+    tools_dir="./app_tools_runtime",     # where the agent CREATES / UPDATES tools
+)
+```
+
+**Resolution order** (identical for both):
+
+1. **Explicit argument** passed to `from_handbag()` — highest priority.
+2. **`handbag.yaml`** manifest keys `skills_output_path` / `tools_output_path`.
+3. **The handbag's own `skills/` / `tools/` folder** — legacy fallback.
+
+The resolved absolute paths are exposed on the personality for tool-generation code paths:
+
+```python
+personality.generated_skills_dir   # Path — absolute, created on demand
+personality.generated_tools_dir    # Path — absolute, created on demand
+```
+
+#### Skill read/write contract (`modifiable:`)
+
+A `SKILL.md` may declare in its YAML frontmatter whether it is safe to overwrite:
+
+| Value | Behaviour |
+| :--- | :--- |
+| `modifiable: true` | **Read/write** — `tool_update_skill`, `tool_append_to_skill`, `tool_remove_skill` may rewrite the **actual** backing file in place. |
+| `modifiable: false` | **Read-only** — every mutation tool refuses. |
+| *(key absent)* | Treated as **read-only** (safe default). The loader performs a one-shot normalisation: it injects a literal `modifiable: false` line into the frontmatter on first load (metadata-only — the skill body is never touched). |
+
+Newly **generated** skills are emitted with `modifiable: true` so they remain overwritable across round-trips. `update_skill` rewrites the exact `skill.file_path`, wherever it lives — handbag, `extra_skills_dirs`, or the app-supplied `skills_dir`.
+
 #### Folder Structure
 
 ```text

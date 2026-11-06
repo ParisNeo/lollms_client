@@ -24,6 +24,7 @@ def tool_tool_maker(
     description: str,
     commit_message: str = "",
     tools_dir: str = "./lcp_tools",
+    tools_output_path: str = "",
     discussion_instance: Optional[Any] = None,
     lollms_client_instance: Optional[Any] = None
 ) -> dict:
@@ -34,7 +35,8 @@ def tool_tool_maker(
         tool_name (str): Lowercase snake_case name of the new tool (e.g. 'file_compressor').
         description (str): A precise, detailed description of what the tool should do, its parameters, and expected output.
         commit_message (str, optional): Message describing the new tool.
-        tools_dir (str, optional): Directory path to save the tool. Defaults to './lcp_tools'.
+        tools_dir (str, optional): Fallback directory path to save the tool. Defaults to './lcp_tools'.
+        tools_output_path (str, optional): Explicit target folder for the generated tool. Overrides `tools_dir` and the discussion workspace when provided.
         discussion_instance (Any, optional): Active discussion session instance. Injected by orchestrator.
         lollms_client_instance (Any, optional): Active client instance. Injected by orchestrator.
     """
@@ -88,12 +90,13 @@ def tool_tool_maker(
         
         code = code_match.group(1).strip()
 
-        # Determine save path
-        if discussion_instance and hasattr(discussion_instance, 'workspace_data_path'):
-            # Save to the discussion's workspace
+        # Determine save path — explicit tools_output_path wins, then discussion workspace,
+        # then the caller-supplied tools_dir fallback.
+        if tools_output_path and tools_output_path.strip():
+            save_dir = Path(tools_output_path).expanduser().resolve()
+        elif discussion_instance and hasattr(discussion_instance, 'workspace_data_path'):
             save_dir = Path(discussion_instance.workspace_data_path) / "lcp_tools"
         else:
-            # Fallback to relative path
             save_dir = Path(tools_dir)
         
         save_dir.mkdir(parents=True, exist_ok=True)

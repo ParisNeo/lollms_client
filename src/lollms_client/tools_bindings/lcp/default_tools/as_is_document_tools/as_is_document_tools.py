@@ -117,6 +117,36 @@ def _extract_pdf_images_for_vlm(pdf_path: Path, target_pages: List[int], max_ima
     return images_b64, media_types
 
 
+def _parse_paragraph_selector(selector: Optional[str], total: int) -> List[int]:
+    """Parses a 0-based paragraph selector into a sorted list of indices.
+
+    Grammar: "10" | "10-50" | "10,20,30-40" | "" (all).
+    Out-of-range values are clamped; unparseable tokens are ignored.
+    """
+    if not selector or not str(selector).strip():
+        return list(range(total))
+    indices: set[int] = set()
+    for part in str(selector).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_s, _, end_s = part.partition("-")
+            try:
+                start, end = int(start_s.strip()), int(end_s.strip())
+            except ValueError:
+                continue
+            if start > end:
+                start, end = end, start
+            for i in range(max(0, start), min(total - 1, end) + 1):
+                indices.add(i)
+        elif part.isdigit():
+            i = int(part)
+            if 0 <= i < total:
+                indices.add(i)
+    return sorted(indices) if indices else list(range(total))
+
+
 def _parse_page_selector(selector: Optional[str], total_pages: int) -> List[int]:
     """
     Parse a 1-based page selector into a sorted list of 0-based page indices.
@@ -653,8 +683,67 @@ def tool_read_document_content(
         elif ext == ".docx":
             import docx
             doc = docx.Document(str(path))
-            text = "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())[:max_chars]
-            return {"success": True, "content": text, "output": text}
+            total_paragraphs = len(doc.paragraphs)
+
+            # `page_or_sheet` is interpreted as a 0-based paragraph selector
+            # ("10", "10-50", "10,20,30-40") so callers can read a chunk of a
+            # large document without loading the whole body.
+            if page_or_sheet and str(page_or_sheet).strip():
+                selected = _parse_paragraph_selector(str(page_or_sheet), total_paragraphs)
+                selected_set = set(selected)
+                paragraphs = [
+                    p.text for idx, p in enumerate(doc.paragraphs)
+                    if idx in selected_set and p.text.strip()
+                ]
+            else:
+                paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+
+            full_text = "\n\n".join(paragraphs)
+            total_chars = len(full_text)
+            text = full_text[:max_chars]
+            truncated = total_chars > len(text)
+
+            # Image metadata (no bytes loaded) so the caller knows what's inside.
+            images_meta: List[Dict[str, Any]] = []
+            try:
+                from docx.oxml.ns import qn
+                for para_idx, para in enumerate(doc.paragraphs):
+                    for run in para.runs:
+                        for drawing in run._element.findall(f".//{qn('w:drawing')}"):
+                            for blip in drawing.findall(f".//{qn('a:blip')}"):
+                                embed_id = blip.get(qn("r:embed"))
+                                if not embed_id:
+                                    continue
+                                try:
+                                    image_part = doc.part.related_parts[embed_id]
+                                    images_meta.append({
+                                        "paragraph_index": para_idx,
+                                        "filename": Path(str(image_part.partname)).name,
+                                        "size_bytes": len(image_part.blob),
+                                        "content_type": image_part.content_type,
+                                    })
+                                except Exception:
+                                    continue
+            except Exception:
+                pass
+
+            result: Dict[str, Any] = {
+                "success": True,
+                "content": text,
+                "output": text,
+                "total_chars": total_chars,
+                "total_paragraphs": total_paragraphs,
+                "truncated": truncated,
+                "images": images_meta,
+                "image_count": len(images_meta),
+            }
+            if truncated:
+                result["next_offset_hint"] = (
+                    f"Body truncated at {len(text)} of {total_chars} chars. "
+                    f"Use tool_read_word(mode='chunk', offset={len(text)}) for the rest, "
+                    f"or narrow with page_or_sheet='<paragraph_range>'."
+                )
+            return result
 
         elif ext in (".xlsx", ".xls"):
             import openpyxl
@@ -989,12 +1078,21 @@ def get_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "tool_read_document_content",
-            "description": "Extracts readable text content from a document (supports specific pages or sheets).",
+            "description": (
+                "Extracts readable text content from a document. For PDF/PPTX, "
+                "`page_or_sheet` selects pages ('3', '2-6', '1,4,9-11'). For Excel, "
+                "it selects the sheet name. For DOCX, it selects a 0-based PARAGRAPH "
+                "range ('10', '10-50', '10,20,30-40'). Every response includes "
+                "total_chars and (for DOCX) total_paragraphs + images metadata "
+                "(count + per-image info) so you can plan chunked reads. When the "
+                "body is truncated, `next_offset_hint` tells you how to continue "
+                "with tool_read_word(mode='chunk', offset=...)."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "file_name": {"type": "string", "description": "Relative path to the file in the workspace."},
-                    "page_or_sheet": {"type": "string", "description": "Specific page number (PDF/PPTX) or sheet name (Excel)."},
+                    "page_or_sheet": {"type": "string", "description": "PDF/PPTX: page selector ('3', '2-6', '1,4,9-11'). Excel: sheet name. DOCX: 0-based paragraph range ('10-50')."},
                     "max_chars": {"type": "integer", "description": "Maximum characters to extract. Defaults to 8000."},
                 },
                 "required": ["file_name"],

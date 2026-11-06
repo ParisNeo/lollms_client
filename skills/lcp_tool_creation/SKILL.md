@@ -261,7 +261,28 @@ The UI thread listens on `event_queue`, renders a dialog (password field for `"s
 
 ---
 
-## 8. Pre-Flight Checklist
+## 8. Configuring Skill / Tool Output Paths
+
+When your host app supplies external skills (via `extra_skills_dirs`) or
+external tools (via `extra_tools`), the LLM's `tool_create_skill` and
+`tool_tool_maker` default to writing into the handbag's own `skills/` and
+`tools/` folders. To redirect them:
+
+- **Manifest-based** (persistent): declare in `handbag.yaml`:
+  ```yaml
+  skills_output_path: "./external_skills"
+  tools_output_path: "./external_tools"
+  ```
+- **Per-call override** (transient): pass `output_path` to `tool_create_skill`
+  or `tools_output_path` to `tool_tool_maker` in the tool call.
+
+**In-place updates**: `tool_update_skill` / `tool_append_to_skill` always write
+back to the skill's original `file_path` — external skills are modified where
+they live, never copied.
+
+---
+
+## 9. Pre-Flight Checklist
 
 Before shipping an LCP tool, verify:
 

@@ -911,16 +911,143 @@ def tool_edit_word(
         }
 
 
+def _extract_docx_body_text(
+    doc: Any,
+    include_tables: bool = True,
+    include_headers_footers: bool = False,
+) -> str:
+    """Extracts the full body text of a docx in document order (paragraphs + tables).
+
+    Paragraphs are joined with a blank line. Tables are rendered as markdown
+    when `include_tables` is True. Headers/footers are appended at the end
+    when `include_headers_footers` is True.
+    """
+    from docx.oxml.ns import qn
+
+    parts: List[str] = []
+    body = doc.element.body
+    for child in body.iterchildren():
+        if child.tag == qn("w:p"):
+            # Find the matching Paragraph wrapper by identity of the XML element.
+            for para in doc.paragraphs:
+                if para._p is child:
+                    if para.text.strip():
+                        parts.append(para.text)
+                    break
+        elif child.tag == qn("w:tbl") and include_tables:
+            for table in doc.tables:
+                if table._tbl is child:
+                    rows_md: List[str] = []
+                    for row in table.rows:
+                        cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+                        rows_md.append("| " + " | ".join(cells) + " |")
+                    if rows_md:
+                        header_sep = "| " + " | ".join(["---"] * len(table.columns)) + " |"
+                        parts.append("\n".join([rows_md[0], header_sep] + rows_md[1:]))
+                    break
+
+    if include_headers_footers:
+        for section in doc.sections:
+            for label, container in (("Header", section.header), ("Footer", section.footer)):
+                for para in container.paragraphs:
+                    if para.text.strip():
+                        parts.append(f"[{label}] {para.text}")
+
+    return "\n\n".join(parts)
+
+
+def _extract_docx_images_metadata(doc: Any) -> List[Dict[str, Any]]:
+    """Returns metadata for every inline image in the document (no bytes loaded).
+
+    Each entry: paragraph_index, filename, size_bytes, content_type.
+    """
+    from docx.oxml.ns import qn
+
+    images: List[Dict[str, Any]] = []
+    for para_idx, para in enumerate(doc.paragraphs):
+        for run in para.runs:
+            for drawing in run._element.findall(f".//{qn('w:drawing')}"):
+                for blip in drawing.findall(f".//{qn('a:blip')}"):
+                    embed_id = blip.get(qn("r:embed"))
+                    if not embed_id:
+                        continue
+                    try:
+                        image_part = doc.part.related_parts[embed_id]
+                        images.append({
+                            "paragraph_index": para_idx,
+                            "filename": Path(str(image_part.partname)).name,
+                            "size_bytes": len(image_part.blob),
+                            "content_type": image_part.content_type,
+                        })
+                    except Exception:
+                        continue
+    return images
+
+
+def _parse_paragraph_selector(selector: Optional[str], total: int) -> List[int]:
+    """Parses a 0-based paragraph selector into a sorted list of indices.
+
+    Grammar: "10" | "10-50" | "10,20,30-40" | "" (all).
+    Out-of-range values are clamped; unparseable tokens are ignored.
+    """
+    if not selector or not str(selector).strip():
+        return list(range(total))
+    indices: set[int] = set()
+    for part in str(selector).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_s, _, end_s = part.partition("-")
+            try:
+                start, end = int(start_s.strip()), int(end_s.strip())
+            except ValueError:
+                continue
+            if start > end:
+                start, end = end, start
+            for i in range(max(0, start), min(total - 1, end) + 1):
+                indices.add(i)
+        elif part.isdigit():
+            i = int(part)
+            if 0 <= i < total:
+                indices.add(i)
+    return sorted(indices) if indices else list(range(total))
+
+
 def tool_read_word(
     file: str,
+    mode: str = "text",
+    offset: int = 0,
+    limit: int = 0,
+    paragraph_range: Optional[str] = None,
+    include_tables: bool = True,
+    include_headers_footers: bool = False,
     discussion_instance: Optional[Any] = None,
     lollms_client_instance: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Reads an existing Word document (.docx/.docm) and returns a markdown inventory.
+    """Reads a Word document (.docx/.docm) with explicit read modes.
 
-    Returns paragraphs (with style names) and tables. Validates the file
-    first; corrupt files return a structured failure instead of a crash.
-    No recipe is executed and nothing is saved.
+    MODES
+    -----
+    - "text"      : full body text (paragraphs + tables as markdown).
+    - "peek"      : first `limit` chars only (default 2000) — cheap preview.
+    - "chunk"     : slice [offset : offset+limit] of the body text.
+    - "inventory" : markdown inventory (paragraph indices + styles + comments
+                    + highlights) — the legacy behavior.
+
+    Every response includes `total_chars`, `total_paragraphs`, `total_tables`,
+    and `images` metadata (count + per-image info) so the caller can plan
+    chunked reads without re-inspecting the file.
+
+    Args:
+        file: Existing .docx/.docm file (relative to workspace or absolute).
+        mode: "text" | "peek" | "chunk" | "inventory". Defaults to "text".
+        offset: 0-based char offset for mode="chunk".
+        limit: Max chars to return. 0 = no limit (mode="text") / 2000 (mode="peek").
+        paragraph_range: Optional 0-based paragraph selector ("10-50", "10,20,30-40").
+                         When set, only those paragraphs are included in the body.
+        include_tables: Append tables as markdown (default True).
+        include_headers_footers: Append header/footer text (default False).
     """
     try:
         if not file or not str(file).strip():
@@ -950,18 +1077,278 @@ def tool_read_word(
                 ),
             }
 
-        inventory = _read_docx(file_path)
+        from docx import Document
+        doc = Document(str(file_path))
+
+        total_paragraphs = len(doc.paragraphs)
+        total_tables = len(doc.tables)
+        images = _extract_docx_images_metadata(doc)
+
+        normalized_mode = (mode or "text").strip().lower()
+        if normalized_mode not in ("text", "peek", "chunk", "inventory"):
+            return {
+                "success": False,
+                "error": f"Invalid mode '{mode}'. Use 'text', 'peek', 'chunk', or 'inventory'.",
+            }
+
+        if normalized_mode == "inventory":
+            inventory = _read_docx(file_path)
+            return {
+                "success": True,
+                "mode": "inventory",
+                "file_name": file_path.name,
+                "workspace_file": str(file_path.resolve()),
+                "inventory": inventory,
+                "total_paragraphs": total_paragraphs,
+                "total_tables": total_tables,
+                "images": images,
+                "image_count": len(images),
+            }
+
+        # Build the body text (optionally restricted to a paragraph range).
+        if paragraph_range:
+            selected = _parse_paragraph_selector(paragraph_range, total_paragraphs)
+            selected_set = set(selected)
+            body_parts: List[str] = []
+            for idx, para in enumerate(doc.paragraphs):
+                if idx in selected_set and para.text.strip():
+                    body_parts.append(para.text)
+            body_text = "\n\n".join(body_parts)
+            if include_tables:
+                for table in doc.tables:
+                    rows_md: List[str] = []
+                    for row in table.rows:
+                        cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+                        rows_md.append("| " + " | ".join(cells) + " |")
+                    if rows_md:
+                        header_sep = "| " + " | ".join(["---"] * len(table.columns)) + " |"
+                        body_text += "\n\n" + "\n".join([rows_md[0], header_sep] + rows_md[1:])
+        else:
+            body_text = _extract_docx_body_text(
+                doc,
+                include_tables=include_tables,
+                include_headers_footers=include_headers_footers,
+            )
+
+        total_chars = len(body_text)
+
+        if normalized_mode == "text":
+            return {
+                "success": True,
+                "mode": "text",
+                "file_name": file_path.name,
+                "workspace_file": str(file_path.resolve()),
+                "text": body_text,
+                "content": body_text,
+                "output": body_text,
+                "total_chars": total_chars,
+                "total_paragraphs": total_paragraphs,
+                "total_tables": total_tables,
+                "images": images,
+                "image_count": len(images),
+            }
+
+        if normalized_mode == "peek":
+            peek_limit = limit if limit and limit > 0 else 2000
+            snippet = body_text[:peek_limit]
+            return {
+                "success": True,
+                "mode": "peek",
+                "file_name": file_path.name,
+                "workspace_file": str(file_path.resolve()),
+                "text": snippet,
+                "content": snippet,
+                "output": snippet,
+                "total_chars": total_chars,
+                "returned_chars": len(snippet),
+                "has_more": total_chars > len(snippet),
+                "next_offset": len(snippet) if total_chars > len(snippet) else None,
+                "total_paragraphs": total_paragraphs,
+                "total_tables": total_tables,
+                "images": images,
+                "image_count": len(images),
+            }
+
+        # mode == "chunk"
+        try:
+            start = max(0, int(offset))
+        except (TypeError, ValueError):
+            start = 0
+        try:
+            chunk_limit = int(limit) if limit else 4000
+        except (TypeError, ValueError):
+            chunk_limit = 4000
+        if chunk_limit <= 0:
+            chunk_limit = 4000
+        end = min(total_chars, start + chunk_limit)
+        chunk = body_text[start:end]
         return {
             "success": True,
+            "mode": "chunk",
             "file_name": file_path.name,
             "workspace_file": str(file_path.resolve()),
-            "inventory": inventory,
+            "text": chunk,
+            "content": chunk,
+            "output": chunk,
+            "offset": start,
+            "returned_chars": len(chunk),
+            "total_chars": total_chars,
+            "has_more": end < total_chars,
+            "next_offset": end if end < total_chars else None,
+            "total_paragraphs": total_paragraphs,
+            "total_tables": total_tables,
+            "images": images,
+            "image_count": len(images),
         }
     except Exception as unexpected_err:
         return {
             "success": False,
             "error": f"Unexpected failure reading Word document: {unexpected_err}",
         }
+
+
+def tool_add_word_comment(
+    file: str,
+    comment: str,
+    search_text: Optional[str] = None,
+    author: str = "Assistant",
+    paragraph_index: Optional[int] = None,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Adds a native Word review comment (Review-pane margin box) to a .docx file.
+
+    The comment is a REAL OOXML comment (w:comment in comments.xml, anchored
+    with commentRangeStart/commentRangeEnd around the target run). The comments
+    part is created automatically when missing.
+
+    Args:
+        file: Existing .docx/.docm file (relative to workspace or absolute).
+        comment: The comment text.
+        search_text: Text to anchor the comment on. Preferred anchor.
+        author: Comment author name. Defaults to "Assistant".
+        paragraph_index: 0-based index into non-empty paragraphs when search_text is absent.
+        discussion_instance: Active discussion session instance.
+        lollms_client_instance: Active client instance.
+    """
+    suffix_failure = _require_suffix(file, _DOCX_SUFFIXES, "tool_add_word_comment")
+    if suffix_failure is not None:
+        return suffix_failure
+    try:
+        if not file or not str(file).strip():
+            return {"success": False, "error": "No file provided."}
+
+        working_dir = _resolve_working_dir(discussion_instance)
+        candidate = Path(str(file).strip())
+        file_path = candidate if candidate.is_absolute() else working_dir / candidate
+        if not file_path.is_file():
+            return {"success": False, "error": f"File not found: {file_path}"}
+
+        ok, reason = _validate_office_file(file_path)
+        if not ok:
+            return {
+                "success": False,
+                "error": (
+                    f"Office Document Integrity Failure [{OFFICE_GUARD_FAILURE_CODE}]: "
+                    f"'{file_path.name}' is corrupt and cannot be read safely.\n"
+                    f"Reason: {reason}"
+                ),
+            }
+
+        from docx import Document
+        doc = Document(str(file_path))
+
+        target_run = _resolve_run_for_text(doc, search_text) if search_text else None
+        target_paragraph = None
+
+        if target_run is not None:
+            target_paragraph = target_run._parent
+        else:
+            non_empty = [p for p in doc.paragraphs if p.text.strip()]
+            if not non_empty:
+                return {"success": False, "error": f"Document '{file_path.name}' has no non-empty paragraphs to anchor a comment on."}
+            if paragraph_index is not None:
+                if not (0 <= paragraph_index < len(non_empty)):
+                    return {"success": False, "error": f"paragraph_index {paragraph_index} out of range (0..{len(non_empty) - 1})."}
+                target_paragraph = non_empty[paragraph_index]
+            else:
+                target_paragraph = non_empty[0]
+
+        add_comment = _build_add_comment_helper()
+        add_comment(doc, target_paragraph, comment, author=author, run=target_run)
+
+        save_result = _save_and_verify(doc, file_path)
+        if not save_result["success"]:
+            return save_result
+
+        return {
+            "success": True,
+            "author": author,
+            "file_name": file_path.name,
+            "workspace_file": str(file_path.resolve()),
+            "output": f"Added native Word comment to '{file_path.name}' by '{author}'.",
+        }
+    except Exception as e:
+        import traceback as _tb
+        return {"success": False, "error": f"Failed to add comment to '{file}': {e}", "traceback": _tb.format_exc()}
+
+
+def tool_get_word_comments(
+    file: str,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Lists all native Word review comments in a .docx file.
+
+    Args:
+        file: Existing .docx/.docm file (relative to workspace or absolute).
+        discussion_instance: Active discussion session instance.
+        lollms_client_instance: Active client instance.
+    """
+    suffix_failure = _require_suffix(file, _DOCX_SUFFIXES, "tool_get_word_comments")
+    if suffix_failure is not None:
+        return suffix_failure
+    try:
+        if not file or not str(file).strip():
+            return {"success": False, "error": "No file provided."}
+
+        working_dir = _resolve_working_dir(discussion_instance)
+        candidate = Path(str(file).strip())
+        file_path = candidate if candidate.is_absolute() else working_dir / candidate
+        if not file_path.is_file():
+            return {"success": False, "error": f"File not found: {file_path}"}
+
+        ok, reason = _validate_office_file(file_path)
+        if not ok:
+            return {
+                "success": False,
+                "error": (
+                    f"Office Document Integrity Failure [{OFFICE_GUARD_FAILURE_CODE}]: "
+                    f"'{file_path.name}' is corrupt and cannot be read safely.\n"
+                    f"Reason: {reason}"
+                ),
+            }
+
+        from docx import Document
+        doc = Document(str(file_path))
+        comments = _list_comments(doc)
+        if not comments:
+            output = f"No native comments found in '{file_path.name}'."
+        else:
+            lines = [f"Found {len(comments)} comment(s) in '{file_path.name}':"]
+            for c in comments:
+                lines.append(f"  [id={c['id']}] {c['author']} ({c['date']}): {c['text']}")
+            output = "\n".join(lines)
+        return {
+            "success": True,
+            "file_name": file_path.name,
+            "workspace_file": str(file_path.resolve()),
+            "count": len(comments),
+            "comments": comments,
+            "output": output,
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Failed to read comments from '{file}': {e}"}
 
 
 def tool_word_review(
@@ -1114,9 +1501,16 @@ def get_tools() -> List[Dict[str, Any]]:
         {
             "name": "tool_read_word",
             "description": (
-                "Reads an existing Word document (.docx/.docm) and returns a markdown inventory "
-                "(paragraphs with styles, tables, comments, highlights). Validates the file first; "
-                "corrupt files return a structured failure."
+                "Reads a Word document (.docx/.docm) with explicit read modes. "
+                "MODES: 'text' (full body text, paragraphs + tables as markdown), "
+                "'peek' (first N chars — cheap preview), 'chunk' (slice [offset:offset+limit] "
+                "for large documents), 'inventory' (paragraph indices + styles + comments + "
+                "highlights). Every response includes total_chars, total_paragraphs, "
+                "total_tables, and images metadata (count + per-image info: paragraph_index, "
+                "filename, size_bytes, content_type) so you can plan chunked reads without "
+                "re-inspecting the file. Use 'peek' first, then 'chunk' with next_offset to "
+                "walk the document. Use paragraph_range ('10-50', '10,20,30-40') to restrict "
+                "the body to specific paragraphs."
             ),
             "parameters": [
                 {
@@ -1124,10 +1518,56 @@ def get_tools() -> List[Dict[str, Any]]:
                     "type": "str",
                     "description": "Existing .docx/.docm file to read (relative to workspace or absolute path).",
                 },
+                {
+                    "name": "mode",
+                    "type": "str",
+                    "description": "'text' (full body) | 'peek' (first N chars) | 'chunk' (offset+limit slice) | 'inventory' (paragraph indices + styles). Defaults to 'text'.",
+                    "optional": True,
+                },
+                {
+                    "name": "offset",
+                    "type": "int",
+                    "description": "0-based char offset for mode='chunk'. Defaults to 0.",
+                    "optional": True,
+                },
+                {
+                    "name": "limit",
+                    "type": "int",
+                    "description": "Max chars to return. 0 = no limit (mode='text') / 2000 (mode='peek') / 4000 (mode='chunk').",
+                    "optional": True,
+                },
+                {
+                    "name": "paragraph_range",
+                    "type": "str",
+                    "description": "Optional 0-based paragraph selector ('10-50', '10,20,30-40'). Restricts the body to those paragraphs.",
+                    "optional": True,
+                },
+                {
+                    "name": "include_tables",
+                    "type": "bool",
+                    "description": "Append tables as markdown. Defaults to True.",
+                    "optional": True,
+                },
+                {
+                    "name": "include_headers_footers",
+                    "type": "bool",
+                    "description": "Append header/footer text. Defaults to False.",
+                    "optional": True,
+                },
             ],
             "output": [
                 {"name": "success", "type": "bool", "description": "Whether the operation succeeded."},
-                {"name": "inventory", "type": "str", "description": "Markdown inventory of the document contents."},
+                {"name": "mode", "type": "str", "description": "The mode that was executed."},
+                {"name": "text", "type": "str", "description": "The extracted text (for text/peek/chunk modes)."},
+                {"name": "inventory", "type": "str", "description": "Markdown inventory (for inventory mode)."},
+                {"name": "total_chars", "type": "int", "description": "Total body text length in chars."},
+                {"name": "returned_chars", "type": "int", "description": "Chars returned in this call."},
+                {"name": "has_more", "type": "bool", "description": "True if more text remains (peek/chunk modes)."},
+                {"name": "next_offset", "type": "int", "description": "Offset to pass to the next chunk call (peek/chunk modes)."},
+                {"name": "total_paragraphs", "type": "int", "description": "Total paragraph count."},
+                {"name": "total_tables", "type": "int", "description": "Total table count."},
+                {"name": "images", "type": "list", "description": "Per-image metadata (paragraph_index, filename, size_bytes, content_type)."},
+                {"name": "image_count", "type": "int", "description": "Number of inline images."},
                 {"name": "file_name", "type": "str", "description": "Name of the file read."},
                 {"name": "workspace_file", "type": "str", "description": "Absolute path to the file."},
                 {"name": "error", "type": "str", "description": "Error message if failed."},
@@ -1162,6 +1602,79 @@ def get_tools() -> List[Dict[str, Any]]:
                 {"name": "error", "type": "str", "description": "Error message if failed."},
             ],
             "callable": tool_word_review,
+            "_source": "word_tools",
+            "_source_file": __file__,
+        },
+        {
+            "name": "tool_add_word_comment",
+            "description": (
+                "Adds a native Word review comment (Review-pane margin box) to a .docx file, "
+                "anchored on search_text or paragraph_index. The comment is a REAL OOXML comment "
+                "(w:comment in comments.xml, anchored with commentRangeStart/commentRangeEnd "
+                "around the target run). The comments part is created automatically when missing."
+            ),
+            "parameters": [
+                {
+                    "name": "file",
+                    "type": "str",
+                    "description": "Existing .docx/.docm file (relative to workspace or absolute path).",
+                },
+                {
+                    "name": "comment",
+                    "type": "str",
+                    "description": "The comment text.",
+                },
+                {
+                    "name": "search_text",
+                    "type": "str",
+                    "description": "Text to anchor the comment on (preferred).",
+                    "optional": True,
+                },
+                {
+                    "name": "author",
+                    "type": "str",
+                    "description": "Comment author name. Defaults to 'Assistant'.",
+                    "optional": True,
+                },
+                {
+                    "name": "paragraph_index",
+                    "type": "int",
+                    "description": "0-based index into non-empty paragraphs when search_text is absent.",
+                    "optional": True,
+                },
+            ],
+            "output": [
+                {"name": "success", "type": "bool", "description": "Whether the operation succeeded."},
+                {"name": "author", "type": "str", "description": "Comment author."},
+                {"name": "file_name", "type": "str", "description": "Name of the file."},
+                {"name": "workspace_file", "type": "str", "description": "Absolute path to the file."},
+                {"name": "output", "type": "str", "description": "Human-readable summary."},
+                {"name": "error", "type": "str", "description": "Error message if failed."},
+            ],
+            "callable": tool_add_word_comment,
+            "_source": "word_tools",
+            "_source_file": __file__,
+        },
+        {
+            "name": "tool_get_word_comments",
+            "description": "Lists all native Word review comments in a .docx file.",
+            "parameters": [
+                {
+                    "name": "file",
+                    "type": "str",
+                    "description": "Existing .docx/.docm file (relative to workspace or absolute path).",
+                },
+            ],
+            "output": [
+                {"name": "success", "type": "bool", "description": "Whether the operation succeeded."},
+                {"name": "count", "type": "int", "description": "Number of comments found."},
+                {"name": "comments", "type": "list", "description": "Structured comments (id, author, initials, date, text)."},
+                {"name": "file_name", "type": "str", "description": "Name of the file."},
+                {"name": "workspace_file", "type": "str", "description": "Absolute path to the file."},
+                {"name": "output", "type": "str", "description": "Human-readable summary."},
+                {"name": "error", "type": "str", "description": "Error message if failed."},
+            ],
+            "callable": tool_get_word_comments,
             "_source": "word_tools",
             "_source_file": __file__,
         },

@@ -257,7 +257,22 @@ A runnable copy of this example ships with the client at
 
 ---
 
-## 5. Best Practices Checklist
+## 5. Skill / Tool Output Paths
+
+When supplying external skills or tools to an agent, control where NEW
+artifacts land:
+
+- `handbag.yaml`: `skills_output_path: "./external_skills"` and
+  `tools_output_path: "./external_tools"` (relative to handbag root or absolute).
+- Per-call: `output_path` on `tool_create_skill`, `tools_output_path` on
+  `tool_tool_maker`.
+
+Existing skills are updated in-place at their original `file_path` — no copy
+is ever created in the handbag.
+
+---
+
+## 6. Best Practices Checklist
 
 1. **Gate, don't ask twice**: use the confirm handler for *authorization* (yes/no/always) and the interaction handler for *information* (values). Never use one for the other's job.
 2. **Never log secrets**: mask returned secret values (`***1234`) before putting them in `output`.

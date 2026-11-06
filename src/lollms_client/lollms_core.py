@@ -161,6 +161,12 @@ class LollmsClient():
         ai_name = "assistant",
         callback: Optional[Callable[[str, MSG_TYPE, Optional[Dict]], bool]] = None,
 
+        # 📂 Root data folder forwarded to every binding instance.
+        # Defaults to <package_dir>/data so apps have a stable, discoverable
+        # place to store models, caches, venvs and databases. Users may point
+        # this to another disk when the code volume is small.
+        lollms_data_folder: Optional[Union[str, Path]] = None,
+
         debug: Optional[bool] = True,
         cooperative_vram_management: Optional[bool] = False,
 
@@ -214,6 +220,18 @@ class LollmsClient():
             self.system_dir.mkdir(parents=True, exist_ok=True)
         else:
             self.system_dir = None
+
+        # 📂 Resolve and materialize the client-wide data folder.
+        if lollms_data_folder:
+            self.lollms_data_folder = Path(lollms_data_folder).expanduser().resolve()
+        else:
+            self.lollms_data_folder = (Path(__file__).parent / "data").resolve()
+        try:
+            self.lollms_data_folder.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            ASCIIColors.warning(
+                f"[LollmsClient] Could not create data folder '{self.lollms_data_folder}': {exc}"
+            )
 
         self.cooperative_vram_management = cooperative_vram_management
         if callback: callback("🚀 Initializing **Lollms Client**...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
@@ -339,7 +357,10 @@ class LollmsClient():
         if tools_binding_name:
             if callback: callback(f"🔌 Initializing **MCP** binding: `{tools_binding_name}`...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
             try:
-                self.tools = self.tools_binding_manager.create_binding(binding_name=tools_binding_name, **(tools_binding_config or {}))
+                tools_cfg = dict(tools_binding_config or {})
+                if getattr(self, "lollms_data_folder", None):
+                    tools_cfg.setdefault('lollms_data_folder', str(self.lollms_data_folder))
+                self.tools = self.tools_binding_manager.create_binding(binding_name=tools_binding_name, **tools_cfg)
                 if self.tools is None:
                     msg = f"Failed to create MCP binding: {tools_binding_name}"
                     if callback: callback(f"❌ {msg}", MSG_TYPE.MSG_TYPE_ERROR, {})
@@ -665,6 +686,10 @@ class LollmsClient():
         if self.system_dir:
             b_config.setdefault('system_dir', str(self.system_dir))
             b_config.setdefault('cwd', str(self.system_dir))
+        # 📂 Forward the client-wide data folder to every binding instance so
+        # bindings know where to persist models/caches/venvs safely.
+        if getattr(self, "lollms_data_folder", None):
+            b_config['lollms_data_folder'] = str(self.lollms_data_folder)
 
         try:
             binding = manager.create_binding(
@@ -795,10 +820,22 @@ class LollmsClient():
 
     def sink(self, s=None,i=None,d=None): pass
 
+    def get_data_folder(self) -> Path:
+        """
+        Returns the client-wide data folder forwarded to every binding.
+
+        Apps should use this (or pass it explicitly to a binding) as the root
+        for any persistent artifact (models, caches, virtual-envs, DBs) so a
+        user can relocate storage to a larger disk without moving the code.
+        """
+        return self.lollms_data_folder
+
     # --- Binding Updates ---
     def _update_binding(self, binding_name: str, config: Optional[Dict[str, Any]], binding_registry: dict, model_registry: dict, instance_cache: dict, switch_method: Callable, modality: str):
         """Generic update method for all modality bindings, respecting the two-tier architecture."""
-        config = config or {}
+        config = dict(config or {})
+        if getattr(self, "lollms_data_folder", None):
+            config.setdefault('lollms_data_folder', str(self.lollms_data_folder))
         binding_registry["master"] = LollmsBindingProfile(
             name="master",
             binding_name=binding_name,

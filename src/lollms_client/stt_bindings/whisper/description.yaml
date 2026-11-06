@@ -44,16 +44,38 @@ global_input_parameters:
     description: "Authentication token for securing server access. Loaded from whisper_server.token if omitted."
     mandatory: false
     default: ""
+  - name: lollms_data_folder
+    type: str
+    description: >
+      Client-wide data root, usually injected automatically by LollmsClient.
+      When provided, Whisper stores its venv, models, tokens, pid and logs under
+      <lollms_data_folder>/stt/whisper. If left empty, the shared default
+      ~/.lollms/data is used (or $LOLLMS_DATA_FOLDER when set permanently).
+      Override at the client level to relocate storage to a larger disk
+      without moving the code tree.
+    mandatory: false
+    default: ""
   - name: venv_path
     type: str
-    description: "Path to the dedicated virtual environment for the Whisper server."
+    description: "Path to the dedicated virtual environment for the Whisper server. Defaults to <system_dir>/venv/stt_whisper_venv."
     mandatory: false
     default: "./venv/stt_whisper_venv"
   - name: cache_dir
     type: str
-    description: "Directory where Whisper models, logs, and authentication tokens are stored."
+    description: >
+      Directory where the whisper daemon keeps runtime state (authentication
+      token, PID file, spawn lock, server log). Defaults to
+      <lollms_data_folder>/stt/whisper. Model weights live in models_dir, not here.
     mandatory: false
-    default: "./data/stt_models/whisper"
+    default: ""
+  - name: models_dir
+    type: str
+    description: >
+      Directory where Whisper model weights are downloaded and loaded from.
+      Defaults to <lollms_data_folder>/stt/whisper/models. Forwarded to the
+      server via --models-dir and used as the download_root of whisper.load_model.
+    mandatory: false
+    default: ""
 model_input_parameters:
   - name: model_name
     type: str

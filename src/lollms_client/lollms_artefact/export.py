@@ -558,11 +558,20 @@ class ExportMixin:
                 workspace_dir = APP_WORKSPACE_DIR
         except ImportError:
             pass
-        file_path = workspace_dir / f"{title}_v{version}{ext}"
 
-        if not file_path.exists():
-            raise FileNotFoundError(f"Original dataset file not found at {file_path}")
-            
+        # Resolve the physical file, tolerating both versioned and unversioned
+        # layouts. When versioning is disabled (agentic mode), the physical file
+        # lives under the plain (unversioned) name only.
+        candidates = [
+            workspace_dir / f"{title}_v{version}{ext}",
+            workspace_dir / f"{title}{ext}",
+        ]
+        file_path = next((p for p in candidates if p.exists()), None)
+        if file_path is None:
+            raise FileNotFoundError(
+                f"Original dataset file not found. Tried: {[str(p) for p in candidates]}"
+            )
+
         try:
             if ext in (".db", ".sqlite", ".sqlite3"):
                 import sqlite3
@@ -602,11 +611,19 @@ class ExportMixin:
                 workspace_dir = APP_WORKSPACE_DIR
         except ImportError:
             pass
-        file_path = workspace_dir / f"{title}_v{version}{ext}"
 
-        if not file_path.exists():
-            raise FileNotFoundError(f"Original dataset file not found at {file_path}")
-            
+        # Resolve the physical file, tolerating both versioned and unversioned
+        # layouts (agentic mode writes only the plain, unversioned name).
+        candidates = [
+            workspace_dir / f"{title}_v{version}{ext}",
+            workspace_dir / f"{title}{ext}",
+        ]
+        file_path = next((p for p in candidates if p.exists()), None)
+        if file_path is None:
+            raise FileNotFoundError(
+                f"Original dataset file not found. Tried: {[str(p) for p in candidates]}"
+            )
+
         try:
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine="openpyxl") as writer:

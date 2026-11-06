@@ -54,6 +54,13 @@ __all__ = [
     "get_configured_profiles",
     "get_binding_params",
     "get_profile_params",
+    "get_data_folder",
+    "set_data_folder",
+    "get_config_file_path",
+    "set_config_file_path",
+    "get_model_profile_schema",
+    "get_binding_commands",
+    "get_configured_commands",
     "set_binding_params",
     "set_profile_params",
     "set_default_profile",
@@ -67,8 +74,18 @@ __all__ = [
 
 SUPPORTED_MODALITIES: Tuple[str, ...] = ("llm", "tti", "tts", "stt", "ttm", "ttv", "connection")
 
-_GLOBAL_CONFIG_DIR = Path.home() / ".lollms_client"
-_GLOBAL_CONFIG_FILE = _GLOBAL_CONFIG_DIR / "config.yaml"
+def _resolve_global_config_file() -> Path:
+    """Returns the shared configuration file via the centralized path policy.
+
+    Honors ``$LOLLMS_CONFIG_FILE`` and defaults to ``~/.lollms/config.yaml``.
+    Kept as a function so env changes during a session are picked up eagerly.
+    """
+    try:
+        from lollms_client.lollms_paths import get_config_file
+        return get_config_file()
+    except Exception:
+        return (Path.home() / ".lollms" / "config.yaml").resolve()
+</｜DSML｜ parameter>
 
 
 def _validate_modality(modality: str) -> str:
@@ -197,11 +214,12 @@ def load_config_map(
     config_map: Dict[str, str] = {}
 
     # Load global config first
-    if global_config and _GLOBAL_CONFIG_FILE.exists():
+    global_file = _resolve_global_config_file()
+    if global_config and global_file.exists():
         try:
-            config_map.update(_flatten_dict_to_env(load_yaml_file(_GLOBAL_CONFIG_FILE)))
+            config_map.update(_flatten_dict_to_env(load_yaml_file(global_file)))
         except Exception as e:
-            ASCIIColors.warning(f"[lollms_config_api] Failed to parse {_GLOBAL_CONFIG_FILE}: {e}")
+            ASCIIColors.warning(f"[lollms_config_api] Failed to parse {global_file}: {e}")
 
     # Then conf_dict overrides
     if conf_dict:
@@ -222,6 +240,92 @@ def load_config_map(
         else:
             raise ValueError(f"Unsupported configuration format: {p.suffix}. Use .yaml, .yml, or .json")
 
+    return config_map
+
+
+def get_data_folder(config_map: Dict[str, str]) -> Optional[str]:
+    """Returns the configured client-wide data folder, or None for the default."""
+    return config_map.get("LOLLMS_DATA_FOLDER") or None
+
+
+def get_config_file_path(config_map: Optional[Dict[str, str]] = None) -> str:
+    """
+    Returns the active configuration file path.
+
+    Honors, in order: an in-map override (``LOLLMS_CONFIG_FILE`` key, highest
+    priority for UI-driven overrides), then ``$LOLLMS_CONFIG_FILE`` from the
+    process env, then the shared default ``~/.lollms/config.yaml``.
+    """
+    if config_map:
+        override = config_map.get("LOLLMS_CONFIG_FILE")
+        if override:
+            return str(Path(override).expanduser().resolve())
+    return str(_resolve_global_config_file())
+
+
+def set_config_file_path(
+    config_map: Dict[str, str],
+    path: Optional[Union[str, Path]],
+    persist_globally: bool = False,
+) -> Dict[str, str]:
+    """
+    Sets (or clears when ``path`` is empty/None) the config file path.
+
+    Args:
+        config_map: the flat map to mutate.
+        path: new config file path, or None/empty to clear.
+        persist_globally: when True, also persists the value as the user-scope
+            env var ``LOLLMS_CONFIG_FILE`` so all future sessions comply.
+
+    Returns:
+        The updated ``config_map``.
+    """
+    cleaned = str(path).strip() if path else ""
+    if not cleaned:
+        config_map.pop("LOLLMS_CONFIG_FILE", None)
+        if persist_globally:
+            try:
+                from lollms_client.lollms_paths import (
+                    ENV_CONFIG_FILE,
+                    unset_env_var_permanently,
+                )
+                unset_env_var_permanently(ENV_CONFIG_FILE)
+            except Exception:
+                pass
+        return config_map
+
+    resolved = Path(cleaned).expanduser().resolve()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    config_map["LOLLMS_CONFIG_FILE"] = str(resolved)
+
+    if persist_globally:
+        try:
+            from lollms_client.lollms_paths import (
+                ENV_CONFIG_FILE,
+                set_env_var_permanently,
+            )
+            set_env_var_permanently(ENV_CONFIG_FILE, str(resolved))
+        except Exception:
+            pass
+    return config_map
+
+
+def set_data_folder(config_map: Dict[str, str], folder: Optional[Union[str, Path]]) -> Dict[str, str]:
+    """
+    Sets (or clears when ``folder`` is empty/None) the client-wide data folder.
+
+    When provided, the folder is created on disk. Values are stored under the
+    top-level ``LOLLMS_DATA_FOLDER`` key and serialized as ``lollms_data_folder``
+    in the YAML root (see ``config_map_to_dict``).
+    """
+    cleaned = str(folder).strip() if folder else ""
+    if not cleaned:
+        config_map.pop("LOLLMS_DATA_FOLDER", None)
+        return config_map
+
+    resolved = Path(cleaned).expanduser().resolve()
+    resolved.mkdir(parents=True, exist_ok=True)
+    config_map["LOLLMS_DATA_FOLDER"] = str(resolved)
     return config_map
 
 
@@ -260,6 +364,86 @@ def get_binding_params(config_map: Dict[str, str], modality: str, alias: str) ->
     alias = _sanitize_alias(alias)
     prefix = f"{modality.upper()}_BINDINGS_{alias.upper()}_"
     return {k[len(prefix):]: v for k, v in config_map.items() if k.upper().startswith(prefix)}
+
+
+def get_model_profile_schema(modality: str, binding_name: str) -> List[Dict[str, Any]]:
+    """
+    Returns the *per-model* parameter schema declared by a binding in its
+    ``description.yaml`` under ``model_profiles_input_parameters``.
+
+    These are the parameters a spawned model profile may set independently
+    (e.g. ``n_gpu_layers``, ``context_size``, ``flash_attn`` for
+    ``llama_cpp_server``) — distinct from the binding-instance parameters
+    returned by ``get_binding_schema``.
+
+    Args:
+        modality: one of SUPPORTED_MODALITIES.
+        binding_name: canonical binding implementation name (e.g. "llama_cpp_server").
+
+    Returns:
+        A list of dicts with keys ``name`` / ``type`` / ``mandatory`` /
+        ``default`` / ``description``. Empty list when the binding declares
+        no per-model parameters (backward compatible).
+    """
+    from lollms_client.lollms_config_cli_env import _get_model_profile_schema
+
+    modality = _validate_modality(modality)
+    binding_name = (binding_name or "").strip()
+    if not binding_name:
+        return []
+    return _get_model_profile_schema(modality, binding_name)
+
+
+def get_binding_commands(modality: str, binding_name: str) -> List[Dict[str, Any]]:
+    """
+    Returns the commands a binding declares in its ``description.yaml``.
+
+    Each entry has ``name``, ``title``, ``description``, ``parameters`` and
+    ``output``. This is the *declaration* (what the binding can offer); to know
+    which commands are currently *enabled* in a map, use
+    :func:`get_configured_commands`.
+    """
+    from lollms_client.lollms_config_cli_env import _get_binding_commands
+
+    modality = _validate_modality(modality)
+    binding_name = (binding_name or "").strip()
+    if not binding_name:
+        return []
+    return _get_binding_commands(binding_name, modality)
+
+
+def get_configured_commands(
+    config_map: Dict[str, str],
+    modality: str,
+    binding_alias: str,
+) -> Dict[str, Dict[str, str]]:
+    """
+    Returns the commands currently enabled for a given binding instance.
+
+    Keys in the returned dict are the **command aliases** (the per-command
+    identifier without the binding prefix), and values are the raw parameter
+    maps (``NAME``, ``TITLE``, ``DESCRIPTION``, plus any declared parameters
+    that were set at enable-time).
+
+    Command env keys live at ``<MOD>_CMDS_<binding_alias>_<command_alias>_<PARAM>``.
+    """
+    modality = _validate_modality(modality)
+    binding_alias = _sanitize_alias(binding_alias)
+    prefix = f"{modality.upper()}_CMDS_{binding_alias.upper()}_"
+
+    commands: Dict[str, Dict[str, str]] = {}
+    for k, v in config_map.items():
+        ku = k.upper()
+        if not ku.startswith(prefix):
+            continue
+        remainder = ku[len(prefix):]
+        if "_" not in remainder:
+            continue
+        cmd_alias, _, param = remainder.partition("_")
+        if not cmd_alias or not param:
+            continue
+        commands.setdefault(cmd_alias.lower(), {})[param] = v
+    return commands
 
 
 def get_profile_params(config_map: Dict[str, str], modality: str, alias: str) -> Dict[str, str]:
@@ -453,7 +637,7 @@ def save_config_map(
     """
     import yaml
 
-    target = Path(path).expanduser() if path else _GLOBAL_CONFIG_FILE
+    target = Path(path).expanduser() if path else _resolve_global_config_file()
     target.parent.mkdir(parents=True, exist_ok=True)
 
     suffix = target.suffix.lower()
@@ -477,6 +661,12 @@ def build_client_config(config_map: Dict[str, str], **modalities: bool) -> Dict[
     (e.g. build_client_config(cfg, tts=True, stt=True)).
     """
     kwargs: Dict[str, Any] = {}
+
+    # 📂 Client-wide data folder — hoisted out of the flat map so it never leaks
+    # into modality resolution and is forwarded to every binding instance.
+    data_folder = config_map.get("LOLLMS_DATA_FOLDER")
+    if data_folder:
+        kwargs["lollms_data_folder"] = data_folder
     for modality in SUPPORTED_MODALITIES:
         enabled = modalities.get(modality, modality == "llm")
         if not enabled:

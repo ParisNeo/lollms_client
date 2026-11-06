@@ -20,7 +20,9 @@ class WhisperCppSTTBinding(LollmsSTTBinding):
     def __init__(self,
                  **kwargs): # Catch-all for future compatibility or specific whisper.cpp params
 
-        super().__init__(binding_name="whispercpp")
+        # Forward kwargs so the base binding can adopt the client-wide
+        # ``lollms_data_folder`` resolution policy (default ~/.lollms/data).
+        super().__init__(binding_name="whispercpp", **kwargs)
 
         # --- Extract values from kwargs with defaults ---
         model_path = kwargs.get("model_path")

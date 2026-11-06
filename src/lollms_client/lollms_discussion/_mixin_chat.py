@@ -1657,7 +1657,16 @@ class _StreamState:
             # skip ALL interception: the whole buffer is conversational prose that
             # must be forwarded verbatim (including the full functional tag text).
             # If a line-start occurrence exists, let normal interception handle it.
-            if inline_tag_found and not line_start_tag_found:
+            #
+            # 🛑 TOOL-TAG EXCEPTION (LEAK FIX): `<tool>` is NEVER prose. A `<tool>`
+            # embedded mid-line (`Let me try: <tool>{...}</tool>`) is still a real
+            # tool call — the model just failed to put it on its own line. If we
+            # forwarded the buffer verbatim, the raw `<tool>{...}</tool>` JSON would
+            # leak into the visible chat. We therefore EXCLUDE `<tool>` from the
+            # inline-quarantine skip: when an inline `<tool` is present, fall
+            # through so the tool-accumulation path below buffers it.
+            _has_inline_tool = "<tool" in self._pending_buffer.lower()
+            if inline_tag_found and not line_start_tag_found and not _has_inline_tool:
                 # Forward the ENTIRE pending buffer verbatim and clear it.
                 self.ai_message.content += self._pending_buffer
                 _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
@@ -4924,6 +4933,17 @@ class _StreamState:
                 self._pending_buffer,
                 flags=re.IGNORECASE,
             )
+            # ── 🛑 PARTIAL `<tool` / `</tool` FRAGMENT STRIP (LEAK FIX) ──
+            # If generation stopped mid-tag (e.g. `<tool` or `<tool>{partial`
+            # with no closing `>`), the fragment can never be dispatched and
+            # MUST NOT reach the UI. The `_is_accumulating_tool` branch above
+            # handles the case where the opener completed; this strip catches
+            # the case where the opener itself was truncated.
+            self._pending_buffer = re.sub(
+                r'(?is)</?tool\b[^>]*$',
+                '',
+                self._pending_buffer,
+            )
 
         if self._pending_buffer or self.artefact_tracker.is_inside_artefact:
             # If we are still inside an artifact for some reason (unclosed tag), dump it to the UI
@@ -5263,10 +5283,18 @@ class ChatMixin:
 
         Returns:
             (all_files, has_data_files, has_doc_files) — identical semantics
-            to the previous inline scan.
+            to the previous inline scan. The cache additionally carries
+            ``has_sqlite_files`` for the SQLite-triggered toolset admission
+            (auto-attach of data-scouting tools whenever a SQLite DB is
+            present in the workspace — independent of ``enable_data_tools``)
+            and ``has_git_dir`` for the git-triggered toolset admission
+            (auto-mount of git tools whenever a ``.git`` repository is
+            detected in the current folder).
         """
-        data_extensions = {".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"}
+        data_extensions = {".csv", ".tsv", ".db", ".sqlite", ".sqlite3", ".sqlconn",
+                           ".xlsx", ".xls", ".parquet", ".ttl", ".rdf"}
         doc_extensions = {".pdf", ".docx", ".pptx", ".odt", ".epub", ".txt", ".md", ".json", ".yaml", ".xml"}
+        sqlite_extensions = {".db", ".sqlite", ".sqlite3"}
 
         revision = int(getattr(self, "_workspace_write_revision", 0))
         cache = getattr(self, "_workspace_scan_cache", None)
@@ -5277,16 +5305,59 @@ class ChatMixin:
             all_files: List[Path] = []
             has_data_files = False
             has_doc_files = False
+            has_sqlite_files = False
         else:
             all_files = list(workspace_dir.rglob("*"))
-            has_data_files = any(f.suffix.lower() in data_extensions for f in all_files if f.is_file())
-            has_doc_files = any(f.suffix.lower() in doc_extensions for f in all_files if f.is_file())
+            file_list = [f for f in all_files if f.is_file()]
+            has_data_files = any(f.suffix.lower() in data_extensions for f in file_list)
+            has_doc_files = any(f.suffix.lower() in doc_extensions for f in file_list)
+            has_sqlite_files = any(f.suffix.lower() in sqlite_extensions for f in file_list)
+
+        # ── 🌿 GIT REPO DETECTION ──
+        # A `.git` DIRECTORY marks a real git repository. We probe both the
+        # tool workspace (where LCP commands run) and its immediate parent
+        # (the "current folder" — the project the user opened). A `.git`
+        # FILE is a legitimate git feature (worktrees / submodules use a
+        # gitlink file), so we honour both forms when present.
+        has_git_dir = False
+        for _candidate_root in (workspace_dir, workspace_dir.parent):
+            try:
+                _git_path = _candidate_root / ".git"
+                if _git_path.exists() and (_git_path.is_dir() or _git_path.is_file()):
+                    has_git_dir = True
+                    break
+            except OSError:
+                continue
 
         object.__setattr__(
             self, "_workspace_scan_cache",
-            {"revision": revision, "all_files": all_files, "has_data_files": has_data_files, "has_doc_files": has_doc_files},
+            {
+                "revision": revision,
+                "all_files": all_files,
+                "has_data_files": has_data_files,
+                "has_doc_files": has_doc_files,
+                "has_sqlite_files": has_sqlite_files,
+                "has_git_dir": has_git_dir,
+            },
         )
         return all_files, has_data_files, has_doc_files
+
+    def _workspace_has_sqlite_files(self, workspace_dir: Path) -> bool:
+        """True when at least one SQLite-family file (*.db / *.sqlite / *.sqlite3)
+        lives in the workspace. Reads the scan cache (populated by
+        ``_cached_workspace_file_scan``); forces a scan when the cache is cold."""
+        self._cached_workspace_file_scan(workspace_dir)
+        cache = getattr(self, "_workspace_scan_cache", None) or {}
+        return bool(cache.get("has_sqlite_files", False))
+
+    def _workspace_has_git_dir(self, workspace_dir: Path) -> bool:
+        """True when the tool workspace (or its immediate parent — the
+        'current folder') contains a ``.git`` repository. Reads the scan
+        cache (populated by ``_cached_workspace_file_scan``); forces a
+        scan when the cache is cold."""
+        self._cached_workspace_file_scan(workspace_dir)
+        cache = getattr(self, "_workspace_scan_cache", None) or {}
+        return bool(cache.get("has_git_dir", False))
 
     def __init__(self, *args, **kwargs):
         """Initialize ChatMixin with sequential cancellation support."""
@@ -5449,15 +5520,18 @@ class ChatMixin:
             file_path = file_info["path"]
             file_size = file_path.stat().st_size
 
-            atype = "document"
-            if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir", ".net", ".op"):
-                atype = "code"
-            elif file_ext in (".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"):
-                atype = "data"
-            elif file_ext in (".md", ".txt", ".log", ".out", ".trace", ".asc", ".raw", ".json", ".yaml", ".yml", ".xml", ".ttl", ".pdf", ".docx", ".pptx", ".odt"):
-                atype = "document"
+            # Data files are as-is FILE artefacts (no dedicated DATA type).
+            atype = ArtefactType.DOCUMENT
+            if file_ext in (".py", ".js", ".ts", ".html", ".css", ".cir", ".net", ".op"):
+                atype = ArtefactType.CODE
+            elif file_ext in (".csv", ".tsv", ".db", ".sqlite", ".sqlite3", ".sqlconn",
+                              ".xlsx", ".xls", ".parquet", ".ttl", ".rdf"):
+                atype = ArtefactType.FILE
+            elif file_ext in (".md", ".txt", ".log", ".out", ".trace", ".asc", ".raw", ".json",
+                              ".yaml", ".yml", ".xml", ".pdf", ".docx", ".pptx", ".odt"):
+                atype = ArtefactType.DOCUMENT
             elif file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
-                atype = "image"
+                atype = ArtefactType.IMAGE
 
             rich_doc_bytes = None
             rich_doc_content = None
@@ -5517,13 +5591,14 @@ class ChatMixin:
 
             if not should_read_content and content_placeholder:
                 if file_ext in _ML_WEIGHT_EXTS:
-                    atype = "data"
+                    # Model weight blobs are as-is FILE artefacts.
+                    atype = ArtefactType.FILE
                 # Tool-generated images default to SINGLE_ROUND: the LLM sees the
                 # pixels on the next round, then the payload is freed. Other
                 # binary artefacts stay TREE_UNLOCKABLE (no pixel payload).
                 _binary_visibility = (
                     ArtefactVisibility.SINGLE_ROUND
-                    if atype == "image"
+                    if atype == ArtefactType.IMAGE
                     else ArtefactVisibility.TREE_UNLOCKABLE
                 )
                 existing_art = self.artefacts.get(file_name)
@@ -5557,7 +5632,11 @@ class ChatMixin:
                 if self.active_branch_id:
                     ai_msg_local = self.get_message(self.active_branch_id)
                     if ai_msg_local:
-                        tag = f'<artefact_image id="{file_name}::0" />' if atype == "image" else f'<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />'
+                        tag = (
+                            f'<artefact_image id="{file_name}::0" />'
+                            if atype == ArtefactType.IMAGE
+                            else f'<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />'
+                        )
                         if tag not in ai_msg_local.content:
                             ai_msg_local.content += f'\n\n{tag}\n'
                         self.commit()
@@ -5587,7 +5666,11 @@ class ChatMixin:
             if self.active_branch_id:
                 ai_msg_local = self.get_message(self.active_branch_id)
                 if ai_msg_local:
-                    tag = f'<artefact_image id="{file_name}::0" />' if atype == "image" else f'<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />'
+                    tag = (
+                        f'<artefact_image id="{file_name}::0" />'
+                        if atype == ArtefactType.IMAGE
+                        else f'<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />'
+                    )
                     if tag not in ai_msg_local.content:
                         ai_msg_local.content += f'\n\n{tag}\n'
                     self.commit()
@@ -5609,15 +5692,18 @@ class ChatMixin:
             img_mtypes = None
 
             if mtime_changed or content_changed:
-                atype = "document"
+                # Data files are as-is FILE artefacts (no dedicated DATA type).
+                atype = ArtefactType.DOCUMENT
                 if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir", ".net", ".op"):
-                    atype = "code"
-                elif file_ext in (".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"):
-                    atype = "data"
-                elif file_ext in (".md", ".txt", ".log", ".out", ".trace", ".asc", ".raw", ".json", ".yaml", ".yml", ".xml", ".ttl", ".pdf", ".docx", ".pptx", ".odt"):
-                    atype = "document"
+                    atype = ArtefactType.CODE
+                elif file_ext in (".csv", ".tsv", ".db", ".sqlite", ".sqlite3", ".sqlconn",
+                                  ".xlsx", ".xls", ".parquet", ".ttl", ".rdf"):
+                    atype = ArtefactType.FILE
+                elif file_ext in (".md", ".txt", ".log", ".out", ".trace", ".asc", ".raw", ".json",
+                                  ".yaml", ".yml", ".xml", ".pdf", ".docx", ".pptx", ".odt"):
+                    atype = ArtefactType.DOCUMENT
                 elif file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
-                    atype = "image"
+                    atype = ArtefactType.IMAGE
 
                 rich_doc_bytes = None
                 rich_doc_content = None
@@ -5676,7 +5762,7 @@ class ChatMixin:
                         content_placeholder = f"### File Error: `{file_name}`\n\nFailed to read or inspect file: {e}"
 
                 if not should_read_content and content_placeholder:
-                    if atype == "image":
+                    if atype == ArtefactType.IMAGE:
                         try:
                             raw_img = file_path.read_bytes()
                             img_b64 = base64.b64encode(raw_img).decode('utf-8')
@@ -5684,16 +5770,18 @@ class ChatMixin:
                         except Exception as ex:
                             trace_exception(ex)
                     elif file_ext in _ML_WEIGHT_EXTS:
-                        atype = "data"
+                        # Model weight blobs are as-is FILE artefacts.
+                        atype = ArtefactType.FILE
 
                     # Tool-generated images default to SINGLE_ROUND: the LLM sees
                     # the pixels on the next round, then the payload is freed.
                     _img_visibility = (
                         ArtefactVisibility.SINGLE_ROUND
-                        if atype == "image"
+                        if atype == ArtefactType.IMAGE
                         else ArtefactVisibility.TREE_UNLOCKABLE
                     )
                     existing_art = self.artefacts.get(file_name)
+                    _is_image_art = (atype == ArtefactType.IMAGE)
                     if existing_art:
                         art = self.artefacts.update(
                             title=file_name,
@@ -5701,7 +5789,7 @@ class ChatMixin:
                             new_type=atype,
                             new_images=img_b64,
                             new_image_media_types=img_mtypes,
-                            active=(atype == "image"),
+                            active=_is_image_art,
                             visibility=_img_visibility,
                             bump_version=True,
                             physical_data=physical_bytes,
@@ -5714,14 +5802,14 @@ class ChatMixin:
                             content=content_placeholder,
                             images=img_b64,
                             image_media_types=img_mtypes,
-                            active=(atype == "image"),
+                            active=_is_image_art,
                             visibility=_img_visibility,
                             physical_data=physical_bytes,
                             commit_message=f"Created by tool '{tool_name}'"
                         )
                     self.commit()
 
-                    if atype == "image":
+                    if _is_image_art:
                         try:
                             raw_img = file_path.read_bytes()
                             img_b64 = base64.b64encode(raw_img).decode('utf-8')
@@ -5739,7 +5827,11 @@ class ChatMixin:
                     if self.active_branch_id:
                         ai_msg_local = self.get_message(self.active_branch_id)
                         if ai_msg_local:
-                            tag = f'<artefact_image id="{file_name}::0" />' if atype == "image" else f'<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />'
+                            tag = (
+                                f'<artefact_image id="{file_name}::0" />'
+                                if atype == ArtefactType.IMAGE
+                                else f'<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />'
+                            )
                             if tag not in ai_msg_local.content:
                                 ai_msg_local.content += f'\n\n{tag}\n'
                             self.commit()
@@ -5772,7 +5864,11 @@ class ChatMixin:
                 if self.active_branch_id:
                     ai_msg_local = self.get_message(self.active_branch_id)
                     if ai_msg_local:
-                        tag = f'<artefact_image id="{file_name}::0" />' if atype == "image" else f'<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />'
+                        tag = (
+                            f'<artefact_image id="{file_name}::0" />'
+                            if atype == ArtefactType.IMAGE
+                            else f'<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />'
+                        )
                         if tag not in ai_msg_local.content:
                             ai_msg_local.content += f'\n\n{tag}\n'
                         self.commit()
@@ -6229,7 +6325,39 @@ class ChatMixin:
 
         workspace_dir = Path(self.workspace_data_path) if getattr(self, "workspace_data_path", None) else Path("./data_workspace")
         all_files, has_data_files, has_doc_files = self._cached_workspace_file_scan(workspace_dir)
-        needs_lcp_binding = enable_data_tools or enable_code_execution or has_data_files or has_doc_files
+
+        # ── 🗄️ SQLITE AUTO-DISCOVERY ──
+        # Whenever at least one SQLite-family file (*.db/.sqlite/.sqlite3) is
+        # present in the workspace, the SQL/data-scouting toolset is
+        # auto-attached — WITHOUT requiring the caller's `enable_data_tools`
+        # flag. This is the "single file → working SQL assistant" behavior:
+        # users drop an SQLite db into the workspace (folder import or tool
+        # generation) and the LLM immediately has the tools it needs to
+        # query it. Extension-agnostic detection honours extensionless
+        # databases implicitly (the scan returns every file; SQLite-magic
+        # sniffing for those extensionless cases is handled at import time —
+        # once an extensionless DB reaches the workspace it is used as a
+        # schema source even before querying).
+        has_sqlite_files = self._workspace_has_sqlite_files(workspace_dir)
+        needs_data_scouts = bool(has_sqlite_files or (enable_data_tools and has_data_files))
+
+        # ── 🌿 GIT AUTO-DISCOVERY ──
+        # Whenever a `.git` repository lives in the current folder, the git
+        # toolset is auto-attached — WITHOUT requiring any explicit flag.
+        # This is the "open a repo, get version-control tools" behaviour:
+        # the LLM can `git status`, diff, commit, branch, etc. immediately,
+        # mirroring the SQLite-triggered data-scout pattern.
+        has_git_dir = self._workspace_has_git_dir(workspace_dir)
+        needs_git_tools = bool(has_git_dir)
+
+        needs_lcp_binding = (
+            enable_data_tools
+            or enable_code_execution
+            or has_data_files
+            or has_doc_files
+            or needs_data_scouts
+            or needs_git_tools
+        )
 
         if needs_lcp_binding and lcp_binding is None:
             try:
@@ -6347,12 +6475,42 @@ class ChatMixin:
                 )
 
             # ── 2. CONTEXTUAL MOUNTING: ONLY WHEN MATCHING FILES EXIST ──
-            if enable_data_tools and has_data_files:
+            # Data-scout toolsets: mounted both for legacy data-file workflow
+            # (enable_data_tools AND has_data_files) and for the new
+            # SQLite-triggered path (any *.db/.sqlite/.sqlite3 present).
+            if needs_data_scouts:
                 lcp_binding.mount_tool_library_if_absent("semantic_data_engineer")
+                # ── Auto-attach SQL query + pandas data-query toolsets ──
+                # These two libraries carry `tool_execute_sql_query` and
+                # `tool_execute_python_data_query`/`tool_get_table_schema`,
+                # pieces that turn any workspace SQLite file into a working
+                # analytics surface for the LLM. Their `.lam` companion (written
+                # by the import pipeline) gives the model the schema inline,
+                # while these tools do the actual querying.
+                lcp_binding.mount_tool_library_if_absent("execute_sql_query")
+                lcp_binding.mount_tool_library_if_absent("execute_python_data_query")
+
+            # ── 🌿 GIT TOOLSET AUTO-MOUNT ──
+            # A `.git` directory in the current folder is an explicit opt-in
+            # signal: the user opened a repository, so version-control tools
+            # belong in the session. Mirrors the SQLite auto-scout branch.
+            if needs_git_tools:
+                lcp_binding.mount_tool_library_if_absent("git_manager")
 
             if enable_data_tools and has_doc_files:
                 lcp_binding.mount_tool_library_if_absent("as_is_document_tools")
                 lcp_binding.mount_tool_library_if_absent("document_editor")
+
+            # ── 2b. DATA-SCOUT ADMISSION SET ──
+            # Names admitted through the auto-SQLite path. The set is a strict
+            # superset of the historical data-query names so legacy callers
+            # (enable_data_tools=True) keep their old tools too.
+            _data_scout_names = {
+                "tool_execute_sql_query",
+                "tool_execute_python_data_query",
+                "tool_get_table_schema",
+                "tool_query_database_sql",
+            }
 
             try:
                 lcp_tools = lcp_binding.to_chat_tool_specs(
@@ -6366,8 +6524,11 @@ class ChatMixin:
                     # Core execution
                     elif t_name in ("tool_execute_python_code", "tool_execute_python_file", "tool_create_and_execute_python_file") and enable_code_execution:
                         active_tools[t_name] = t_spec
-                    # Contextual data query
-                    elif t_name in ("tool_execute_python_data_query", "tool_get_table_schema", "tool_query_database_sql") and enable_data_tools and has_data_files:
+                    # Data scouts: SQLite presence OR legacy data-file workflow
+                    elif t_name in _data_scout_names and needs_data_scouts:
+                        active_tools[t_name] = t_spec
+                    # Git tools: `.git` repository present in the current folder
+                    elif t_name.startswith("tool_git_") and needs_git_tools:
                         active_tools[t_name] = t_spec
                     # Contextual document annotation
                     elif t_name in ("tool_inspect_document", "tool_read_document_content", "tool_annotate_document", "tool_edit_document_text") and enable_data_tools and has_doc_files:
@@ -6378,7 +6539,8 @@ class ChatMixin:
             for td in lcp_binding.discovered_tools:
                 t_name = td.get("name", "")
                 if t_name not in active_tools:
-                    if (t_name == "tool_execute_python_data_query" and enable_data_tools and has_data_files) or \
+                    if (t_name in _data_scout_names and needs_data_scouts) or \
+                       (t_name.startswith("tool_git_") and needs_git_tools) or \
                        (t_name in ("tool_execute_python_code", "tool_execute_python_file", "tool_create_and_execute_python_file") and enable_code_execution) or \
                        (t_name in ("tool_read_lines", "tool_read_chars", "tool_grep_file") and enable_code_execution) or \
                        (t_name.startswith(("tool_inspect_document", "tool_read_document_content", "tool_grep_document", "tool_modify_docx", "tool_modify_excel", "tool_edit_document_text", "tool_annotate_document", "tool_modify_pdf_annotation", "tool_modify_pptx_slide")) and enable_data_tools and has_doc_files):
@@ -6396,6 +6558,34 @@ class ChatMixin:
                             "parameters": params_list,
                         }
                         ASCIIColors.success(f"[ChatMixin] Registered {t_name} via direct discovered_tools fallback.")
+
+        if has_sqlite_files:
+            _admitted_sql = sorted(n for n in active_tools if n in _data_scout_names)
+            if _admitted_sql:
+                ASCIIColors.info(
+                    f"[ChatMixin] SQLite auto-scout active ({len(_admitted_sql)} tool(s)): "
+                    f"{_admitted_sql}"
+                )
+            else:
+                ASCIIColors.warning(
+                    "[ChatMixin] SQLite files present in workspace but NO data-scout tool "
+                    "was admitted — check that execute_sql_query and "
+                    "execute_python_data_query libraries are discoverable by LCP."
+                )
+
+        if has_git_dir:
+            _admitted_git = sorted(n for n in active_tools if n.startswith("tool_git_"))
+            if _admitted_git:
+                ASCIIColors.info(
+                    f"[ChatMixin] Git auto-scout active ({len(_admitted_git)} tool(s)): "
+                    f"{_admitted_git}"
+                )
+            else:
+                ASCIIColors.warning(
+                    "[ChatMixin] .git repository detected in current folder but NO git "
+                    "tool was admitted — check that the 'git_manager' LCP library is "
+                    "discoverable by the LCP binding."
+                )
 
         if debug:
             if active_tools:

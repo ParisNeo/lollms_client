@@ -49,6 +49,49 @@ show?") to that vision model — useful when `tool_render_pdf_pages` returns
 an image but you cannot see it yourself. Both tools can be combined: render
 the PDF page first, then ask `tool_vlm_query` to describe it.
 
+## Rewrite / Transform Workflow (Anti-Loop Contract)
+
+When the user asks to **rewrite, translate, restyle, or transform** a document (e.g. "rewrite this course without the word X"), follow this contract strictly. It exists because agents routinely burn tokens re-querying the same document and then confabulate tool failures.
+
+### 1. Sufficiency rule — stop when you have the data
+
+- **One targeted `tool_grep_document`** for the token(s) to replace (e.g. `(?i)claude`) returns **every occurrence with line numbers**. That is *sufficient* to plan the rewrite.
+- **Do NOT** follow up with `pattern="."` or `max_matches=200` "to get the full text". Large greps get summarized by the runtime and yield nothing new.
+- **Do NOT** re-call `tool_inspect_document` after it already returned paragraph/heading counts.
+- **Loop budget**: at most **2 exploratory calls** per document (1 inspect + 1 grep, or 2 greps). After that, commit to producing output.
+
+### 2. No phantom tools — only call what exists
+
+The document toolset is exactly: `tool_inspect_document`, `tool_read_document_content`, `tool_grep_document`, `tool_render_pdf_pages`, `tool_modify_docx`, `tool_modify_excel`, `tool_modify_pptx_slide`, `tool_modify_pdf_annotation`, `tool_annotate_document`, `tool_edit_document_text`.
+
+- **Never invent** `tool_build_word`, `tool_read_word`, `tool_write_docx`, or any other name. If a tool is not in the list above, it does not exist — do not call it, do not "diagnose" it as broken.
+- If you genuinely need a capability that is missing, say so **once** and propose the closest existing tool.
+
+### 3. Format fidelity — deliver the same format the user gave you
+
+- Source is `.docx` → deliver `.docx` via `tool_modify_docx` (full-document replace) or `tool_edit_document_text` (surgical).
+- Source is `.pdf` → deliver annotated `.pdf` via `tool_modify_pdf_annotation`, or a new `.docx`/`.md` **only if the user asked for a different format**.
+- **Never silently downgrade** a `.docx` request to a `.md` artifact and blame a tool. If `tool_modify_docx` fails, report the exact error and ask the user how to proceed — do not substitute a different format unilaterally.
+
+### 4. Rewrite execution pattern
+
+```
+1. tool_grep_document(pattern="(?i)<token>")   # get all occurrences — ONE call
+2. Plan the replacements from the grep output (no more reads needed)
+3. tool_modify_docx(file, new_content=...)      # full rewrite, OR
+   tool_edit_document_text(file, edits=[...])   # surgical replacements
+4. Report what changed; emit <done/>
+```
+
+If the document is large and the grep output is truncated, use `tool_read_document_content` with **narrow page ranges** (`page_or_sheet="1-10"`) — never a whole-document read.
+
+### 5. Anti-confabulation checklist (self-audit before emitting `<done/>`)
+
+- [ ] Did I call any tool not in the list above? → If yes, that call was a hallucination; discard it.
+- [ ] Did I re-query the same document more than twice? → If yes, I violated the loop budget.
+- [ ] Did I deliver the same format the user provided? → If no, justify it explicitly or fix it.
+- [ ] Did I claim a tool is "broken" without an actual error message from that tool? → If yes, that is confabulation.
+
 ## Proofreading & Annotation Protocol
 When asked to proofread, correct, or review a document:
 - Step 1: Read the document text batch by batch (or render scanned pages with `tool_render_pdf_pages` and save the findings to the scratchpad).

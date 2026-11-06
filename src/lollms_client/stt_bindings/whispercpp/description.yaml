@@ -4,6 +4,15 @@ creation_date: 2025-10-21
 last_update_date: 2025-10-21
 description: Connects to a local whisper.cpp executable for speech-to-text transcription. Requires a pre-built whisper.cpp executable and a GGUF model file.
 global_input_parameters:
+  - name: lollms_data_folder
+    type: str
+    description: >
+      Client-wide data root, usually injected automatically by LollmsClient.
+      If left empty, the shared default ~/.lollms/data is used (or
+      $LOLLMS_DATA_FOLDER when set permanently). Whisper.cpp itself remains a
+      user-installed binary; this folder is where related state can live.
+    mandatory: false
+    default: ""
   - name: whispercpp_exe_path
     type: str
     description: "Path to the whisper.cpp executable. If not provided, it will be searched for in the system's PATH."

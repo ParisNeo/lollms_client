@@ -10,7 +10,12 @@ class Handbag:
     """
     A self-contained folder carrying ALL of an agent's resources.
     """
-    def __init__(self, handbag_path: Union[str, Path]):
+    def __init__(
+        self,
+        handbag_path: Union[str, Path],
+        skills_output_path: Optional[Union[str, Path]] = None,
+        tools_output_path: Optional[Union[str, Path]] = None,
+    ):
         self.path = Path(handbag_path).resolve()
         if not self.path.exists() or not self.path.is_dir():
             raise ValueError(f"Handbag path does not exist or is not a directory: {self.path}")
@@ -126,6 +131,23 @@ class Handbag:
         self.memory_db_path: Optional[str] = f"sqlite:///{self.memory_dir / 'memory.db'}" if self.memory_dir.exists() else None
         self.assets: Dict[str, str] = self._load_assets()
 
+
+
+    def _resolve_manifest_path(self, key: str) -> Optional[Path]:
+        """Resolves an optional manifest-declared path relative to the handbag root."""
+        raw = self.manifest.get(key) if isinstance(self.manifest, dict) else None
+        if not raw:
+            return None
+        try:
+            p = Path(str(raw)).expanduser()
+            if not p.is_absolute():
+                p = (self.path / p).resolve()
+            else:
+                p = p.resolve()
+            return p
+        except Exception:
+            return None
+
     @property
     def global_memory_db_path(self) -> Optional[str]:
         """Returns the path to the global handbag memory database."""
@@ -135,6 +157,51 @@ class Handbag:
     def skills_dir(self) -> Path:
         """Returns the canonical skills directory for this handbag."""
         return self._skills_dir
+
+    @property
+    def builtin_skills(self) -> Dict[str, str]:
+        """
+        Returns a ``{skill_title: skill_file_path}`` map for every skill shipped
+        natively with this handbag.
+
+        A skill is "builtin" when its SKILL.md lives under one of this handbag's
+        registered ``skills_dirs`` (which always includes ``<handbag>/skills``
+        but may also include additional app-registered dirs — see
+        ``register_skills_dir``).
+
+        A skill whose SKILL.md cannot be parsed or has no title is skipped.
+        Only the file path is recorded (no content); the value is the absolute
+        path string of the ``SKILL.md`` file.
+        """
+        from .skill import parse_skill_md  # local import: avoid circular import at module load
+
+        builtin: Dict[str, str] = {}
+        for skills_root in self.skills_dirs:
+            try:
+                root = Path(skills_root).resolve()
+            except Exception:
+                continue
+            if not root.exists() or not root.is_dir():
+                continue
+
+            # A handbag can host skills in two layouts:
+            #   1. <root>/<slug>/SKILL.md
+            #   2. <root>/<file>.md  (single-file skill)
+            for item in sorted(root.iterdir()):
+                try:
+                    if item.is_dir():
+                        skill_file = item / "SKILL.md"
+                        if skill_file.exists():
+                            skill = parse_skill_md(skill_file)
+                            if skill and skill.title:
+                                builtin[skill.title] = str(skill_file.resolve())
+                    elif item.is_file() and item.suffix.lower() == ".md" and item.name != "README.md":
+                        skill = parse_skill_md(item)
+                        if skill and skill.title:
+                            builtin[skill.title] = str(item.resolve())
+                except Exception:
+                    continue
+        return builtin
 
     def register_skills_dir(self, skills_dir: Union[str, Path]) -> Path:
         """

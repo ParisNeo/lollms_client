@@ -9,7 +9,7 @@ import difflib
 import re
 import traceback
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Union, Callable
+from typing import Optional, List, Dict, Any, Union, Callable, Tuple
 
 from builtins import compile as _native_compile
 
@@ -41,6 +41,17 @@ _PER_SOFTWARE_GATES = {
     "pdf_tools": ("enable_pdf",),
 }
 
+# Per-software stems also auto-activate when a matching file type is present
+# in the workspace. This lets the LLM handle existing office files "as is"
+# even when the corresponding chat flag is off. When no matching file exists,
+# the per-software flag remains the sole gate (fail-closed).
+_PER_SOFTWARE_FILE_TYPES = {
+    "word_tools": (".docx", ".docm"),
+    "excel_tools": (".xlsx", ".xlsm"),
+    "powerpoint_tools": (".pptx", ".pptm"),
+    "pdf_tools": (".pdf",),
+}
+
 # ── DOCUMENT-FAMILY LIBRARY GATE (file-type aware) ──
 # Document-family toolsets (as_is_document_tools, document_editor) are admitted
 # based on which file types are ACTUALLY PRESENT in the workspace. Dropping a
@@ -64,6 +75,9 @@ _DOCUMENT_LIBRARY_STEMS = frozenset({
     # (.txt/.md/.py/.js/... etc.) and auto-mounts when any is present. No flag
     # is required — file presence is the entire admission criterion.
     "classic_document_tools",
+    # `markdown_tools` declares TOOL_LIBRARY_FILE_TYPES = [".md", ".markdown"]
+    # and auto-mounts whenever a Markdown file is present in the workspace.
+    "markdown_tools",
 })
 
 # Directory names skipped while scanning the workspace for file-type detection.
@@ -75,18 +89,36 @@ _SKIP_SCAN_DIRS = frozenset({
 _WORKSPACE_SCAN_MAX_DEPTH = 4
 
 
-def _office_library_admitted(stem: str, session_flags: Optional[Dict[str, Any]]) -> bool:
+def _office_library_admitted(
+    stem: str,
+    session_flags: Optional[Dict[str, Any]],
+    workspace_file_types: Optional[Any] = None,
+) -> bool:
     """Resolves office-family admission for a per-software library stem.
 
-    Per-software stems (powerpoint_tools/word_tools/excel_tools) require their
-    own flag. Unknown/missing flags are fail-closed (excluded).
+    Per-software stems (powerpoint_tools/word_tools/excel_tools) are admitted
+    when EITHER:
+      1. Their own session flag is truthy (explicit opt-in), OR
+      2. A file with a matching extension is present in the workspace
+         (auto-activation so existing office files can be handled "as is").
+
+    When neither condition holds, the stem is fail-closed (excluded).
     """
     if stem not in _OFFICE_LIBRARY_STEMS:
         return True
     flags = session_flags if isinstance(session_flags, dict) else {}
     own_gates = _PER_SOFTWARE_GATES.get(stem)
     if own_gates is not None:
-        return any(bool(flags.get(g)) for g in own_gates)
+        if any(bool(flags.get(g)) for g in own_gates):
+            return True
+        # File-presence auto-activation: a matching workspace file admits the
+        # toolset even when the chat flag is off.
+        declared = _PER_SOFTWARE_FILE_TYPES.get(stem, ())
+        if declared:
+            present = {str(t).lower() for t in (workspace_file_types or set())}
+            if any(ext.lower() in present for ext in declared):
+                return True
+        return False
     office_enabled = bool(flags.get("enable_office_files")) or any(
         bool(flags.get(g)) for gates in _PER_SOFTWARE_GATES.values() for g in gates
     )
@@ -122,7 +154,7 @@ def _document_library_admitted(
         if t
     }
     if not declared:
-        return _office_library_admitted(stem, session_flags)
+        return _office_library_admitted(stem, session_flags, workspace_file_types)
 
     present = {str(t).lower() for t in (workspace_file_types or set())}
     return bool(declared & present)
@@ -143,6 +175,21 @@ sub-attributes must be feature-checked for None.
     - Host-Configurable parameters are invisible to the LLM and enforced by the host app.
     """
 
+    # ── Sandbox gated-task registry (single source of truth) ──
+    # Every confirmation prompt a tool may raise MUST declare one of these
+    # categories. "Always allow" answers are recorded per (discussion,
+    # category) so a user accepting process execution in discussion A never
+    # silently unlocks it in discussion B.
+    GATED_TASK_CATEGORIES: Tuple[str, ...] = (
+        "process_execution",   # running shells / subprocesses (system_shell, python kernel)
+        "internet_access",     # HTTP(S) fetches, websearch, internet_import
+        "file_write",          # writing/deleting files outside the safe workspace
+        "filesystem_delete",   # destructive filesystem ops (rm, rmtree)
+        "external_api",        # third-party authenticated API calls
+        "computer_use",        # desktop/UI automation (clicks, keystrokes)
+        "code_execution",      # executing LLM-authored code (execute_python)
+    )
+
     def __init__(self, host_tool_configs: Optional[Dict[str, Dict[str, Any]]] = None, **kwargs: Any):
         super().__init__(binding_name="LCP")
 
@@ -150,7 +197,16 @@ sub-attributes must be feature-checked for None.
         self.host_tool_configs: Dict[str, Dict[str, Any]] = host_tool_configs or {}
         self.confirm_handler: Optional[Callable] = kwargs.get("confirm_handler")
         self.user_interaction_handler: Optional[Callable] = kwargs.get("user_interaction_handler")
-        self.user_interaction_handler: Optional[Callable] = kwargs.get("user_interaction_handler")
+
+        # Per-discussion "always allow" gate store.
+        #   key   -> discussion id (hashable), or "__host__" when no discussion
+        #           object is available (personality chat / bare tool calls)
+        #   value -> set of GATED_TASK_CATEGORIES the user has permanently
+        #           accepted for that discussion
+        # This structure NEVER crosses discussion boundaries: a new discussion
+        # starts with an empty set, and reset_discussion_gates() clears it.
+        self._discussion_gates: Dict[Any, set] = {}
+        self._no_discussion_scope: str = "__host__"
 
         # Resolve Direct Tool Files (must resolve first: explicit tool_files implies an empty folder scan)
         self.tool_files: List[Path] = []
@@ -500,10 +556,14 @@ sub-attributes must be feature-checked for None.
         file. Returns True when the library may be loaded/mounted."""
         stem = py_file.stem
 
-        if not _office_library_admitted(stem, self.session_flags):
+        if not _office_library_admitted(
+            stem, self.session_flags, self._workspace_file_types
+        ):
             if stem in _OFFICE_LIBRARY_STEMS:
                 ASCIIColors.debug(
-                    f"[LCP] Library '{stem}' skipped: office session flag not enabled."
+                    f"[LCP] Library '{stem}' skipped: office session flag not "
+                    f"enabled and no matching workspace file "
+                    f"(detected={sorted(self._workspace_file_types)})."
                 )
             return False
 
@@ -929,6 +989,145 @@ sub-attributes must be feature-checked for None.
             if py_file and py_file.exists() and py_file.suffix == ".py":
                 self._load_tool_file(py_file)
 
+    # ── Sandbox gating helpers (per category, per discussion) ──
+
+    def _discussion_scope(self, env: Any = None, discussion_instance: Any = None) -> Any:
+        """Returns the current discussion's gate-scope key.
+
+        Resolution order:
+            1. `env.discussion` (unified Env passed by the dispatch seam).
+            2. Explicit `discussion_instance` argument.
+            3. Fallback to the host-wide scope (never crosses into a durable
+               per-discussion store).
+        """
+        candidate = None
+        if env is not None:
+            candidate = getattr(env, "discussion", None)
+        if candidate is None:
+            candidate = discussion_instance
+        if candidate is None:
+            return self._no_discussion_scope
+        # Prefer stable ids over object identity (discussion may be reloaded).
+        for attr in ("id", "discussion_id", "uid"):
+            val = getattr(candidate, attr, None)
+            if val is not None:
+                return f"discussion:{val}"
+        return f"discussion_obj:{id(candidate)}"
+
+    def _is_gate_open(self, scope: Any, category: Optional[str]) -> bool:
+        """True when `category` is already allow-listed for `scope`."""
+        if not category:
+            return False
+        return category in self._discussion_gates.get(scope, set())
+
+    def _open_gate(self, scope: Any, category: Optional[str]) -> None:
+        """Mark `category` as "always allowed" for `scope` only."""
+        if not category:
+            return
+        self._discussion_gates.setdefault(scope, set()).add(category)
+
+    def revoke_gate(self, discussion_id: Any, category: str) -> bool:
+        """Clears one category for one discussion. Returns True if revoked."""
+        scope = f"discussion:{discussion_id}"
+        cats = self._discussion_gates.get(scope)
+        if not cats or category not in cats:
+            return False
+        cats.discard(category)
+        if not cats:
+            self._discussion_gates.pop(scope, None)
+        return True
+
+    def reset_discussion_gates(self, discussion_id: Any) -> None:
+        """Drops the entire gate set for a discussion (call on discussion end)."""
+        self._discussion_gates.pop(f"discussion:{discussion_id}", None)
+
+    def list_open_gates(self, discussion_id: Any) -> List[str]:
+        """Read-only snapshot of the currently open gates for a discussion."""
+        return sorted(self._discussion_gates.get(f"discussion:{discussion_id}", set()))
+
+    @staticmethod
+    def _confirm_answer_is_always(answer: Any) -> bool:
+        """Interprets a host confirm-handler answer to detect an `always` decision.
+
+        The host UI contract is intentionally permissive to accept every
+        shape already in use (bool, str, tuple, dict). Anything unrecognized
+        is treated as a *once-only* approval — never as "always".
+        """
+        if answer is True:
+            return False  # plain True means this-time-only
+        if isinstance(answer, str):
+            return answer.strip().lower() in ("always", "all", "permanent", "forever")
+        if isinstance(answer, (tuple, list)) and answer:
+            head = str(answer[0]).strip().lower()
+            tail = answer[1] if len(answer) > 1 else None
+            if head in ("always", "allow_always") and tail is not False:
+                return True
+            return False
+        if isinstance(answer, dict):
+            return bool(answer.get("always") or answer.get("permanent"))
+        return False
+
+    def _gated_confirm(
+        self,
+        message: str,
+        task_category: Optional[str] = None,
+        env: Any = None,
+        discussion_instance: Any = None,
+        **extra: Any,
+    ) -> bool:
+        """Sandbox-aware confirmation entry point.
+
+        Order of operations:
+        1. If the category is already open for the current discussion,
+           short-circuit to True WITHOUT calling the host UI.
+        2. Otherwise delegate to the host `confirm_handler`.
+        3. If the host answered "always", persist the category in the
+           per-discussion gate set ONLY (never globally).
+        """
+        if task_category and task_category not in self.GATED_TASK_CATEGORIES:
+            # Unknown categories are still routed through the host UI but
+            # never permanently persisted — prevents typo-driven leaks.
+            task_category = None
+
+        scope = self._discussion_scope(env=env, discussion_instance=discussion_instance)
+
+        if task_category and self._is_gate_open(scope, task_category):
+            ASCIIColors.debug(
+                f"[LCP Gate] Auto-approved '{task_category}' for '{scope}' "
+                "(gate open for this discussion)."
+            )
+            return True
+
+        if self.confirm_handler is None:
+            # Fail-closed: without a host handler, only pre-approved gates pass.
+            return False
+
+        try:
+            answer = self.confirm_handler(message, **extra)
+        except TypeError:
+            # Some host handlers accept only the message positional arg.
+            try:
+                answer = self.confirm_handler(message)
+            except Exception as exc:
+                ASCIIColors.error(f"[LCP Gate] Confirm handler failed: {exc}")
+                return False
+        except Exception as exc:
+            ASCIIColors.error(f"[LCP Gate] Confirm handler failed: {exc}")
+            return False
+
+        approved = bool(answer) and answer is not False or self._confirm_answer_is_always(answer)
+        if not approved:
+            return False
+
+        if task_category and self._confirm_answer_is_always(answer):
+            self._open_gate(scope, task_category)
+            ASCIIColors.info(
+                f"[LCP Gate] User accepted '{task_category}' ALWAYS for '{scope}' "
+                "(discussion-scoped)."
+            )
+
+        return True
+
     def set_confirm_handler(self, handler: Optional[Callable]) -> None:
         """Registers a confirmation callback on LCPBinding and propagates it to all loaded tool modules."""
         self.confirm_handler = handler
@@ -1168,6 +1367,13 @@ sub-attributes must be feature-checked for None.
 
         python_file_path = Path(tool_def.get('_python_file_path')) if tool_def.get('_python_file_path') else None
 
+        # Resolve the discussion scope once so the sandbox gate wrapper below
+        # sees the exact same key the call-shortcut path will consult.
+        _scope_env = kwargs.get("env")
+        _discussion_scope_kw = discussion_instance
+        if _scope_env is not None and getattr(_scope_env, "discussion", None) is not None:
+            _discussion_scope_kw = getattr(_scope_env, "discussion")
+
         input_schema = tool_def.get("input_schema", {})
         for prop_name, prop_info in input_schema.get("properties", {}).items():
             if prop_name not in params and isinstance(prop_info, dict) and "default" in prop_info:
@@ -1233,6 +1439,37 @@ sub-attributes must be feature-checked for None.
             host_discussion = getattr(env, "discussion", None) if env is not None else discussion_instance
             if host_discussion is not None and ("discussion_instance" in sig.parameters or has_var_kw):
                 clean_params["discussion_instance"] = host_discussion
+
+            # ── SANDBOX CATEGORY PROPAGATION ──
+            # If a tool declares a ``GATED_TASK_CATEGORY`` module constant, we
+            # surface it on the invocation env so that any ``confirm_handler``
+            # call the tool performs can be matched against the current
+            # discussion's gate set. This makes "always allow" discussion-scoped
+            # without every toolset reimplementing the logic.
+            tool_category: Optional[str] = None
+            try:
+                if python_file_path and getattr(tool_module, "GATED_TASK_CATEGORY", None):
+                    declared = getattr(tool_module, "GATED_TASK_CATEGORY")
+                    if isinstance(declared, str) and declared in self.GATED_TASK_CATEGORIES:
+                        tool_category = declared
+            except Exception:
+                tool_category = None
+
+            # Wrap the tool's confirm handler for the duration of the call so
+            # short-circuited categories never reach the host UI.
+            if tool_category and hasattr(tool_module, "set_confirm_handler"):
+                def _scoped_confirm(message, _cat=tool_category, _scope_env=env, _disc=_discussion_scope_kw, **_kw):
+                    return self._gated_confirm(
+                        message,
+                        task_category=_cat,
+                        env=_scope_env,
+                        discussion_instance=_disc,
+                        **_kw,
+                    )
+                try:
+                    tool_module.set_confirm_handler(_scoped_confirm)
+                except Exception:
+                    pass
 
             try:
                 result = execute_function(**clean_params)

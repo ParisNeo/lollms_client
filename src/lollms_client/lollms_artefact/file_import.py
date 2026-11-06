@@ -214,10 +214,8 @@ def _detect_artefact_type_from_mode(path: Path, mode: str) -> str:
     """
     ext = path.suffix.lower()
 
-    if mode == IMPORT_MODE_AS_IS:
+    if mode in (IMPORT_MODE_AS_IS, IMPORT_MODE_DATA, IMPORT_MODE_DATA_BUNDLE):
         return ArtefactType.FILE
-    if mode in (IMPORT_MODE_DATA, IMPORT_MODE_DATA_BUNDLE):
-        return ArtefactType.DATA
     if mode == IMPORT_MODE_IMAGES_ONLY:
         return ArtefactType.IMAGE
     if mode == IMPORT_MODE_AUDIO_STT:
@@ -957,25 +955,181 @@ class FileImportMixin:
                 mode = IMPORT_MODE_TEXT
             else:
                 _progress(f"Scanning folder for data files: {path}")
-                supported_exts = {".csv", ".tsv", ".xlsx", ".xls"} # SQLite handled separately or skipped for now in fusion logic
-                csv_xlsx_files = []
+                # Data-bundle universe:
+                #   - CSV/XLSX files → schema-fusion pipeline (existing behavior)
+                #   - Native SQLite DBs → preserved as-is (no fusion, no rename)
+                # The two populations are kept strictly separate so a native DB
+                # never gets duplicated as "{name}_consolidated.db / {name}.db / {name}".
+                tabular_exts = {".csv", ".tsv", ".xlsx", ".xls"}
+                sqlite_exts  = {".db", ".sqlite", ".sqlite3"}
+                csv_xlsx_files: List[Path] = []
+                sqlite_files: List[Path] = []
 
-                # 1. SCAN PHASE: Find all relevant files and extract schemas (ignoring compilation dirs)
+                def _has_sqlite_magic(p: Path) -> bool:
+                    """Sniff SQLite header (16-byte magic). Extension-independent."""
+                    try:
+                        with open(p, "rb") as _fh:
+                            return _fh.read(16) == b"SQLite format 3\x00"
+                    except Exception:
+                        return False
+
+                # 1. SCAN PHASE: classify every relevant file (ignoring compilation dirs)
                 from .lollms_artefact import _is_ignored_path
                 for root, dirs, filenames in os.walk(path):
-                    # Filter out ignored directories in-place to prevent descending into them
                     dirs[:] = [d for d in dirs if not _is_ignored_path(d)]
                     for fname in filenames:
                         f_path = Path(root) / fname
                         if _is_ignored_path(f_path):
                             continue
-                        if f_path.suffix.lower() in supported_exts:
+                        ext_l = f_path.suffix.lower()
+                        if ext_l in sqlite_exts:
+                            # Extension says SQLite — verify the magic to reject
+                            # text files that merely carry a .db suffix.
+                            if _has_sqlite_magic(f_path):
+                                sqlite_files.append(f_path)
+                            else:
+                                # Misnamed: treat as plain tabular candidate
+                                csv_xlsx_files.append(f_path)
+                                warnings.append(
+                                    f"File '{f_path.name}' has a SQLite extension but no SQLite header; "
+                                    f"treating as tabular data."
+                                )
+                        elif ext_l in tabular_exts:
                             csv_xlsx_files.append(f_path)
+                        else:
+                            # Header-based detection for extensionless SQLite files
+                            try:
+                                if f_path.is_file() and f_path.stat().st_size >= 16 and _has_sqlite_magic(f_path):
+                                    sqlite_files.append(f_path)
+                            except Exception:
+                                pass
 
-                if not csv_xlsx_files:
-                    warnings.append("No supported CSV/XLSX data files found in the folder.")
+                if not csv_xlsx_files and not sqlite_files:
+                    warnings.append("No supported SQLite/CSV/XLSX data files found in the folder.")
                     mode = IMPORT_MODE_TEXT
-                else:
+
+                # ── 1a. NATIVE SQLITE FILES: preserve 1:1 (no fusion, no rename) ──
+                # Compute the destination workspace root once (shared by both paths).
+                from .lollms_artefact import _is_ignored_path as _ign
+                _disc = self if hasattr(self, 'workspace_path') else getattr(self, '_discussion', None)
+                workspace_dir = Path(_disc.workspace_path) if _disc and _disc.workspace_path else Path("./data_workspace")
+                if not (_disc and _disc.workspace_path):
+                    try:
+                        from lollms_client.app.Discussion_UI.server import APP_WORKSPACE_DIR as awd
+                        if awd is not None:
+                            workspace_dir = awd
+                    except ImportError:
+                        pass
+                workspace_dir.mkdir(exist_ok=True)
+
+                preserved_sqlite_artefacts: List[Dict[str, Any]] = []
+                for sqlite_src in sqlite_files:
+                    try:
+                        # Preserve relative subfolder structure under the bundle root
+                        try:
+                            rel_path = sqlite_src.relative_to(path)
+                        except ValueError:
+                            rel_path = Path(sqlite_src.name)
+                        dest_path = workspace_dir / rel_path
+                        dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+                        _progress(f"Preserving native SQLite file: {rel_path}")
+                        raw_bytes = sqlite_src.read_bytes()
+                        dest_path.write_bytes(raw_bytes)
+
+                        # Build the .lam schema descriptor (no sidecar twins).
+                        lam_schema, _, _ = _parse_data_file(
+                            dest_path,
+                            dest_path.name,
+                            version=1,
+                            progress_cb=progress_cb,
+                            skip_sidecar_write=True,
+                        )
+
+                        # Write the .lam companion file next to the .db so data-scouting
+                        # tools can find the schema on disk without a dedicated artefact
+                        # type. The .lam itself is registered as a FILE artefact.
+                        lam_disk_path = dest_path.with_suffix(dest_path.suffix + ".lam")
+                        try:
+                            lam_disk_path.write_text(lam_schema, encoding="utf-8")
+                        except Exception as lam_write_err:
+                            warnings.append(
+                                f"Failed to write .lam companion for '{rel_path}': {lam_write_err}"
+                            )
+
+                        art_title = str(rel_path).replace("\\", "/")
+                        existing = self.artefacts.get(art_title)
+                        if existing is None:
+                            art = self.artefacts.add(
+                                title=art_title,
+                                artefact_type=ArtefactType.FILE,
+                                content=lam_schema,
+                                active=activate,
+                                file_ext=dest_path.suffix.lower(),
+                                version=1,
+                                read_only=True,
+                                physical_data=raw_bytes,
+                                logical_content=lam_schema,
+                                commit_message=f"Preserved native SQLite '{rel_path}' from bundle import",
+                            )
+                        else:
+                            art = self.artefacts.update(
+                                title=art_title,
+                                new_content=lam_schema,
+                                new_type=ArtefactType.FILE,
+                                active=activate,
+                                bump_version=True,
+                                logical_content=lam_schema,
+                                physical_data=raw_bytes,
+                            )
+
+                        # Register the .lam companion file as a FILE artefact too
+                        lam_title = f"{art_title}.lam"
+                        existing_lam = self.artefacts.get(lam_title)
+                        if existing_lam is None:
+                            self.artefacts.add(
+                                title=lam_title,
+                                artefact_type=ArtefactType.FILE,
+                                content=lam_schema,
+                                active=False,
+                                file_ext=".lam",
+                                version=1,
+                                read_only=True,
+                                visibility=ArtefactVisibility.TREE_UNLOCKABLE,
+                                commit_message=f"Schema descriptor for '{rel_path}'",
+                            )
+                        else:
+                            self.artefacts.update(
+                                title=lam_title,
+                                new_content=lam_schema,
+                                new_type=ArtefactType.FILE,
+                                bump_version=True,
+                                visibility=ArtefactVisibility.TREE_UNLOCKABLE,
+                            )
+
+                        preserved_sqlite_artefacts.append(art)
+                    except Exception as sqlite_err:
+                        warnings.append(f"Failed to preserve SQLite '{sqlite_src.name}': {sqlite_err}")
+
+                if preserved_sqlite_artefacts:
+                    _progress(
+                        f"Preserved {len(preserved_sqlite_artefacts)} native SQLite datasource(s)."
+                    )
+
+                # If no tabular files remain, we are done — return the preserved SQLite artefacts.
+                if not csv_xlsx_files:
+                    primary = preserved_sqlite_artefacts[0] if preserved_sqlite_artefacts else None
+                    return {
+                        "text_artefact": primary,
+                        "image_artefact": None,
+                        "mode": IMPORT_MODE_DATA_BUNDLE,
+                        "page_count": 0,
+                        "image_count": 0,
+                        "preserved_sqlite": preserved_sqlite_artefacts,
+                        "warnings": warnings,
+                    }
+
+                if True:  # keep block structure for the tabular-fusion path
                     _progress(f"Found {len(csv_xlsx_files)} data files. Analyzing schemas...")
                     _ensure_installed("pandas")
                     _ensure_installed("openpyxl")
@@ -983,21 +1137,10 @@ class FileImportMixin:
                     import sqlite3
                     from collections import defaultdict
 
-                    # FIX: FileImportMixin is mixed into LollmsDiscussion, so `self` IS the discussion.
-                    # We access workspace_path directly via `self`, with a fallback to `self._discussion`
-                    # in case this mixin is ever used standalone on an ArtefactManager.
-                    _disc = self if hasattr(self, 'workspace_path') else getattr(self, '_discussion', None)
-                    workspace_dir = Path(_disc.workspace_path) if _disc and _disc.workspace_path else Path("./data_workspace")
-
-                    # Try to override with server's APP_WORKSPACE_DIR only if no custom workspace_path was set
-                    if not (_disc and _disc.workspace_path):
-                       try:
-                           from lollms_client.app.Discussion_UI.server import APP_WORKSPACE_DIR as awd
-                           if awd is not None:
-                               workspace_dir = awd
-                       except ImportError:
-                           pass
-                    workspace_dir.mkdir(exist_ok=True)
+                    # `workspace_dir` was already resolved above during the SQLite
+                    # preservation pass; reuse it to guarantee both paths write to
+                    # the same destination root.
+                    workspace_dir = workspace_dir
 
                     # Schema fingerprinting with normalized column names for better grouping
                     schema_groups = defaultdict(list)
@@ -1263,10 +1406,19 @@ class FileImportMixin:
                     if description and description.strip():
                         extra_meta["description"] = description.strip()
 
-                    _progress(f"Registering consolidated database artifact...")
+                    # Write the .lam companion file next to the consolidated .db
+                    # so data-scouting tools discover the schema on disk.
+                    db_title_with_ext = f"{title}.db"
+                    try:
+                        lam_disk_path = workspace_dir / f"{db_title_with_ext}.lam"
+                        lam_disk_path.write_text(lam_content, encoding="utf-8")
+                    except Exception as lam_write_err:
+                        warnings.append(f"Failed to write .lam companion for consolidated DB: {lam_write_err}")
+
+                    _progress(f"Registering consolidated database artifact (as-is FILE)...")
                     art = self.artefacts.add(
-                        title=title,
-                        artefact_type=ArtefactType.DATA,
+                        title=db_title_with_ext,
+                        artefact_type=ArtefactType.FILE,
                         content=lam_content,
                         active=activate,
                         file_ext=".db",
@@ -1276,6 +1428,20 @@ class FileImportMixin:
                         logical_content=lam_content,
                         **extra_meta
                     )
+                    # Also register the .lam companion as a FILE artefact
+                    lam_title = f"{db_title_with_ext}.lam"
+                    if self.artefacts.get(lam_title) is None:
+                        self.artefacts.add(
+                            title=lam_title,
+                            artefact_type=ArtefactType.FILE,
+                            content=lam_content,
+                            active=False,
+                            file_ext=".lam",
+                            version=1,
+                            read_only=True,
+                            visibility=ArtefactVisibility.TREE_UNLOCKABLE,
+                            commit_message=f"Schema descriptor for '{db_title_with_ext}'",
+                        )
                     _progress(f"Data bundle consolidation complete. Reduced {len(csv_xlsx_files)} files to {tables_created} tables.")
                     return {
                         "text_artefact": art,
@@ -1283,6 +1449,7 @@ class FileImportMixin:
                         "mode": mode,
                         "page_count": 0,
                         "image_count": 0,
+                        "preserved_sqlite": preserved_sqlite_artefacts,
                         "warnings": warnings,
                     }
 
@@ -1357,68 +1524,62 @@ class FileImportMixin:
             }
 
         # ── data mode (Single File) ──────────────────────────────────────────
-        # 🛑 CRITICAL FIX: Dedented to top-level so it executes when mode == IMPORT_MODE_DATA
+        # Data files are as-is FILE artefacts. The schema lives in a sibling
+        # '.lam' file so tools and LLM discovery both work without a dedicated
+        # DATA artefact type.
         if mode == IMPORT_MODE_DATA:
             _progress("Analyzing structured data file...")
 
-            # 🛡️ TITLE NORMALIZATION PROTOCOL (ENFORCED)
-            # CRITICAL: The Artifact Title MUST match the Physical Filename exactly (including extension).
-            # Tools rely on this exact string match to find files on disk.
             clean_title = title
-
-            # ONLY strip if it's a doubled extension (e.g. "file.csv.csv" -> "file.csv")
             double_ext = ext + ext
             if clean_title.lower().endswith(double_ext):
                 clean_title = clean_title[:-len(ext)]
                 _progress(f"Normalized title '{title}' -> '{clean_title}' to remove double extension.")
-            # DO NOT add extension if missing here, because 'title' comes from filename.stem by default.
-            # The 'title' variable at this point is already path.stem (no extension).
-            # We MUST append it now to ensure Artifact Title == Filename.
             if not clean_title.lower().endswith(ext):
                 clean_title = f"{clean_title}{ext}"
 
             _progress(f"Final artifact title (with extension): '{clean_title}'")
 
-            # 1. Parse and extract the Markdown schema description (This becomes the .lam Logical Twin)
-            # _parse_data_file returns: (schema_text, images_list, raw_physical_bytes)
-            # We pass clean_title (with extension) so the schema header matches the artifact name
-            parse_result = _parse_data_file(path, clean_title, version=1, progress_cb=progress_cb)
-
-            # Handle both 2-tuple (old) and 3-tuple (new) returns from _parse_data_file
+            # Build the schema (never side-write copies; source file is the artefact)
+            parse_result = _parse_data_file(
+                path, clean_title, version=1, progress_cb=progress_cb, skip_sidecar_write=True,
+            )
             if len(parse_result) == 3:
                 schema_text, _, raw_physical_bytes = parse_result
             else:
                 schema_text, _ = parse_result
                 raw_physical_bytes = None
-
-            # Fallback: If _parse_data_file didn't return raw bytes, read them ourselves
             if raw_physical_bytes is None:
                 try:
                     raw_physical_bytes = path.read_bytes()
                 except Exception as e:
                     _progress(f"Warning: Could not read raw bytes: {e}")
 
-            # Append description if provided (before the schema content)
             full_description = schema_text
             if description and description.strip():
                 full_description = f"## Description\n{description.strip()}\n\n{schema_text}"
 
-            atype = ArtefactType.DATA
+            # Write the .lam companion alongside the source (workspace root)
+            lam_disk_path = path.with_suffix(path.suffix + ".lam")
+            try:
+                lam_disk_path.write_text(full_description, encoding="utf-8")
+            except Exception as lam_write_err:
+                warnings.append(f"Failed to write .lam companion: {lam_write_err}")
 
-            # Use clean_title (with extension) for lookup and registration
+            atype = ArtefactType.FILE
+
             existing = self.artefacts.get(clean_title)
-
             if existing is None:
                 art = self.artefacts.add(
                     title=clean_title,
                     artefact_type=atype,
-                    content=full_description,       # Fallback content (usually schema)
+                    content=full_description,
                     active=activate,
                     file_ext=ext,
                     version=1,
                     read_only=True,
-                    physical_data=raw_physical_bytes, # The raw CSV/DB bytes for tools
-                    logical_content=full_description,    # The rich schema for the LLM (.lam)
+                    physical_data=raw_physical_bytes,
+                    logical_content=full_description,
                     commit_message="Imported via FileImport engine (mode=data)"
                 )
             else:
@@ -1430,10 +1591,26 @@ class FileImportMixin:
                     file_ext=ext,
                     version=1,
                     read_only=True,
+                    physical_data=raw_physical_bytes,
+                    logical_content=full_description,
                 )
-            _progress("Data analysis complete.")
 
-            # 🛑 CRITICAL EXIT: Prevent fall-through to generic text processing
+            # Register the .lam companion artefact
+            lam_title = f"{clean_title}.lam"
+            if self.artefacts.get(lam_title) is None:
+                self.artefacts.add(
+                    title=lam_title,
+                    artefact_type=ArtefactType.FILE,
+                    content=full_description,
+                    active=False,
+                    file_ext=".lam",
+                    version=1,
+                    read_only=True,
+                    visibility=ArtefactVisibility.TREE_UNLOCKABLE,
+                    commit_message=f"Schema descriptor for '{clean_title}'",
+                )
+
+            _progress("Data analysis complete.")
             return {
                 "text_artefact": art,
                 "image_artefact": None,
@@ -1732,10 +1909,10 @@ class FileImportMixin:
             atype = _detect_artefact_type_from_mode(path, mode)
             extra_data = {}
             # 🛑 CRITICAL FIX: We DO NOT inject file_ext for text imports.
-            # Injecting file_ext triggers the Dual-Stream .lam protocol in ArtefactManager,
+            # Injecting file_ext triggers the .lam dual-stream protocol in ArtefactManager,
             # which replaces the extracted text with a binary data schema.
-            # Only `data` mode should inject file_ext.
-            if atype == ArtefactType.DATA:
+            # Only `data`/`data_bundle` modes should inject file_ext (via FILE).
+            if atype == ArtefactType.FILE:
                 extra_data["file_ext"] = path.suffix.lower()
             elif title.lower().endswith(".md"):
                 # 🛑 FORCE .md FILE EXTENSION FOR RICH TEXT IMPORTS

@@ -937,6 +937,14 @@ class CoreMixin:
         """
         from lollms_client.lollms_artefact import ArtefactVisibility
 
+        # ── CHAT-MIXIN FLAG GATE: VERSIONING OFF ⇒ NO WORKSPACE ENUMERATION ──
+        # When the discussion disables artefact versioning (agentic mode with a
+        # custom workspace that may contain millions of files), we MUST NOT walk
+        # the workspace. Blind enumeration would kill the session. Only files the
+        # LLM explicitly writes via <artifact> are tracked in that mode.
+        if getattr(self, "disable_artefact_versioning", False):
+            return {"new_artefacts": 0, "updated_artefacts": 0, "deleted_artefacts": 0}
+
         ws_data_path = getattr(self, 'workspace_data_path', None)
         if not ws_data_path:
             return {"new_artefacts": 0, "updated_artefacts": 0, "deleted_artefacts": 0}

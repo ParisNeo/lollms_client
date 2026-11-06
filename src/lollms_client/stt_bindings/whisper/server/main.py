@@ -120,9 +120,14 @@ class ModelManager:
         models_cache_dir: Path,
         batch_window: float = 0.02,
         max_batch_size: int = 8,
+        models_dir: Optional[Path] = None,
     ):
         self.config = config
         self.models_cache_dir = models_cache_dir
+        # 🗂 Folder where Whisper weights are downloaded/loaded. Falls back to
+        # the cache dir when not explicitly provided (backward compatible).
+        self.models_dir: Path = Path(models_dir).resolve() if models_dir else Path(models_cache_dir).resolve()
+        self.models_dir.mkdir(parents=True, exist_ok=True)
         self.batch_window = batch_window
         self.max_batch_size = max_batch_size
         self.model = None
@@ -174,16 +179,23 @@ class ModelManager:
             self._unload_model()
 
         import filelock
-        cache_dir = self.models_cache_dir
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        lock_file = cache_dir / f"{model_name}.lock"
+        lock_dir = self.models_cache_dir
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_file = lock_dir / f"{model_name}.lock"
         lock = filelock.FileLock(lock_file, timeout=300)
 
         load_error: Optional[Exception] = None
         try:
             with lock:
-                ASCIIColors.info(f"Loading Whisper model '{model_name}' on device '{self.device}'...")
-                self.model = whisper.load_model(model_name, device=self.device)
+                ASCIIColors.info(
+                    f"Loading Whisper model '{model_name}' on device '{self.device}' "
+                    f"(download_root={self.models_dir})..."
+                )
+                self.model = whisper.load_model(
+                    model_name,
+                    device=self.device,
+                    download_root=str(self.models_dir),
+                )
                 self.loaded_model_name = model_name
                 self.last_used_time = time.time()
                 ASCIIColors.green(f"Whisper model '{model_name}' loaded successfully on '{self.device}'.")
@@ -211,7 +223,11 @@ class ModelManager:
                     torch.cuda.empty_cache()
                 self.device = "cpu"
                 try:
-                    self.model = whisper.load_model(model_name, device="cpu")
+                    self.model = whisper.load_model(
+                        model_name,
+                        device="cpu",
+                        download_root=str(self.models_dir),
+                    )
                     self.loaded_model_name = model_name
                     self.last_used_time = time.time()
                     ASCIIColors.green(f"Whisper model '{model_name}' loaded on CPU fallback.")
@@ -399,6 +415,7 @@ class WhisperRegistry:
                 cls._instance._managers = {}
                 cls._instance._registry_lock = threading.Lock()
                 cls._instance.models_cache_dir = kwargs.get("models_cache_dir")
+                cls._instance.models_dir = kwargs.get("models_dir") or cls._instance.models_cache_dir
                 cls._instance.batch_window = kwargs.get("batch_window", 0.02)
                 cls._instance.max_batch_size = kwargs.get("max_batch_size", 8)
         return cls._instance
@@ -414,6 +431,7 @@ class WhisperRegistry:
                     self.models_cache_dir,
                     batch_window=self.batch_window,
                     max_batch_size=self.max_batch_size,
+                    models_dir=self.models_dir,
                 )
             return self._managers[key]
 
@@ -427,13 +445,22 @@ class WhisperRegistry:
 
 
 class ServerState:
-    def __init__(self, models_cache_dir: Path, auth_token: Optional[str] = None, batch_window: float = 0.02, max_batch_size: int = 8):
+    def __init__(
+        self,
+        models_cache_dir: Path,
+        auth_token: Optional[str] = None,
+        batch_window: float = 0.02,
+        max_batch_size: int = 8,
+        models_dir: Optional[Path] = None,
+    ):
         self.models_cache_dir = models_cache_dir
+        self.models_dir = Path(models_dir).resolve() if models_dir else Path(models_cache_dir).resolve()
         self.auth_token = auth_token
         self.batch_window = batch_window
         self.max_batch_size = max_batch_size
         self.registry = WhisperRegistry(
             models_cache_dir=models_cache_dir,
+            models_dir=self.models_dir,
             batch_window=batch_window,
             max_batch_size=max_batch_size,
         )
@@ -907,6 +934,12 @@ if __name__ == "__main__":
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9633)
     parser.add_argument("--cache-dir", type=str, required=True)
+    parser.add_argument(
+        "--models-dir",
+        type=str,
+        default=None,
+        help="Directory for Whisper model weights (defaults to cache-dir).",
+    )
     parser.add_argument("--token", type=str, default=None)
     parser.add_argument("--batch-window", type=float, default=0.02)
     parser.add_argument("--max-batch-size", type=int, default=8)
@@ -915,6 +948,9 @@ if __name__ == "__main__":
 
     cache_path = Path(args.cache_dir).resolve()
     cache_path.mkdir(parents=True, exist_ok=True)
+
+    models_path = Path(args.models_dir).resolve() if args.models_dir else cache_path
+    models_path.mkdir(parents=True, exist_ok=True)
 
     pid_file_path = Path(args.pid_file).resolve() if args.pid_file else cache_path / "whisper_server.pid"
     try:
@@ -944,11 +980,13 @@ if __name__ == "__main__":
         auth_token=auth_token,
         batch_window=args.batch_window,
         max_batch_size=args.max_batch_size,
+        models_dir=models_path,
     )
 
     ASCIIColors.cyan("--- Whisper STT Shared Server ----------------------------------")
     ASCIIColors.green(f"Host:Port      : http://{args.host}:{args.port}")
     ASCIIColors.green(f"Cache Path     : {cache_path}")
+    ASCIIColors.green(f"Models Path    : {models_path}")
     ASCIIColors.green(f"Micro-Batching : window={args.batch_window}s, max_batch={args.max_batch_size}")
     ASCIIColors.green(f"Auth Protected : {'Yes' if auth_token else 'No'}")
     ASCIIColors.cyan("----------------------------------------------------------------")

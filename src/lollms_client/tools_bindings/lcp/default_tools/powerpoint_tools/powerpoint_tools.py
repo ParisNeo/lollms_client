@@ -752,22 +752,130 @@ def tool_edit_powerpoint(
     return _build_result(save_result, save_path)
 
 
+def _extract_pptx_body_text(prs: Any, slide_range: Optional[str] = None) -> Tuple[str, int, List[str]]:
+    """Extracts the body text of a deck (or a slide subset) as markdown.
+
+    Returns (body_text, total_slides, slide_titles). Each slide is rendered as
+    `## Slide N — <title>` followed by its shape texts. `slide_range` accepts
+    the same grammar as `_parse_slides_spec` ('1-4', '2,5,7', '3'); None = all.
+    """
+    total_slides = len(prs.slides)
+    if slide_range:
+        selected = _parse_slides_spec_unlimited(slide_range, total_slides)
+    else:
+        selected = list(range(1, total_slides + 1))
+
+    parts: List[str] = []
+    slide_titles: List[str] = []
+    for slide_no in selected:
+        if slide_no < 1 or slide_no > total_slides:
+            continue
+        slide = prs.slides[slide_no - 1]
+        title_text = ""
+        try:
+            title_shape = slide.shapes.title
+            if title_shape is not None and (title_shape.text or "").strip():
+                title_text = title_shape.text.strip().splitlines()[0]
+        except Exception:
+            title_text = ""
+        slide_titles.append(title_text)
+        header = f"## Slide {slide_no}" + (f" — {title_text}" if title_text else "")
+        parts.append(header)
+        for shape in slide.shapes:
+            try:
+                text = (shape.text or "").strip()
+            except Exception:
+                text = ""
+            if text:
+                parts.append(text)
+        parts.append("")
+    return "\n".join(parts), total_slides, slide_titles
+
+
+def _extract_pptx_images_metadata(prs: Any) -> List[Dict[str, Any]]:
+    """Returns metadata for every picture shape in the deck (no bytes loaded).
+
+    Each entry: slide (1-based), shape_name, filename, size_bytes, content_type.
+    """
+    images: List[Dict[str, Any]] = []
+    for slide_idx, slide in enumerate(prs.slides, start=1):
+        for shape in slide.shapes:
+            try:
+                if not hasattr(shape, "image"):
+                    continue
+                image = shape.image
+                images.append({
+                    "slide": slide_idx,
+                    "shape_name": getattr(shape, "name", "") or "",
+                    "filename": getattr(image, "filename", "") or "",
+                    "size_bytes": len(getattr(image, "blob", b"") or b""),
+                    "content_type": getattr(image, "content_type", "") or "",
+                })
+            except Exception:
+                continue
+    return images
+
+
+def _parse_slides_spec_unlimited(spec: str, deck_size: int) -> List[int]:
+    """Parses a slides spec into a deduplicated, clamped list (NO 4-slide cap).
+
+    Used by the reader (which returns text, not images) so the caller can walk
+    the whole deck. The 4-slide cap only applies to `tool_view_slides`.
+    """
+    raw = (spec or "").strip()
+    if not raw:
+        return list(range(1, deck_size + 1))
+    picked: List[int] = []
+    seen: set = set()
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        range_match = re.match(r"^(\d+)\s*-\s*(\d+)$", chunk)
+        if range_match:
+            start = max(1, int(range_match.group(1)))
+            end = min(deck_size, int(range_match.group(2)))
+            for n in range(start, end + 1):
+                if n not in seen:
+                    seen.add(n)
+                    picked.append(n)
+            continue
+        if chunk.isdigit():
+            n = int(chunk)
+            if 1 <= n <= deck_size and n not in seen:
+                seen.add(n)
+                picked.append(n)
+    return picked
+
+
 def tool_read_powerpoint(
     file: str,
+    mode: str = "text",
+    slide_range: Optional[str] = None,
+    offset: int = 0,
+    limit: int = 0,
     discussion_instance=None,
     lollms_client_instance=None,
 ) -> Dict[str, Any]:
-    """Reads a PowerPoint deck and returns a markdown inventory of its slides.
+    """Reads a PowerPoint deck (.pptx/.pptm) with explicit read modes.
 
-    Validates the file first (three-layer OOXML check), then extracts each
-    slide's title and shape texts. For layout/template details use
-    tool_pptx_info; for rendered pixels use tool_view_slides.
+    MODES
+    -----
+    - "text"      : full body text (all slides, or a subset via `slide_range`).
+    - "peek"      : first `limit` slides only (default 3) — cheap preview.
+    - "chunk"     : slides [offset : offset+limit] of the body (default 10 slides).
+    - "inventory" : markdown inventory (slide titles + shape texts).
+
+    Every response includes `total_slides`, `slide_titles`, and `images`
+    metadata (per-slide picture info) so the caller can plan chunked reads
+    without re-inspecting the file.
 
     Args:
-        file (str): Deck file name (.pptx or .pptm).
-
-    Returns:
-        dict: {"success", "file_name", "workspace_file", "inventory"}.
+        file: Deck file name (.pptx or .pptm).
+        mode: "text" | "peek" | "chunk" | "inventory". Defaults to "text".
+        slide_range: Optional 1-based slide selector ('1-4', '2,5,7', '3').
+        offset: 0-based SLIDE offset for mode="chunk".
+        limit: Max SLIDES to return. 0 = no limit (text) / 3 (peek) / 10 (chunk).
     """
     suffix_check = _require_suffix(file, _PPTX_SUFFIXES, "tool_read_powerpoint")
     if suffix_check:
@@ -784,13 +892,109 @@ def tool_read_powerpoint(
     if not ok:
         return {"success": False, "error": f"file failed integrity validation: {detail}"}
 
-    inventory = _read_pptx(save_path)
+    normalized_mode = (mode or "text").strip().lower()
+    if normalized_mode not in ("text", "peek", "chunk", "inventory"):
+        return {
+            "success": False,
+            "error": f"Invalid mode '{mode}'. Use 'text', 'peek', 'chunk', or 'inventory'.",
+        }
+
+    try:
+        from pptx import Presentation as _PptxPresentation
+        prs = _PptxPresentation(str(save_path))
+    except Exception as open_error:
+        return {"success": False, "error": f"failed to open '{file_name}': {open_error}"}
+
+    total_slides = len(prs.slides)
+    images = _extract_pptx_images_metadata(prs)
+
+    if normalized_mode == "inventory":
+        inventory = _read_pptx(save_path)
+        return {
+            "success": True,
+            "mode": "inventory",
+            "file_name": save_path.name,
+            "workspace_file": save_path.name,
+            "inventory": inventory,
+            "output": inventory,
+            "total_slides": total_slides,
+            "images": images,
+            "image_count": len(images),
+        }
+
+    body_text, _, slide_titles = _extract_pptx_body_text(prs, slide_range=slide_range)
+    total_chars = len(body_text)
+    body_lines = body_text.splitlines()
+
+    if normalized_mode == "text":
+        return {
+            "success": True,
+            "mode": "text",
+            "file_name": save_path.name,
+            "workspace_file": save_path.name,
+            "text": body_text,
+            "content": body_text,
+            "output": body_text,
+            "total_chars": total_chars,
+            "total_slides": total_slides,
+            "slide_titles": slide_titles,
+            "images": images,
+            "image_count": len(images),
+        }
+
+    if normalized_mode == "peek":
+        peek_limit = limit if limit and limit > 0 else 3
+        snippet_lines = body_lines[:peek_limit]
+        snippet = "\n".join(snippet_lines)
+        return {
+            "success": True,
+            "mode": "peek",
+            "file_name": save_path.name,
+            "workspace_file": save_path.name,
+            "text": snippet,
+            "content": snippet,
+            "output": snippet,
+            "total_chars": total_chars,
+            "returned_lines": len(snippet_lines),
+            "total_slides": total_slides,
+            "slide_titles": slide_titles,
+            "has_more": len(body_lines) > len(snippet_lines),
+            "next_offset": len(snippet_lines) if len(body_lines) > len(snippet_lines) else None,
+            "images": images,
+            "image_count": len(images),
+        }
+
+    # mode == "chunk"
+    try:
+        start = max(0, int(offset))
+    except (TypeError, ValueError):
+        start = 0
+    try:
+        chunk_limit = int(limit) if limit else 10
+    except (TypeError, ValueError):
+        chunk_limit = 10
+    if chunk_limit <= 0:
+        chunk_limit = 10
+    end = min(len(body_lines), start + chunk_limit)
+    chunk_lines = body_lines[start:end]
+    chunk = "\n".join(chunk_lines)
     return {
         "success": True,
+        "mode": "chunk",
         "file_name": save_path.name,
         "workspace_file": save_path.name,
-        "inventory": inventory,
-        "output": inventory,
+        "text": chunk,
+        "content": chunk,
+        "output": chunk,
+        "offset": start,
+        "returned_lines": len(chunk_lines),
+        "total_chars": total_chars,
+        "total_slides": total_slides,
+        "slide_titles": slide_titles,
+        "has_more": end < len(body_lines),
+        "next_offset": end if end < len(body_lines) else None,
+        "images": images,
+        "image_count": len(images),
     }
 
 
@@ -1072,13 +1276,23 @@ def get_tools() -> List[Dict[str, Any]]:
         {
             "name": "tool_read_powerpoint",
             "description": (
-                "Read a PowerPoint deck and return a markdown inventory of its slides "
-                "(titles + shape texts). Validated with a three-layer OOXML check first."
+                "Read a PowerPoint deck (.pptx/.pptm) with explicit read modes. "
+                "MODES: 'text' (full body, all slides or a subset via `slide_range`), "
+                "'peek' (first N slides — cheap preview), 'chunk' (slides [offset:offset+limit] "
+                "for large decks), 'inventory' (slide titles + shape texts). Every response "
+                "includes total_slides, slide_titles, and images metadata (per-slide picture "
+                "info) so you can plan chunked reads without re-inspecting the file. Use "
+                "'peek' first, then 'chunk' with next_offset to walk the deck. `slide_range` "
+                "accepts '1-4', '2,5,7', '3'."
             ),
             "parameters": [
                 {"name": "file", "type": "string", "description": "Deck file name (.pptx or .pptm)."},
+                {"name": "mode", "type": "string", "description": "'text' (full body) | 'peek' (first N slides) | 'chunk' (offset+limit slides) | 'inventory' (titles + shape texts). Defaults to 'text'.", "optional": True},
+                {"name": "slide_range", "type": "string", "description": "Optional 1-based slide selector ('1-4', '2,5,7', '3').", "optional": True},
+                {"name": "offset", "type": "integer", "description": "0-based SLIDE offset for mode='chunk'. Defaults to 0.", "optional": True},
+                {"name": "limit", "type": "integer", "description": "Max SLIDES to return. 0 = no limit (text) / 3 (peek) / 10 (chunk).", "optional": True},
             ],
-            "output": "JSON result with success, file_name, inventory.",
+            "output": "JSON result with success, mode, text/inventory, total_slides, slide_titles, images, has_more, next_offset.",
             "callable": tool_read_powerpoint,
             "_source": "powerpoint_tools",
             "_source_file": __file__,

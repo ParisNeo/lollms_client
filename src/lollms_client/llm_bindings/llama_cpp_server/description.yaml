@@ -46,86 +46,6 @@ global_input_parameters:
     description: "Dedicated port number for this server instance (null/0 for auto-assign)."
     mandatory: false
     default: null
-  - name: ctx_size
-    type: int
-    description: "Context window size (tokens)."
-    mandatory: false
-    default: 4096
-  - name: n_gpu_layers
-    type: int
-    description: "Number of transformer layers to offload to GPU (-1 = all)."
-    mandatory: false
-    default: -1
-  - name: n_threads
-    type: int
-    description: "CPU threads to use for generation (null = auto)."
-    mandatory: false
-    default: null
-  - name: n_parallel
-    type: int
-    description: "Parallel decoding slots (for concurrent requests)."
-    mandatory: false
-    default: 1
-  - name: batch_size
-    type: int
-    description: "Prompt-evaluation batch size."
-    mandatory: false
-    default: 512
-  - name: flash_attn
-    type: bool
-    description: "Enable FlashAttention (requires compatible build)."
-    mandatory: false
-    default: false
-  - name: mmap
-    type: bool
-    description: "Use memory-mapped I/O for model weights."
-    mandatory: false
-    default: true
-  - name: mlock
-    type: bool
-    description: "Lock model weights in RAM (prevents swapping)."
-    mandatory: false
-    default: false
-  - name: rope_scale
-    type: float
-    description: "RoPE context scaling factor (null = off)."
-    mandatory: false
-    default: null
-  - name: rope_freq_base
-    type: float
-    description: "RoPE frequency base override (null = model default)."
-    mandatory: false
-    default: null
-  - name: rope_freq_scale
-    type: float
-    description: "RoPE frequency scale override (null = model default)."
-    mandatory: false
-    default: null
-  - name: tensor_split
-    type: str
-    description: "Comma-separated GPU tensor-split ratios, e.g. '0.6,0.4'."
-    mandatory: false
-    default: null
-  - name: main_gpu
-    type: int
-    description: "GPU index to use for scratch/small tensors."
-    mandatory: false
-    default: null
-  - name: cache_type_k
-    type: str
-    description: "KV-cache key quantisation type (f16, q8_0, q4_0 …)."
-    mandatory: false
-    default: null
-  - name: cache_type_v
-    type: str
-    description: "KV-cache value quantisation type."
-    mandatory: false
-    default: null
-  - name: multimodal
-    type: bool
-    description: "Enable automatic vision projector (mmproj) detection. Disable if you only use text models."
-    mandatory: false
-    default: true
   - name: max_active_models
     type: int
     description: "Maximum simultaneous model servers (-1 = unlimited)."
@@ -159,9 +79,105 @@ model_input_parameters:
     description: "Filename of the GGUF model to load on startup."
     mandatory: false
     default: ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-model (per-profile) parameters.
+#
+# These knobs drive llama-server launch flags and legitimately differ from one
+# model to another (a 7B Q4 fits fully on GPU with -1 layers, a 70B needs
+# tensor_split; a 128k-context model needs a big ctx_size while a 4k model
+# would waste VRAM). They are therefore declared at the *profile* level so the
+# wizard, auto-generation, and headless API can populate them per model —
+# not once per binding instance.
+#
+# The client forwards each profile's non-framework keys into `binding_config`,
+# which the binding already consumes verbatim from `kwargs`. Nothing else is
+# required to plumb them.
+# ─────────────────────────────────────────────────────────────────────────────
+model_profiles_input_parameters:
+  - name: ctx_size
+    type: int
+    description: "Per-model context window size (tokens). Larger contexts consume more VRAM."
+    mandatory: false
+    default: 4096
+  - name: n_gpu_layers
+    type: int
+    description: "Transformer layers offloaded to GPU for this model (-1 = all, 0 = CPU only)."
+    mandatory: false
+    default: -1
+  - name: n_threads
+    type: int
+    description: "CPU threads used for generation with this model (null = auto)."
+    mandatory: false
+    default: null
+  - name: n_parallel
+    type: int
+    description: "Parallel decoding slots for this model's server."
+    mandatory: false
+    default: 1
+  - name: batch_size
+    type: int
+    description: "Prompt-evaluation batch size for this model."
+    mandatory: false
+    default: 512
+  - name: flash_attn
+    type: bool
+    description: "Enable FlashAttention for this model (requires a compatible build and model)."
+    mandatory: false
+    default: false
+  - name: mmap
+    type: bool
+    description: "Use memory-mapped I/O for this model's weights."
+    mandatory: false
+    default: true
+  - name: mlock
+    type: bool
+    description: "Lock this model's weights in RAM (prevents swapping; not compatible with mmap)."
+    mandatory: false
+    default: false
+  - name: rope_scale
+    type: float
+    description: "RoPE context scaling factor for this model (null = off)."
+    mandatory: false
+    default: null
+  - name: rope_freq_base
+    type: float
+    description: "RoPE frequency base override for this model (null = model default)."
+    mandatory: false
+    default: null
+  - name: rope_freq_scale
+    type: float
+    description: "RoPE frequency scale override for this model (null = model default)."
+    mandatory: false
+    default: null
+  - name: tensor_split
+    type: str
+    description: "Comma-separated GPU tensor-split ratios for this model, e.g. '0.6,0.4'."
+    mandatory: false
+    default: null
+  - name: main_gpu
+    type: int
+    description: "GPU index used for scratch/small tensors when this model runs."
+    mandatory: false
+    default: null
+  - name: cache_type_k
+    type: str
+    description: "KV-cache key quantisation type for this model (f16, q8_0, q4_0 …)."
+    mandatory: false
+    default: null
+  - name: cache_type_v
+    type: str
+    description: "KV-cache value quantisation type for this model."
+    mandatory: false
+    default: null
+  - name: multimodal
+    type: bool
+    description: "Enable automatic vision projector (mmproj) detection for this model. Disable for text-only models to skip mmproj probing."
+    mandatory: false
+    default: true
   - name: reasoning
     type: str
-    description: "Activates or deactivates reasoning."
+    description: "Activates the reasoning mode for this model at the server level."
     mandatory: false
     default: "off"
     options:
@@ -169,7 +185,7 @@ model_input_parameters:
       - "on"
   - name: reasoning_budget
     type: int
-    description: "Maximum reasoning budget in tokens."
+    description: "Maximum reasoning budget in tokens for this model (0 = unlimited)."
     mandatory: false
     default: 0
 

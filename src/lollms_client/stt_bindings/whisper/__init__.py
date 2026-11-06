@@ -56,7 +56,9 @@ class WhisperSTTBinding(LollmsSTTBinding):
     """
 
     def __init__(self, **kwargs):
-        super().__init__(binding_name="whisper")
+        # Forward kwargs so the base binding can pick up ``lollms_data_folder``
+        # (injected by LollmsClient) and expose it via ``get_data_folder()``.
+        super().__init__(binding_name="whisper", **kwargs)
         self.config = kwargs
         self.host = kwargs.get("host", "127.0.0.1")
         self.port = int(kwargs.get("port", 9633))
@@ -69,19 +71,31 @@ class WhisperSTTBinding(LollmsSTTBinding):
         self.binding_root = Path(__file__).parent
         self.server_dir = self.binding_root / "server"
 
-        system_root = self.get_system_dir()
+        # 📂 Whisper persists its state (venv, models, tokens, pid, logs) under
+        # <lollms_data_folder>/stt/whisper. This lets users relocate storage to
+        # a larger disk by configuring the client-wide data folder.
+        data_root = self.resolve_data_path("stt", "whisper")
+
         if kwargs.get("venv_path"):
             self.venv_dir = self.resolve_system_path(kwargs["venv_path"])
         else:
-            self.venv_dir = (system_root / "venv" / "stt_whisper_venv").resolve()
+            self.venv_dir = (self.get_system_dir() / "venv" / "stt_whisper_venv").resolve()
 
+        # 🗄 cache_dir hosts server state artifacts: auth token, PID, spawn lock, log.
         if kwargs.get("cache_dir"):
             self.cache_dir = self.resolve_system_path(kwargs["cache_dir"])
         else:
-            self.cache_dir = (system_root / "data" / "stt_models" / "whisper").resolve()
+            self.cache_dir = data_root
+
+        # 🗂 models_dir hosts Whisper model weights (download_root for load_model).
+        if kwargs.get("models_dir"):
+            self.models_dir = self.resolve_system_path(kwargs["models_dir"])
+        else:
+            self.models_dir = (data_root / "models").resolve()
 
         self.venv_dir.mkdir(exist_ok=True, parents=True)
         self.cache_dir.mkdir(exist_ok=True, parents=True)
+        self.models_dir.mkdir(exist_ok=True, parents=True)
 
         self.token_file = self.cache_dir / "whisper_server.token"
         self.pid_file = self.cache_dir / _PID_FILE_NAME
@@ -206,6 +220,7 @@ class WhisperSTTBinding(LollmsSTTBinding):
             "--host", str(self.host),
             "--port", str(self.port),
             "--cache-dir", str(self.cache_dir.resolve()),
+            "--models-dir", str(self.models_dir.resolve()),
             "--token", str(self.service_key),
             "--batch-window", str(self.batch_window),
             "--max-batch-size", str(self.max_batch_size),
@@ -318,6 +333,16 @@ class WhisperSTTBinding(LollmsSTTBinding):
             raise ValueError("audio_source must be str, Path, or bytes")
 
         audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+
+        payload = {
+            "audio_b64": audio_b64,
+            "model_name": model or self.config.get("model_name", "base"),
+            "language": kwargs.get("language"),
+            "task": kwargs.get("task", "transcribe"),
+            "fp16": kwargs.get("fp16"),
+            "device": kwargs.get("device"),
+            "filename": filename_hint,
+        }
 
         url = f"{self.base_url}/transcribe"
         resp = _module_post(
