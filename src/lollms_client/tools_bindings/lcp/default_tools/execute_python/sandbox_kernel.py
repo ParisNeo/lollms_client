@@ -48,6 +48,7 @@ import shutil
 import socket
 import importlib
 import subprocess
+import glob
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
@@ -456,6 +457,46 @@ def _is_read_only_open_mode(mode: Any) -> bool:
     if any(c in m for c in ("w", "a", "x", "+")):
         return False
     return "r" in m
+
+
+_GLOB_MAGIC_CHARS: frozenset[str] = frozenset({"*", "?", "["})
+
+
+def _glob_static_root(pattern: Any) -> str:
+    """Returns the longest magic-free leading path prefix of a glob pattern.
+
+    For ``'/etc/**/*.py'`` returns ``'/etc'``; for ``'data/*.csv'`` returns
+    ``'data'``; for ``'*'`` returns ``'.'`` (the pattern enumerates the CWD,
+    which the sandbox pins to the workspace root). This is exactly the
+    directory ``glob`` will scan, so resolving it against the workspace root
+    is the correct, minimal guard on the ``glob`` surface.
+
+    Handles bytes patterns (decoded for path checking only) and Windows
+    drives/roots via ``Path.parts`` — e.g. ``'C:\\\\Users\\\\x\\\\*'`` yields
+    ``'C:\\\\Users\\\\x'``.
+    """
+    if isinstance(pattern, (bytes, bytearray)):
+        try:
+            text = bytes(pattern).decode("utf-8", "surrogateescape")
+        except Exception:
+            return "."
+    else:
+        try:
+            text = os.fspath(pattern)
+        except TypeError:
+            return "."
+        if isinstance(text, bytes):
+            text = text.decode("utf-8", "surrogateescape")
+    if not text:
+        return "."
+    static_parts: List[str] = []
+    for part in Path(text).parts:
+        if any(c in _GLOB_MAGIC_CHARS for c in part):
+            break
+        static_parts.append(part)
+    if not static_parts:
+        return "."
+    return os.sep.join(static_parts) or "."
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1465,6 +1506,24 @@ class SandboxContext:
             "os.link": getattr(os, "link", None),
             "os.chdir": getattr(os, "chdir", None),
             "os.fchdir": getattr(os, "fchdir", None),
+            # Directory-enumeration primitives: read-only, but they leak the
+            # host filesystem layout (filenames, sizes, mtimes) when their
+            # argument resolves outside the workspace. Guarded below so a
+            # sandboxed scan cannot enumerate `~/.ssh`, `C:\\Users\\...`,
+            # `/etc`, etc.
+            #
+            # `glob.glob` / `glob.iglob` are snapshotted separately because
+            # CPython <= 3.10 binds `scandir` BY VALUE inside the `glob`
+            # module at import time (`from os import scandir`). Patching
+            # `os.scandir` later does NOT rebind `glob.scandir`, so a bare
+            # scandir guard does not intercept `glob.glob`. The glob entry
+            # points must be guarded explicitly; the scandir/listdir guards
+            # remain as defense-in-depth for direct callers.
+            "os.listdir": getattr(os, "listdir", None),
+            "os.scandir": getattr(os, "scandir", None),
+            "os.walk": getattr(os, "walk", None),
+            "glob.glob": getattr(glob, "glob", None),
+            "glob.iglob": getattr(glob, "iglob", None),
             "shutil.rmtree": getattr(shutil, "rmtree", None),
             "shutil.move": getattr(shutil, "move", None),
             "shutil.copy": getattr(shutil, "copy", None),
@@ -1547,6 +1606,8 @@ class SandboxContext:
                         setattr(socket, attr, orig)
                 elif owner == "importlib":
                     setattr(importlib, attr, orig)
+                elif owner == "glob":
+                    setattr(glob, attr, orig)
             except Exception:
                 pass
         self._originals = {}
@@ -1922,6 +1983,50 @@ class SandboxContext:
             _resolve_within(root, path)
             return self._originals["os.open"](path, *a, **kw)
 
+        # -------- directory-enumeration guards (read-only, path-bounded) --------
+        # `os.listdir` / `os.scandir` / `os.walk` are pure reads — they cannot
+        # modify the host — but they expose the filesystem layout. Guarding
+        # them closes the reconnaissance gap the transcript surfaced: the LLM
+        # could previously `os.listdir('/')` or `glob.glob('~/**')` inside the
+        # sandbox and learn host paths, while `open('/...')` of the same path
+        # was correctly blocked. The guard is PATH-ARGUMENT-AUTHORITATIVE
+        # (mirrors `_guarded_open`): any enumeration whose argument resolves
+        # outside `workspace_root` — but inside a trusted interpreter root —
+        # raises `SandboxPermissionError`. `allow_trusted_read=True` is set
+        # because every op in this set is read-only by definition.
+        #
+        # `glob.glob` is NOT patched directly: CPython's `glob._iglob` routes
+        # through `os.scandir(dirname)`, so guarding `os.scandir` transitively
+        # guards `glob.glob`, `glob.iglob`, and `Path.glob` for free.
+        def _bounded_listdir(path=".", *a, **kw):
+            _resolve_within(root, path, allow_trusted_read=True)
+            return self._originals["os.listdir"](path, *a, **kw)
+        def _bounded_scandir(path=".", *a, **kw):
+            _resolve_within(root, path, allow_trusted_read=True)
+            return self._originals["os.scandir"](path, *a, **kw)
+        def _bounded_walk(top, *a, **kw):
+            # `os.walk` recurses: guard the seed path here, and rely on the
+            # patched `scandir`/`listdir` (which `walk` internally calls) to
+            # guard every level it descends into. This two-layer guard is
+            # belt-and-suspenders: even if a future walk implementation
+            # bypasses scandir, the entry point is still bounded.
+            _resolve_within(root, top, allow_trusted_read=True)
+            return self._originals["os.walk"](top, *a, **kw)
+
+        # CPython <= 3.10's `glob` module binds `scandir` BY VALUE at its own
+        # import time (`from os import scandir`). Patching `os.scandir` later
+        # does NOT rebind `glob.scandir`, so a bare scandir guard does not
+        # intercept `glob.glob` — a fact this suite proved by failing before
+        # the explicit guard below was added. The glob entry points are thus
+        # guarded on the STATIC leading directory of the pattern (the longest
+        # magic-free path prefix), which is exactly the directory `glob` scans.
+        def _bounded_glob(pattern, *a, **kw):
+            _resolve_within(root, _glob_static_root(pattern), allow_trusted_read=True)
+            return self._originals["glob.glob"](pattern, *a, **kw)
+        def _bounded_iglob(pattern, *a, **kw):
+            _resolve_within(root, _glob_static_root(pattern), allow_trusted_read=True)
+            return self._originals["glob.iglob"](pattern, *a, **kw)
+
         for name, fn in (
             ("remove", _bounded_remove),
             ("unlink", _bounded_unlink),
@@ -1934,9 +2039,17 @@ class SandboxContext:
             ("mkdir", _bounded_mkdir),
             ("makedirs", _bounded_makedirs),
             ("open", _bounded_os_open),
+            ("listdir", _bounded_listdir),
+            ("scandir", _bounded_scandir),
+            ("walk", _bounded_walk),
         ):
             if self._originals.get(f"os.{name}") is not None:
                 setattr(os, name, fn)
+
+        if self._originals.get("glob.glob") is not None:
+            glob.glob = _bounded_glob
+        if self._originals.get("glob.iglob") is not None:
+            glob.iglob = _bounded_iglob
 
         # -------- shutil.* lockdown (same frame-gated policy) --------
         # Same policy: path argument alone decides.

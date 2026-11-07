@@ -17,12 +17,9 @@ import atexit
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union, Callable
 
-import pipmaster as pm
-from ascii_colors import ASCIIColors, trace_exception
-from lollms_client.lollms_llm_binding import LollmsLLMBinding
-from lollms_client.lollms_types import MSG_TYPE
-from lollms_client.lollms_discussion import LollmsDiscussion
-from lollms_client.lollms_utilities import to_int, to_float, _convert_to_bool
+
+
+
 
 # Ensure dependencies
 pm.ensure_packages(["openai", "huggingface_hub", "filelock", "requests", "tqdm", "psutil", "pyyaml"])
@@ -1953,10 +1950,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
     # Model zoo
     # ──────────────────────────────────────────────────────────────────────────
 
-    def get_zoo(self) -> List[Dict[str, Any]]:
-        return [
-            {
-                "name": "Magistral-Small-2509-GGUF",
+
                 "description": "Mistral AI Magistral 2509 – Efficient Thinking Model",
                 "size": "14.3 GB (Q4_K_M)",
                 "type": "gguf",
@@ -2111,11 +2105,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                 progress_callback({"status": "error", "message": err})
             return {"status": False, "error": err}
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Cleanup
-    # ──────────────────────────────────────────────────────────────────────────
 
-    def cleanup_orphans_if_needed(self):
         """
         Called at interpreter exit.  Performs a lightweight registry scan and
         removes stale entries left by crashed processes.
@@ -2129,6 +2119,4 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             except Exception:
                 rf.unlink(missing_ok=True)
 
-    def __del__(self):
-        if hasattr(self, "_watchdog_stop"):
-            self._watchdog_stop.set()
+

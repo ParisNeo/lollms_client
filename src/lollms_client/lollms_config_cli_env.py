@@ -144,7 +144,6 @@ def _serialize_config_map_to_yaml(config_map: Dict[str, str]) -> Dict[str, Any]:
         known_aliases_by_modality[mod] = {
             "bindings": _get_configured_aliases(mod, config_map, "BINDINGS"),
             "profiles": _get_configured_aliases(mod, config_map, "PROFILES"),
-            "commands": _get_configured_command_aliases(mod, config_map),
         }
 
     for k, v in config_map.items():
@@ -165,7 +164,7 @@ def _serialize_config_map_to_yaml(config_map: Dict[str, str]) -> Dict[str, Any]:
 
         modality = parts[0].lower()
         category = parts[1].lower()
-        if category not in ("bindings", "profiles", "commands"):
+        if category not in ("bindings", "profiles"):
             continue
         remainder = parts[2]
 
@@ -191,16 +190,6 @@ def _serialize_config_map_to_yaml(config_map: Dict[str, str]) -> Dict[str, Any]:
                     idx = remainder.find("_ROUTING_")
                     alias = remainder[:idx]
                     param_name = remainder[idx + 1:].lower()
-            elif category == "commands":
-                # Command keys look like: <binding_alias>_<command_alias>_<param>.
-                # The command alias is user-chosen and used verbatim in the map,
-                # so we keep the entire remainder before NAME/TITLE/DESCRIPTION
-                # as-is. Longest-suffix-first matching avoids stranding name chars.
-                for suffix in ("_DESCRIPTION", "_TITLE", "_NAME"):
-                    if remainder.endswith(suffix):
-                        alias = remainder[: -len(suffix)]
-                        param_name = suffix.lstrip("_").lower()
-                        break
             else:
                 if remainder.endswith("_BINDING_NAME"):
                     alias = remainder[:-len("_BINDING_NAME")]
@@ -687,13 +676,6 @@ def _get_binding_commands(b_name: str, b_type: str) -> List[Dict[str, Any]]:
             "output": entry.get("output") or [],
         })
     return commands
-
-def _command_env_prefix(b_type: str, binding_alias: str, command_alias: str) -> str:
-    """Env-prefix for a single command: <MOD>_CMDS_<binding_alias>_<command_alias>_."""
-    return (
-        f"{b_type.upper()}_CMDS_{_sanitize_alias(binding_alias).upper()}_"
-        f"{_sanitize_alias(command_alias).upper()}_"
-    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Unified Client Resolver
@@ -1215,23 +1197,19 @@ def _bindings_menu(b_type: str, config_map: Dict[str, str]):
             selection()
 
 def _commands_menu(b_type: str, binding_alias: str, config_map: Dict[str, str]) -> None:
-    """Interactive menu to enable / edit / disable a binding's commands.
+    """Interactive menu to run a binding's declared commands.
 
-    Commands are declared in the binding's description.yaml (``commands:``) and
-    materialized as env-keys under ``<MOD>_CMDS_<binding_alias>_<cmd>_*``. This
-    menu presents:
-      * the commands the binding author declared, and
-      * the commands already enabled into the config map (which may include
-        user-added commands, or ones from an older description).
-
-    Actions are dispatched as plain prompts (``_safe_select`` /
-    ``_safe_confirm`` / ``_safe_input_or_back``), avoiding nested ``Menu``
-    objects (which corrupted terminal state on some platforms).
+    Commands are declared in the binding's description.yaml under ``commands:``
+    and map 1:1 to methods on the binding object (e.g. ``pull_model``,
+    ``update``, ``unload_model``, ``bind_multimodal_model``). This menu lists
+    every declared command, prompts for its parameters, and invokes it
+    immediately — there is no "enable" step: a declared command is always
+    runnable.
     """
     binding_prefix = f"{b_type.upper()}_BINDINGS_{_sanitize_alias(binding_alias).upper()}_"
     binding_name: Optional[str] = None
     for k, v in config_map.items():
-        if k.upper() == f"{binding_prefix}BINDING_NAME".upper():
+        if k.upper() == f"{binding_prefix}BINDING_NAME":
             binding_name = v
             break
     if not binding_name:
@@ -1239,178 +1217,368 @@ def _commands_menu(b_type: str, binding_alias: str, config_map: Dict[str, str]) 
         return
 
     declared = _get_binding_commands(binding_name, b_type)
-    declared_by_name = {c["name"].lower(): c for c in declared}
-
-    def _mapped_cmd_aliases() -> List[str]:
-        """Returns the FULL `<binding_alias>_<cmd>` id for mapped commands only."""
-        mod = b_type.upper()
-        prefix = f"{mod}_CMDS_{_sanitize_alias(binding_alias).upper()}_"
-        alias_ids: set = set()
-        for k in config_map:
-            ku = k.upper()
-            if not ku.startswith(prefix) or not ku.endswith("_NAME"):
-                continue
-            cmd_alias = ku[len(prefix):-len("_NAME")]
-            if cmd_alias:
-                alias_ids.add(cmd_alias.lower())
-        return sorted(alias_ids)
-
-    def _mapped_keys_for(full_alias: str) -> Dict[str, str]:
-        prefix = f"{b_type.upper()}_CMDS_{full_alias.upper()}_"
-        out: Dict[str, str] = {}
-        for k, v in config_map.items():
-            ku = k.upper()
-            if ku.startswith(prefix):
-                out[ku[len(prefix):]] = v
-        return out
+    if not declared:
+        ASCIIColors.warning(
+            f"\n  ⚠️ Binding '{binding_name}' declares no commands in description.yaml."
+        )
+        return
 
     while True:
-        mapped = _mapped_cmd_aliases()
-
         ASCIIColors.rich_print("\n[bold cyan]── Commands ──[/bold cyan]")
         ASCIIColors.rich_print(
             f"[dim]Binding: {binding_name} (alias '{binding_alias}')\n"
-            f"Declared: {len(declared)}   |   Enabled: {len(mapped)}[/dim]"
+            f"Declared commands: {len(declared)}[/dim]"
+        )
+        labels = [f"▶️ {c['name']} — {c['title']}" for c in declared]
+        picked = _safe_select(f"Run a command on '{binding_alias}':", labels)
+        if not picked:
+            return
+        target = declared[labels.index(picked)]
+        _execute_binding_command(
+            b_type, binding_alias, binding_name, target, config_map
         )
 
-        # Build a flat, navigable choice list.
-        choices: List[str] = []
-        # 1. Enable from description: every declared command not yet mapped.
-        enableable: List[Dict[str, Any]] = []
-        for c in declared:
-            already_enabled = any(
-                full.endswith(f"_{_sanitize_alias(c['name']).lower()}")
-                for full in mapped
-            )
-            if not already_enabled:
-                enableable.append(c)
-        if enableable:
-            choices.append(f"➕ Enable a declared command ({len(enableable)} available)")
-        # 2. Edit existing
-        if mapped:
-            choices.append(f"✏️ Edit an enabled command ({len(mapped)})")
-        # 3. Disable existing
-        if mapped:
-            choices.append(f"🗑️ Disable an enabled command ({len(mapped)})")
-        # 4. Add custom command (freeform name)
-        choices.append("🆕 Add a custom command (not declared in description.yaml)")
-        choices.append("↩ Back")
+def _build_client_from_binding_alias(
+    b_type: str,
+    binding_alias: str,
+    binding_name: str,
+    config_map: Dict[str, str],
+):
+    """Constructs a LollmsClient bound to a specific binding alias's saved config.
 
-        choice = _safe_select(f"Manage commands for '{binding_alias}'", choices)
-        if not choice or choice.startswith("↩"):
+    Reuses the alias-scoped config extraction in ``_fetch_available_models`` so
+    parameter typing (int/bool/float coercion) stays identical. Returns the raw
+    binding object (e.g. ``client.llm``) so the caller can invoke declared
+    commands (``pull_model``, ``update``, ``bind_multimodal_model`` …) which
+    live as methods on the binding itself.
+
+    Raises RuntimeError if the binding cannot be instantiated.
+    """
+    from lollms_client import LollmsClient
+
+    desc = _get_binding_description(binding_name, b_type) or {}
+    params_meta = {
+        p.get("name", "").lower(): p
+        for p in (
+            desc.get("global_input_parameters", [])
+            + desc.get("model_input_parameters", [])
+        )
+    }
+
+    prefix = f"{b_type.upper()}_BINDINGS_{binding_alias.upper()}_"
+    b_config: Dict[str, Any] = {}
+    for k, v in config_map.items():
+        if not v:
+            continue
+        key_clean = k
+        if key_clean.upper().startswith(prefix):
+            key_clean = key_clean[len(prefix):]
+        elif key_clean.upper().startswith(f"{b_type.upper()}_"):
+            key_clean = key_clean[len(f"{b_type.upper()}_"):]
+
+        key_lower = key_clean.lower()
+        if key_lower == "binding_name":
+            continue
+
+        p_meta = params_meta.get(key_lower, {})
+        p_type = str(p_meta.get("type", "str")).lower()
+
+        if p_type == "bool":
+            b_config[key_lower] = _convert_to_bool(v)
+        elif p_type == "int":
+            try:
+                b_config[key_lower] = int(v)
+            except (TypeError, ValueError):
+                pass
+        elif p_type == "float":
+            try:
+                b_config[key_lower] = float(v)
+            except (TypeError, ValueError):
+                pass
+        elif isinstance(v, str) and v.strip().lower() in ("null", "none"):
+            b_config[key_lower] = None
+        else:
+            b_config[key_lower] = v
+
+    try:
+        client = LollmsClient(
+            **{
+                f"{b_type}_binding_name": binding_name,
+                f"{b_type}_binding_config": b_config,
+            }
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not instantiate {b_type.upper()} binding '{binding_name}': {exc}"
+        ) from exc
+
+    binding = getattr(client, b_type, None)
+    if binding is None:
+        raise RuntimeError(
+            f"LollmsClient did not expose a '{b_type}' binding for '{binding_name}'."
+        )
+    return binding
+
+
+def _render_command_summary(
+    cmd_name: str,
+    binding_alias: str,
+    binding_name: str,
+    raw_params: Dict[str, Any],
+) -> None:
+    """Renders the parameter table shown before a command is executed."""
+    ASCIIColors.rich_print("\n[bold magenta]── Command Summary ──[/bold magenta]")
+    ASCIIColors.rich_print(
+        f"[dim]Command: {cmd_name}  |  Binding: {binding_alias} ({binding_name})[/dim]"
+    )
+    if not raw_params:
+        ASCIIColors.rich_print("[dim](this command takes no parameters)[/dim]")
+        return
+    rows = [
+        [name, "" if val is None else str(val)]
+        for name, val in raw_params.items()
+    ]
+    try:
+        ASCIIColors.table(
+            "Parameter", "Value",
+            rows=rows,
+            title=f"Configured parameters for '{cmd_name}'",
+            box="rounded",
+        )
+    except Exception:
+        for name, val in raw_params.items():
+            ASCIIColors.info(f"   • {name} = {val}")
+
+
+def _collect_command_params(command: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Prompts for every declared parameter of a command.
+
+    Returns the assembled kwargs when all prompts complete successfully, or
+    ``None`` when the user pressed back/kb-interrupt at any prompt. Empty
+    optional string values are omitted so binding defaults apply.
+    """
+    raw_params: Dict[str, Any] = {}
+    for p in command.get("parameters", []) or []:
+        if not isinstance(p, dict):
+            continue
+        pname = str(p.get("name") or "").strip()
+        if not pname:
+            continue
+        mandatory = bool(p.get("mandatory", False))
+        default = p.get("default")
+        ptype = str(p.get("type") or "str").lower()
+
+        if ptype == "bool":
+            default_bool = (
+                bool(default) if isinstance(default, bool)
+                else str(default).lower() in ("true", "1", "yes", "on")
+            )
+            val = _prompt_param(
+                pname, p.get("description", ""), "bool", mandatory, default_bool
+            )
+            if val is _BACK_SENTINEL:
+                return None
+            raw_params[pname] = bool(val)
+        elif ptype in ("int", "float"):
+            default_str = "" if default is None else str(default)
+            val = _prompt_param(
+                pname, p.get("description", ""), ptype, mandatory, default_str
+            )
+            if val is _BACK_SENTINEL:
+                return None
+            raw_params[pname] = val
+        else:
+            default_str = "" if default is None else str(default)
+            val = _prompt_param(
+                pname, p.get("description", ""), "str", mandatory, default_str
+            )
+            if val is _BACK_SENTINEL:
+                return None
+            if val == "" and not mandatory:
+                continue
+            raw_params[pname] = val
+    return raw_params
+
+
+def _run_command_capture_output(
+    b_type: str,
+    binding_alias: str,
+    binding_name: str,
+    cmd_name: str,
+    raw_params: Dict[str, Any],
+    config_map: Dict[str, str],
+) -> Dict[str, Any]:
+    """Instantiates the binding, runs the command, captures stdout/stderr.
+
+    Returns a dict with:
+      ``ok``            - True when the method returned truthy ``status``/``success``
+                          (or a non-dict payload without an error flag).
+      ``result``        - the raw return value (or None when thread was killed).
+      ``stdout``        - captured standard output stream.
+      ``stderr``        - captured standard error stream.
+      ``error``         - human-readable error message (empty when ok).
+      ``duration_sec``  - wall-clock time spent running.
+    """
+    import contextlib
+    import io
+    import time as _time
+
+    outcome: Dict[str, Any] = {
+        "ok": False,
+        "result": None,
+        "stdout": "",
+        "stderr": "",
+        "error": "",
+        "duration_sec": 0.0,
+    }
+    stdout_buf = io.StringIO()
+    stderr_buf = io.StringIO()
+    started = _time.monotonic()
+    try:
+        ASCIIColors.info(
+            f"\n  ⏳ Instantiating binding '{binding_name}' for '{cmd_name}' …"
+        )
+        binding = _build_client_from_binding_alias(
+            b_type, binding_alias, binding_name, config_map
+        )
+        method = getattr(binding, cmd_name, None)
+        if not callable(method):
+            outcome["error"] = (
+                f"Binding '{binding_name}' does not implement '{cmd_name}'."
+            )
+            return outcome
+
+        ASCIIColors.info(f"  🚀 Running '{cmd_name}' now — waiting for completion…")
+        ASCIIColors.rich_print(
+            "[dim]  (download / install progress will appear below; please wait)[/dim]"
+        )
+        ASCIIColors.rich_print(
+            "[yellow]  ─── command output ─────────────────────────────────[/yellow]"
+        )
+
+        with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
+            result = method(**raw_params)
+        outcome["result"] = result
+
+        # Interpret dict-typed returns (status/message/success/error).
+        if isinstance(result, dict):
+            status = result.get("status", result.get("success"))
+            message = (
+                result.get("message")
+                or result.get("error")
+                or result.get("result")
+                or ""
+            )
+            # Normalize: missing status but present message -> treat message as error only when
+            # the dict carries a truthy 'error' key.
+            if status is None and result.get("error"):
+                outcome["error"] = str(result["error"])
+            elif status is False:
+                outcome["error"] = str(message or "Command reported failure.")
+            else:
+                outcome["ok"] = True
+        elif isinstance(result, bool):
+            outcome["ok"] = result
+            if not result:
+                outcome["error"] = f"'{cmd_name}' returned False."
+        else:
+            # Non-dict, non-bool: assume success unless it looks like an error string.
+            outcome["ok"] = True
+    except Exception as exc:
+        outcome["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        outcome["duration_sec"] = _time.monotonic() - started
+        outcome["stdout"] = stdout_buf.getvalue().strip()
+        outcome["stderr"] = stderr_buf.getvalue().strip()
+    return outcome
+
+
+def _render_command_outcome(
+    cmd_name: str,
+    outcome: Dict[str, Any],
+) -> None:
+    """Displays the captured stdout/stderr and status for a finished command."""
+    ASCIIColors.rich_print(
+        "[yellow]  ─── end of output ────────────────────────────────────[/yellow]"
+    )
+    if outcome["stdout"]:
+        ASCIIColors.rich_print("[bold cyan]── Captured stdout ──[/bold cyan]")
+        ASCIIColors.rich_print(outcome["stdout"])
+    if outcome["stderr"]:
+        ASCIIColors.rich_print("[bold yellow]── Captured stderr ──[/bold yellow]")
+        ASCIIColors.rich_print(outcome["stderr"])
+
+    duration = outcome.get("duration_sec") or 0.0
+    if outcome["ok"]:
+        ASCIIColors.green(
+            f"\n  ✅ '{cmd_name}' completed successfully in {duration:.1f}s."
+        )
+    else:
+        ASCIIColors.red(
+            f"\n  ❌ '{cmd_name}' failed after {duration:.1f}s."
+        )
+        if outcome["error"]:
+            ASCIIColors.error(f"  {outcome['error']}")
+
+
+def _execute_binding_command(
+    b_type: str,
+    binding_alias: str,
+    binding_name: str,
+    command: Dict[str, Any],
+    config_map: Dict[str, str],
+) -> None:
+    """Interactive command lifecycle for a declared binding command.
+
+    Loop:
+      1. Prompt for parameters (fresh each iteration so "modify" can refine).
+      2. Show the parameter summary and ask Execute / Cancel.
+      3. Run the command (capturing stdout/stderr), display the full result.
+      4. Offer a post-run menu:
+           ✅ Validate result         → return to the commands menu.
+           🔁 Modify parameters & re-run → loop back to step 1.
+           ↩ Back                     → exit without further action.
+    """
+    cmd_name = command["name"]
+
+    while True:
+        ASCIIColors.rich_print(
+            f"\n[bold cyan]── Execute: {command.get('title') or cmd_name} ──[/bold cyan]"
+        )
+        if command.get("description"):
+            ASCIIColors.rich_print(f"[dim]{command['description']}[/dim]")
+
+        raw_params = _collect_command_params(command)
+        if raw_params is None:
+            ASCIIColors.yellow("\n  ⚠️ Command execution cancelled.")
             return
 
-        # ── Enable from description ──────────────────────────────────────
-        if choice.startswith("➕ Enable"):
-            names = [f"{c['name']} — {c['title']}" for c in enableable]
-            picked = _safe_select("Select a command to enable:", names)
-            if not picked:
-                continue
-            target = enableable[names.index(picked)]
-            cmd_alias = _sanitize_alias(target["name"])
-            full_alias = f"{binding_alias}_{cmd_alias}"
-            prefix = _command_env_prefix(b_type, binding_alias, cmd_alias)
-            if not _safe_confirm(
-                f"Enable command '{target['name']}' for binding '{binding_alias}'?",
-                default=True,
-            ):
-                continue
-            config_map[prefix + "NAME"] = target["name"]
-            config_map[prefix + "TITLE"] = target["title"]
-            if target["description"]:
-                config_map[prefix + "DESCRIPTION"] = target["description"]
+        _render_command_summary(cmd_name, binding_alias, binding_name, raw_params)
+        action = _safe_select(
+            f"Run '{cmd_name}' now?", ["▶️ Execute", "✖️ Cancel"]
+        )
+        if action != "▶️ Execute":
+            ASCIIColors.info("\n  ℹ️ Command cancelled. No action was taken.")
+            return
 
-            # Prompt for declared parameters with defaults.
-            for p in target.get("parameters", []) or []:
-                if not isinstance(p, dict):
-                    continue
-                pname = str(p.get("name") or "").strip()
-                if not pname:
-                    continue
-                mandatory = bool(p.get("mandatory", False))
-                default = p.get("default")
-                ptype = str(p.get("type") or "str").lower()
-                if ptype == "bool":
-                    val = _prompt_param(
-                        pname,
-                        p.get("description", ""),
-                        "bool",
-                        mandatory,
-                        bool(default) if isinstance(default, bool) else False,
-                    )
-                elif ptype in ("int", "float"):
-                    val = _prompt_param(
-                        pname,
-                        p.get("description", ""),
-                        ptype,
-                        mandatory,
-                        "" if default is None else str(default),
-                    )
-                else:
-                    val = _prompt_param(
-                        pname,
-                        p.get("description", ""),
-                        "str",
-                        mandatory,
-                        "" if default is None else str(default),
-                    )
-                if val is _BACK_SENTINEL:
-                    continue
-                config_map[prefix + pname.upper()] = _format_env_value(val)
+        outcome = _run_command_capture_output(
+            b_type, binding_alias, binding_name, cmd_name, raw_params, config_map
+        )
+        _render_command_outcome(cmd_name, outcome)
 
-            ASCIIColors.green(f"\n  ✓ Enabled command: {target['name']} → {full_alias}")
+        # Post-run decision — always shown, so the user is never dropped
+        # silently back into the parent menu.
+        post_action = _safe_select(
+            "What next?",
+            [
+                "✅ Validate result (return)",
+                "🔁 Modify parameters & re-run",
+            ],
+        )
+        if post_action == "🔁 Modify parameters & re-run":
             continue
+        return
 
-        # ── Edit an enabled command ───────────────────────────────────────
-        if choice.startswith("✏️ Edit"):
-            picked = _safe_select("Select a command to edit:", mapped)
-            if not picked:
-                continue
-            _edit_keys_menu(b_type, "CMDS", picked, config_map)
-            continue
-
-        # ── Disable an enabled command ─────────────────────────────────────
-        if choice.startswith("🗑️ Disable"):
-            picked = _safe_select("Select a command to disable:", mapped)
-            if not picked:
-                continue
-            keys = [k for k in list(config_map.keys())
-                    if k.upper().startswith(f"{b_type.upper()}_CMDS_{picked.upper()}_")]
-            if not keys:
-                ASCIIColors.yellow(f"\n  ⚠️ No keys found for command '{picked}'.")
-                continue
-            if not _safe_confirm(
-                f"Disable command '{picked}' ({len(keys)} keys will be removed)?",
-                default=False,
-            ):
-                ASCIIColors.info("\n  ℹ️ Cancelled. No changes were made.")
-                continue
-            for k in keys:
-                del config_map[k]
-            ASCIIColors.green(f"\n  🗑️ Disabled command: {picked}")
-            continue
-
-        # ── Add a custom command ───────────────────────────────────────────
-        if choice.startswith("🆕 Add"):
-            raw = _safe_input_or_back("Command name (e.g. my_tool)", "")
-            if not raw or not raw.strip():
-                continue
-            cmd_alias = _sanitize_alias(raw.strip())
-            full_alias = f"{binding_alias}_{cmd_alias}"
-            prefix = _command_env_prefix(b_type, binding_alias, cmd_alias)
-            if any(k.upper().startswith(prefix.upper()) for k in config_map):
-                ASCIIColors.red(
-                    f"\n  ❌ Command '{raw.strip()}' already exists for binding '{binding_alias}'."
-                )
-                continue
-            title = _safe_input_or_back("Command title", raw.strip()) or raw.strip()
-            description = _safe_input_or_back("Command description", "") or ""
-            config_map[prefix + "NAME"] = raw.strip()
-            config_map[prefix + "TITLE"] = title
-            if description:
-                config_map[prefix + "DESCRIPTION"] = description
-            ASCIIColors.green(f"\n  ✓ Added custom command: {full_alias}")
-            continue
 
 def _edit_keys_menu(b_type: str, category: str, alias: str, config_map: Dict[str, str]):
     # Backfill profile-level defaults so pre-existing profiles expose the
@@ -1479,7 +1647,7 @@ def _edit_keys_menu(b_type: str, category: str, alias: str, config_map: Dict[str
                 value="__REAPPLY_INFERENCE__",
             )
             menu.add_choice(
-                f"🛠️ Configure Commands ('{alias}')",
+                f"▶️ Execute Commands ('{alias}')",
                 value="__COMMANDS__",
             )
             for k, v in self_keys_for_edit.items():

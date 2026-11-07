@@ -85,7 +85,6 @@ def _resolve_global_config_file() -> Path:
         return get_config_file()
     except Exception:
         return (Path.home() / ".lollms" / "config.yaml").resolve()
-</｜DSML｜ parameter>
 
 
 def _validate_modality(modality: str) -> str:

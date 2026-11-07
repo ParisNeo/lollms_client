@@ -2791,7 +2791,68 @@ class LollmsPersonality:
         res = self.generate_with_tools(prompt=prompt, tools=tools, **kwargs)
         return res.get("response", "")
 
+    # ------------------------------------------------------------------ handbag
 
+    @classmethod
+    def from_handbag(
+        cls,
+        handbag_path: Union[str, Path],
+        lollms_client: Optional[Any] = None,
+        extra_skills_dirs: Optional[List[Union[str, Path]]] = None,
+        extra_tools: Optional[List[Union[str, Path]]] = None,
+        extra_knowledge_bases: Optional[List[Union[str, Path]]] = None,
+        extra_safe_stores: Optional[List[Any]] = None,
+        workspace_path: Optional[Union[str, Path]] = None,
+        capabilities: Optional[Any] = None,
+        model_params: Optional[Dict[str, Any]] = None,
+        max_tokens_per_turn: int = 4096,
+        workspace: Optional[Union[str, Path]] = None,
+        **kwargs: Any,
+    ) -> "LollmsPersonality":
+        """
+        Build a fully-armed LollmsPersonality from a handbag folder.
+
+        Args:
+            handbag_path: Root folder of the handbag (contains SOUL.md, tools/,
+                skills/, rag/, docs/, coworkers/ subfolders as available).
+            lollms_client: Optional client used for downstream generation and
+                RAG initialization.
+            extra_skills_dirs: Extra skill directories to load in addition to
+                the handbag's native ``skills/``.
+            extra_tools: Extra tool files to load in addition to the handbag's
+                native tool files.
+            extra_knowledge_bases: Caller-supplied knowledge-base paths. ``.db``
+                paths are auto-promoted into ``extra_safe_stores`` by the
+                personality constructor.
+            extra_safe_stores: Caller-supplied SafeStore bindings or deferred
+                config dicts (``{"name","db_path","vectorizer_name","description"}``).
+            workspace_path: Explicit workspace override (defaults to the
+                handbag's ``workspace/`` folder when it exists).
+            capabilities: Optional ``CapabilityFlags``; a fresh default is
+                created when omitted.
+            model_params: Optional per-instance model parameters.
+            max_tokens_per_turn: Per-turn token budget.
+            workspace: Legacy alias for ``workspace_path``.
+            **kwargs: Forward-compat pass-through (currently ignored).
+        """
+        hb = Handbag(handbag_path)
+        if not hb.path.exists():
+            raise FileNotFoundError(f"Handbag path does not exist: {hb.path}")
+
+        sm = None
+        try:
+            if hb.skills_dir.exists() or extra_skills_dirs:
+                from .skills_manager import SkillsManager as _SM
+                initial_dirs: List[Path] = []
+                if hb.skills_dir.exists():
+                    initial_dirs.append(hb.skills_dir.resolve())
+                for d in (extra_skills_dirs or []):
+                    resolved = Path(d).resolve()
+                    if resolved.exists() and resolved not in initial_dirs:
+                        initial_dirs.append(resolved)
+                sm = _SM(skills_dirs=initial_dirs, mode="loadable", max_visible_tokens=1200)
+        except Exception as _sm_err:
+            ASCIIColors.warning(f"[Handbag.from_handbag] Skills manager init failed: {_sm_err}")
 
         # Parse SOUL.md
         soul_content = hb.soul_path.read_text(encoding="utf-8", errors="ignore") if hb.soul_path.exists() else ""
@@ -2881,6 +2942,14 @@ class LollmsPersonality:
         except Exception:
             pass
 
+        resolved_workspace: Optional[Path] = None
+        if workspace_path:
+            resolved_workspace = Path(workspace_path)
+        elif workspace:
+            resolved_workspace = Path(workspace)
+        elif hb.workspace_dir.exists():
+            resolved_workspace = hb.workspace_dir
+
         pers = LollmsPersonality(
             name=name,
             author=author,
@@ -2894,8 +2963,11 @@ class LollmsPersonality:
             memory_manager=mm,
             handbag_path=hb.path,
             data_sources=rag_data_sources if rag_data_sources else None,
-            workspace_path=hb.workspace_dir if hb.workspace_dir.exists() else None,
+            workspace_path=resolved_workspace,
             lollms_client=lollms_client,
+            capabilities=capabilities,
+            model_params=model_params,
+            max_tokens_per_turn=max_tokens_per_turn,
             extra_knowledge_bases=merged_kbs,
             extra_safe_stores=merged_safe_stores,
         )

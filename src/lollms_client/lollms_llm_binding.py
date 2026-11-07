@@ -1,9 +1,15 @@
+
+
 # lollms_llm_binding.py
 from __future__ import annotations
+
 from abc import abstractmethod
+from dataclasses import dataclass, field
 import importlib
+import inspect
 from pathlib import Path
-from typing import Optional, Callable, List, Union, Dict, Any
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
 from ascii_colors import trace_exception, ASCIIColors
 from lollms_client.lollms_types import MSG_TYPE
 from lollms_client.lollms_discussion import LollmsDiscussion
@@ -23,6 +29,39 @@ def _coerce_positive_int(value, fallback: int) -> int:
         return n if n > 0 else fallback
     except (TypeError, ValueError):
         return fallback
+
+
+@dataclass
+class CommandParameter:
+    """Schema for a single executable-command parameter.
+
+    The configuration UI renders one editable field per entry. There is NO
+    separate "enable command" gate: presence of a CommandSpec in a binding's
+    ``get_commands()`` means the command is runnable.
+    """
+
+    name: str
+    type: str = "str"          # str | int | float | bool | path | json
+    description: str = ""
+    required: bool = False
+    default: Any = None
+    choices: Optional[List[Any]] = None
+
+
+@dataclass
+class CommandSpec:
+    """Backend-agnostic description of a binding operation exposed to config UIs.
+
+    ``dangerous`` is display-only (UX warning); it never blocks execution.
+    ``method_name`` overrides the dispatched method when the command name and
+    the underlying method name differ.
+    """
+
+    name: str
+    description: str = ""
+    parameters: List[CommandParameter] = field(default_factory=list)
+    dangerous: bool = False
+    method_name: Optional[str] = None
 
 
 def _normalize_effort_list(value):
