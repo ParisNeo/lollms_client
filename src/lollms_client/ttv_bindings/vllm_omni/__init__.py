@@ -343,18 +343,133 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
                 detail = resp.text
             raise RuntimeError(f"MiniMax-H3 I2V generation failed [{resp.status_code}]: {detail}") from e
 
+
+
+    # ------------------------------------------------------------------
+    # Optional capabilities (lipsync + first/last frame)
+    # ------------------------------------------------------------------
+
+    def supports_lipsync(self) -> bool:
+        # MiniMax-H3 supports audio-driven talking-head generation (FL2VA task).
+        return True
+
+    def supports_first_last_frame(self) -> bool:
+        # MiniMax-H3 supports first/last-frame conditioning via frame_indices [0, -1].
+        return True
+
+    def _read_media_bytes(self, media: Union[bytes, str, Path]) -> bytes:
+        """Normalize a MediaInput (path, raw bytes, or base64 str) to raw bytes."""
+        if isinstance(media, bytes):
+            return media
+        if isinstance(media, Path):
+            return media.read_bytes()
+        if isinstance(media, str):
+            path = Path(media)
+            if path.exists():
+                return path.read_bytes()
+            # Fall back to base64-decoding strings that aren't real filesystem paths.
+            return base64.b64decode(media)
+        raise TypeError(f"Unsupported media type: {type(media)!r}")
+
+    def _extract_error(self, resp: requests.Response) -> str:
+        try:
+            return resp.json().get("detail", resp.text)
+        except Exception:
+            return resp.text
+
+    def generate_lipsync_video(
+        self,
+        image: Union[bytes, str, Path],
+        audio: Union[bytes, str, Path],
+        prompt: str = "",
+        **kwargs,
+    ) -> bytes:
+        """
+        Generates a lip-synced talking-head video from a portrait image and an audio
+        track (multipart upload to /v1/videos/sync). Returns the raw mp4 bytes.
+        """
+        self._ensure_server_ready()
+
+        image_bytes = self._read_media_bytes(image)
+        audio_bytes = self._read_media_bytes(audio)
+
+        image_ext = (kwargs.get("image_ext") or "png").lstrip(".")
+        audio_ext = (kwargs.get("audio_ext") or "wav").lstrip(".")
+
+        fps = kwargs.get("fps") or self.default_fps
+        num_inference_steps = int(kwargs.get("num_inference_steps", 30))
+
+        data: Dict[str, Any] = {
+            "prompt": prompt or "",
+            "fps": fps,
+            "num_inference_steps": num_inference_steps,
+        }
+        if self.model:
+            data["model"] = self.model
+        if kwargs.get("negative_prompt"):
+            data["negative_prompt"] = kwargs["negative_prompt"]
+        seed = kwargs.get("seed")
+        if seed is not None and seed != -1:
+            data["seed"] = seed
+
+        for scalar_key in ("width", "height", "num_frames", "guidance_scale", "aspect_ratio"):
+            if kwargs.get(scalar_key) is not None:
+                data[scalar_key] = kwargs[scalar_key]
+
+        extra_params: Dict[str, Any] = {
+            "task": "fl2va",
+            "duration": kwargs.get("duration", self.default_duration),
+        }
+        extra_params.update(kwargs.get("extra_params", {}))
+        data["extra_params"] = json.dumps(extra_params)
+
+        files = [
+            ("image", (f"portrait.{image_ext}", io.BytesIO(image_bytes), f"image/{image_ext}")),
+            ("audio", (f"voice.{audio_ext}", io.BytesIO(audio_bytes), f"audio/{audio_ext}")),
+        ]
+
+        try:
+            resp = self._session.post(
+                f"{self.base_url}/v1/videos/sync",
+                data=data,
+                files=files,
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            return resp.content
+        except requests.HTTPError as e:
+            raise RuntimeError(
+                f"MiniMax-H3 lipsync generation failed [{resp.status_code}]: {self._extract_error(resp)}"
+            ) from e
+
     def generate_video_first_and_last_frame(
         self,
         prompt: str,
         start_image: Union[bytes, str, Path],
         end_image: Union[bytes, str, Path],
-        negative_prompt: Optional[str] = None,
-        duration: Optional[float] = None,
-        fps: Optional[int] = None,
-        num_inference_steps: int = 30,
-        seed: Optional[int] = None,
         **kwargs,
     ) -> bytes:
+        """
+        Public alibi for first/last-frame video generation. Delegates to the existing
+        generate_video_first_and_last_frame concrete method (kept for the base API).
+        """
+        negative_prompt = kwargs.pop("negative_prompt", None)
+        return self.generate_video_first_and_last_frame_impl(
+            prompt=prompt,
+            start_image=start_image,
+            end_image=end_image,
+            negative_prompt=negative_prompt,
+            **kwargs,
+        )
+
+    def generate_video_first_and_last_frame_impl(
+        self,
+        prompt: str,
+        start_image: Union[bytes, str, Path],
+        end_image: Union[bytes, str, Path],
+        **kwargs,
+    ) -> bytes:
+        """Concrete implementation for FL2V generation (shared by public API)."""
         self._ensure_server_ready()
 
         start_bytes = self._prepare_image_bytes(start_image)
@@ -362,21 +477,26 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
 
         data: Dict[str, Any] = {
             "prompt": prompt,
-            "fps": fps or self.default_fps,
-            "num_inference_steps": num_inference_steps,
+            "fps": kwargs.get("fps") or self.default_fps,
+            "num_inference_steps": int(kwargs.get("num_inference_steps", 30)),
         }
         if self.model:
             data["model"] = self.model
-        if negative_prompt:
-            data["negative_prompt"] = negative_prompt
+        if kwargs.get("negative_prompt"):
+            data["negative_prompt"] = kwargs["negative_prompt"]
+        seed = kwargs.get("seed")
         if seed is not None and seed != -1:
             data["seed"] = seed
+        for scalar_key in ("width", "height", "num_frames", "guidance_scale"):
+            if kwargs.get(scalar_key) is not None:
+                data[scalar_key] = kwargs[scalar_key]
 
-        extra_params = {
+        extra_params: Dict[str, Any] = {
             "task": "fl2va",
-            "duration": duration if duration is not None else self.default_duration,
+            "duration": kwargs.get("duration", self.default_duration),
             "frame_indices": [0, -1],
         }
+        extra_params.update(kwargs.get("extra_params", {}))
         data["extra_params"] = json.dumps(extra_params)
 
         files = [
@@ -394,11 +514,10 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
             resp.raise_for_status()
             return resp.content
         except requests.HTTPError as e:
-            try:
-                detail = resp.json().get("detail", resp.text)
-            except Exception:
-                detail = resp.text
-            raise RuntimeError(f"MiniMax-H3 First/Last frame generation failed [{resp.status_code}]: {detail}") from e
+            raise RuntimeError(
+                f"MiniMax-H3 first/last frame generation failed "
+                f"[{resp.status_code}]: {self._extract_error(resp)}"
+            ) from e
 
     def health_check(self) -> bool:
         try:

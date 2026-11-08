@@ -204,7 +204,7 @@ commands:
         mandatory: true
       - name: mmproj_repo_id
         type: str
-        description: "Repo ID for the vision projector (optional)."
+        description: "Repo ID for the vision projector (optional). Defaults to `repo_id` when left blank — most GGUF repos ship the mmproj alongside the model file."
         mandatory: false
       - name: mmproj_filename
         type: str
@@ -222,6 +222,74 @@ commands:
         type: int
       - name: total
         type: int
+    # ────────────────────────────────────────────────────────────────────────
+    # Templates: curated, ready-to-run parameter combinations for popular
+    # GGUF models. The wizard surfaces these as one-click choices so users
+    # don't have to look up Hugging Face repo IDs and filenames manually.
+    # Each template pre-fills every declared parameter above; the user can
+    # still pick "✍️ Use custom parameters" to enter values themselves.
+    # ────────────────────────────────────────────────────────────────────────
+    templates:
+      - name: Magistral Small 2509 (Mistral thinking model)
+        description: Efficient thinking model from Mistral AI.
+        size: "14.3 GB (Q4_K_M)"
+        parameters:
+          repo_id: bartowski/mistralai_Magistral-Small-2509-GGUF
+          filename: mistralai_Magistral-Small-2509-Q4_K_M.gguf
+      - name: Ministral 3 3B Instruct 2512 (small edge model)
+        description: Lightweight Mistral edge model, fast on CPU.
+        size: "2.2 GB (Q4_K_M)"
+        parameters:
+          repo_id: bartowski/mistralai_Ministral-3-3B-Instruct-2512-GGUF
+          filename: mistralai_Ministral-3-3B-Instruct-2512-Q4_K_M.gguf
+      - name: Devstral Small 2 24B (coding specialist)
+        description: Devstral coding model from Mistral AI.
+        size: "14.8 GB (Q4_K_M)"
+        parameters:
+          repo_id: bartowski/mistralai_Devstral-Small-2-24B-Instruct-2512-GGUF
+          filename: mistralai_Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf
+      - name: Qwen3.5 4B GLB 3D Coder — Multimodal (vision enabled)
+        description: Same 4B coder model + mmproj projector for multimodal inference.
+        parameters:
+          repo_id: ccore/Qwen3.5-4B-GLB-3D-Coder
+          filename: Qwen3.5-4B-GLB-3D-Coder-Q4_K_M.gguf
+          mmproj_filename: mmproj-Qwen3.5-4B-BF16.gguf
+      - name: Llama 4 Scout 17B (16-expert MoE)
+        description: Meta Llama 4 Scout Mixture-of-Experts.
+        size: "11.2 GB (Q4_K_M)"
+        parameters:
+          repo_id: bartowski/meta-llama_Llama-4-Scout-17B-16E-Instruct-old-GGUF
+          filename: meta-llama_Llama-4-Scout-17B-16E-Instruct-Q4_K_M.gguf
+      - name: Qwen3-VL 32B Thinking (vision + reasoning)
+        description: Vision + chain-of-thought reasoning.
+        size: "19.5 GB (Q4_K_M)"
+        parameters:
+          repo_id: bartowski/Qwen_Qwen3-VL-32B-Thinking-GGUF
+          filename: Qwen_Qwen3-VL-32B-Thinking-Q4_K_M.gguf
+      - name: Qwen3 72B Embiggened (enhanced dense reasoning)
+        description: Enhanced Qwen 3 72B cognitive model.
+        size: "43.1 GB (Q4_K_M)"
+        parameters:
+          repo_id: bartowski/cognitivecomputations_Qwen3-72B-Embiggened-GGUF
+          filename: Qwen3-72B-Embiggened-Q4_K_M.gguf
+      - name: Devstral 2 123B (heavy coding)
+        description: Large-scale coding model, needs lots of VRAM.
+        size: "71.4 GB (Q4_K_M)"
+        parameters:
+          repo_id: bartowski/mistralai_Devstral-2-123B-Instruct-2512-GGUF
+          filename: Devstral-2-123B-Instruct-2512-Q4_K_M.gguf
+      - name: GPT-OSS 120B (open research)
+        description: OpenAI open-weight research model.
+        size: "69.8 GB (Q4_K_M)"
+        parameters:
+          repo_id: bartowski/openai_gpt-oss-120b-GGUF
+          filename: gpt-oss-120b-Q4_K_M.gguf
+      - name: DeepSeek V3 0324 (671B MoE)
+        description: DeepSeek V3 Mixture-of-Experts, huge.
+        size: "365 GB (Q4_K_M)"
+        parameters:
+          repo_id: bartowski/deepseek-ai_DeepSeek-V3-0324-GGUF
+          filename: DeepSeek-V3-0324-Q4_K_M.gguf
 
   - name: bind_multimodal_model
     title: Bind Vision Projector

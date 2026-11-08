@@ -56,9 +56,46 @@ class LollmsTTVBinding(LollmsBaseBinding):
         """
         raise NotImplementedError(f"{self.binding_name} does not support lip-sync video generation")
 
+    def supports_first_last_frame(self) -> bool:
+        """
+        True if this binding can interpolate a video between a first and a last
+        reference image (FL2V / FLF2V). Default: False.
+
+        Implementations may return False at runtime (e.g., when the loaded model is a
+        pure T2V model that cannot accept keyframes).
+        """
+        return False
+
+    def generate_video_first_and_last_frame(
+        self,
+        prompt: str,
+        start_image: MediaInput,
+        end_image: MediaInput,
+        **kwargs,
+    ) -> bytes:
+        """
+        Generates a video that begins at `start_image` and ends at `end_image`, guided
+        by `prompt`. Both images are `MediaInput` (path or raw bytes). Returns the
+        encoded video (mp4) as bytes.
+
+        Optional kwargs a binding may honor: negative_prompt, seed, fps, width, height,
+        num_frames, num_inference_steps, guidance_scale, image_ext (when passing raw
+        bytes). Unknown kwargs must be ignored, not rejected.
+
+        Unimplemented by default: bindings without this ability raise NotImplementedError.
+        """
+        raise NotImplementedError(
+            f"{self.binding_name} does not support first/last frame video generation"
+        )
+
     def get_capabilities(self) -> Dict[str, bool]:
         """Capability flags for UIs/agents. Extend as new optional abilities are added."""
-        return {"text_to_video": True, "lipsync": bool(self.supports_lipsync())}
+        return {
+            "text_to_video": True,
+            "image_to_video": True,
+            "lipsync": bool(self.supports_lipsync()),
+            "first_last_frame": bool(self.supports_first_last_frame()),
+        }
 
     @abstractmethod
     def list_models(self, **kwargs) -> List[str]:

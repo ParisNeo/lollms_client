@@ -378,28 +378,49 @@ class LollmsClient():
         resolved_defaults_to_save: Dict[str, Tuple[str, List[str]]] = {}
 
         def _eagerly_instantiate_default(model_registry: dict, switch_method: Callable, modality_name: str):
+            """
+            Instantiates ONLY the single active default profile for the modality.
+
+            Resolution order (deterministic, never order-fragile):
+              1. If exactly one profile carries ``is_default=True``, honour it.
+              2. If several do (defensive — the registration layer has already
+                 collapsed them, but we stay resilient), prefer a non-``master``
+                 alias so an explicit user-selected model always wins over a
+                 legacy ``master`` profile.
+              3. Fall back to ``master`` (legacy callers), then the first entry.
+            """
             default_aliases = [a for a, p in model_registry.items() if p.is_default]
+            target_alias: Optional[str] = None
+
             if len(default_aliases) > 1:
-                chosen_default = default_aliases[0]
-                demoted = default_aliases[1:]
+                non_master = [a for a in default_aliases if a != "master"]
+                chosen_default = non_master[0] if non_master else default_aliases[0]
+                demoted = [a for a in default_aliases if a != chosen_default]
                 ASCIIColors.info(
-                    f"[LollmsClient] Multiple default profiles detected for {modality_name}: {default_aliases}. "
-                    f"Selected '{chosen_default}' as default and demoted {demoted}."
+                    f"[LollmsClient] {modality_name}: resolved multiple defaults "
+                    f"{default_aliases} -> '{chosen_default}' (preferring non-'master'). "
+                    f"Demoting {demoted}."
                 )
                 for alias in demoted:
                     model_registry[alias].is_default = False
                 resolved_defaults_to_save[modality_name.lower()] = (chosen_default, demoted)
-
-            default_alias = next((a for a, p in model_registry.items() if p.is_default), None)
-            if default_alias:
-                switch_method(default_alias, callback=callback)
+                target_alias = chosen_default
+            elif len(default_aliases) == 1:
+                target_alias = default_aliases[0]
             elif "master" in model_registry:
-                switch_method("master", callback=callback)
+                target_alias = "master"
             elif model_registry:
-                first_alias = next(iter(model_registry))
-                model_registry[first_alias].is_default = True
-                resolved_defaults_to_save[modality_name.lower()] = (first_alias, [])
-                switch_method(first_alias, callback=callback)
+                target_alias = next(iter(model_registry))
+                model_registry[target_alias].is_default = True
+                resolved_defaults_to_save[modality_name.lower()] = (target_alias, [])
+
+            if target_alias:
+                bound_model = getattr(model_registry.get(target_alias), "model_name", None) or "(server default)"
+                ASCIIColors.success(
+                    f"[LollmsClient] Active {modality_name} default: "
+                    f"'{target_alias}' -> model '{bound_model}'."
+                )
+                switch_method(target_alias, callback=callback)
 
         missing_model_names = [
             alias for alias, prof in self.llm_model_profiles_registry.items()
@@ -479,17 +500,55 @@ class LollmsClient():
             )
 
     def _register_model_profiles(self, profiles_dict: Optional[Dict], registry: Dict[str, LollmsModelProfile], modality_name: str, binding_registry: Dict[str, LollmsBindingProfile]):
-        """Registers execution layer profiles (models). Auto-creates a master profile only for legacy bindings."""
-        found_default = False
+        """
+        Registers execution-layer profiles (models) and resolves the single default.
+
+        When the incoming configuration declares more than one ``is_default=True``
+        (very common: a stale ``master`` profile from an earlier config write
+        coexists with the user's freshly-selected model), the winner is chosen
+        deterministically:
+
+          1. Any non-``master`` alias flagged as default WINS.
+          2. Otherwise, ``master`` wins (legacy path).
+          3. With no explicit default, no profile is marked default here;
+             ``_eagerly_instantiate_default`` picks one afterwards.
+
+        This ensures the model a user selects in the UI can NEVER be silently
+        demoted in favour of a legacy ``master`` profile, regardless of dict
+        iteration order.
+
+        Auto-creates a ``master`` profile only when a legacy ``master`` *binding*
+        exists and the caller supplied none — and it never competes with an
+        already-registered explicit default.
+        """
         if profiles_dict:
+            # ── Pass 1: collect raw `is_default` declarations ─────────
+            declared_defaults: List[str] = []
+            for alias, p_data in profiles_dict.items():
+                if isinstance(p_data, LollmsModelProfile):
+                    if p_data.is_default:
+                        declared_defaults.append(alias)
+                elif isinstance(p_data, dict) and p_data.get("is_default", False):
+                    declared_defaults.append(alias)
+
+            # ── Pass 2: deterministic single-default winner ───────────
+            winner_alias: Optional[str] = None
+            if declared_defaults:
+                non_master = [a for a in declared_defaults if a != "master"]
+                winner_alias = non_master[0] if non_master else declared_defaults[0]
+                if len(declared_defaults) > 1:
+                    losers = [a for a in declared_defaults if a != winner_alias]
+                    ASCIIColors.info(
+                        f"[LollmsClient] {modality_name}: multiple default profiles "
+                        f"declared {declared_defaults}. Keeping '{winner_alias}' "
+                        f"(preferring non-'master') and demoting {losers}."
+                    )
+
+            # ── Pass 3: build profiles with the resolved default ──────
             for alias, p_data in profiles_dict.items():
                 if isinstance(p_data, LollmsModelProfile):
                     profile = p_data
-                    if profile.is_default:
-                        if not found_default:
-                            found_default = True
-                        else:
-                            profile.is_default = False
+                    profile.is_default = (alias == winner_alias)
                 else:
                     raw_efforts = p_data.get("supported_reasoning_efforts") or p_data.get("reasoning_efforts")
                     if isinstance(raw_efforts, str) and raw_efforts.strip():
@@ -499,18 +558,11 @@ class LollmsClient():
                     else:
                         parsed_efforts = None
 
-                    is_def = p_data.get("is_default", False)
-                    if is_def:
-                        if not found_default:
-                            found_default = True
-                        else:
-                            is_def = False
-
                     profile = LollmsModelProfile(
                         name=alias,
                         binding_profile_name=p_data.get("binding_profile_name") or p_data.get("binding_alias") or "master",
                         model_name=p_data.get("model_name"),
-                        is_default=is_def,
+                        is_default=(alias == winner_alias),
                         vision_enabled=p_data.get("vision_enabled", False),
                         forced_context_size=p_data.get("forced_context_size"),
                         routing_config=p_data.get("routing_config") or p_data.get("routing_profile"),
@@ -526,7 +578,9 @@ class LollmsClient():
                     )
                 registry[alias] = profile
 
-        # Backward compatibility: Create a master model profile if a master binding exists and master is not in registry
+        # ── Backward compatibility: create a `master` model profile only for
+        #    legacy `llm_binding_name=` callers that supplied NO model profiles.
+        #    It must never displace an already-declared explicit default.
         if "master" in binding_registry and "master" not in registry:
             model_name = binding_registry["master"].binding_config.get("model_name")
             has_default = any(p.is_default for p in registry.values())
@@ -534,7 +588,7 @@ class LollmsClient():
                 name="master",
                 binding_profile_name="master",
                 model_name=model_name,
-                is_default=not has_default
+                is_default=not has_default,
             )
 
     def _save_single_default_profiles_to_disk(self, resolved_defaults: Dict[str, Tuple[str, List[str]]]) -> None:
@@ -615,14 +669,24 @@ class LollmsClient():
                 for line in lines:
                     stripped = line.strip()
                     updated_line = line
+                    upper_line = stripped.upper()
                     for mod_name, (chosen_default, demoted_list) in resolved_defaults.items():
                         mod_prefix = f"{mod_name.upper()}_PROFILES_"
-                        for demoted_alias in demoted_list:
-                            clean_alias = re.sub(r"[^A-Za-z0-9_]", "_", demoted_alias.upper())
-                            target_key = f"{mod_prefix}{clean_alias}_IS_DEFAULT"
-                            if stripped.upper().startswith(f"{target_key}=") and "=TRUE" in stripped.upper():
-                                updated_line = f"{target_key}=false"
+                        clean_chosen = re.sub(r"[^A-Za-z0-9_]", "_", chosen_default.upper())
+                        chosen_key = f"{mod_prefix}{clean_chosen}_IS_DEFAULT"
+
+                        # Promote the chosen alias if it exists on disk but reads false.
+                        if upper_line.startswith(f"{chosen_key}="):
+                            if "=TRUE" not in upper_line:
+                                updated_line = f"{chosen_key}=true"
                                 changed = True
+                            break
+
+                        # Demote every other `*_IS_DEFAULT=true` line for this modality.
+                        if upper_line.startswith(mod_prefix) and "IS_DEFAULT=TRUE" in upper_line:
+                            key_part = stripped.split("=", 1)[0]
+                            updated_line = f"{key_part}=false"
+                            changed = True
                     new_lines.append(updated_line)
 
                 if changed:
@@ -792,6 +856,70 @@ class LollmsClient():
 
     def switch_rag(self, alias: str, callback=None) -> bool:
         return self._switch_modality(alias, self.rag_model_profiles_registry, self.rag_binding_profiles_registry, self.rags, self.rag_binding_manager, "rag", "rag", "_active_rag_alias", callback)
+
+    def set_default_model_profile(self, alias: str, modality: str = "llm") -> bool:
+        """
+        Marks the given execution-layer profile as the SOLE persistent default
+        for its modality, mounts it, and writes the choice back to disk
+        (``config.yaml`` and ``.env``) so it survives a process restart.
+
+        This is the canonical API for UI "Set as default" buttons. Calling
+        ``switch_model(alias)`` alone only affects the CURRENT session; a
+        subsequent launch re-reads the on-disk flags and can revert to the
+        previously persisted default (typically a stale ``master`` profile).
+
+        Args:
+            alias: The profile alias to promote (e.g. ``"qwen"``).
+            modality: One of llm, tti, tts, stt, ttv, ttm, tools, connection, rag.
+
+        Returns:
+            True if the profile was found, persisted AND successfully mounted.
+        """
+        modality_key = modality.lower()
+        model_registry: Dict[str, LollmsModelProfile] = getattr(
+            self, f"{modality_key}_model_profiles_registry", {}
+        )
+
+        if alias not in model_registry:
+            ASCIIColors.error(
+                f"[LollmsClient] Cannot set default: {modality_key.upper()} profile "
+                f"'{alias}' not found. Available: {list(model_registry.keys())}"
+            )
+            return False
+
+        demoted: List[str] = []
+        for other_alias, profile in model_registry.items():
+            if other_alias == alias:
+                profile.is_default = True
+            elif profile.is_default:
+                profile.is_default = False
+                demoted.append(other_alias)
+
+        # Persist promote+demote atomically to every existing config file.
+        self._save_single_default_profiles_to_disk({modality_key: (alias, demoted)})
+
+        switch_method_name = {
+            "llm": "switch_model",
+            "tti": "switch_tti",
+            "tts": "switch_tts",
+            "stt": "switch_stt",
+            "ttv": "switch_ttv",
+            "ttm": "switch_ttm",
+            "tools": "switch_tools",
+            "connection": "switch_connection",
+            "rag": "switch_rag",
+        }.get(modality_key)
+
+        if not switch_method_name:
+            ASCIIColors.error(f"[LollmsClient] Unknown modality '{modality}'.")
+            return False
+
+        bound_model = getattr(model_registry[alias], "model_name", None) or "(server default)"
+        ASCIIColors.success(
+            f"[LollmsClient] Persisted {modality_key.upper()} default -> "
+            f"'{alias}' (model '{bound_model}'). Demoted: {demoted or 'none'}."
+        )
+        return getattr(self, switch_method_name)(alias)
 
     # Legacy aliases
     def mount_llm(self, alias: str) -> bool: return self.switch_model(alias)

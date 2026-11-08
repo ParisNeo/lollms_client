@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-08 06:57]
+
+- feat(client): enhance LLM bindings and CLI environment configuration
+
 ## [2026-11-07 23:31]
 
 - fix: resolve import errors and clean up code formatting

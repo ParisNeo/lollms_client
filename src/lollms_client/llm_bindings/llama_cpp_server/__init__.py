@@ -18,8 +18,12 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any, Union, Callable
 
 
-
-
+import pipmaster as pm
+from ascii_colors import ASCIIColors, trace_exception
+from lollms_client.lollms_llm_binding import LollmsLLMBinding
+from lollms_client.lollms_types import MSG_TYPE
+from lollms_client.lollms_discussion import LollmsDiscussion
+from lollms_client.lollms_utilities import to_int, to_float, _convert_to_bool
 
 # Ensure dependencies
 pm.ensure_packages(["openai", "huggingface_hub", "filelock", "requests", "tqdm", "psutil", "pyyaml"])
@@ -1950,78 +1954,78 @@ class LlamaCppServerBinding(LollmsLLMBinding):
     # Model zoo
     # ──────────────────────────────────────────────────────────────────────────
 
+    def _load_zoo_from_description(self) -> List[Dict[str, Any]]:
+        """Builds the zoo list from description.yaml's ``pull_model`` templates.
 
-                "description": "Mistral AI Magistral 2509 – Efficient Thinking Model",
-                "size": "14.3 GB (Q4_K_M)",
-                "type": "gguf",
-                "link": "bartowski/mistralai_Magistral-Small-2509-GGUF",
-                "filename": "mistralai_Magistral-Small-2509-Q4_K_M.gguf",
-            },
-            {
-                "name": "Ministral-3-3B-Instruct-2512-GGUF",
-                "description": "Mistral AI Ministral 3 3B Instruct – Efficient Edge Model",
-                "size": "2.2 GB (Q4_K_M)",
-                "type": "gguf",
-                "link": "bartowski/mistralai_Ministral-3-3B-Instruct-2512-GGUF",
-                "filename": "mistralai_Ministral-3-3B-Instruct-2512-Q4_K_M.gguf",
-            },
-            {
-                "name": "Devstral-Small-2-24B-Instruct-GGUF",
-                "description": "Mistral AI Devstral Small 2 24B Instruct – Coding Specialist",
-                "size": "14.8 GB (Q4_K_M)",
-                "type": "gguf",
-                "link": "bartowski/mistralai_Devstral-Small-2-24B-Instruct-2512-GGUF",
-                "filename": "mistralai_Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf",
-            },
-            {
-                "name": "Llama-4-Scout-17B-Instruct-GGUF",
-                "description": "Meta Llama 4 Scout 17B Instruct – 16-Expert MoE",
-                "size": "11.2 GB (Q4_K_M)",
-                "type": "gguf",
-                "link": "bartowski/meta-llama_Llama-4-Scout-17B-16E-Instruct-old-GGUF",
-                "filename": "meta-llama_Llama-4-Scout-17B-16E-Instruct-Q4_K_M.gguf",
-            },
-            {
-                "name": "Qwen3-VL-32B-Thinking-GGUF",
-                "description": "Qwen 3 VL 32B Thinking – Vision + CoT Reasoning",
-                "size": "19.5 GB (Q4_K_M)",
-                "type": "gguf",
-                "link": "bartowski/Qwen_Qwen3-VL-32B-Thinking-GGUF",
-                "filename": "Qwen_Qwen3-VL-32B-Thinking-Q4_K_M.gguf",
-            },
-            {
-                "name": "Qwen3-72B-Embiggened-GGUF",
-                "description": "Qwen 3 72B Embiggened – Enhanced Reasoning Dense Model",
-                "size": "43.1 GB (Q4_K_M)",
-                "type": "gguf",
-                "link": "bartowski/cognitivecomputations_Qwen3-72B-Embiggened-GGUF",
-                "filename": "Qwen3-72B-Embiggened-Q4_K_M.gguf",
-            },
-            {
-                "name": "Devstral-2-123B-Instruct-GGUF",
-                "description": "Mistral AI Devstral 2 123B Instruct – Heavy-Duty Coding",
-                "size": "71.4 GB (Q4_K_M)",
-                "type": "gguf",
-                "link": "bartowski/mistralai_Devstral-2-123B-Instruct-2512-GGUF",
-                "filename": "Devstral-2-123B-Instruct-2512-Q4_K_M.gguf",
-            },
-            {
-                "name": "ChatGPT-OSS-120B-GGUF",
-                "description": "OpenAI GPT-OSS 120B – Open-Weight Research Model",
-                "size": "69.8 GB (Q4_K_M)",
-                "type": "gguf",
-                "link": "bartowski/openai_gpt-oss-120b-GGUF",
-                "filename": "gpt-oss-120b-Q4_K_M.gguf",
-            },
-            {
-                "name": "DeepSeek-V3-0324-GGUF",
-                "description": "DeepSeek V3 0324 – 671B MoE Giant",
-                "size": "365 GB (Q4_K_M)",
-                "type": "gguf",
-                "link": "bartowski/deepseek-ai_DeepSeek-V3-0324-GGUF",
-                "filename": "DeepSeek-V3-0324-Q4_K_M.gguf",
-            },
-        ]
+        Single source of truth: adding or removing a ``templates:`` entry in
+        ``description.yaml`` automatically updates ``get_zoo()`` — no hardcoded
+        list lives here anymore.
+
+        Mapping from template → zoo entry:
+          template.name                        → entry["name"]
+          template.description                 → entry["description"]
+          template.size (optional)             → entry["size"]
+          template.parameters.repo_id          → entry["link"]
+          template.parameters.filename         → entry["filename"]
+          template.parameters.mmproj_repo_id   → entry["mmproj_repo_id"] (if set)
+          template.parameters.mmproj_filename  → entry["mmproj_filename"] (if set)
+
+        Returns ``[]`` when description.yaml is missing/malformed, or when the
+        binding does not declare a ``pull_model`` command with templates.
+        """
+        desc_path = Path(__file__).parent / "description.yaml"
+        if not desc_path.is_file():
+            ASCIIColors.warning(
+                f"description.yaml not found at {desc_path}; zoo is empty."
+            )
+            return []
+        try:
+            with open(desc_path, "r", encoding="utf-8") as f:
+                desc = yaml.safe_load(f) or {}
+        except Exception as e:
+            ASCIIColors.warning(f"Failed to read description.yaml for zoo: {e}")
+            return []
+
+        for cmd in desc.get("commands") or []:
+            if not isinstance(cmd, dict):
+                continue
+            if str(cmd.get("name", "")).lower() != "pull_model":
+                continue
+            entries: List[Dict[str, Any]] = []
+            for t in cmd.get("templates") or []:
+                if not isinstance(t, dict):
+                    continue
+                params = t.get("parameters") or {}
+                if not isinstance(params, dict):
+                    continue
+                link = params.get("repo_id")
+                filename = params.get("filename")
+                if not link or not filename:
+                    continue
+                entry: Dict[str, Any] = {
+                    "name": str(t.get("name") or filename),
+                    "description": str(t.get("description") or ""),
+                    "size": str(t.get("size") or ""),
+                    "type": "gguf",
+                    "link": str(link),
+                    "filename": str(filename),
+                }
+                if params.get("mmproj_repo_id"):
+                    entry["mmproj_repo_id"] = str(params["mmproj_repo_id"])
+                if params.get("mmproj_filename"):
+                    entry["mmproj_filename"] = str(params["mmproj_filename"])
+                entries.append(entry)
+            return entries
+        return []
+
+    def get_zoo(self) -> List[Dict[str, Any]]:
+        """Returns the curated model zoo, sourced from ``description.yaml``.
+
+        The zoo is derived from the ``templates:`` block of the ``pull_model``
+        command declared in ``description.yaml`` (single source of truth).
+        Users can call ``download_from_zoo(index)`` to fetch a given entry.
+        """
+        return self._load_zoo_from_description()
 
     def download_from_zoo(
         self,
@@ -2032,9 +2036,13 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         if not (0 <= index < len(zoo)):
             return {"status": False, "message": "Index out of bounds."}
         item = zoo[index]
+        # Forward mmproj fields so multimodal zoo entries download the
+        # projector alongside the model and bind it automatically.
         return self.pull_model(
             item["link"],
             item.get("filename"),
+            mmproj_repo_id=item.get("mmproj_repo_id"),
+            mmproj_filename=item.get("mmproj_filename"),
             progress_callback=progress_callback,
         )
 
@@ -2105,7 +2113,11 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                 progress_callback({"status": "error", "message": err})
             return {"status": False, "error": err}
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # Cleanup
+    # ──────────────────────────────────────────────────────────────────────────
 
+    def cleanup_orphans_if_needed(self):
         """
         Called at interpreter exit.  Performs a lightweight registry scan and
         removes stale entries left by crashed processes.
@@ -2119,4 +2131,6 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             except Exception:
                 rf.unlink(missing_ok=True)
 
-
+    def __del__(self):
+        if hasattr(self, "_watchdog_stop"):
+            self._watchdog_stop.set()

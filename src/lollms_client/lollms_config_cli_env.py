@@ -668,12 +668,44 @@ def _get_binding_commands(b_name: str, b_type: str) -> List[Dict[str, Any]]:
         if key in seen:
             continue
         seen.add(key)
+
+        raw_templates = entry.get("templates") or []
+        templates: List[Dict[str, Any]] = []
+        if isinstance(raw_templates, list):
+            for t in raw_templates:
+                if not isinstance(t, dict):
+                    continue
+                tname = t.get("name")
+                if not isinstance(tname, str) or not tname.strip():
+                    continue
+                raw_tparams = t.get("parameters") or {}
+                if isinstance(raw_tparams, list):
+                    # Tolerate list-of-{name,value} form for ergonomics.
+                    raw_tparams = {
+                        str(tp.get("name")): tp.get("value")
+                        for tp in raw_tparams
+                        if isinstance(tp, dict) and tp.get("name")
+                    }
+                if not isinstance(raw_tparams, dict):
+                    raw_tparams = {}
+                clean_params = {
+                    str(k).strip(): v
+                    for k, v in raw_tparams.items()
+                    if str(k).strip()
+                }
+                templates.append({
+                    "name": tname.strip(),
+                    "description": str(t.get("description") or "").strip(),
+                    "parameters": clean_params,
+                })
+
         commands.append({
             "name": name.strip(),
             "title": str(entry.get("title") or name).strip(),
             "description": str(entry.get("description") or "").strip(),
             "parameters": entry.get("parameters") or [],
             "output": entry.get("output") or [],
+            "templates": templates,
         })
     return commands
 
@@ -1314,6 +1346,19 @@ def _build_client_from_binding_alias(
 
     binding = getattr(client, b_type, None)
     if binding is None:
+        # LollmsClient can swallow binding import failures and leave the
+        # modality attribute as None — surface the *real* underlying cause by
+        # re-importing the binding module so the wizard's error message points
+        # to the actual syntax/dependency problem instead of a bare "not
+        # exposed" sentinel.
+        mod_path = f"lollms_client.{b_type}_bindings.{binding_name}"
+        try:
+            import importlib as _importlib
+            _importlib.import_module(mod_path)
+        except Exception as import_exc:
+            raise RuntimeError(
+                f"Binding module '{mod_path}' failed to import: {import_exc}"
+            ) from import_exc
         raise RuntimeError(
             f"LollmsClient did not expose a '{b_type}' binding for '{binding_name}'."
         )
@@ -1350,21 +1395,88 @@ def _render_command_summary(
             ASCIIColors.info(f"   • {name} = {val}")
 
 
-def _collect_command_params(command: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Prompts for every declared parameter of a command.
+def _choose_command_template(command: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Lets the user pick a command template or opt to enter params manually.
 
-    Returns the assembled kwargs when all prompts complete successfully, or
-    ``None`` when the user pressed back/kb-interrupt at any prompt. Empty
-    optional string values are omitted so binding defaults apply.
+    Returns:
+        A template dict (with ``name`` / ``description`` / ``parameters``) when
+        the user picks one; ``{}`` when the user chooses "custom parameters";
+        ``None`` when the user cancels/backs out.
+    """
+    templates = command.get("templates") or []
+    if not templates:
+        return {}
+    labels: List[str] = []
+    for t in templates:
+        label = f"⚡ {t['name']}"
+        if t.get("description"):
+            label += f" — {t['description']}"
+        labels.append(label)
+    labels.append("✍️ Use custom parameters")
+    picked = _safe_select(
+        f"Pick a template for '{command.get('title') or command['name']}'?",
+        labels,
+    )
+    if not picked:
+        return None
+    if picked == "✍️ Use custom parameters":
+        return {}
+    for t, label in zip(templates, labels):
+        if label == picked:
+            return t
+    return {}
+
+
+def _collect_command_params(
+    command: Dict[str, Any],
+    preset: Optional[Dict[str, Any]] = None,
+    template_mode: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Collects a command's parameter values.
+
+    Two modes are supported:
+
+    * **Custom mode** (``template_mode=False``): every declared parameter is
+      prompted interactively (except any name present in ``preset``).
+    * **Template mode** (``template_mode=True``): a template was chosen and is
+      treated as the complete parameter set. Values present in ``preset`` are
+      used verbatim, non-mandatory parameters missing from the template are
+      silently defaulted (declared ``default`` when present, otherwise
+      omitted), and only missing **mandatory** parameters are prompted — so a
+      well-formed template runs end-to-end without a single prompt.
+
+    Args:
+        command: The declared command descriptor.
+        preset: Template-supplied values keyed by parameter name.
+        template_mode: When True, apply the fast-path defaulting described
+            above. Ignored when ``preset`` is empty.
+
+    Returns:
+        The assembled kwargs dict, or ``None`` when the user backed out of a
+        prompt. Empty optional strings are omitted so binding defaults apply.
     """
     raw_params: Dict[str, Any] = {}
+    preset = preset or {}
+    effective_template_mode = template_mode and bool(preset)
     for p in command.get("parameters", []) or []:
         if not isinstance(p, dict):
             continue
         pname = str(p.get("name") or "").strip()
         if not pname:
             continue
+        # Template pre-fill: skip the prompt and preserve the value.
+        if pname in preset:
+            raw_params[pname] = preset[pname]
+            continue
         mandatory = bool(p.get("mandatory", False))
+        # Fast path: a template was chosen, the parameter isn't in it, and it's
+        # optional — do not prompt. Fall back to the declared default (if any)
+        # so the summary shows a concrete value instead of an empty one.
+        if effective_template_mode and not mandatory:
+            default = p.get("default")
+            if default is not None:
+                raw_params[pname] = default
+            continue
         default = p.get("default")
         ptype = str(p.get("type") or "str").lower()
 
@@ -1540,6 +1652,7 @@ def _execute_binding_command(
            ↩ Back                     → exit without further action.
     """
     cmd_name = command["name"]
+    has_templates = bool(command.get("templates"))
 
     while True:
         ASCIIColors.rich_print(
@@ -1548,7 +1661,29 @@ def _execute_binding_command(
         if command.get("description"):
             ASCIIColors.rich_print(f"[dim]{command['description']}[/dim]")
 
-        raw_params = _collect_command_params(command)
+        # Template picker runs on every iteration so "Modify parameters & re-run"
+        # also lets the user switch templates or drop into fully-custom mode.
+        template_name: Optional[str] = None
+        preset: Dict[str, Any] = {}
+        template_mode = False
+        if has_templates:
+            chosen = _choose_command_template(command)
+            if chosen is None:
+                ASCIIColors.yellow("\n  ⚠️ Command execution cancelled.")
+                return
+            preset = dict(chosen.get("parameters") or {})
+            if preset:
+                template_name = chosen.get("name")
+                template_mode = True
+                ASCIIColors.rich_print(
+                    f"[dim]📋 Using template: [bold]{template_name}[/bold] "
+                    f"({len(preset)} parameter(s) pre-filled — other params "
+                    f"use declared defaults).[/dim]"
+                )
+
+        raw_params = _collect_command_params(
+            command, preset=preset, template_mode=template_mode
+        )
         if raw_params is None:
             ASCIIColors.yellow("\n  ⚠️ Command execution cancelled.")
             return

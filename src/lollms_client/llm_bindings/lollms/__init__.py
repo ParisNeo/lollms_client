@@ -1171,10 +1171,15 @@ class LollmsBinding(LollmsLLMBinding):
                     "content": [{"type": "text", "text": prompt}] + media_blocks,
                 })
         else:
+            # Plain-text turn: emit a bare string, not a content array. Several
+            # OpenAI-compatible backends (llama.cpp server, older vLLM, and
+            # some LoLLMS proxies) crash with HTTP 500 when a text-only turn
+            # is sent as ``[{"type": "text", ...}]`` with no media attached.
+            # The string form is universally accepted.
             if split:
                 messages += self.split_discussion(prompt, user_keyword=user_keyword, ai_keyword=ai_keyword)
             else:
-                messages.append({"role": "user", "content": [{"type": "text", "text": prompt}]})
+                messages.append({"role": "user", "content": prompt})
 
         # ── Tool-aware path: route through the shared loop so the callback
         # can return tool results and expect the binding to re-invoke.
@@ -1215,7 +1220,14 @@ class LollmsBinding(LollmsLLMBinding):
 
                 try:
                     chat_completion = self.client.chat.completions.create(**params)
-                except Exception as ex:
+                except openai.BadRequestError as ex:
+                    # Only retry on 400-class validation errors: the retry
+                    # strips parameters that server-side validators reject.
+                    # Retrying on 5xx (server crash, OOM, bad template) just
+                    # re-sends the same broken payload — retry once with
+                    # parameter stripping is still useful because some NIM /
+                    # strict-schema endpoints return 500 for unknown params,
+                    # so keep the retry but propagate the body if it fails.
                     trace_exception(ex)
                     if "max_tokens" in params:
                         params["max_completion_tokens"] = params.pop("max_tokens")
@@ -1226,9 +1238,25 @@ class LollmsBinding(LollmsLLMBinding):
                         params["extra_body"].pop("chat_template_kwargs", None)
                         params["extra_body"].pop("reasoning_effort", None)
                         params["extra_body"].pop("thinking", None)
+                        if not params["extra_body"]:
+                            params.pop("extra_body", None)
                     if effort is None or is_thinking_deactivated:
                         params["temperature"] = 1
                     chat_completion = self.client.chat.completions.create(**params)
+                except openai.InternalServerError as ex:
+                    # 5xx: server-side fault (bad chat template, model OOM,
+                    # broken prompt rendering). Do NOT re-send the identical
+                    # payload — surface the server body so the operator can
+                    # read the real traceback from the backend log.
+                    trace_exception(ex)
+                    ASCIIColors.error(
+                        f"[LollmsBinding] Server returned 500 Internal "
+                        f"Server Error. This is a backend fault, not a client "
+                        f"payload error. Check the inference server logs "
+                        f"(model load failure, OOM, or chat template issues). "
+                        f"Server body: {getattr(ex, 'body', None)}"
+                    )
+                    raise
 
                 if stream:
                     handler = _StreamThinkingHandler(streaming_callback, suppress_thinking=is_thinking_deactivated)
@@ -1376,7 +1404,7 @@ class LollmsBinding(LollmsLLMBinding):
                 )
                 try:
                     completion = self.client.completions.create(**params)
-                except Exception as ex:
+                except openai.BadRequestError as ex:
                     trace_exception(ex)
                     if "max_tokens" in params:
                         params["max_completion_tokens"] = params.pop("max_tokens")
@@ -1384,6 +1412,13 @@ class LollmsBinding(LollmsLLMBinding):
                     params.pop("top_p", None)
                     params.pop("frequency_penalty", None)
                     completion = self.client.completions.create(**params)
+                except openai.InternalServerError as ex:
+                    trace_exception(ex)
+                    ASCIIColors.error(
+                        f"[LollmsBinding] Server returned 500 on /completions. "
+                        f"Backend fault. Server body: {getattr(ex, 'body', None)}"
+                    )
+                    raise
 
                 if stream:
                     for resp in completion:

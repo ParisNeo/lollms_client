@@ -134,3 +134,76 @@ commands:
         type: "int"
         default: -1
         description: "RNG seed for reproducible generation. Use -1 for random."
+
+  - name: "generate_video_first_and_last_frame"
+    description: >
+      First/last-frame video generation (FL2V). Interpolates a video that starts at
+      `start_image` and ends at `end_image`, guided by `prompt`. Requires a model that
+      supports keyframe conditioning (e.g., MiniMax-H3 FL2VA).
+    params:
+      - name: "prompt"
+        type: "str"
+        description: "Text description of the desired transition/motion."
+      - name: "start_image"
+        type: "str"
+        description: "Path or base64 string of the first-frame image."
+      - name: "end_image"
+        type: "str"
+        description: "Path or base64 string of the last-frame image."
+      - name: "negative_prompt"
+        type: "str"
+        default: ""
+        description: "Negative guidance text."
+      - name: "fps"
+        type: "int"
+        default: 24
+        description: "Output video frames per second."
+      - name: "num_inference_steps"
+        type: "int"
+        default: 30
+        description: "Number of denoising steps."
+      - name: "seed"
+        type: "int"
+        default: -1
+        description: "RNG seed for reproducible generation. Use -1 for random."
+
+  - name: "generate_lipsync_video"
+    description: >
+      Audio-driven talking-head generation (lipsync). Animates a portrait image so
+      that its mouth moves in sync with the provided audio track. Uses MiniMax-H3's
+      FL2VA task with `image` + `audio` multipart uploads to `/v1/videos/sync`.
+    params:
+      - name: "image"
+        type: "str"
+        description: "Path or base64 string of the portrait image."
+      - name: "audio"
+        type: "str"
+        description: "Path or base64 string of the driving audio track (wav/mp3)."
+      - name: "prompt"
+        type: "str"
+        default: ""
+        description: "Optional scene/style guidance."
+      - name: "negative_prompt"
+        type: "str"
+        default: ""
+        description: "Negative guidance text."
+      - name: "fps"
+        type: "int"
+        default: 24
+        description: "Output video frames per second."
+      - name: "num_inference_steps"
+        type: "int"
+        default: 30
+        description: "Number of denoising steps."
+      - name: "seed"
+        type: "int"
+        default: -1
+        description: "RNG seed for reproducible generation. Use -1 for random."
+      - name: "image_ext"
+        type: "str"
+        default: "png"
+        description: "Image extension hint when passing raw bytes (png/jpg/webp)."
+      - name: "audio_ext"
+        type: "str"
+        default: "wav"
+        description: "Audio extension hint when passing raw bytes (wav/mp3/flac)."
