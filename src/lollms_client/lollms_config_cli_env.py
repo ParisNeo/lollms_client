@@ -31,17 +31,219 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_default_config_file() -> Path:
-    """Returns the active configuration file according to the shared path policy.
+    """Returns the shared global configuration file (respects $LOLLMS_CONFIG_FILE).
 
-    Honors (in order): an explicit path (not used here), the permanent
-    ``$LOLLMS_CONFIG_FILE`` env override, and falls back to
-    ``~/.lollms/config.yaml`` — see ``lollms_paths.get_config_file``.
+    This is the wizard's historical save target. It is what the wizard and
+    most callers write into by default.
     """
     try:
         from lollms_client.lollms_paths import get_config_file
         return get_config_file()
     except Exception:
         return (Path.home() / ".lollms" / "config.yaml").resolve()
+
+
+def _get_project_config_file() -> Path:
+    """Returns the caller's project-local config path (``./.lollms_code/config.yaml``).
+
+    A host app (e.g. ``lollms-code``) can drop a ``.lollms_code/config.yaml``
+    next to the workspace. It is only *read* when ``LOLLMS_PROJECT_CONFIG=1``
+    is set — see ``get_client_from_env`` — but it exists on disk regardless,
+    so the wizard must be able to display it and let the user edit it.
+    """
+    return Path.cwd() / ".lollms_code" / "config.yaml"
+
+
+def _is_project_config_enabled() -> bool:
+    """True when the project-local config overlay is permitted for this process.
+
+    Semantics (inverted from the previous behaviour so the wizard, the
+    runtime, and workspace-resident apps all agree on the SAME file):
+
+      * No env var set, ``./.lollms_code/config.yaml`` exists -> **enabled**
+        (default). Running an app from a workspace that carries its own
+        ``.lollms_code/config.yaml`` is a deliberate per-project choice;
+        that file IS the project config, not a forgotten leftover.
+      * ``LOLLMS_PROJECT_CONFIG=0`` (or ``false``/``no``/``off``) -> disabled.
+        Explicit opt-out for users who want a single shared global config
+        across every workspace.
+      * ``LOLLMS_PROJECT_CONFIG=1`` (or ``true``/``yes``/``on``) -> enabled
+        (unchanged from the opt-in behaviour).
+    """
+    raw = os.getenv("LOLLMS_PROJECT_CONFIG", "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    # Any other value (unset, "1", "true", "yes", "on", "") means enabled.
+    return True
+
+
+def _get_effective_config_file() -> Path:
+    """Returns the file that ``get_client_from_env`` will *actually* use.
+
+    Resolution order (identical to ``_load_existing_env_to_map`` and
+    ``get_client_from_env``):
+
+      1. ``$LOLLMS_CONFIG_FILE`` — explicit, highest-priority override.
+      2. ``./.lollms_code/config.yaml`` — project-local, authoritative for
+         the current working directory **when it exists** and the project
+         overlay is not explicitly disabled (``LOLLMS_PROJECT_CONFIG=0``).
+         This is what makes ``/config`` in a workspace app like
+         ``lollms-code`` edit the SAME file the app mounts.
+      3. ``~/.lollms/config.yaml`` — shared fallback when no project file
+         is present.
+    """
+    env_override = os.getenv("LOLLMS_CONFIG_FILE", "").strip()
+    if env_override:
+        return Path(env_override).expanduser().resolve()
+    project_yaml = _get_project_config_file()
+    if project_yaml.exists() and _is_project_config_enabled():
+        return project_yaml.resolve()
+    return _get_default_config_file()
+
+
+def _discover_config_sources() -> List[Path]:
+    """Lists every on-disk config that could be the effective one, in
+    precedence order. Used by the wizard banner to show the divergence at
+    a glance (users can then fix it or import/export between them).
+
+    The ordering mirrors ``_get_effective_config_file``:
+      * ``$LOLLMS_CONFIG_FILE`` (highest priority).
+      * ``./.lollms_code/config.yaml`` (project-local).
+      * ``~/.lollms/config.yaml`` (shared fallback).
+    """
+    sources: List[Path] = []
+    env_override = os.getenv("LOLLMS_CONFIG_FILE", "").strip()
+    if env_override:
+        sources.append(Path(env_override).expanduser().resolve())
+    project_yaml = _get_project_config_file()
+    if project_yaml.exists():
+        sources.append(project_yaml.resolve())
+    default_yaml = _get_default_config_file()
+    if default_yaml.exists() and default_yaml.resolve() not in sources:
+        sources.append(default_yaml.resolve())
+    return sources
+
+
+def _compact_path(p: Union[str, Path]) -> str:
+    """Shortens an absolute path so it fits comfortably on a single menu line."""
+    try:
+        path = Path(p).expanduser()
+        try:
+            return f"~/{path.relative_to(Path.home())}"
+        except ValueError:
+            return str(path)
+    except Exception:
+        return str(p)
+
+
+def describe_active_config(
+    cli_env_path: Optional[Union[str, Path]] = None,
+) -> Dict[str, Any]:
+    """Returns a structured report of the ACTIVE configuration landscape.
+
+    This is the single source of truth used by the wizard's on-menu diagnostic
+    row, its startup banner, and any embedding application (``lollms-code``'s
+    ``/config``, ``lollms-bot``'s ``--config``) that wants to show the user
+    *which file they will actually be editing*.
+
+    Contract — critical invariant for embedding hosts:
+
+      * When ``cli_env_path`` is provided, that pinned path is **authoritative**.
+        It overrides ``_get_effective_config_file()`` everywhere (this is what
+        ``lollms-code`` passes: its per-project ``.lollms_code/config.yaml``).
+      * Otherwise the effective file is derived from the standard precedence
+        chain (``$LOLLMS_CONFIG_FILE`` → project-local → shared global).
+
+    Keys returned:
+      ``cwd``                     — current working directory.
+      ``effective_file``          — file the wizard writes to / client reads from.
+      ``effective_exists``        — whether that file currently exists on disk.
+      ``pinned_cli_env_path``     — caller-supplied override (``None`` if unset).
+      ``candidates``              — list of ``{path, exists, active}`` for every
+                                    on-disk config that could be the effective one.
+      ``project_overlay_enabled`` — ``LOLLMS_PROJECT_CONFIG`` state.
+      ``project_config_exists``   — whether ``./.lollms_code/config.yaml`` exists.
+    """
+    pinned: Optional[Path] = Path(cli_env_path).expanduser().resolve() if cli_env_path else None
+    effective: Path = pinned if pinned else _get_effective_config_file()
+
+    candidates: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    def _add(candidate: Optional[Path]) -> None:
+        if candidate is None:
+            return
+        try:
+            rp = candidate.expanduser()
+            rp = rp.resolve() if rp.exists() else rp
+        except Exception:
+            rp = candidate
+        key = str(rp)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append({"path": rp, "exists": Path(key).exists(), "active": rp == effective})
+
+    _add(pinned)
+    _add(_get_project_config_file())
+    env_override = os.getenv("LOLLMS_CONFIG_FILE", "").strip()
+    if env_override:
+        _add(Path(env_override).expanduser())
+    _add(_get_default_config_file())
+
+    return {
+        "cwd": str(Path.cwd()),
+        "effective_file": str(effective),
+        "effective_exists": effective.exists(),
+        "pinned_cli_env_path": str(pinned) if pinned else None,
+        "candidates": candidates,
+        "project_overlay_enabled": _is_project_config_enabled(),
+        "project_config_exists": _get_project_config_file().exists(),
+    }
+
+
+def _print_active_config_report(cli_env_path: Optional[Union[str, Path]] = None) -> None:
+    """Renders the full active-configuration inventory to the terminal.
+
+    Called by (a) the wizard's on-menu diagnostic entry, and (b) embedding
+    hosts (``lollms-code``'s ``/config``) that want a rich, on-demand report.
+    """
+    info = describe_active_config(cli_env_path)
+
+    ASCIIColors.rich_print("\n[bold magenta]── Active Configuration ──[/bold magenta]")
+    ASCIIColors.rich_print(f"[dim]Working directory: {info['cwd']}[/dim]")
+
+    if info["pinned_cli_env_path"]:
+        ASCIIColors.success(
+            f"  📌 Pinned target file (this session — will be saved to): "
+            f"{info['pinned_cli_env_path']}"
+        )
+    else:
+        ASCIIColors.success(
+            f"  📌 Effective target file (resolved from precedence chain): "
+            f"{info['effective_file']}"
+            + ("" if info["effective_exists"] else "  [dim](does not exist — will be created on save)[/dim]")
+        )
+
+    ASCIIColors.rich_print("[dim]All candidate configs, precedence order:[/dim]")
+    for cand in info["candidates"]:
+        marker = "🟢 ACTIVE" if cand["active"] else "  present"
+        if not cand["exists"] and cand["active"]:
+            marker = "🟢 ACTIVE (to be created)"
+        elif not cand["exists"]:
+            marker = "  missing"
+        ASCIIColors.info(f"   {marker}  {cand['path']}")
+
+    if info["project_config_exists"] and not info["project_overlay_enabled"]:
+        ASCIIColors.warning(
+            "  ⚠  Project-local config exists but LOLLMS_PROJECT_CONFIG=0 "
+            "forces the shared global file. Remove the opt-out to use the project file."
+        )
+    elif info["project_overlay_enabled"] and not info["project_config_exists"] and not info["pinned_cli_env_path"]:
+        ASCIIColors.info(
+            "  ℹ  Project overlay is enabled but no .lollms_code/config.yaml is present "
+            "(falling back to the shared global config)."
+        )
 
 
 def resolve_env_file(cli_env_path: Optional[Union[str, Path]] = None) -> Tuple[Optional[Path], bool]:
@@ -118,26 +320,31 @@ def _serialize_config_map_to_yaml(config_map: Dict[str, str]) -> Dict[str, Any]:
       profiles:
         <alias>:
           <param_name>: <value>
+
+    Special first-class keys handled here:
+      * ``LOLLMS_DATA_FOLDER``    -> ``lollms_data_folder`` at YAML root.
+      * ``LLM_ACTIVE_PROFILE``    -> ``llm.active_profile`` (authoritative default).
+
     Pre-discovers configured aliases so aliases containing underscores
     (e.g. local_ollama, qwen_2_5) are preserved without truncation.
     """
     yaml_data: Dict[str, Any] = {}
 
-    def _convert_scalar(v: Any) -> Any:
-        if isinstance(v, bool):
-            return v
-        v_str = str(v).strip()
-        if v_str.lower() in ("true", "yes", "1", "on"):
+    def _convert_scalar(value: Any) -> Any:
+        if isinstance(value, bool):
+            return value
+        value_str = str(value).strip()
+        if value_str.lower() in ("true", "yes", "1", "on"):
             return True
-        if v_str.lower() in ("false", "no", "0", "off"):
+        if value_str.lower() in ("false", "no", "0", "off"):
             return False
         try:
-            return int(v_str)
+            return int(value_str)
         except ValueError:
             try:
-                return float(v_str)
+                return float(value_str)
             except ValueError:
-                return v_str
+                return value_str
 
     known_aliases_by_modality: Dict[str, Dict[str, List[str]]] = {}
     for mod in ("llm", "tti", "tts", "stt", "ttm", "ttv", "connection", "rag"):
@@ -152,10 +359,16 @@ def _serialize_config_map_to_yaml(config_map: Dict[str, str]) -> Dict[str, Any]:
 
         k_upper = k.upper().strip()
 
-        # 📂 Top-level client-wide data folder: persist as a first-class key,
-        # never parsed as a modality-namespaced entry.
+        # 📂 Top-level client-wide data folder (never parsed as a modality entry).
         if k_upper == "LOLLMS_DATA_FOLDER":
             yaml_data["lollms_data_folder"] = str(v).strip()
+            continue
+
+        # 🎯 Explicit active-LLM selection. Persisted as ``llm.active_profile``
+        # so ``get_client_from_env`` can authoritatively resolve which model to
+        # mount, regardless of stale `is_default` flags left on disk.
+        if k_upper == "LLM_ACTIVE_PROFILE":
+            yaml_data.setdefault("llm", {})["active_profile"] = str(v).strip()
             continue
 
         parts = k_upper.split("_", 2)
@@ -166,11 +379,12 @@ def _serialize_config_map_to_yaml(config_map: Dict[str, str]) -> Dict[str, Any]:
         category = parts[1].lower()
         if category not in ("bindings", "profiles"):
             continue
-        remainder = parts[2]
 
+        remainder = parts[2]
         known_aliases = known_aliases_by_modality.get(modality, {}).get(category, [])
-        alias = None
-        param_name = None
+
+        alias: Optional[str] = None
+        param_name: Optional[str] = None
 
         for known_alias in sorted(known_aliases, key=len, reverse=True):
             marker = f"{known_alias.upper()}_"
@@ -190,10 +404,9 @@ def _serialize_config_map_to_yaml(config_map: Dict[str, str]) -> Dict[str, Any]:
                     idx = remainder.find("_ROUTING_")
                     alias = remainder[:idx]
                     param_name = remainder[idx + 1:].lower()
-            else:
-                if remainder.endswith("_BINDING_NAME"):
-                    alias = remainder[:-len("_BINDING_NAME")]
-                    param_name = "binding_name"
+            elif remainder.endswith("_BINDING_NAME"):
+                alias = remainder[:-len("_BINDING_NAME")]
+                param_name = "binding_name"
 
         if not alias or not param_name:
             continue
@@ -410,29 +623,68 @@ _LLM_PROFILE_DEFAULTS = {
 }
 
 
-def _auto_promote_default(profiles: Dict[str, Dict[str, Any]], registry_order: List[str]) -> None:
+def _auto_promote_default(
+    profiles: Dict[str, Dict[str, Any]],
+    registry_order: List[str],
+    active_profile_hint: Optional[str] = None,
+) -> None:
     """
     READ-TIME AUTO-PROMOTION (SINGLE-DEFAULT INVARIANT, read side).
-    If a modality has profiles but none flagged as default, the FIRST profile
-    (insertion order from the env map) is promoted in-memory. If several are
-    flagged, the first flagged one wins and the others are demoted. This never
-    writes to disk — persistence only happens when the user saves.
+
+    Resolution precedence (highest first):
+      1. ``active_profile_hint`` — an explicit, authoritative alias recorded in
+         the YAML root by the wizard (``llm.active_profile``). It is the ONLY
+         source of truth that survives stale ``is_default: true`` flags
+         left over from a previous session, so a wizard-saved choice can
+         never be silently overridden by dictionary iteration order.
+      2. A single profile carrying ``is_default: true`` (already consistent —
+         return without touching anything).
+      3. First flagged profile (legacy fallback when hint is missing).
+      4. First profile in registry order (legacy fallback when no flags at all).
+
+    This mutates ``profiles`` in memory only — disk persistence is the
+    responsibility of the Save flow (``_save_and_validate``).
     """
     if not profiles:
         return
+
     flagged = [
         alias for alias, p_data in profiles.items()
         if isinstance(p_data, dict) and p_data.get("is_default")
     ]
-    if len(flagged) == 1:
+
+    hint = (active_profile_hint or "").strip().lower() or None
+    if hint and hint in profiles:
+        owner = hint
+    elif len(flagged) == 1:
         return
-    owner = flagged[0] if flagged else registry_order[0]
+    else:
+        owner = flagged[0] if flagged else registry_order[0]
+
     for alias, p_data in profiles.items():
         if isinstance(p_data, dict):
             p_data["is_default"] = (alias == owner)
 
 
-def _extract_profiles_from_env(prefix: str, bindings: Dict[str, Dict[str, Any]], env_data: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
+def _extract_profiles_from_env(
+    prefix: str,
+    bindings: Dict[str, Dict[str, Any]],
+    env_data: Dict[str, str],
+    active_profile_hint: Optional[str] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Extracts profiles from the flat env map.
+
+    ``active_profile_hint`` (optional) is the authoritative default alias
+    recorded by the wizard (see ``llm.active_profile``). When provided, it
+    silently overrides any stale ``is_default`` flags during promotion.
+
+    Profiles whose ``binding_alias`` does not resolve to a defined binding are
+    still **skipped** (LollmsClient requires a binding_name to instantiate),
+    but we now emit a loud, actionable warning naming both the profile alias
+    and the unresolvable binding alias. This prevents the silent fallback to
+    an unrelated default profile that made the wizard/client divergence look
+    inexplicable.
+    """
     clean_prefix = prefix.rstrip("_").upper()
     profiles = {}
     profile_prefix = f"{clean_prefix}_PROFILES_"
@@ -513,49 +765,66 @@ def _extract_profiles_from_env(prefix: str, bindings: Dict[str, Dict[str, Any]],
 
     resolved_profiles = {}
     if profiles:
-        _auto_promote_default(profiles, registry_order=list(profiles.keys()))
-    for p_alias, p_data in profiles.items():
-        b_alias = _sanitize_alias(p_data.get("binding_alias") or "") or None
-        b_info = bindings.get(b_alias, {}) if b_alias else {}
-        binding_name = p_data.get("binding_name") or b_info.get("binding_name")
-        base_b_config = b_info.get("binding_config", {})
-        profile_b_config = {k: v for k, v in p_data.items() if k not in {
-            "binding_alias", "is_default",
-            "vision_enabled", "video_enabled", "image_token_cost",
-            "thinking_enabled", "supported_reasoning_efforts", "default_reasoning_effort",
-            "forced_context_size", "model_name", "instance_name",
-            "binding_name", "routing_config",
-            "tool_calling_enabled",
-        }}
-        merged_b_config = {**base_b_config, **profile_b_config}
-        if "model_name" in p_data:
-            merged_b_config["model_name"] = p_data["model_name"]
-        # For connection bindings, instance_name maps to model_name conceptually
-        elif "instance_name" in p_data:
-            merged_b_config["model_name"] = p_data["instance_name"]
-        if not binding_name:
-            continue
+        _auto_promote_default(
+            profiles,
+            registry_order=list(profiles.keys()),
+            active_profile_hint=active_profile_hint,
+        )
 
-        # Use instance_name as model_name for connections when model_name not set
-        effective_model_name = p_data.get("model_name") or p_data.get("instance_name")
+        for p_alias, p_data in profiles.items():
+            b_alias = _sanitize_alias(p_data.get("binding_alias") or "") or None
+            b_info = bindings.get(b_alias, {}) if b_alias else {}
+            binding_name = p_data.get("binding_name") or b_info.get("binding_name")
+            base_b_config = b_info.get("binding_config", {})
+            profile_b_config = {k: v for k, v in p_data.items() if k not in {
+                "binding_alias", "is_default",
+                "vision_enabled", "video_enabled", "image_token_cost",
+                "thinking_enabled", "supported_reasoning_efforts", "default_reasoning_effort",
+                "forced_context_size", "model_name", "instance_name",
+                "binding_name", "routing_config",
+                "tool_calling_enabled", "_default_flag_order",
+            }}
+            merged_b_config = {**base_b_config, **profile_b_config}
+            if "model_name" in p_data:
+                merged_b_config["model_name"] = p_data["model_name"]
+            # For connection bindings, instance_name maps to model_name conceptually
+            elif "instance_name" in p_data:
+                merged_b_config["model_name"] = p_data["instance_name"]
+            if not binding_name:
+                # Previously a silent `continue`, which caused a healthy-looking
+                # fallback to the FIRST remaining profile (typically an unrelated
+                # legacy default) whenever a user's chosen profile referenced a
+                # binding that didn't exist in the merged config. Surface it so
+                # the effective diff is diagnosable.
+                ASCIIColors.warning(
+                    f"[config-resolver] {clean_prefix} profile '{p_alias}' "
+                    f"references unknown binding alias '{b_alias}' — profile "
+                    f"skipped (no usable binding_name). Verify the binding "
+                    f"alias is spelled correctly and its *_BINDING_NAME key is "
+                    f"present in the effective configuration."
+                )
+                continue
 
-        resolved_profiles[p_alias] = {
-            "binding_name": binding_name,
-            "binding_alias": b_alias,
-            "binding_profile_name": b_alias,
-            "binding_config": merged_b_config,
-            "model_name": effective_model_name,
-            "is_default": p_data.get("is_default", False),
-            "vision_enabled": p_data.get("vision_enabled", False),
-            "video_enabled": p_data.get("video_enabled", False),
-            "image_token_cost": p_data.get("image_token_cost", 256),
-            "thinking_enabled": p_data.get("thinking_enabled", False),
-            "tool_calling_enabled": p_data.get("tool_calling_enabled", False),
-            "supported_reasoning_efforts": p_data.get("supported_reasoning_efforts") or ["low", "medium", "high"],
-            "default_reasoning_effort": p_data.get("default_reasoning_effort") or None,
-            "forced_context_size": p_data.get("forced_context_size"),
-            "routing_config": p_data.get("routing_config", {})
-        }
+            # Use instance_name as model_name for connections when model_name not set
+            effective_model_name = p_data.get("model_name") or p_data.get("instance_name")
+
+            resolved_profiles[p_alias] = {
+                "binding_name": binding_name,
+                "binding_alias": b_alias,
+                "binding_profile_name": b_alias,
+                "binding_config": merged_b_config,
+                "model_name": effective_model_name,
+                "is_default": p_data.get("is_default", False),
+                "vision_enabled": p_data.get("vision_enabled", False),
+                "video_enabled": p_data.get("video_enabled", False),
+                "image_token_cost": p_data.get("image_token_cost", 256),
+                "thinking_enabled": p_data.get("thinking_enabled", False),
+                "tool_calling_enabled": p_data.get("tool_calling_enabled", False),
+                "supported_reasoning_efforts": p_data.get("supported_reasoning_efforts") or ["low", "medium", "high"],
+                "default_reasoning_effort": p_data.get("default_reasoning_effort") or None,
+                "forced_context_size": p_data.get("forced_context_size"),
+                "routing_config": p_data.get("routing_config", {})
+            }
     return resolved_profiles
 
 def _get_configured_aliases(binding_type: str, config_map: Dict[str, str], category: str = "BINDINGS") -> List[str]:
@@ -774,6 +1043,12 @@ def get_client_from_env(
     from lollms_client import LollmsClient
 
     resolved_env: Dict[str, str] = {}
+    config_sources: List[Path] = []
+
+    # Track provenance of every file that contributes to the effective config.
+    # This is the anti-confusion mechanism: printing it makes it obvious that
+    # the wizard's `~/.lollms/config.yaml` is being overridden by a stray
+    # per-project file when the user reports "lollms-code uses the wrong model".
 
     # Prioritize the shared, machine-wide config file (respects $LOLLMS_CONFIG_FILE).
     home_yaml = _get_default_config_file()
@@ -781,17 +1056,38 @@ def get_client_from_env(
         try:
             yaml_data = load_yaml_file(home_yaml)
             resolved_env.update(_flatten_dict_to_env(yaml_data))
+            config_sources.append(home_yaml)
         except Exception as e:
             ASCIIColors.warning(f"Failed to parse global config at {home_yaml}: {e}")
 
-    # Then local .lollms_code/config.yaml
-    local_yaml = Path.cwd() / ".lollms_code" / "config.yaml"
+    # Local `.lollms_code/config.yaml` — PROJECT-LOCAL, authoritative by default.
+    #
+    # Running an app (lollms-code, lollms-bot in a workspace, …) from a
+    # directory that carries its own `.lollms_code/config.yaml` is a deliberate
+    # per-project choice. That file must therefore be the effective config for
+    # this process, so `/config`, the wizard's save, and the runtime all target
+    # the SAME file. `LOLLMS_PROJECT_CONFIG=0` disables this if a user wants to
+    # lock every workspace to the shared global file.
+    #
+    # Note on precedence: the project file is loaded *after* the global file so
+    # its keys naturally override via dict.update(). This is what makes
+    # project-scoped selections (LLM_ACTIVE_PROFILE, per-profile is_default,
+    # binding configs) win over the shared global values.
+    local_yaml = _get_project_config_file()
     if local_yaml.exists():
-        try:
-            yaml_data = load_yaml_file(local_yaml)
-            resolved_env.update(_flatten_dict_to_env(yaml_data))
-        except Exception as e:
-            ASCIIColors.warning(f"Failed to parse local config at {local_yaml}: {e}")
+        if _is_project_config_enabled():
+            try:
+                yaml_data = load_yaml_file(local_yaml)
+                resolved_env.update(_flatten_dict_to_env(yaml_data))
+                config_sources.append(local_yaml)
+            except Exception as e:
+                ASCIIColors.warning(f"Failed to parse project config at {local_yaml}: {e}")
+        else:
+            ASCIIColors.warning(
+                f"[config-resolver] Project-local config at '{local_yaml}' is "
+                f"present but explicitly disabled (LOLLMS_PROJECT_CONFIG=0). "
+                f"The shared global config is authoritative for this process."
+            )
 
     # Finally, the specified conf_file (if any)
     if conf_file:
@@ -801,8 +1097,15 @@ def get_client_from_env(
                 yaml_data = load_yaml_file(p)
                 data = _descend_into_entry(yaml_data, entry)
                 resolved_env.update(_flatten_dict_to_env(data))
+                config_sources.append(p)
             except Exception as e:
                 ASCIIColors.warning(f"Failed to parse configuration at {conf_file}: {e}")
+
+    if config_sources:
+        ASCIIColors.info(
+            f"[config-resolver] Effective configuration sources: "
+            f"{[str(p) for p in config_sources]}"
+        )
 
     # Apply conf_dict overrides
     if conf_dict:
@@ -811,6 +1114,13 @@ def get_client_from_env(
     # 📂 Pop the client-wide data folder out of the flat map so it does not
     # leak into modality resolution.
     lollms_data_folder = resolved_env.pop("LOLLMS_DATA_FOLDER", None)
+
+    # 🎯 Pop the authoritative active-LLM selection if present. This is the
+    # wizard's persisted "user clicked Set as default" marker
+    # (``llm.active_profile`` in YAML, flattened to ``LLM_ACTIVE_PROFILE``).
+    # It overrides every other heuristic — a stale ``is_default: true`` flag
+    # from a prior session cannot win against it.
+    llm_active_profile = (resolved_env.pop("LLM_ACTIVE_PROFILE", "") or "").strip().lower() or None
 
     if create_llm and not _is_modality_configured("llm", resolved_env):
         if run_wizard_if_fail:
@@ -850,7 +1160,14 @@ def get_client_from_env(
         prefix = b_type.upper()
 
         bindings = _extract_bindings_from_env(prefix, resolved_env)
-        profiles = _extract_profiles_from_env(prefix, bindings, resolved_env)
+        # The active-profile hint is LLM-specific (the wizard only records
+        # `llm.active_profile`). Non-LLM modalities keep the legacy heuristic.
+        profiles = _extract_profiles_from_env(
+            prefix,
+            bindings,
+            resolved_env,
+            active_profile_hint=(llm_active_profile if b_type == "llm" else None),
+        )
 
         if bindings:
             kwargs[f"{b_type}_binding_profiles"] = bindings
@@ -881,6 +1198,31 @@ def get_client_from_env(
 
             kwargs[f"{b_type}_binding_name"] = binding_name
             kwargs[f"{b_type}_binding_config"] = binding_config
+
+        # LLM-specific diagnostics: confirm what was actually resolved so the
+        # user can immediately compare `/config` (effective) with the wizard
+        # (on-disk global config).
+        if b_type == "llm":
+            resolved_alias: Optional[str] = None
+            if default_profile is not None:
+                for a, p in profiles.items():
+                    if p is default_profile:
+                        resolved_alias = a
+                        break
+            if resolved_alias:
+                ASCIIColors.info(
+                    f"[config-resolver] Resolved LLM profile: '{resolved_alias}' "
+                    f"-> binding='{binding_name}' model='{default_profile.get('model_name')}' "
+                    f"(requested active_profile='{llm_active_profile}')"
+                )
+            if llm_active_profile and resolved_alias != llm_active_profile:
+                ASCIIColors.error(
+                    f"[config-resolver] Requested LLM alias '{llm_active_profile}' "
+                    f"was NOT usable. Usable profiles: {list(profiles.keys())}. "
+                    f"See warnings above (likely a missing binding reference in "
+                    f"one of the source files). Falling back to "
+                    f"'{resolved_alias or binding_name}'."
+                )
 
     if lollms_data_folder:
         kwargs["lollms_data_folder"] = lollms_data_folder
@@ -2284,6 +2626,12 @@ def _enforce_single_default_profile(b_type: str, config_map: Dict[str, str]) -> 
     config_map.clear()
     config_map.update(new_map)
 
+    # 🎯 Persist the authoritative active-LLM alias alongside the profile's
+    # `IS_DEFAULT=true` flag. This disambiguates resolution on the client
+    # side when old `is_default: true` entries coexist with the new one.
+    if b_type == "llm":
+        config_map["LLM_ACTIVE_PROFILE"] = chosen_alias.lower()
+
 
 def _set_default_profile_action(b_type: str, alias: str, config_map: Dict[str, str]):
     profile_prefix = f"{b_type.upper()}_PROFILES_"
@@ -2299,6 +2647,13 @@ def _set_default_profile_action(b_type: str, alias: str, config_map: Dict[str, s
             config_map[found_key] = val
         else:
             config_map[target_key] = val
+
+    # 🎯 Record the authoritative active-LLM alias. Persisted in YAML as
+    # `llm.active_profile` by `_serialize_config_map_to_yaml`, and honoured
+    # by `get_client_from_env` as the ground-truth default on next launch.
+    if b_type == "llm":
+        config_map["LLM_ACTIVE_PROFILE"] = _sanitize_alias(alias)
+
     ASCIIColors.green(f"\n  ✓ Profile '{alias}' set as default for {b_type.upper()}.")
 
 
@@ -3464,31 +3819,75 @@ def _normalize_config_map_keys(config_map: Dict[str, str]) -> None:
 
 def _load_existing_env_to_map(cli_env_path: Optional[Union[str, Path]] = None) -> Dict[str, str]:
     config_map = {}
+    config_sources: List[Path] = []
 
-    # Prioritize the shared, machine-wide config file (respects $LOLLMS_CONFIG_FILE).
-    home_yaml = _get_default_config_file()
-    if home_yaml.exists():
+    # Walk the SAME precedence chain as `get_client_from_env`, so the wizard's
+    # in-memory view always mirrors what the runtime will mount.
+    #
+    # Precedence:
+    #   1. $LOLLMS_CONFIG_FILE
+    #   2. ~/.lollms/config.yaml (shared global)
+    #   3. ./.lollms_code/config.yaml (project-local) — opt-in
+    #   4. explicit cli_env_path
+    #
+    # Load order is *lowest priority first* so `dict.update()` naturally layers
+    # higher-priority sources on top (same semantic as get_client_from_env).
+
+    # Walk the SAME precedence chain as `get_client_from_env`, so the wizard's
+    # in-memory view always mirrors what the runtime will mount.
+    #
+    # Precedence:
+    #   1. $LOLLMS_CONFIG_FILE
+    #   2. ~/.lollms/config.yaml (shared global)
+    #   3. ./.lollms_code/config.yaml (project-local) — authoritative when present
+    #   4. explicit cli_env_path
+    #
+    # Load order is *lowest priority first* so `dict.update()` naturally layers
+    # higher-priority sources on top (same semantic as get_client_from_env).
+
+    global_yaml = _get_default_config_file()
+    if global_yaml.exists():
         try:
-            config_map.update(_flatten_dict_to_env(load_yaml_file(home_yaml)))
+            config_map.update(_flatten_dict_to_env(load_yaml_file(global_yaml)))
+            config_sources.append(global_yaml)
         except Exception as e:
-            ASCIIColors.warning(f"Failed to load existing config.yaml from {home_yaml}: {e}")
+            ASCIIColors.warning(f"Failed to load global config from {global_yaml}: {e}")
 
-    # Then local .lollms_code/config.yaml
-    local_yaml = Path.cwd() / ".lollms_code" / "config.yaml"
+    local_yaml = _get_project_config_file()
     if local_yaml.exists():
-        try:
-            config_map.update(_flatten_dict_to_env(load_yaml_file(local_yaml)))
-        except Exception as e:
-            ASCIIColors.warning(f"Failed to load local configuration from {local_yaml}: {e}")
+        if _is_project_config_enabled():
+            try:
+                config_map.update(_flatten_dict_to_env(load_yaml_file(local_yaml)))
+                config_sources.append(local_yaml)
+            except Exception as e:
+                ASCIIColors.warning(f"Failed to load project-local config from {local_yaml}: {e}")
+        else:
+            ASCIIColors.warning(
+                f"[config-resolver] Project-local config detected at "
+                f"'{local_yaml}' but LOLLMS_PROJECT_CONFIG=0 explicitly disables "
+                f"it. The shared global config will be used instead. Remove the "
+                f"opt-out (or set LOLLMS_PROJECT_CONFIG=1) to use the project file."
+            )
 
-    # Finally, the specified cli_env_path (if any)
     if cli_env_path:
         p = Path(cli_env_path).expanduser()
         if p.exists() and p.suffix in (".yaml", ".yml"):
             try:
                 config_map.update(_flatten_dict_to_env(load_yaml_file(p)))
+                config_sources.append(p)
             except Exception as e:
                 ASCIIColors.warning(f"Failed to load configuration from {p}: {e}")
+
+    if config_sources:
+        effective = _get_effective_config_file()
+        ASCIIColors.info(
+            f"[config-resolver] Loaded configuration from: "
+            f"{[str(p) for p in config_sources]}"
+        )
+        ASCIIColors.info(
+            f"[config-resolver] Effective config file (what the runtime uses): "
+            f"{effective}"
+        )
 
     _normalize_config_map_keys(config_map)
     return config_map
@@ -3499,31 +3898,30 @@ def _save_and_validate(
     cli_env_path: Optional[Union[str, Path]] = None,
 ) -> bool:
     _normalize_config_map_keys(config_map)
-    target_yaml_file = _get_default_config_file()
+
+    # 🎯 Pin the save target to the caller-supplied path when provided.
+    #
+    # Rationale: `lollms-code` (and any workspace host) opens the wizard with
+    # an explicit `cli_env_path` pointing at its *per-project* config. Saving
+    # to `_get_effective_config_file()` **as well** — which the previous
+    # implementation did when the two paths differed — is exactly what caused
+    # the "wizard saved one file, app reads another" divergence. We now write
+    # to ONE file. The pinned path wins; otherwise the effective file is used.
+    explicit_target = Path(cli_env_path).expanduser().resolve() if cli_env_path else None
+    target_yaml_file = explicit_target if explicit_target else _get_effective_config_file()
     target_yaml_file.parent.mkdir(parents=True, exist_ok=True)
 
     yaml_data = _serialize_config_map_to_yaml(config_map)
 
     try:
-        # 1. Write config.yaml to ~/.lollms_client/
         if yaml:
             with open(target_yaml_file, "w", encoding="utf-8") as f:
                 yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False)
 
-        # 2. If explicit custom path was specified outside default home directory, write there too
-        explicit_target = Path(cli_env_path).expanduser().resolve() if cli_env_path else None
-        if explicit_target and explicit_target != target_yaml_file:
-            explicit_target.parent.mkdir(parents=True, exist_ok=True)
-            if explicit_target.suffix in (".yaml", ".yml"):
-                if yaml:
-                    with open(explicit_target, "w", encoding="utf-8") as f:
-                        yaml.dump(yaml_data, f, default_flow_style=False, sort_keys=False)
-            else:
-                ASCIIColors.warning("⚠️ Non-YAML output format not supported. Skipping.")
-
-        primary_saved_path = explicit_target if explicit_target else target_yaml_file
+        source_note = "pinned target file" if explicit_target else "effective config file"
         ASCIIColors.panel(
-            f"Configuration synchronized and saved to: [bold green]{primary_saved_path}[/bold green]",
+            f"Configuration saved to ({source_note}):\n"
+            f"  [bold green]{target_yaml_file}[/bold green]",
             title="[bold]✅ Success[/bold]",
             border_style="green"
         )
@@ -3604,6 +4002,48 @@ def build_wizard_menu(
     )
     menu.set_intro(intro_desc)
 
+    # 🎯 Surface the config landscape up-front so a user can never again be
+    # surprised by "lollms-code uses model Y but the wizard shows model X".
+    # Every on-disk candidate is listed with an explicit marker showing which
+    # one is effective for the current process. The `cli_env_path` argument is
+    # authoritative — when pinned by the calling app (lollms-code's per-project
+    # config), that file is what the wizard will save and the runtime will read.
+    try:
+        info = describe_active_config(cli_env_path)
+        if info["pinned_cli_env_path"]:
+            ASCIIColors.info(f"\n📁 Pinned target file (this session): {info['pinned_cli_env_path']}")
+        ASCIIColors.info(f"📁 Effective config file: {info['effective_file']}")
+        for cand in info["candidates"]:
+            marker = "🟢 ACTIVE" if cand["active"] else "  present"
+            if not cand["exists"] and cand["active"]:
+                marker = "🟢 ACTIVE (to be created)"
+            elif not cand["exists"]:
+                marker = "  missing"
+            ASCIIColors.info(f"   {marker}  {cand['path']}")
+        if info["project_config_exists"] and not info["project_overlay_enabled"]:
+            ASCIIColors.warning(
+                "   ⚠️  A project-local config exists but LOLLMS_PROJECT_CONFIG=0 "
+                "is forcing the shared global config. Remove the opt-out (or set "
+                "LOLLMS_PROJECT_CONFIG=1) to use the project-local file."
+            )
+    except Exception:
+        # Never let diagnostic printing kill the menu — the wizard must remain
+        # usable even if the extra info can't be rendered.
+        pass
+
+    # 📁 First-class, ALWAYS-VISIBLE diagnostic menu entry — the file name is
+    # embedded in the row itself so the user sees it *at the point of decision*
+    # (not buried in earlier scrollback). Selecting it re-prints the full
+    # inventory without mutating state. Handled by callers via the
+    # `__SHOW_EFFECTIVE_CONFIG__` sentinel.
+    try:
+        _effective_compact = _compact_path(describe_active_config(cli_env_path)["effective_file"])
+    except Exception:
+        _effective_compact = "<unknown>"
+    menu.add_choice(
+        f"📁 Active config file: {_effective_compact}  (click for full details)",
+        value="__SHOW_EFFECTIVE_CONFIG__",
+    )
 
     # Sentinel-string entries (like __RENAME_ENTRY__/__DELETE_ENTRY__ elsewhere
     # in this module) are handled *after* menu.run() by the caller. This keeps
@@ -3677,11 +4117,30 @@ def run_wizard_and_save(cli_env_path: Optional[Union[str, Path]] = None):
     Runs the wizard as its own top-level menu. On exit, the configuration is
     saved to `cli_env_path` when provided, otherwise to ~/.lollms_client/config.yaml.
     """
-    target_desc = Path(cli_env_path).expanduser() if cli_env_path else _get_default_config_file()
+    # 🚀 Startup banner — always tells the user EXACTLY which file the wizard
+    # will load from and save to. A pinned `cli_env_path` (as `lollms-code`
+    # supplies) overrides the derived effective file everywhere, so the banner
+    # reflects the app's real config even when the global default is different.
+    _startup = describe_active_config(cli_env_path)
+    _banner_lines = [
+        "[bold]Lollms Client Configuration Wizard[/bold]",
+        "[dim]Configure your bindings and profiles.[/dim]",
+    ]
+    if _startup["pinned_cli_env_path"]:
+        _banner_lines.append(
+            f"[bold green]Pinned target file (this session): {_startup['pinned_cli_env_path']}[/bold green]"
+        )
+    _banner_lines.append(
+        f"[dim]Effective file: {_startup['effective_file']}"
+        f"{'' if _startup['effective_exists'] else '  (does not exist yet — created on save)'}[/dim]"
+    )
+    _banner_lines.append(
+        "[dim](the same file get_client_from_env will read from — no divergence)[/dim]"
+    )
     ASCIIColors.panel(
-        f"[bold]Lollms Client Configuration Wizard[/bold]\n[dim]Configure your bindings and profiles.[/dim]\n[dim]Target file: {target_desc}[/dim]",
+        "\n".join(_banner_lines),
         title="[bold magenta]🧙 Wizard[/bold magenta]",
-        border_style="magenta"
+        border_style="magenta",
     )
 
     config_map = _load_existing_env_to_map(cli_env_path)
@@ -3728,6 +4187,13 @@ def run_wizard_and_save(cli_env_path: Optional[Union[str, Path]] = None):
 
         if selection == "__IMPORT_CONFIG_FILE__":
             _import_config_from_file(config_map)
+            continue
+
+        if selection == "__SHOW_EFFECTIVE_CONFIG__":
+            # Read-only: prints the full inventory (pinned/effective path,
+            # candidate files, project-overlay state) then re-renders the
+            # top-level menu, inheriting the same loop-managed state.
+            _print_active_config_report(cli_env_path)
             continue
 
         if selection == "__CHANGE_CONFIG_FILE__":
