@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-09 11:51]
+
+- fix: host-app-single-default-assertions doc for modality granularity enforcement
+
 ## [2026-11-09 11:52]
 
 - fix: resolve artifact syncing issues and enhance tool execution environments
