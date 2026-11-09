@@ -520,6 +520,10 @@ Each binding's constructor signature defines its accepted `binding_config` keys 
 
 ## 7. Default Resolution & the Single-Default Invariant
 
+**Per-modality granularity:** the invariant is scoped **per modality** — exactly one default **model profile** and at most one default **binding profile** exist *within each* of the nine modalities (`llm`, `tti`, `tts`, `stt`, `ttv`, `ttm`, `connection`, `rag`, `tools`). Having one default per modality simultaneously (e.g. a default `llm` profile *and* a default `tti` profile) is **not** a violation — each modality owns its own single-default slot.
+
+**Per-modality granularity:** the invariant is scoped **per modality** — exactly one default **model profile** and at most one default **binding profile** exist *within each* of the nine modalities (`llm`, `tti`, `tts`, `stt`, `ttv`, `ttm`, `connection`, `rag`, `tools`). Having one default per modality simultaneously (e.g. a default `llm` profile *and* a default `tti` profile) is **not** a violation — each modality owns its own single-default slot.
+
 At startup, `_eagerly_instantiate_default` runs for every modality and enforces **exactly one default**:
 
 1. **Multiple defaults?** The *first* registered default wins; the rest are demoted (`is_default = False`) with a warning listing the choice.
@@ -537,6 +541,8 @@ At startup, `_eagerly_instantiate_default` runs for every modality and enforces 
 | Startup (`_eagerly_instantiate_default`) | Demotes multiples with a warning, auto-promotes a default when none exists |
 | Persistence (`lollms_config_api.set_default_profile`) | Exclusive setter — sets the chosen default and clears all others |
 | Auto-repair (`_save_single_default_profiles_to_disk`) | Writes the resolved single default back to YAML/env files so warnings never repeat |
+| **Host app (session init)** | **The host application MUST assert, for every modality it wires, that (a) at most one binding profile and (b) at most one model profile carry `is_default=True`, and (c) every `binding_profile_name` resolves. Fail fast with `ValueError` before constructing `LollmsClient`** |
+| **Host app (session init)** | **The host application MUST assert, for every modality it wires, that (a) at most one binding profile and (b) at most one model profile carry `is_default=True`, and (c) every `binding_profile_name` resolves. Fail fast with `ValueError` before constructing `LollmsClient`** |
 
 ---
 
