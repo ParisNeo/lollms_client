@@ -2200,18 +2200,19 @@ class PersonalityBundle:
         if tools_dir.exists():
             try:
                 from lollms_client.tools_bindings.lcp import LCPBinding
+                from lollms_client.tools_bindings.lcp.tool_layout import (
+                    iter_library_candidates,
+                )
                 tool_binding = LCPBinding(
                     tools_folders=[str(tools_dir)],
                     tool_files=[]
                 )
 
-                for item in tools_dir.iterdir():
-                    if item.is_file() and item.suffix == ".py":
-                        exported_tool_paths.append(str(item))
-                    elif item.is_dir():
-                        tool_file = item / "TOOL.py"
-                        if tool_file.exists():
-                            exported_tool_paths.append(str(tool_file))
+                # Record the FOLDER of each imported library (the loader resolves
+                # TOOLS.py / <folder>.py / first .py internally). This keeps the
+                # bundle round-trip safe when a toolset is renamed to TOOLS.py.
+                for _name, library_dir, _entry in iter_library_candidates(tools_dir):
+                    exported_tool_paths.append(str(library_dir))
             except Exception as e:
                 ASCIIColors.warning(f"[PersonalityBundle] Failed to load tools: {e}")
 
@@ -2900,6 +2901,14 @@ class LollmsPersonality:
         mm = hb.create_memory_manager()
 
         # Load Tools
+        #
+        # ``hb.tool_files`` now yields the toolset FOLDER for each library (per
+        # the TOOLS.py canonical standard); flat single-file tool libs are still
+        # returned as FILES. The same is true of ``extra_tools`` — callers may
+        # pass either a folder (preferred) or a single-file tool.
+        #
+        # The LCP resolver normalises both shapes internally, so we forward the
+        # entries unchanged and let it find ``TOOLS.py`` inside each folder.
         tool_binding = None
         all_tool_files = list(hb.tool_files)
         if extra_tools:
@@ -2916,8 +2925,9 @@ class LollmsPersonality:
                 if discovered_count == 0:
                     ASCIIColors.error(
                         f"[Handbag] Tool binding created but discovered 0 tools from {len(all_tool_files)} "
-                        f"file(s): {[f.name for f in all_tool_files]}. Check for syntax errors or missing "
-                        f"'tool_' function definitions in each file."
+                        f"toolset(s): {[f.name for f in all_tool_files]}. Each toolset folder must "
+                        f"contain TOOLS.py (or <folder>.py, or a first .py with tool_* functions). "
+                        f"Check for syntax errors or missing 'tool_' function definitions."
                     )
                 else:
                     ASCIIColors.success(
@@ -5214,7 +5224,9 @@ JSON:"""
         hb = Handbag(self.handbag_path)
         native_tool_files = hb.tool_files
         
-        # Filter existing extra tool files (in case some were deleted)
+        # Filter existing extra tool entries (in case some were deleted).
+        # ``_extra_tool_files`` may contain FOLDERS (preferred) or single-file
+        # tools; the resolver handles both shapes at load time.
         extra_tool_files = []
         for f in getattr(self, '_extra_tool_files', []):
             if f.exists():
@@ -5972,8 +5984,21 @@ JSON:"""
 
         if tool_files:
             try:
+                # ``tool_files`` may contain FILES or toolset FOLDERS. Normalise
+                # to entry-point paths so the loader picks up TOOLS.py when a
+                # folder was passed (canonical standard).
+                from lollms_client.tools_bindings.lcp.tool_layout import (
+                    resolve_library,
+                )
+                entry_paths: List[Union[str, Path]] = []
+                for candidate in tool_files:
+                    resolved = resolve_library(Path(candidate))
+                    if resolved is not None:
+                        entry_paths.append(resolved[1])
+                    else:
+                        entry_paths.append(candidate)
                 tools_mgr = _ToolsManager()
-                file_tools = tools_mgr.build_inline_tools_dict(tool_files)
+                file_tools = tools_mgr.build_inline_tools_dict(entry_paths)
                 active_tools.update(file_tools)
             except Exception:
                 pass

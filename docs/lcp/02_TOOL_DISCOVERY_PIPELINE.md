@@ -14,8 +14,8 @@
 default_tools/  (folder on disk)
       │
       ▼
-_iter_library_files()            yields default_tools/<name>/<name>.py
-      │                          (+ legacy flat default_tools/<name>.py)
+_iter_library_files()            yields default_tools/<name>/TOOLS.py   ← canonical
+      │                          (legacy: <name>/<name>.py, flat <name>.py)
       ▼
 _load_tool_file()                _lazy_import_tools_file() → persistent module
       │                          → module.init_tools_library(host_config)
@@ -49,9 +49,22 @@ LLM-visible tool specs           consumed by personality _discover_tools()
 
 ### 2.1 Enumeration — `_iter_library_files(...)`
 
-Yields candidate library files using the dir+primary pattern
-(`default_tools/<name>/<name>.py`) plus legacy flat files. No import, no
-gate — pure enumeration. See [01_LCP_BINDING_CORE.md](./01_LCP_BINDING_CORE.md) §5.
+Yields candidate library **entry points** by delegating to the canonical
+resolver `lcp.tool_layout.iter_library_candidates(folder)`. For each folder
+under a tools folder, the resolver picks the entry file by this precedence:
+
+1. `<folder>/TOOLS.py` — **canonical** (folder-per-tool, mirrors the skills
+   layout: `SKILL.md` in a folder named after the skill).
+2. `<folder>/<folder>.py` — legacy **backward compatible** entry point.
+3. First non-`__init__` `*.py` file, sorted — last-resort fallback.
+
+Flat `<folder>.py` libraries (files sitting directly in a tools folder) are
+also yielded as single-file libraries. `assets/`, `references/`, `__pycache__/`
+and hidden folders are skipped. Sibling `.py` files inside a library folder
+(imported by `TOOLS.py`) are mounted as additional sources via
+`iter_sibling_modules(...)`. No import, no gate — pure enumeration. See
+[01_LCP_BINDING_CORE.md](./01_LCP_BINDING_CORE.md) §5 and
+[10_TOOLSET_AUTHORING_GUIDE.md](./10_TOOLSET_AUTHORING_GUIDE.md) §1.
 
 ### 2.2 Loading — `_load_tool_file(...)`
 
@@ -262,6 +275,10 @@ Every LCP library uses exactly one of two seams to describe its tools:
 
 - Discovery is a **funnel**: enumerate → load → gate → extract → register →
   mount. Each stage has its own failure mode and its own diagnostic.
+- Enumeration is folder-driven: each tool library is a folder; its entry
+  point is picked by `tool_layout.resolve_library_entry` in this order:
+  `TOOLS.py` (canonical) → `<folder>.py` (legacy) → first non-`__init__` `.py`.
+  Sibling helpers are picked up by `tool_layout.iter_sibling_modules`.
 - There are exactly **two discovery seams**: AST-parsed `tool_*` docstring
   libraries (Seam A) and `get_tools()` hand-authored spec libraries (Seam B).
 - `_parse_tool_via_ast` considers only **top-level `tool_*`** functions;

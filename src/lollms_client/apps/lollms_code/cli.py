@@ -4584,6 +4584,8 @@ def main():
 
     personality = create_coding_personality(config, client)
     if getattr(config, "attach_files", None) or getattr(config, "attach_texts", None):
+        from cli_attachments import materialize_attachments
+
         _n_att = materialize_attachments(
             workspace=config.workspace_path,
             attach_files=config.attach_files,

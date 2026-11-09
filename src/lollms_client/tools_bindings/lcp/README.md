@@ -174,7 +174,23 @@ Alternatively, you can mount specific default tool libraries on demand using `mo
 ---
 ## 🛠️ How to Write an LCP Tool
 
-To create a tool, simply write a Python file and place it inside your LCP tools directory (e.g., `src/lollms_client/tools_bindings/lcp/default_tools/`).
+To create a tool, write a Python module inside a **folder named after your
+toolset**, and name the entry file `TOOLS.py`:
+
+```text
+<tools_folder>/
+└── my_toolset/
+    ├── TOOLS.py          # entry point — define tool_* functions here
+    ├── helper.py         # (optional) imported by TOOLS.py
+    ├── README.md         # (optional)
+    ├── LICENSE.md        # (optional)
+    └── assets/           # (optional) icon.png + other resources
+        └── icon.png
+```
+
+The canonical entry point is `TOOLS.py`. For backward compatibility the loader
+also resolves `<folder>/<folder>.py` and any flat `<folder>.py` file — see
+"File Organization" below.
 
 ### Example 1: Multi-Tool Library (Recommended)
 Group related functions in one file. LCP will register **both** `tool_calculate_bmi` and `tool_calculate_tdee` as separate tools.
@@ -397,23 +413,60 @@ client = LollmsClient(
 
 ## 📂 File Organization
 
-### Flat Structure (Legacy/Simple)
-```text
-default_tools/
-├── weather.py          # Exposes: tool_get_weather
-├── calculator.py       # Exposes: tool_add, tool_subtract
-```
+### Canonical Library Structure (Recommended)
 
-### Library Structure (Recommended)
+Each toolset is a **folder named after the toolset**, with `TOOLS.py` as the
+entry point. This mirrors the skills folder layout (`<skill>/SKILL.md`).
+
 ```text
 default_tools/
 ├── semantic_data_engineer/
-│   └── semantic_data_engineer.py  # Exposes: tool_get_schema, tool_filter, tool_plot, etc.
+│   ├── TOOLS.py                    # ENTRY POINT — exposes tool_get_schema, tool_filter, ...
+│   ├── helper_module.py            # optional — imported by TOOLS.py
+│   ├── README.md                   # optional
+│   ├── LICENSE.md                  # optional
+│   ├── description.yaml            # metadata + load flag (recommended)
+│   └── assets/
+│       ├── icon.png                # optional
+│       └── sample.png              # optional — other assets
 ├── matter_controller/
-│   └── matter_controller.py       # Exposes: tool_discover, tool_commission, tool_control
-├── debug_toolset/
-│   └── debug_toolset.py           # Exposes: tool_dump_context (Opt-in via debug=True)
+│   └── TOOLS.py                    # exposes tool_discover, tool_commission, tool_control
+└── debug_toolset/
+    └── TOOLS.py                    # exposes tool_dump_context (opt-in via debug=True)
 ```
+
+**Entry-point resolution (centralized in `lcp/tool_layout.py`)** — first match
+wins, so legacy toolsets keep working unchanged:
+
+1. `<folder>/TOOLS.py` — **canonical**.
+2. `<folder>/<folder>.py` — legacy backward-compatible primary file.
+3. First non-`__init__` `*.py` in the folder, sorted — last-resort fallback.
+
+Sibling `.py` files are mounted **in addition** to the entry point, so
+multi-file libraries work everywhere the entry point is (mount, discovery,
+`find_library_for_tool`).
+
+### Legacy Structures (Still Supported)
+
+Flat single-file libraries:
+
+```text
+default_tools/
+├── weather.py          # exposes tool_get_weather
+└── calculator.py       # exposes tool_add, tool_subtract
+```
+
+Old per-folder primary-file libraries (pre-`TOOLS.py`):
+
+```text
+default_tools/
+└── semantic_data_engineer/
+    └── semantic_data_engineer.py   # legacy — eligible for rename to TOOLS.py
+```
+
+> **Migrating**: rename `<folder>/<folder>.py` → `<folder>/TOOLS.py`. No code
+> change is required — the resolver prefers `TOOLS.py` and falls back to the
+> legacy name, so migration is safe and incremental.
 
 ---
 

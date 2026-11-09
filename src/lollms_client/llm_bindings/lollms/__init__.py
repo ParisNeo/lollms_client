@@ -1245,18 +1245,40 @@ class LollmsBinding(LollmsLLMBinding):
                     chat_completion = self.client.chat.completions.create(**params)
                 except openai.InternalServerError as ex:
                     # 5xx: server-side fault (bad chat template, model OOM,
-                    # broken prompt rendering). Do NOT re-send the identical
+                    # broken prompt rendering, or a semantically-empty agentic
+                    # loop on the backend). Do NOT re-send the identical
                     # payload — surface the server body so the operator can
-                    # read the real traceback from the backend log.
+                    # read the real traceback from the backend log. Return a
+                    # structured error dict (never raise) so the
+                    # ``Union[str, dict]`` contract of this method is honored
+                    # on every path.
                     trace_exception(ex)
+                    server_body = getattr(ex, "body", None)
                     ASCIIColors.error(
                         f"[LollmsBinding] Server returned 500 Internal "
                         f"Server Error. This is a backend fault, not a client "
                         f"payload error. Check the inference server logs "
                         f"(model load failure, OOM, or chat template issues). "
-                        f"Server body: {getattr(ex, 'body', None)}"
+                        f"Server body: {server_body}"
                     )
-                    raise
+                    hint = self._classify_backend_error_body(server_body)
+                    message = (
+                        "[LollmsBinding] Backend returned 500 Internal Server "
+                        "Error. This is a server-side fault. "
+                        f"Server body: {server_body}"
+                    )
+                    if hint:
+                        message = f"{message}\n\n{hint}"
+                    if streaming_callback:
+                        emit_callback_safe(
+                            streaming_callback, message,
+                            MSG_TYPE.MSG_TYPE_EXCEPTION, {},
+                        )
+                    return {
+                        "status": "error",
+                        "message": message,
+                        "server_body": server_body,
+                    }
 
                 if stream:
                     handler = _StreamThinkingHandler(streaming_callback, suppress_thinking=is_thinking_deactivated)
@@ -1414,11 +1436,29 @@ class LollmsBinding(LollmsLLMBinding):
                     completion = self.client.completions.create(**params)
                 except openai.InternalServerError as ex:
                     trace_exception(ex)
+                    server_body = getattr(ex, "body", None)
                     ASCIIColors.error(
                         f"[LollmsBinding] Server returned 500 on /completions. "
-                        f"Backend fault. Server body: {getattr(ex, 'body', None)}"
+                        f"Backend fault. Server body: {server_body}"
                     )
-                    raise
+                    hint = self._classify_backend_error_body(server_body)
+                    message = (
+                        "[LollmsBinding] Backend returned 500 on "
+                        "/completions. This is a server-side fault. "
+                        f"Server body: {server_body}"
+                    )
+                    if hint:
+                        message = f"{message}\n\n{hint}"
+                    if streaming_callback:
+                        emit_callback_safe(
+                            streaming_callback, message,
+                            MSG_TYPE.MSG_TYPE_EXCEPTION, {},
+                        )
+                    return {
+                        "status": "error",
+                        "message": message,
+                        "server_body": server_body,
+                    }
 
                 if stream:
                     for resp in completion:
@@ -1946,6 +1986,59 @@ class LollmsBinding(LollmsLLMBinding):
             return {"status": "error", "message": err_msg, "server_body": getattr(e, "body", None)}
 
         return output
+
+    def _classify_backend_error_body(self, server_body: Any) -> Optional[str]:
+        """
+        Translate a backend 500 body into an actionable remediation hint.
+
+        The LoLLMS server (and other OpenAI-compatible proxies that chain a
+        native agentic loop) returns 500 with a ``detail`` string when the
+        tool loop terminates without content, reasoning, or ``tool_calls``.
+        This is a *configuration* failure, not a transient fault — surface
+        the exact fix so operators stop chasing a phantom server crash.
+
+        Returns ``None`` when the body does not match a known pattern.
+        """
+        if not server_body:
+            return None
+        text = str(server_body)
+        lowered = text.lower()
+
+        if (
+            "empty final answer" in lowered
+            or "tool loop completed" in lowered
+        ):
+            return (
+                "Diagnosis: the backend's internal tool loop terminated with "
+                "an EMPTY final answer (no content, no reasoning, and no "
+                "tool_calls on the last round). This is a backend/model-side "
+                "capability issue, not a client payload error. Fixes:\n"
+                "  • Enable think=True on this call so reasoning-only outputs "
+                "are surfaced instead of suppressed.\n"
+                "  • Ensure the server is launched with tool-calling enabled "
+                "for the selected model (vLLM: `--enable-auto-tool-choice "
+                "--tool-call-parser <family>`; llama.cpp/Ollama: a chat "
+                "template that exposes the tools array).\n"
+                "  • If the model family does not support native tool "
+                "calling, use a tool-capable model or disable the backend's "
+                "agentic loop for this request."
+            )
+
+        if "model not found" in lowered or "no such model" in lowered:
+            return (
+                "Diagnosis: the requested model is not loaded on the backend. "
+                "Verify `model_name` in your binding profile or load the model "
+                "via the server's management endpoint."
+            )
+
+        if "out of memory" in lowered or "cuda oom" in lowered or "oom" in lowered:
+            return (
+                "Diagnosis: the backend ran out of GPU/CPU memory while "
+                "serving the request. Reduce context size, lower batch size, "
+                "or switch to a smaller/quantized model."
+            )
+
+        return None
 
     def _synthesize_tool_xml_if_needed(
         self,
@@ -2636,8 +2729,22 @@ class LollmsBinding(LollmsLLMBinding):
 
                     if output.strip():
                         return output, tool_results
-                    # Empty: no further escalation options for the streaming
-                    # path (the tool-aware guard above already bailed).
+                    # Empty: emit an accurate diagnostic per whether tools
+                    # were requested on this round (see the non-streaming
+                    # twin just below for the reasoning).
+                    if sanitized_tools:
+                        return "", None
+                    return {
+                        "status": "error",
+                        "message": (
+                            "[OpenAIBinding] The model returned an EMPTY "
+                            "answer for a plain chat turn (no tools were "
+                            "requested). Most common cause: a reasoning-"
+                            "only model running with think=False. Retry "
+                            "with think=True, or raise n_predict if the "
+                            "response was truncated mid-reasoning."
+                        ),
+                    }, None
 
             else:
                 message_obj = completion.choices[0].message
@@ -2697,8 +2804,36 @@ class LollmsBinding(LollmsLLMBinding):
                 # answer. Re-issuing the identical payload cannot make
                 # the model suddenly emit tool_calls; the diagnostic is
                 # surfaced by _run_tool_loop. Bail now.
-                if sanitized_tools and not native_tool_calls and not output.strip():
-                    return "", None
+                if not native_tool_calls and not output.strip():
+                    # Two disambiguation paths:
+                    #   (a) tools WERE requested → the model did not emit
+                    #       tool_calls; the tool loop's diagnostic covers it.
+                    #       Return an empty string so the outer diagnostic is
+                    #       the accurate one.
+                    #   (b) tools were NOT requested → the model returned
+                    #       nothing at all for a plain chat turn. Surface a
+                    #       structured error dict NOW so the caller receives
+                    #       an actionable "empty model response" message
+                    #       instead of the misleading "tool loop completed
+                    #       with an EMPTY final answer" diagnostic. See
+                    #       _run_tool_loop for the reasoning-only / think=False
+                    #       remediation hint.
+                    if sanitized_tools:
+                        return "", None
+                    return {
+                        "status": "error",
+                        "message": (
+                            "[OpenAIBinding] The model returned an EMPTY "
+                            "answer (no visible content, no reasoning, and "
+                            "no tool_calls) for a plain chat turn. No tools "
+                            "were requested on this call. Most common "
+                            "cause: a reasoning-only model running with "
+                            "think=False (DeepSeek V4.1/R1, QwQ, o-series "
+                            "emit only reasoning_content for some prompts). "
+                            "Retry with think=True, or raise n_predict if "
+                            "the response was truncated mid-reasoning."
+                        ),
+                    }, None
 
                 if native_tool_calls:
                     accumulated_any = True

@@ -16,6 +16,14 @@ from builtins import compile as _native_compile
 from lollms_client.lollms_tools_binding import LollmsToolBinding
 from ascii_colors import ASCIIColors, trace_exception
 
+from .tool_layout import (
+    TOOLS_ENTRYPOINT,
+    iter_library_candidates,
+    iter_sibling_modules,
+    resolve_library,
+    resolve_library_entry,
+)
+
 BindingName = "LCPBinding"
 
 # ── OFFICE-FAMILY LIBRARY GATE (fail-closed) ──
@@ -291,7 +299,7 @@ sub-attributes must be feature-checked for None.
             tools = []
             for node in _iter_functions_ordered(tree):
                 if node.name.startswith("tool_"):
-                    tool_def = self._extract_single_tool_schema(node, py_file_path.stem)
+                    tool_def = self._extract_single_tool_schema(node, py_file_path)
                     if tool_def:
                         tools.append(tool_def)
 
@@ -387,7 +395,7 @@ sub-attributes must be feature-checked for None.
 
         return tools if tools else None
 
-    def _extract_single_tool_schema(self, func_node: ast.FunctionDef, file_stem: str) -> Optional[Dict[str, Any]]:
+    def _extract_single_tool_schema(self, func_node: ast.FunctionDef, py_file_path) -> Optional[Dict[str, Any]]:
         tool_name = func_node.name
         docstring = ast.get_docstring(func_node) or ""
         description = docstring.strip().split("\n\n")[0].strip() if docstring else "No description provided."
@@ -453,6 +461,10 @@ sub-attributes must be feature-checked for None.
                     if "optional" not in p_type_raw and "default" not in p_type_raw:
                         required.append(p_name)
 
+        # Record the ACTUAL source file. Earlier versions reconstructed
+        # ``default_tools/<stem>/<stem>.py`` here, which breaks the canonical
+        # ``TOOLS.py`` layout and custom tool folders. Passing the real entry
+        # path lets the standard apply uniformly (folder-driven, not name-driven).
         return {
             "name": tool_name,
             "description": description,
@@ -461,7 +473,8 @@ sub-attributes must be feature-checked for None.
                 "properties": properties,
                 "required": required
             },
-            "_python_file_path": str(Path(__file__).parent / "default_tools" / file_stem / f"{file_stem}.py")
+            "_python_file_path": str(Path(py_file_path).resolve()) if py_file_path else None,
+            "_library_name": Path(py_file_path).parent.name if py_file_path else None,
         }
 
     def _library_load_flag(self, py_file: Path) -> Optional[str]:
@@ -624,17 +637,10 @@ sub-attributes must be feature-checked for None.
         for folder in search_dirs:
             if not folder.exists() or not folder.is_dir():
                 continue
-            for item in folder.iterdir():
-                if item.is_dir():
-                    primary = item / f"{item.name}.py"
-                    if primary.exists():
-                        yield item.name, primary
-                    else:
-                        for fallback in item.glob("*.py"):
-                            if fallback.stem != "__init__":
-                                yield item.name, fallback
-                elif item.suffix == ".py" and item.stem != "__init__":
-                    yield item.stem, item
+            # The canonical resolver applies TOOLS.py > <folder>.py > first .py
+            # and yields both folder libraries and flat .py libraries uniformly.
+            for name, _lib_dir, entry in iter_library_candidates(folder):
+                yield name, entry
 
     def _resolve_library_name(self, raw: str) -> Optional[str]:
         """Resolves a user/LLM-provided toolkit name to a library stem,
@@ -766,6 +772,9 @@ sub-attributes must be feature-checked for None.
         for t in self.discovered_tools:
             if t.get("name") == clean_name and t.get("_python_file_path"):
                 p = Path(t["_python_file_path"])
+                library_name = t.get("_library_name")
+                if library_name:
+                    return library_name
                 return p.parent.name if p.parent.name not in ("default_tools", "tools") else p.stem
 
         # 3. Check AST function names inside all library files across all tools folders
@@ -777,18 +786,13 @@ sub-attributes must be feature-checked for None.
         for folder in search_dirs:
             if not folder.exists() or not folder.is_dir():
                 continue
-            for item in folder.iterdir():
-                py_files = []
-                if item.is_dir():
-                    py_files = [f for f in item.glob("*.py") if f.stem != "__init__"]
-                elif item.suffix == ".py" and item.stem != "__init__":
-                    py_files = [item]
-
-                for py_f in py_files:
+            for lib_name, lib_dir, entry in iter_library_candidates(folder):
+                candidates_to_scan = [entry] + list(iter_sibling_modules(lib_dir, entry))
+                for py_f in candidates_to_scan:
                     try:
                         extracted = self._extract_tool_names_from_file(py_f)
                         if clean_name in extracted and self._is_library_permitted(py_f):
-                            return item.name if item.is_dir() else py_f.stem
+                            return lib_name
                     except Exception:
                         pass
         return None
@@ -827,24 +831,14 @@ sub-attributes must be feature-checked for None.
         if not lib_path or not lib_path.exists() or not lib_path.is_dir():
             return False
 
-        expected_tool_names: set = set()
-        for item in lib_path.iterdir():
-            py_file = None
-            sibling_py_files: List[Path] = []
-            if item.is_dir():
-                py_file = item / f"{item.name}.py"
-                if not py_file.exists():
-                    sub_py_files = [f for f in item.iterdir() if f.is_file() and f.suffix == ".py" and f.stem != "__init__"]
-                    for fallback_py in sub_py_files:
-                        expected_tool_names.update(self._extract_tool_names_from_file(fallback_py))
-                    continue
-            elif item.suffix == ".py" and item.stem != "__init__":
-                py_file = item
+        entry = resolve_library_entry(lib_path)
+        if entry is None:
+            return False
 
-            if py_file and py_file.exists():
-                expected_tool_names.update(self._extract_tool_names_from_file(py_file))
-            for sibling_py in sibling_py_files:
-                expected_tool_names.update(self._extract_tool_names_from_file(sibling_py))
+        expected_tool_names: set = set()
+        expected_tool_names.update(self._extract_tool_names_from_file(entry))
+        for sibling in iter_sibling_modules(lib_path, entry):
+            expected_tool_names.update(self._extract_tool_names_from_file(sibling))
 
         if not expected_tool_names:
             return False
@@ -862,15 +856,14 @@ sub-attributes must be feature-checked for None.
     def mount_tool_library(self, library_name: str) -> bool:
         resolved_name = self._resolve_library_name(library_name)
         _gate_dir = self._find_library_dir(resolved_name or library_name)
-        if _gate_dir and _gate_dir.is_dir():
-            _gate_py = _gate_dir / f"{_gate_dir.name}.py"
-            if _gate_py.exists() and not self._is_library_admitted(_gate_py):
-                ASCIIColors.warning(
-                    f"[LCP Mount] Library '{library_name}' is gated and its "
-                    "session flag/file-type trigger is not satisfied. "
-                    "Mount refused (fail-closed)."
-                )
-                return False
+        _gate_entry = resolve_library_entry(_gate_dir) if _gate_dir and _gate_dir.is_dir() else None
+        if _gate_entry and not self._is_library_admitted(_gate_entry):
+            ASCIIColors.warning(
+                f"[LCP Mount] Library '{library_name}' is gated and its "
+                "session flag/file-type trigger is not satisfied. "
+                "Mount refused (fail-closed)."
+            )
+            return False
         if resolved_name and resolved_name != library_name.strip():
             ASCIIColors.info(f"[LCP Mount] Resolving toolkit '{library_name}' -> '{resolved_name}'.")
         lib_path = self._find_library_dir(resolved_name or library_name)
@@ -878,8 +871,8 @@ sub-attributes must be feature-checked for None.
             ASCIIColors.warning(f"[LCP Mount] Library '{library_name}' not found in search paths.")
             return False
 
-        primary_py = lib_path / f"{lib_path.name}.py"
-        if primary_py.exists() and not self._is_library_permitted(primary_py):
+        primary_py = resolve_library_entry(lib_path)
+        if primary_py and not self._is_library_permitted(primary_py):
             flag_name = self._library_load_flag(primary_py)
             ASCIIColors.warning(
                 f"[LCP Mount] Library '{library_name}' is gated by "
@@ -893,20 +886,10 @@ sub-attributes must be feature-checked for None.
             return True
 
         expected_tool_names: set = set()
-        for item in lib_path.iterdir():
-            py_file = None
-            if item.is_dir():
-                py_file = item / f"{item.name}.py"
-                if not py_file.exists():
-                    sub_py_files = [f for f in item.iterdir() if f.is_file() and f.suffix == ".py" and f.stem != "__init__"]
-                    for fallback_py in sub_py_files:
-                        expected_tool_names.update(self._extract_tool_names_from_file(fallback_py))
-                    continue
-            elif item.suffix == ".py" and item.stem != "__init__":
-                py_file = item
-
-            if py_file and py_file.exists():
-                expected_tool_names.update(self._extract_tool_names_from_file(py_file))
+        if primary_py:
+            expected_tool_names.update(self._extract_tool_names_from_file(primary_py))
+        for sibling in iter_sibling_modules(lib_path, primary_py):
+            expected_tool_names.update(self._extract_tool_names_from_file(sibling))
 
         if not expected_tool_names:
             ASCIIColors.warning(f"[LCP Mount] ⚠️ Library '{library_name}' contains no tool definitions.")
@@ -926,19 +909,10 @@ sub-attributes must be feature-checked for None.
 
         initial_tool_count = len(self.discovered_tools)
 
-        for item in lib_path.iterdir():
-            py_file = None
-            sibling_py_files: List[Path] = []
-            if item.is_dir():
-                py_file = item / f"{item.name}.py"
-                sibling_py_files = [f for f in item.iterdir() if f.is_file() and f.suffix == ".py" and f.stem != "__init__" and f != py_file]
-            elif item.suffix == ".py" and item.stem != "__init__":
-                py_file = item
-
-            if py_file and py_file.exists():
-                self._load_tool_file(py_file)
-            for sibling_py in sibling_py_files:
-                self._load_tool_file(sibling_py)
+        if primary_py:
+            self._load_tool_file(primary_py)
+        for sibling in iter_sibling_modules(lib_path, primary_py):
+            self._load_tool_file(sibling)
 
         new_tool_count = len(self.discovered_tools) - initial_tool_count
 
@@ -970,24 +944,25 @@ sub-attributes must be feature-checked for None.
         for folder in self.tools_folders:
             if not folder or not folder.is_dir():
                 continue
+            for _name, lib_dir, entry in iter_library_candidates(folder):
+                self._load_tool_file(entry)
+                for sibling in iter_sibling_modules(lib_dir, entry):
+                    self._load_tool_file(sibling)
 
-            for item in folder.iterdir():
-                py_file = None
-                sibling_py_files: List[Path] = []
-                if item.is_dir():
-                    py_file = item / f"{item.name}.py"
-                    sibling_py_files = [f for f in item.iterdir() if f.is_file() and f.suffix == ".py" and f.stem != "__init__" and f != py_file]
-                elif item.suffix == ".py" and item.stem != "__init__":
-                    py_file = item
-
-                if py_file and py_file.exists():
-                    self._load_tool_file(py_file)
-                for sibling_py in sibling_py_files:
-                    self._load_tool_file(sibling_py)
-
-        for py_file in self.tool_files:
-            if py_file and py_file.exists() and py_file.suffix == ".py":
-                self._load_tool_file(py_file)
+        # ``tool_files`` may contain FILES (flat single-file libs) or FOLDERS
+        # (library directories). The resolver normalises both shapes, so
+        # callers may safely pass the toolset FOLDER and let the loader find
+        # ``TOOLS.py`` inside it.
+        for candidate in self.tool_files:
+            if not candidate or not candidate.exists():
+                continue
+            resolved = resolve_library(candidate)
+            if resolved is None:
+                continue
+            lib_dir, entry = resolved
+            self._load_tool_file(entry)
+            for sibling in iter_sibling_modules(lib_dir, entry):
+                self._load_tool_file(sibling)
 
     # ── Sandbox gating helpers (per category, per discussion) ──
 

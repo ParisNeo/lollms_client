@@ -88,7 +88,7 @@ hb = Handbag("./my_agent_handbag")
 | `docs_dir` | `Path` | Path to `docs/`. |
 | `workspace_dir` | `Path` | Path to `workspace/`. |
 | `manifest` | `Dict[str, Any]` | Parsed `handbag.yaml` (safe load; `{}` on error). |
-| `tool_files` | `List[Path]` | Discovered `*.py` tool files. |
+| `tool_files` | `List[Path]` | Discovered toolset **folders** (canonical `TOOLS.py` standard). Flat single-file libraries are returned as `.py` files for backward compatibility. Both shapes are handled by `lcp.tool_layout.resolve_library`. |
 | `skills_dirs` | `List[Path]` | Registered skill libraries. |
 | `rag_files` | `List[Path]` | Discovered RAG source files. |
 | `extra_knowledge_bases` | `List[Path]` | Plain-path knowledge bases from `handbag.yaml`. |
@@ -114,8 +114,12 @@ my_agent_handbag/
 ├── SOUL.md
 ├── coworkers/
 ├── tools/
-│   └── my_tools/
-│       └── search.py
+│   └── my_toolset/           # folder-per-toolset (canonical)
+│       ├── TOOLS.py          # entry point
+│       ├── helper.py         # optional
+│       ├── README.md         # optional
+│       ├── LICENSE.md        # optional
+│       └── assets/icon.png   # optional
 ├── skills/
 │   └── SKILL.md
 ├── assets/
@@ -129,7 +133,7 @@ my_agent_handbag/
 
 | Directory | Discovery rule |
 | :--- | :--- |
-| `tools/` | Only `*.py` files whose stem is not `__init__`. Recurses **one level** into immediate subdirectories (`item.glob("*.py")`). |
+| `tools/` | Returns the **toolset folder** for each library (canonical `TOOLS.py` standard). The entry point (`TOOLS.py` → `<folder>.py` → first `.py`, resolved by `lcp.tool_layout.resolve_library_entry`) is picked at load time by `LCPBinding`. Flat single-file `.py` libraries sitting directly in `tools/` are returned as files (legacy compat). Sub-folders named `assets/`, `references/`, `__pycache__/` and hidden folders are skipped. |
 | `rag/` | Recursive `rglob("*")`, **files only**, skipping names that start with `.`. |
 | `skills/` | The canonical skills directory. Additional libraries can be appended via `register_skills_dir()`. |
 | `assets/` | Loaded into `assets: Dict[str, str]`. |
@@ -170,13 +174,18 @@ for sub in ("tools", "rag", "assets", "skills", "docs", "workspace", "memory"):
     encoding="utf-8",
 )
 
-# ── 4. Drop a tool ───────────────────────────────────────────────────────────
-(root / "tools" / "my_tool.py").write_text(
+# ── 4. Drop a toolset (canonical TOOLS.py layout) ────────────────────────────
+toolset_dir = root / "tools" / "my_toolset"
+toolset_dir.mkdir(parents=True, exist_ok=True)
+(toolset_dir / "TOOLS.py").write_text(
     "def tool_echo(text: str) -> dict:\n"
     "    '''Echoes the input text back.'''\n"
     "    return {'success': True, 'output': text}\n",
     encoding="utf-8",
 )
+# Optional siblings (README.md, LICENSE.md, assets/icon.png, helper .py files)
+(toolset_dir / "assets").mkdir(exist_ok=True)
+(toolset_dir / "README.md").write_text("# my_toolset\n", encoding="utf-8")
 
 # ── 5. Drop a RAG source ─────────────────────────────────────────────────────
 (root / "rag" / "notes.md").write_text(
@@ -200,7 +209,7 @@ hb = Handbag(root)
 
 print("path:            ", hb.path)
 print("soul_path:       ", hb.soul_path)
-print("tool_files:      ", [p.name for p in hb.tool_files])
+print("tool_files:      ", [p.name for p in hb.tool_files])   # -> ['my_toolset'] (folder)
 print("rag_files:       ", [p.name for p in hb.rag_files])
 print("skills_dirs:     ", [p.name for p in hb.skills_dirs])
 print("manifest:        ", hb.manifest)
@@ -215,7 +224,7 @@ Expected output (abridged):
 ```
 path:             /abs/path/my_agent_handbag
 soul_path:        /abs/path/my_agent_handbag/SOUL.md
-tool_files:       ['my_tool.py']
+tool_files:       ['my_tool.py'] # the folder, not a file
 rag_files:        ['notes.md']
 skills_dirs:      ['skills']
 manifest:         {'extra_knowledge_bases': ['./shared/company_handbook.md', './shared/archive.db']}
@@ -241,7 +250,7 @@ The wiring is:
 
 | Handbag resource | Personality component |
 | :--- | :--- |
-| `hb.tool_files` | The personality's tool binding (each `*.py` file is parsed for `tool_*` functions). |
+| `hb.tool_files` | The personality's tool binding. Each entry is a **toolset folder** (canonical `TOOLS.py` standard). The binding resolves `TOOLS.py` → `<folder>.py` → first `.py` via `lcp.tool_layout.resolve_library`, so renaming to `TOOLS.py` is transparent. |
 | `hb.rag_files` + `hb.extra_safe_stores` | The RAG source(s). |
 | `hb.skills_dirs` | The `SkillsManager`. |
 | `hb.docs_dir` | The `DocNavigator`. |
@@ -393,7 +402,9 @@ Both lists are then consumed by the personality's RAG layer: plain paths become 
 - **`workspace/` is the sandbox CWD.** When the personality runs Python execution tools, the current working directory is set to the Handbag's `workspace/` directory. Tools should resolve files with relative paths.
 - **`register_skills_dir()` is idempotent.** Calling it repeatedly with the same path is safe. It creates the directory if missing.
 - **The manifest is loaded safely.** If `handbag.yaml` is malformed, `manifest` is `{}` — the Handbag still loads, but `extra_knowledge_bases` will be empty.
-- **`tool_files` recurses one level.** Only immediate subdirectories of `tools/` are scanned (`item.glob("*.py")`). Deeper nesting is not discovered.
+- **`tool_files` returns folders, not files.** Each entry corresponds to a toolset **folder** under `tools/` (canonical `TOOLS.py` standard), except flat single-file `.py` libraries which are returned as files for backward compatibility. The entry point inside the folder is chosen by `lcp.tool_layout.resolve_library_entry` — `TOOLS.py` first, then `<folder>.py`, then any non-`__init__` `.py`.
+- **Prefer `TOOLS.py`.** New toolsets should ship `TOOLS.py` as the entry point. Legacy `<folder>.py` and flat `.py` layouts are still supported, so migration is optional and can be done incrementally.
+- **Extra tools handed to `from_handbag` are folders too.** Pass the toolset **folder** path (not the individual `.py` file), e.g. `extra_tools=[Path("./my_toolset")]`. Passing a single-file `.py` still works.
 - **`rag_files` recurses fully.** `rglob("*")` walks the entire `rag/` tree.
 
 ---

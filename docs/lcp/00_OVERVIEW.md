@@ -14,15 +14,25 @@ in-process tool execution framework of `lollms_client`. It lives at:
 ```
 src/lollms_client/tools_bindings/lcp/
 ├── __init__.py          ← the LCPBinding class (the binding core)
+├── tool_layout.py       ← canonical entry-point resolver (TOOLS.py > <folder>.py > first .py)
 ├── description.yaml     ← binding metadata
 ├── README.md            ← tool-creation guidelines
 └── default_tools/       ← the tool libraries (one folder per library)
-    ├── word_tools/word_tools.py
-    ├── excel_tools/excel_tools.py
-    ├── powerpoint_tools/powerpoint_tools.py
-    ├── document_editor/document_editor.py
-    └── ... (~25 libraries)
+    ├── word_tools/TOOLS.py                 # canonical entry point
+    ├── excel_tools/TOOLS.py
+    ├── powerpoint_tools/TOOLS.py
+    ├── document_editor/TOOLS.py
+    ├── websearch/TOOLS.py
+    └── ... (~30 libraries)
+
 ```
+**Layout standard (mirrors the skills folder layout).** Each tool library is
+a **folder named after the toolset** with `TOOLS.py` as the entry point, plus
+optional siblings (`README.md`, `LICENSE.md`, `assets/`, additional `.py`
+helpers). The legacy `<folder>/<folder>.py` layout is still resolved by the
+binding for backward compatibility — see
+[10_TOOLSET_AUTHORING_GUIDE.md](./10_TOOLSET_AUTHORING_GUIDE.md) §1 and the
+central resolver `tool_layout.py`.
 
 Its role: let an LLM **discover** tools (so it knows what exists and how to call
 them), **emit tool calls**, and have those calls **executed locally in the same
@@ -262,12 +272,14 @@ feature-checked (`if env.discussion is not None:`). Any tool that branches on
 - The LCP is the **in-process** tool binding; MCP is the remote/external one.
   Both implement the same `LollmsToolBinding` contract
   (`discover_tools` / `list_tools` / `execute_tool`).
-- Tool libraries live under `default_tools/<name>/<name>.py` (directory +
-  primary-file pattern); legacy flat `default_tools/<name>.py` files are also
-  supported by `_iter_library_files`.
-- There are exactly **two discovery seams**: AST parsing of top-level `tool_*`
-  functions, and hand-authored `get_tools()` spec dicts. See
-  [02_TOOL_DISCOVERY_PIPELINE.md](./02_TOOL_DISCOVERY_PIPELINE.md).
+- Tool libraries live under `default_tools/<name>/TOOLS.py` (canonical,
+  folder-per-tool, mirroring the skills folder layout). Legacy
+  `default_tools/<name>/<name>.py` and flat `default_tools/<name>.py` are
+  still resolved for backward compatibility. All entry-point resolution is
+  centralized in `lcp/tool_layout.py` (`resolve_library_entry` /
+  `resolve_library` / `iter_library_candidates` / `iter_sibling_modules`).
+  See [02_TOOL_DISCOVERY_PIPELINE.md](./02_TOOL_DISCOVERY_PIPELINE.md) and
+  [10_TOOLSET_AUTHORING_GUIDE.md](./10_TOOLSET_AUTHORING_GUIDE.md) §1.
 - Library admission is **fail-closed**: no matching capability flag ⇒ library
   is not loaded. See [03_SESSION_FLAGS_GATING.md](./03_SESSION_FLAGS_GATING.md).
 - `execute_tool` always returns a normalized dict; `success=False` surfaces the

@@ -234,17 +234,34 @@ class Handbag:
             return {}
 
     def _load_tools(self) -> List[Path]:
+        """Returns one entry per tool library shipped in ``<handbag>/tools/``.
+
+        The layout mirrors the skills standard: **the entry stored here is the
+        toolset FOLDER** (which the LCP loader resolves to ``TOOLS.py``,
+        ``<folder>.py``, or the first ``.py``). This lets individual tool files
+        be renamed to ``TOOLS.py`` without breaking handbags.
+
+        Flat ``.py`` files sitting directly under ``<handbag>/tools/`` remain
+        supported for backward compatibility: the FILE path is returned, and
+        the resolver treats it as a single-file library.
+        """
         if not self.tools_dir.exists():
             return []
-        files = []
+        entries: List[Path] = []
         for item in sorted(self.tools_dir.iterdir()):
             if item.is_file() and item.suffix == ".py" and item.stem != "__init__":
-                files.append(item.resolve())
+                # Legacy flat single-file tool library.
+                entries.append(item.resolve())
             elif item.is_dir():
-                for py_file in sorted(item.glob("*.py")):
-                    if py_file.stem != "__init__":
-                        files.append(py_file.resolve())
-        return files
+                # Skip asset / metadata folders that are not libraries.
+                if item.name in ("assets", "references", "__pycache__") or item.name.startswith("."):
+                    continue
+                # Only emit the folder if it contains at least one .py — the
+                # LCP resolver will fail-closed otherwise, so we avoid
+                # cluttering the list with empty folders.
+                if any(f.suffix == ".py" and f.stem != "__init__" for f in item.iterdir() if f.is_file()):
+                    entries.append(item.resolve())
+        return entries
 
     def _load_rag_files(self) -> List[Path]:
         if not self.rag_dir.exists():

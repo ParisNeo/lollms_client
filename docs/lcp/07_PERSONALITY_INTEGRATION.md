@@ -282,3 +282,8 @@ native sources, so `agent.has_data`, `agent.query_data(...)`, and
   personality — one spec shape serves discovery and execution.
 - The personality holds `lollms_client`; execution flows chat mixin →
   personality/client seam → `LCPBinding.execute_tool` → library callable.
+- **Toolset entry points are folder-resolved.** `hb.tool_files` yields the
+  toolset **folder** for each library (canonical `TOOLS.py` standard); a
+  flat `.py` entry is still returned as a file for backward compatibility.
+  Both shapes are normalized by `tool_layout.resolve_library(...)` — the
+  loader never needs a hardcoded `<folder>/<folder>.py` path.

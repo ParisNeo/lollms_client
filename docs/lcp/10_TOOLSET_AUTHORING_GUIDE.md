@@ -1,10 +1,12 @@
 # 10 — LCP Toolset Authoring Guide (Reference)
 
 > **Purpose**: The hands-on reference for **building** LCP toolsets — the
-> `default_tools/<name>/<name>.py` libraries the LCP binding discovers, gates,
-> mounts, and executes. While documents 01–09 explain how the LCP *works*,
-> this document teaches how to **author a library that works with it**.
-> Audience: library authors (human or LLM). Prerequisites: skim
+> `default_tools/<name>/TOOLS.py` libraries the LCP binding discovers, gates,
+> mounts, and executes. The layout **mirrors the skills layout**: one folder
+> per toolset, named after the toolset, whose canonical entry point is
+> `TOOLS.py`. While documents 01–09 explain how the LCP *works*, this
+> document teaches how to **author a library that works with it**. Audience:
+> library authors (human or LLM). Prerequisites: skim
 > [00_OVERVIEW.md](./00_OVERVIEW.md); consult
 > [09_STUDY_GUIDE.md](./09_STUDY_GUIDE.md) §(e) for the condensed tutorial.
 
@@ -13,25 +15,56 @@
 ## 1. What an LCP toolset is
 
 An LCP toolset (library) is a **plain Python module** that the LCP binding
-imports in-process. It has no server, no network, no framework — just:
+imports in-process. It has no server, no network, no framework — just a folder
+whose entry point is `TOOLS.py`:
 
 ```
 src/lollms_client/tools_bindings/lcp/default_tools/
-└── my_library/
-    ├── my_library.py        ← the library module (REQUIRED, name must match folder)
-    └── description.yaml     ← metadata + load-flag declaration (RECOMMENDED)
+└── my_toolset/                    ← folder name = toolset name
+    ├── TOOLS.py                   ← ENTRY POINT (REQUIRED, canonical)
+    ├── helper_module.py           ← optional — imported by TOOLS.py
+    ├── README.md                  ← optional
+    ├── LICENSE.md                 ← optional
+    ├── description.yaml           ← metadata + load-flag declaration (RECOMMENDED)
+    └── assets/                    ← optional — icon.png + other assets
+        ├── icon.png
+        ├── diagram.svg
+        └── sample.wav
 ```
 
-**Layout law** (enforced by `_iter_library_files`):
+The layout **mirrors the skills folder layout**:
+
+| Skill layout | Tool layout |
+|---|---|
+| `<skill_name>/SKILL.md` (entry point) | `<toolset_name>/TOOLS.py` (entry point) |
+| `<skill_name>/references/file.md` | `<toolset_name>/helper_module.py` (importable helpers) |
+| `<skill_name>/README.md` | `<toolset_name>/README.md` |
+| `<skill_name>/LICENSE.md` | `<toolset_name>/LICENSE.md` |
+| `<skill_name>/assets/icon.png` | `<toolset_name>/assets/icon.png` |
+
+**Layout law** (enforced by `lcp/tool_layout.py`):
 
 | Layout | Status |
 |---|---|
-| `default_tools/<name>/<name>.py` | ✅ Canonical (dir + primary file) |
-| `default_tools/<name>.py` | ⚠️ Legacy flat (supported, not preferred) |
+| `default_tools/<name>/TOOLS.py` | ✅ **Canonical** (folder-per-tool, mirrors skills) |
+| `default_tools/<name>/<name>.py` | ⚠️ **Legacy** (backward compatible, pre-`TOOLS.py`) |
+| `default_tools/<name>.py` | ⚠️ **Legacy flat** (backward compatible, single-file libs) |
 
-Sibling `.py` files inside the library folder are also scanned (as fallbacks
-when the primary file is missing, and as siblings during mounts), but the
-canonical pattern is **one folder, one primary file named after the folder**.
+**Entry-point resolution order** (first match wins, see
+`lcp.tool_layout.resolve_library_entry`):
+
+1. `<folder>/TOOLS.py` — **canonical**.
+2. `<folder>/<folder>.py` — legacy backward-compatible entry point.
+3. First non-`__init__` `*.py` inside the folder, sorted — last-resort fallback.
+
+Sibling `.py` files (imported helpers) inside the library folder are mounted
+in addition to the entry point via `iter_sibling_modules(...)` — so a
+multi-file library is supported everywhere the entry point is (mount,
+`is_library_mounted`, `find_library_for_tool`, `_discover_local_tools`).
+
+> **Migration path**: renaming `my_toolset/my_toolset.py` → `my_toolset/TOOLS.py`
+> is safe and immediate — the resolver picks `TOOLS.py` first. Legacy
+> `<folder>.py` files keep working unchanged, so migration can be incremental.
 
 **The philosophy** (from the binding's own docstring):
 
@@ -785,7 +818,12 @@ description would mislead (e.g. tool behavior depends on workspace state).
 
 ## 9. Worked example — a complete minimal library
 
-`default_tools/weather_exporter/weather_exporter.py`:
+`default_tools/weather_exporter/TOOLS.py`:
+
+> *Note*: the example below still uses the file name `TOOLS.py` — the
+> canonical standard. If you are migrating an existing library, keep the code
+> intact and simply rename the file from `<folder>.py` to `TOOLS.py`; the
+> resolver picks it up automatically.
 
 ```python
 """Weather data exporter: fetches nothing, formats workspace CSV data.
@@ -922,7 +960,9 @@ exception.
 ## 12. Authoring checklist (print this)
 
 ```
-□  default_tools/<name>/<name>.py — folder + primary file, names match
+□  default_tools/<name>/TOOLS.py — folder-per-tool, entry point named TOOLS.py
+     (legacy <name>.py also accepted, but TOOLS.py is the canonical standard)
+□  Optional siblings: helper_module.py, README.md, LICENSE.md, assets/icon.png
 □  description.yaml with metadata + load_flag
 □  Exactly ONE discovery seam chosen:
      □  Seam A: top-level tool_* functions + Google-style docstrings, OR
@@ -957,9 +997,19 @@ exception.
 
 ## 13. Key invariants
 
-- A toolset is a plain Python module at
-  `default_tools/<name>/<name>.py` (+ `description.yaml`); tools are agnostic
-  scripts operating on workspace files.
+- A toolset is a plain Python module at `default_tools/<name>/TOOLS.py` (plus
+  optional `description.yaml`, sibling `.py` helpers, `README.md`,
+  `LICENSE.md`, and `assets/`). This mirrors the skills folder layout
+  (`<skill>/SKILL.md`). Legacy `<folder>/<folder>.py` remains supported for
+  backward compatibility. Tools are agnostic scripts operating on workspace
+  files.
+- Entry-point resolution is centralized in `lcp/tool_layout.py`
+  (`resolve_library_entry` → `TOOLS.py` > `<folder>.py` > first `.py`;
+  `resolve_library` normalises file OR folder; `iter_library_candidates`
+  enumerates; `iter_sibling_modules` yields helper modules).
+- A handbag's `tools/` entry is the **toolset folder**, not an individual
+  `.py` file — this lets you rename `<folder>.py` → `TOOLS.py` without
+  breaking any handbag or personality wiring.
 - Exactly **one** discovery seam per library: AST `tool_*` docstring functions
   (Seam A) or `get_tools()` spec dicts (Seam B) — never both, never neither.
 - Seam-B specs: `name` MUST match the callable; `output` MUST match actual

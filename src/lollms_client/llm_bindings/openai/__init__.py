@@ -2433,17 +2433,55 @@ class OpenAIBinding(LollmsLLMBinding):
         # unable to distinguish "endpoint returned nothing" from "loop
         # exited cleanly". Surface a diagnostic error so the root cause is
         # visible instead of swallowed by the example's final print.
+        #
+        # The diagnostic is TOOL-AWARE: when the caller never supplied a
+        # tools array (plain chat through the managed loop), the misleading
+        # "tool loop" message would send operators chasing server-side
+        # --tool-call-parser flags that are irrelevant. Emit an honest
+        # "empty model response" hint instead, including the most common
+        # root cause for reasoning-heavy families (DeepSeek V4.1, QwQ,
+        # o-series): a reasoning-only completion that was suppressed by
+        # think=False.
         if isinstance(last_output, str) and not last_output.strip():
+            if tools:
+                return {
+                    "status": "error",
+                    "message": (
+                        "[OpenAIBinding] Tool loop completed with an EMPTY final "
+                        "answer (no content, no reasoning, and no native "
+                        "tool_calls were emitted). Two likely causes:\n"
+                        "  1. The server does not emit OpenAI-format "
+                        "`tool_calls`. For vLLM, launch with "
+                        "`--enable-auto-tool-choice --tool-call-parser <family>` "
+                        "(e.g. `deepseek_v3`, `hermes`, `internlm`, `mistral`, "
+                        "`llama3_json`); for llama.cpp / Ollama use a chat "
+                        "template that exposes the tools array to the model. "
+                        "Check the server log for the actual tool-parsing "
+                        "messages.\n"
+                        "  2. The model never emits visible content (reasoning-"
+                        "only responses under think=False); try think=True."
+                    ),
+                }
             return {
                 "status": "error",
                 "message": (
-                    "[OpenAIBinding] Tool loop completed with an EMPTY final "
-                    "answer (no content, no reasoning, and no tool calls on "
-                    "the last round). Likely cause: this endpoint does not "
-                    "support tool-aware continuation for the selected model, "
-                    "or the model emitted reasoning-only output that was "
-                    "suppressed because think=False. Enable think=True on "
-                    "the binding or switch to a tool-capable model."
+                    "[OpenAIBinding] The model returned an EMPTY answer — no "
+                    "visible content arrived from the endpoint across the "
+                    "non-streaming request and its streaming fallback. This "
+                    "is not a tool-calling failure: no tools were requested "
+                    "on this call.\n"
+                    "Most common causes:\n"
+                    "  1. Reasoning-only model under think=False. DeepSeek "
+                    "V4.1/R1, QwQ, o-series, and similar families can emit "
+                    "only `reasoning_content` for certain prompts; the "
+                    "binding strips it because thinking is deactivated. "
+                    "Retry with `think=True` (or an explicit reasoning_effort) "
+                    "so the reasoning is surfaced instead of discarded.\n"
+                    "  2. The prompt was truncated below the model's reasoning "
+                    "budget — raise n_predict.\n"
+                    "  3. vLLM's chat template produced an empty assistant turn "
+                    "for this request shape — check the server log for "
+                    "template warnings."
                 ),
             }
         return last_output
