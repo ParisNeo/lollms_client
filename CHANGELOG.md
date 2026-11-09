@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-09 04:34]
+
+- `Fix Lollms client version update to v1.22.0`
+
 ## [2026-11-09 04:33]
 
 - docs: update LCP documentation and fix tool binding imports
