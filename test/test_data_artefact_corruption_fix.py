@@ -44,8 +44,12 @@ class MockClient:
 
 class TestDataArtefactCorruptionFix(unittest.TestCase):
     """
-    Validates that updating a DATA artifact (e.g., SQLite .db) does not corrupt
-    the physical binary file by overwriting it with the .lam logical schema text.
+    Validates that updating an as-is FILE artifact (e.g., SQLite .db, .csv) does not
+    corrupt the physical bytes on disk by overwriting them with the .lam schema text.
+
+    NOTE: The ``ArtefactType.DATA`` type was removed. Data files are now regular
+    ``ArtefactType.FILE`` artefacts whose physical bytes travel via ``physical_data``
+    and whose descriptor lives in ``logical_content`` (mirrored in ``content``).
     """
 
     def setUp(self):
@@ -78,18 +82,18 @@ class TestDataArtefactCorruptionFix(unittest.TestCase):
 
     def test_update_preserves_sqlite_binary_integrity(self):
         """
-        Scenario: A SQLite database is imported as a DATA artifact. The LLM updates
-        the artifact's logical content (.lam schema).
+        Scenario: A SQLite database is imported as an as-is FILE artifact. The LLM
+        updates the artifact's logical content (.lam schema).
         Expected: The physical .db file on disk must remain a valid SQLite database.
                   It must NOT be overwritten with the .lam schema text.
         """
         title = "test_db.db"
         lam_content = "# SQLite Database: test_db.db\n## Table: users\nColumns: id (INTEGER), name (TEXT)"
 
-        # 1. Add the data artifact with physical bytes
+        # 1. Add the as-is FILE artifact with physical bytes
         self.discussion.artefacts.add(
             title=title,
-            artefact_type=ArtefactType.DATA,
+            artefact_type=ArtefactType.FILE,
             content=lam_content,
             logical_content=lam_content,
             physical_data=self.db_bytes,
@@ -135,20 +139,20 @@ class TestDataArtefactCorruptionFix(unittest.TestCase):
 
     def test_update_without_logical_content_preserves_sqlite_binary(self):
         """
-        Scenario: A SQLite database is imported as a DATA artifact. The user edits
-        the artifact's metadata via the UI Raw Editor, which calls update() with
-        new_content = edited schema text but does NOT pass logical_content.
-        Expected: The is_raw_data_update heuristic must NOT treat the string
-                  new_content as raw binary data for .db files. The physical .db
-                  file on disk must remain a valid SQLite database.
+        Scenario: A SQLite database is imported as an as-is FILE artifact. The user
+        edits the artifact's metadata via the UI Raw Editor, which calls update()
+        with new_content = edited schema text but does NOT pass logical_content.
+        Expected: The binary-guard heuristic in update() must NOT treat the string
+                  new_content as the new physical payload for .db files. The
+                  physical .db file on disk must remain a valid SQLite database.
         """
         title = "test_db_no_lam.db"
         lam_content = "# SQLite Database: test_db_no_lam.db\n## Table: users\nColumns: id (INTEGER), name (TEXT)"
 
-        # 1. Add the data artifact with physical bytes
+        # 1. Add the as-is FILE artifact with physical bytes
         self.discussion.artefacts.add(
             title=title,
-            artefact_type=ArtefactType.DATA,
+            artefact_type=ArtefactType.FILE,
             content=lam_content,
             logical_content=lam_content,
             physical_data=self.db_bytes,
@@ -166,8 +170,8 @@ class TestDataArtefactCorruptionFix(unittest.TestCase):
         # 2. Update the artifact's content WITHOUT passing logical_content.
         #    This simulates the UI Raw Editor path (POST /api/artifacts/{title}/update)
         #    which passes new_content=payload.content but no logical_content parameter.
-        #    The is_raw_data_update heuristic must detect _is_binary_db and refuse
-        #    to encode the schema text as physical bytes.
+        #    update() must detect the binary extension and preserve/rehydrate the
+        #    physical bytes rather than encode the schema text as a payload.
         updated_lam = "# SQLite Database: test_db_no_lam.db\n## Table: users\nColumns: id (INTEGER), name (TEXT), email (TEXT)"
         self.discussion.artefacts.update(
             title=title,
@@ -217,7 +221,7 @@ class TestDataArtefactCorruptionFix(unittest.TestCase):
             title=title,
             content=lam_content,
             version=1,
-            atype=ArtefactType.DATA,
+            atype=ArtefactType.FILE,
             file_ext=".db",
             physical_data=None,
             logical_content=lam_content
@@ -235,7 +239,8 @@ class TestDataArtefactCorruptionFix(unittest.TestCase):
 
     def test_update_preserves_csv_physical_bytes(self):
         """
-        Scenario: A CSV file is imported as a DATA artifact. The LLM updates the schema.
+        Scenario: A CSV file is imported as an as-is FILE artifact. The LLM updates
+        the schema.
         Expected: The physical .csv file on disk must contain the original CSV rows,
                   not the .lam schema text.
         """
@@ -243,10 +248,10 @@ class TestDataArtefactCorruptionFix(unittest.TestCase):
         csv_bytes = b"id,name\n1,Alice\n2,Bob\n"
         lam_content = "# CSV Schema: data.csv\nColumns: id (int), name (str)"
 
-        # 1. Add the data artifact
+        # 1. Add the as-is FILE artifact
         self.discussion.artefacts.add(
             title=title,
-            artefact_type=ArtefactType.DATA,
+            artefact_type=ArtefactType.FILE,
             content=lam_content,
             logical_content=lam_content,
             physical_data=csv_bytes,
@@ -279,8 +284,8 @@ class TestDataArtefactCorruptionFix(unittest.TestCase):
 
 class TestUpdatePhantomRevertFix(unittest.TestCase):
     """
-    Validates that ArtefactManager.update() does not create a phantom version 
-    with old content after updating with new content (simulates the FastAPI 
+    Validates that ArtefactManager.update() does not create a phantom version
+    with old content after updating with new content (simulates the FastAPI
     update_manual_artefact endpoint behavior).
     """
 
@@ -304,7 +309,7 @@ class TestUpdatePhantomRevertFix(unittest.TestCase):
 
     def test_update_does_not_create_phantom_version(self):
         """
-        Scenario: An artifact is added (v1), then updated with new content using 
+        Scenario: An artifact is added (v1), then updated with new content using
                   bump_version=False and active=True (mimicking the router call).
         Expected: Only 1 version exists in the database, containing the NEW content.
                   The physical file on disk also contains the NEW content.
@@ -337,7 +342,7 @@ class TestUpdatePhantomRevertFix(unittest.TestCase):
 
         # 3. Assert NO phantom version was created
         history_after = self.discussion.artefacts.get_version_history(title)
-        self.assertEqual(len(history_after), 1, 
+        self.assertEqual(len(history_after), 1,
                          "Phantom version created! update() should not add a new version when bump_version=False.")
 
         # 4. Assert the DB content is the NEW content
@@ -350,7 +355,7 @@ class TestUpdatePhantomRevertFix(unittest.TestCase):
         ws_data_dir = Path(self.discussion.workspace_data_path)
         file_path = ws_data_dir / title
         self.assertTrue(file_path.exists(), "Physical file should exist after update.")
-        
+
         disk_content = file_path.read_text(encoding="utf-8")
         self.assertEqual(disk_content, updated_content,
                          "Physical file on disk should contain the updated content, not the original.")

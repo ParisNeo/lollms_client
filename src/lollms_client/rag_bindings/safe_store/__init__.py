@@ -268,6 +268,7 @@ class SafeStoreRAGBinding(LollmsRAGBinding):
         self,
         query: str,
         top_k: int = 5,
+        reconstruct_overlapping_chunks: bool = True,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """
@@ -293,7 +294,7 @@ class SafeStoreRAGBinding(LollmsRAGBinding):
             ``sources=[]`` — never raises.
         """
         try:
-            hits = self.query(query_text=query, top_k=top_k, **kwargs)
+            hits = self.query(query_text=query, top_k=top_k, reconstruct_overlapping_chunks=reconstruct_overlapping_chunks, **kwargs)
             try:
                 _preview = ""
                 if hits:

@@ -881,7 +881,8 @@ class CoreMixin:
                         ".sh", ".bash", ".bat", ".ps1"):
             return "code"
         if file_ext in (".csv", ".tsv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"):
-            return "data"
+            # Data files are ordinary FILE artefacts (no dedicated DATA type).
+            return "file"
         if file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
             return "image"
         return "document"
@@ -1019,7 +1020,9 @@ class CoreMixin:
                         report["updated_artefacts"] += 1
             else:
                 # ── BINARY / NON-TEXT FILE: as-is metadata entry, no content read ──
-                type_desc = "Binary/Structured Data" if atype == "data" else "As-Is / Non-Text"
+                # Data files (.csv/.db/.xlsx/...) are ordinary FILE artefacts; the
+                # physical bytes stay on disk in their native format.
+                type_desc = "As-Is / Non-Text"
                 content_placeholder = (
                     f"### File: `{rel_str}`\n\n"
                     f"- **Type**: {file_ext.upper().lstrip('.') if file_ext else 'Unknown'} ({type_desc})\n"

@@ -122,10 +122,10 @@ class TestLollmsArtifactTools(unittest.TestCase):
             workspace_path=tmp_workspace
         )
 
-        # Create a read-only artifact
+        # Create a read-only FILE artifact (data files are now as-is FILE artefacts)
         art = isolated_disc.artefacts.add(
             title="sales_data",
-            artefact_type="data",
+            artefact_type=ArtefactType.FILE,
             content="data schema description",
             file_ext=".xlsx",
             read_only=True
@@ -172,7 +172,7 @@ class TestLollmsArtifactTools(unittest.TestCase):
 
         art = self.discussion.artefacts.add(
             title="user_salaries",
-            artefact_type="data",
+            artefact_type=ArtefactType.FILE,
             content="Mock schema",
             file_ext=".csv",
             version=1,
@@ -246,7 +246,7 @@ class TestLollmsArtifactTools(unittest.TestCase):
         # 4. Register as active session artifact with physical_data
         art = self.discussion.artefacts.add(
             title="my_external_db",
-            artefact_type="data",
+            artefact_type=ArtefactType.FILE,
             content=schema,
             file_ext=".sqlconn",
             version=1,
@@ -313,7 +313,7 @@ class TestLollmsArtifactTools(unittest.TestCase):
         # 2. Register data artifact in active discussion with physical_data
         art = self.discussion.artefacts.add(
             title="user_salaries",
-            artefact_type="data",
+            artefact_type=ArtefactType.FILE,
             content="Mock schema",
             file_ext=".csv",
             version=1,

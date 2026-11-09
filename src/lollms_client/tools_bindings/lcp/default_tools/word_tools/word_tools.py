@@ -17,10 +17,12 @@ Doctrine (read this before writing any recipe):
 - Review: list_comments(doc) / list_highlights(doc) expose existing review
   state to recipes; tool_word_review reads it without a recipe.
 """
+import os
 import re
 import textwrap
 import traceback
 import zipfile
+import shutil
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -77,6 +79,36 @@ OFFICE_GUARD_GUIDANCE = (
     "content: prefer building fresh documents over round-tripping desktop-authored "
     "files, and validate any OXML element you construct."
 )
+
+# Guaranteed OPC parts, in the order Word's own strict validator walks them.
+# (Kept per-extension so future formats can extend the table safely.)
+OOXML_MANDATORY_PARTS = (
+    "[Content_Types].xml",
+    "_rels/.rels",
+    "word/document.xml",
+    "word/_rels/document.xml.rels",
+)
+
+# Parts whose absence in a RE-SAVED document is the specific failure mode the
+# guard message calls out ("python-docx re-saves dropping parts desktop Word
+# requires"). These are presence-conditional: they must survive a round-trip
+# IF they were present in the pre-save snapshot. We don't require them for a
+# fresh document.
+OOXML_ROUNDTRIP_PARTS = (
+    "word/styles.xml",
+    "word/stylesWithEffects.xml",
+    "word/numbering.xml",
+    "word/settings.xml",
+    "word/fontTable.xml",
+    "word/theme/theme1.xml",
+    "word/comments.xml",
+    "word/commentsExtended.xml",
+    "word/footnotes.xml",
+    "word/endnotes.xml",
+)
+
+# XML namespaces we care about when running OXML post-save sanity checks.
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
 _DOCX_SUFFIXES = (".docx", ".docm")
 
@@ -478,83 +510,298 @@ def _reopen_office_file(path: Path, suffix: str) -> Tuple[bool, str]:
         return False, f"re-open failed: {reopen_err}"
 
 
-def _validate_office_file(path) -> Tuple[bool, str]:
-    """Three-layer Office OOXML integrity validation. Never raises."""
-    office_path = Path(path)
+def _snapshot_archive_parts(path: Optional[Path]) -> Optional[frozenset]:
+    """Returns the frozen set of archive member names in a .docx/.docm, or None.
+
+    Used to detect parts python-docx dropped during a round-trip save. Never
+    raises — a corrupt snapshot simply disables the round-trip check.
+    """
+    if not path:
+        return None
     try:
-        if not office_path.is_file():
-            return False, "file does not exist"
-        suffix = office_path.suffix.lower()
-        validator = OOXML_VALIDATORS.get(suffix, {})
-        required_parts = validator.get("required_parts", ("[Content_Types].xml",))
+        p = Path(path)
+        if not p.is_file():
+            return None
+        with zipfile.ZipFile(p) as z:
+            return frozenset(z.namelist())
+    except Exception:
+        return None
+
+
+def _check_preserved_parts(before: Optional[frozenset], after: frozenset) -> Optional[str]:
+    """Returns the first mandatory round-trip part present-before but missing-after.
+
+    Only parts that were actually present in the original are checked — a
+    binding intentionally adding comments.xml to a doc that never had one
+    must NOT trip this guard. Conversely, a part python-docx silently dropped
+    (the classic desktop-authored styles.xml/numbering.xml loss) is surfaced
+    by name so the user learns the real cause.
+    """
+    if not before:
+        return None
+    for part in OOXML_ROUNDTRIP_PARTS:
+        if part in before and part not in after:
+            return part
+    return None
+
+
+def _check_sectpr_and_comment_ranges(document_xml_bytes: bytes) -> Optional[str]:
+    """Post-parse OXML sanity check on the saved word/document.xml.
+
+    Catches the two most common foot-guns in LLM-authored OXML:
+      * duplicate ``w:sectPr`` siblings under ``w:body`` (Word refuses to open);
+      * unbalanced ``w:commentRangeStart`` / ``w:commentRangeEnd`` markers
+        (a comment stamped but the range never closed — Word surfaces as a
+        "broken comments part").
+    Returns an error string, or None when the OXML looks structurally sound.
+    """
+    try:
+        root = ET.fromstring(document_xml_bytes)
+    except ET.ParseError as parse_err:
+        return f"malformed document.xml: {parse_err}"
+    body_ns = f"{{{_W_NS}}}body"
+    sectpr_qname = f"{{{_W_NS}}}sectPr"
+    start_qname = f"{{{_W_NS}}}commentRangeStart"
+    end_qname = f"{{{_W_NS}}}commentRangeEnd"
+    id_attr = f"{{{_W_NS}}}id"
+
+    opens: List[str] = []
+    closes: List[str] = []
+    sectpr_siblings = 0
+    for body in root.iter(body_ns):
+        for child in body:
+            if child.tag == sectpr_qname:
+                sectpr_siblings += 1
+        if sectpr_siblings > 1:
+            return (
+                f"duplicate w:sectPr under w:body ({sectpr_siblings} occurrences) — "
+                "Word refuses to open documents with multiple body-level sectPr "
+                "elements. Use doc.add_section(WD_SECTION.NEW_PAGE) instead of "
+                "hand-injecting sectPr via OxmlElement."
+            )
+        break
+
+    for elem in root.iter():
+        if elem.tag == start_qname:
+            opens.append(elem.get(id_attr) or "")
+        elif elem.tag == end_qname:
+            closes.append(elem.get(id_attr) or "")
+
+    if len(opens) != len(closes):
+        return (
+            f"unbalanced comment ranges: {len(opens)} commentRangeStart vs "
+            f"{len(closes)} commentRangeEnd. Every started comment range must "
+            "be closed with a matching commentRangeEnd (same w:id). Use the "
+            "pre-bound add_comment() helper instead of hand-injecting ranges."
+        )
+    opens_sorted = sorted(opens)
+    closes_sorted = sorted(closes)
+    if opens_sorted != closes_sorted:
+        return (
+            f"comment range id mismatch: started {opens_sorted}, closed "
+            f"{closes_sorted}. Each commentRangeStart must pair with a "
+            "commentRangeEnd carrying the same w:id."
+        )
+    return None
+
+
+def _validate_office_file(
+    path,
+    *,
+    require_parts: Optional[Tuple[str, ...]] = None,
+    preserved_snapshot: Optional[frozenset] = None,
+) -> Tuple[bool, str]:
+    """Three-layer Office OOXML integrity validation. Never raises.
+
+    Layering:
+      1. OPC container sanity — file exists, is a valid zip, and every
+         ``.xml``/``.rels`` member parses as XML.
+      2. Mandatory-parts presence — ``[Content_Types].xml``, ``_rels/.rels``,
+         ``word/document.xml``, ``word/_rels/document.xml.rels`` (extendable
+         per caller via ``require_parts``).
+      3. OXML structural checks on ``word/document.xml`` — duplicate
+         ``w:sectPr``, unbalanced comment ranges.
+      4. python-docx re-open (best-effort; skipped when python-docx is
+         unavailable; NEVER the sole reason the file fails).
+
+    Round-trip check (only in edit flows): when a *pre-save part snapshot*
+    is provided, the validation fails if any conditional round-trip part
+    that was present before the save is missing after the save — that is
+    the exact failure mode the guard message names.
+    """
+    office_path = Path(path)
+    if not office_path.is_file():
+        return False, f"file does not exist: {office_path}"
+    suffix = office_path.suffix.lower()
+    validator = OOXML_VALIDATORS.get(suffix, {})
+    base_required = tuple(validator.get("required_parts", OOXML_MANDATORY_PARTS))
+    required_parts = base_required + tuple(require_parts or ())
+    try:
         with zipfile.ZipFile(office_path) as z:
             bad_member = z.testzip()
             if bad_member:
                 return False, f"corrupt zip member: {bad_member}"
             names = z.namelist()
+            names_set = frozenset(names)
+
             for required in required_parts:
-                if required not in names:
+                if required not in names_set:
                     return False, f"missing required part: {required}"
+
+            if preserved_snapshot:
+                dropped = _check_preserved_parts(preserved_snapshot, names_set)
+                if dropped:
+                    return False, (
+                        f"round-trip dropped a Word-mandatory part '{dropped}'. "
+                        "python-docx re-saves of desktop-authored documents can "
+                        "silently lose styles/numbering/theme/comments parts, "
+                        "which strict Word validation rejects. Consider building "
+                        "the document fresh with tool_build_word rather than "
+                        "round-tripping."
+                    )
+
             for member_name in names:
                 if member_name.endswith((".xml", ".rels")):
                     try:
                         ET.fromstring(z.read(member_name))
                     except ET.ParseError as xml_err:
                         return False, f"malformed XML in part '{member_name}': {xml_err}"
-        reopen_ok, reopen_reason = _reopen_office_file(office_path, suffix)
-        if not reopen_ok:
-            return False, reopen_reason
-        return True, reopen_reason
+
+            # Layer 3 — structural checks on the body part.
+            try:
+                document_xml = z.read("word/document.xml")
+            except KeyError:
+                document_xml = None
+            if document_xml is not None:
+                structural_error = _check_sectpr_and_comment_ranges(document_xml)
+                if structural_error:
+                    return False, structural_error
     except zipfile.BadZipFile:
         return False, "not a valid zip container (BadZipFile)"
-    except Exception as e:
-        return False, f"validation error: {e}"
+    except Exception as exc:
+        return False, f"validation error: {exc}"
+
+    # Layer 4 — python-docx re-open (non-fatal if python-docx is absent).
+    reopen_ok, reopen_reason = _reopen_office_file(office_path, suffix)
+    if not reopen_ok:
+        return False, reopen_reason
+    return True, reopen_reason
 
 
-def _save_and_verify(obj: Any, save_path: Path) -> Dict[str, Any]:
-    """Transactional save: snapshot → save → validate → rollback on failure."""
-    save_path = Path(save_path)
-    pre_existing = save_path.is_file()
-    snapshot_bytes = save_path.read_bytes() if pre_existing else None
+def _save_and_verify(
+    obj: Any,
+    save_path: Path,
+    *,
+    preserved_snapshot: Optional[frozenset] = None,
+) -> Dict[str, Any]:
+    """Atomic save: write to <name>.partial.docx → validate → os.replace.
+
+    Guarantees:
+      * The destination file is NEVER destroyed on a validation failure.
+        The pre-existing file (if any) is left byte-identical on disk; a
+        fresh build with no pre-existing file simply leaves no file at all
+        (never deletes anything the user owns).
+      * On validation failure the failed artifact is renamed to
+        ``<name>.invalid<ext>`` for human inspection — the error message
+        therefore never says "file does not exist"; it names the actual
+        validation reason.
+      * The atomic ``os.replace`` is POSIX-safe and Windows-safe (same-volume
+        rename), so a mid-flight crash cannot leave the destination in a
+        half-written state.
+
+    Args:
+        obj: Object exposing ``.save(str_path)``.
+        save_path: Destination path (``.docx``/``.docm``).
+        preserved_snapshot: Optional frozenset of archive member names to
+            compare against post-save (round-trip part preservation).
+    """
+    save_path = Path(save_path).resolve()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    partial_path = save_path.with_name(f"{save_path.stem}.partial{save_path.suffix}")
+    invalid_path = save_path.with_name(f"{save_path.stem}.invalid{save_path.suffix}")
+
+    # Clean stale residue from a prior aborted attempt.
+    for stale in (partial_path, invalid_path):
+        try:
+            if stale.exists():
+                stale.unlink()
+        except Exception:
+            pass
+
     try:
-        obj.save(str(save_path))
+        obj.save(str(partial_path))
     except Exception as save_err:
-        if pre_existing:
-            save_path.write_bytes(snapshot_bytes)
-        else:
-            save_path.unlink(missing_ok=True)
+        try:
+            partial_path.unlink(missing_ok=True)
+        except Exception:
+            pass
         return {
             "success": False,
             "error": (
                 f"Save failed before validation could run: {save_err}\n"
-                "The file was restored to its pre-save state. Fix the recipe and retry."
+                "The destination file was not modified (the failed artifact was "
+                "written to a temporary .partial file and discarded). Fix the "
+                "recipe and retry."
             ),
         }
 
-    ok, reason = _validate_office_file(save_path)
+    ok, reason = _validate_office_file(
+        partial_path, preserved_snapshot=preserved_snapshot
+    )
     if ok:
+        try:
+            os.replace(partial_path, save_path)
+        except Exception as rename_err:
+            try:
+                partial_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return {
+                "success": False,
+                "error": (
+                    f"Atomic commit failed: {rename_err}\n"
+                    "The document validated successfully but could not be "
+                    "moved into place. The destination file was not modified."
+                ),
+            }
         return {
             "success": True,
             "saved_path": str(save_path),
             "file_name": save_path.name,
         }
 
-    if pre_existing:
-        save_path.write_bytes(snapshot_bytes)
-        restoration_note = "The file was restored to its pre-save state (pre-save in-memory snapshot)."
-    else:
-        save_path.unlink(missing_ok=True)
-        restoration_note = "The new file was deleted (no previous version to restore)."
+    # Validation failed — preserve the failed artifact for inspection, and
+    # leave the destination (if any) untouched.
+    try:
+        os.replace(partial_path, invalid_path)
+        artifact_note = (
+            f"The failed document was preserved for inspection: {invalid_path.name}"
+        )
+    except Exception:
+        try:
+            partial_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        artifact_note = "The failed document could not be preserved."
 
-    ASCIIColors.error(f"[Word Guard] {save_path.name} failed validation ({reason}) — rolled back.")
+    destination_note = (
+        f"Destination file '{save_path.name}' was NOT modified (validation failed before commit)."
+        if save_path.exists()
+        else f"Destination file '{save_path.name}' was NOT created."
+    )
+
+    ASCIIColors.error(
+        f"[Word Guard] {save_path.name} failed validation ({reason}) — destination left untouched."
+    )
     return {
         "success": False,
         "error": (
-            f"Office Document Integrity Failure [{OFFICE_GUARD_FAILURE_CODE}]: the saved document "
-            f"failed strict validation and was rolled back.\n"
+            f"Office Document Integrity Failure [{OFFICE_GUARD_FAILURE_CODE}]: the "
+            f"generated document failed strict validation and was NOT committed.\n"
             f"File: {save_path.name}\n"
             f"Reason: {reason}\n"
-            f"{restoration_note}\n"
+            f"{destination_note}\n"
+            f"{artifact_note}\n"
             f"{OFFICE_GUARD_GUIDANCE}"
         ),
     }
@@ -789,6 +1036,10 @@ def tool_build_word(
         root_obj = _pick_effective_root(namespace, suffix, root_obj)
 
         save_path = working_dir / file_name
+        # A build from scratch replaces any stale file at the destination.
+        # We do NOT compare against the previous archive's parts: a fresh
+        # build is explicitly allowed to omit parts the old file carried
+        # (that is not "round-trip dropping" — it is a from-scratch rebuild).
         save_result = _save_and_verify(root_obj, save_path)
         if not save_result["success"]:
             return save_result
@@ -900,7 +1151,16 @@ def tool_edit_word(
 
         root_obj = _pick_effective_root(namespace, suffix, root_obj)
 
-        save_result = _save_and_verify(root_obj, file_path)
+        # Snapshot the ORIGINAL archive parts BEFORE we save, so we can detect
+        # the classic "python-docx silently dropped styles/numbering/theme"
+        # failure mode and refuse to commit a document that loses a part Word
+        # needs. Only edit flows compare against the pre-save snapshot — a
+        # build from scratch has no pre-save to compare with.
+        preserved_snapshot = _snapshot_archive_parts(file_path)
+
+        save_result = _save_and_verify(
+            root_obj, file_path, preserved_snapshot=preserved_snapshot
+        )
         if not save_result["success"]:
             return save_result
         return _build_result(save_result, file_path)
@@ -1277,7 +1537,10 @@ def tool_add_word_comment(
         add_comment = _build_add_comment_helper()
         add_comment(doc, target_paragraph, comment, author=author, run=target_run)
 
-        save_result = _save_and_verify(doc, file_path)
+        preserved_snapshot = _snapshot_archive_parts(file_path)
+        save_result = _save_and_verify(
+            doc, file_path, preserved_snapshot=preserved_snapshot
+        )
         if not save_result["success"]:
             return save_result
 

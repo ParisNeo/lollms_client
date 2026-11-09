@@ -2,7 +2,7 @@
 from abc import abstractmethod
 import importlib
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Union, Callable
+from typing import Optional, List, Dict, Any, Union, Callable, Tuple, Set
 from ascii_colors import trace_exception, ASCIIColors
 import yaml
 from lollms_client.lollms_base_binding import LollmsBaseBinding
@@ -145,7 +145,52 @@ class LollmsToolBinding(LollmsBaseBinding):
         """
         super().__init__(binding_name=binding_name, debug=debug, **kwargs)
         self.settings = kwargs
+        # ── Chat-spec memoization ────────────────────────────────────────
+        # ``to_chat_tool_specs()`` is invoked on every prompt (once per
+        # discussion turn by the chat mixin) to forward tool schemas to the
+        # LLM backend. Re-serializing the JSON Schema → flat param list,
+        # rebuilding the per-tool ``callable`` closure, and re-normalising
+        # descriptions on every turn adds measurable latency *before* the
+        # LLM ever sees the prompt (and LCP's underlying ``discover_tools``
+        # may re-walk the tool folder each call). We memoize the produced
+        # spec dict keyed by the tool-signature so subsequent calls in the
+        # same conversation are O(1).
+        self._chat_specs_cache: Optional[Dict[str, Dict[str, Any]]] = None
+        self._chat_specs_signature: Optional[Tuple[Any, ...]] = None
 
+    @staticmethod
+    def _spec_cache_signature(raw_tools: List[Dict[str, Any]]) -> Tuple[Any, ...]:
+        """Cheap structural signature of a raw tool list.
+
+        Detects when the tool set has structurally changed (name, description,
+        parameters, input_schema, output) so the memoized spec dict in
+        :meth:`to_chat_tool_specs` can be reused across turns without
+        re-translating JSON Schema, rebuilding closures, or re-hashing
+        descriptions on every prompt.
+        """
+        signature: List[Any] = []
+        for tool in raw_tools:
+            if not isinstance(tool, dict):
+                signature.append(repr(tool))
+                continue
+            signature.append((
+                tool.get("name", ""),
+                hash(tool.get("description", "")),
+                repr(tool.get("parameters")),
+                repr(tool.get("input_schema")),
+                repr(tool.get("output")),
+            ))
+        return tuple(signature)
+
+    def invalidate_chat_specs_cache(self) -> None:
+        """Force the next :meth:`to_chat_tool_specs` call to rebuild specs.
+
+        Subclasses (e.g. LCP) MUST call this after mounting or unmounting a
+        tool library so the next prompt sees the new tool set instead of
+        waiting for the structural-signature check to detect the change.
+        """
+        self._chat_specs_cache = None
+        self._chat_specs_signature = None
 
     @abstractmethod
     def discover_tools(self, **kwargs) -> List[Dict[str, Any]]:
@@ -228,6 +273,22 @@ class LollmsToolBinding(LollmsBaseBinding):
         """
         discover_kwargs.pop("force_refresh", None)
         raw_tools = self.discover_tools(force_refresh=False, **discover_kwargs)
+
+        # Hot-path short-circuit: if the discovered tool set is structurally
+        # unchanged since the last conversion, return the memoized spec dict.
+        # This avoids JSON-Schema → param-list translation, closure rebuild,
+        # and hash-per-description for every prompt in the same discussion.
+        try:
+            signature = self._spec_cache_signature(raw_tools)
+        except Exception:
+            signature = None
+        if (
+            signature is not None
+            and self._chat_specs_cache is not None
+            and signature == self._chat_specs_signature
+        ):
+            return self._chat_specs_cache
+
         specs: Dict[str, Dict[str, Any]] = {}
 
         for tool in raw_tools:
@@ -297,6 +358,10 @@ class LollmsToolBinding(LollmsBaseBinding):
                 "_python_file_path": tool.get("_python_file_path"),
             }
 
+        # Store for future turns; only reached on cache miss.
+        if signature is not None:
+            self._chat_specs_cache = specs
+            self._chat_specs_signature = signature
         return specs
 
     # ------------------------------------------------------------------

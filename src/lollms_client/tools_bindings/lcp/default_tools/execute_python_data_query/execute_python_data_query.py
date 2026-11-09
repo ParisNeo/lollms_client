@@ -884,31 +884,71 @@ def tool_execute_python_data_query(
     }
 
     uses_df = re.search(r'\bdf\b', code) is not None
-    defines_df = re.search(r'\bdf\s*=\s*', code) is not None
+    # Used ONLY for the persistence decision further down: if the user code
+    # brings its own `df = pd.read_*(...)` load, we must NOT persist their
+    # derived DataFrame back to the auto-loaded source file (that would
+    # silently overwrite an unrelated CSV/XLSX). It does NOT gate auto-load.
+    defines_own_df = re.search(
+        r'\bdf\s*=\s*(?:pd|pandas|dq)\.read_', code
+    ) is not None
     auto_loaded_df_file = None
     auto_loaded_sep = ","
 
-    if uses_df and not defines_df and _pd is not None:
+    # Auto-load `df` from the first workspace *.csv / *.xlsx whenever user
+    # code references `df` at all. Prior heuristics tried to guess whether the
+    # code "already declares df" and only auto-load when it does not — every
+    # variant was wrong on some legitimate pattern and produced a hard
+    # `NameError: name 'df' is not defined` on line 1:
+    #   - `\bdf\s*=\s*`         matched `df = df.sort_values(...)` (mutation,
+    #                           needs the seeded value) AND `df['col'] = ...`
+    #   - `df\s*=\s*pd\.read_`  missed aliased loads, `pd.DataFrame(...)`,
+    #                           parquet/json/html readers, user helpers.
+    # The SAFE and simple rule: if `df` appears in code and pandas is present,
+    # seed it. A user who loads their own df on line 1 rebinds the name and
+    # discards the seeded value — no observable effect. There is no pathology
+    # where seeding "df" harms a legitimate caller, and every "skip" scenario
+    # risks a NameError.
+    if uses_df and _pd is not None:
         data_files = list(Path(".").glob("*.csv")) + list(Path(".").glob("*.xlsx"))
         if data_files:
             first_file = data_files[0]
             auto_loaded_df_file = first_file
             ASCIIColors.info(f"[execute_python_data_query] Auto-loading df from {first_file.name}")
+            # NA POLICY — `keep_default_na=False, na_values=[""]`:
+            # pandas' DEFAULT NA list remaps the literal strings 'NA', 'N/A',
+            # 'NULL', 'None', 'NaN', 'NULL', 'nan', 'null', ... to NaN. In
+            # practice this SILENTLY CORRUPTS real data: a North-America region
+            # column written as `NA` becomes NaN, and `df.groupby('region')`
+            # then drops that group entirely (observed: 3 regions → 2 after
+            # filter+groupby). The tool auto-loads on the user's behalf, so it
+            # must NOT reinterpret their data. The only string that
+            # legitimately means "missing" in a CSV/Excel sheet is the EMPTY
+            # cell — that is re-added via `na_values=[""]` so `.fillna(0)`
+            # workflows keep working. Explicit user code that calls
+            # `pd.read_csv(...)` itself is NOT affected (they own their NA
+            # policy end-to-end).
+            na_kwargs = {"keep_default_na": False, "na_values": [""]}
             try:
                 if first_file.suffix.lower() == ".csv":
                     first_line = first_file.read_text(encoding="utf-8", errors="ignore").splitlines()[0] if first_file.stat().st_size > 0 else ""
                     auto_loaded_sep = ";" if ";" in first_line else ","
-                    local_vars["df"] = _pd.read_csv(first_file, sep=auto_loaded_sep, encoding="utf-8-sig")
+                    local_vars["df"] = _pd.read_csv(
+                        first_file,
+                        sep=auto_loaded_sep,
+                        encoding="utf-8-sig",
+                        **na_kwargs,
+                    )
                 elif first_file.suffix.lower() in (".xlsx", ".xls"):
-                    local_vars["df"] = _pd.read_excel(first_file)
+                    local_vars["df"] = _pd.read_excel(first_file, **na_kwargs)
             except Exception as load_err:
                 ASCIIColors.warning(f"[execute_python_data_query] Failed to auto-load df: {load_err}")
-    elif uses_df and not defines_df and _pd is None:
+    elif uses_df and _pd is None:
         ASCIIColors.warning("[execute_python_data_query] Code references 'df' but pandas is unavailable. User must load data manually.")
 
     uses_conn = re.search(r'\bconn\b', code) is not None
     defines_conn = re.search(r'\bconn\s*=\s*', code) is not None
     auto_loaded_engine = None
+    auto_loaded_conn_url: Optional[str] = None
 
     if uses_conn and not defines_conn:
         sqlconn_files = list(Path(".").glob("*.sqlconn"))
@@ -937,8 +977,16 @@ def tool_execute_python_data_query(
                         elif dialect == "postgresql":
                             connection_url = f"postgresql+psycopg2://{username}:{password}@{host}{port_str}/{database}"
 
+                # Fail-fast connectivity check in the parent. We do NOT detach
+                # a raw DBAPI connection here: it would escape the pool, be
+                # immune to `engine.dispose()`, and hold a Windows file lock on
+                # the underlying SQLite file for the rest of the process — the
+                # source of PermissionError[WinError 32] during teardown and
+                # repeated runs. The child process (which actually executes the
+                # user code) re-opens its own connection from the URL via the
+                # trusted `conn_bootstrap` below, and dies with it.
                 auto_loaded_engine = create_engine(connection_url)
-                local_vars["conn"] = auto_loaded_engine.raw_connection()
+                auto_loaded_conn_url = connection_url
             except Exception as load_err:
                 ASCIIColors.warning(f"[execute_python_data_query] Failed to auto-load conn: {load_err}")
 
@@ -956,7 +1004,10 @@ def tool_execute_python_data_query(
     # it into its own namespace under the name "df".
     child_seed: Dict[str, Any] = {}
     df_present_at_start = "df" in local_vars
-    persist_df = (auto_loaded_df_file is not None) or defines_df
+    # Persist ONLY when the seeded auto-loaded df is the one the user operated
+    # on. If the user code starts with `df = pd.read_*(...)`, that's THEIR df —
+    # writing it back to the auto-loaded source would corrupt an unrelated file.
+    persist_df = (auto_loaded_df_file is not None) and (not defines_own_df)
     persist_df_target = auto_loaded_df_file
 
     # Modules MUST NOT go through the pickle seed transport: pickling a module
@@ -984,8 +1035,22 @@ def tool_execute_python_data_query(
     if "df" in local_vars:
         child_seed["df"] = local_vars["df"]
 
+    # Raw DBAPI connections cannot be pickled across process boundaries.
+    # Ship the connection URL (picklable string) and let the child re-open its
+    # own connection. The bootstrap is trusted tool code, not user input, so it
+    # is injected AFTER static validation. Line numbers stay aligned because
+    # the SAME `exec_source` is used for traceback annotation further down.
+    exec_source = code
+    if auto_loaded_conn_url is not None:
+        conn_bootstrap = (
+            "from sqlalchemy import create_engine as _lollms_ce\n"
+            f"_lollms_conn_url = {auto_loaded_conn_url!r}\n"
+            "conn = _lollms_ce(_lollms_conn_url).raw_connection()"
+        )
+        exec_source = conn_bootstrap + "\n" + code
+
     envelope = run_in_sandboxed_child(
-        source=code,
+        source=exec_source,
         workspace_root=workspace_root,
         profile="data_query",
         script_label="<execute_python_data_query>",
@@ -1033,7 +1098,7 @@ def tool_execute_python_data_query(
                 "output": raw_output,
             }
         rollback_failure = _validate_and_maybe_rollback(office_snapshot, raw_output)
-        annotated_traceback = _annotate_traceback(child_traceback, code)
+        annotated_traceback = _annotate_traceback(child_traceback, exec_source)
         ASCIIColors.error(f"❌ Execution Failed (child):\n{child_traceback}")
         if rollback_failure is not None:
             annotated_traceback += (

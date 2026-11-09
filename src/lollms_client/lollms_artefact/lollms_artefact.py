@@ -2117,7 +2117,20 @@ class ArtefactManager:
         root_node = {"files": [], "folders": {}}
 
         for a in visible_artifacts:
-            display_path = a.get("physical_path") or a["title"]
+            # Resolve the ACTUAL on-disk filename (with extension) so the tree
+            # mirrors what tools must reference. Preserve any subfolder prefix.
+            raw_path = a.get("physical_path") or a["title"]
+            resolved_filename = self._get_filename_with_ext(
+                raw_path,
+                a.get("type", ArtefactType.DOCUMENT),
+                a.get("language"),
+                a.get("file_ext"),
+            )
+            if "/" in raw_path.replace("\\", "/"):
+                parent, _, _ = raw_path.replace("\\", "/").rpartition("/")
+                display_path = f"{parent}/{resolved_filename}"
+            else:
+                display_path = resolved_filename
 
             parts = display_path.split("/")
             curr = root_node

@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from lollms_client.lollms_discussion import LollmsDiscussion
 from lollms_client.lollms_discussion._db import LollmsDataManager
-from lollms_client.lollms_artefact import ArtefactVisibility
+from lollms_client.lollms_artefact import ArtefactVisibility, ArtefactType
 
 class MockLollmsClient:
     def __init__(self):
@@ -186,9 +186,11 @@ class TestArtifactSyncForTools(unittest.TestCase):
         self.assertTrue(source_bytes[:2] == b"PK", "source file is not a ZIP container")
 
         # 2. Register it as an active artifact using the suite's existing pattern.
+        # Data files (xlsx, csv, db, ...) are registered as FILE artefacts now
+        # that the dedicated DATA type has been removed from the type system.
         self.discussion.artefacts.add(
             title="report.xlsx",
-            artefact_type="data",
+            artefact_type=ArtefactType.FILE,
             content="### Data File: report.xlsx",
             active=True,
             visibility=ArtefactVisibility.FULL,

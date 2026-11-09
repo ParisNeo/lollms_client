@@ -6004,19 +6004,79 @@ JSON:"""
                 pass
 
         # ── MERGE PERSONALITY-SPECIFIC TOOLS (e.g., from Handbag) ──
-        # This ensures tools attached directly to the personality (self._tool_binding)
-        # are available even if they are not in the client's global LCPBinding.
-        if self._tool_binding and hasattr(self._tool_binding, "to_chat_tool_specs"):
+        # A personality's OWN tools MUST take precedence over the client's
+        # generic LCP defaults: if a handbag tool and a default tool share a
+        # name, the handbag version is what the personality actually ships
+        # and therefore what the LLM must see. We therefore OVERWRITE on
+        # collision rather than skip.
+        #
+        # FAIL-VISIBLE: any failure here (empty specs, exception during
+        # spec-building, etc.) is logged loudly because a silent drop is
+        # exactly how "my handbag tools are invisible" happens.
+        if self._tool_binding is not None and hasattr(self._tool_binding, "to_chat_tool_specs"):
+            binding_name = getattr(self._tool_binding, "binding_name", type(self._tool_binding).__name__)
             try:
                 personality_specs = self._tool_binding.to_chat_tool_specs(
                     discussion_instance=getattr(self, '_artefact_proxy', None),
                     lollms_client_instance=self.lollms_client
                 )
-                for t_name, t_spec in personality_specs.items():
-                    if t_name not in active_tools:
+                merged_new = 0
+                merged_overridden = 0
+                if personality_specs:
+                    for t_name, t_spec in personality_specs.items():
+                        if t_name in active_tools:
+                            merged_overridden += 1
+                        else:
+                            merged_new += 1
+                        # Personality tools WIN on collision.
                         active_tools[t_name] = t_spec
+
+                discovered_count = 0
+                discovered_tools = getattr(self._tool_binding, "discovered_tools", None)
+                if discovered_tools is not None:
+                    discovered_count = len(discovered_tools)
+                raw_tool_files = getattr(self._tool_binding, "tool_files", None)
+                raw_tool_folders = getattr(self._tool_binding, "tools_folders", None)
+
+                if not personality_specs:
+                    ASCIIColors.error(
+                        f"[{self.name}] ❌ Personality tool binding '{binding_name}' "
+                        f"produced 0 tool spec(s) at chat time "
+                        f"(raw discovered_tools={discovered_count}, "
+                        f"tool_files={[str(p) for p in (raw_tool_files or [])]}, "
+                        f"tools_folders={[str(p) for p in (raw_tool_folders or [])]}). "
+                        f"Handbag toolsets will NOT be visible to the model. "
+                        f"Check: (1) each toolset folder contains TOOLS.py "
+                        f"(or <folder>.py) exposing `tool_*` functions; "
+                        f"(2) any declared TOOL_LIBRARY_LOAD_FLAG is enabled via "
+                        f"host_tool_configs['<toolset>']['<flag>']; "
+                        f"(3) the toolset module syntax is valid."
+                    )
+                else:
+                    ASCIIColors.success(
+                        f"[{self.name}] ✅ Personality tool binding '{binding_name}' "
+                        f"surfaced {len(personality_specs)} tool(s) to the LLM: "
+                        f"{merged_new} new, {merged_overridden} overriding default name(s). "
+                        f"Names: {sorted(personality_specs.keys())}"
+                    )
             except Exception as e:
-                ASCIIColors.warning(f"[{self.name}] Failed to merge personality-specific tools: {e}")
+                trace_exception(e)
+                ASCIIColors.error(
+                    f"[{self.name}] ❌ FAILED to merge personality-specific tools from "
+                    f"'{binding_name}': {e}. Handbag toolsets will be INVISIBLE to the model. "
+                    f"See full traceback above."
+                )
+        elif self._tool_binding is not None:
+            ASCIIColors.error(
+                f"[{self.name}] ❌ Personality tool binding is set "
+                f"({type(self._tool_binding).__name__}) but does not expose "
+                f"`to_chat_tool_specs()`. Handbag toolsets will be INVISIBLE."
+            )
+        else:
+            ASCIIColors.debug(
+                f"[{self.name}] No personality-specific tool binding attached "
+                f"(self._tool_binding is None)."
+            )
 
         doc_navigator = self._get_doc_navigator()
         if doc_navigator is not None:
@@ -6522,11 +6582,18 @@ JSON:"""
                 "\n=== ACTIVE TOOLS (Lean Schema) ===",
                 "Emit on a clean line: `<tool>{\"name\": \"...\", \"parameters\": {...}}</tool>`\n"
             ]
+            rendered_count = 0
             for t_name, t_spec in sorted(active_tools.items()):
                 desc = (t_spec.get("description") or "").strip().split("\n\n")[0].strip()
                 params_list = t_spec.get("parameters") or []
                 param_sig = ", ".join([f"{p.get('name')}: {p.get('type', 'any')}{'?' if p.get('optional') else ''}" for p in params_list]) if params_list else ""
                 tool_sections.append(f"• **`{t_name}({param_sig})`**: {desc}")
+                rendered_count += 1
+            ASCIIColors.info(
+                f"[{self.name}] Tool schema rendered into system prompt: "
+                f"{rendered_count} tool(s) — "
+                f"{sorted(active_tools.keys())}"
+            )
 
             loadable_index = getattr(self, "_loadable_tool_index", None)
             if loadable_index:
@@ -6924,6 +6991,38 @@ JSON:"""
             for t_name, t_spec in active_tools.items():
                 if t_name in ("tool_create_skill", "tool_update_skill"):
                     t_spec["description"] += "\n\n**VISIBILITY CONTROL**: You can control how this skill is stored in your workspace by setting the `output_visibility` parameter.\n- `output_visibility=\"context\"` (default): Loads the skill directly into your context [C].\n- `output_visibility=\"artefact\"`: Saves the skill as a file [U] without loading it, saving context space."
+
+        # ── 🛡️ HANDBAG TOOLS SURVIVAL GUARD ──
+        # Final safety net: if the personality carries a tool binding with
+        # discovered tools, they MUST be present in `active_tools` before we
+        # build the system prompt. Any downstream transformation that removed
+        # them (e.g. an explicit-allowlist filter, a capability gate, etc.)
+        # would make them invisible to the LLM — which is unacceptable for a
+        # handbag's own tools. We re-merge here as a hard guarantee.
+        if self._tool_binding is not None and hasattr(self._tool_binding, "to_chat_tool_specs"):
+            try:
+                _survival_specs = self._tool_binding.to_chat_tool_specs(
+                    discussion_instance=getattr(self, '_artefact_proxy', None),
+                    lollms_client_instance=self.lollms_client
+                )
+                _resurrected = 0
+                for _t_name, _t_spec in (_survival_specs or {}).items():
+                    if _t_name not in active_tools:
+                        active_tools[_t_name] = _t_spec
+                        _resurrected += 1
+                if _resurrected:
+                    ASCIIColors.warning(
+                        f"[{self.name}] 🛡️ Handbag tools survival guard re-injected "
+                        f"{_resurrected} tool(s) that had been dropped after "
+                        f"initial discovery: "
+                        f"{[n for n in (_survival_specs or {}) if n in active_tools and n not in []]}. "
+                        f"Please investigate what removed them upstream."
+                    )
+            except Exception as _surv_err:
+                trace_exception(_surv_err)
+                ASCIIColors.error(
+                    f"[{self.name}] 🛡️ Handbag tools survival guard failed: {_surv_err}"
+                )
 
         stable_system_prompt = self._build_system_prompt(active_tools, dynamic_effort=dynamic_effort)
         stable_system_prompt += self._build_user_profile_context()
@@ -9711,6 +9810,7 @@ class NullPersonality(LollmsPersonality):
         self._tool_binding            = _NULL_TOOL_BINDING
         self._has_explicit_allowlist  = False
         self._raw_data_source         = None
+        self.data_sources             = []
         self.data_files               = []
         self.vectorize_chunk_callback = None
         self.is_vectorized_callback   = None

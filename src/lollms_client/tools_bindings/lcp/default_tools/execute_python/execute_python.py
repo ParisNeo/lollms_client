@@ -840,7 +840,17 @@ def _run_python_source(
             user_authorized_risky = True
             ASCIIColors.success("[execute_python] 🔓 Auto-approval enabled for this session.")
         elif decision == "allow":
-            user_authorized_risky = True
+            # HEADLESS AUTO-PROCEED: in pytest/CI there is no operator to
+            # consent, so `_prompt_user_validation` returns "allow" to let the
+            # static/runtime sandbox be the control. We deliberately do NOT
+            # set `user_authorized_risky=True` here — that flag would promote
+            # the static profile to "authorized", which PERMITS subprocess /
+            # socket, defeating the security tests (`import subprocess` and
+            # `import socket` would succeed in headless mode). Under headless
+            # auto-proceed the profile stays "standard", so the standard
+            # denylist correctly refuses those imports.
+            if not _is_headless_environment():
+                user_authorized_risky = True
 
     # ── LAYER 1: static AST validation ──
     # Profile selection:
@@ -1339,9 +1349,38 @@ def tool_execute_python_code(code: str = "", env: Optional[Any] = None) -> Dict[
         code = code.get("code") or next((v for v in code.values() if isinstance(v, str)), "")
 
     code_str = code if isinstance(code, str) else ("" if code is None else str(code))
-    gate_result = _enforce_inline_code_limit(code_str)
-    if gate_result is not None:
-        return gate_result
+
+    # Accept a workspace .py file path as `code` for parity with
+    # tool_execute_python_data_query. Agents frequently pass a script path
+    # to the inline tool (e.g. `str(script)` from a helper helper); the
+    # PREVIOUS behavior fed the raw path directly to `exec()`, producing
+    # `SyntaxError: unexpected character after line continuation character`
+    # on Windows (each backslash in `C:\...\hello.py` is a line
+    # continuation). Resolving the path to its CONTENTS up front keeps the
+    # rest of the pipeline identical and dials tool behavior correctly.
+    stripped_input = code_str.strip() if code_str else ""
+    resolved_from_file = False
+    if stripped_input and stripped_input.lower().endswith(".py"):
+        candidate = Path(stripped_input)
+        if candidate.is_file():
+            try:
+                code_str = candidate.read_text(encoding="utf-8")
+            except Exception as read_err:
+                return {
+                    "success": False,
+                    "error": f"Failed to read '{stripped_input}': {read_err}",
+                    "output": "",
+                    "stderr": "",
+                }
+
+
+    # The inline-size limit steers agents toward artifacts for SUBSTANTIAL
+    # code. A file that already lives on disk has been persisted — the limit
+    # does not apply; we are simply running it.
+    if not resolved_from_file:
+        gate_result = _enforce_inline_code_limit(code_str)
+        if gate_result is not None:
+            return gate_result
     if not code_str.strip():
         return {
             "success": False,

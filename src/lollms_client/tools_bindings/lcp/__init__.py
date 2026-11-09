@@ -566,8 +566,13 @@ sub-attributes must be feature-checked for None.
 
     def _is_library_admitted(self, py_file: Path) -> bool:
         """Combines office- and document-family admission for a single library
-        file. Returns True when the library may be loaded/mounted."""
-        stem = py_file.stem
+        file. Returns True when the library may be loaded/mounted.
+
+        The stem used for gate resolution is the LIBRARY identity (folder name
+        for the canonical ``TOOLS.py`` layout, file stem otherwise) — NOT
+        ``py_file.stem`` which would always be ``"TOOLS"`` for that layout.
+        """
+        stem = self._library_identity(py_file)
 
         if not _office_library_admitted(
             stem, self.session_flags, self._workspace_file_types
@@ -592,6 +597,27 @@ sub-attributes must be feature-checked for None.
                 )
                 return False
         return True
+
+    @staticmethod
+    def _library_identity(py_file: Path) -> str:
+        """Return the LIBRARY name for a Python entry file.
+
+        For the canonical ``TOOLS.py`` layout, the library name is the PARENT
+        FOLDER (e.g. ``tools/websearch/TOOLS.py`` -> ``websearch``), because
+        gate constants (``TOOL_LIBRARY_LOAD_FLAG``, ``_OFFICE_LIBRARY_STEMS``,
+        ``_DOCUMENT_LIBRARY_STEMS``) are keyed by toolset folder name, not by
+        the file basename. Using ``py_file.stem`` here would return ``"TOOLS"``
+        and silently bypass every per-toolset gate — the exact bug class that
+        causes handbag toolsets to disappear (or leak) from the LLM's tool
+        registry.
+
+        For legacy layouts (``websearch/websearch.py``) the stem is already the
+        library name, so identity == stem.
+        """
+        name = py_file.name
+        if name == TOOLS_ENTRYPOINT:
+            return py_file.parent.name
+        return py_file.stem
 
     @staticmethod
     def _normalize_name(raw: str) -> str:
@@ -677,11 +703,18 @@ sub-attributes must be feature-checked for None.
         Resolves a library's TOOL_LIBRARY_LOAD_FLAG declaration against host
         configuration. Returns True when the library has no gating flag or the
         flag is explicitly enabled, False when the flag exists and is disabled.
+
+        The config lookup uses the LIBRARY identity (folder name for the
+        canonical ``TOOLS.py`` layout) so that ``host_tool_configs["websearch"]``
+        is honoured even when the entry file is ``TOOLS.py``. Using
+        ``py_file.stem`` (== ``"TOOLS"``) here would silently drop gated
+        handbag toolsets from the LLM's tool registry.
         """
         flag_name = self._library_load_flag(py_file)
         if not flag_name:
             return True
-        host_cfg = self.host_tool_configs.get(py_file.stem, {})
+        library_key = self._library_identity(py_file)
+        host_cfg = self.host_tool_configs.get(library_key, {})
         raw_value = host_cfg.get(flag_name, self._load_flag_kwargs.get(flag_name, False))
 
         if isinstance(raw_value, str):
@@ -689,19 +722,27 @@ sub-attributes must be feature-checked for None.
         return bool(raw_value)
 
     def _load_tool_file(self, py_file: Path) -> int:
-        file_stem = py_file.stem
+        # The LIBRARY identity is the folder name for the canonical ``TOOLS.py``
+        # layout (and the file stem for legacy layouts). All gate lookups MUST
+        # use this identity — using ``py_file.stem`` would collapse to ``"TOOLS"``
+        # and silently bypass every per-toolset gate/permission check.
+        file_stem = self._library_identity(py_file)
 
         # ── OFFICE + DOCUMENT SESSION GATE (fail-closed) ──
         # Office per-software toolsets require their own flag. Document-family
         # toolsets are admitted when their declared file types are present in
         # the workspace (see _document_library_admitted).
         if not self._is_library_admitted(py_file):
+            ASCIIColors.debug(
+                f"[LCP] Library '{file_stem}' ({py_file.name}) skipped: "
+                f"session gate not satisfied."
+            )
             return 0
 
         if not self._is_library_permitted(py_file):
             ASCIIColors.debug(
-                f"[LCP] Library '{file_stem}' skipped: TOOL_LIBRARY_LOAD_FLAG "
-                "not enabled in host configuration."
+                f"[LCP] Library '{file_stem}' ({py_file.name}) skipped: "
+                "TOOL_LIBRARY_LOAD_FLAG not enabled in host configuration."
             )
             return 0
 
@@ -955,9 +996,18 @@ sub-attributes must be feature-checked for None.
         # ``TOOLS.py`` inside it.
         for candidate in self.tool_files:
             if not candidate or not candidate.exists():
+                ASCIIColors.warning(
+                    f"[LCP] Tool candidate does not exist and will be skipped: {candidate}"
+                )
                 continue
             resolved = resolve_library(candidate)
             if resolved is None:
+                ASCIIColors.warning(
+                    f"[LCP] Tool candidate '{candidate}' could not be resolved to a "
+                    f"library entry (expected TOOLS.py, <folder>.py, or a *.py file "
+                    f"inside it). This toolset will NOT be discovered. "
+                    f"Fix the toolset folder layout or provide a valid entry file."
+                )
                 continue
             lib_dir, entry = resolved
             self._load_tool_file(entry)

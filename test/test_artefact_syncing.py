@@ -69,7 +69,12 @@ class TestArtefactSyncing(unittest.TestCase):
         self.assertEqual(art["visibility"], ArtefactVisibility.TREE_UNLOCKABLE)
 
     def test_disk_to_db_new_binary_file_registration(self):
-        """Verify a binary file (e.g., .db) is registered with a placeholder."""
+        """Verify a binary file (e.g., .db) is registered as a FILE artefact with a placeholder.
+
+        The dedicated DATA artefact type was removed by design: structured data
+        files (.csv/.db/.xlsx/...) are ordinary FILE artefacts whose physical
+        bytes remain on disk in their native format.
+        """
         binary_file = self.ws_data_dir / "database.sqlite"
         binary_file.write_bytes(b"SQLite format 3\x00\x00\x00\x00")
 
@@ -78,8 +83,8 @@ class TestArtefactSyncing(unittest.TestCase):
         self.assertEqual(report["new_artefacts"], 1)
         art = self.discussion.artefacts.get("database.sqlite")
         self.assertIsNotNone(art, "Binary artifact should be registered.")
-        self.assertEqual(art["type"], "data")
-        self.assertIn("Binary/Structured Data", art["content"])
+        self.assertEqual(art["type"], "file")
+        self.assertIn("As-Is / Non-Text", art["content"])
         self.assertEqual(art["visibility"], ArtefactVisibility.TREE_UNLOCKABLE)
 
     def test_deleted_disk_file_purges_db_record(self):
@@ -119,10 +124,14 @@ class TestArtefactSyncing(unittest.TestCase):
         self.assertIn("# Restored Content", disk_path.read_text(encoding="utf-8"))
 
     def test_sync_all_active_to_disk_skips_true_binary_data_restoration(self):
-        """Verify true binary data artifacts (.db) are NOT recreated from text placeholder."""
+        """Verify true binary data artifacts (.db) are NOT recreated from text placeholder.
+
+        Data files are registered as FILE artefacts; the physical bytes live on
+        disk only and must never be synthesized from a text placeholder.
+        """
         self.discussion.artefacts.add(
             title="binary_data.db",
-            artefact_type=ArtefactType.DATA,
+            artefact_type=ArtefactType.FILE,
             content="### Data File: `binary_data.db`",
             file_ext=".db",
             active=True,
@@ -280,11 +289,15 @@ class TestArtefactSyncing(unittest.TestCase):
         self.assertEqual(len(self.discussion.artefacts.list()), 0)
 
     def test_text_based_data_artifact_restoration(self):
-        """Verify text-based data artifacts (CSV) are restored to disk if missing."""
+        """Verify text-based data artifacts (CSV) are restored to disk if missing.
+
+        CSV is a FILE artefact with a textual payload: its content is stored in
+        the DB and healed back to disk when the physical file is missing.
+        """
         csv_content = "name,age\nAlice,30\nBob,25"
         self.discussion.artefacts.add(
             title="users.csv",
-            artefact_type=ArtefactType.DATA,
+            artefact_type=ArtefactType.FILE,
             content=csv_content,
             file_ext=".csv",
             active=True,

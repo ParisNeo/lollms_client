@@ -396,20 +396,20 @@ _SANDBOX_WRITE_ROOTS: set = set()
 
 
 def _compute_sandbox_cache_root(workspace_root: Path) -> Path:
-    """Returns a stable per-workspace sandbox cache directory under the system temp.
+    """Returns the per-workspace sandbox cache directory: `<workspace>/.sandbox_cache/`.
 
-    Layout: `<tempdir>/lollms_sandbox_cache/<sha1(workspace)>/`. Using a hash of
-    the workspace path keeps concurrent sandboxes for different workspaces
-    isolated while allowing cache reuse across repeated calls into the SAME
-    workspace (matplotlib fontlist build is expensive — build it once).
+    The sandbox cache MUST live inside the workspace perimeter so that the
+    path guard's single invariant — "everything the sandbox writes is under
+    `workspace_root`" — holds without needing to widen `_SANDBOX_WRITE_ROOTS`.
+    This is what makes `tempfile.NamedTemporaryFile()` and every XDG/matplotlib/
+    pip cache write land inside the workspace, allowing them to succeed while
+    keeping the escape boundary strict.
+
+    The caches remain invisible to user tooling via their well-known names
+    (`.sandbox_cache/`, hidden on POSIX by the leading dot, and excluded from
+    workspace-level scans by tooling that already filters dot-directories).
     """
-    import hashlib
-    import tempfile as _tf
-    try:
-        ws_key = hashlib.sha1(str(workspace_root).encode("utf-8")).hexdigest()[:16]
-    except Exception:
-        ws_key = "default"
-    return Path(_tf.gettempdir()) / "lollms_sandbox_cache" / ws_key
+    return Path(workspace_root).resolve() / ".sandbox_cache"
 
 
 def _compute_trusted_read_roots() -> frozenset:
@@ -1634,20 +1634,6 @@ class SandboxContext:
         import tempfile as _tf
         workspace_root = self.workspace_root.resolve()
         sandbox_cache = _compute_sandbox_cache_root(workspace_root)
-
-        # Migration cleanup: earlier versions wrote the cache INSIDE the
-        # workspace as `<workspace>/.sandbox_cache/`. That polluted the user's
-        # project tree and caused the artefact-sync layer to mistake matplotlib
-        # fontlist JSON for a user artefact. Remove any stale workspace-local
-        # cache so the tree is pristine from the next tool call onward.
-        stale_workspace_cache = workspace_root / ".sandbox_cache"
-        if stale_workspace_cache.is_dir():
-            _raw_rmtree = self._originals.get("shutil.rmtree") or shutil.rmtree
-            try:
-                _raw_rmtree(str(stale_workspace_cache), ignore_errors=True)
-            except Exception:
-                pass
-            _SANDBOX_CACHE_READY.discard(str(stale_workspace_cache))
 
         if str(sandbox_cache) not in _SANDBOX_CACHE_READY:
             # Use raw os.makedirs to avoid re-entering our own Path.mkdir guard.

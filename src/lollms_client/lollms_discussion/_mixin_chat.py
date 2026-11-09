@@ -5968,6 +5968,16 @@ class ChatMixin:
         """
         resolved: Dict[str, Dict[str, Any]] = {}
         lcp_binding = getattr(self.lollmsClient, "tools", None)
+        # ── PER-DISCUSSION AUTO-BINDING CACHE ──
+        # The on-demand LCPBinding bootstrap below is expensive (directory walk,
+        # module import, description.yaml parse). Persisting it on the client is
+        # best-effort (the client may expose ``tools`` as a Mock, or a future
+        # code path may replace it). Cache it on the discussion instance so
+        # subsequent turns resolve the SAME instance without a rebuild.
+        if lcp_binding is None:
+            cached_auto = getattr(self, "_auto_lcp_binding", None)
+            if cached_auto is not None and hasattr(cached_auto, "mount_tool_library"):
+                lcp_binding = cached_auto
         if lcp_binding is None and personality is not None:
             from lollms_client.lollms_chat_core import _is_tool_binding
             if _is_tool_binding(getattr(personality, "tools", None)):
@@ -6048,6 +6058,10 @@ class ChatMixin:
                         # Duck-typing on `mount_tool_library` is the required contract.
                         if hasattr(_boot_binding, "mount_tool_library"):
                             lcp_binding = _boot_binding
+                            # Persist on the discussion instance: this is the
+                            # authoritative cache that survives turns even when
+                            # the client-attribute write below is a no-op.
+                            object.__setattr__(self, "_auto_lcp_binding", _boot_binding)
                             try:
                                 if (
                                     hasattr(self.lollmsClient, "tools")
@@ -6072,53 +6086,127 @@ class ChatMixin:
                     # the flag in BOTH containers before the mount; also keep the
                     # session-flag write for office-family gates. All writes are
                     # idempotent dict assignments.
-                    if _flag_value:
-                        try:
-                            _cfg = getattr(lcp_binding, "tools_binding_config", None)
-                            if isinstance(_cfg, dict):
-                                _cfg[_flag_value] = True
-                            _htc = getattr(lcp_binding, "host_tool_configs", None)
-                            if isinstance(_htc, dict):
-                                _htc.setdefault(py_path.parent.name, {})[_flag_value] = True
-                        except Exception:
-                            pass  # Best-effort; the load will warn if the gate blocks
-                        if hasattr(lcp_binding, "set_session_flags"):
-                            lcp_binding.set_session_flags({_flag_value: True})
+                    #
+                    # Skip entirely when the library is already live: the flag was
+                    # delivered at mount time and these containers do not need to
+                    # be rewritten on every prompt.
+                    _gate_stems = getattr(self, "_explicit_mounted_library_stems", set())
+                    if _flag_value and py_path.parent.name not in _gate_stems:
+                        # Skipped entirely when the library was already mounted in this
+                        # conversation: the flag was delivered at mount time and the
+                        # pre-authorization containers do not need rewriting.
+                        _stems_for_gate = getattr(self, "_explicit_mounted_library_stems", set())
+                        _library_already_live = py_path.parent.name in _stems_for_gate
+                        if _flag_value and not _library_already_live:
+                            try:
+                                _cfg = getattr(lcp_binding, "tools_binding_config", None)
+                                if isinstance(_cfg, dict):
+                                    _cfg[_flag_value] = True
+                                _htc = getattr(lcp_binding, "host_tool_configs", None)
+                                if isinstance(_htc, dict):
+                                    _htc.setdefault(py_path.parent.name, {})[_flag_value] = True
+                            except Exception:
+                                pass  # Best-effort; the load will warn if the gate blocks
+                            if hasattr(lcp_binding, "set_session_flags"):
+                                lcp_binding.set_session_flags({_flag_value: True})
 
                     def _specs_from_this_file() -> Dict[str, Dict[str, Any]]:
                         lcp_specs = lcp_binding.to_chat_tool_specs(
                             discussion_instance=self,
                             lollms_client_instance=self.lollmsClient,
                         )
+                        # ── RESILIENT OWNERSHIP MATCH ──
+                        # The spec must be attributed back to the explicit tool path
+                        # the caller passed, even after LCP's discovery cache is
+                        # rebuilt between turns (which can change or drop the
+                        # `_python_file_path` / `library` metadata fields). We
+                        # therefore accept three independent ownership signals:
+                        #   1. Exact source-file match (strongest — the tool was
+                        #      loaded from THIS .py path).
+                        #   2. Library-stem match on the `library` metadata field.
+                        #   3. Tool NAME prefixed by the library stem (e.g.
+                        #      `tool_websearch_*` for the `websearch` library).
+                        # A false positive here is impossible in practice: a tool
+                        # from a DIFFERENT library cannot carry this file's path
+                        # nor a name derived from this library's stem without
+                        # having been explicitly re-homed.
+                        _lib_stem_l = py_path.parent.name.lower()
+                        _py_path_str = str(py_path)
                         matched: Dict[str, Dict[str, Any]] = {}
                         for t_name, t_spec in lcp_specs.items():
                             tool_def = next(
                                 (t for t in lcp_binding.discovered_tools if t.get("name") == t_name),
                                 None,
                             )
-                            if tool_def and (
-                                tool_def.get("_python_file_path") == str(py_path)
-                                or tool_def.get("library") == py_path.parent.name
+                            if not tool_def:
+                                continue
+                            _src = tool_def.get("_python_file_path") or tool_def.get("_source_file") or ""
+                            _lib = str(tool_def.get("library") or "")
+                            if (
+                                _src == _py_path_str
+                                or _lib == py_path.parent.name
+                                or _lib.lower() == _lib_stem_l
+                                or t_name.lower().startswith(f"tool_{_lib_stem_l}_")
+                                or t_name.lower().startswith(f"{_lib_stem_l}_")
                             ):
                                 matched[t_name] = t_spec
                         return matched
 
                     _mount_outcome: Optional[Dict[str, Dict[str, Any]]] = None
                     _mount_fail_reason = ""
+                    # ── IDEMPOTENT MOUNT GUARD (PER-DISCUSSION) ──
+                    # Callers legitimately re-pass tools=[<path>] every turn.
+                    # After the first successful mount, re-mounting imports the
+                    # module and rebuilds the discovery/spec caches again — the
+                    # dominant pre-prompt cost. Track the unique library stems
+                    # already live in this discussion and short-circuit to a
+                    # spec refresh on subsequent turns.
+                    _mounted_stems = getattr(self, "_explicit_mounted_library_stems", None)
+                    if _mounted_stems is None:
+                        _mounted_stems = set()
+                        object.__setattr__(self, "_explicit_mounted_library_stems", _mounted_stems)
+                    _lib_name = py_path.parent.name
+                    _already_mounted = _lib_name in _mounted_stems
                     try:
-                        _lib_name = py_path.parent.name
                         if hasattr(lcp_binding, "mount_tool_library"):
-                            lcp_binding.mount_tool_library(_lib_name)
-                            _mount_outcome = _specs_from_this_file()
-                            if _mount_outcome:
-                                ASCIIColors.success(
-                                    f"[ChatMixin] Mounted library '{_lib_name}' from explicit tool path "
-                                    f"({len(_mount_outcome)} tool(s))."
-                                )
-                            else:
-                                _mount_fail_reason = (
-                                    f"mount_tool_library('{_lib_name}') produced 0 matching tool specs"
-                                )
+                            # ── SELF-HEALING "ALREADY MOUNTED" PATH ──
+                            # Membership in `_mounted_stems` is a hint, not a
+                            # guarantee: the LCP binding may have been rebuilt,
+                            # its discovery cache invalidated, or the previous
+                            # mount may have failed AFTER the stem was recorded
+                            # by an older code path. If the spec refresh comes
+                            # back empty, we MUST NOT trust the set — clear the
+                            # stem and perform a real mount now. Trusting the
+                            # set blindly is exactly the "0 tools visible"
+                            # failure mode.
+                            if _already_mounted:
+                                _mount_outcome = _specs_from_this_file()
+                                if not _mount_outcome:
+                                    _mounted_stems.discard(_lib_name)
+                                    _already_mounted = False
+                                    ASCIIColors.warning(
+                                        f"[ChatMixin] '{_lib_name}' was recorded as mounted but the "
+                                        f"binding has no live specs for it — clearing the marker and "
+                                        f"mounting it for real."
+                                    )
+                            if not _already_mounted:
+                                lcp_binding.mount_tool_library(_lib_name)
+                                _mount_outcome = _specs_from_this_file()
+                                if _mount_outcome:
+                                    # Only mark as mounted once we have PROOF the
+                                    # binding produced specs for this library.
+                                    # Recording the stem on a 0-spec mount would
+                                    # permanently short-circuit every later turn
+                                    # to the empty "refresh" path.
+                                    _mounted_stems.add(_lib_name)
+                                    ASCIIColors.success(
+                                        f"[ChatMixin] Mounted library '{_lib_name}' from explicit tool path "
+                                        f"({len(_mount_outcome)} tool(s))."
+                                    )
+                                else:
+                                    _mount_fail_reason = (
+                                        f"mount_tool_library('{_lib_name}') produced 0 matching tool specs"
+                                    )
                         else:
                             _mount_fail_reason = "binding lacks mount_tool_library()"
                     except Exception as mount_ex:
@@ -7303,13 +7391,13 @@ class ChatMixin:
         elif personality and hasattr(personality, "tools") and isinstance(personality.tools, dict) and not orchestrator_persona:
             active_tools.update(personality.tools)
 
-        # 2. Explicit User-Supplied Tools (Callables, file paths, or structured definitions)
-        if isinstance(tools, dict):
-            active_tools.update(tools)
-        elif isinstance(tools, list):
-            resolved = self._resolve_mixed_tools_list(tools, personality=personality)
-            active_tools.update(resolved)
-
+        # Explicit user-supplied tools are ALREADY resolved inside
+        # `_resolve_active_tools()` (single source of truth). A former duplicate
+        # `_resolve_mixed_tools_list(tools)` call lived here and re-mounted every
+        # explicit `.py` tool path on every prompt — the root cause of the double
+        # "Mounted library '<x>' from explicit tool path" log line and the bulk
+        # of the pre-prompt latency. Do NOT reintroduce a second resolver call
+        # here: if the resolver ever migrates, update `_resolve_active_tools`.
         lcp_binding = getattr(self.lollmsClient, "tools", None)
 
         if debug and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
@@ -7802,8 +7890,11 @@ class ChatMixin:
         native_tools_schema: Optional[List[Dict[str, Any]]] = (
             _tools_specs_to_openai_schema(active_tools) if native_tools_enabled else None
         )
+        # Informational: emitted only in verbose mode. This probe is evaluated on
+        # every prompt, but it is not actionable telemetry for a normal run and
+        # its unconditional emission cluttered the console on every turn.
         if native_tools_enabled:
-            ASCIIColors.info(
+            _dbg(
                 f"[ChatMixin] Native tool-calling enabled via binding "
                 f"'{getattr(_active_llm_binding, 'binding_name', '?')}' "
                 f"({len(native_tools_schema or [])} tool schema(s) forwarded)."

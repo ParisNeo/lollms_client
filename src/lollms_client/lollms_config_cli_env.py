@@ -763,6 +763,42 @@ def _extract_profiles_from_env(
         elif key == "VERIFY_SSL_CERTIFICATE":
             profiles[p_alias].setdefault("binding_config", {})["verify_ssl_certificate"] = _convert_to_bool(v)
 
+    # 🧩 Second pass — binding-declared per-model params (e.g. N_GPU_LAYERS,
+    # CONTEXT_SIZE, FLASH_ATTN, CHAT_FORMAT). These are not in
+    # ``_PROFILE_KNOWN_KEYS`` (they're binding-specific), so the first pass
+    # ignored them. Attribute them to a known profile alias using the longest
+    # alias match, then store under the *lowercased* declared name inside the
+    # profile's ``binding_config`` so spawner bindings receive them verbatim.
+    if profiles:
+        known_profile_aliases = sorted(
+            (a.upper() for a in profiles.keys()),
+            key=len,
+            reverse=True,
+        )
+        for k, v in env_data.items():
+            k_upper = k.upper()
+            if not k_upper.startswith(profile_prefix):
+                continue
+            remainder = k_upper[len(profile_prefix):]
+            matched_alias: Optional[str] = None
+            param_key: Optional[str] = None
+            for raw_alias in known_profile_aliases:
+                marker = f"{raw_alias}_"
+                if remainder.startswith(marker):
+                    matched_alias = raw_alias
+                    param_key = remainder[len(marker):]
+                    break
+            if not matched_alias or not param_key:
+                continue
+            # Skip keys already consumed by the first pass (framework-managed).
+            if param_key in _PROFILE_KNOWN_KEYS:
+                continue
+            if "_ROUTING_" in param_key:
+                # Handled by first pass when alias was recognizable.
+                continue
+            p_alias = _sanitize_alias(matched_alias)
+            profiles[p_alias].setdefault("binding_config", {})[param_key.lower()] = v
+
     resolved_profiles = {}
     if profiles:
         _auto_promote_default(
@@ -776,15 +812,25 @@ def _extract_profiles_from_env(
             b_info = bindings.get(b_alias, {}) if b_alias else {}
             binding_name = p_data.get("binding_name") or b_info.get("binding_name")
             base_b_config = b_info.get("binding_config", {})
-            profile_b_config = {k: v for k, v in p_data.items() if k not in {
-                "binding_alias", "is_default",
-                "vision_enabled", "video_enabled", "image_token_cost",
-                "thinking_enabled", "supported_reasoning_efforts", "default_reasoning_effort",
-                "forced_context_size", "model_name", "instance_name",
-                "binding_name", "routing_config",
-                "tool_calling_enabled", "_default_flag_order",
-            }}
-            merged_b_config = {**base_b_config, **profile_b_config}
+            # The second extraction pass stores binding-declared per-model
+            # params (n_gpu_layers, context_size, …) under a nested
+            # ``binding_config`` dict on ``p_data``. Flatten it into the
+            # merged dict instead of treating it as a sibling key — otherwise
+            # ``merged_b_config`` would carry ``binding_config`` as a nested
+            # value and lose every declared param at the top level, which is
+            # exactly where spawner bindings read them from.
+            profile_nested_b_config = p_data.get("binding_config") or {}
+            profile_b_config = {
+                k: v for k, v in p_data.items() if k not in {
+                    "binding_alias", "is_default",
+                    "vision_enabled", "video_enabled", "image_token_cost",
+                    "thinking_enabled", "supported_reasoning_efforts", "default_reasoning_effort",
+                    "forced_context_size", "model_name", "instance_name",
+                    "binding_name", "routing_config", "binding_config",
+                    "tool_calling_enabled", "_default_flag_order",
+                }
+            }
+            merged_b_config = {**base_b_config, **profile_nested_b_config, **profile_b_config}
             if "model_name" in p_data:
                 merged_b_config["model_name"] = p_data["model_name"]
             # For connection bindings, instance_name maps to model_name conceptually
@@ -1357,9 +1403,9 @@ def _prompt_param(name: str, desc: str, ptype: str, mandatory: bool, default: An
     if desc: ASCIIColors.rich_print(f"[dim]{desc[:120]}{'...' if len(desc)>120 else ''}[/dim]")
     ASCIIColors.rich_print(f"Type: [yellow]{ptype}[/yellow] {'[red](required)[/red]' if mandatory else '[dim](optional)[/dim]'}")
     if ptype == "bool":
-        return _safe_confirm("Enter yes/no:", default if isinstance(default, bool) else False)
+        return _safe_confirm(f"Enable {name} (yes/no):", default if isinstance(default, bool) else False)
     elif ptype in ("int", "float"):
-        ans = _safe_input_or_back("Enter value", str(default) if default is not None else "")
+        ans = _safe_input_or_back(f"Enter {name}", str(default) if default is not None else "")
         if ans is None:
             return _BACK_SENTINEL
         if not ans.strip() and mandatory:
@@ -1373,7 +1419,7 @@ def _prompt_param(name: str, desc: str, ptype: str, mandatory: bool, default: An
             return _convert_value(ans, ptype)
         return coerced
     else:
-        ans = _safe_input_or_back("Enter value", str(default) if default is not None else "")
+        ans = _safe_input_or_back(f"Enter {name}", str(default) if default is not None else "")
         if ans is None:
             return _BACK_SENTINEL
         if not ans.strip() and mandatory:
@@ -2082,8 +2128,15 @@ def _edit_keys_menu(b_type: str, category: str, alias: str, config_map: Dict[str
             if bound_binding_name:
                 for declared in _get_model_profile_schema(b_type, bound_binding_name):
                     pkey = f"{b_type.upper()}_PROFILES_{alias.upper()}_{declared['name'].upper()}"
-                    if pkey not in config_map and declared.get("default") is not None:
-                        config_map[pkey] = _format_env_value(declared["default"])
+                    if pkey in config_map:
+                        continue
+                    default = declared.get("default")
+                    # An empty-string (or missing) default means "no value to
+                    # backfill" — writing "" would create a phantom key the
+                    # user never set and the serializer would skip anyway.
+                    if default is None or (isinstance(default, str) and default == ""):
+                        continue
+                    config_map[pkey] = _format_env_value(default)
 
     while True:
         prefix_upper = f"{b_type.upper()}_{category.upper()}_{alias.upper()}_"
@@ -3166,27 +3219,86 @@ def _reapply_inference_to_existing_profiles(
         ASCIIColors.info("\n  ℹ️ Re-inference cancelled. No changes were made.")
         return
 
+    # Shared framework defaults used to detect "still untouched" values.
+    # A field whose current value matches one of these (case-insensitively)
+    # has not been tuned by the user and may be refreshed by (re-)inference.
+    _FRAMEWORK_DEFAULTS: Dict[str, str] = {
+        "VISION_ENABLED": "false",
+        "VIDEO_ENABLED": "false",
+        "THINKING_ENABLED": "false",
+        "TOOL_CALLING_ENABLED": "false",
+        "IMAGE_TOKEN_COST": "256",
+    }
+
+    def _coerce_compare(value: Any) -> str:
+        """Normalizes a scalar for equality comparison (bool/int vs str)."""
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return str(value).strip().lower()
+
     updated_count = 0
     changed_fields = 0
     for p_alias, model_name in targets:
         caps = _infer_model_capabilities(model_name, b_type, binding_name)
         p_prefix = f"{profile_prefix}{p_alias.upper()}_"
-        was_updated = False
 
-        def _maybe_update(key: str, new_value: str, prior_default: Optional[str]) -> None:
-            """Set only if empty OR current value still matches prior default."""
-            nonlocal was_updated, changed_fields
+        # 🔍 Profile-level user-tuning detection.
+        #
+        # The re-apply action must accomplish BOTH:
+        #   * preserved behaviour for a profile the user has manually tuned,
+        #   * refresh capability for profiles that still carry (possibly
+        #     stale) framework defaults from an earlier run.
+        #
+        # These two states are indistinguishable field-by-field — a user
+        # who sets TOOL_CALLING_ENABLED=false looks identical to one who
+        # never touched it. The reliable signal is *whether ANY field
+        # diverges from what (re-)inference would produce*. A single clear
+        # divergence (e.g. a hand-tuned CTX_SIZE of 65536 where inference
+        # would say 32768) tells us the profile is user-curated; in that
+        # case we preserve every existing value and only fill blank fields.
+        # Otherwise the profile is considered untouched, so fields still at
+        # framework defaults get refreshed.
+        user_tuned = False
+        inferred_ctx = caps.get("forced_context_size")
+        for key, default_val in _FRAMEWORK_DEFAULTS.items():
+            current = config_map.get(p_prefix + key)
+            if current is None or str(current).strip() == "":
+                continue
+            if _coerce_compare(current) != _coerce_compare(default_val):
+                user_tuned = True
+                break
+        if not user_tuned and inferred_ctx:
+            for ctx_key in ("FORCED_CONTEXT_SIZE", "CTX_SIZE"):
+                current_ctx = config_map.get(p_prefix + ctx_key)
+                if current_ctx is None or str(current_ctx).strip() == "":
+                    continue
+                if _coerce_compare(current_ctx) != str(int(inferred_ctx)):
+                    user_tuned = True
+                    break
+
+        def _maybe_update(key: str, new_value: str, framework_default: Optional[str]) -> None:
+            """Fill blanks always; overwrite equal-to-default values only when
+            the profile is *not* user-tuned; otherwise preserve existing."""
+            nonlocal changed_fields
             full = p_prefix + key
             current = config_map.get(full)
             if current is None or str(current).strip() == "":
                 if new_value == "":
                     return
-            elif prior_default is not None and str(current).strip().lower() != str(prior_default).strip().lower():
-                return  # user diverged → preserve
+                config_map[full] = str(new_value)
+                changed_fields += 1
+                return
+            if user_tuned:
+                return  # profile is user-curated → preserve all present values
+            if framework_default is not None and _coerce_compare(current) != _coerce_compare(framework_default):
+                return  # user diverged on this specific field → preserve
             if str(current) != str(new_value):
                 config_map[full] = str(new_value)
-                was_updated = True
                 changed_fields += 1
+
+        # Track whether anything actually changed for this profile: compare
+        # a snapshot before vs after the _maybe_update calls.
+        snapshot = {k: v for k, v in config_map.items() if k.startswith(p_prefix)}
 
         # Vision / video / thinking / tool_calling
         _maybe_update("VISION_ENABLED", "true" if caps["vision_enabled"] else "false", "false")
@@ -3207,7 +3319,8 @@ def _reapply_inference_to_existing_profiles(
                 None,
             )
 
-        if was_updated:
+        post_snapshot = {k: v for k, v in config_map.items() if k.startswith(p_prefix)}
+        if post_snapshot != snapshot:
             updated_count += 1
 
     if updated_count:

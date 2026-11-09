@@ -539,10 +539,18 @@ class TestD4_ExtraKnowledgeBasesSplit:
 class TestD5_HandbagDiscovery:
     """D5: tools/ / rag/ / memory/ discovery rules."""
 
-    def test_tools_excludes_dunder_init_and_recurses_one_level(self, tmp_path):
+    def test_tools_returns_one_entry_per_library_and_skips_dunder_init(self, tmp_path):
         """
-        Doctrine: tools/ picks up `*.py` at the top level and one level deep;
-        `__init__.py` is excluded. Deeper nesting is NOT discovered.
+        Doctrine (current): tools/ yields **one entry per tool library**.
+
+          * A flat ``.py`` file directly under ``tools/`` (a legacy single-file
+            library) is returned as that FILE.
+          * A sub-directory containing at least one non-``__init__`` ``.py``
+            is returned as that FOLDER (the LCP loader resolves it to
+            ``TOOLS.py`` / ``<folder>.py`` / first ``.py`` internally).
+          * ``__init__.py`` at the top level is never surfaced as a library.
+          * Recursion into nested library internals (``sub/deeper/``) does NOT
+            produce a separate entry — the library is ``sub/`` as a whole.
         """
         handbag_root = _make_handbag(tmp_path)
         tools = handbag_root / "tools"
@@ -557,9 +565,17 @@ class TestD5_HandbagDiscovery:
         hb = Handbag(handbag_root)
         names = sorted(p.name for p in hb.tool_files)
 
-        assert names == ["nested.py", "top.py"], (
-            f"Expected top.py + nested.py only; got {names}"
+        # One entry per library: `top` is a flat single-file lib (kept as `.py`),
+        # `sub` is a folder library. `__init__.py` is excluded, and the deep
+        # `buried.py` is NOT surfaced separately (it lives inside `sub/`).
+        assert names == ["sub", "top.py"], (
+            f"Expected folder-library 'sub' + flat file 'top.py'; got {names}"
         )
+        # The folder entry must actually resolve to the `sub/` directory,
+        # not to the nested file inside it.
+        sub_entry = next(p for p in hb.tool_files if p.name == "sub")
+        assert sub_entry.is_dir()
+        assert sub_entry.name == "sub"
 
     def test_rag_recurses_fully_but_skips_dotfiles(self, tmp_path):
         """rag/ uses `rglob("*")` (full recursion) and skips dotfiles."""
