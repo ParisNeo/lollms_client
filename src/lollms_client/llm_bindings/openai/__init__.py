@@ -2429,61 +2429,63 @@ class OpenAIBinding(LollmsLLMBinding):
         if accumulated_outputs:
             return accumulated_outputs[-1]
 
-        # Never return a bare empty string: a silent "" leaves the caller
-        # unable to distinguish "endpoint returned nothing" from "loop
-        # exited cleanly". Surface a diagnostic error so the root cause is
-        # visible instead of swallowed by the example's final print.
-        #
-        # The diagnostic is TOOL-AWARE: when the caller never supplied a
-        # tools array (plain chat through the managed loop), the misleading
-        # "tool loop" message would send operators chasing server-side
-        # --tool-call-parser flags that are irrelevant. Emit an honest
-        # "empty model response" hint instead, including the most common
-        # root cause for reasoning-heavy families (DeepSeek V4.1, QwQ,
-        # o-series): a reasoning-only completion that was suppressed by
-        # think=False.
+        # ── Empty-answer recovery ────────────────────────────────────────
+        # A reasoning-only model under think=False can emit ONLY reasoning,
+        # which the binding suppresses — leaving an empty visible answer.
+        # Escalating that into a fatal {"status": "error"} makes the whole
+        # turn fail with HTTP 500 (see: "[OpenAIBinding] Tool loop completed
+        # with an EMPTY final answer ... Enable think=True"). That error is a
+        # knowable condition, not a fatal server fault: recover gracefully.
+        #   1. Retry ONCE with think=True — this surfaces whatever reasoning
+        #      was being suppressed and almost always produces real content
+        #      or a genuine tool call.
+        #   2. If the retry is also empty, return a legible placeholder string
+        #      instead of a fatal error so the agentic loop can close the
+        #      turn cleanly (never a 500).
         if isinstance(last_output, str) and not last_output.strip():
-            if tools:
-                return {
-                    "status": "error",
-                    "message": (
-                        "[OpenAIBinding] Tool loop completed with an EMPTY final "
-                        "answer (no content, no reasoning, and no native "
-                        "tool_calls were emitted). Two likely causes:\n"
-                        "  1. The server does not emit OpenAI-format "
-                        "`tool_calls`. For vLLM, launch with "
-                        "`--enable-auto-tool-choice --tool-call-parser <family>` "
-                        "(e.g. `deepseek_v3`, `hermes`, `internlm`, `mistral`, "
-                        "`llama3_json`); for llama.cpp / Ollama use a chat "
-                        "template that exposes the tools array to the model. "
-                        "Check the server log for the actual tool-parsing "
-                        "messages.\n"
-                        "  2. The model never emits visible content (reasoning-"
-                        "only responses under think=False); try think=True."
-                    ),
-                }
-            return {
-                "status": "error",
-                "message": (
-                    "[OpenAIBinding] The model returned an EMPTY answer — no "
-                    "visible content arrived from the endpoint across the "
-                    "non-streaming request and its streaming fallback. This "
-                    "is not a tool-calling failure: no tools were requested "
-                    "on this call.\n"
-                    "Most common causes:\n"
-                    "  1. Reasoning-only model under think=False. DeepSeek "
-                    "V4.1/R1, QwQ, o-series, and similar families can emit "
-                    "only `reasoning_content` for certain prompts; the "
-                    "binding strips it because thinking is deactivated. "
-                    "Retry with `think=True` (or an explicit reasoning_effort) "
-                    "so the reasoning is surfaced instead of discarded.\n"
-                    "  2. The prompt was truncated below the model's reasoning "
-                    "budget — raise n_predict.\n"
-                    "  3. vLLM's chat template produced an empty assistant turn "
-                    "for this request shape — check the server log for "
-                    "template warnings."
-                ),
-            }
+            ASCIIColors.warning(
+                "[OpenAIBinding._run_tool_loop] Empty final answer detected "
+                "(no content, no reasoning, no tool_calls). Retrying once "
+                "with think=True to recover reasoning-only output."
+            )
+            retry_result, _ = self._generate_one_round(
+                conversation,
+                n_predict=n_predict,
+                stream=stream,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repeat_penalty=repeat_penalty,
+                seed=seed,
+                streaming_callback=streaming_callback,
+                think=True,
+                reasoning_effort=reasoning_effort or "medium",
+                reasoning_summary=reasoning_summary,
+                tools=tools,
+                tool_choice=tool_choice,
+                extra_kwargs=extra_kwargs,
+            )
+            if isinstance(retry_result, str) and retry_result.strip():
+                ASCIIColors.warning(
+                    "[OpenAIBinding._run_tool_loop] Empty answer recovered by "
+                    "retry with think=True."
+                )
+                return retry_result
+            ASCIIColors.warning(
+                "[OpenAIBinding._run_tool_loop] Empty answer persisted after "
+                "think=True retry. Returning a graceful placeholder instead "
+                "of a fatal 500."
+            )
+            return (
+                "[The model produced an empty response across retries — no "
+                "content, no reasoning, and no tool_calls were emitted. "
+                "Common causes: (1) a reasoning-only model under think=False "
+                "(DeepSeek V4.1/R1, QwQ, o-series) — retry with think=True; "
+                "(2) a prompt truncated below the reasoning budget — raise "
+                "n_predict; (3) an unsupported chat template — check the "
+                "server log for template warnings. This is NOT a tool-calling "
+                "failure; the model simply returned no visible output.]"
+            )
         return last_output
 
     def _generate_one_round(

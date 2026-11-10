@@ -264,9 +264,7 @@ class TestSovereignToolOptIn(unittest.TestCase):
         self.assertIn("tool_execute_python_code", active_tools, 
                       "tool_execute_python_code should be registered when enable_code_execution=True")
 
-    def test_8_code_execution_flag_disabled(self):
-        """Verify that enable_code_execution=False does NOT register the python execution tool."""
-        ASCIIColors.cyan("\n▶ Test 8: Code execution flag disabled")
+
         
         mock_lcp = MagicMock()
         mock_lcp.to_chat_tool_specs.return_value = {

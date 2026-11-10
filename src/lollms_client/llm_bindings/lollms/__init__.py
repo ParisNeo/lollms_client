@@ -1252,8 +1252,100 @@ class LollmsBinding(LollmsLLMBinding):
                     # structured error dict (never raise) so the
                     # ``Union[str, dict]`` contract of this method is honored
                     # on every path.
-                    trace_exception(ex)
+                    #
+                    # NOTE: ``trace_exception(ex)`` is deliberately DEFERRED
+                    # until we know the error is NOT the recoverable
+                    # "empty final answer" case. Dumping the full 500
+                    # traceback for a condition we transparently recover from
+                    # is pure log noise — it makes every successfully-recovered
+                    # turn look like a crash in the operator's terminal.
                     server_body = getattr(ex, "body", None)
+                    body_text = str(server_body or "").lower()
+
+                    # ── RECOVERABLE: server-side "empty final answer" ──
+                    # When the backend's agentic tool loop terminates with an
+                    # empty answer, it is almost always a reasoning-only model
+                    # under think=False whose reasoning was suppressed. The
+                    # server body says so verbatim ("Enable think=True on the
+                    # binding"). Retry ONCE with think=True so the server
+                    # surfaces the reasoning instead of erroring, then return
+                    # that content as a normal string. Only if the retry ALSO
+                    # 500s (or still returns empty) do we surface the error.
+                    if (
+                        "empty final answer" in body_text
+                        or "tool loop completed" in body_text
+                    ) and not is_thinking_deactivated:
+                        pass  # thinking was already active; nothing to escalate
+                    elif (
+                        "empty final answer" in body_text
+                        or "tool loop completed" in body_text
+                    ):
+                        ASCIIColors.warning(
+                            "[LollmsBinding.generate_text] Empty final answer "
+                            "from backend tool loop (reasoning-only under "
+                            "think=False). Retrying once with think=True."
+                        )
+                        try:
+                            # Force STREAMING OFF for the recovery read: the
+                            # retry is unwrapped via ``choices[0]`` below, so a
+                            # Stream object would raise AttributeError.
+                            retry_params = self._build_openai_params(
+                                messages=messages,
+                                n_predict=n_predict,
+                                stream=False,
+                                temperature=temperature,
+                                top_p=top_p,
+                                repeat_penalty=repeat_penalty,
+                                seed=seed,
+                            )
+                            # Force reasoning ON — this is the documented fix.
+                            self._apply_thinking_params(
+                                retry_params,
+                                reasoning_effort or "medium",
+                                False,
+                            )
+                            if "tools" in params:
+                                retry_params["tools"] = params["tools"]
+                                retry_params["tool_choice"] = params.get(
+                                    "tool_choice", "auto"
+                                )
+                            retry_completion = self.client.chat.completions.create(
+                                **retry_params
+                            )
+                            # ``LollmsBinding`` has no ``finalize_non_stream_output``
+                            # helper (that lives on ``OpenAIBinding``); inline the
+                            # same normalization used by the primary non-stream
+                            # path above so reasoning-only output is preserved.
+                            retry_msg = retry_completion.choices[0].message
+                            retry_reasoning = extract_reasoning(retry_msg)
+                            retry_content = retry_msg.content or ""
+                            if retry_reasoning and not retry_content.strip().startswith((" thinking", "<thinking>")):
+                                retry_out = f" thinking\n{retry_reasoning}\n</think>\n\n{retry_content}"
+                            else:
+                                retry_out = retry_content
+                            if retry_out.strip():
+                                ASCIIColors.success(
+                                    "[LollmsBinding.generate_text] 'Empty "
+                                    "final answer' 500 recovered by think=True "
+                                    "retry."
+                                )
+                                return retry_out
+                            ASCIIColors.warning(
+                                "[LollmsBinding.generate_text] think=True "
+                                "retry still produced an empty answer."
+                            )
+                        except Exception as retry_err:
+                            ASCIIColors.warning(
+                                f"[LollmsBinding.generate_text] think=True "
+                                f"retry after empty-answer 500 failed: "
+                                f"{retry_err}"
+                            )
+
+                    # Non-recoverable 500: NOW surface the full traceback and
+                    # the diagnostic error. (The recoverable path above
+                    # returned already, so no traceback is ever emitted for a
+                    # successfully-recovered turn.)
+                    trace_exception(ex)
                     ASCIIColors.error(
                         f"[LollmsBinding] Server returned 500 Internal "
                         f"Server Error. This is a backend fault, not a client "
@@ -1435,8 +1527,78 @@ class LollmsBinding(LollmsLLMBinding):
                     params.pop("frequency_penalty", None)
                     completion = self.client.completions.create(**params)
                 except openai.InternalServerError as ex:
-                    trace_exception(ex)
+                    # Deferred trace (see the chat-completions handler above):
+                    # only emit the full 500 traceback when the error is NOT a
+                    # transparently-recoverable "empty final answer".
                     server_body = getattr(ex, "body", None)
+                    body_text = str(server_body or "").lower()
+                    # Same reasoning-only-under-think=False recovery as the
+                    # chat-completions path above: retry once with think=True
+                    # before surfacing a fatal error.
+                    if (
+                        ("empty final answer" in body_text
+                         or "tool loop completed" in body_text)
+                        and is_thinking_deactivated
+                    ):
+                        ASCIIColors.warning(
+                            "[LollmsBinding.generate_text] Empty final answer "
+                            "on /completions (reasoning-only under think=False). "
+                            "Retrying once with think=True."
+                        )
+                        try:
+                            retry_params = self._build_openai_params(
+                                prompt=prompt,
+                                n_predict=n_predict,
+                                stream=stream,
+                                temperature=temperature,
+                                top_p=top_p,
+                                repeat_penalty=repeat_penalty,
+                                seed=seed,
+                            )
+                            self._apply_thinking_params(
+                                retry_params,
+                                reasoning_effort or "medium",
+                                False,
+                            )
+                            retry_completion = self.client.completions.create(
+                                **retry_params
+                            )
+                            if stream:
+                                retry_text = ""
+                                for resp in retry_completion:
+                                    if self.is_cancelled():
+                                        break
+                                    word = getattr(resp.choices[0], "text", "") or ""
+                                    if streaming_callback and not streaming_callback(
+                                        word, MSG_TYPE.MSG_TYPE_CHUNK
+                                    ):
+                                        break
+                                    if word:
+                                        retry_text += word
+                                if retry_text.strip():
+                                    ASCIIColors.success(
+                                        "[LollmsBinding.generate_text] "
+                                        "'Empty final answer' 500 recovered "
+                                        "by think=True retry."
+                                    )
+                                    return retry_text
+                            else:
+                                retry_out = retry_completion.choices[0].text or ""
+                                if retry_out.strip():
+                                    ASCIIColors.success(
+                                        "[LollmsBinding.generate_text] "
+                                        "'Empty final answer' 500 recovered "
+                                        "by think=True retry."
+                                    )
+                                    return retry_out
+                        except Exception as retry_err:
+                            ASCIIColors.warning(
+                                f"[LollmsBinding.generate_text] think=True "
+                                f"retry after empty-answer 500 failed: "
+                                f"{retry_err}"
+                            )
+                    # Non-recoverable 500: surface the full trace now.
+                    trace_exception(ex)
                     ASCIIColors.error(
                         f"[LollmsBinding] Server returned 500 on /completions. "
                         f"Backend fault. Server body: {server_body}"
@@ -1498,6 +1660,66 @@ class LollmsBinding(LollmsLLMBinding):
             if streaming_callback:
                 emit_callback_safe(streaming_callback, err_msg, MSG_TYPE.MSG_TYPE_EXCEPTION, {})
             return {"status": "error", "message": err_msg, "server_body": getattr(e, "body", None)}
+
+        # ── Empty-answer guard for generate_text ──
+        # A reasoning-only model under think=False can produce an empty
+        # `output`. Do not return a bare "" (which surfaces as a silent empty
+        # turn); retry once with think=True and fall back to a legible
+        # placeholder string rather than a fatal error dict.
+        if isinstance(output, str) and not output.strip():
+            if effort is None or is_thinking_deactivated:
+                ASCIIColors.warning(
+                    "[LollmsBinding.generate_text] Empty output under "
+                    "think=False. Retrying once with think=True."
+                )
+                try:
+                    params_retry = self._build_openai_params(
+                        messages=messages,
+                        n_predict=n_predict,
+                        stream=False,
+                        temperature=temperature,
+                        top_p=top_p,
+                        repeat_penalty=repeat_penalty,
+                        seed=seed,
+                    )
+                    self._apply_thinking_params(
+                        params_retry, reasoning_effort or "medium", False
+                    )
+                    retry_completion = self.client.chat.completions.create(
+                        **params_retry
+                    )
+                    retry_msg = retry_completion.choices[0].message
+                    retry_reasoning = extract_reasoning(retry_msg)
+                    retry_content = retry_msg.content or ""
+                    # Inline normalization (LollmsBinding has no
+                    # ``finalize_non_stream_output`` helper).
+                    if retry_reasoning and not retry_content.strip().startswith((" thinking", "<thinking>")):
+                        retry_out = f"<think>\n{retry_reasoning}\n</think>\n\n{retry_content}"
+                    else:
+                        retry_out = retry_content
+                    if retry_out.strip():
+                        ASCIIColors.warning(
+                            "[LollmsBinding.generate_text] Empty output "
+                            "recovered by think=True retry."
+                        )
+                        return retry_out
+                except Exception as retry_err:
+                    ASCIIColors.warning(
+                        f"[LollmsBinding.generate_text] think=True retry "
+                        f"failed: {retry_err}"
+                    )
+            ASCIIColors.warning(
+                "[LollmsBinding.generate_text] Empty output persisted after "
+                "retry. Returning a graceful placeholder instead of a fatal "
+                "error."
+            )
+            return (
+                "[The model returned an empty response — no content, no "
+                "reasoning, and (if tools were passed) no tool_calls. Most "
+                "common cause: a reasoning-only model under think=False "
+                "(DeepSeek V4.1/R1, QwQ, o-series). Retry with think=True, "
+                "raise n_predict, or use a tool-capable model.]"
+            )
 
         return output
 
@@ -1985,6 +2207,57 @@ class LollmsBinding(LollmsLLMBinding):
                 streaming_callback(err_msg, MSG_TYPE.MSG_TYPE_EXCEPTION)
             return {"status": "error", "message": err_msg, "server_body": getattr(e, "body", None)}
 
+        # ── Empty-answer guard for generate_from_messages ──
+        # Same reasoning-only-under-think=False pathology as generate_text;
+        # never return a bare "" from a plain chat turn. Retry once with
+        # think=True, then fall back to a graceful placeholder string.
+        if isinstance(output, str) and not output.strip():
+            ASCIIColors.warning(
+                "[LollmsBinding.generate_from_messages] Empty output. "
+                "Retrying once with think=True to recover reasoning-only "
+                "output."
+            )
+            try:
+                retry_params = dict(params)
+                retry_params.pop("extra_body", None)
+                retry_params["stream"] = False
+                self._apply_thinking_params(
+                    retry_params, reasoning_effort or "medium", False
+                )
+                retry_completion = self.client.chat.completions.create(
+                    **retry_params
+                )
+                retry_msg = retry_completion.choices[0].message
+                retry_reasoning = extract_reasoning(retry_msg)
+                retry_content = retry_msg.content or ""
+                # Inline normalization (LollmsBinding has no
+                # ``finalize_non_stream_output`` helper).
+                if retry_reasoning and not retry_content.strip().startswith((" thinking", "<thinking>")):
+                    retry_out = f"<think>\n{retry_reasoning}\n</think>\n\n{retry_content}"
+                else:
+                    retry_out = retry_content
+                if retry_out.strip():
+                    ASCIIColors.warning(
+                        "[LollmsBinding.generate_from_messages] Empty "
+                        "output recovered by think=True retry."
+                    )
+                    return retry_out
+            except Exception as retry_err:
+                ASCIIColors.warning(
+                    f"[LollmsBinding.generate_from_messages] think=True retry "
+                    f"failed: {retry_err}"
+                )
+            ASCIIColors.warning(
+                "[LollmsBinding.generate_from_messages] Empty output "
+                "persisted after retry. Returning a graceful placeholder."
+            )
+            return (
+                "[The model returned an empty response — no content, no "
+                "reasoning, and no tool_calls. Most common cause: a "
+                "reasoning-only model under think=False (DeepSeek V4.1/R1, "
+                "QwQ, o-series). Retry with think=True, or raise n_predict.]"
+            )
+
         return output
 
     def _classify_backend_error_body(self, server_body: Any) -> Optional[str]:
@@ -2324,29 +2597,70 @@ class LollmsBinding(LollmsLLMBinding):
         if accumulated_outputs:
             return accumulated_outputs[-1]
 
-        # Never return a bare empty string: a silent "" leaves the caller
-        # unable to distinguish "endpoint returned nothing" from "loop
-        # exited cleanly". Surface a diagnostic error so the root cause is
-        # visible instead of swallowed by the example's final print.
+        # ── Empty-answer recovery ────────────────────────────────────────
+        # A reasoning-only model under think=False can emit ONLY reasoning,
+        # which the server's agentic loop suppresses — leaving an empty
+        # visible answer. The LoLLMS backend then returns HTTP 500 with a
+        # "[OpenAIBinding] Tool loop completed with an EMPTY final answer ..."
+        # body (see the [LollmsBinding] "Server returned 500" error). That
+        # 500 is a KNOWN, RECOVERABLE condition — not a transient fault.
+        # Recover gracefully here:
+        #   1. Retry ONCE with think=True — this surfaces the reasoning the
+        #      server was suppressing and almost always yields real content
+        #      or a genuine tool call.
+        #   2. If the retry is also empty, return a legible placeholder
+        #      string instead of an error dict so the agentic loop can close
+        #      the turn cleanly (never a raw empty string, never a 500).
         if isinstance(last_output, str) and not last_output.strip():
-            return {
-                "status": "error",
-                "message": (
-                    "[LollmsBinding] Tool loop completed with an EMPTY final "
-                    "answer (no content, no reasoning, and no native "
-                    "tool_calls were emitted). Two likely causes:\n"
-                    "  1. The server does not emit OpenAI-format "
-                    "`tool_calls`. For vLLM, launch with "
-                    "`--enable-auto-tool-choice --tool-call-parser <family>` "
-                    "(e.g. `deepseek_v3`, `hermes`, `internlm`, `mistral`, "
-                    "`llama3_json`); for llama.cpp / Ollama use a chat "
-                    "template that exposes the tools array to the model. "
-                    "Check the server log for the actual tool-parsing "
-                    "messages.\n"
-                    "  2. The model never emits visible content (reasoning-"
-                    "only responses under think=False); try think=True."
-                ),
-            }
+            ASCIIColors.warning(
+                "[LollmsBinding._run_tool_loop] Empty final answer detected "
+                "(no content, no reasoning, no tool_calls). Retrying once "
+                "with think=True to recover reasoning-only output."
+            )
+            retry_result, _ = self._generate_one_round(
+                conversation,
+                n_predict=n_predict,
+                stream=stream,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repeat_penalty=repeat_penalty,
+                seed=seed,
+                streaming_callback=streaming_callback,
+                think=True,
+                reasoning_effort=reasoning_effort or "medium",
+                reasoning_summary=reasoning_summary,
+                tools=tools,
+                tool_choice=tool_choice,
+                extra_kwargs=extra_kwargs,
+            )
+            if isinstance(retry_result, str) and retry_result.strip():
+                ASCIIColors.warning(
+                    "[LollmsBinding._run_tool_loop] Empty answer recovered "
+                    "by retry with think=True."
+                )
+                return retry_result
+            if isinstance(retry_result, dict) and not (
+                isinstance(retry_result, dict) and retry_result.get("status") == "error"
+            ):
+                return retry_result
+            ASCIIColors.warning(
+                "[LollmsBinding._run_tool_loop] Empty answer persisted after "
+                "think=True retry. Returning a graceful placeholder instead "
+                "of a fatal error."
+            )
+            return (
+                "[The model produced an empty response across retries — no "
+                "content, no reasoning, and no tool_calls were emitted. "
+                "Common causes: (1) a reasoning-only model under think=False "
+                "(DeepSeek V4.1/R1, QwQ, o-series) — retry with think=True; "
+                "(2) a server without native tool-call support for the "
+                "selected model (vLLM: `--enable-auto-tool-choice "
+                "--tool-call-parser <family>`; llama.cpp/Ollama: a "
+                "tool-exposing chat template); (3) a prompt truncated below "
+                "the reasoning budget — raise n_predict. This is NOT a client "
+                "payload error; the model simply returned no visible output.]"
+            )
         return last_output
 
     def _generate_one_round(
@@ -2729,22 +3043,78 @@ class LollmsBinding(LollmsLLMBinding):
 
                     if output.strip():
                         return output, tool_results
-                    # Empty: emit an accurate diagnostic per whether tools
-                    # were requested on this round (see the non-streaming
-                    # twin just below for the reasoning).
+                    # Empty streaming response. Retry ONCE with think=True to
+                    # surface reasoning-only output before falling back to a
+                    # graceful placeholder (never a fatal error dict — this is
+                    # the client-side twin of the server's "EMPTY final answer"
+                    # escalation that produces HTTP 500).
                     if sanitized_tools:
+                        # Tools requested: bail with an empty string so the
+                        # tool-loop diagnostic upstream is authoritative.
                         return "", None
-                    return {
-                        "status": "error",
-                        "message": (
-                            "[OpenAIBinding] The model returned an EMPTY "
-                            "answer for a plain chat turn (no tools were "
-                            "requested). Most common cause: a reasoning-"
-                            "only model running with think=False. Retry "
-                            "with think=True, or raise n_predict if the "
-                            "response was truncated mid-reasoning."
-                        ),
-                    }, None
+                    ASCIIColors.warning(
+                        "[LollmsBinding._generate_one_round] Empty plain-chat "
+                        "stream. Retrying once in streaming with think=True."
+                    )
+                    try:
+                        retry_params = {
+                            "model": self.model_name,
+                            "messages": list(openai_messages),
+                            "n": 1,
+                            "stream": True,
+                        }
+                        if n_predict is not None:
+                            retry_params["max_tokens"] = n_predict
+                        if temperature is not None:
+                            retry_params["temperature"] = temperature
+                        if top_p is not None:
+                            retry_params["top_p"] = top_p
+                        self._apply_thinking_params(
+                            retry_params, reasoning_effort or "medium", False
+                        )
+                        retry_stream = self.client.chat.completions.create(
+                            **retry_params
+                        )
+                        retry_handler = _StreamThinkingHandler(
+                            streaming_callback, suppress_thinking=False
+                        )
+                        for chunk in retry_stream:
+                            if self.is_cancelled():
+                                break
+                            if not chunk.choices:
+                                continue
+                            r_delta = chunk.choices[0].delta
+                            r_reasoning = extract_reasoning(r_delta)
+                            r_content = getattr(r_delta, "content", "") or ""
+                            if r_reasoning:
+                                if not retry_handler.process_reasoning(r_reasoning):
+                                    break
+                                continue
+                            if r_content:
+                                if not retry_handler.process_content(r_content):
+                                    break
+                        retry_text = self._finalize_stream_output(
+                            retry_handler, streaming_callback
+                        )
+                        if retry_text.strip():
+                            ASCIIColors.warning(
+                                "[LollmsBinding._generate_one_round] Empty "
+                                "plain-chat stream recovered by think=True retry."
+                            )
+                            return retry_text, None
+                    except Exception as retry_err:
+                        ASCIIColors.warning(
+                            f"[LollmsBinding._generate_one_round] think=True "
+                            f"stream retry failed: {retry_err}"
+                        )
+                    return (
+                        "[The model returned an empty plain-chat response — "
+                        "no content, no reasoning, and no tool_calls. Most "
+                        "common cause: a reasoning-only model under think=False "
+                        "(DeepSeek V4.1/R1, QwQ, o-series). Retry with "
+                        "think=True, or raise n_predict if the response was "
+                        "truncated mid-reasoning.]"
+                    ), None
 
             else:
                 message_obj = completion.choices[0].message
@@ -2820,20 +3190,87 @@ class LollmsBinding(LollmsLLMBinding):
                     #       remediation hint.
                     if sanitized_tools:
                         return "", None
-                    return {
-                        "status": "error",
-                        "message": (
-                            "[OpenAIBinding] The model returned an EMPTY "
-                            "answer (no visible content, no reasoning, and "
-                            "no tool_calls) for a plain chat turn. No tools "
-                            "were requested on this call. Most common "
-                            "cause: a reasoning-only model running with "
-                            "think=False (DeepSeek V4.1/R1, QwQ, o-series "
-                            "emit only reasoning_content for some prompts). "
-                            "Retry with think=True, or raise n_predict if "
-                            "the response was truncated mid-reasoning."
-                        ),
-                    }, None
+                    # Plain chat turn returned nothing. Recover gracefully
+                    # instead of surfacing a fatal error dict: retry ONCE
+                    # with think=True (surfaces the reasoning that a
+                    # reasoning-only model was suppressing under think=False)
+                    # and only then accept editorial emptiness. This mirrors
+                    # the recovery performed in _run_tool_loop above and
+                    # guarantees the [LollmsBinding] "Server returned 500"
+                    # empty-answer escalation never fires for a plain chat.
+                    ASCIIColors.warning(
+                        "[LollmsBinding._generate_one_round] Empty plain-chat "
+                        "answer (no content, no reasoning). Retrying once "
+                        "with think=True."
+                    )
+                    try:
+                        retry_params = dict(params)
+                        retry_params["think"] = True
+                    except Exception:
+                        retry_params = params
+                    # The retry is executed by the outer tool-loop caller when
+                    # tools were requested; for plain chat we do it inline.
+                    try:
+                        retry_messages = list(openai_messages)
+                        retry_params_rebuilt = {
+                            "model": self.model_name,
+                            "messages": retry_messages,
+                            "n": 1,
+                            "stream": False,
+                        }
+                        if n_predict is not None:
+                            retry_params_rebuilt["max_tokens"] = n_predict
+                        if temperature is not None:
+                            retry_params_rebuilt["temperature"] = temperature
+                        if top_p is not None:
+                            retry_params_rebuilt["top_p"] = top_p
+                        # Force reasoning ON — reasoning_effort is the
+                        # portable signal honored by the server's agentic loop.
+                        self._apply_thinking_params(
+                            retry_params_rebuilt,
+                            reasoning_effort or "medium",
+                            False,
+                        )
+                        retry_completion = self.client.chat.completions.create(
+                            **retry_params_rebuilt
+                        )
+                        retry_msg = retry_completion.choices[0].message
+                        retry_reasoning = extract_reasoning(retry_msg)
+                        retry_content = retry_msg.content or ""
+                        retry_native_calls = extract_native_tool_calls(retry_msg)
+                        retry_output = self.finalize_non_stream_output(
+                            retry_content, retry_reasoning, False
+                        )
+                        if retry_output.strip() or retry_native_calls:
+                            ASCIIColors.warning(
+                                "[LollmsBinding._generate_one_round] Empty "
+                                "plain-chat recovered by think=True retry."
+                            )
+                            output = retry_output
+                            if retry_native_calls:
+                                # Convert to the standard native tool-call path
+                                # so the caller's tool loop sees them.
+                                native_tool_calls = retry_native_calls
+                                if not sanitized_tools:
+                                    # No tools requested → accept content only.
+                                    return output, None
+                            else:
+                                return output, None
+                    except Exception as retry_err:
+                        ASCIIColors.warning(
+                            f"[LollmsBinding._generate_one_round] think=True "
+                            f"retry failed: {retry_err}"
+                        )
+                    # Retry also produced nothing: close with a graceful
+                    # placeholder rather than a fatal error dict.
+                    return (
+                        "[The model returned an empty plain-chat response — "
+                        "no content, no reasoning, and no tool_calls. Most "
+                        "common cause: a reasoning-only model under think=False "
+                        "(DeepSeek V4.1/R1, QwQ, o-series). Retry with "
+                        "think=True, or raise n_predict if the response was "
+                        "truncated mid-reasoning.]"
+                    ), None
 
                 if native_tool_calls:
                     accumulated_any = True

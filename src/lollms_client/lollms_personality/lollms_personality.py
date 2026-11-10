@@ -2356,6 +2356,30 @@ class _NullToolBinding:
 
 _NULL_TOOL_BINDING = _NullToolBinding()
 
+# Sentinels that explicitly mean "no personality tool binding". A binding whose
+# ``binding_name`` resolves to one of these is a deliberate opt-out (the
+# documented ``_NullToolBinding`` sentinel), NOT a misconfiguration — so the
+# tool-discovery merge must skip it silently instead of emitting a false error.
+_NULL_TOOL_BINDING_NAMES = frozenset({"null", "none", ""})
+
+
+def _is_null_tool_binding(binding: Any) -> bool:
+    """True when ``binding`` is the intentional 'no binding' sentinel.
+
+    Recognises the ``_NullToolBinding`` instance directly, any object exposing
+    a ``binding_name`` in ``{"null", "none", ""}``, and ``None``. Used to gate
+    the tool-merge error path so an explicit opt-out stays silent while a
+    genuinely broken binding still surfaces an error.
+    """
+    if binding is None:
+        return True
+    if isinstance(binding, _NullToolBinding):
+        return True
+    name = getattr(binding, "binding_name", None)
+    if name is None:
+        return False
+    return str(name).strip().lower() in _NULL_TOOL_BINDING_NAMES
+
 
 # ---------------------------------------------------------------------------
 # LollmsPersonality
@@ -4398,19 +4422,67 @@ If the interaction is a task, greeting, or ephemeral request, output:
 
 JSON:"""
 
+            # Force think=True on this auxiliary sub-call: it runs against the
+            # SAME backend as the main turn, and reasoning-only models under
+            # think=False trigger the backend's "empty final answer" 500 on
+            # this tiny extraction prompt. think=True is cheap here (n_predict
+            # is small) and eliminates the failure at the source.
             reflection = self.lollms_client.generate_text(
                 prompt=consolidation_prompt,
                 temperature=0.1,
-                n_predict=256
+                n_predict=256,
+                think=True,
             )
 
             if not isinstance(reflection, str):
                 return
 
             import json as _json
-            json_match = re.search(r'\{.*\}', reflection, re.DOTALL)
-            if json_match:
-                data = _json.loads(json_match.group(0))
+
+            def _first_json_object(text: str):
+                """Return the FIRST brace-balanced ``{...}`` substring that
+                parses as JSON, or ``None``.
+
+                The old ``re.search(r'\\{.*\\}', text, re.DOTALL)`` was greedy:
+                when the model appended a second object (an example, a nested
+                object inside the ``content`` string, or a duplicated reply),
+                it captured from the first ``{`` to the last ``}`` and
+                ``json.loads`` failed with ``Extra data: line 1 column N``.
+                Scanning brace-balanced spans (respecting string literals and
+                escapes) and trying each until one parses is robust to that.
+                """
+                start = text.find("{")
+                while start != -1:
+                    depth = 0
+                    in_string = False
+                    escaped = False
+                    for i in range(start, len(text)):
+                        ch = text[i]
+                        if in_string:
+                            if escaped:
+                                escaped = False
+                            elif ch == "\\":
+                                escaped = True
+                            elif ch == '"':
+                                in_string = False
+                            continue
+                        if ch == '"':
+                            in_string = True
+                        elif ch == "{":
+                            depth += 1
+                        elif ch == "}":
+                            depth -= 1
+                            if depth == 0:
+                                candidate = text[start:i + 1]
+                                try:
+                                    return _json.loads(candidate)
+                                except (_json.JSONDecodeError, ValueError):
+                                    break
+                    start = text.find("{", start + 1)
+                return None
+
+            data = _first_json_object(reflection)
+            if isinstance(data, dict):
                 if data.get("save_memory"):
                     content_to_save = data.get("content", "").strip()
                     task_reject_regex = re.compile(r'^(?:user\s+wants\s+to|user\s+asked\s+to|organize|create|implement|build|fix|add)\b', re.IGNORECASE)
@@ -4476,10 +4548,14 @@ JSON:"""
         )
 
         try:
+            # Force think=True (see _autonomous_memory_consolidation): avoids
+            # the reasoning-only-under-think=False "empty final answer" 500 on
+            # this auxiliary backend call.
             cleanup_response = self.lollms_client.generate_text(
                 prompt=cleanup_prompt,
                 temperature=0.1,
-                n_predict=512
+                n_predict=512,
+                think=True,
             )
 
             if not isinstance(cleanup_response, str) or not cleanup_response.strip():
@@ -5625,7 +5701,7 @@ JSON:"""
                     for t_name in ("tool_execute_python_data_query", "tool_get_table_schema", "tool_query_database_sql"):
                         if t_name in specs:
                             active_tools[t_name] = specs[t_name]
-                    ASCIIColors.info(f"[{self.name}] Mounted database & tabular query tools (data files detected).")
+                    ASCIIColors.debug(f"[{self.name}] Mounted database & tabular query tools (data files detected).")
                 except Exception as ex:
                     ASCIIColors.warning(f"Failed to mount data query tools: {ex}")
 
@@ -6013,7 +6089,15 @@ JSON:"""
         # FAIL-VISIBLE: any failure here (empty specs, exception during
         # spec-building, etc.) is logged loudly because a silent drop is
         # exactly how "my handbag tools are invisible" happens.
-        if self._tool_binding is not None and hasattr(self._tool_binding, "to_chat_tool_specs"):
+        if _is_null_tool_binding(self._tool_binding):
+            # Deliberate 'no binding' opt-out (_NullToolBinding sentinel). The
+            # LCP tools already merged above are authoritative; nothing to
+            # discover here, and an ERROR would be a false alarm on every turn.
+            ASCIIColors.debug(
+                f"[{self.name}] No personality tool binding (null sentinel) — "
+                f"skipping handbag tool discovery; LCP tools remain active."
+            )
+        elif self._tool_binding is not None and hasattr(self._tool_binding, "to_chat_tool_specs"):
             binding_name = getattr(self._tool_binding, "binding_name", type(self._tool_binding).__name__)
             try:
                 personality_specs = self._tool_binding.to_chat_tool_specs(
@@ -6589,7 +6673,7 @@ JSON:"""
                 param_sig = ", ".join([f"{p.get('name')}: {p.get('type', 'any')}{'?' if p.get('optional') else ''}" for p in params_list]) if params_list else ""
                 tool_sections.append(f"• **`{t_name}({param_sig})`**: {desc}")
                 rendered_count += 1
-            ASCIIColors.info(
+            ASCIIColors.debug(
                 f"[{self.name}] Tool schema rendered into system prompt: "
                 f"{rendered_count} tool(s) — "
                 f"{sorted(active_tools.keys())}"
@@ -6999,7 +7083,12 @@ JSON:"""
         # them (e.g. an explicit-allowlist filter, a capability gate, etc.)
         # would make them invisible to the LLM — which is unacceptable for a
         # handbag's own tools. We re-merge here as a hard guarantee.
-        if self._tool_binding is not None and hasattr(self._tool_binding, "to_chat_tool_specs"):
+        if (
+            self._tool_binding is not None
+            and not _is_null_tool_binding(self._tool_binding)
+            and hasattr(self._tool_binding, "to_chat_tool_specs")
+        ):
+            # Genuine (non-null) binding only — the null sentinel is an opt-out.
             try:
                 _survival_specs = self._tool_binding.to_chat_tool_specs(
                     discussion_instance=getattr(self, '_artefact_proxy', None),
@@ -7541,6 +7630,11 @@ JSON:"""
             _generation_succeeded = False
             round_connection_error = None
 
+            # Detect the specific "empty final answer" server body ONCE per
+            # turn so we can flip think=True on the retry and stop the
+            # 500 loop before the connection-error circuit breaker fires.
+            _empty_answer_retry_done = False
+
             for _retry_attempt in range(_max_retries):
                 try:
                     gen_res = self.lollms_client.generate_from_messages(
@@ -7552,6 +7646,27 @@ JSON:"""
                     if isinstance(gen_res, dict):
                         is_conn_dict, conn_reason_dict = _core_is_connection_or_server_error(gen_res)
                         if is_conn_dict:
+                            _body = str(gen_res.get("server_body") or gen_res.get("message") or "").lower()
+                            _is_empty_answer = (
+                                "empty final answer" in _body
+                                or "tool loop completed" in _body
+                            )
+                            if _is_empty_answer and not _empty_answer_retry_done:
+                                # Recoverable: retry ONCE with think=True so
+                                # the server surfaces the reasoning instead of
+                                # 500-ing. Do NOT raise; do NOT trip the
+                                # connection-error breaker.
+                                _empty_answer_retry_done = True
+                                ASCIIColors.warning(
+                                    f"[{self.name}] Backend 'empty final answer' "
+                                    "500 detected. retrying once with think=True."
+                                )
+                                gen_kwargs["think"] = True
+                                gen_kwargs["reasoning_effort"] = (
+                                    gen_kwargs.get("reasoning_effort") or "medium"
+                                )
+                                ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
+                                continue
                             round_connection_error = conn_reason_dict
                             raise ConnectionError(conn_reason_dict)
 
