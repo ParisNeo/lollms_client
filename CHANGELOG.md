@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-10 01:30]
+
+- fix: skip header and code fence for DATA artefacts without token count
+
 ## [2026-11-09 12:00]
 
 - `fix: update client version from v1.22.0 to v1.22.1 for minor release compatibility`

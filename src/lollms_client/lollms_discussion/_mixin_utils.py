@@ -298,7 +298,7 @@ class UtilsMixin:
                 continue
 
             art_tokens = art.get("token_count")
-            if art_tokens is None or atype == ArtefactType.DATA:
+            if art_tokens is None:
                 lang = art.get('language') or ''
                 header = f"###[{atype.capitalize()}] {art['title']} (v{art['version']})\n"
                 fence = f"```{lang}\n{content}\n```" if content else ""
