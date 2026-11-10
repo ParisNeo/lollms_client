@@ -37,8 +37,16 @@ TOOL_LIBRARY_ICON = "📊"
 _MAX_RECIPE_CHARS = 60_000
 _FORBIDDEN_TOKENS = (
     "eval(", "exec(", "compile(", "open(",
-    "os.", "sys.", "subprocess", "shutil", "pathlib", "__",
+    "os.", "sys.", "subprocess", "shutil", "pathlib",
     "globals(", "locals(", "vars(", "getattr(", "setattr(", "delattr(",
+)
+# Block only dangerous dunder access. Harmless dunders (__iter__, __self__,
+# __name__, __init__, __doc__ ...) are legitimately used by recipes that print
+# debug info or introspect objects — a blanket "__" ban rejected them all.
+_FORBIDDEN_DUNDERS = (
+    "__class__", "__globals__", "__subclasses__", "__bases__",
+    "__mro__", "__builtins__", "__import__", "__code__", "__closure__",
+    "__dict__", "__reduce__", "__reduce_ex__", "__getattribute__",
 )
 
 _IMPORT_PREFIX_WHITELIST = ("pptx.",)
@@ -134,8 +142,14 @@ def _check_recipe(recipe: str) -> None:
             raise ValueError(
                 f"Forbidden token '{token}' in recipe. Recipes are plain Python: imports "
                 "are allowed only from the whitelist (pptx.* and safe stdlib modules), "
-                "with no file/system access and no dunder access. Prefer the pre-imported "
-                "design symbols."
+                "with no file/system access. Prefer the pre-imported design symbols."
+            )
+    for dunder in _FORBIDDEN_DUNDERS:
+        if dunder in recipe:
+            raise ValueError(
+                f"Forbidden dunder '{dunder}' in recipe. Object introspection escapes "
+                "(class/subclass/globals walking) are blocked. Harmless dunders like "
+                "__iter__, __self__, __name__, __init__ remain available."
             )
 
 
@@ -331,8 +345,16 @@ def _save_and_verify(obj: Any, save_path: Path) -> Dict[str, Any]:
     except Exception:
         snapshot = None
 
+    # The recipe sandbox installs a no-op `save` shim on the root presentation
+    # so in-recipe `prs.save()` calls are absorbed. That instance attribute
+    # shadows the REAL python-pptx save. Invoke the GENUINE class-level save to
+    # bypass the shim (same pattern as excel_tools/word_tools).
+    real_save = getattr(type(obj), "save", None)
+    if real_save is None:
+        real_save = obj.save
+
     try:
-        obj.save(str(save_path))
+        real_save(obj, str(save_path))
     except Exception as save_error:
         if snapshot is not None:
             try:

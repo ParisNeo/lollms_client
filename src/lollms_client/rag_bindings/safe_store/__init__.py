@@ -557,11 +557,16 @@ class SafeStoreRAGBinding(LollmsRAGBinding):
 
     # ── Context Windows & Full Document Retrieval ─────────────────────────────
 
+    # SafeStore implements both optional context operations below.
+    supports_full_documents: bool = True
+    supports_context_window: bool = True
+    supports_sparql: bool = True
+
     def query_full_documents(
         self,
         query_text: str,
         top_k_docs: int = 3,
-        min_relevance_percent: float = 40.0,
+        min_relevance_percent: float = 0.0,
         **kwargs: Any
     ) -> List[Dict[str, Any]]:
         store = self.get_store()
@@ -584,7 +589,7 @@ class SafeStoreRAGBinding(LollmsRAGBinding):
         top_k_hits: int = 3,
         window_before: int = 1,
         window_after: int = 1,
-        min_relevance_percent: float = 40.0,
+        min_relevance_percent: float = 0.0,
         **kwargs: Any
     ) -> List[Dict[str, Any]]:
         store = self.get_store()

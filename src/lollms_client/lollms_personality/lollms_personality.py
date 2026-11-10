@@ -3678,6 +3678,384 @@ class LollmsPersonality:
                     trace_exception(e)
                     return {"success": False, "error": f"RAG query failed: {e}"}
 
+            def _resolve_store_for_datastore(datasource_name: Optional[str]):
+                """Resolve a datasource_name to a live store-like binding.
+
+                Resolution order:
+                  1. Handbag SafeStore bindings (``safe_store_map``), materializing
+                     deferred dict configs on first use.
+                  2. Plain KB path entries (``kb_path_map``) — a ``.db`` is opened
+                     as a SafeStore binding; non-``.db`` entries are skipped here
+                     (they route through ``query_data`` in the query tool).
+                  3. Declarative data sources (``self.data_sources``).
+                  4. The client's own RAG binding (``self.lollms_client.rag``) when
+                     no per-personality store matches — binding-level RAG.
+                Returns ``None`` when nothing matches.
+                """
+                if datasource_name and datasource_name in safe_store_map:
+                    _st = safe_store_map[datasource_name]
+                    if isinstance(_st, dict):
+                        _db = _st.get("db_path")
+                        if not _db:
+                            return None
+                        _mat = _get_or_create_safestore_binding(Path(_db))
+                        if _mat is not None:
+                            safe_store_map[datasource_name] = _mat
+                        return _mat
+                    return _st
+                if datasource_name and datasource_name in kb_path_map:
+                    _p = kb_path_map[datasource_name]
+                    if Path(_p).suffix.lower() == ".db":
+                        return _get_or_create_safestore_binding(Path(_p))
+                    return None
+                if datasource_name:
+                    for _ds in self.data_sources:
+                        if _ds.name.lower() == datasource_name.lower():
+                            return _ds
+                    return None
+                # No datasource_name: prefer the sole declared source, else the
+                # client's own RAG binding.
+                if len(self.data_sources) == 1:
+                    return self.data_sources[0]
+                if self.lollms_client and getattr(self.lollms_client, "rag", None):
+                    return self.lollms_client.rag
+                return None
+
+            def _store_supports(obj: Any, capability: str, method_name: str) -> bool:
+                """True when the store advertises (and can execute) a capability.
+
+                Honours the ``supports_*`` capability flags declared on the
+                generic ``LollmsRAGBinding`` interface so bindings that do not
+                implement the optional context operations are never advertised
+                (their base-class stubs raise NotImplementedError).
+                """
+                if obj is None:
+                    return False
+                flag = getattr(obj, capability, None)
+                if flag is True:
+                    return True
+                # Undeclared flag: fall back to duck-typing, but ONLY for
+                # non-base objects — a bare LollmsRAGBinding instance has the
+                # base stubs and would falsely signal support.
+                fn = getattr(obj, method_name, None)
+                if not callable(fn):
+                    return False
+                from lollms_client.lollms_rag_binding import LollmsRAGBinding
+                if isinstance(obj, LollmsRAGBinding):
+                    return flag is True
+                return True
+
+            def _normalize_window_entries(raw: Any) -> List[Dict[str, Any]]:
+                """Coerce a store's window/full-doc payload into a list of dicts."""
+                if isinstance(raw, dict):
+                    if "sources" in raw:
+                        return list(raw.get("sources") or [])
+                    return [raw]
+                if isinstance(raw, list):
+                    return [r for r in raw if isinstance(r, dict)]
+                return []
+
+            def _tool_read_rag_document(
+                document_title: str,
+                datasource_name: Optional[str] = None,
+                query: Optional[str] = None,
+                max_chars: int = 0,
+            ) -> dict:
+                """Read the FULL content of a document in a RAG store.
+
+                The chunk returned by tool_query_rag may be a small excerpt; when
+                the model needs the whole file (and its context window allows it),
+                it can retrieve the complete document text here. If `query` is
+                provided, the tool uses it to identify the best-matching document
+                via query_full_documents; otherwise it resolves document_title
+                directly.
+                """
+                try:
+                    max_chars = int(max_chars) if max_chars is not None else 0
+                except (TypeError, ValueError):
+                    max_chars = 0
+
+                if datasource_name is None and len(safe_store_map) + len(kb_path_map) == 1:
+                    datasource_name = next(iter(safe_store_map.keys() or kb_path_map.keys()))
+
+                store = _resolve_store_for_datastore(datasource_name)
+                if store is None:
+                    return {"success": False, "error": f"Datasource '{datasource_name}' not found."}
+                if not _store_supports(store, "supports_full_documents", "query_full_documents"):
+                    return {
+                        "success": False,
+                        "error": (
+                            f"Datasource '{datasource_name or 'default'}' does not support "
+                            "full-document retrieval. Use `tool_expand_rag_context` or "
+                            "`tool_query_rag` instead."
+                        ),
+                    }
+
+                try:
+                    full_text = ""
+                    title = document_title or "Document"
+
+                    # Preferred path: query_full_documents (document aggregation)
+                    lookup_q = query or document_title or ""
+                    if lookup_q:
+                        docs = _normalize_window_entries(
+                            store.query_full_documents(
+                                query_text=lookup_q,
+                                top_k_docs=3,
+                                min_relevance_percent=0.0,
+                            )
+                        )
+                        _want = (document_title or "").strip().lower()
+                        _chosen = None
+                        for d in docs:
+                            _dt = str(d.get("document_title") or d.get("file_path") or "").lower()
+                            if _want and _want in _dt:
+                                _chosen = d
+                                break
+                        if _chosen is None and docs:
+                            _chosen = docs[0]
+                        if _chosen is not None:
+                            full_text = (
+                                _chosen.get("full_text")
+                                or _chosen.get("document_text")
+                                or _chosen.get("chunk_text")
+                                or ""
+                            )
+                            title = _chosen.get("document_title") or title
+
+                    # Fallback: reconstruct via a broad lexical query
+                    if not full_text and hasattr(store, "query"):
+                        _q = query or document_title
+                        if _q:
+                            try:
+                                hits = store.query(_q, top_k=20, min_relevance_percent=0.0)
+                            except TypeError:
+                                hits = store.query(_q, top_k=20)
+                            norm = _normalise_raw(hits, _q, datasource_name or "rag")
+                            if norm.get("sources"):
+                                full_text = "\n\n".join(
+                                    s.get("content", "") for s in norm["sources"]
+                                )
+
+                    if not full_text:
+                        return {
+                            "success": True,
+                            "output": f"No document content found for '{document_title}' in '{datasource_name}'.",
+                        }
+
+                    truncated = False
+                    if max_chars and len(full_text) > max_chars:
+                        full_text = full_text[:max_chars]
+                        truncated = True
+
+                    header = f"=== FULL DOCUMENT: {title} (datasource: {datasource_name}) ==="
+                    if truncated:
+                        header += f" [truncated to {max_chars} chars — raise max_chars to read more]"
+                    return {
+                        "success": True,
+                        "output": f"{header}\n{full_text}\n=== END FULL DOCUMENT ===",
+                        "document_title": title,
+                        "chars": len(full_text),
+                        "truncated": truncated,
+                    }
+                except Exception as e:
+                    trace_exception(e)
+                    return {"success": False, "error": f"Failed to read document: {e}"}
+
+            def _tool_expand_rag_context(
+                query: str,
+                datasource_name: Optional[str] = None,
+                top_k_hits: int = 3,
+                window_before: int = 2,
+                window_after: int = 2,
+                min_relevance_percent: float = 0.0,
+            ) -> dict:
+                """Expand the neighborhoods around the best-matching chunks.
+
+                Use this after tool_query_rag when the returned chunk looks like
+                a middle fragment: this returns the surrounding chunks (before
+                and after) stitched into a coherent passage, so the model can
+                read the continuous context around the hit without pulling the
+                whole document.
+                """
+                try:
+                    top_k_hits = int(top_k_hits) if top_k_hits is not None else 3
+                except (TypeError, ValueError):
+                    top_k_hits = 3
+                try:
+                    window_before = int(window_before) if window_before is not None else 2
+                except (TypeError, ValueError):
+                    window_before = 2
+                try:
+                    window_after = int(window_after) if window_after is not None else 2
+                except (TypeError, ValueError):
+                    window_after = 2
+                try:
+                    min_relevance_percent = float(min_relevance_percent) if min_relevance_percent is not None else 0.0
+                except (TypeError, ValueError):
+                    min_relevance_percent = 0.0
+                top_k_hits = max(1, top_k_hits)
+                window_before = max(0, window_before)
+                window_after = max(0, window_after)
+
+                if datasource_name is None and len(safe_store_map) + len(kb_path_map) == 1:
+                    datasource_name = next(iter(safe_store_map.keys() or kb_path_map.keys()))
+
+                store = _resolve_store_for_datastore(datasource_name)
+                if store is None:
+                    return {"success": False, "error": f"Datasource '{datasource_name}' not found."}
+
+                try:
+                    if not _store_supports(store, "supports_context_window", "query_document_content_window"):
+                        # Graceful fallback: if the store can read full documents,
+                        # that is the closest semantically-equivalent widen.
+                        if _store_supports(store, "supports_full_documents", "query_full_documents"):
+                            return _tool_read_rag_document(
+                                document_title=query,
+                                datasource_name=datasource_name,
+                                query=query,
+                            )
+                        return {
+                            "success": False,
+                            "error": (
+                                f"Datasource '{datasource_name or 'default'}' does not "
+                                "support context-window expansion. Use "
+                                "`tool_query_rag` instead."
+                            ),
+                        }
+
+                    windows = _normalize_window_entries(
+                        store.query_document_content_window(
+                            query_text=query,
+                            top_k_hits=top_k_hits,
+                            window_before=window_before,
+                            window_after=window_after,
+                            min_relevance_percent=min_relevance_percent,
+                        )
+                    )
+
+                    if not windows:
+                        # Graceful degrade to the read-document fallback
+                        return _tool_read_rag_document(
+                            document_title=query,
+                            datasource_name=datasource_name,
+                            query=query,
+                        )
+
+                    parts = []
+                    for i, w in enumerate(windows, 1):
+                        title = w.get("document_title") or w.get("file_path") or "Document"
+                        text = (
+                            w.get("stitched_window_text")
+                            or w.get("chunk_text")
+                            or w.get("text")
+                            or w.get("content")
+                            or ""
+                        )
+                        score = w.get("relevance_score", w.get("score"))
+                        score_str = (
+                            f" (Score: {score:.1f})"
+                            if isinstance(score, (int, float))
+                            else ""
+                        )
+                        parts.append(f"[{i}] {title}{score_str}:\n{text}")
+
+                    return {
+                        "success": True,
+                        "output": "\n\n".join(parts),
+                        "windows_count": len(windows),
+                    }
+                except Exception as e:
+                    trace_exception(e)
+                    return {"success": False, "error": f"Failed to expand context: {e}"}
+
+            def _tool_list_rag_documents(datasource_name: Optional[str] = None) -> dict:
+                """List the documents indexed in a RAG store.
+
+                Use this to discover what documents are available before calling
+                tool_read_rag_document on one of them.
+                """
+                if datasource_name is None and len(safe_store_map) + len(kb_path_map) == 1:
+                    datasource_name = next(iter(safe_store_map.keys() or kb_path_map.keys()))
+
+                store = _resolve_store_for_datastore(datasource_name)
+                if store is None:
+                    return {"success": False, "error": f"Datasource '{datasource_name}' not found."}
+
+                try:
+                    # SafeStore exposes get_database_info() with a documents listing
+                    info = None
+                    if hasattr(store, "get_database_info"):
+                        try:
+                            info = store.get_database_info()
+                        except Exception:
+                            info = None
+                    if info and isinstance(info, dict):
+                        docs_block = info.get("documents") or {}
+                        listing = docs_block.get("list") if isinstance(docs_block, dict) else None
+                        if listing:
+                            lines = [
+                                f"Documents in '{datasource_name}' ({len(listing)}):"
+                            ]
+                            for d in listing:
+                                t = d.get("document_title") or d.get("file_path") or "?"
+                                cc = d.get("chunk_count", "?")
+                                lines.append(f"- {t} ({cc} chunks)")
+                            return {"success": True, "output": "\n".join(lines)}
+
+                    # Fallback: enumerate via a wildcard query
+                    if hasattr(store, "query"):
+                        try:
+                            hits = store.query("*", top_k=200, min_relevance_percent=0.0)
+                        except TypeError:
+                            hits = store.query("*", top_k=200)
+                        norm = _normalise_raw(hits, "*", datasource_name or "rag")
+                        seen = set()
+                        lines = []
+                        for s in norm.get("sources", []):
+                            t = s.get("title") or s.get("source")
+                            if t and t not in seen:
+                                seen.add(t)
+                                lines.append(f"- {t}")
+                        if lines:
+                            return {
+                                "success": True,
+                                "output": f"Documents in '{datasource_name}':\n" + "\n".join(lines),
+                            }
+
+                    return {
+                        "success": True,
+                        "output": f"No documents could be listed for '{datasource_name}'.",
+                    }
+                except Exception as e:
+                    trace_exception(e)
+                    return {"success": False, "error": f"Failed to list documents: {e}"}
+
+            # ── Capability probe: which extended tools to advertise? ──
+            # Probe every reachable store (handbag stores, .db KB paths,
+            # declarative sources, and the client's own RAG binding) and gate
+            # the optional tools on the matching ``supports_*`` flags. This
+            # ensures a binding that raises NotImplementedError on the base
+            # interface never has a tool advertised for it.
+            _probe_stores: List[Any] = []
+            for _st in safe_store_map.values():
+                _probe_stores.append(_st)
+            for _kb in kb_path_map.values():
+                if Path(_kb).suffix.lower() == ".db":
+                    _probe_stores.append(_kb)
+            _probe_stores.extend(self.data_sources)
+            if self.lollms_client and getattr(self.lollms_client, "rag", None):
+                _probe_stores.append(self.lollms_client.rag)
+
+            _can_full_docs = any(
+                _store_supports(s, "supports_full_documents", "query_full_documents")
+                for s in _probe_stores
+            )
+            _can_window = any(
+                _store_supports(s, "supports_context_window", "query_document_content_window")
+                for s in _probe_stores
+            )
+
             tools: Dict[str, Dict[str, Any]] = {
                 "tool_query_rag": {
                     "name": "tool_query_rag",
@@ -3685,7 +4063,10 @@ class LollmsPersonality:
                         "Query external RAG knowledge bases for information.\n"
                         f"Available databases:\n{ds_list_str}\n\n"
                         f"Pass `datasource_name` (one of: {_ds_options}) to target a specific database by name; "
-                        "omit it to query the default knowledge base."
+                        "omit it to query the default knowledge base.\n\n"
+                        "Returns the best-matching chunks. If a returned excerpt is too short or you need the "
+                        "surrounding prose, use `tool_expand_rag_context` (neighborhood) or "
+                        "`tool_read_rag_document` (full document) on the SAME source."
                     ),
                     "parameters": [
                         {"name": "query", "type": "str", "description": "The search query or keywords."},
@@ -3695,8 +4076,69 @@ class LollmsPersonality:
                         {"name": "method", "type": "str", "description": "Retrieval strategy: 'dense' (semantic vectors), 'hybrid' (vectors + BM25 fusion), 'lexical' (BM25 keywords only), 'graph' (knowledge-graph subgraph). Default 'dense'.", "optional": True},
                     ],
                     "callable": _tool_query_rag_unified,
-                }
+                },
+                "tool_list_rag_documents": {
+                    "name": "tool_list_rag_documents",
+                    "description": (
+                        "List the documents indexed in a RAG knowledge base.\n"
+                        "Use this to discover what documents are available before calling "
+                        "tool_read_rag_document on a specific one.\n"
+                        f"Available databases:\n{ds_list_str}"
+                    ),
+                    "parameters": [
+                        {"name": "datasource_name", "type": "str", "description": f"Exact database name. Valid values: {_ds_options}.", "optional": True},
+                    ],
+                    "callable": _tool_list_rag_documents,
+                },
             }
+
+            # ── Extended context tools (capability-gated) ──
+            # Only advertised when a reachable binding advertises the matching
+            # ``supports_*`` flag. This covers the LollmsRAGBinding base case
+            # (whose stubs raise NotImplementedError) without surfacing a tool
+            # that would always fail.
+            if _can_full_docs:
+                tools["tool_read_rag_document"] = {
+                    "name": "tool_read_rag_document",
+                    "description": (
+                        "Read the FULL content of a document stored in a RAG knowledge base.\n"
+                        "Use this when a chunk returned by tool_query_rag is a fragment and the whole "
+                        "document is needed to answer correctly — the full text is returned so you can "
+                        "quote it verbatim.\n"
+                        f"Available databases:\n{ds_list_str}\n\n"
+                        "Provide `document_title` (from a prior tool_query_rag hit) and, optionally, a "
+                        "`query` to help identify the document if the exact title is uncertain. "
+                        "Pass `max_chars` > 0 to cap very large documents."
+                    ),
+                    "parameters": [
+                        {"name": "document_title", "type": "str", "description": "The document title or file name as shown by tool_query_rag (e.g. 'manual.pdf').", "optional": True},
+                        {"name": "datasource_name", "type": "str", "description": f"Exact database name. Valid values: {_ds_options}.", "optional": True},
+                        {"name": "query", "type": "str", "description": "Optional query used to disambiguate the target document if the exact title is uncertain.", "optional": True},
+                        {"name": "max_chars", "type": "int", "description": "Maximum characters to return (0 = no limit). Use to avoid blowing up a small context window.", "optional": True},
+                    ],
+                    "callable": _tool_read_rag_document,
+                }
+
+            if _can_window:
+                tools["tool_expand_rag_context"] = {
+                    "name": "tool_expand_rag_context",
+                    "description": (
+                        "Expand the surrounding context of the best-matching chunks in a RAG knowledge base.\n"
+                        "Use this AFTER tool_query_rag when the returned chunk is a mid-document fragment and "
+                        "you need the preceding and following chunks (the 'neighborhood') to understand it. "
+                        "Returns the surrounding chunks stitched chronologically.\n"
+                        f"Available databases:\n{ds_list_str}"
+                    ),
+                    "parameters": [
+                        {"name": "query", "type": "str", "description": "The query whose hits you want to expand around."},
+                        {"name": "datasource_name", "type": "str", "description": f"Exact database name. Valid values: {_ds_options}.", "optional": True},
+                        {"name": "top_k_hits", "type": "int", "description": "How many top hits to expand (default 3).", "optional": True},
+                        {"name": "window_before", "type": "int", "description": "Number of preceding chunks to include per hit (default 2).", "optional": True},
+                        {"name": "window_after", "type": "int", "description": "Number of succeeding chunks to include per hit (default 2).", "optional": True},
+                        {"name": "min_relevance_percent", "type": "float", "description": "Minimum relevance (0-100) for the seed hits; default 0.", "optional": True},
+                    ],
+                    "callable": _tool_expand_rag_context,
+                }
 
             try:
                 ASCIIColors.info(
@@ -6191,15 +6633,22 @@ JSON:"""
         _safe_stores = getattr(self, "extra_safe_stores", [])
         _kb_paths = getattr(self, "extra_knowledge_bases", [])
 
-        # Idempotent merge: ensure the unified tool_query_rag is present even if
+        # Idempotent merge: ensure the full RAG toolset is present even if
         # build_rag_tools() was bypassed by the app-level fallback path.
-        if "tool_query_rag" not in active_tools and (self.has_data or _safe_stores or _kb_paths):
+        _RAG_TOOL_NAMES = (
+            "tool_query_rag",
+            "tool_read_rag_document",
+            "tool_expand_rag_context",
+            "tool_list_rag_documents",
+        )
+        if any(t not in active_tools for t in _RAG_TOOL_NAMES) and (self.has_data or _safe_stores or _kb_paths):
             try:
-                _unified = self.build_rag_tools()
-                if "tool_query_rag" in _unified:
-                    active_tools["tool_query_rag"] = _unified["tool_query_rag"]
+                _rag_toolset = self.build_rag_tools()
+                for _rt in _RAG_TOOL_NAMES:
+                    if _rt in _rag_toolset and _rt not in active_tools:
+                        active_tools[_rt] = _rag_toolset[_rt]
             except Exception as _merge_err:
-                ASCIIColors.warning(f"[{self.name}] Failed to merge unified tool_query_rag: {_merge_err}")
+                ASCIIColors.warning(f"[{self.name}] Failed to merge RAG toolset: {_merge_err}")
 
         if _safe_stores or _kb_paths:
             try:

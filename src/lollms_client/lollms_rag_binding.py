@@ -181,6 +181,15 @@ class LollmsRAGBinding(LollmsBaseBinding):
 
     # ── Advanced Context & Neighborhood Contract ──────────────────────────────
 
+    # Capability flags — a binding that supports one of the optional context
+    # operations below MUST override the corresponding flag to return True.
+    # Callers (e.g. tool builders) consult these flags to decide whether to
+    # advertise the matching tool, instead of probing the methods and catching
+    # NotImplementedError.
+    supports_full_documents: bool = False
+    supports_context_window: bool = False
+    supports_sparql: bool = False
+
     def query_full_documents(
         self,
         query_text: str,
@@ -190,8 +199,24 @@ class LollmsRAGBinding(LollmsBaseBinding):
     ) -> List[Dict[str, Any]]:
         """
         Aggregates chunk hits up to complete document texts.
+
+        Optional capability. Bindings that do NOT support whole-document
+        retrieval leave ``supports_full_documents = False`` and this method
+        raises ``NotImplementedError`` so callers get an explicit signal
+        rather than a silently-empty result. Bindings that DO support it
+        override both the flag and this method.
+
+        Returns
+        -------
+        List[Dict[str, Any]]
+            Each entry is a document dict, typically containing keys such as
+            ``document_title``, ``full_text``/``document_text``,
+            ``relevance_score`` and any document metadata.
         """
-        return []
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support query_full_documents(...). "
+            "Override it and set `supports_full_documents = True` to enable."
+        )
 
     def query_document_content_window(
         self,
@@ -203,9 +228,25 @@ class LollmsRAGBinding(LollmsBaseBinding):
         **kwargs: Any
     ) -> List[Dict[str, Any]]:
         """
-        Expands chunk hits to include surrounding contiguous chunk neighborhoods.
+        Expands chunk hits to include surrounding contiguous chunk
+        neighborhoods (the chunks immediately before/after each hit).
+
+        Optional capability. Bindings that do NOT support neighborhood
+        expansion leave ``supports_context_window = False`` and this method
+        raises ``NotImplementedError``. Bindings that DO support it override
+        both the flag and this method.
+
+        Returns
+        -------
+        List[Dict[str, Any]]
+            Each entry is a window dict, typically containing keys such as
+            ``document_title``, ``stitched_window_text`` (or ``chunk_text``)
+            and ``relevance_score``.
         """
-        return []
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support query_document_content_window(...). "
+            "Override it and set `supports_context_window = True` to enable."
+        )
 
     # ── Knowledge Graph & SPARQL 1.1 Contract ─────────────────────────────────
 

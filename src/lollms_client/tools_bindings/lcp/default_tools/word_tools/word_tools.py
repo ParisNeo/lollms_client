@@ -46,8 +46,16 @@ TOOL_LIBRARY_ICON = "📝"
 _MAX_RECIPE_CHARS = 60_000
 _FORBIDDEN_TOKENS = (
     "eval(", "exec(", "compile(", "open(",
-    "os.", "sys.", "subprocess", "shutil", "pathlib", "__",
+    "os.", "sys.", "subprocess", "shutil", "pathlib",
     "globals(", "locals(", "vars(", "getattr(", "setattr(", "delattr(",
+)
+# Block only dangerous dunder access. Harmless dunders (__iter__, __self__,
+# __name__, __init__, __doc__ ...) are legitimately used by recipes that print
+# debug info or introspect objects — a blanket "__" ban rejected them all.
+_FORBIDDEN_DUNDERS = (
+    "__class__", "__globals__", "__subclasses__", "__bases__",
+    "__mro__", "__builtins__", "__import__", "__code__", "__closure__",
+    "__dict__", "__reduce__", "__reduce_ex__", "__getattribute__",
 )
 
 _IMPORT_PREFIX_WHITELIST = ("docx.",)
@@ -158,8 +166,14 @@ def _check_recipe(recipe: str) -> None:
             raise ValueError(
                 f"Forbidden token '{token}' in recipe. Recipes are plain Python: imports "
                 "are allowed only from the whitelist (docx.* and safe stdlib modules), "
-                "with no file/system access and no dunder access. Prefer the pre-imported "
-                "design symbols."
+                "with no file/system access. Prefer the pre-imported design symbols."
+            )
+    for dunder in _FORBIDDEN_DUNDERS:
+        if dunder in recipe:
+            raise ValueError(
+                f"Forbidden dunder '{dunder}' in recipe. Object introspection escapes "
+                "(class/subclass/globals walking) are blocked. Harmless dunders like "
+                "__iter__, __self__, __name__, __init__ remain available."
             )
 
 
@@ -728,8 +742,16 @@ def _save_and_verify(
         except Exception:
             pass
 
+    # The recipe sandbox installs a no-op `save` shim on the root object so
+    # in-recipe `doc.save()` calls are absorbed; the harness owns persistence.
+    # That instance attribute shadows the REAL python-docx save, producing a
+    # missing/truncated file. Invoke the GENUINE class-level save captured from
+    # the type, exactly like excel_tools._save_and_verify, to bypass the shim.
+    real_save = getattr(type(obj), "save", None)
+    if real_save is None:
+        real_save = obj.save
     try:
-        obj.save(str(partial_path))
+        real_save(obj, str(partial_path))
     except Exception as save_err:
         try:
             partial_path.unlink(missing_ok=True)

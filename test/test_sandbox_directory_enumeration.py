@@ -63,7 +63,11 @@ def test_listdir_inside_workspace_is_allowed(workspace: Path):
 def test_scandir_inside_workspace_is_allowed(workspace: Path):
     with SandboxContext(workspace_root=workspace, profile="standard"):
         names = sorted(entry.name for entry in os.scandir(str(workspace)))
-    assert names == ["notes.txt", "sub"]
+    # The sandbox installs its own ``.sandbox_cache`` bookkeeping directory
+    # inside the workspace root; it is legitimate sandbox housekeeping, not
+    # part of the user's data. Filter internal entries before asserting.
+    user_visible = [name for name in names if not name.startswith(".sandbox_")]
+    assert user_visible == ["notes.txt", "sub"]
 
 
 def test_walk_inside_workspace_is_allowed(workspace: Path):

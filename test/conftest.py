@@ -18,20 +18,45 @@ import os
 import importlib.abc
 import importlib.machinery
 
+
 # ── 1. Block numexpr to prevent NumPy 2.x binary crash ──
+class _BlockedLoader(importlib.abc.Loader):
+    """
+    Loader that fails only when a blocked module is actually executed.
+
+    Returning a spec (rather than raising from find_spec) preserves the
+    import-machinery contract: find_spec is a non-raising probe used by
+    importlib.util.find_spec() and by every `import` statement. Raising
+    here would escape those probes and can abort an entire pytest session.
+    """
+
+    def __init__(self, name: str):
+        self._name = name
+
+    def create_module(self, spec):
+        return None  # Use default module creation semantics.
+
+    def exec_module(self, module):
+        raise ImportError(
+            f"{self._name} blocked by conftest.py to prevent NumPy 2.x binary crash. "
+            "Pandas will fall back to pure-Python evaluation."
+        )
+
+
 class NumexprBlocker(importlib.abc.MetaPathFinder):
     """Prevents the `numexpr` module from being imported."""
+
+    _BLOCKED_PREFIX = "numexpr"
+
     def find_spec(self, name, path, target=None):
-        if name == "numexpr" or name.startswith("numexpr."):
-            # Return a dummy spec that points to a non-existent loader
-            # This causes ImportError, which pandas handles gracefully
-            raise ImportError(
-                "numexpr blocked by conftest.py to prevent NumPy 2.x binary crash. "
-                "Pandas will fall back to pure-Python evaluation."
-            )
+        # Only intercept numexpr and its submodules. For every other name,
+        # return None so the standard finders continue normally.
+        if name == self._BLOCKED_PREFIX or name.startswith(self._BLOCKED_PREFIX + "."):
+            return importlib.machinery.ModuleSpec(name, _BlockedLoader(name))
         return None
 
-# Install the blocker at the highest priority
+
+# Install the blocker at the highest priority.
 sys.meta_path.insert(0, NumexprBlocker())
 
 # ── 2. Environment variables to suppress warnings ──

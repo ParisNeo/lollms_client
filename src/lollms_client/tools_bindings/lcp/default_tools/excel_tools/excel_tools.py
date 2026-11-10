@@ -45,8 +45,16 @@ TOOL_LIBRARY_ICON = "📈"
 _MAX_RECIPE_CHARS = 60_000
 _FORBIDDEN_TOKENS = (
     "eval(", "exec(", "compile(", "open(",
-    "os.", "sys.", "subprocess", "shutil", "pathlib", "__",
+    "os.", "sys.", "subprocess", "shutil", "pathlib",
     "globals(", "locals(", "vars(", "getattr(", "setattr(", "delattr(",
+)
+# Block only dangerous dunder access. Harmless dunders (__iter__, __self__,
+# __name__, __init__, __doc__ ...) are legitimately used by recipes that print
+# debug info or introspect objects — a blanket "__" ban rejected them all.
+_FORBIDDEN_DUNDERS = (
+    "__class__", "__globals__", "__subclasses__", "__bases__",
+    "__mro__", "__builtins__", "__import__", "__code__", "__closure__",
+    "__dict__", "__reduce__", "__reduce_ex__", "__getattribute__",
 )
 
 _IMPORT_PREFIX_WHITELIST = ("openpyxl.",)
@@ -128,8 +136,14 @@ def _check_recipe(recipe: str) -> None:
             raise ValueError(
                 f"Forbidden token '{token}' in recipe. Recipes are plain Python: imports "
                 "are allowed only from the whitelist (openpyxl.* and safe stdlib modules), "
-                "with no file/system access and no dunder access. Prefer the pre-imported "
-                "design symbols."
+                "with no file/system access. Prefer the pre-imported design symbols."
+            )
+    for dunder in _FORBIDDEN_DUNDERS:
+        if dunder in recipe:
+            raise ValueError(
+                f"Forbidden dunder '{dunder}' in recipe. Object introspection escapes "
+                "(class/subclass/globals walking) are blocked. Harmless dunders like "
+                "__iter__, __self__, __name__, __init__ remain available."
             )
 
 

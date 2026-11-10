@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-10 05:23]
+
+- fix: prevent directory enumeration in tools and RAG bindings
+
 ## [2026-11-10 03:24]
 
 - feat: add sovereign tool opt-in logic to bindings and personality
