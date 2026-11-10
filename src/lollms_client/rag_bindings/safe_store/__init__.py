@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union, Callable
@@ -674,6 +675,113 @@ class SafeStoreRAGBinding(LollmsRAGBinding):
             "chunk_size": self.chunk_size,
             "encrypted": bool(self.encryption_key)
         }
+
+    def list_documents(self) -> List[Dict[str, Any]]:
+        """
+        Enumerates the documents indexed in this SafeStore database.
+
+        Strategy (most-authoritative first):
+          1. Direct ``SELECT ... FROM documents`` against the live store
+             connection — exposes stable identity, paths and metadata that
+             ``get_database_info()`` may omit across safe_store versions.
+          2. Fallback to ``store.get_database_info()['documents']['list']``
+             (documented public shape) when no direct cursor is reachable.
+          3. Empty list on any failure — never raises.
+
+        Each entry is a normalised dict with (best-effort) keys:
+          - ``doc_id``          : int | None
+          - ``document_title``  : str  (always present)
+          - ``file_path``       : str | None
+          - ``chunk_count``     : int | None
+          - ``metadata``        : dict  (empty when unavailable)
+        """
+        try:
+            store = self.get_store()
+        except Exception as e:
+            trace_exception(e)
+            return []
+
+        # --- Strategy 1: direct SQL against the documents table -----------
+        documents: List[Dict[str, Any]] = []
+        cursor_connection = None
+        try:
+            with store:
+                cursor_connection = getattr(store, "conn", None) or getattr(store, "connection", None)
+                if cursor_connection is not None:
+                    cursor = cursor_connection.cursor()
+                    try:
+                        cursor.execute(
+                            "SELECT d.id, d.file_path, d.metadata, "
+                            "COUNT(c.id) AS chunk_count "
+                            "FROM documents d "
+                            "LEFT JOIN chunks c ON c.doc_id = d.id "
+                            "GROUP BY d.id, d.file_path, d.metadata "
+                            "ORDER BY d.id"
+                        )
+                        rows = cursor.fetchall()
+                    finally:
+                        try:
+                            cursor.close()
+                        except Exception:
+                            pass
+
+                    for row in rows:
+                        doc_id = row[0]
+                        file_path = row[1] or ""
+                        metadata: Dict[str, Any] = {}
+                        try:
+                            raw_metadata = row[2]
+                            if raw_metadata:
+                                metadata = (
+                                    raw_metadata
+                                    if isinstance(raw_metadata, dict)
+                                    else json.loads(raw_metadata)
+                                )
+                        except Exception:
+                            metadata = {}
+                        title = (
+                            metadata.get("title")
+                            if isinstance(metadata, dict) and metadata.get("title")
+                            else Path(str(file_path)).name or f"document_{doc_id}"
+                        )
+                        documents.append({
+                            "doc_id": doc_id,
+                            "document_title": title,
+                            "file_path": file_path or None,
+                            "chunk_count": int(row[3]) if row[3] is not None else 0,
+                            "metadata": metadata if isinstance(metadata, dict) else {},
+                        })
+        except Exception as e:
+            trace_exception(e)
+
+        if documents:
+            return documents
+
+        # --- Strategy 2: fallback to get_database_info()['documents'] ------
+        try:
+            info = self.get_database_info()
+            listed = (info or {}).get("documents", {}).get("list", []) or []
+            for entry in listed:
+                if not isinstance(entry, dict):
+                    continue
+                title = (
+                    entry.get("document_title")
+                    or entry.get("title")
+                    or entry.get("file_path")
+                    or entry.get("document_name")
+                    or "Untitled"
+                )
+                documents.append({
+                    "doc_id": entry.get("doc_id"),
+                    "document_title": str(title),
+                    "file_path": entry.get("file_path") or entry.get("path"),
+                    "chunk_count": entry.get("chunk_count"),
+                    "metadata": entry.get("metadata", {}) if isinstance(entry.get("metadata"), dict) else {},
+                })
+        except Exception as e:
+            trace_exception(e)
+
+        return documents
 
     def info(self) -> None:
         store = self.get_store()

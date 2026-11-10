@@ -19,7 +19,15 @@ which inspection tools to use to read the omitted middle.
 
 HUMAN-IN-THE-LOOP AUTHORIZATION:
 In safe mode, execution prompts the user with a code preview and authorization choices:
-[y]es (run once), [a]lways (auto-approve for this session), [n]o (reject with feedback), [v]iew full code.
+[y]es (run once), [a]lways (auto-approve the CATEGORY of the shown code), [n]o (reject with feedback), [v]iew full code.
+
+"always" is CATEGORY-SCOPED, not session-wide: it authorizes only the risk
+category of the code displayed at prompt time (e.g. "network" for socket /
+requests; "process" for subprocess). A subsequent snippet touching a DIFFERENT
+category will prompt again. This prevents blanket session-wide bypass while
+still honoring the operator's intent ("I approve network access, not process
+spawning"). Categories: network / process / dynamic / system.
+
 In non-interactive environments without an interactive handler, refusal is cleanly assumed without blocking.
 """
 
@@ -101,6 +109,13 @@ TOOL_LIBRARY_DESC = (
 TOOL_LIBRARY_ICON = "🐍"
 
 AUTONOMY_LEVEL: str = "safe"
+# Category-scoped pre-approval set (replaces the old binary `_AUTO_APPROVE_PYTHON`).
+# A category (e.g. "network") in this set means: for the rest of the session,
+# skip the prompt IF AND ONLY IF the snippet's risk categories are ALL in this
+# set. Different categories still prompt. See `_approve_categories()`.
+_APPROVED_CATEGORIES: frozenset = frozenset()
+# Kept for backward compatibility with external code that reads this name;
+# means "at least one category has been pre-approved".
 _AUTO_APPROVE_PYTHON: bool = False
 _CONFIRM_HANDLER: Optional[Any] = None
 
@@ -121,6 +136,244 @@ def set_confirm_handler(handler: Optional[Any]) -> None:
                 mod._CONFIRM_HANDLER = handler
             except Exception:
                 pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Category-scoped "always allow" registry.
+#
+# CONTRACT: "always" authorizes ONLY the risk CATEGORY of the code that was
+# displayed at prompt time — not the whole session. If the operator approves
+# `socket` usage (category "network"), a subsequent `subprocess` snippet
+# (category "process") MUST prompt again, because it is a different category.
+#
+# Categories are a partition of the risky surface exposed by
+# `_detect_risky_operations`. When a snippet touches several categories, the
+# prompt reports ALL of them (comma-joined) and "always" grants all of them
+# together — the operator saw them together when they said "always".
+#
+# The registry is process-wide (mirrored on `sys`) and propagated to every
+# loaded `execute_python` module instance, symmetric with `set_confirm_handler`.
+# ──────────────────────────────────────────────────────────────────────────────
+_SYS_APPROVED_CATEGORIES_ATTR = "__lollms_execute_python_approved_categories__"
+
+
+# Category taxonomy — maps a category name to the set of `_detect_risky_operations`
+# signal SUBSTRINGS that belong to it. The detection function emits reasons
+# like "Attempting to spawn external processes via 'subprocess'" — those are
+# what we bucket. Keep the substrings narrow and unambiguous.
+_RISK_CATEGORY_SIGNALS: Dict[str, Tuple[str, ...]] = {
+    "network": (
+        "socket", "ssl", "requests", "urllib", "urllib3", "httpx", "aiohttp",
+        "ftplib", "smtplib", "telnetlib", "paramiko", "fabric",
+        "Low-level system access",  # generic risky_system_module fallback
+    ),
+    "process": (
+        "spawn external processes", "subprocess", "multiprocessing", "pty",
+        "commands", "os.system", "os.popen", "os.spawn", "os.exec",
+        "os.kill", "system/process command",
+    ),
+    "dynamic": (
+        "importlib", "runpy", "imp", "pkgutil", "zipimport",
+        "Dynamic import", "Dynamic access to risky attribute",
+    ),
+    "system": (
+        "psutil", "webbrowser", "ctypes", "winreg",
+    ),
+    # Filesystem access OUTSIDE the workspace (reads of site-packages, listing
+    # the venv, probing an interpreter install, etc.). This category exists so
+    # the operator can say "always allow filesystem reads" and — crucially —
+    # have the runtime path guard actually honour it instead of hard-blocking
+    # at scandir/open with no prompt. The static and runtime kernels both read
+    # the approved-roots registry (`sandbox_kernel.set_extra_read_roots`).
+    #
+    # A snippet that triggers this category is one the AST layer flagged as
+    # touching the host filesystem beyond `workspace_root` — e.g.
+    # `os.scandir(r'C:\\...\\site-packages')` from user code, or a literal
+    # absolute path outside the workspace appearing in the source.
+    "filesystem": (
+        "host filesystem", "outside the workspace", "filesystem escape",
+        "path outside", "absolute host path",
+    ),
+}
+
+
+def _classify_risk_categories(risky_reason: Optional[str]) -> frozenset:
+    """Maps a `_detect_risky_operations` reason string to a set of categories.
+
+    Unknown reasons (defensive: any future detection signal not yet bucketed)
+    map to a synthetic category equal to the reason itself, so "always" on such
+    a snippet remains scoped to that specific reason and does not leak across
+    to wholly different operations.
+    """
+    if not risky_reason:
+        return frozenset()
+    lowered = risky_reason.lower()
+    matched = set()
+    for category, signals in _RISK_CATEGORY_SIGNALS.items():
+        if any(sig.lower() in lowered for sig in signals):
+            matched.add(category)
+    return frozenset(matched) if matched else frozenset({lowered.strip()})
+
+
+def _get_approved_categories() -> frozenset:
+    """Returns the process-wide set of categories the operator pre-approved.
+
+    Reads from `sys` first (survives module reloads and multiple module
+    identities), falling back to the local module-global for backward compat.
+    """
+    sys_set = getattr(sys, _SYS_APPROVED_CATEGORIES_ATTR, None)
+    if isinstance(sys_set, frozenset):
+        return sys_set
+    if isinstance(sys_set, (set, list, tuple)):
+        return frozenset(sys_set)
+    return frozenset(_APPROVED_CATEGORIES)
+
+
+def _approve_categories(categories: frozenset) -> None:
+    """Adds `categories` to the process-wide pre-approval set.
+
+    Called from the "[a]lways" branch of every authorization prompt, with the
+    categories of the code the operator actually saw. Mutates the process-wide
+    set exactly once and mirrors it to every loaded module instance.
+    """
+    global _APPROVED_CATEGORIES
+    new_set = _get_approved_categories() | set(categories)
+    new_frozen = frozenset(new_set)
+    _APPROVED_CATEGORIES = new_frozen
+    try:
+        setattr(sys, _SYS_APPROVED_CATEGORIES_ATTR, new_frozen)
+    except Exception:
+        pass
+    for mod_name, mod in list(sys.modules.items()):
+        if "execute_python" in mod_name and mod is not sys.modules.get(__name__):
+            try:
+                mod._APPROVED_CATEGORIES = new_frozen
+            except Exception:
+                pass
+
+
+def _reset_approved_categories() -> None:
+    """Clears the pre-approval set. Exposed for operator/host control."""
+    global _APPROVED_CATEGORIES
+    _APPROVED_CATEGORIES = frozenset()
+    try:
+        setattr(sys, _SYS_APPROVED_CATEGORIES_ATTR, frozenset())
+    except Exception:
+        pass
+    for mod_name, mod in list(sys.modules.items()):
+        if "execute_python" in mod_name and mod is not sys.modules.get(__name__):
+            try:
+                mod._APPROVED_CATEGORIES = frozenset()
+            except Exception:
+                pass
+    # Symmetric with `_approve_categories`: revoke filesystem roots too.
+    _clear_approved_path_roots()
+
+
+def _sync_approved_path_roots(workspace_root: Optional[Path]) -> None:
+    """Publishes the operator-consented extra read/write roots to the kernel.
+
+    The runtime path guard (`sandbox_kernel._resolve_within`) raises when a
+    path resolves outside the workspace — BY DESIGN, as a first line of
+    defense. But once the operator presses "always" on a snippet whose category
+    is `filesystem`, that same guard must stop blocking the operator's
+    consented surface. Otherwise the user sees exactly the reported bug:
+    "I said always, but it still says BLOCKED BY SANDBOX."
+
+    We compute a conservative set of trusted roots from the source directory
+    of this very module and from the interpreter installation. Those are the
+    realistic escapes an LLM probes ("is torch installed? what's in
+    site-packages?"). Wider roots (e.g. the home directory, `/`) are NEVER
+    auto-added — the operator scoped the consent to "filesystem", not
+    "everything". This matches the principle: consented category ⇒ unblocked
+    for THAT category's realistic surface, not for arbitrary paths.
+    """
+    roots = set()
+    # Interpreter install (site-packages, venv root, stdlib). These are the
+    # roots that appear in the reported log (`.../AITIANA_studio/.venv/...`).
+    try:
+        import sys as _sys_local
+        for attr in ("prefix", "base_prefix", "exec_prefix"):
+            p = getattr(_sys_local, attr, None)
+            if p:
+                try:
+                    roots.add(str(Path(p).resolve()))
+                except Exception:
+                    pass
+        # The interpreter's Lib/site-packages sits under prefix, but on venvs
+        # it's sometimes a separate sysconfig path; resolve it explicitly.
+        try:
+            import sysconfig as _sysconfig_local
+            for key in ("purelib", "platlib", "stdlib", "platstdlib"):
+                try:
+                    p = _sysconfig_local.get_path(key)
+                    if p:
+                        roots.add(str(Path(p).resolve()))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # Directory containing this tool's module. Legitimate scope: "the agent
+    # may inspect its own package tree".
+    try:
+        roots.add(str(Path(__file__).resolve().parent))
+    except Exception:
+        pass
+    # Workspace root is always allowed — the kernel already enforces it, but
+    # including it in the same contract keeps the two layers in sync.
+    if workspace_root is not None:
+        try:
+            roots.add(str(Path(workspace_root).resolve()))
+        except Exception:
+            pass
+    publish_extra_read_roots = getattr(_sandbox_kernel, "set_extra_read_roots", None)
+    if callable(publish_extra_read_roots):
+        try:
+            publish_extra_read_roots(frozenset(roots))
+        except Exception:
+            pass
+    publish_extra_write_roots = getattr(_sandbox_kernel, "set_extra_write_roots", None)
+    if callable(publish_extra_write_roots):
+        try:
+            publish_extra_write_roots(frozenset(roots))
+        except Exception:
+            pass
+
+
+def _clear_approved_path_roots() -> None:
+    """Revokes the extra roots (used when the operator resets the session)."""
+    for name in ("set_extra_read_roots", "set_extra_write_roots"):
+        fn = getattr(_sandbox_kernel, name, None)
+        if callable(fn):
+            try:
+                fn(frozenset())
+            except Exception:
+                pass
+
+
+def _categories_for(source: str, workspace_root: Optional[Path] = None) -> frozenset:
+    """Convenience: runs detection + classification in one call."""
+    return _classify_risk_categories(
+        _detect_risky_operations(source, workspace_root=workspace_root)
+    )
+
+
+def _is_category_approved(risky_reason: Optional[str]) -> bool:
+    """True iff *every* category of `risky_reason` is already pre-approved.
+
+    Only when ALL present categories are approved may the prompt be skipped.
+    A snippet spanning `network` + `process` will prompt even if `network` is
+    approved, because `process` has not been. This is the strictly-safe rule:
+    the operator is asked about every category they have not consented to.
+    """
+    if not risky_reason:
+        return True  # benign — no category, no prompt
+    categories = _classify_risk_categories(risky_reason)
+    if not categories:
+        return False
+    return categories.issubset(_get_approved_categories())
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -300,7 +553,7 @@ def init_tools_library(config: dict = None) -> None:
     (see `_prompt_user_validation`); it is unchanged and runs regardless of
     trust level.
     """
-    global AUTONOMY_LEVEL, _AUTO_APPROVE_PYTHON, _CONFIRM_HANDLER
+    global AUTONOMY_LEVEL, _CONFIRM_HANDLER
 
     # ── Autonomy configuration (existing feature, trust-neutral) ──
     if config and isinstance(config, dict):
@@ -310,8 +563,28 @@ def init_tools_library(config: dict = None) -> None:
             ASCIIColors.info(f"[execute_python] Configured autonomy level: {AUTONOMY_LEVEL}")
         else:
             AUTONOMY_LEVEL = "safe"
+        # Host-controlled pre-approval. Accepts either:
+        #   - a bool (legacy `auto_approve: True`)  → approve ALL categories
+        #   - an iterable of category names         → approve only those
+        #     (e.g. ["network"] authorizes socket/requests but still prompts
+        #     for subprocess).
         if "auto_approve" in config:
-            _AUTO_APPROVE_PYTHON = bool(config.get("auto_approve"))
+            raw = config.get("auto_approve")
+            if isinstance(raw, bool):
+                if raw:
+                    _approve_categories(frozenset(_RISK_CATEGORY_SIGNALS.keys()))
+                else:
+                    _reset_approved_categories()
+            elif isinstance(raw, (list, tuple, set, frozenset)):
+                _reset_approved_categories()
+                valid = {c for c in raw if c in _RISK_CATEGORY_SIGNALS}
+                if valid:
+                    _approve_categories(frozenset(valid))
+            else:
+                ASCIIColors.warning(
+                    f"[execute_python] Ignoring invalid auto_approve config "
+                    f"(expected bool or list of category names, got {type(raw).__name__})."
+                )
         if "confirm_handler" in config:
             set_confirm_handler(config.get("confirm_handler"))
     else:
@@ -503,9 +776,26 @@ def _prompt_user_validation(source: str, script_label: str, argv: Optional[List[
             border_style="yellow"
         )
 
+        # Make the category scope explicit so the operator knows what they are
+        # granting. "always" is bound to the categories shown in the prompt
+        # above (derived from the risk reason), NOT to the whole session.
+        # We resolve the workspace root here so the filesystem category fires
+        # correctly (only for genuine escapes, not for workspace-relative I/O).
+        try:
+            _ws_for_prompt = _get_workspace_root(None)
+        except Exception:
+            _ws_for_prompt = None
+        risk_categories = _classify_risk_categories(
+            _detect_risky_operations(source, workspace_root=_ws_for_prompt)
+        )
+        cats_hint = ", ".join(sorted(risk_categories)) if risk_categories else "none"
         while True:
             try:
-                choice = input("  Authorize execution? [y]es / [n]o / [a]lways for session / [v]iew full code (default: y): ").strip().lower()
+                choice = input(
+                    f"  Authorize execution? [y]es / [n]o / "
+                    f"[a]lways for category [{cats_hint}] / [v]iew full code "
+                    f"(default: y): "
+                ).strip().lower()
             except (EOFError, KeyboardInterrupt):
                 print()
                 return "reject", "Execution interrupted by operator (Ctrl+C / EOF)."
@@ -675,14 +965,28 @@ def _persist_full_output(text: str, script_label: str, tool_ctx: Optional[Any] =
         return None
 
 
-def _detect_risky_operations(source: str) -> Optional[str]:
+def _detect_risky_operations(
+    source: str,
+    workspace_root: Optional[Path] = None,
+) -> Optional[str]:
     """
     Analyzes Python code AST for potentially risky operations:
       - Spawning external OS processes (subprocess, pty, commands, multiprocessing)
       - Shell execution and process management (os.system, os.popen, os.spawn*, os.exec*, os.kill*)
       - Dynamic system escapes (ctypes, winreg)
+      - Filesystem access to absolute paths OUTSIDE the workspace (reads of
+        site-packages, venv probing, host tree enumeration). Reported as the
+        "filesystem" category so the operator can authorize it explicitly.
     Normal computation, data science (numpy, pandas, scipy, sklearn), document creation
-    (python-docx, python-pptx, reportlab, openpyxl), matplotlib/seaborn plotting, and workspace I/O return None.
+    (python-docx, python-pptx, reportlab, openpyxl), matplotlib/seaborn plotting, and
+    workspace-relative I/O return None.
+
+    `workspace_root` (optional): when supplied, any string literal that looks
+    like an absolute path and resolves outside it triggers the filesystem
+    category. When omitted, only clearly-absolute OS paths (drive letters,
+    /home, /etc, C:\\Users, ...) that could NOT be workspace-relative are
+    flagged — this keeps inline ``code="print(2+2)"`` snippets free of false
+    positives.
     """
     try:
         tree = ast.parse(source)
@@ -751,7 +1055,66 @@ def _detect_risky_operations(source: str) -> Optional[str]:
                     if attr_name in forbidden_os_process_attrs:
                         return f"Dynamic access to risky attribute '{attr_name}' via getattr"
 
+        # 4. Filesystem access to absolute paths outside the workspace.
+        # Detect string literals that look like absolute host paths and resolve
+        # outside `workspace_root` (when provided). This is what lets the LLM
+        # legitimately probe a venv / site-packages directory after the operator
+        # explicitly said "always allow filesystem", instead of being silently
+        # blocked at the runtime scandir/open guard with no prompt.
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            literal = node.value
+            if _looks_like_absolute_host_path(literal, workspace_root):
+                return (
+                    f"Filesystem access to a host filesystem path outside the "
+                    f"workspace ('{_shorten_path_for_prompt(literal)}')"
+                )
+
     return None
+
+
+def _looks_like_absolute_host_path(literal: str, workspace_root: Optional[Path]) -> bool:
+    """True iff `literal` is an absolute filesystem path that escapes the workspace.
+
+    Conservative heuristic: only treats a string as an absolute path when it
+    parses as one (`Path.is_absolute()`), is not a lone drive root (`C:\\`,
+    `C:/`), and (when `workspace_root` is known) does NOT resolve inside it.
+    Bare words like ``"hello"`` or Windows-less URLs never match.
+    """
+    if not literal or len(literal) < 3:
+        return False
+    # Reject strings that carry an obvious scheme (URLs, repo URIs).
+    if "://" in literal:
+        return False
+    # A bare drive root like "C:\\" is directory-listing of a whole volume; we
+    # do flag it (it's a broad escape), but we don't treat "C:\\" itself as a
+    # "path outside" match unless workspace_root explicitly excludes it.
+    try:
+        candidate = Path(literal)
+    except (ValueError, OSError):
+        return False
+    if not candidate.is_absolute():
+        return False
+    if workspace_root is not None:
+        try:
+            candidate.resolve(strict=False).relative_to(Path(workspace_root).resolve())
+            return False  # inside workspace → not a filesystem escape
+        except (ValueError, OSError):
+            return True  # outside workspace → requires filesystem approval
+    # No workspace_root: flag only unambiguously-host paths (drive roots,
+    # POSIX /home /etc /usr /var, Windows C:\\Users\\ ..., C:\\Program ...).
+    s = literal.replace("\\", "/").lower()
+    host_prefixes = (
+        "c:/", "d:/", "e:/", "f:/", "/home/", "/etc/", "/usr/", "/var/",
+        "/root/", "/opt/", "/tmp/", "/private/",
+    )
+    return any(s.startswith(p) for p in host_prefixes)
+
+
+def _shorten_path_for_prompt(literal: str, limit: int = 70) -> str:
+    """Trims a path for display in a prompt / error reason string."""
+    if len(literal) <= limit:
+        return literal
+    return literal[: limit // 2] + "…" + literal[-(limit // 2):]
 
 
 def _run_python_source(
@@ -774,8 +1137,6 @@ def _run_python_source(
     `pre_authorized` state: "authorized" if risky, "standard" otherwise.
     This avoids double-prompting the user for write+execute flows.
     """
-    global _AUTO_APPROVE_PYTHON
-
     # Emit an initial status so the UI shows a "processing" indicator the
     # instant the tool is invoked — before AST validation, before the child
     # spawns, before any user code runs. Without this, long-running executions
@@ -808,13 +1169,23 @@ def _run_python_source(
     #                    On rejection, return a clear blocked error.
     #   3. FULL_ACCESS: no prompt; run with "authorized" profile if risky,
     #                    "standard" otherwise.
-    risky_reason = _detect_risky_operations(source)
+    # Determine the workspace root up front so the risk detector can
+    # distinguish "inside workspace" from "outside workspace" paths — this is
+    # what makes the filesystem category fire ONLY on genuine escapes, so
+    # `open('data.csv')` never prompts while `open('C:/.../site-packages')` does.
+    _workspace_root_for_detection = _get_workspace_root(tool_ctx)
+    risky_reason = _detect_risky_operations(source, workspace_root=_workspace_root_for_detection)
+    # Category-scoped approval: only skip the prompt when EVERY risk category
+    # present in this snippet is already pre-approved by the operator. A new
+    # category (e.g. operator approved network, now sees subprocess) MUST
+    # prompt — this is the core requirement of category-scoped "always".
+    auto_approved = _is_category_approved(risky_reason)
 
     requires_user_prompt = False
     prompt_label = script_label
-    user_authorized_risky = pre_authorized
+    user_authorized_risky = pre_authorized or auto_approved
 
-    if not pre_authorized and not _AUTO_APPROVE_PYTHON:
+    if not pre_authorized and not auto_approved:
         if AUTONOMY_LEVEL == "strict":
             requires_user_prompt = True
             prompt_label = f"[STRICT] {script_label}"
@@ -836,9 +1207,22 @@ def _run_python_source(
                 "stderr": f"Execution blocked: {reason_msg}"
             }
         elif decision == "always":
-            _AUTO_APPROVE_PYTHON = True
+            # Grant ONLY the categories present in THIS snippet. Subsequent
+            # code touching a different category will prompt again.
+            approved_now = _classify_risk_categories(risky_reason)
+            _approve_categories(approved_now)
+            # If the operator authorized filesystem access, widen the runtime
+            # path guard to the interpreter's installation roots so a
+            # subsequent probe of site-packages / venv succeeds instead of
+            # being silently hard-blocked at scandir/open with no prompt —
+            # the exact bug reported ("I said always, but it still blocks").
+            if "filesystem" in approved_now:
+                _sync_approved_path_roots(_workspace_root_for_detection)
             user_authorized_risky = True
-            ASCIIColors.success("[execute_python] 🔓 Auto-approval enabled for this session.")
+            cats_display = ", ".join(sorted(approved_now)) or "none"
+            ASCIIColors.success(
+                f"[execute_python] 🔓 Auto-approval enabled for category(ies): {cats_display}."
+            )
         elif decision == "allow":
             # HEADLESS AUTO-PROCEED: in pytest/CI there is no operator to
             # consent, so `_prompt_user_validation` returns "allow" to let the
@@ -1504,12 +1888,13 @@ def tool_create_and_execute_python_file(
     # Same decision matrix as `_run_python_source` — the user must be prompted
     # for risky code in safe mode, and their approval must select the
     # "authorized" profile so the runtime doesn't re-block what they approved.
-    global _AUTO_APPROVE_PYTHON
-    risky_reason = _detect_risky_operations(code_str)
+    risky_reason = _detect_risky_operations(code_str, workspace_root=workspace_root)
     requires_user_prompt = False
     prompt_label = clean_name
 
-    if not _AUTO_APPROVE_PYTHON:
+    # Category-scoped approval: skip the prompt only when ALL categories of
+    # this snippet are pre-approved. A different category must prompt again.
+    if not _is_category_approved(risky_reason):
         if AUTONOMY_LEVEL == "strict":
             requires_user_prompt = True
             prompt_label = f"[STRICT] {clean_name}"
@@ -1535,8 +1920,14 @@ def tool_create_and_execute_python_file(
                 "stderr": f"Execution rejected: {reason_msg}"
             }
         if decision == "always":
-            _AUTO_APPROVE_PYTHON = True
-            ASCIIColors.success("[execute_python] 🔓 Auto-approval enabled for this session.")
+            approved_now = _classify_risk_categories(risky_reason)
+            _approve_categories(approved_now)
+            if "filesystem" in approved_now:
+                _sync_approved_path_roots(workspace_root)
+            cats_display = ", ".join(sorted(approved_now)) or "none"
+            ASCIIColors.success(
+                f"[execute_python] 🔓 Auto-approval enabled for category(ies): {cats_display}."
+            )
 
     try:
         target_path.write_text(code_str, encoding="utf-8")

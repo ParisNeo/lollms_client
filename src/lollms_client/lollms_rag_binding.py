@@ -313,6 +313,24 @@ class LollmsRAGBinding(LollmsBaseBinding):
         """Alias for list_models for conceptual clarity with RAG data stores."""
         return self.list_models()
 
+    def list_documents(self) -> List[Dict[str, Any]]:
+        """
+        Lists the documents currently indexed in this data store.
+
+        Returns
+        -------
+        List[Dict[str, Any]]
+            One dictionary per indexed document. Bindings that support the
+            operation SHOULD return at minimum ``{"document_title": str}``,
+            ideally enriched with stable identity/provenance fields such as
+            ``doc_id``, ``file_path``, ``chunk_count``, ``metadata``.
+
+            Bindings that cannot enumerate their contents leave the default
+            implementation (empty list) in place — callers must handle the
+            empty case gracefully instead of assuming documents exist.
+        """
+        return []
+
 
 class LollmsRAGBindingManager:
     """Manages discovery and instantiation of RAG bindings."""

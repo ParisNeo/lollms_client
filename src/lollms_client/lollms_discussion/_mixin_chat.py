@@ -6325,6 +6325,476 @@ class ChatMixin:
             })
         return inventory
 
+    def _resolve_rag_binding_for_tools(self, datastore: Optional[str] = None):
+        """
+        Resolves a live LollmsRAGBinding for RAG document tools.
+
+        Resolution order (best-effort, never raises):
+          1. An explicit datastore name matched against the personality's
+             registered data sources (self.data_sources / _data_sources).
+          2. The personality's single primary data source (if exactly one).
+          3. The active client's RAG binding (client.rag), when present.
+
+        Returns the binding instance, or None when no RAG store is reachable.
+        """
+        # ── Collect candidate data sources from the personality / self ──
+        candidates: List[Any] = []
+        personality = getattr(self, "_active_personality", None)
+
+        for holder in (personality, self):
+            if holder is None:
+                continue
+            for attr_name in ("data_sources", "_data_sources"):
+                src_map = getattr(holder, attr_name, None)
+                if isinstance(src_map, dict) and src_map:
+                    candidates.extend(src_map.values())
+                elif isinstance(src_map, (list, tuple)) and src_map:
+                    candidates.extend(src_map)
+            # A single-resource attribute (RAGDataSource / binding) may exist too.
+            single = getattr(holder, "data_source", None)
+            if single is not None:
+                candidates.append(single)
+
+        def _unwrap(entry: Any) -> Any:
+            """Extracts the binding instance from a data-source entry."""
+            if entry is None:
+                return None
+            # RAGDataSource exposes .binding or .store or .rag_binding
+            for attr in ("binding", "store", "rag_binding", "rag", "instance"):
+                inner = getattr(entry, attr, None)
+                if inner is not None and hasattr(inner, "list_documents"):
+                    return inner
+            # Direct binding passed through
+            if hasattr(entry, "list_documents"):
+                return entry
+            return None
+
+        normalized = [b for b in (_unwrap(c) for c in candidates) if b is not None]
+
+        # ── 1. Match explicit datastore name ──
+        if datastore:
+            store_key = str(datastore).strip().lower()
+            for binding in normalized:
+                names = {
+                    str(getattr(binding, "binding_name", "") or "").lower(),
+                    str(getattr(binding, "store_name", "") or "").lower(),
+                }
+                for holder in (personality, self):
+                    src_map = getattr(holder, "_data_sources", None)
+                    if isinstance(src_map, dict) and src_map.get(datastore) is not None:
+                        if _unwrap(src_map[datastore]) is binding:
+                            return binding
+                    src_map2 = getattr(holder, "data_sources", None)
+                    if isinstance(src_map2, dict) and src_map2.get(datastore) is not None:
+                        if _unwrap(src_map2[datastore]) is binding:
+                            return binding
+                if store_key in names or any(store_key in n for n in names if n):
+                    return binding
+
+        # ── 2. Single primary data source ──
+        if len(normalized) == 1:
+            return normalized[0]
+        if normalized:
+            # Multiple stores but no datastore argument: prefer one that
+            # exposes list_documents (safe_store) — deterministic first match.
+            for binding in normalized:
+                if hasattr(binding, "list_documents"):
+                    return binding
+
+        # ── 3. Active client RAG binding fallback ──
+        client = getattr(self, "lollmsClient", None)
+        if client is not None:
+            client_rag = getattr(client, "rag", None)
+            if client_rag is not None and hasattr(client_rag, "list_documents"):
+                return client_rag
+        return None
+
+    def _build_rag_document_tools(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Builds the RAG document-introspection tool family:
+          • tool_list_rag_documents        – enumerate indexed documents
+          • tool_read_rag_document         – fetch a document's full text
+          • tool_recover_rag_document      – dump a document to a workspace .md
+
+        Tools are CLOSURES over `self`, so a single registration point covers
+        every turn. Each tool resolves the target store at call time via
+        `_resolve_rag_binding_for_tools`, honouring an optional `datastore`
+        parameter the LLM can pass to disambiguate multiple stores.
+        """
+        from lollms_client.lollms_rag_binding import LollmsRAGBinding  # noqa: F401 — type reference
+
+        def _norm_path(text: str) -> str:
+            return (text or "").replace("\\", "/").strip()
+
+        def tool_list_rag_documents(datastore: str = "") -> Dict[str, Any]:
+            """Lists every document indexed in a RAG data store.
+
+            Parameters
+            ----------
+            datastore : str
+                Optional name of the data source to query. Leave empty when
+                only one store is configured.
+            """
+            binding = self._resolve_rag_binding_for_tools(datastore or None)
+            if binding is None:
+                return {
+                    "success": False,
+                    "error": "No RAG data store is available in this session.",
+                    "documents": [],
+                }
+            try:
+                docs = binding.list_documents()
+            except Exception as ex:
+                trace_exception(ex)
+                return {
+                    "success": False,
+                    "error": _sanitize_host_paths(f"list_documents() failed: {ex}"),
+                    "documents": [],
+                }
+            if not isinstance(docs, list):
+                docs = []
+            # Trim heavy metadata fields for the LLM while preserving essentials.
+            compact = []
+            for d in docs:
+                if not isinstance(d, dict):
+                    continue
+                compact.append({
+                    "doc_id": d.get("doc_id"),
+                    "document_title": d.get("document_title", "Untitled"),
+                    "file_path": d.get("file_path"),
+                    "chunk_count": d.get("chunk_count"),
+                })
+            return {
+                "success": True,
+                "datastore": getattr(binding, "store_name", datastore or ""),
+                "count": len(compact),
+                "documents": compact,
+            }
+
+        def _resolve_document_entry(binding, doc_ref: str) -> Optional[Dict[str, Any]]:
+            """Finds a document entry by doc_id, title or filename substring."""
+            try:
+                docs = binding.list_documents()
+            except Exception:
+                docs = []
+            ref = _norm_path(str(doc_ref)).strip()
+            if not ref:
+                return None
+            ref_lower = ref.lower()
+            # 1. Exact doc_id
+            for d in docs:
+                if not isinstance(d, dict):
+                    continue
+                if str(d.get("doc_id")) == ref:
+                    return d
+            # 2. Exact title / filename
+            for d in docs:
+                title = _norm_path(str(d.get("document_title", ""))).lower()
+                fpath = _norm_path(str(d.get("file_path", ""))).lower()
+                base = Path(fpath).name.lower() if fpath else ""
+                if ref_lower in (title, base):
+                    return d
+            # 3. Substring match on title or file_path
+            for d in docs:
+                title = _norm_path(str(d.get("document_title", ""))).lower()
+                fpath = _norm_path(str(d.get("file_path", ""))).lower()
+                if ref_lower in title or ref_lower in fpath:
+                    return d
+            return None
+
+        def _extract_full_document_text(binding, doc_entry: Dict[str, Any]) -> str:
+            """
+            Best-effort full-text extraction for one document.
+
+            Primary path: `query_full_documents` (safe_store returns the
+            aggregated full_text). Fallback: `query` with the document title
+            as the query and reconstruct_overlapping_chunks enabled.
+            """
+            doc_title = doc_entry.get("document_title") or _norm_path(
+                str(doc_entry.get("file_path", ""))
+            )
+            # Primary: query_full_documents
+            full_docs_fn = getattr(binding, "query_full_documents", None)
+            if callable(full_docs_fn):
+                try:
+                    full_docs = full_docs_fn(
+                        query_text=str(doc_title),
+                        top_k_docs=5,
+                        search_mode="hybrid",
+                        min_relevance_percent=0.0,
+                    )
+                    if isinstance(full_docs, list) and full_docs:
+                        target_id = doc_entry.get("doc_id")
+                        target_title = str(doc_title).lower()
+                        for fd in full_docs:
+                            if not isinstance(fd, dict):
+                                continue
+                            if target_id is not None and fd.get("doc_id") == target_id:
+                                text = fd.get("full_text") or fd.get("chunk_text")
+                                if text:
+                                    return text
+                        # Match by title
+                        for fd in full_docs:
+                            if str(fd.get("document_title", "")).lower() == target_title:
+                                text = fd.get("full_text") or fd.get("chunk_text")
+                                if text:
+                                    return text
+                except Exception as ex:
+                    trace_exception(ex)
+
+            # Fallback: windowed query on the doc title
+            q_fn = getattr(binding, "query", None)
+            if callable(q_fn):
+                try:
+                    hits = q_fn(
+                        query_text=str(doc_title),
+                        top_k=20,
+                        reconstruct_overlapping_chunks=True,
+                    )
+                    if isinstance(hits, list):
+                        target_id = doc_entry.get("doc_id")
+                        for h in hits:
+                            if not isinstance(h, dict):
+                                continue
+                            if target_id is not None and h.get("doc_id") not in (None, target_id):
+                                continue
+                            text = h.get("chunk_text") or h.get("combined_text")
+                            if text:
+                                return text
+                except Exception as ex:
+                    trace_exception(ex)
+            return ""
+
+        def tool_read_rag_document(document: str, datastore: str = "") -> Dict[str, Any]:
+            """Returns the full text of one indexed RAG document.
+
+            Parameters
+            ----------
+            document : str
+                Document id, title, or filename substring.
+            datastore : str
+                Optional data source name.
+            """
+            if not document or not str(document).strip():
+                return {"success": False, "error": "`document` is required (id, title or filename)."}
+            binding = self._resolve_rag_binding_for_tools(datastore or None)
+            if binding is None:
+                return {"success": False, "error": "No RAG data store is available in this session."}
+            entry = _resolve_document_entry(binding, document)
+            if entry is None:
+                return {
+                    "success": False,
+                    "error": f"Document '{document}' not found in the data store.",
+                }
+            text = _extract_full_document_text(binding, entry)
+            if not text:
+                return {
+                    "success": False,
+                    "error": (
+                        f"Could not retrieve the full text of '{entry.get('document_title')}'. "
+                        "The store may not expose full-document text for this entry."
+                    ),
+                    "document": entry,
+                }
+            return {
+                "success": True,
+                "document": {
+                    "doc_id": entry.get("doc_id"),
+                    "document_title": entry.get("document_title"),
+                    "file_path": entry.get("file_path"),
+                    "chunk_count": entry.get("chunk_count"),
+                },
+                "full_text": text,
+                "length": len(text),
+            }
+
+        def tool_recover_rag_document(
+            document: str,
+            output_name: str = "",
+            datastore: str = "",
+        ) -> Dict[str, Any]:
+            """Writes a RAG document's full text to a Markdown file in the workspace.
+
+            The saved .md becomes an artifact and can then be processed by
+            markdown/document tools. Returns the workspace-relative path.
+
+            Parameters
+            ----------
+            document : str
+                Document id, title, or filename substring.
+            output_name : str
+                Optional output filename (defaults to <title>.md).
+            datastore : str
+                Optional data source name.
+            """
+            read_res = tool_read_rag_document(document, datastore=datastore)
+            if not read_res.get("success"):
+                return read_res
+
+            entry = read_res["document"]
+            full_text = read_res["full_text"]
+            title = entry.get("document_title") or f"rag_doc_{entry.get('doc_id', 'x')}"
+            stem = Path(_norm_path(str(title))).stem or f"rag_doc_{entry.get('doc_id', 'x')}"
+            if output_name and str(output_name).strip():
+                md_name = _norm_path(str(output_name)).strip()
+                if not md_name.lower().endswith(".md"):
+                    md_name += ".md"
+            else:
+                md_name = f"{stem}.md"
+
+            # Workspace resolution (mirror the tool-execution CWD contract).
+            if getattr(self, "workspace_data_path", None):
+                ws_dir = Path(self.workspace_data_path)
+            else:
+                base_ws = Path(self.workspace_path) if getattr(self, "workspace_path", None) else Path("./data_workspace")
+                ws_dir = base_ws / self.id / "workspace_data"
+            ws_dir.mkdir(parents=True, exist_ok=True)
+
+            # Normalize: no traversal, no leading slashes.
+            safe_parts = [p for p in md_name.split("/") if p and p not in (".", "..")]
+            if not safe_parts:
+                safe_parts = [f"{stem}.md"]
+            rel_path = "/".join(safe_parts)
+            target = ws_dir / rel_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+
+            _store_label = datastore or ""
+            try:
+                _binding_for_label = self._resolve_rag_binding_for_tools(datastore or None)
+                if _binding_for_label is not None:
+                    _store_label = getattr(_binding_for_label, "store_name", "") or _store_label
+            except Exception:
+                pass
+            if not _store_label:
+                _store_label = "rag"
+
+            header = (
+                f"# {title}\n\n"
+                f"> Recovered from RAG data store `{_store_label}`\n"
+                f"> Source: `{entry.get('file_path') or title}`\n"
+                f"> Doc ID: {entry.get('doc_id')} · Chunks: {entry.get('chunk_count')}\n\n"
+                "---\n\n"
+            )
+            try:
+                target.write_text(header + full_text, encoding="utf-8", errors="ignore")
+            except Exception as ex:
+                trace_exception(ex)
+                return {
+                    "success": False,
+                    "error": _sanitize_host_paths(f"Failed to write '{rel_path}': {ex}"),
+                }
+
+            # Register as a workspace artifact so md/document tools can read it.
+            try:
+                self.artefacts.add(
+                    title=rel_path,
+                    artefact_type=ArtefactType.DOCUMENT,
+                    content=header + full_text,
+                    active=True,
+                    visibility=ArtefactVisibility.FULL,
+                    commit_message=f"Recovered from RAG document '{title}'",
+                )
+                if hasattr(self, "commit"):
+                    self.commit()
+            except Exception as ex:
+                ASCIIColors.warning(
+                    f"[RAGTools] Could not register recovered document '{rel_path}' as an artifact: {ex}"
+                )
+
+            try:
+                object.__setattr__(
+                    self, "_workspace_write_revision",
+                    int(getattr(self, "_workspace_write_revision", 0)) + 1,
+                )
+            except Exception:
+                pass
+
+            return {
+                "success": True,
+                "workspace_path": rel_path,
+                "size_chars": len(header) + len(full_text),
+                "document": entry,
+                "note": (
+                    f"Saved '{rel_path}' in the workspace. Use tool_read_file, "
+                    f"tool_grep_file, or <unlock_file>{rel_path}</unlock_file> to "
+                    f"read it in a structured way."
+                ),
+            }
+
+        return {
+            "tool_list_rag_documents": {
+                "name": "tool_list_rag_documents",
+                "description": (
+                    "Lists every document indexed in a RAG data store (id, title, "
+                    "file path, chunk count). Use this to discover what documents "
+                    "the user can ask about before reading them."
+                ),
+                "parameters": [
+                    {
+                        "name": "datastore",
+                        "type": "string",
+                        "description": "Optional data source name (omit when only one store is configured).",
+                        "optional": True,
+                        "default": "",
+                    },
+                ],
+                "callable": tool_list_rag_documents,
+            },
+            "tool_read_rag_document": {
+                "name": "tool_read_rag_document",
+                "description": (
+                    "Returns the full text of a single indexed RAG document. Identify "
+                    "the document by doc_id, title, or filename substring. Use after "
+                    "tool_list_rag_documents to read a document the user referenced."
+                ),
+                "parameters": [
+                    {
+                        "name": "document",
+                        "type": "string",
+                        "description": "Document id, title, or filename substring.",
+                    },
+                    {
+                        "name": "datastore",
+                        "type": "string",
+                        "description": "Optional data source name.",
+                        "optional": True,
+                        "default": "",
+                    },
+                ],
+                "callable": tool_read_rag_document,
+            },
+            "tool_recover_rag_document": {
+                "name": "tool_recover_rag_document",
+                "description": (
+                    "Recovers a RAG document's full text into a Markdown file in the "
+                    "workspace, making it available to the markdown/document tool "
+                    "family for structured reading (grep, read_lines, unlock)."
+                ),
+                "parameters": [
+                    {
+                        "name": "document",
+                        "type": "string",
+                        "description": "Document id, title, or filename substring.",
+                    },
+                    {
+                        "name": "output_name",
+                        "type": "string",
+                        "description": "Optional output filename (defaults to <title>.md).",
+                        "optional": True,
+                        "default": "",
+                    },
+                    {
+                        "name": "datastore",
+                        "type": "string",
+                        "description": "Optional data source name.",
+                        "optional": True,
+                        "default": "",
+                    },
+                ],
+                "callable": tool_recover_rag_document,
+            },
+        }
+
     def _resolve_active_tools(
         self,
         personality,
@@ -6370,6 +6840,20 @@ class ChatMixin:
 
         if personality and hasattr(personality, "build_rag_tools") and not _persona_active:
             active_tools.update(personality.build_rag_tools())
+
+        # ── 📚 RAG DOCUMENT-INTROSPECTION TOOLS (LIST / READ / RECOVER) ──
+        # Registered independently of personality.build_rag_tools so the LLM
+        # can enumerate and fully read indexed documents in any session that
+        # has a reachable RAG store — even without a personality. The tools
+        # resolve the store at call time, so registering them is cheap.
+        if not _persona_active:
+            _rag_doc_tools_seed_binding = self._resolve_rag_binding_for_tools()
+            if _rag_doc_tools_seed_binding is not None:
+                active_tools.update(self._build_rag_document_tools())
+                _dbg(
+                    f"[ChatMixin] Registered RAG document tools for store "
+                    f"'{getattr(_rag_doc_tools_seed_binding, 'store_name', '?')}'."
+                )
 
         if personality and hasattr(personality, "skills_manager") and personality.skills_manager and not _persona_active:
             sm = personality.skills_manager

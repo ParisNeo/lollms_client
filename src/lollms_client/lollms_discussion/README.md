@@ -372,6 +372,106 @@ I need to check the database schema for the orders table.
 
 ---
 
+### 📚 RAG Document Introspection: List, Read, Recover
+
+`tool_query_rag` retrieves *chunks* by similarity. But sometimes the agent needs to know **what documents exist** in the store, read **one document in full**, or **materialize a document into the workspace** so it can be processed by the markdown/document tool family. Three tools handle that.
+
+They are mounted **automatically** whenever any reachable RAG store exists in the session (a personality data source, or `client.rag`), independent of whether `personality.build_rag_tools()` supplied the query tools. They resolve the store **at call time**, so registering them is free.
+
+| Tool | Purpose | Parameters |
+| :--- | :--- | :--- |
+| `tool_list_rag_documents` | Enumerate every indexed document (id, title, file path, chunk count). | `datastore=""` (optional store name) |
+| `tool_read_rag_document` | Return the **full text** of one document, identified by id / title / filename substring. | `document` (required), `datastore=""` |
+| `tool_recover_rag_document` | Write a document's full text to a **`.md` file in the workspace** and register it as an artefact so markdown/document tools can read it structurally. | `document` (required), `output_name=""`, `datastore=""` |
+
+#### Why these exist
+
+- **Discovery before retrieval.** Pre-hydration and `tool_query_rag` assume the agent already knows what's in the store. `tool_list_rag_documents` lets it *look first* — "what can the user ask about?" — instead of firing blind semantic queries.
+- **Full-document reading.** Chunk retrieval fragments a document. `tool_read_rag_document` returns the whole text (via `query_full_documents`, with a `query(reconstruct_overlapping_chunks=True)` fallback), so the agent can reason over the complete source.
+- **Hand-off to structured tools.** Once recovered as `.md` in the workspace, a document flows straight into `tool_read_file`, `tool_grep_file`, `<unlock_file>`, or the `markdown_tools` library — grep, read-by-line, section extraction — instead of being re-queried chunk by chunk.
+
+#### Tool family discovery flow
+
+```
+User: "What documents do you have on billing, and read me the refund policy in full."
+        │
+        ▼
+tool_list_rag_documents()              →  [{doc_id: 7, document_title: "refund_policy.md", ...}, ...]
+        │
+        ▼
+tool_read_rag_document("refund_policy") →  full_text (whole document)
+        │
+        ├─ (answer directly from full_text)
+        │
+        └─ tool_recover_rag_document("refund_policy")
+                │  → writes refund_policy.md + registers artefact (visibility FULL)
+                ▼
+           tool_read_file / tool_grep_file / <unlock_file>
+                │
+                ▼
+           structured markdown processing (sections, tables, links)
+```
+
+#### Example 1: List what's indexed
+
+```xml
+<tool>{"name": "tool_list_rag_documents", "parameters": {}}</tool>
+```
+
+Result:
+
+```json
+{
+  "success": true,
+  "datastore": "/data/kb/billing.db",
+  "count": 3,
+  "documents": [
+    {"doc_id": 7,  "document_title": "refund_policy.md", "file_path": "policies/refund_policy.md", "chunk_count": 24},
+    {"doc_id": 8,  "document_title": "invoice_fields.md", "file_path": "specs/invoice_fields.md", "chunk_count": 11},
+    {"doc_id": 12, "document_title": "tax_rules.pdf",     "file_path": "legal/tax_rules.pdf",        "chunk_count": 57}
+  ]
+}
+```
+
+#### Example 2: Read one document in full
+
+```xml
+<tool>{"name": "tool_read_rag_document", "parameters": {"document": "refund_policy"}}</tool>
+```
+
+The `document` argument matches in this order: exact `doc_id` → exact title / filename → substring of title or file path. So `"refund"`, `"refund_policy"`, `"refund_policy.md"`, or `"7"` all resolve to the same document.
+
+#### Example 3: Recover a document into the workspace as Markdown
+
+```xml
+<tool>{"name": "tool_recover_rag_document", "parameters": {"document": "tax_rules", "output_name": "tax_rules_recovered.md"}}</tool>
+```
+
+Result:
+
+```json
+{
+  "success": true,
+  "workspace_path": "tax_rules_recovered.md",
+  "size_chars": 48213,
+  "document": {"doc_id": 12, "document_title": "tax_rules.pdf", "file_path": "legal/tax_rules.pdf", "chunk_count": 57},
+  "note": "Saved 'tax_rules_recovered.md' in the workspace. Use tool_read_file, tool_grep_file, or <unlock_file>tax_rules_recovered.md</unlock_file> to read it in a structured way."
+}
+```
+
+The recovered file:
+
+- is written to `data_workspace/discussions/{id}/workspace_data/{output_name}.md`,
+- carries a provenance header (`# Title`, store name, source path, doc id, chunk count),
+- is registered as a `DOCUMENT` artefact with `FULL` visibility so it enters context immediately,
+- applies path-traversal sanitization (`..` / absolute segments are stripped) before writing.
+
+> 💡 **Multi-store sessions**: pass `datastore="<name>"` to target a specific knowledge base. Without it, the tool resolves the single configured store, or the first store exposing `list_documents`, or the active `client.rag` binding — in that order.
+
+> 🔌 **Binding contract**: the list tool calls `LollmsRAGBinding.list_documents()` — the standard interface method implemented by `SafeStoreRAGBinding` (direct SQL against the `documents` table, with a `get_database_info()` fallback). Any RAG binding that implements it gets these tools for free; bindings that don't simply return `[]`, and the tools degrade to a clean "no documents" response.
+
+---
+
 ### 📊 RAG Parameters & Configuration Options
 
 | Parameter | Type | Default | Description |
@@ -2675,6 +2775,8 @@ response = discussion.chat(
 
 print(response["ai_message"].content)
 ```
+
+> 📚 **What's in the store?** Whenever a RAG store is reachable, the session also mounts three document-introspection tools — `tool_list_rag_documents`, `tool_read_rag_document` (full text), and `tool_recover_rag_document` (dump to a workspace `.md` for markdown tools). See [RAG Document Introspection](#-rag-document-introspection-list-read-recover).
 
 ---
 

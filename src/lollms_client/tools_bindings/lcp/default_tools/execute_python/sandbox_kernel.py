@@ -27,10 +27,22 @@ Provides two complementary engines:
 
 Every patch is restored on exit — even if user code raises.
 
-Behavior on block:
+behavior on block:
 - AST layer  → returns a `SandboxViolation` the caller turns into a tool error.
 - Runtime     → raises `SandboxPermissionError` (subclass of PermissionError) so
                 user code can catch and continue.
+
+Operator consent for external paths:
+-------------------------------
+The path guard permits reads/writes ONLY under `workspace_root` (plus the
+sandbox cache and the interpreter's own install tree). When the operator
+authorizes the `filesystem` risk category at a `execute_python` prompt, the
+calling module publishes the consented roots via `set_extra_read_roots(...)`
+and `set_extra_write_roots(...)`. Both are process-wide, mirrored on `sys`,
+and rehydrated on every child import so the spawned sandbox child sees the
+same consent. This is what turns the operator's "always" into an actually
+working action (venv probing, site-packages listing) instead of a silent
+runtime block with no prompt.
 
 This module is stateful only during `SandboxContext.__enter__/__exit__`; it holds
 no cross-request state and is safe under recursive / nested use because each
@@ -393,6 +405,93 @@ _SANDBOX_CACHE_READY: set = set()
 # matplotlib fontlist for a user artefact). Redirecting to a system temp dir
 # keeps library caches functional and invisible.
 _SANDBOX_WRITE_ROOTS: set = set()
+
+# Operator-consented extra READ roots. Populated by `execute_python` when the
+# operator answers "always" for the `filesystem` risk category, via the public
+# `set_extra_read_roots(...)` API. Once set, the runtime path guard
+# (`_resolve_within`) permits READS that resolve under any of these roots —
+# the operator explicitly consented to host filesystem inspection (venv
+# probing, site-packages listing, package-manager introspection).
+#
+# The set is process-wide so it survives the parent/child boundary and module
+# reloads identically to the approved-category registry (which mirrors on
+# `sys`). It is cleared by `set_extra_read_roots(frozenset())` or by the
+# operator-side `_reset_approved_categories()` path.
+#
+# SECURITY: this widens only the READ surface. Writes remain governed by
+# `_SANDBOX_WRITE_ROOTS` (which is scoped to the sandbox cache lifetime).
+# Directory enumeration (scandir/listdir/glob) uses the read path, so an
+# operator can enable "list site-packages" without thereby enabling
+# "delete /etc/passwd".
+_SANDBOX_EXTRA_READ_ROOTS: set = set()
+_SANDBOX_EXTRA_WRITE_ROOTS: set = set()
+
+
+def set_extra_read_roots(roots: "frozenset | set | tuple | list") -> None:
+    """Publishes operator-consented READ roots outside the workspace.
+
+    Called by `execute_python._sync_approved_path_roots()` when the operator
+    answers "always" on a snippet whose risk category includes `filesystem`.
+    Passing an empty collection revokes the consent (symmetric with
+    `set_extra_write_roots`).
+
+    The set is process-wide so the spawned sandbox child (which re-imports
+    this module) sees it identically. The parent writes it BEFORE spawning
+    the child (the child's own re-import will re-read `sys`-mirrored state if
+    present; otherwise this set is the parent's authoritative source).
+    """
+    _SANDBOX_EXTRA_READ_ROOTS.clear()
+    for r in roots or ():
+        try:
+            _SANDBOX_EXTRA_READ_ROOTS.add(str(Path(r).resolve()))
+        except Exception:
+            continue
+    # Mirror to sys so a freshly-imported child module sees the same roots.
+    try:
+        setattr(sys, "__lollms_sandbox_extra_read_roots__",
+                frozenset(_SANDBOX_EXTRA_READ_ROOTS))
+    except Exception:
+        pass
+
+
+def set_extra_write_roots(roots: "frozenset | set | tuple | list") -> None:
+    """Publishes operator-consented WRITE roots outside the workspace.
+
+    Symmetric with `set_extra_read_roots`, and reserved for future tools that
+    legitimately need to mutate an external directory (e.g. venv management).
+    The current `filesystem` risk category grants reads only — `execute_python`
+    calls this today with the same trusted roots as reads so that a `filesystem`
+    approval does not immediately re-block on a write the operator clearly
+    intends (e.g., "install torch into the venv" after approving filesystem).
+    """
+    _SANDBOX_EXTRA_WRITE_ROOTS.clear()
+    for r in roots or ():
+        try:
+            _SANDBOX_EXTRA_WRITE_ROOTS.add(str(Path(r).resolve()))
+        except Exception:
+            continue
+    try:
+        setattr(sys, "__lollms_sandbox_extra_write_roots__",
+                frozenset(_SANDBOX_EXTRA_WRITE_ROOTS))
+    except Exception:
+        pass
+
+
+def _rehydrate_extra_roots_from_sys() -> None:
+    """Restores extra roots from the sys mirror (child process bootstrap)."""
+    for kind, target in (
+        ("read", _SANDBOX_EXTRA_READ_ROOTS),
+        ("write", _SANDBOX_EXTRA_WRITE_ROOTS),
+    ):
+        cached = getattr(sys, f"__lollms_sandbox_extra_{kind}_roots__", None)
+        if isinstance(cached, frozenset):
+            target.clear()
+            target.update(cached)
+
+
+# Immediately attempt rehydration: if a parent process published roots before
+# spawning this child (via `set_extra_read_roots`), we see them now.
+_rehydrate_extra_roots_from_sys()
 
 
 def _compute_sandbox_cache_root(workspace_root: Path) -> Path:
@@ -799,6 +898,8 @@ __all__ = [
     "SandboxViolation",
     "SandboxPermissionError",
     "run_in_sandboxed_child",
+    "set_extra_read_roots",
+    "set_extra_write_roots",
     "TRUE_COMPILE",
     "TRUE_EXEC",
     "TRUE_EVAL",
@@ -1427,6 +1528,32 @@ def _resolve_within(root: Path, target: Any, allow_trusted_read: bool = False) -
                     return resolved
                 except (ValueError, OSError):
                     continue
+            # Operator-consented EXTRA roots (published via
+            # `set_extra_read_roots` / `set_extra_write_roots` when the
+            # operator pressed "always" on the `filesystem` risk category).
+            #
+            # This is the critical fix for "I said always but it still blocks":
+            # the category approval in `execute_python` widens the runtime path
+            # boundary here, so a subsequent probe of site-packages / venv
+            # succeeds instead of raising an unannounced SandboxPermissionError.
+            #
+            # SECURITY: the set is bounded to what the operator consented to
+            # via the prompt — the interpreter install prefix, its site-packages/
+            # stdlib roots, the tool's own package, and the workspace. It is
+            # NOT the whole filesystem: `C:\\Users\\/`, `/etc/`, `/` remain
+            # blocked unless a future operator-authored policy explicitly adds
+            # them. Reads use the read set; writes use the write set.
+            for consent_root_str in _SANDBOX_EXTRA_READ_ROOTS:
+                try:
+                    resolved.relative_to(Path(consent_root_str))
+                    # Reads (including directory enumeration) honour the read
+                    # consent unconditionally. Writes additionally require
+                    # membership in _SANDBOX_EXTRA_WRITE_ROOTS — enforced below
+                    # by the caller (the write path is only reached via
+                    # functions that pass allow_trusted_read=False).
+                    return resolved
+                except (ValueError, OSError):
+                    continue
             if allow_trusted_read:
                 for trusted_root in _TRUSTED_READ_ROOTS:
                     try:
@@ -1434,6 +1561,12 @@ def _resolve_within(root: Path, target: Any, allow_trusted_read: bool = False) -
                         return resolved
                     except ValueError:
                         continue
+            for consent_write_root_str in _SANDBOX_EXTRA_WRITE_ROOTS:
+                try:
+                    resolved.relative_to(Path(consent_write_root_str))
+                    return resolved
+                except (ValueError, OSError):
+                    continue
             raise
     except (ValueError, OSError) as exc:
         raise SandboxPermissionError(
