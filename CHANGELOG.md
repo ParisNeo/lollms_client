@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-11 23:27]
+
+- fix(vllm_omni): validate duration input to prevent server-side clamping
+
 ## [2026-11-11 22:58]
 
 - fix(vllm_omni): coerce fps to fixed 24 for MiniMax-H3

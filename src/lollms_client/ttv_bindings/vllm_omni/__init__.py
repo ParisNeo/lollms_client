@@ -309,6 +309,26 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
             )
         return self.FIXED_FPS
 
+    def _resolve_duration(self, duration: Optional[Union[float, int, str]]) -> float:
+        """
+        MiniMax-H3 derives the generated clip length from the ``duration`` field
+        forwarded inside ``extra_params`` (the server multiplies it by its fixed
+        fps=24 internally). A missing or invalid value falls back to the binding
+        default duration; we never emit a bogus duration that the server would
+        silently clamp to its 4-second hard-coded minimum.
+        """
+        raw = self.default_duration if duration is None else duration
+        try:
+            seconds = float(raw)
+        except (TypeError, ValueError):
+            ASCIIColors.warning(
+                f"Invalid duration value {duration!r}; using default {self.default_duration}s."
+            )
+            return float(self.default_duration)
+        if seconds <= 0:
+            return float(self.default_duration)
+        return seconds
+
     def _prepare_image_bytes(self, image: Union[bytes, str, Path]) -> bytes:
         if isinstance(image, (str, Path)):
             path = Path(image)
@@ -343,9 +363,11 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
         if seed is not None and seed != -1:
             data["seed"] = seed
 
+        resolved_duration = self._resolve_duration(duration)
+
         extra_params = {
             "task": task,
-            "duration": duration if duration is not None else self.default_duration,
+            "duration": resolved_duration,
         }
         extra_params.update(kwargs.get("extra_params", {}))
         data["extra_params"] = json.dumps(extra_params)
@@ -390,10 +412,13 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
         if seed is not None and seed != -1:
             data["seed"] = seed
 
+        resolved_duration = self._resolve_duration(duration)
+
         extra_params = {
             "task": "fl2va",
-            "duration": duration if duration is not None else self.default_duration,
+            "duration": resolved_duration,
         }
+        extra_params.update(kwargs.get("extra_params", {}))
         data["extra_params"] = json.dumps(extra_params)
 
         files = {
@@ -483,13 +508,15 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
         if seed is not None and seed != -1:
             data["seed"] = seed
 
-        for scalar_key in ("width", "height", "num_frames", "guidance_scale", "aspect_ratio"):
+        resolved_duration = self._resolve_duration(kwargs.get("duration"))
+
+        for scalar_key in ("width", "height", "guidance_scale", "aspect_ratio"):
             if kwargs.get(scalar_key) is not None:
                 data[scalar_key] = kwargs[scalar_key]
 
         extra_params: Dict[str, Any] = {
             "task": "fl2va",
-            "duration": kwargs.get("duration", self.default_duration),
+            "duration": resolved_duration,
         }
         extra_params.update(kwargs.get("extra_params", {}))
         data["extra_params"] = json.dumps(extra_params)
@@ -557,13 +584,15 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
         seed = kwargs.get("seed")
         if seed is not None and seed != -1:
             data["seed"] = seed
-        for scalar_key in ("width", "height", "num_frames", "guidance_scale"):
+        resolved_duration = self._resolve_duration(kwargs.get("duration"))
+
+        for scalar_key in ("width", "height", "guidance_scale"):
             if kwargs.get(scalar_key) is not None:
                 data[scalar_key] = kwargs[scalar_key]
 
         extra_params: Dict[str, Any] = {
             "task": "fl2va",
-            "duration": kwargs.get("duration", self.default_duration),
+            "duration": resolved_duration,
             "frame_indices": [0, -1],
         }
         extra_params.update(kwargs.get("extra_params", {}))
