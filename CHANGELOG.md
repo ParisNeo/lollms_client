@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-11 22:07]
+
+- feat(vllm_omni): dynamically resolve model identifiers and support negative prompts
+
 ## [2026-11-11 22:00]
 
 - fix(vllm_omni): prevent model field injection in managed server mode

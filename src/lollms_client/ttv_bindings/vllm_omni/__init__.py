@@ -236,17 +236,46 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
 
     def _model_field(self) -> Optional[str]:
         """
-        Returns the model identifier to embed in the request body.
+        Returns the model identifier to embed in the request body, or None to omit it.
 
-        In managed mode we must NOT send a model identifier: the server is
-        launched with a single, already-resolved model (local path or HF repo)
-        and would reject any mismatch against the client-side string.
-        In remote mode the caller is responsible for selecting a model on the
-        target server, so we forward it explicitly.
+        vLLM-Omni (like vLLM) typically serves exactly one model per instance and
+        rejects requests whose ``model`` field does not match the launched model
+        id verbatim (a local path vs. a HF repo id will always mismatch).
+
+        Safety rules:
+          - Managed mode: never send ``model``; the local process owns it.
+          - Remote mode: only send ``model`` when the server actually advertises
+            that exact id via ``GET /v1/models``. Otherwise omit it so a
+            single-model deployment accepts the request. A failed probe leaves
+            us on the safe side by omitting the field too.
         """
         if self.server_mode == "managed":
             return None
-        return self.model or None
+        if not self.model:
+            return None
+        advertised = self._advertised_models()
+        if advertised is None:
+            # Could not probe the server: do not risk a hard 400 mismatch.
+            return None
+        if self.model in advertised:
+            return self.model
+        if len(advertised) == 1:
+            # Single-model deployment under a different id (e.g. a local path).
+            return advertised[0]
+        ASCIIColors.warning(
+            f"Model '{self.model}' is not advertised by {self.base_url}; "
+            f"available: {advertised}. Omitting model field."
+        )
+        return None
+
+    def _advertised_models(self) -> Optional[List[str]]:
+        """Probe ``/v1/models``. Returns the id list, or None on failure."""
+        try:
+            resp = self._session.get(f"{self.base_url}/v1/models", timeout=5)
+            resp.raise_for_status()
+            return [m["id"] for m in resp.json().get("data", [])]
+        except Exception:
+            return None
 
     def _inject_model(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Attaches the resolved model field to a request payload, if any."""
@@ -421,6 +450,11 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
         data: Dict[str, Any] = {
             "prompt": prompt or "",
             "fps": fps,
+            "num_inference_steps": num_inference_steps,
+        }
+        self._inject_model(data)
+        if kwargs.get("negative_prompt"):
+            data["negative_prompt"] = kwargs["negative_prompt"]
         seed = kwargs.get("seed")
         if seed is not None and seed != -1:
             data["seed"] = seed
@@ -491,7 +525,11 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
         data: Dict[str, Any] = {
             "prompt": prompt,
             "fps": kwargs.get("fps") or self.default_fps,
-
+            "num_inference_steps": int(kwargs.get("num_inference_steps", 30)),
+        }
+        self._inject_model(data)
+        if kwargs.get("negative_prompt"):
+            data["negative_prompt"] = kwargs["negative_prompt"]
         seed = kwargs.get("seed")
         if seed is not None and seed != -1:
             data["seed"] = seed
