@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-11 22:21]
+
+- fix: enforce fps to 24 for MiniMax-H3 in vLLM-Omni
+
 ## [2026-11-11 22:07]
 
 - feat(vllm_omni): dynamically resolve model identifiers and support negative prompts

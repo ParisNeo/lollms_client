@@ -284,6 +284,23 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
             data["model"] = model_id
         return data
 
+    def _resolve_fps(self, fps: Optional[int]) -> Optional[int]:
+        """
+        MiniMax-H3 in vLLM-Omni fixes output fps at exactly 24 and returns a 400
+        for any other value. We therefore only forward ``fps`` when the caller
+        explicitly overrides the default, and coerce it to a strict int.
+        """
+        requested = self.default_fps if fps is None else fps
+        try:
+            requested = int(requested)
+        except (TypeError, ValueError):
+            raise ValueError(f"fps must be an integer, got {fps!r}")
+        if requested != 24:
+            raise ValueError(
+                f"MiniMax-H3 output fps is fixed at 24 (got {requested})."
+            )
+        return requested
+
     def _prepare_image_bytes(self, image: Union[bytes, str, Path]) -> bytes:
         if isinstance(image, (str, Path)):
             path = Path(image)
@@ -309,7 +326,7 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
         data: Dict[str, Any] = {
             "prompt": prompt,
             "aspect_ratio": aspect_ratio or self.default_aspect_ratio,
-            "fps": fps or self.default_fps,
+            "fps": self._resolve_fps(fps),
             "num_inference_steps": num_inference_steps,
         }
         self._inject_model(data)
@@ -356,7 +373,7 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
         image_bytes = self._prepare_image_bytes(image)
         data: Dict[str, Any] = {
             "prompt": prompt,
-            "fps": fps or self.default_fps,
+            "fps": self._resolve_fps(fps),
             "num_inference_steps": num_inference_steps,
         }
         self._inject_model(data)
@@ -444,12 +461,11 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
         image_ext = (kwargs.get("image_ext") or "png").lstrip(".")
         audio_ext = (kwargs.get("audio_ext") or "wav").lstrip(".")
 
-        fps = kwargs.get("fps") or self.default_fps
         num_inference_steps = int(kwargs.get("num_inference_steps", 30))
 
         data: Dict[str, Any] = {
             "prompt": prompt or "",
-            "fps": fps,
+            "fps": self._resolve_fps(kwargs.get("fps")),
             "num_inference_steps": num_inference_steps,
         }
         self._inject_model(data)
@@ -524,7 +540,7 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
 
         data: Dict[str, Any] = {
             "prompt": prompt,
-            "fps": kwargs.get("fps") or self.default_fps,
+            "fps": self._resolve_fps(kwargs.get("fps")),
             "num_inference_steps": int(kwargs.get("num_inference_steps", 30)),
         }
         self._inject_model(data)
