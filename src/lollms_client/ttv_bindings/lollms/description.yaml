@@ -1,0 +1,244 @@
+title: "LoLLMS Server TTV"
+author: "ParisNeo"
+version: 1.0.0
+binding_name: "lollms"
+description: |
+  Connects to a remote LoLLMS server and uses its video generation API
+  (`/lollms/v1/videos*`) for text-to-video, image-to-video, first/last-frame
+  interpolation, and audio-driven lip-sync generation.
+
+  The server must expose an active Text-to-Video (TTV) binding. Verify with
+  `GET /lollms/v1/capabilities` — the `active_bindings.ttv` list must be non-empty.
+  Requests otherwise return HTTP 501.
+
+  The binding speaks the vLLM-Omni compatible wire protocol, so any LoLLMS
+  server with a TTV binding (vllm_omni, diffusers, sd.cpp, minimaxh3, …) works
+  transparently.
+
+global_input_parameters:
+  - name: "host_address"
+    type: "str"
+    default: "http://localhost:9642"
+    description: "Base URL of the LoLLMS server (e.g. http://localhost:9642). Any trailing /v1 or /lollms/v1 is stripped."
+
+  - name: "service_key"
+    type: "str"
+    default: ""
+    description: "Bearer API key for the LoLLMS server. Can also be set via the LOLLMS_API_KEY environment variable."
+    is_secret: true
+
+  - name: "verify_ssl_certificate"
+    type: "bool"
+    default: true
+    description: "Verify the server's TLS certificate. Set to false for self-signed dev servers."
+
+  - name: "certificate_file_path"
+    type: "str"
+    default: ""
+    description: "Path to a custom CA bundle (.pem/.crt) used to verify the server identity. Useful for self-signed certs. Validated at init; a missing file raises FileNotFoundError."
+
+  - name: "mode"
+    type: "str"
+    default: "sync"
+    description: "Transport mode: 'sync' uses POST /videos/sync (blocking, returns MP4 directly); 'async' submits POST /videos and polls GET /videos/{id} until completion."
+    options:
+      - sync
+      - async
+
+  - name: "timeout"
+    type: "int"
+    default: 900
+    description: "Overall HTTP/polling timeout in seconds. Video generation can take several minutes on large models."
+
+  - name: "poll_interval"
+    type: "float"
+    default: 2.0
+    description: "Polling interval in seconds when mode='async' (or for multipart reference requests, which always use the async job API)."
+
+model_input_parameters:
+  - name: "model"
+    type: "str"
+    default: ""
+    description: "Optional `binding_alias/model_name` selection forwarded to the server. Leave empty to use the server's default active TTV binding."
+
+  - name: "default_num_frames"
+    type: "int"
+    default: 80
+    description: "Frames to generate when the caller does not specify num_frames."
+
+  - name: "default_fps"
+    type: "int"
+    default: 16
+    description: "Output FPS when the caller does not specify fps."
+
+  - name: "default_width"
+    type: "int"
+    default: null
+    description: "Default output width (model default when null)."
+
+  - name: "default_height"
+    type: "int"
+    default: null
+    description: "Default output height (model default when null)."
+
+  - name: "num_inference_steps"
+    type: "int"
+    default: null
+    description: "Default denoising steps (model default when null)."
+
+  - name: "guidance_scale"
+    type: "float"
+    default: null
+    description: "Default CFG scale (model default when null)."
+
+commands:
+  - name: "health_check"
+    description: "Ping GET /lollms/v1/capabilities to verify the server is reachable."
+    params: []
+
+  - name: "get_capabilities"
+    description: "Fetch remote capability flags; text_to_video/image_to_video reflect the server's active TTV binding."
+    params: []
+
+  - name: "list_models"
+    description: "List TTV models exposed by the server via GET /lollms/v1/ttv/models."
+    params: []
+
+  - name: "generate_video"
+    description: "Text-to-video generation (recipe A)."
+    params:
+      - name: "prompt"
+        type: "str"
+        description: "Text description of the desired video."
+      - name: "negative_prompt"
+        type: "str"
+        default: ""
+        description: "Elements to discourage."
+      - name: "width"
+        type: "int"
+        default: null
+      - name: "height"
+        type: "int"
+        default: null
+      - name: "num_frames"
+        type: "int"
+        default: null
+      - name: "fps"
+        type: "int"
+        default: null
+      - name: "num_inference_steps"
+        type: "int"
+        default: null
+      - name: "guidance_scale"
+        type: "float"
+        default: null
+      - name: "seed"
+        type: "int"
+        default: -1
+        description: "RNG seed. -1 for random."
+
+  - name: "generate_video_from_image"
+    description: "Image-to-video generation using the image as the first frame (recipe B)."
+    params:
+      - name: "prompt"
+        type: "str"
+      - name: "image"
+        type: "str"
+        description: "Path, raw bytes, or base64 image."
+      - name: "negative_prompt"
+        type: "str"
+        default: ""
+      - name: "width"
+        type: "int"
+        default: null
+      - name: "height"
+        type: "int"
+        default: null
+      - name: "num_frames"
+        type: "int"
+        default: null
+      - name: "fps"
+        type: "int"
+        default: null
+      - name: "num_inference_steps"
+        type: "int"
+        default: null
+      - name: "guidance_scale"
+        type: "float"
+        default: null
+      - name: "seed"
+        type: "int"
+        default: -1
+
+  - name: "generate_video_first_and_last_frame"
+    description: "First/last-frame interpolation (recipe C). Requires a server binding that advertises supports_first_last_frame()."
+    params:
+      - name: "prompt"
+        type: "str"
+      - name: "start_image"
+        type: "str"
+        description: "Path, raw bytes, or base64 first-frame image."
+      - name: "end_image"
+        type: "str"
+        description: "Path, raw bytes, or base64 last-frame image."
+      - name: "negative_prompt"
+        type: "str"
+        default: ""
+      - name: "width"
+        type: "int"
+        default: null
+      - name: "height"
+        type: "int"
+        default: null
+      - name: "num_frames"
+        type: "int"
+        default: null
+      - name: "fps"
+        type: "int"
+        default: null
+      - name: "num_inference_steps"
+        type: "int"
+        default: null
+      - name: "guidance_scale"
+        type: "float"
+        default: null
+      - name: "seed"
+        type: "int"
+        default: -1
+
+  - name: "generate_lipsync_video"
+    description: "Audio-driven talking-head generation (recipe E). Requires a server binding that advertises supports_lipsync()."
+    params:
+      - name: "image"
+        type: "str"
+        description: "Path, raw bytes, or base64 portrait image."
+      - name: "audio"
+        type: "str"
+        description: "Path, raw bytes, or base64 driving audio."
+      - name: "prompt"
+        type: "str"
+        default: ""
+      - name: "negative_prompt"
+        type: "str"
+        default: ""
+      - name: "width"
+        type: "int"
+        default: null
+      - name: "height"
+        type: "int"
+        default: null
+      - name: "num_frames"
+        type: "int"
+        default: null
+      - name: "fps"
+        type: "int"
+        default: null
+      - name: "num_inference_steps"
+        type: "int"
+        default: null
+      - name: "guidance_scale"
+        type: "float"
+        default: null
+      - name: "seed"
+        type: "int"
+        default: -1

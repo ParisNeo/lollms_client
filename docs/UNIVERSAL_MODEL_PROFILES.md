@@ -817,6 +817,8 @@ client = LollmsClient(
 client.generate_video(prompt="waves on a rocky shore")
 ```
 
+> 📹 **Full TTV guide**: see [`TTV_VIDEO_GENERATION.md`](TTV_VIDEO_GENERATION.md) for capability probing (`get_capabilities`), lip-sync and first/last-frame generation, model zoos/installation, and authoring a custom TTV binding.
+
 ### 8.7 Connection — Outbound Messaging
 
 Connection profiles represent **channels** (e.g. webhook endpoints). The helper `send_connection_message` **auto-switches** when you pass a `channel_alias`:

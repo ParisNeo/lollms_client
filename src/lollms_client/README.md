@@ -543,6 +543,108 @@ with open("output/song.wav", "wb") as f:
 
 ---
 
+## 4.6 Video Generation (TTV)
+
+The Text-to-Video (TTV) modality generates video bytes (`mp4`) from a text prompt, and — on capable bindings — supports optional lip-sync and first/last-frame interpolation. It uses the same two-tier profile system as every other modality. See the full guide in [`docs/TTV_VIDEO_GENERATION.md`](../../docs/TTV_VIDEO_GENERATION.md).
+
+### Configure TTV Profiles
+
+```python
+from lollms_client import LollmsClient
+
+client = LollmsClient(
+    ttv_binding_profiles={
+        "local_ttv": {
+            "binding_name": "diffusers",
+            "binding_config": {"host": "127.0.0.1", "port": 14212, "auto_start_server": True},
+        },
+    },
+    ttv_model_profiles={
+        "svd": {
+            "binding_profile_name": "local_ttv",
+            "model_name": "stabilityai/stable-video-diffusion-img2vid-xt",
+            "is_default": True,
+        },
+    },
+)
+```
+
+### Text-to-Video
+
+```python
+video_bytes = client.generate_video(
+    prompt="waves crashing on a rocky shore at sunset, cinematic",
+    # optional kwargs a binding may honor:
+    # negative_prompt="blurry, static", seed=42, fps=24, width=1024, height=576,
+    # num_frames=64, num_inference_steps=25, guidance_scale=7.5
+)
+
+with open("output/shore.mp4", "wb") as f:
+    f.write(video_bytes)
+```
+
+### Switching Bindings at Runtime
+
+```python
+# Lazy-load a different TTV model profile (reuses cache on later switches)
+client.switch_ttv("svd")
+
+# Legacy alias
+client.mount_ttv("svd")
+```
+
+### Optional Capabilities (Opt-In per Binding)
+
+Not every binding can do every task. Query capabilities before calling optional methods — the default base-class implementation **raises `NotImplementedError`**.
+
+```python
+caps = client.ttv.get_capabilities()
+# {"text_to_video": True, "image_to_video": True, "lipsync": bool, "first_last_frame": bool}
+
+if client.ttv.supports_lipsync():
+    lipsync_bytes = client.ttv.generate_lipsync_video(
+        image="portrait.png",          # path or raw bytes
+        audio="speech.wav",            # path or raw bytes
+        prompt="the subject speaks calmly",
+    )
+
+if client.ttv.supports_first_last_frame():
+    flf_bytes = client.ttv.generate_video_first_and_last_frame(
+        prompt="a flower blooming",
+        start_image="bud.png",
+        end_image="bloom.png",
+    )
+```
+
+> Both `MediaInput` parameters accept either a filesystem `str`/`Path` **or** raw `bytes` (pass `image_ext` / `audio_ext` when using raw bytes).
+
+### Model Discovery & Installation
+
+```python
+from lollms_client.lollms_ttv_binding import list_binding_models
+
+# List models supported by a binding without instantiating a full client
+models = list_binding_models(
+    ttv_binding_name="diffusers",
+    ttv_binding_config={"host": "127.0.0.1", "port": 14212},
+)
+
+# Download / install from the binding's model zoo
+client.ttv.install_model("stabilityai/stable-video-diffusion-img2vid-xt")
+client.ttv.pull_model("stabilityai/stable-video-diffusion-img2vid-xt")
+```
+
+### Available Bindings
+
+Run `list_bindings("ttv")` (from `lollms_bindings_utils`) to enumerate installed TTV bindings. The repository ships with `diffusers`, `lollms`, `lollms_minimax_h3`, `minimaxh3`, `novita_ai_ttv`, `sd.cpp`, and `vllm_omni`.
+
+### VRAM & Multi-Process
+
+- TTV bindings run as their own server (via `auto_start_server` / a fixed port), so they participate in **cooperative VRAM management** — enabling `cooperative_vram_management=True` lets the LLM/TTI free VRAM before the TTV server loads its model.
+- Multiple processes can share one TTV daemon by pointing multiple binding profiles at the same `host`/`port` (see the Phenix shared-daemon architecture).
+
+---
+
 ## 5. Agentic Tool Calling
 
 Enable autonomous tool use with `generate_with_tools`:

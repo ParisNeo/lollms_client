@@ -89,7 +89,7 @@ from lollms_client.apps.lollms_code.user_profile import (
 
 APP_NAME = "lollms_code"
 APP_VERSION = "2.0.0"
-APP_CONFIG_DIR = Path.home() / ".lollms_client" / "lollms_code"
+APP_CONFIG_DIR = Path.home() / ".lollms" / "lollms_code"
 APP_CONFIG_FILE = APP_CONFIG_DIR / "config.json"
 APP_USER_PROFILE_FILE = Path.home() / ".lollms_client" / "user_profile.md"
 APP_DEFAULT_WORKSPACE = Path.cwd()

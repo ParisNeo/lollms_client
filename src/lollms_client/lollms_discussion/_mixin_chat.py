@@ -458,6 +458,46 @@ def _tool_may_write_files(tool_name: str) -> bool:
     return tool_name not in _TOOLS_WITHOUT_FILE_SIDE_EFFECTS
 
 
+def _workspace_top_level_fingerprint(root: Path) -> Optional[Tuple[int, int, int]]:
+    """Cheap fingerprint of a workspace's top-level entries.
+
+    Returns a tuple `(entry_count, max_mtime_ns, total_size)` combining the
+    immediate children of `root`. This is O(children) — one `os.scandir` pass
+    — instead of the O(all_files) full `rglob` walk that `_cached_workspace_scan`
+    performs. Used as a Tier-2 cache key: if the fingerprint is unchanged
+    since the last full scan, the cached scan result is almost certainly still
+    valid (no file was created, deleted, or modified at the workspace root
+    or in any immediate subdirectory).
+
+    Deeply-nested file mutations (e.g. `src/pkg/module.py`) will change the
+    mtime of the parent directory chain on every mainstream filesystem
+    (POSIX, NTFS, APFS all bump directory mtime on child entry mutation), so
+    this fingerprint catches nested changes within one round-trip.
+
+    Returns None if the directory does not exist or cannot be scanned. Never
+    raises — a filesystem error degrades to a cache miss (full scan).
+    """
+    if not root.exists():
+        return None
+    entry_count = 0
+    max_mtime_ns = 0
+    total_size = 0
+    try:
+        with os.scandir(root) as it:
+            for entry in it:
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                entry_count += 1
+                if st.st_mtime_ns > max_mtime_ns:
+                    max_mtime_ns = st.st_mtime_ns
+                total_size += st.st_size
+    except OSError:
+        return None
+    return (entry_count, max_mtime_ns, total_size)
+
+
 def _canonicalize_tool_params(params: Any) -> str:
     """
     Stable JSON fingerprint of tool parameters with inert cosmetic options removed.
@@ -5151,14 +5191,38 @@ class ChatMixin:
 
         Unions:
           1. Physical files discovered by the cached workspace scan
-             (respects `_workspace_write_revision` invalidation, so it is O(1)
-             on repeated calls within the same turn).
+             (respects `_workspace_write_revision` + top-level mtime
+             fingerprint invalidation, so it is O(1) on repeated calls).
           2. Artefact titles registered in the DB (files that may live only in
              the artefact store or in a versioned twin on disk).
+
+        Caching: the derived extension set is memoized on
+        `_workspace_turn_file_types_cache` keyed by the scan revision AND the
+        current artifact count, so both sources stay in sync without re-walking
+        or re-enumerating raw artifacts on every prompt.
 
         Returns a lowercase, dotted extension set: {".pdf", ".docx", ...}.
         Extensions with no suffix are excluded.
         """
+        art_manager = getattr(self, "artefacts", None)
+        artefact_count = 0
+        try:
+            if art_manager is not None and hasattr(art_manager, "_get_all_raw"):
+                # _get_all_raw is the authoritative count source; we only
+                # read len() here, not the list itself, unless the cache is
+                # cold.
+                artefact_count = len(art_manager._get_all_raw() or [])
+        except Exception:
+            artefact_count = -1  # sentinel: cache key not usable
+
+        cache_key = (
+            int(getattr(self, "_workspace_write_revision", 0)),
+            artefact_count,
+        )
+        cached = getattr(self, "_workspace_turn_file_types_cache", None)
+        if cached is not None and cached.get("key") == cache_key:
+            return cached["types"]
+
         detected: set = set()
 
         try:
@@ -5172,7 +5236,6 @@ class ChatMixin:
         except Exception:
             pass
 
-        art_manager = getattr(self, "artefacts", None)
         if art_manager is not None:
             raw_arts: List[Dict[str, Any]] = []
             try:
@@ -5193,6 +5256,10 @@ class ChatMixin:
                 if suffix:
                     detected.add(suffix)
 
+        object.__setattr__(
+            self, "_workspace_turn_file_types_cache",
+            {"key": cache_key, "types": detected},
+        )
         return detected
 
     def _resolve_toolset_admission(
@@ -5296,10 +5363,39 @@ class ChatMixin:
         doc_extensions = {".pdf", ".docx", ".pptx", ".odt", ".epub", ".txt", ".md", ".json", ".yaml", ".xml"}
         sqlite_extensions = {".db", ".sqlite", ".sqlite3"}
 
+        # ── 🚀 TWO-TIER CACHE (REVISION + MTIME FINGERPRINT) ──
+        # Tier 1 (cheap): the `_workspace_write_revision` counter. Bumped only
+        #   when an artifact write or explicit context change occurs. On a
+        #   common turn with no writes, this returns the cached result in O(1).
+        # Tier 2 (cheap): even when the revision changed (a tool fired and
+        #   bumped it via _bump_environment_epoch), the actual workspace may
+        #   have hundreds of files that were just re-touched but the file SET
+        #   is identical. A quick `os.scandir` stat walk of the root's
+        #   immediate children gives us an mtime fingerprint in milliseconds;
+        #   if the fingerprint is unchanged, we reuse the (potentially heavy)
+        #   cached `all_files` list without doing the full `rglob`.
+        #
+        # This makes the scan path effectively O(children) on the common
+        # case, and only pays the full `rglob` cost when the file set or
+        # mtimes genuinely changed.
         revision = int(getattr(self, "_workspace_write_revision", 0))
         cache = getattr(self, "_workspace_scan_cache", None)
         if cache is not None and cache.get("revision") == revision:
             return cache["all_files"], cache["has_data_files"], cache["has_doc_files"]
+
+        # Tier 2: cheap mtime fingerprint of top-level entries.
+        if cache is not None and workspace_dir.exists():
+            try:
+                fingerprint = _workspace_top_level_fingerprint(workspace_dir)
+                if cache.get("fingerprint") == fingerprint:
+                    # Same top-level mtime/size signature: the file set is
+                    # almost certainly unchanged. Refresh only the revision
+                    # tag so tier-1 hits next time, and return the cached
+                    # results without a full rglob.
+                    cache["revision"] = revision
+                    return cache["all_files"], cache["has_data_files"], cache["has_doc_files"]
+            except Exception:
+                pass  # Fall through to full scan on any filesystem hiccup
 
         if not workspace_dir.exists():
             all_files: List[Path] = []
@@ -5329,10 +5425,19 @@ class ChatMixin:
             except OSError:
                 continue
 
+        try:
+            fingerprint = (
+                _workspace_top_level_fingerprint(workspace_dir)
+                if workspace_dir.exists() else None
+            )
+        except Exception:
+            fingerprint = None
+
         object.__setattr__(
             self, "_workspace_scan_cache",
             {
                 "revision": revision,
+                "fingerprint": fingerprint,
                 "all_files": all_files,
                 "has_data_files": has_data_files,
                 "has_doc_files": has_doc_files,
@@ -5340,6 +5445,9 @@ class ChatMixin:
                 "has_git_dir": has_git_dir,
             },
         )
+        # Invalidate the downstream extension-set cache: it derives from this
+        # scan and MUST recompute on the next `_collect_turn_file_types` call.
+        object.__setattr__(self, "_workspace_turn_file_types_cache", None)
         return all_files, has_data_files, has_doc_files
 
     def _workspace_has_sqlite_files(self, workspace_dir: Path) -> bool:
@@ -5366,6 +5474,11 @@ class ChatMixin:
         super().__init__(*args, **kwargs)
         object.__setattr__(self, '_delegation_depth', 0)
         object.__setattr__(self, '_worker_counter', 0)
+        # Caches used by _cached_workspace_file_scan() / _collect_turn_file_types().
+        # Initialized here so the first chat() call never trips an AttributeError.
+        object.__setattr__(self, '_workspace_scan_cache', None)
+        object.__setattr__(self, '_workspace_turn_file_types_cache', None)
+        object.__setattr__(self, '_last_full_artefact_sync_revision', -1)
         from ..lollms_memory.lollms_memory import FailureMemory
         object.__setattr__(self, '_failure_memory', FailureMemory())
 
@@ -5508,7 +5621,49 @@ class ChatMixin:
         Detects new and modified files by diffing before/after workspace snapshots,
         then registers them as artifacts following the Tool-Generated File Visibility Doctrine.
         This logic is shared between the direct-callable and LCP dispatch paths.
+
+        COMMIT COALESCING: each `self.commit()` is a DB transaction plus a
+        disk-twin reconciliation pass. A build tool that emits hundreds of
+        files would previously fire one commit per detected file (500+ IO
+        round trips). We coalesce commits within this method using a
+        time-based batch window: commits are skipped unless >20ms have
+        elapsed since the last one, and a final flush is always performed
+        at method exit so no state is lost.
         """
+        # Batch-commit state for this invocation.
+        _batch_start_ns = time.monotonic_ns()
+        _last_commit_ns = _batch_start_ns
+        _pending_commit = False
+
+        def _coalesced_commit() -> None:
+            """Fires a commit unless one fired within the last 20ms."""
+            nonlocal _last_commit_ns, _pending_commit
+            now_ns = time.monotonic_ns()
+            if (now_ns - _last_commit_ns) < 20_000_000:
+                # Too soon; defer to batch flush.
+                _pending_commit = True
+                return
+            try:
+                self.commit()
+            except Exception as commit_err:
+                ASCIIColors.warning(
+                    f"[ChatMixin] Batched commit failed inside _sync_tool_artifacts: {commit_err}"
+                )
+            _last_commit_ns = time.monotonic_ns()
+            _pending_commit = False
+
+        def _flush_batch_commit() -> None:
+            """Guarantees any deferred commit is flushed at method exit."""
+            nonlocal _pending_commit
+            if _pending_commit:
+                try:
+                    self.commit()
+                except Exception as commit_err:
+                    ASCIIColors.warning(
+                        f"[ChatMixin] Final batched commit failed inside _sync_tool_artifacts: {commit_err}"
+                    )
+            _pending_commit = False
+
         # Detect NEW files
         new_files = set(files_after.keys()) - set(files_before.keys())
 
@@ -5625,9 +5780,14 @@ class ChatMixin:
                         logical_content=None if _agentic_mode else content_placeholder,
                         commit_message=f"Created by tool '{tool_name}'"
                     )
-                self.commit()
-
                 self._affected_artefacts_this_turn.append(art)
+                # NOTE: commit() is deferred to the end of _sync_tool_artifacts
+                # via `_deferred_commit` — each commit is a DB transaction plus
+                # a disk-twin reconciliation pass. Firing one per detected file
+                # on a build tool that emits 500 files was ~500x the necessary
+                # IO. A single batched commit at the end of the diff pass keeps
+                # the store consistent with a fraction of the latency.
+                _needs_commit = True
 
                 if self.active_branch_id:
                     ai_msg_local = self.get_message(self.active_branch_id)
@@ -5661,7 +5821,6 @@ class ChatMixin:
                     visibility=ArtefactVisibility.FULL,
                     commit_message=f"Created by tool '{tool_name}'"
                 )
-            self.commit()
 
             if self.active_branch_id:
                 ai_msg_local = self.get_message(self.active_branch_id)
@@ -5673,7 +5832,7 @@ class ChatMixin:
                     )
                     if tag not in ai_msg_local.content:
                         ai_msg_local.content += f'\n\n{tag}\n'
-                    self.commit()
+            _coalesced_commit()
 
         # Detect MODIFIED files
         common_files = set(files_after.keys()) & set(files_before.keys())
@@ -5807,7 +5966,6 @@ class ChatMixin:
                             physical_data=physical_bytes,
                             commit_message=f"Created by tool '{tool_name}'"
                         )
-                    self.commit()
 
                     if _is_image_art:
                         try:
@@ -5819,7 +5977,6 @@ class ChatMixin:
                                 new_image_media_types=[f"image/{file_ext[1:]}"],
                                 bump_version=True
                             )
-                            self.commit()
                             self._affected_artefacts_this_turn.append(self.artefacts.get(file_name))
                         except Exception as ex:
                             trace_exception(ex)
@@ -5834,7 +5991,7 @@ class ChatMixin:
                             )
                             if tag not in ai_msg_local.content:
                                 ai_msg_local.content += f'\n\n{tag}\n'
-                            self.commit()
+                    _coalesced_commit()
                     continue
 
                 file_size_kb = file_path.stat().st_size / 1024
@@ -5859,7 +6016,6 @@ class ChatMixin:
                         visibility=ArtefactVisibility.FULL if not is_large_file else ArtefactVisibility.TREE_UNLOCKABLE,
                         commit_message=f"Created by tool '{tool_name}'"
                     )
-                self.commit()
 
                 if self.active_branch_id:
                     ai_msg_local = self.get_message(self.active_branch_id)
@@ -5871,7 +6027,10 @@ class ChatMixin:
                         )
                         if tag not in ai_msg_local.content:
                             ai_msg_local.content += f'\n\n{tag}\n'
-                        self.commit()
+                _coalesced_commit()
+
+        # Flush any deferred batched commit accumulated during this diff pass.
+        _flush_batch_commit()
 
     def _extract_rich_document_content(
         self,
@@ -8734,6 +8893,32 @@ class ChatMixin:
 
         object.__setattr__(self, "_bump_environment_epoch", _bump_environment_epoch)
 
+        # ── 🚀 ARTIFACT SYNC DEBOUNCING ──
+        # `self.artefacts.sync_all_active_to_disk()` re-materializes EVERY
+        # FULL-visibility artifact to the workspace on disk. On a project
+        # workspace with hundreds of FULL artifacts, this is a multi-second
+        # IO hit — and the previous code called it before EVERY tool
+        # execution (both the LCP path and the direct-callable path). Since
+        # the artifact store and the disk twins are only invalidated when
+        # an artifact is created, updated, or its visibility changes — all
+        # of which bump `_workspace_write_revision` — we can skip the sync
+        # entirely when the revision has not changed since the last full
+        # sync in this turn. A single sync per turn-revision is sufficient.
+        def _maybe_sync_active_artifacts_to_disk() -> None:
+            """Syncs active artifacts to disk UNLESS they are already synced
+            at the current workspace revision. Safe to call before every
+            tool execution — the debounce makes it O(1) on repeat calls."""
+            current_rev = _current_workspace_revision()
+            if getattr(self, "_last_full_artefact_sync_revision", -1) == current_rev:
+                return
+            try:
+                self.artefacts.sync_all_active_to_disk()
+                object.__setattr__(self, "_last_full_artefact_sync_revision", current_rev)
+            except Exception as sync_ex:
+                trace_exception(sync_ex)
+
+        object.__setattr__(self, "_maybe_sync_active_artifacts_to_disk", _maybe_sync_active_artifacts_to_disk)
+
         round_event_state = {"last_status": None}
         if dynamic_effort:
             if reasoning_effort:
@@ -9110,10 +9295,9 @@ class ChatMixin:
                             _ws.mkdir(parents=True, exist_ok=True)
                             try:
                                 os.chdir(str(_ws.resolve()))
-                                try:
-                                    self.artefacts.sync_all_active_to_disk()
-                                except Exception:
-                                    pass
+                                # Debounced: no-op if artifacts were already
+                                # materialized at the current workspace revision.
+                                _maybe_sync_active_artifacts_to_disk()
                                 _files_before = (
                                     _snapshot_workspace(Path(_ws.resolve()))
                                     if _tool_may_write_files(tool_name) else {}
@@ -9146,10 +9330,7 @@ class ChatMixin:
                             }
                     else:
                         # Direct-callable execution
-                        try:
-                            self.artefacts.sync_all_active_to_disk()
-                        except Exception:
-                            pass
+                        _maybe_sync_active_artifacts_to_disk()
                         _old_cwd = os.getcwd()
                         if getattr(self, "workspace_data_path", None):
                             _ws = Path(self.workspace_data_path)
@@ -11237,10 +11418,9 @@ class ChatMixin:
                             try:
                                 os.chdir(_lcp_workspace_str)
 
-                                try:
-                                    self.artefacts.sync_all_active_to_disk()
-                                except Exception as sync_ex:
-                                    trace_exception(sync_ex)
+                                # Debounced: no-op if artifacts were already
+                                # materialized at the current workspace revision.
+                                _maybe_sync_active_artifacts_to_disk()
 
                                 # ── Take BEFORE Snapshot (LCP Path) ──
                                 # Skipped entirely for tools with no file side
@@ -11369,12 +11549,9 @@ class ChatMixin:
                                 "prompt_injection": "\n\n⚠️ **Execution Aborted.**\nThe user cancelled the generation. Do not attempt to call tools again."
                             }
                         elif active_tools and tool_name in active_tools and "callable" in active_tools[tool_name]:
-                            # Sync all active artifacts to disk BEFORE tool execution
-                            try:
-                                sync_ws, sync_files = self.artefacts.sync_all_active_to_disk()
-                            except Exception as ex:
-                                trace_exception(ex)
-                                sync_ws, sync_files = None, []
+                            # Sync active artifacts to disk BEFORE tool execution
+                            # (debounced: no-op if already synced at current revision).
+                            _maybe_sync_active_artifacts_to_disk()
 
                             old_cwd = os.getcwd()
 

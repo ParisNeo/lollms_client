@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-11 18:58]
+
+- feat(ttv): implement video generation bindings and documentation
+
 ## [2026-11-10 13:10]
 
 - feat: add safe_store RAG binding and enhance execute_python sandbox
