@@ -234,6 +234,27 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
             if not res["status"]:
                 raise RuntimeError(f"Managed server auto-start failed: {res['message']}")
 
+    def _model_field(self) -> Optional[str]:
+        """
+        Returns the model identifier to embed in the request body.
+
+        In managed mode we must NOT send a model identifier: the server is
+        launched with a single, already-resolved model (local path or HF repo)
+        and would reject any mismatch against the client-side string.
+        In remote mode the caller is responsible for selecting a model on the
+        target server, so we forward it explicitly.
+        """
+        if self.server_mode == "managed":
+            return None
+        return self.model or None
+
+    def _inject_model(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Attaches the resolved model field to a request payload, if any."""
+        model_id = self._model_field()
+        if model_id:
+            data["model"] = model_id
+        return data
+
     def _prepare_image_bytes(self, image: Union[bytes, str, Path]) -> bytes:
         if isinstance(image, (str, Path)):
             path = Path(image)
@@ -262,8 +283,7 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
             "fps": fps or self.default_fps,
             "num_inference_steps": num_inference_steps,
         }
-        if self.model:
-            data["model"] = self.model
+        self._inject_model(data)
         if negative_prompt:
             data["negative_prompt"] = negative_prompt
         if seed is not None and seed != -1:
@@ -310,8 +330,7 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
             "fps": fps or self.default_fps,
             "num_inference_steps": num_inference_steps,
         }
-        if self.model:
-            data["model"] = self.model
+        self._inject_model(data)
         if negative_prompt:
             data["negative_prompt"] = negative_prompt
         if seed is not None and seed != -1:
@@ -402,12 +421,6 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
         data: Dict[str, Any] = {
             "prompt": prompt or "",
             "fps": fps,
-            "num_inference_steps": num_inference_steps,
-        }
-        if self.model:
-            data["model"] = self.model
-        if kwargs.get("negative_prompt"):
-            data["negative_prompt"] = kwargs["negative_prompt"]
         seed = kwargs.get("seed")
         if seed is not None and seed != -1:
             data["seed"] = seed
@@ -478,12 +491,7 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
         data: Dict[str, Any] = {
             "prompt": prompt,
             "fps": kwargs.get("fps") or self.default_fps,
-            "num_inference_steps": int(kwargs.get("num_inference_steps", 30)),
-        }
-        if self.model:
-            data["model"] = self.model
-        if kwargs.get("negative_prompt"):
-            data["negative_prompt"] = kwargs["negative_prompt"]
+
         seed = kwargs.get("seed")
         if seed is not None and seed != -1:
             data["seed"] = seed
