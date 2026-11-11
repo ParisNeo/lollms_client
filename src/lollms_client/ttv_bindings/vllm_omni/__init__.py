@@ -284,22 +284,30 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
             data["model"] = model_id
         return data
 
-    def _resolve_fps(self, fps: Optional[int]) -> Optional[int]:
+    # vLLM-Omni MiniMax-H3 hard-codes output fps; any other value is a 400.
+    FIXED_FPS = 24
+
+    def _resolve_fps(self, fps: Optional[Union[int, float, str]]) -> int:
         """
         MiniMax-H3 in vLLM-Omni fixes output fps at exactly 24 and returns a 400
-        for any other value. We therefore only forward ``fps`` when the caller
-        explicitly overrides the default, and coerce it to a strict int.
+        for any other value. Callers upstream (UI presets, generic routers) often
+        pass a different fps such as 12 or "24"; instead of failing we coerce to
+        an int and silently override it with the model's fixed value.
         """
-        requested = self.default_fps if fps is None else fps
+        if fps is None:
+            return self.FIXED_FPS
         try:
-            requested = int(requested)
+            requested = int(float(fps))
         except (TypeError, ValueError):
-            raise ValueError(f"fps must be an integer, got {fps!r}")
-        if requested != 24:
-            raise ValueError(
-                f"MiniMax-H3 output fps is fixed at 24 (got {requested})."
+            ASCIIColors.warning(
+                f"Invalid fps value {fps!r}; forcing MiniMax-H3 fixed fps={self.FIXED_FPS}."
             )
-        return requested
+            return self.FIXED_FPS
+        if requested != self.FIXED_FPS:
+            ASCIIColors.info(
+                f"Overriding requested fps={requested} to MiniMax-H3 fixed fps={self.FIXED_FPS}."
+            )
+        return self.FIXED_FPS
 
     def _prepare_image_bytes(self, image: Union[bytes, str, Path]) -> bytes:
         if isinstance(image, (str, Path)):
