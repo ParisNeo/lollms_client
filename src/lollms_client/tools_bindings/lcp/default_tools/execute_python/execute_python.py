@@ -1183,6 +1183,27 @@ def _looks_like_absolute_host_path(literal: str, workspace_root: Optional[Path])
             return False  # inside workspace → not a filesystem escape
         except (ValueError, OSError):
             return True  # outside workspace → requires filesystem approval
+    # Even without `workspace_root`, an absolute path that resolves under the
+    # interpreter's own installation tree is NOT a "filesystem escape" — it is
+    # ordinary interpreter introspection (`sys.executable`, `sys.prefix`,
+    # `sysconfig.get_paths()`, venv probing). Flagging those was causing a
+    # false-positive prompt on EVERY call that printed `sys.executable`. The
+    # trusted roots are computed once at kernel import and mirror the same set
+    # used by the runtime path guard.
+    try:
+        resolved_literal = Path(literal).resolve(strict=False)
+        # `_sandbox_kernel` was resolved by `_import_sandbox_kernel()` at
+        # module load with three import-context fallbacks — reuse it here so
+        # this check works identically whether the toolset is imported as a
+        # package, by file path, or from a dev checkout.
+        for trusted_root in getattr(_sandbox_kernel, "_TRUSTED_READ_ROOTS", ()):
+            try:
+                resolved_literal.relative_to(trusted_root)
+                return False  # interpreter's own tree → legitimate introspection
+            except (ValueError, OSError):
+                continue
+    except Exception:
+        pass
     # No workspace_root: flag only unambiguously-host paths (drive roots,
     # POSIX /home /etc /usr /var, Windows C:\\Users\\ ..., C:\\Program ...).
     s = literal.replace("\\", "/").lower()

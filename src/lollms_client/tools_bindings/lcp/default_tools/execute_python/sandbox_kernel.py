@@ -381,7 +381,18 @@ _SANDBOX_CACHE_ENV_MAP: Dict[str, str] = {
     "TORCH_HOME":          "torch",
     "KERAS_HOME":          "keras",
     "NUMBA_CACHE_DIR":     "numba",
-    "PYTHONPYCACHEPREFIX": "pycache",
+    # NOTE: `PYTHONPYCACHEPREFIX` is deliberately NOT redirected.
+    # Redirecting it into `<workspace>/.sandbox_cache/pycache/` forces the
+    # interpreter — AND every subprocess the user code spawns — to cold-compile
+    # every imported module from source on first use, because the sandbox
+    # path has no reusable `.pyc` files. For import-heavy libraries (torch,
+    # pandas, matplotlib) this creates thousands of pyc writes on every tool
+    # call, floods the artefact-sync layer, and turns a 30-second import into a
+    # 10-minute hang. The interpreter's own `__pycache__` locations are trusted
+    # read/write roots (`_TRUSTED_READ_ROOTS` covers the install prefix), so
+    # allowing normal pyc caching is both faster and equally sandboxed — the
+    # sources cannot escape the read guard, and the pyc write lands in the
+    # interpreter's own tree, which is already a trusted root.
     "TMPDIR":              "tmp",
     "TEMP":                "tmp",
     "TMP":                 "tmp",
@@ -507,8 +518,19 @@ def _compute_sandbox_cache_root(workspace_root: Path) -> Path:
     The caches remain invisible to user tooling via their well-known names
     (`.sandbox_cache/`, hidden on POSIX by the leading dot, and excluded from
     workspace-level scans by tooling that already filters dot-directories).
+
+    IMPORTANT for callers doing artefact scanning: this directory is a
+    TRANSIENT cache, not user content. Any "workspace artefacts" scanner
+    MUST skip this directory AND everything beneath it (matplotlib fontlist,
+    pip wheels, pyc fragments). The main `execute_python` tools already route
+    captures to `logs/` (not here) for the same reason.
     """
     return Path(workspace_root).resolve() / ".sandbox_cache"
+
+
+# Canonical directory name for the sandbox cache. Exported so artefact-sync
+# callers can filter it: `if SANDBOX_CACHE_DIRNAME in Path(p).parts: continue`.
+SANDBOX_CACHE_DIRNAME: str = ".sandbox_cache"
 
 
 def _compute_trusted_read_roots() -> frozenset:
@@ -1947,6 +1969,13 @@ class SandboxContext:
             _tf.tempdir = str(sandbox_cache / "tmp")
         except Exception:
             pass
+
+        # Hard-deny subprocess pyc cache redirection: even if any leftover
+        # env var in the parent points PYTHONPYCACHEPREFIX at the sandbox
+        # cache (e.g. inherited from a nested tool call), strip it so a
+        # user-spawned subprocess cannot be forced into cold-recompiling
+        # torch / pandas / numpy through the sandbox path.
+        os.environ.pop("PYTHONPYCACHEPREFIX", None)
 
     def _restore_cache_env(self) -> None:
         """Reverse `_redirect_cache_env()` — must be idempotent and safe."""
