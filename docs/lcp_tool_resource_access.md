@@ -134,7 +134,27 @@ tool crosses modalities (e.g., generates an image *and* narrates it).
 
 ---
 
-## 9. Imports for Examples
+## 9. Confirm Handler — Authorization and Long-Running Execution
+
+The same `confirm_handler`-seam documented here for **execution authorization**
+(in `execute_python` / `execute_python_data_query`) is also used to govern
+**long-running execution**:
+
+> When a sandboxed child exceeds its wall-clock budget, the handler receives a
+> structured dict with `action_type="timeout"` and can answer `"continue"` or
+> `"stop"`. See
+> [`execute_python_timeout_policy.md`](execute_python_timeout_policy.md) for
+> the full timeout contract, defaults (1 h), and dispatch rules.
+
+This means a host that registers a single handler gets **both** capabilities
+without any code change — legacy handlers that return `allow`/`always`/`reject`
+are automatically mapped onto the timeout protocol (`allow`/`always` → continue,
+`reject` → stop), and a broken handler safely defaults to *stop* rather than
+allowing a hang to extend.
+
+---
+
+## 10. Imports for Examples
 
 ```python
 from lollms_client import (

@@ -834,7 +834,90 @@ def _prompt_user_validation(source: str, script_label: str, argv: Optional[List[
     )
 
 
+# Default wall-clock budget before the child is considered "long-running".
+# Raised from 180s to 3600s because legitimate analytical workloads (model
+# fitting, large-file processing, plot rendering) routinely exceed 3 minutes.
+# On expiry the operator is PROMPTED (see `_timeout_decision_prompt`) rather
+# than having the child silently killed.
+_DEFAULT_EXECUTION_TIMEOUT_SECONDS: float = 3600.0
+
 _IMPORT_CACHE: Dict[str, Any] = {}
+
+def _timeout_decision_prompt(script_label: str, elapsed_seconds: float) -> str:
+    """Asks the operator whether to keep waiting on a long-running child.
+
+    Returns "continue" to extend the wait window, or "stop" to terminate.
+
+    Priority order (same policy as `_prompt_user_validation`):
+      1. Registered `_CONFIRM_HANDLER` — extended protocol. We pass a dict /
+         callable with `action_type="timeout"`. The handler may return the
+         canonical "continue"/"stop" strings; legacy booleans are still mapped
+         (True→continue, False→stop) so no existing handler regresses.
+      2. Headless (pytest/CI) → "stop": a blocking prompt in a headless
+         context would hang the entire suite, and the sandbox is the control
+         — the operator is not present to consent to a longer wait anyway.
+      3. Interactive TTY → prompt the operator directly.
+      4. No interactive channel → "stop" (fail safe; do NOT extend silently).
+
+    This function never raises. A broken handler is treated as "stop".
+    """
+    handler = _CONFIRM_HANDLER
+    if not handler:
+        for mod_name, mod in list(sys.modules.items()):
+            if "execute_python" in mod_name and hasattr(mod, "_CONFIRM_HANDLER") and mod._CONFIRM_HANDLER:
+                handler = mod._CONFIRM_HANDLER
+                break
+
+    if handler is not None and callable(handler):
+        try:
+            # Pass a structured payload so the handler can distinguish a
+            # timeout decision from a normal authorize/reject prompt.
+            try:
+                res = handler({
+                    "tool_name": "execute_python",
+                    "action_type": "timeout",
+                    "script_label": script_label,
+                    "elapsed_seconds": elapsed_seconds,
+                })
+            except TypeError:
+                res = handler(script_label)
+            if isinstance(res, tuple):
+                decision = str(res[0]).strip().lower()
+            elif isinstance(res, bool):
+                decision = "continue" if res else "stop"
+            elif isinstance(res, str):
+                decision = res.strip().lower()
+            else:
+                decision = "stop"
+            # Legacy handlers return "allow"/"always"/"reject"/"y"/"n"; map
+            # them onto the timeout protocol so nothing regresses.
+            if decision in ("continue", "wait", "allow", "always", "y", "yes", ""):
+                return "continue"
+            return "stop"
+        except Exception as handler_err:
+            ASCIIColors.warning(
+                f"[execute_python] Timeout confirm handler failed: {handler_err}"
+            )
+            return "stop"
+
+    if _is_headless_environment():
+        return "stop"
+
+    if _can_prompt_interactive():
+        try:
+            choice = input(
+                f"  ⏱️  '{script_label}' has been running for {elapsed_seconds:.0f}s. "
+                f"Keep waiting? [c]ontinue / [s]top (default: continue): "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "stop"
+        if choice in ("", "c", "continue", "y", "yes"):
+            return "continue"
+        return "stop"
+
+    return "stop"
+
 
 def _ensure_import(module_name: str, package_name: str = None):
     """Cached import helper.
@@ -1474,6 +1557,16 @@ def _run_python_source(
     # otherwise the user's authorization is silently overridden at exec time
     # (AST permits subprocess, runtime still blocks it → "BLOCKED BY SANDBOX"
     # after the user clicked "yes"). This was the exact bug reported.
+    #
+    # TIMEOUT POLICY: the child runs up to `_DEFAULT_EXECUTION_TIMEOUT_SECONDS`
+    # (1 hour by default). On expiry, the operator is PROMPTED via
+    # `_timeout_decision_prompt` — a "continue" answer extends the wait window
+    # by the same slice; a "stop" answer terminates the child and returns a
+    # TimeoutError envelope. The operator keeps control of any long-running
+    # execution instead of the sandbox silently killing it.
+    def _on_exec_timeout(elapsed: float) -> str:
+        return _timeout_decision_prompt(script_label, elapsed)
+
     envelope = _run_in_sandboxed_child(
         source=source,
         workspace_root=workspace_root,
@@ -1482,7 +1575,8 @@ def _run_python_source(
         argv=child_argv,
         seed_locals=child_seed,
         persist_df_name=None,
-        hard_timeout=180.0,
+        hard_timeout=_DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+        timeout_decision_cb=_on_exec_timeout,
     )
 
     progress_tc = tool_ctx if (tool_ctx is not None and hasattr(tool_ctx, "emit_progress")) else None

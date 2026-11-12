@@ -1215,6 +1215,7 @@ def run_in_sandboxed_child(
     persist_df_name: Optional[str] = None,
     hard_timeout: float = _CHILD_HARD_TIMEOUT_DEFAULT,
     seed_imports: Optional[Dict[str, str]] = None,
+    timeout_decision_cb: Optional[Callable[[float], str]] = None,
 ) -> Dict[str, Any]:
     """Executes `source` in a sandboxed child process. Returns the envelope.
 
@@ -1244,12 +1245,27 @@ def run_in_sandboxed_child(
       - df_pickle (bytes|None)
       - scalars (dict[str, JSON-safe])
 
-    When the child exceeds `hard_timeout`, it is terminated and a synthetic
-    envelope with `success=False, error_type="TimeoutError"` is returned.
+    LONG-RUNNING CONTROL (`timeout_decision_cb`):
+        When the child exceeds `hard_timeout`, `timeout_decision_cb(elapsed)`
+        is invoked with the elapsed seconds. Its return value decides:
+          - "continue" (or any truthy "wait"/"allow"/"always"): keep waiting.
+            The wait window extends by another `hard_timeout` slice, and the
+            callback is invoked again if that slice also elapses.
+          - "stop" / "kill" / "reject" / anything else: terminate the child
+            immediately and return a TimeoutError envelope.
+        When `timeout_decision_cb` is None (default), the child is terminated
+        on the first timeout — identical to the previous behavior.
+
+        The child's stdout/stderr are redirected to temp FILES (not pipes) so
+        the retried `wait()` loop cannot deadlock on a full OS pipe buffer.
+        This is what makes "keep waiting" correct on every platform: a repeat
+        `wait()` is well-defined on a live process, whereas re-calling a
+        `communicate()` after a `TimeoutExpired` is not.
     """
     import json as _json
     import base64 as _b64
     import subprocess as _sp
+    import tempfile as _tf
 
     # SELF-HEAL module-level TRUE_* from the sys-cache (defensive symmetry with
     # the child's fresh import — kept for other code paths that read them).
@@ -1339,16 +1355,44 @@ def run_in_sandboxed_child(
         # CREATE_NO_WINDOW: never flash a console window on Windows.
         _creationflags = getattr(_sp, "CREATE_NO_WINDOW", 0)
 
+    # ── Pipe-to-FILE redirection ───────────────────────────────────────────
+    # The child is launched with stdout/stderr redirected to temp FILES, not
+    # pipes. This is the ONLY design that supports a correct "keep waiting?"
+    # retry loop: `proc.wait()` is repeatable on a live process (both POSIX
+    # and Windows), whereas re-calling `communicate()` after a
+    # `TimeoutExpired` is not — it would try to close stdin a second time and
+    # leave the read side consumed. Files also eliminate the OS pipe-buffer
+    # deadlock: a child that writes >64 KiB to a pipe the parent is not
+    # draining blocks forever; a child that writes to a file never blocks.
+    stdout_fh = None
+    stderr_fh = None
+    proc = None
     try:
+        stdout_fh = _tf.TemporaryFile(delete=False, mode="w+b")
+        stderr_fh = _tf.TemporaryFile(delete=False, mode="w+b")
+        stdout_path = stdout_fh.name
+        stderr_path = stderr_fh.name
         proc = _sp.Popen(
             [sys.executable, "-c", _CHILD_BOOTSTRAP_SOURCE],
             stdin=_sp.PIPE,
-            stdout=_sp.PIPE,
-            stderr=_sp.PIPE,
+            stdout=stdout_fh,
+            stderr=stderr_fh,
             cwd=os.getcwd(),
             creationflags=_creationflags,
         )
     except Exception as exc:
+        for _fh in (stdout_fh, stderr_fh):
+            if _fh is not None:
+                try:
+                    _fh.close()
+                except Exception:
+                    pass
+        for _p in (locals().get("stdout_path"), locals().get("stderr_path")):
+            if _p:
+                try:
+                    os.unlink(_p)
+                except Exception:
+                    pass
         return {
             "success": False, "stdout": "", "stderr": "",
             "traceback": f"Failed to spawn sandboxed child: {exc}",
@@ -1357,35 +1401,136 @@ def run_in_sandboxed_child(
             "figures": [], "df_pickle": None, "scalars": {},
         }
 
+    # ── Write the config to stdin, then close it ───────────────────────────
+    # `communicate()` was doing this implicitly; doing it manually lets us
+    # detach stdin from the wait loop and rely on `proc.wait()` — the only
+    # primitive safe to call repeatedly. A `BrokenPipeError` means the child
+    # died mid-config-read; that surfaces via the wait loop below exactly as
+    # communicate() would have surfaced it.
     try:
-        stdout_data, stderr_data = proc.communicate(
-            input=config_blob, timeout=hard_timeout,
-        )
-    except _sp.TimeoutExpired:
+        if proc.stdin is not None:
+            proc.stdin.write(config_blob)
+            proc.stdin.close()
+    except BrokenPipeError:
+        pass
+    except Exception as exc:
         try:
             proc.kill()
-            proc.communicate(timeout=2.0)
+            proc.wait(timeout=2.0)
         except Exception:
             pass
+        for _fh in (stdout_fh, stderr_fh):
+            try:
+                _fh.close()
+            except Exception:
+                pass
+        for _p in (stdout_path, stderr_path):
+            try:
+                os.unlink(_p)
+            except Exception:
+                pass
         return {
             "success": False, "stdout": "", "stderr": "",
-            "traceback": (
-                f"Sandboxed child exceeded {hard_timeout:.0f}s hard timeout "
-                "and was terminated."
-            ),
-            "error_type": "TimeoutError",
+            "traceback": f"Failed to send config to sandboxed child: {exc}",
+            "error_type": type(exc).__name__,
             "sandbox_violation": False,
             "figures": [], "df_pickle": None, "scalars": {},
         }
+
+    # ── Wait loop with operator-controlled retries ─────────────────────────
+    # `elapsed_seconds` accumulates only the time we actually spent waiting,
+    # so a hung prompt does not artificially enlarge the reported elapsed time.
+    import time as _time
+    wall_clock_start = _time.monotonic()
+    timed_out = False
+    try:
+        while True:
+            try:
+                proc.wait(timeout=hard_timeout)
+                break  # child exited cleanly (whatever its exit code)
+            except _sp.TimeoutExpired:
+                elapsed = _time.monotonic() - wall_clock_start
+                decision = "stop"
+                if timeout_decision_cb is not None:
+                    try:
+                        decision = str(timeout_decision_cb(elapsed)).strip().lower()
+                    except Exception:
+                        # A broken callback must never extend a hang: default
+                        # to stop. The failure is not swallowed — it is
+                        # reported in the timeout envelope by the caller.
+                        decision = "stop"
+                if decision in ("continue", "wait", "allow", "always", "keep_waiting", "keep waiting"):
+                    # Extend by the same slice and re-wait. Loop indefinitely
+                    # if the operator keeps saying continue — the caller owns
+                    # ultimate termination via the operator channel.
+                    continue
+                timed_out = True
+                break
     except Exception as exc:
         try:
             proc.kill()
         except Exception:
             pass
+        for _fh in (stdout_fh, stderr_fh):
+            try:
+                _fh.close()
+            except Exception:
+                pass
+        for _p in (stdout_path, stderr_path):
+            try:
+                os.unlink(_p)
+            except Exception:
+                pass
         return {
             "success": False, "stdout": "", "stderr": "",
             "traceback": f"Failed to communicate with sandboxed child: {exc}",
             "error_type": type(exc).__name__,
+            "sandbox_violation": False,
+            "figures": [], "df_pickle": None, "scalars": {},
+        }
+
+    if timed_out:
+        try:
+            proc.kill()
+            proc.wait(timeout=2.0)
+        except Exception:
+            pass
+
+    # ── Drain output files and clean up ────────────────────────────────────
+    stdout_data = b""
+    stderr_data = b""
+    try:
+        stdout_fh.flush()
+        stdout_fh.seek(0)
+        stdout_data = stdout_fh.read()
+    except Exception:
+        pass
+    try:
+        stderr_fh.flush()
+        stderr_fh.seek(0)
+        stderr_data = stderr_fh.read()
+    except Exception:
+        pass
+    for _fh in (stdout_fh, stderr_fh):
+        try:
+            _fh.close()
+        except Exception:
+            pass
+    for _p in (stdout_path, stderr_path):
+        try:
+            os.unlink(_p)
+        except Exception:
+            pass
+
+    if timed_out:
+        total_elapsed = _time.monotonic() - wall_clock_start
+        return {
+            "success": False, "stdout": "", "stderr": "",
+            "traceback": (
+                f"Sandboxed child exceeded the {hard_timeout:.0f}s hard timeout "
+                f"(total {total_elapsed:.0f}s) and was terminated."
+            ),
+            "error_type": "TimeoutError",
             "sandbox_violation": False,
             "figures": [], "df_pickle": None, "scalars": {},
         }

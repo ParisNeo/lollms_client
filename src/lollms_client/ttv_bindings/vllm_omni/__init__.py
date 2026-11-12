@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -88,6 +89,8 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
 
         # Ensure directories exist
         self.models_dir.mkdir(parents=True, exist_ok=True)
+
+        self.debug = debug
 
     # ------------------------------------------------------------------
     # Environment & Server Management Methods
@@ -284,6 +287,50 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
             data["model"] = model_id
         return data
 
+    def _log_curl_equivalent(
+        self,
+        url: str,
+        data: Dict[str, Any],
+        files: Optional[List[Any]] = None,
+    ) -> None:
+        """
+        Logs the equivalent ``curl -F ...`` command for the request being issued.
+
+        This mirrors the exact fields, multipart file parts (field name, filename,
+        content type) and scalar form fields sent to the server so a failing
+        request can be reproduced verbatim outside the binding.
+        """
+        if not getattr(self, "debug", False):
+            return
+
+        def _shell_quote(value: str) -> str:
+            escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+            return f'"{escaped}"'
+
+        parts: List[str] = [
+            "curl -X POST",
+            _shell_quote(url),
+        ]
+
+        for key, value in data.items():
+            if isinstance(value, (dict, list)):
+                value = json.dumps(value)
+            parts.append(f"-F {_shell_quote(f'{key}={value}')}")
+
+        for field_name, file_spec in files or []:
+            filename, file_obj, content_type = file_spec
+            # Reconstruct the on-disk path hint for reproducibility.
+            path_hint = getattr(file_obj, "name", None) or filename
+            parts.append(
+                "-F "
+                + _shell_quote(f"{field_name}=@{path_hint};type={content_type}")
+            )
+
+        parts.append(f"--max-time {self.timeout}")
+        parts.append("-o output.mp4")
+
+        ASCIIColors.info("vLLM-Omni request (curl equivalent):\n" + " \\\n  ".join(parts))
+
     # vLLM-Omni MiniMax-H3 hard-codes output fps; any other value is a 400.
     FIXED_FPS = 24
 
@@ -421,13 +468,13 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
         extra_params.update(kwargs.get("extra_params", {}))
         data["extra_params"] = json.dumps(extra_params)
 
-        files = {
-            "input_reference": ("start_frame.png", io.BytesIO(image_bytes), "image/png")
-        }
+        url = f"{self.base_url}/v1/videos/sync"
+        files = [("input_reference", ("start_frame.png", io.BytesIO(image_bytes), "image/png"))]
+        self._log_curl_equivalent(url, data, files)
 
         try:
             resp = self._session.post(
-                f"{self.base_url}/v1/videos/sync",
+                url,
                 data=data,
                 files=files,
                 timeout=self.timeout,

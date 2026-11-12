@@ -341,6 +341,11 @@ into the chat.
   object that now supersedes those per-mode injections for tool code.
 - **`docs/lcp/00_OVERVIEW.md`** — canonical definition of the `env` contract
   (§6) and the chat-system portability rule (§7).
+- **`docs/execute_python_timeout_policy.md`** — how the sandboxed Python tools
+  govern long-running execution: the 1-hour default budget, the operator-prompted
+  "keep waiting or stop?" decision, `confirm_handler` dispatch, and the
+  retry-loop implementation contract. Applies to `execute_python` and
+  `execute_python_data_query`.
 
 ---
 

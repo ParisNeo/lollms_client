@@ -378,6 +378,12 @@ OOXML_VALIDATORS = {
 }
 GUARDED_EXTENSIONS = tuple(OOXML_VALIDATORS.keys())
 
+# Default wall-clock budget for the sandboxed child. Raised from 120s to 3600s
+# because analytical workloads (large-file processing, model fitting, plot
+# rendering) routinely exceed 2 minutes. On expiry the operator is prompted
+# (when a handler is registered) instead of the child being silently killed.
+_DEFAULT_DATA_QUERY_TIMEOUT_SECONDS: float = 3600.0
+
 OFFICE_FAILURE_CODES = {
     ".xlsx": "xlsx_failed_excel_validation",
     ".xlsm": "xlsx_failed_excel_validation",
@@ -1049,6 +1055,21 @@ def tool_execute_python_data_query(
         )
         exec_source = conn_bootstrap + "\n" + code
 
+    # ── Timeout policy: operator-prompted, extended budget ──
+    # The child runs up to `_DEFAULT_DATA_QUERY_TIMEOUT_SECONDS` (1 hour). On
+    # expiry, if this call has a confirmation handler (the standard operator
+    # channel), the operator is asked "keep waiting or stop?". Without a
+    # handler (headless/CI) the child is terminated — the strict sandbox is
+    # the control and there is no human to consent to a longer wait.
+    def _on_dq_timeout(elapsed: float) -> str:
+        if not _has_registered_confirm_handler(env):
+            return "stop"
+        decision, _reason = _confirm_data_query_execution(
+            f"[timeout after {elapsed:.0f}s] keep waiting on data-query child?",
+            env=env,
+        )
+        return "continue" if decision in ("allow", "always") else "stop"
+
     envelope = run_in_sandboxed_child(
         source=exec_source,
         workspace_root=workspace_root,
@@ -1058,7 +1079,8 @@ def tool_execute_python_data_query(
         seed_locals=child_seed,
         seed_imports=seed_imports,
         persist_df_name="df" if persist_df else None,
-        hard_timeout=120.0,
+        hard_timeout=_DEFAULT_DATA_QUERY_TIMEOUT_SECONDS,
+        timeout_decision_cb=_on_dq_timeout,
     )
 
     # Restore the parent-side UTF-8 env (the child had its own copies).
