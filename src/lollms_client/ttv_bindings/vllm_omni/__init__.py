@@ -300,9 +300,6 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
         content type) and scalar form fields sent to the server so a failing
         request can be reproduced verbatim outside the binding.
         """
-        if not getattr(self, "debug", False):
-            return
-
         def _shell_quote(value: str) -> str:
             escaped = value.replace("\\", "\\\\").replace('"', '\\"')
             return f'"{escaped}"'
@@ -402,6 +399,7 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
         task: str = "t2va",
         **kwargs,
     ) -> bytes:
+        print(f"[VllmOmniTTVBinding.generate_video] ENTERED (TEXT-ONLY path, task={task})", flush=True)
         self._ensure_server_ready()
 
         data: Dict[str, Any] = {
@@ -425,9 +423,12 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
         extra_params.update(kwargs.get("extra_params", {}))
         data["extra_params"] = json.dumps(extra_params)
 
+        url = f"{self.base_url}/v1/videos/sync"
+        self._log_curl_equivalent(url, data, None)
+
         try:
             resp = self._session.post(
-                f"{self.base_url}/v1/videos/sync",
+                url,
                 data=data,
                 timeout=self.timeout,
             )
@@ -451,9 +452,19 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
         seed: Optional[int] = None,
         **kwargs,
     ) -> bytes:
+        print(
+            f"[VllmOmniTTVBinding.generate_video_from_image] ENTERED "
+            f"(image input type={type(image).__name__})",
+            flush=True,
+        )
         self._ensure_server_ready()
 
         image_bytes = self._prepare_image_bytes(image)
+        print(
+            f"[VllmOmniTTVBinding.generate_video_from_image] image_bytes length={len(image_bytes)} "
+            f"first8={image_bytes[:8]!r}",
+            flush=True,
+        )
         data: Dict[str, Any] = {
             "prompt": prompt,
             "fps": self._resolve_fps(fps),
