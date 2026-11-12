@@ -58,6 +58,10 @@ class SpinoffConfig:
     temperature: float = 0.3
     reasoning_effort: Optional[str] = None
     dynamic_effort: bool = False
+    # Relative subfolder inside the parent workspace, or "" to inherit the
+    # parent root verbatim. Verified at spawn time via
+    # `resolve_worker_workspace` (imported from `sub_agent_spawner`).
+    workspace: str = ""
 
 
 def build_spinoff_agent_tools(
@@ -102,18 +106,11 @@ def build_spinoff_agent_tools(
     # ────────────────────────────── sandbox helpers ──────────────────────────
 
     def _workspace_root() -> Path:
-        artefacts = getattr(discussion, "artefacts", None)
-        if artefacts and hasattr(artefacts, "_get_workspace_root"):
-            try:
-                return Path(artefacts._get_workspace_root())
-            except Exception:
-                pass
-        return Path(
-            getattr(discussion, "workspace_data_path", None)
-            or getattr(discussion, "_resolved_workspace", None)
-            or getattr(discussion, "workspace_path", None)
-            or "."
-        ).resolve()
+        # Delegate to the canonical resolver so `<agent>` and `tool_spinoff_agent`
+        # behave identically. Imported lazily to avoid a module-load cycle
+        # between spinoff_tools and sub_agent_spawner.
+        from lollms_client.lollms_agentic.sub_agent_spawner import get_parent_workspace_root
+        return get_parent_workspace_root(discussion)
 
     def _artifact_content(art: Dict[str, Any]) -> str:
         artefacts = getattr(discussion, "artefacts", None)
@@ -279,6 +276,7 @@ def build_spinoff_agent_tools(
         effort: str = "",
         model_name: str = "",
         dynamic_effort: bool = False,
+        workspace: str = "",
     ) -> dict:
         """
         Spawns a fully conditioned, specialized sub-agent in an isolated, focused sandbox.
@@ -300,6 +298,11 @@ def build_spinoff_agent_tools(
                 specialist may read. Defaults to "" (workspace tree only).
             max_rounds (int, optional): Bounded reasoning budget for the specialist. Defaults to 6.
             temperature (float, optional): Sampling temperature for the specialist. Defaults to 0.3.
+            workspace (str, optional): A RELATIVE subfolder inside the parent workspace
+                where the specialist operates (e.g. "scratch/sql_opt"). Verified to
+                resolve inside the parent workspace; absolute paths and '..'
+                traversal are rejected. Leave empty to inherit the parent workspace
+                verbatim (default). Defaults to "".
 
         Returns:
             dict: {"success": bool, "output": str (the specialist's report), "files": list}
@@ -308,6 +311,24 @@ def build_spinoff_agent_tools(
             # ── Input validation & bounding ──
             if not task or not task.strip():
                 return {"success": False, "error": "Parameter 'task' is required and must be non-empty."}
+
+            # Resolve the worker's workspace BEFORE conditioning. A bad
+            # `workspace` argument fails fast — no spawn, no partial state.
+            from lollms_client.lollms_agentic.sub_agent_spawner import (
+                resolve_worker_workspace,
+            )
+            parent_ws_root = _workspace_root()
+            try:
+                worker_workspace = resolve_worker_workspace(parent_ws_root, workspace)
+            except ValueError as ws_err:
+                return {
+                    "success": False,
+                    "error": (
+                        f"Invalid 'workspace' parameter: {ws_err}. Provide a "
+                        "relative subfolder inside the parent workspace, or "
+                        "omit it to inherit the parent workspace verbatim."
+                    ),
+                }
 
             clean_name = (agent_name or "").strip()[:64] or "Specialist"
             bounded_task = task.strip()[:_MAX_TASK_CHARS]
@@ -353,6 +374,7 @@ def build_spinoff_agent_tools(
                 temperature=bounded_temp,
                 reasoning_effort=clean_effort,
                 dynamic_effort=bool(dynamic_effort),
+                workspace=(workspace or "").strip(),
             )
 
             system_prompt = _build_persona_system_prompt(
@@ -387,6 +409,7 @@ def build_spinoff_agent_tools(
                 name=clean_name,
                 system_prompt=system_prompt,
                 lollms_client=client,
+                workspace_path=worker_workspace,
             )
 
             pre_run_tip = getattr(discussion, "active_branch_id", None)
@@ -539,6 +562,7 @@ def build_spinoff_agent_tools(
             {"name": "effort", "type": "str", "description": "Known reasoning effort to assign to the specialist ('none', 'low', 'medium', 'high'). Preferred: give the specialist a focused task with a known effort level.", "optional": True},
             {"name": "model_name", "type": "str", "description": "Select a specific model or profile alias for this specialist subtask (e.g. 'gpt4o', 'qwen_coder', 'fast_local').", "optional": True},
             {"name": "dynamic_effort", "type": "bool", "description": "If true, allows the sub-agent to dynamically adjust its reasoning effort using <effort level='...'/>.", "optional": True},
+            {"name": "workspace", "type": "str", "description": "Optional RELATIVE subfolder inside the parent workspace where the specialist operates (e.g. 'scratch/sql_opt'). Absolute paths and '..' are rejected. Leave empty to inherit the parent workspace verbatim.", "optional": True},
         ],
         "callable": tool_spinoff_agent,
     }

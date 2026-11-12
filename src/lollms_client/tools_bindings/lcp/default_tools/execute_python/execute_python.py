@@ -194,7 +194,79 @@ _RISK_CATEGORY_SIGNALS: Dict[str, Tuple[str, ...]] = {
         "host filesystem", "outside the workspace", "filesystem escape",
         "path outside", "absolute host path",
     ),
+    # Dedicated DELETION category — triggered by the AST detector below
+    # (`_detect_deletion_ops`) whenever the snippet performs a destructive
+    # filesystem operation (os.remove / os.unlink / os.rmdir / shutil.rmtree /
+    # Path.unlink / Path.rmdir). The category is intentionally NEVER
+    # auto-approved by a previous "always": the operator's intent — "ask me
+    # when you would delete files" — must be honoured for EVERY deletion
+    # batch, even inside the workspace. Only the current snippet is
+    # authorized by a "yes" answer.
+    "delete": (
+        "deletes files", "deletes directories", "recursive delete",
+    ),
 }
+
+# AST-detectable destructive filesystem operations. The detector walks every
+# call in the snippet and returns the sorted set of operations it found.
+# Convenient, because it lets the prompt say *which* operations will run
+# ("os.remove, shutil.rmtree") instead of just "destructive work".
+_DELETION_OS_ATTRS: frozenset[str] = frozenset({
+    "remove", "unlink", "rmdir", "removedirs",
+})
+_DELETION_SHUTIL_ATTRS: frozenset[str] = frozenset({"rmtree"})
+_DELETION_PATH_METHODS: frozenset[str] = frozenset({"unlink", "rmdir"})
+
+
+def _detect_deletion_ops(source: str) -> List[str]:
+    """Returns the sorted list of destructive filesystem calls in `source`.
+
+    Detects the AST surface only — this is a PROMPTING heuristic, not the
+    security boundary (the runtime `_bounded_*` guards remain the boundary
+    for path bounds). It exists so that:
+      * `safe` mode can force a prompt on snippets that delete files, even
+        when the snippet touches no other risk category;
+      * the prompt can name the exact operations the operator is about to
+        authorize ("os.remove, shutil.rmtree"), so consent is informed.
+
+    Never raises; a syntax error yields an empty list (nothing to prompt on
+    for a source that cannot compile anyway).
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    found: set = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        func_name = ""
+        if isinstance(func, ast.Attribute):
+            attr = func.attr
+            target = func.value
+            # os.<deletion>
+            if isinstance(target, ast.Name) and target.id == "os" and attr in _DELETION_OS_ATTRS:
+                found.add(f"os.{attr}")
+            # shutil.<deletion>
+            elif isinstance(target, ast.Name) and target.id == "shutil" and attr in _DELETION_SHUTIL_ATTRS:
+                found.add(f"shutil.{attr}")
+            # <anything>.<unlink|rmdir> — matches Path(...).unlink(),
+            # open(...).rmdir (impossible but harmless), and the canonical
+            # Path form. False positives simply mean an extra confirmation
+            # prompt, which is the correct safe default.
+            elif attr in _DELETION_PATH_METHODS:
+                # Exclude modules we explicitly know are not fs deletion:
+                # `tempfile.unlink` (not a real API), `zipfile.rmdir` (not
+                # real) — these are non-issues; leaving the broad match is
+                # strictly safer than missing a real `Path.unlink()`.
+                found.add(f".{attr}()")
+        elif isinstance(func, ast.Name):
+            func_name = func.id
+            # Bare `remove(...)` when `from os import remove` was used.
+            if func_name in _DELETION_OS_ATTRS:
+                found.add(f"{func_name}()")
+    return sorted(found)
 
 
 def _classify_risk_categories(risky_reason: Optional[str]) -> frozenset:
@@ -235,9 +307,16 @@ def _approve_categories(categories: frozenset) -> None:
     Called from the "[a]lways" branch of every authorization prompt, with the
     categories of the code the operator actually saw. Mutates the process-wide
     set exactly once and mirrors it to every loaded module instance.
+
+    The `delete` category is EXCLUDED by invariant: "always" on a snippet that
+    deletes files must NOT license future deletions — the operator's intent is
+    "confirm every destructive action". Deletions are always re-prompted.
     """
     global _APPROVED_CATEGORIES
-    new_set = _get_approved_categories() | set(categories)
+    persistent = set(categories) - {"delete"}
+    if not persistent:
+        return
+    new_set = _get_approved_categories() | persistent
     new_frozen = frozenset(new_set)
     _APPROVED_CATEGORIES = new_frozen
     try:
@@ -354,26 +433,47 @@ def _clear_approved_path_roots() -> None:
 
 
 def _categories_for(source: str, workspace_root: Optional[Path] = None) -> frozenset:
-    """Convenience: runs detection + classification in one call."""
-    return _classify_risk_categories(
+    """Convenience: runs risk detection + deletion detection, then classifies."""
+    categories = set(_classify_risk_categories(
         _detect_risky_operations(source, workspace_root=workspace_root)
-    )
+    ))
+    # Deletion category is added independently of the risky-operation reason
+    # so that a snippet whose ONLY risky surface is deletion still prompts in
+    # safe mode. The prompt is the security property here: the user's intent
+    # is "ask before you delete anything", and this is where we honour it.
+    if _detect_deletion_ops(source):
+        categories.add("delete")
+    return frozenset(categories)
 
 
-def _is_category_approved(risky_reason: Optional[str]) -> bool:
+def _is_category_approved(risky_reason: Optional[str], source: Optional[str] = None) -> bool:
     """True iff *every* category of `risky_reason` is already pre-approved.
 
     Only when ALL present categories are approved may the prompt be skipped.
     A snippet spanning `network` + `process` will prompt even if `network` is
     approved, because `process` has not been. This is the strictly-safe rule:
     the operator is asked about every category they have not consented to.
+
+    When `source` is provided, the snippet is ALSO scanned for deletions. The
+    `delete` category is deliberately EXCLUDED from the persistent approval
+    set: the operator's intent is "ask me when you would delete files", and
+    "always" on a previous snippet must NOT license future deletions. Only a
+    "yes" on the CURRENT prompt authorizes the current deletion batch. This is
+    the correct contract — every destructive action is confirmed.
     """
-    if not risky_reason:
-        return True  # benign — no category, no prompt
-    categories = _classify_risk_categories(risky_reason)
+    categories = set(_classify_risk_categories(risky_reason))
+    if source is not None and _detect_deletion_ops(source):
+        categories.add("delete")
     if not categories:
+        return True  # benign — no category, no prompt
+    # ── Deletion always forces the prompt. ──
+    # Not part of `_get_approved_categories()` de facto (it is never added by
+    # `_approve_categories` — see the check below), but stated explicitly so
+    # the invariant is self-documenting at the dispatch site.
+    if "delete" in categories and "delete" not in _get_approved_categories():
         return False
-    return categories.issubset(_get_approved_categories())
+    approved = _get_approved_categories() - {"delete"}
+    return (categories - {"delete"}).issubset(approved)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -785,24 +885,46 @@ def _prompt_user_validation(source: str, script_label: str, argv: Optional[List[
             _ws_for_prompt = _get_workspace_root(None)
         except Exception:
             _ws_for_prompt = None
-        risk_categories = _classify_risk_categories(
+        risk_categories = set(_classify_risk_categories(
             _detect_risky_operations(source, workspace_root=_ws_for_prompt)
-        )
+        ))
+        # Deletion detection is INDEPENDENT of risk detection: an inside-workspace
+        # `os.remove('tmp.txt')` carries no risk category (safe path, no shell),
+        # but the operator's directive is "ask me before you delete anything" —
+        # so a `delete` category is surfaced here for informational purposes AND
+        # to gate the "always" branch (the delete category is never persisted; each
+        # deletion batch prompts again).
+        deletion_ops = _detect_deletion_ops(source)
+        if deletion_ops:
+            risk_categories.add("delete")
         cats_hint = ", ".join(sorted(risk_categories)) if risk_categories else "none"
+        deletion_note = ""
+        if deletion_ops:
+            deletion_note = (
+                f"\n  ⚠️  This snippet DELETES files/directories: "
+                f"{', '.join(deletion_ops)}.\n"
+                f"  Deletion confirmation is per-execution: a previous "
+                f"'always' does not auto-approve it."
+            )
         while True:
             try:
                 choice = input(
                     f"  Authorize execution? [y]es / [n]o / "
                     f"[a]lways for category [{cats_hint}] / [v]iew full code "
-                    f"(default: y): "
+                    f"(default: y): " + deletion_note
                 ).strip().lower()
             except (EOFError, KeyboardInterrupt):
                 print()
                 return "reject", "Execution interrupted by operator (Ctrl+C / EOF)."
 
             if choice in ("", "y", "yes"):
+                # Explicit "yes" authorizes THIS execution including any
+                # deletions it performs. The next deletion will prompt again
+                # because `delete` is never added to the persistent set.
                 return "allow", ""
             elif choice in ("a", "always"):
+                # "always" persists every category in `risk_categories` EXCEPT
+                # `delete` — deletions always prompt, per operator directive.
                 return "always", ""
             elif choice in ("n", "no"):
                 try:
@@ -1278,24 +1400,44 @@ def _run_python_source(
     # what makes the filesystem category fire ONLY on genuine escapes, so
     # `open('data.csv')` never prompts while `open('C:/.../site-packages')` does.
     _workspace_root_for_detection = _get_workspace_root(tool_ctx)
+    # Static risk detection — the reason string drives both the prompt label
+    # and the category-scoped approval decision below. Computed once here so
+    # the same reason is reused by the prompt and the static profile selector.
     risky_reason = _detect_risky_operations(source, workspace_root=_workspace_root_for_detection)
     # Category-scoped approval: only skip the prompt when EVERY risk category
     # present in this snippet is already pre-approved by the operator. A new
     # category (e.g. operator approved network, now sees subprocess) MUST
     # prompt — this is the core requirement of category-scoped "always".
-    auto_approved = _is_category_approved(risky_reason)
+    #
+    # The `source` argument enables deletion detection: a snippet whose ONLY
+    # unusual surface is `os.remove('x')` inside the workspace has NO risk
+    # category, but MUST still be confirmed — the operator said "ask before
+    # deleting". This overrides the auto-approval (see `_is_category_approved`).
+    auto_approved = _is_category_approved(risky_reason, source=source)
 
     requires_user_prompt = False
     prompt_label = script_label
     user_authorized_risky = pre_authorized or auto_approved
 
+    # Deletion detection runs independently: it forces the prompt even when
+    # `risky_reason` is None (a purely workspace-internal deletion triggers no
+    # risk category — safe path, no shell — but the operator has asked to be
+    # consulted before anything is deleted).
+    _deletion_ops = _detect_deletion_ops(source)
+    _has_deletion = bool(_deletion_ops)
+
     if not pre_authorized and not auto_approved:
         if AUTONOMY_LEVEL == "strict":
             requires_user_prompt = True
             prompt_label = f"[STRICT] {script_label}"
-        elif AUTONOMY_LEVEL == "safe" and risky_reason:
+        elif AUTONOMY_LEVEL == "safe" and (_has_deletion or risky_reason):
             requires_user_prompt = True
-            prompt_label = f"[RISKY: {risky_reason}] {script_label}"
+            label_parts: List[str] = []
+            if risky_reason:
+                label_parts.append(f"RISKY: {risky_reason}")
+            if _has_deletion:
+                label_parts.append(f"DELETES: {', '.join(_deletion_ops)}")
+            prompt_label = f"[{' | '.join(label_parts)}] {script_label}"
 
     if requires_user_prompt:
         decision, rejection_reason = _prompt_user_validation(source, prompt_label, argv)
@@ -1312,7 +1454,10 @@ def _run_python_source(
             }
         elif decision == "always":
             # Grant ONLY the categories present in THIS snippet. Subsequent
-            # code touching a different category will prompt again.
+            # code touching a different category will prompt again. The
+            # `delete` category is never persisted (see `_approve_categories`):
+            # every future deletion prompts the operator again, matching the
+            # "ask before you delete" contract.
             approved_now = _classify_risk_categories(risky_reason)
             _approve_categories(approved_now)
             # If the operator authorized filesystem access, widen the runtime
@@ -1323,9 +1468,10 @@ def _run_python_source(
             if "filesystem" in approved_now:
                 _sync_approved_path_roots(_workspace_root_for_detection)
             user_authorized_risky = True
-            cats_display = ", ".join(sorted(approved_now)) or "none"
+            cats_display = ", ".join(sorted(approved_now - {"delete"})) or "none"
+            extra = " (deletions will still prompt)" if _has_deletion else ""
             ASCIIColors.success(
-                f"[execute_python] 🔓 Auto-approval enabled for category(ies): {cats_display}."
+                f"[execute_python] 🔓 Auto-approval enabled for category(ies): {cats_display}{extra}."
             )
         elif decision == "allow":
             # HEADLESS AUTO-PROCEED: in pytest/CI there is no operator to
@@ -1898,37 +2044,82 @@ def tool_execute_python_code(code: str = "", env: Optional[Any] = None) -> Dict[
 
 def _sanitize_python_file_name(file_name: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    Validates and normalizes a target .py file name for the combined write+run tool.
+    Validates and normalizes a target .py file path for the combined write+run tool.
 
-    Returns (clean_name, None) on success, or (None, error_message) on rejection.
-    Enforces: non-empty, no directory components, no traversal, .py extension,
-    and rejects names that collide with the tool's own log naming scheme.
+    Returns (clean_rel_path, None) on success, or (None, error_message) on rejection.
+
+    The returned value is a **workspace-relative** path and MAY contain
+    subdirectory components (e.g. ``"scripts/build_presentation.py"``). This is
+    the correct contract: the workspace root is the containment boundary, and
+    the final ``target_path.relative_to(workspace_root)`` check in
+    ``tool_create_and_execute_python_file`` is what actually enforces it —
+    traversal below the workspace is a legitimate organizing pattern, not an
+    escape.
+
+    Enforces:
+      * non-empty;
+      * no parent-traversal (``..``) segments — this is the STRING-level escape
+        check that runs before `Path.resolve()`;
+      * no absolute paths (leading ``/``, drive letters, ``~`` expansion) — the
+        tool only ever writes INSIDE the workspace, so absolute targets are
+        rejected at parse time;
+      * ``.py`` extension appended when missing;
+      * the *basename* does not collide with the tool's own ``exec_output_*``
+        log naming scheme.
+
+    The authoritative containment check remains the post-resolve
+    ``relative_to(workspace_root)`` guard in the caller — that is what catches
+    symlink escapes and (on Windows) alternate-drive tricks the string scan
+    cannot see. This helper deliberately leaves that check to the caller so
+    the resolve cost is paid once, against the real workspace root.
     """
     if not isinstance(file_name, str) or not file_name.strip():
-        return None, "The 'file_name' parameter is empty. Provide a target .py file name (e.g. 'script.py')."
+        return None, "The 'file_name' parameter is empty. Provide a target .py file path (e.g. 'script.py' or 'scripts/script.py')."
 
-    raw = file_name.strip()
-    if ".." in raw or "/" in raw or "\\" in raw or raw.startswith("~"):
+    raw = file_name.strip().replace("\\", "/").strip()
+
+    # -- Reject absolute paths and tilde. Both are ALWAYS escapes: the tool
+    #    writes only inside the workspace, so an absolute target has no
+    #    legitimate meaning here.
+    if raw.startswith("~"):
         return None, (
-            f"Invalid or unsafe file name: '{file_name}'. Directory components, "
-            "path traversal ('..'), and '~' are blocked. Provide a bare file name "
-            "such as 'script.py'."
+            f"Invalid file name: '{file_name}'. '~' expansion is not allowed; "
+            "provide a path relative to the workspace root."
+        )
+    if raw.startswith("/") or re.match(r"^[A-Za-z]:/", raw):
+        return None, (
+            f"Invalid file name: '{file_name}'. Absolute paths are not allowed; "
+            "provide a path relative to the workspace root (e.g. "
+            "'scripts/build_presentation.py')."
         )
 
-    name = Path(raw).name
-    if not name or name in (".", ".."):
+    # -- Reject '..' segments explicitly. This is the string-level traversal
+    #    guard; the caller's `relative_to(workspace_root)` after `resolve()`
+    #    is the authoritative one (catches symlink-based escapes too).
+    parts = [p for p in raw.split("/") if p not in ("", ".")]
+    if not parts:
         return None, f"Invalid file name: '{file_name}'."
-
-    if not name.lower().endswith(".py"):
-        name = f"{name}.py"
-
-    if name.lower().startswith("exec_output_"):
+    if any(p == ".." for p in parts):
         return None, (
-            f"Reserved file name: '{name}'. Names starting with 'exec_output_' are "
-            "used for persisted execution logs. Choose a different name."
+            f"Invalid file name: '{file_name}'. Parent traversal ('..') is "
+            "not allowed; provide a path relative to the workspace root."
         )
 
-    return name, None
+    # --- Extension & reserved-prefix checks on the BASENAME only: nothing
+    #     represents the log naming scheme beyond the final component, and a
+    #     subdirectory named `exec_output_scripts/` should remain usable.
+    basename = parts[-1]
+    if not basename.lower().endswith(".py"):
+        basename = f"{basename}.py"
+        parts[-1] = basename
+    if basename.lower().startswith("exec_output_"):
+        return None, (
+            f"Reserved file name: '{basename}'. Names starting with "
+            "'exec_output_' are used for persisted execution logs. Choose a "
+            "different name."
+        )
+
+    return "/".join(parts), None
 
 
 def tool_create_and_execute_python_file(
@@ -1955,8 +2146,10 @@ def tool_create_and_execute_python_file(
 
     Args:
         code (str): The complete Python source to write and execute. Required.
-        file_name (str): Target .py file name in the workspace (bare name, no
-            directories). Required. Path traversal is blocked.
+        file_name (str): Workspace-RELATIVE target .py file path. It MAY include
+            subdirectories (e.g. ``'scripts/build_presentation.py'``); they are
+            created on demand. Absolute paths, ``~`` expansion, and ``..``
+            traversal are rejected. Required.
         args (list): Optional command-line style arguments passed via sys.argv[1:].
         env: Optional host-injected runtime context; its tool_context streams stdout live.
     """
@@ -1988,13 +2181,23 @@ def tool_create_and_execute_python_file(
 
     tool_ctx = getattr(env, "tool_context", None) if env else None
     workspace_root = _get_workspace_root(tool_ctx)
+    # `clean_name` is already normalized to forward slashes and is guaranteed
+    # to have no '..' segments, no leading slash, and no drive letter (see
+    # `_sanitize_python_file_name`). The `resolve()` + `relative_to()` pair is
+    # the AUTHORITATIVE containment check: it catches symlink-based escapes
+    # that the string scan cannot detect, and — because resolve() is a no-op
+    # for a path that doesn't yet exist — it also protects the write that
+    # follows.
     target_path = (workspace_root / clean_name).resolve()
     try:
         target_path.relative_to(workspace_root.resolve())
     except ValueError:
         return {
             "success": False,
-            "error": f"Invalid or unsafe file path: '{file_name}'. Path traversal is blocked.",
+            "error": (
+                f"Invalid or unsafe file path: '{file_name}'. The resolved "
+                "target escapes the workspace root (symlink or mount point)."
+            ),
             "output": "",
             "stderr": ""
         }
@@ -2009,13 +2212,22 @@ def tool_create_and_execute_python_file(
 
     # Category-scoped approval: skip the prompt only when ALL categories of
     # this snippet are pre-approved. A different category must prompt again.
-    if not _is_category_approved(risky_reason):
+    # Deletion detection adds an independent prompt trigger — the same
+    # "ask before deleting" contract as the inline tool.
+    _deletion_ops = _detect_deletion_ops(code_str)
+    _has_deletion = bool(_deletion_ops)
+    if not _is_category_approved(risky_reason, source=code_str):
         if AUTONOMY_LEVEL == "strict":
             requires_user_prompt = True
             prompt_label = f"[STRICT] {clean_name}"
-        elif AUTONOMY_LEVEL == "safe" and risky_reason:
+        elif AUTONOMY_LEVEL == "safe" and (_has_deletion or risky_reason):
             requires_user_prompt = True
-            prompt_label = f"[RISKY: {risky_reason}] {clean_name}"
+            label_parts: List[str] = []
+            if risky_reason:
+                label_parts.append(f"RISKY: {risky_reason}")
+            if _has_deletion:
+                label_parts.append(f"DELETES: {', '.join(_deletion_ops)}")
+            prompt_label = f"[{' | '.join(label_parts)}] {clean_name}"
 
     if requires_user_prompt:
         decision, rejection_reason = _prompt_user_validation(code_str, prompt_label, args)
@@ -2035,16 +2247,26 @@ def tool_create_and_execute_python_file(
                 "stderr": f"Execution rejected: {reason_msg}"
             }
         if decision == "always":
+            # Persist every category EXCEPT `delete` (see `_approve_categories`):
+            # deletions always prompt again. The alias maps every risky
+            # category from the classifier, plus the `filesystem` widening
+            # that unlocks interpreter-tree reads.
             approved_now = _classify_risk_categories(risky_reason)
             _approve_categories(approved_now)
             if "filesystem" in approved_now:
                 _sync_approved_path_roots(workspace_root)
-            cats_display = ", ".join(sorted(approved_now)) or "none"
+            cats_display = ", ".join(sorted(approved_now - {"delete"})) or "none"
+            extra = " (deletions will still prompt)" if _has_deletion else ""
             ASCIIColors.success(
-                f"[execute_python] 🔓 Auto-approval enabled for category(ies): {cats_display}."
+                f"[execute_python] 🔓 Auto-approval enabled for category(ies): {cats_display}{extra}."
             )
 
     try:
+        # Create any subdirectory components (e.g. `scripts/`) required by the
+        # target path. `exist_ok=True` makes repeated calls idempotent; the
+        # parent directory is spawned ONLY after the containment check above,
+        # so it is guaranteed to be inside the workspace.
+        target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.write_text(code_str, encoding="utf-8")
     except Exception as write_err:
         return {

@@ -341,23 +341,72 @@ DANGEROUS_BUILTINS: frozenset[str] = frozenset({
     "help", "exit", "quit",
 })
 
-# `os` functions that mutate filesystem / processes.
-DANGEROUS_OS_ATTRS: frozenset[str] = frozenset({
+# `os` attributes that provide a PROCESS-LEVEL escape surface. These are hard-
+# blocked at the AST layer in EVERY profile — no path containment can make them
+# safe, since they hand control to the host OS process table directly.
+#
+# Keep this set TIGHT. Only primitives whose ONLY meaningful purpose is to
+# escape the sandbox live here. Ordinary filesystem mutation is covered by
+# `MUTATING_OS_ATTRS` below — those are PATH-BOUNDED and runtime-guarded, so
+# blocking them at AST time was the source of the "refuses to create a folder
+# inside the workspace" bug.
+PROCESS_ESCAPE_OS_ATTRS: frozenset[str] = frozenset({
     "system", "popen", "spawnl", "spawnle", "spawnlp", "spawnlpe",
     "spawnv", "spawnve", "spawnvp", "spawnvpe",
     "execl", "execle", "execlp", "execlpe", "execv", "execve", "execvp", "execvpe",
-    "kill", "killpg", "remove", "unlink", "rmdir", "removedirs",
-    "rename", "renames", "replace", "chmod", "chown", "lchown",
-    "symlink", "link", "walk", "mkdir", "makedirs", "mknod",
-    "putenv", "unsetenv", "setsid", "fork", "forkpty",
-    "startfile", "abort", "truncate", "open", "close",
+    "kill", "killpg", "setsid", "fork", "forkpty",
+    "startfile", "abort",
 })
 
-# Sub-attributes on shutil that mutate filesystem.
+# `os` attributes that MUTATE the filesystem within a bounded path. These are
+# SAFE inside the workspace because the runtime `SandboxContext` wraps them
+# (`_bounded_makedirs`, `_bounded_remove`, `_bounded_rename`, ...) and calls
+# `_resolve_within(root, target)` on EVERY path argument. The AST layer MUST
+# NOT pre-reject them: doing so was the exact bug where `os.makedirs(d)`
+# (inside the workspace) was refused at compile time even though the runtime
+# would have allowed it.
+#
+# Deletion-flavoured operations (`remove`, `unlink`, `rmdir`, `removedirs`)
+# are further gated by the *deletion confirmation* prompt in `execute_python`
+# — the AST lets them through, the runtime path-checks them, and the user is
+# asked before the child executes (see `_classify_risk_categories` below).
+MUTATING_OS_ATTRS: frozenset[str] = frozenset({
+    "remove", "unlink", "rmdir", "removedirs",
+    "rename", "renames", "replace",
+    "chmod", "chown", "lchown",
+    "symlink", "link", "mknod",
+    "mkdir", "makedirs",
+    "putenv", "unsetenv",
+    "truncate",
+})
+
+# Backwards-compatible union: anything that used to be considered "dangerous".
+# External code (tests, plugins) that imported the old name keeps seeing the
+# full set — but the AST validators below now consult the two split sets so
+# legitimate filesystem operations are permitted.
+DANGEROUS_OS_ATTRS: frozenset[str] = (
+    PROCESS_ESCAPE_OS_ATTRS | MUTATING_OS_ATTRS | frozenset({"open", "close", "walk"})
+)
+
+# Sub-attributes on shutil that mutate filesystem. ALL of these are path-bound
+# (each takes explicit src/dst/target arguments that the runtime guard checks
+# via `_bounded_shutil_*`). Like `MUTATING_OS_ATTRS`, the AST layer permits
+# them; the RUNTIME layer is the boundary.
+#
+# `rmtree` and `unpack_archive` are additionally flagged as destructive by the
+# deletion-confirmation classifier in `execute_python` (see
+# `_DELETION_SIGNAL_PATTERNS`).
 DANGEROUS_SHUTIL_ATTRS: frozenset[str] = frozenset({
     "rmtree", "move", "copy", "copy2", "copyfile", "copyfileobj",
     "copymode", "copystat", "copytree", "make_archive", "unpack_archive",
 })
+
+# shutil attributes that must STILL be AST-blocked — these spawn subprocesses
+# internally (`shutil.which` is safe; `shutil.chown` reaches os.chown which
+# the runtime path-guards). Nothing currently in this set — reserved for
+# future hardening if a shutil path is ever found that bypasses the runtime
+# guard.
+FORBIDDEN_SHUTIL_ATTRS: frozenset[str] = frozenset()
 
 # `pathlib.Path` methods that mutate the filesystem (path-guarded at runtime).
 MUTATING_PATH_METHODS: frozenset[str] = frozenset({
@@ -695,7 +744,14 @@ def _validate_data_query(tree: ast.AST) -> Optional[SandboxViolation]:
                 attr = func.attr
                 target = func.value
                 if isinstance(target, ast.Name) and target.id == "os":
-                    if attr in DANGEROUS_OS_ATTRS:
+                    # Process-escape surface remains forbidden (no path
+                    # containment can make `os.system` safe). Filesystem
+                    # MUTATIONS are permitted here; the strict runtime path
+                    # guard (`_bounded_makedirs` / `_bounded_remove` / ...)
+                    # rejects any target outside `workspace_root`, which is
+                    # the real boundary. Blocking mutations at AST time was
+                    # the "can't even make a folder" bug.
+                    if attr in PROCESS_ESCAPE_OS_ATTRS:
                         return SandboxViolation(
                             reason=(
                                 f"Call to 'os.{attr}' is not permitted in the "
@@ -705,7 +761,7 @@ def _validate_data_query(tree: ast.AST) -> Optional[SandboxViolation]:
                             line=getattr(node, "lineno", 0),
                         )
                 if isinstance(target, ast.Name) and target.id == "shutil":
-                    if attr in DANGEROUS_SHUTIL_ATTRS:
+                    if attr in FORBIDDEN_SHUTIL_ATTRS:
                         return SandboxViolation(
                             reason=(
                                 f"Call to 'shutil.{attr}' is not permitted in the "
@@ -766,14 +822,24 @@ def _validate_standard(tree: ast.AST) -> Optional[SandboxViolation]:
                 attr = func.attr
                 target = func.value
                 if isinstance(target, ast.Name) and target.id == "os":
-                    if attr in DANGEROUS_OS_ATTRS:
+                    # Process-escape keeps AST rejection; filesystem mutations
+                    # are PATH-BOUNDED at runtime and therefore permitted here.
+                    # Rationale: `os.makedirs(d, exist_ok=True)` where `d` is
+                    # inside the workspace is a completely legitimate operation
+                    # for a coding agent. The runtime `_bounded_makedirs`
+                    # rejects any `d` outside `workspace_root`. Blocking it at
+                    # compile time (the previous behavior) produced the exact
+                    # "🛑 BLOCKED BY SANDBOX (line 6): Call to 'os.makedirs' is
+                    # forbidden in the sandbox" bug and made the sandbox
+                    # unusable for ordinary work.
+                    if attr in PROCESS_ESCAPE_OS_ATTRS:
                         return SandboxViolation(
                             reason=f"Call to 'os.{attr}' is forbidden in the sandbox.",
                             snippet=_describe(node),
                             line=getattr(node, "lineno", 0),
                         )
                 if isinstance(target, ast.Name) and target.id == "shutil":
-                    if attr in DANGEROUS_SHUTIL_ATTRS:
+                    if attr in FORBIDDEN_SHUTIL_ATTRS:
                         return SandboxViolation(
                             reason=f"Call to 'shutil.{attr}' is forbidden in the sandbox.",
                             snippet=_describe(node),
@@ -842,7 +908,7 @@ def _validate_authorized(tree: ast.AST) -> Optional[SandboxViolation]:
                 attr = func.attr
                 target = func.value
                 if isinstance(target, ast.Name) and target.id == "os":
-                    if attr in DANGEROUS_OS_ATTRS:
+                    if attr in PROCESS_ESCAPE_OS_ATTRS:
                         return SandboxViolation(
                             reason=(
                                 f"Call to 'os.{attr}' is forbidden even under user "
@@ -853,7 +919,7 @@ def _validate_authorized(tree: ast.AST) -> Optional[SandboxViolation]:
                             line=getattr(node, "lineno", 0),
                         )
                 if isinstance(target, ast.Name) and target.id == "shutil":
-                    if attr in DANGEROUS_SHUTIL_ATTRS:
+                    if attr in FORBIDDEN_SHUTIL_ATTRS:
                         return SandboxViolation(
                             reason=f"Call to 'shutil.{attr}' is forbidden in the sandbox.",
                             snippet=_describe(node),
@@ -922,6 +988,11 @@ __all__ = [
     "run_in_sandboxed_child",
     "set_extra_read_roots",
     "set_extra_write_roots",
+    "DANGEROUS_OS_ATTRS",
+    "PROCESS_ESCAPE_OS_ATTRS",
+    "MUTATING_OS_ATTRS",
+    "DANGEROUS_SHUTIL_ATTRS",
+    "FORBIDDEN_SHUTIL_ATTRS",
     "TRUE_COMPILE",
     "TRUE_EXEC",
     "TRUE_EVAL",

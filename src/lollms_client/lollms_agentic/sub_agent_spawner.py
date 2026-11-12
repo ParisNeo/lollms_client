@@ -17,6 +17,7 @@
 # emitted, the report envelope it received, and its own final answer.
 
 import re
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ascii_colors import ASCIIColors, trace_exception
@@ -34,6 +35,95 @@ _REPORT_CLOSE_RE = re.compile(r'</report>', re.IGNORECASE)
 _MAX_CONTEXT_FILES = 8
 _MAX_REPORT_CHARS = 6000
 _MAX_TASK_CHARS = 4000
+_MAX_WORKSPACE_ARG_CHARS = 400
+
+
+def get_parent_workspace_root(discussion) -> Path:
+    """Resolves the parent conversation's workspace root.
+
+    Preference order (identical to ``spinoff_tools._workspace_root``):
+      1. ``discussion.artefacts._get_workspace_root()`` — the authoritative
+         root artifacts are flushed to;
+      2. ``discussion.workspace_data_path`` / ``_resolved_workspace`` /
+         ``workspace_path``;
+      3. ``"."`` (CWD).
+    """
+    artefacts = getattr(discussion, "artefacts", None)
+    if artefacts is not None and hasattr(artefacts, "_get_workspace_root"):
+        try:
+            return Path(artefacts._get_workspace_root()).resolve()
+        except Exception:
+            pass
+    return Path(
+        getattr(discussion, "workspace_data_path", None)
+        or getattr(discussion, "_resolved_workspace", None)
+        or getattr(discussion, "workspace_path", None)
+        or "."
+    ).resolve()
+
+
+def resolve_worker_workspace(
+    parent_workspace_root: Path, workspace_arg: Optional[str],
+) -> Path:
+    """Returns the confinement-safe workspace path for a worker.
+
+    Rules (fail-closed — any ambiguity raises ``ValueError``):
+      * ``None`` / ``""``            → inherit the parent root (same folder).
+      * absolute path                → rejected (callers must use relative).
+      * any ``..`` segment           → rejected (no traversal, even inside).
+      * ``~``-prefixed path          → rejected (user-home expansion is a
+                                       silent escape from the parent tree).
+      * the resolved target MUST sit inside ``parent_workspace_root`` AFTER
+        ``Path.resolve()`` — this catches symlink escapes that the lexical
+        check on the raw string would miss.
+
+    The returned Path is already resolved; callers pass it verbatim to
+    ``LollmsPersonality(workspace_path=...)`` with no further checks needed.
+    The child directory is created on demand by the LollmsPersonality
+    constructor (``workspace_path.mkdir(parents=True, exist_ok=True)``).
+    """
+    parent_root = Path(parent_workspace_root).resolve()
+    raw = (workspace_arg or "").strip()
+    if not raw:
+        return parent_root
+    if len(raw) > _MAX_WORKSPACE_ARG_CHARS:
+        raise ValueError(
+            f"'workspace' parameter exceeds {_MAX_WORKSPACE_ARG_CHARS} characters."
+        )
+    if raw.startswith("~"):
+        raise ValueError(
+            "The 'workspace' parameter must be a relative path inside the "
+            "parent workspace; '~' expansion is not permitted."
+        )
+    normalized = raw.replace("\\", "/").strip().lstrip("/")
+    if not normalized:
+        return parent_root
+    candidate_path = Path(normalized)
+    if candidate_path.is_absolute():
+        raise ValueError(
+            "The 'workspace' parameter must be a RELATIVE path inside the "
+            "parent workspace (absolute paths are rejected)."
+        )
+    if ".." in candidate_path.parts:
+        raise ValueError(
+            "The 'workspace' parameter must not contain '..' (parent traversal "
+            "is rejected)."
+        )
+    try:
+        resolved = (parent_root / normalized).resolve()
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Failed to resolve 'workspace' path: {exc}") from exc
+    try:
+        resolved.relative_to(parent_root)
+    except ValueError:
+        # This catches the symlink case: a relative path inside the workspace
+        # can still resolve OUTSIDE via a symlinked subdirectory.
+        raise ValueError(
+            "The 'workspace' parameter resolves outside the parent workspace "
+            "(symlink escape or mount point rejected)."
+        )
+    return resolved
+
 
 WORKER_TASK_WRAPPER = """\
 === TASK ===
@@ -100,6 +190,7 @@ class SubAgentConfig:
         "name", "task", "context_files", "max_rounds",
         "system_prompt", "spawn_tag_verbatim",
         "reasoning_effort", "dynamic_effort",
+        "workspace",
     )
 
     def __init__(
@@ -112,6 +203,7 @@ class SubAgentConfig:
         spawn_tag_verbatim: str,
         reasoning_effort: Optional[str] = None,
         dynamic_effort: bool = False,
+        workspace: Optional[str] = None,
     ):
         self.name = name
         self.task = task
@@ -121,6 +213,11 @@ class SubAgentConfig:
         self.spawn_tag_verbatim = spawn_tag_verbatim
         self.reasoning_effort = reasoning_effort
         self.dynamic_effort = dynamic_effort
+        # Relative subfolder inside the parent workspace, or None to inherit
+        # the parent root verbatim. Verified via `resolve_worker_workspace`
+        # at spawn time (see `run_sub_agent`), NOT here — parse is cheap and
+        # workspace resolution needs the live discussion.
+        self.workspace = workspace
 
 
 def parse_agent_tag(opening_tag: str, body: str) -> Optional[SubAgentConfig]:
@@ -171,6 +268,7 @@ def parse_agent_tag(opening_tag: str, body: str) -> Optional[SubAgentConfig]:
         spawn_tag_verbatim=opening_tag,
         reasoning_effort=raw_effort,
         dynamic_effort=dynamic_effort,
+        workspace=(attrs.get("workspace") or "").strip() or None,
     )
 
 
@@ -378,6 +476,28 @@ def run_sub_agent(
     from lollms_client.lollms_agentic.prompts import WORKER_SYSTEM_PROMPT
     from lollms_client.lollms_personality.lollms_personality import LollmsPersonality
 
+    # Resolve the worker's workspace BEFORE constructing the persona:
+    # a bad `workspace="..."` attribute must fail fast rather than spawn a
+    # worker pointed at an unreachable directory.
+    parent_ws_root = get_parent_workspace_root(discussion)
+    try:
+        worker_workspace = resolve_worker_workspace(parent_ws_root, config.workspace)
+    except ValueError as ws_err:
+        ASCIIColors.warning(f"[SubAgentSpawner] Invalid workspace for '{config.name}': {ws_err}")
+        return {
+            "agent_tag": config.spawn_tag_verbatim,
+            "report_envelope": (
+                f"[WORKER REPORT {worker_index} — FAILURE]\n"
+                f"Agent: {config.name}\n"
+                f"Files created/modified: none\n"
+                f"---\n"
+                f"Spawn rejected: invalid workspace parameter ({ws_err}).\n"
+                f"---\n"
+            ),
+            "files": [],
+            "success": False,
+        }
+
     system_prompt = WORKER_SYSTEM_PROMPT
     if config.system_prompt:
         system_prompt = config.system_prompt + "\n\n" + WORKER_SYSTEM_PROMPT
@@ -385,6 +505,7 @@ def run_sub_agent(
         name=config.name,
         system_prompt=system_prompt,
         lollms_client=discussion.lollmsClient,
+        workspace_path=worker_workspace,
     )
 
     context_body = build_worker_context(discussion, config)
@@ -398,18 +519,27 @@ def run_sub_agent(
         "task": config.task[:500],
         "context_files": config.context_files,
         "max_rounds": config.max_rounds,
+        "workspace": (
+            str(worker_workspace.relative_to(parent_ws_root))
+            if worker_workspace != parent_ws_root
+            else "."
+        ),
     }
     _cb(callback, "", MSG_TYPE.MSG_TYPE_WORKER_SPAWN_START, {**spawn_meta, "event_mode": event_mode})
 
     # ── User-facing spawn announcement (processing block) ──
     task_preview = config.task[:200].replace("\n", " ")
+    workspace_label = spawn_meta["workspace"]
     spawn_block = (
         f'\n<processing type="agent_spawn" title="Spawning agent: {_escape_attr(config.name)}"'
         f' task="{_escape_attr(task_preview)}"'
         f' context_files="{_escape_attr(", ".join(config.context_files))}"'
+        f' workspace="{_escape_attr(workspace_label)}"'
         f' max_rounds="{config.max_rounds}">\n'
         f"* 🤖 Spawning sub-agent **{config.name}** (budget: {config.max_rounds} rounds).\n"
     )
+    if workspace_label != ".":
+        spawn_block += f"* 📁 Workspace confinement: `{workspace_label}` (inside parent workspace).\n"
     if config.context_files:
         spawn_block += f"* 📎 Context files: {', '.join(config.context_files)}.\n"
     if config.system_prompt:
