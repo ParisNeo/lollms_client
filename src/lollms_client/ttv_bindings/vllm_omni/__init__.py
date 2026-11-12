@@ -335,7 +335,7 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
 
         ASCIIColors.info("vLLM-Omni request (curl equivalent):\n" + " \\\n  ".join(parts))
         print("vLLM-Omni CURL EQUIVALENT >>> " + " ".join(parts), flush=True)
-</｜DSML｜ parameter>
+
 
     # vLLM-Omni MiniMax-H3 hard-codes output fps; any other value is a 400.
     FIXED_FPS = 24

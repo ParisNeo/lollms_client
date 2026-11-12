@@ -290,6 +290,14 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-12 00:57]
+
+- chore: remove debug trace from vllm_omni bindings
+
+## [2026-11-12 00:57]
+
+- fix: remove malformed DSML artifact from vllm_omni init
+
 ## [2026-11-12 00:52]
 
 - feat(vllm-omni): add curl equivalent console output for debugging
