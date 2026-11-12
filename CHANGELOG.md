@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-12 00:48]
+
+- fix: use form-string for scalar fields and temp file for multipart uploads
+
 ## [2026-11-12 00:39]
 
 - fix: improve python execution sandbox handling and update docs

@@ -315,11 +315,15 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
         for key, value in data.items():
             if isinstance(value, (dict, list)):
                 value = json.dumps(value)
-            parts.append(f"-F {_shell_quote(f'{key}={value}')}")
+            # curl -F treats @ prefixes specially; use --form-string for raw
+            # scalar values (prompt text, JSON blobs) to stay byte-exact.
+            parts.append(
+                f"--form-string {_shell_quote(f'{key}={value}')}"
+            )
 
         for field_name, file_spec in files or []:
             filename, file_obj, content_type = file_spec
-            # Reconstruct the on-disk path hint for reproducibility.
+            # Prefer the real on-disk path so the logged command is replayable.
             path_hint = getattr(file_obj, "name", None) or filename
             parts.append(
                 "-F "
@@ -469,16 +473,35 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
         data["extra_params"] = json.dumps(extra_params)
 
         url = f"{self.base_url}/v1/videos/sync"
-        files = [("input_reference", ("start_frame.png", io.BytesIO(image_bytes), "image/png"))]
-        self._log_curl_equivalent(url, data, files)
+
+        # Persist the reference image to a real temp file on disk and upload it
+        # from that file handle. This mirrors the working curl invocation
+        # ``-F "input_reference=@saif.png;type=image/png"`` exactly: the server
+        # keys on multipart parts that carry a genuine on-disk filename.
+        tmp_ref = tempfile.NamedTemporaryFile(
+            prefix="vllm_omni_ref_", suffix=".png", delete=False
+        )
+        tmp_ref.write(image_bytes)
+        tmp_ref.flush()
+        tmp_ref.close()
+
+        self._log_curl_equivalent(
+            url,
+            data,
+            [("input_reference", ("start_frame.png", tmp_ref, "image/png"))],
+        )
 
         try:
-            resp = self._session.post(
-                url,
-                data=data,
-                files=files,
-                timeout=self.timeout,
-            )
+            with open(tmp_ref.name, "rb") as ref_handle:
+                files = [
+                    ("input_reference", ("start_frame.png", ref_handle, "image/png"))
+                ]
+                resp = self._session.post(
+                    url,
+                    data=data,
+                    files=files,
+                    timeout=self.timeout,
+                )
             resp.raise_for_status()
             return resp.content
         except requests.HTTPError as e:
@@ -487,6 +510,11 @@ class VllmOmniTTVBinding(LollmsTTVBinding):
             except Exception:
                 detail = resp.text
             raise RuntimeError(f"MiniMax-H3 I2V generation failed [{resp.status_code}]: {detail}") from e
+        finally:
+            try:
+                os.unlink(tmp_ref.name)
+            except OSError:
+                pass
 
 
 
