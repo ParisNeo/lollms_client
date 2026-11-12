@@ -2222,11 +2222,65 @@ class SandboxContext:
                 "🛑 BLOCKED BY SANDBOX: this OS operation is not permitted."
             )
 
-        for attr in ("system", "popen", "kill", "killpg", "putenv",
-                     "unsetenv", "symlink", "link", "chroot", "setuid",
-                     "setgid", "fork", "forkpty", "fchdir"):
+        for attr in ("system", "popen", "kill", "killpg",
+                     "chroot", "setuid", "setgid", "fork", "forkpty", "fchdir"):
             if hasattr(os, attr):
                 setattr(os, attr, _blocked)
+
+        # ── FRAME-GATED os.putenv / os.unsetenv ──
+        # Blocking these bluntly (the previous behavior) breaks every library
+        # that touches `os.environ[...] = ...` during import: `os.environ`
+        # assignment routes through `os.putenv` from inside the frozen `os`
+        # module frame — NOT from a user frame. The most aggressive offender is
+        # torch: importing `torch.optim` imports `torch._dynamo`, which imports
+        # `torch._inductor.runtime.cache_dir_utils`, which does
+        # `os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir` at MODULE IMPORT
+        # TIME. That single dict write was killing every PPO / training /
+        # inference run before the user's own code had done anything wrong.
+        # Same failure class for transformers, huggingface_hub, jax, numba,
+        # wandb, matplotlib (font cache), pytorch_lightning, xgboost, etc.
+        #
+        # The policy is identical to that already used for eval/exec/compile:
+        # user-code frames must be refused (that's the security surface —
+        # letting user code poison the parent process env leaks into sibling
+        # tool calls). Library frames proceed unimpeded (they own their env
+        # vars; that's just ordinary library behavior).
+        #
+        # `os.environ.__setitem__` on CPython calls `os.putenv` via
+        # `posix.putenv` / `nt.putenv` — the immediate caller of the patch is
+        # `os.environ.__setitem__`'s C-level shim, whose Python-visible caller
+        # is the *real* user frame (library or user). `_caller_is_user_code()`
+        # walks ≤3 frames, which is enough to see a user frame when user code
+        # does `os.environ[x] = y`, and returns False when torch's own
+        # import-time module frame is on the stack.
+        _orig_putenv = self._originals.get("os.putenv")
+        _orig_unsetenv = self._originals.get("os.unsetenv")
+        if _orig_putenv is not None:
+            def _gated_putenv(name, value, *a, **kw):
+                if _caller_is_user_code():
+                    raise SandboxPermissionError(
+                        "🛑 BLOCKED BY SANDBOX: setting environment variables "
+                        "is forbidden in user code."
+                    )
+                return _orig_putenv(name, value, *a, **kw)
+            os.putenv = _gated_putenv
+        if _orig_unsetenv is not None:
+            def _gated_unsetenv(name, *a, **kw):
+                if _caller_is_user_code():
+                    raise SandboxPermissionError(
+                        "🛑 BLOCKED BY SANDBOX: unsetting environment variables "
+                        "is forbidden in user code."
+                    )
+                return _orig_unsetenv(name, *a, **kw)
+            os.unsetenv = _gated_unsetenv
+
+        # NOTE: `os.symlink` / `os.link` remain hard-blocked. Those are genuine
+        # filesystem mutations that could escape the workspace path guard
+        # (their target resolution differs from the entry path), and no
+        # mainstream library creates symlinks during ordinary import —
+        # the values-inspected torch/pandas/matplotlib/hf stack does not
+        # touch them. We keep them blunt-blocked; if a library later
+        # demonstrates the same false-positive, apply the same frame gate.
 
         # -------- cwd boundary (chdir to a subdir is allowed, escape is not) --------
         _orig_chdir = self._originals.get("os.chdir")

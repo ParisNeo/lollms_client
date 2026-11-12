@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-12 02:16]
+
+- fix(sandbox): gate `os.putenv`/`os.unsetenv` to prevent blocking library imports
+
 ## [2026-11-12 02:07]
 
 - fix(execute_python): remove PYTHONPYCACHEPREFIX redirection to improve performance
