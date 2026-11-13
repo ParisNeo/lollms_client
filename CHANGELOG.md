@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-13 10:32]
+
+- `Fix client version to updated minor patch version`
+
 ## [2026-11-13 10:26]
 
 - feat(chat): add support for boolean flags in chat configuration
