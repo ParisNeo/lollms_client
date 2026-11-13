@@ -1265,7 +1265,7 @@ def make_gui_python_confirm_handler(event_queue: "queue.Queue[AgentEvent]", pref
             script_label = kwargs.get("script_label") or kwargs.get("label") or "script.py"
             argv = kwargs.get("argv")
 
-        resp_queue = queue.Queue(maxsize=1)
+        resp_queue: "queue.Queue[Tuple[str, str]]" = queue.Queue(maxsize=1)
         _CURRENT_RESP_QUEUE = resp_queue
 
         event_queue.put(AgentEvent(
@@ -1276,20 +1276,31 @@ def make_gui_python_confirm_handler(event_queue: "queue.Queue[AgentEvent]", pref
             response_queue=resp_queue,
         ))
 
+        # BLOCK INDEFINITELY. The user MUST answer — this is a hard safety gate.
+        # Any timeout here silently converts "user never answered" into a
+        # spurious decision that lets the agentic loop keep running while the
+        # modal is still visible on the operator's screen. If we truly need to
+        # abort (user pressed Stop / closed the turn), `cancel_agent_turn`
+        # pushes a ("reject", "...") sentinel into `_CURRENT_RESP_QUEUE`.
         try:
-            # Wait for user decision with safety timeout to avoid hanging if the frontend has no interaction
-            decision, reason = resp_queue.get(timeout=180.0)
-            _CURRENT_RESP_QUEUE = None
-            if decision == "always":
-                # Enable auto-approval in-memory for this active session only (do not persist to disk)
-                prefs.auto_approve_python = True
-            return decision, reason
-        except queue.Empty:
-            _CURRENT_RESP_QUEUE = None
-            return "reject", "Authorization timed out: no operator response received from the user interface."
+            decision, reason = resp_queue.get(block=True)
         except Exception as e:
             _CURRENT_RESP_QUEUE = None
-            return "reject", f"Approval interrupted or no user interaction channel available: {e}"
+            return "reject", f"Approval interrupted: {e}"
+
+        # Clear the routing slot only after we've consumed the answer, so a
+        # concurrent stop() cannot race us into a None dereference.
+        if _CURRENT_RESP_QUEUE is resp_queue:
+            _CURRENT_RESP_QUEUE = None
+
+        # Defensive normalization: any malformed answer is a REJECTION.
+        if decision not in ("allow", "always", "reject"):
+            return "reject", str(reason or "Unrecognized user decision.")
+
+        if decision == "always":
+            # Enable auto-approval in-memory for this active session only (do not persist to disk)
+            prefs.auto_approve_python = True
+        return decision, reason
 
     return _handler
 
@@ -1315,15 +1326,17 @@ def make_gui_user_interaction_handler(event_queue: "queue.Queue[AgentEvent]"):
         ))
 
         try:
-            answer = response_queue.get(timeout=600.0)
-            _CURRENT_INTERACTION_QUEUE = None
-            return answer
-        except queue.Empty:
-            _CURRENT_INTERACTION_QUEUE = None
-            return None
+            # Blocking wait — a tool that asked the user a question must not
+            # proceed with a synthesised answer. `cancel_agent_turn` pushes
+            # None into this queue to unblock on user Stop.
+            answer = response_queue.get(block=True)
         except Exception:
             _CURRENT_INTERACTION_QUEUE = None
             return None
+
+        if _CURRENT_INTERACTION_QUEUE is response_queue:
+            _CURRENT_INTERACTION_QUEUE = None
+        return answer
 
     return _handler
 

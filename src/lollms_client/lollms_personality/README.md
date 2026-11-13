@@ -485,7 +485,79 @@ Now I will read it.
 <tool>{"name": "tool_read_file", "parameters": {"path": "./src/config.yaml"}}</tool>
 ```
 
-## 📚 4. API Reference
+## 🌳 4. Workspace Tree Management
+
+Every `LollmsPersonality` that has a `workspace_path` renders a **workspace tree** into its system prompt, giving the LLM a structural map of the files it can act on. The tree is rebuilt from disk on every round and is explicitly designed to stay cheap on small-model context windows.
+
+### Where the tree is rendered
+
+The tree is produced by `_build_workspace_context_block()`, which returns a two-part block appended to the dynamic portion of the system prompt:
+
+1. **`=== WORKSPACE ===` (or `=== WORKSPACE TREE ===`)** — the structural inventory.
+2. **`=== FULLY LOADED FILE CONTENTS [C] ===` (only when files are loaded)** — full text of every artefact currently at `visibility=FULL`, `PINNED`, or `SINGLE_ROUND`.
+
+Both are rebuilt from disk on each round, so the model never reasons about a stale tree after a tool deletes, renames, or creates a file.
+
+### Compact vs. full mode (`compact_workspace_tree`)
+
+| Mode | Prompt cost | When it is used |
+| :--- | :--- | :--- |
+| **Full** (default) | Whole tree down to `_MAX_TREE_DEPTH` (2), `_MAX_DIR_ITEMS` (12) per directory | Moderately sized workspaces; the LLM benefits from seeing the layout up front. |
+| **Compact** (`personality.compact_workspace_tree = True`) | A single stub: `Root: ./ (N top-level items). Full tree is NOT inlined to save context.` | Small (4B-class) models, or very large workspaces where the tree would dominate the prompt. The model must call `tool_show_workspace_tree()` on demand to inspect a folder. |
+
+Set `compact_workspace_tree` before calling `chat()`:
+
+```python
+personality.compact_workspace_tree = True
+response = personality.chat(prompt="...", lollms_client=client)
+```
+
+When compact mode is active, the model is told exactly how to discover the tree:
+
+```python
+tool_show_workspace_tree(folder="", depth=2, max_items=40)
+```
+
+`folder` is workspace-relative (empty = root), `depth` is clamped to `[1, 6]`, and `max_items` is clamped to `[5, 200]`. It renders the same per-directory inventory as the full tree, but only for the folder the model asks about.
+
+### Token-efficiency features of the tree itself
+
+These apply in **both** modes and keep the tree compact even on wide directories:
+
+- **Junk suppression**: `_IGNORED_WS_DIRS` (`__pycache__`, `.venv`, `node_modules`, `.git`, `.lollms_code`, `artefacts_metadata`, `discussions`, etc.) and `_IGNORED_WS_EXTS` (`.pyc`, `.so`, `.dll`, …) are excluded from the inventory entirely.
+- **Size clustering**: `_cluster_similar_files()` groups numbered sequences (e.g. `img_dalle__1.png .. img_dalle__16.png (16 PNG files, 4.2 MB)`) so that 16 files cost one line rather than 16.
+- **Compact size strings**: `_format_compact_size()` renders sizes as `124 KB`, `11.7 MB`, `1.2 GB` — one or two tokens per entry.
+- **Overflow line**: when a directory has more than `_MAX_DIR_ITEMS` file clusters, the tree truncates and appends `... (+N more files in this directory. Use tool_list_files to view)`.
+- **Collapsed folders**: `_get_collapsed_folders_from_db()` reads `collapsed_folders` from `.lollms_code/context_state.db` and marks those directories `[📁 COLLAPSED] name/ (N items, X MB)`. The `<collapse_folder>` / `<uncollapse_folder>` tags mutate that table, so collapsed state survives across sessions.
+- **Deep folders**: directories at the maximum depth are marked `[📁 DEEP] name/ (N items, X MB)` — their contents are not descended into.
+
+### Loaded-file contents (`[C]` zone)
+
+The `=== FULLY LOADED FILE CONTENTS [C] ===` section is built from the artefact manager, not from the tree walk:
+
+- Only artefacts at `visibility ∈ {FULL, PINNED, SINGLE_ROUND}` are emitted.
+- Binary files (`.png`, `.db`, `.pdf`, …) — detected by extension **and** by a `/0` NUL-byte probe of the first 4 KB — are replaced by a size stub or their `.lam` metadata, never raw bytes, so a stray `.png` cannot blow the context window.
+- Text files at `visibility=FULL` are read from disk (`content_source == "disk"`), so patches applied by tool calls are reflected verbatim.
+
+### On-demand workspace introspection tools
+
+Two meta-tools are always registered alongside the tree to keep the prompt lean:
+
+| Tool | Purpose |
+| :--- | :--- |
+| `tool_show_workspace_tree` | Scoped tree query (see above). Default `folder=""`, `depth=2`, `max_items=40`. |
+| `tool_describe_tools` | Returns the full description + parameter schema for a named tool (or all tools) — pairs with the compact tool schema block on 4B models. |
+
+`tool_show_workspace_tree` never raises: out-of-workspace paths are rejected (`relative_to()` guard), missing folders return a `success: False` error, and empty folders return `Folder '<name>' is empty (or only ignored files).`
+
+### Refreshing the tree between rounds
+
+The tree is rebuilt on every round via `_build_workspace_context_block()`. Two escape hatches invalidate the cached tree mid-turn:
+
+- `object.__setattr__(self, '_last_ws_sync_time', 0.0)` — forced when a context-visibility tool changes file state.
+- `_sync_base_context_artifacts()` — called by the rolling-artefact-compaction protocol when an `<artifact>` round is evicted from `virtual_history`; it rewrites the `=== CURRENT WORKSPACE CONTEXT ===` block in the base conversation so the fresh tree (with the newly created file listed) is what the model sees next.
+
+## 📚 5. API Reference
 
 ### `LollmsPersonality`
 
@@ -535,6 +607,7 @@ Returns a structured list of all skills registered with this personality, distin
 - **`memory_manager`**: `LollmsMemoryManager` instance (Independent Life).
 - **`workspace_path`**: Optional workspace path for standalone mode.
 - **`enable_git_management`**: If `True`, dynamically mounts Git Manager Toolset if `.git` is detected.
+- **`workspace_path`**: When set, enables the artefact system and the workspace tree. See ["Workspace Tree Management"](#-4-workspace-tree-management).
 
 #### `chat(...)`
 - **`prompt`**: The user's input message or task.
@@ -562,7 +635,19 @@ Queries the attached RAG data source. Always returns a normalized dictionary, ne
 #### `has_data` (property)
 Returns `True` when any data source or RAG callback is configured.
 
-### `PersonalityBundle`
+#### `compact_workspace_tree` (attribute, default `False`)
+When `True`, the full recursive workspace tree is **not** inlined in the system prompt. Instead a one-line stub is emitted and the model is expected to call `tool_show_workspace_tree(folder=..., depth=..., max_items=...)` on demand. Recommended on 4B-class models or large workspaces. See ["Workspace Tree Management"](#-4-workspace-tree-management).
+
+#### `list_workspace_files() -> List[str]`
+Returns every non-ignored, non-hidden file in the workspace, recursively, as workspace-relative POSIX paths. Used for diagnostics and by tooling that needs a flat inventory independent of the rendered tree.
+
+#### `_build_workspace_context_block() -> str`
+Returns the current workspace block (tree and/or `[C]` zone). Called once per round from `chat()`. Consumed by `_calculate_context_telemetry()` for per-segment token accounting (`workspace_tree` vs `loaded_contents`).
+
+#### `_execute_context_visibility(tag_name, body) -> Dict[str, Any]`
+Backs the `<unlock_file>`, `<lock_file>`, `<hide_file>`, `<collapse_folder>`, `<uncollapse_folder>` tags. Sets `_last_ws_sync_time = 0.0` so the tree is rebuilt on the next round.
+
+### `NullPersonality`
 
 #### `PersonalityBundle.import_bundle(bundle_path, lollms_client=None) -> LollmsPersonality`
 Imports a legacy personality bundle from a directory. (Note: `from_handbag()` is the modern equivalent).
@@ -718,7 +803,7 @@ For a fully working end-to-end example, see [`examples/handbag_agent_example.py`
 
 ---
 
-## 📡 5. Event Modes & Streaming Protocol (Live Telemetry)
+## 📡 6. Event Modes & Streaming Protocol (Live Telemetry)
 
 When using the independent `LollmsPersonality.chat()` method (outside of a `LollmsDiscussion`), you can control how execution telemetry is reported to the `streaming_callback` using the `event_mode` parameter.
 
@@ -817,7 +902,7 @@ personality.chat(
 
 ---
 
-## 📚 5. API Reference
+## 📚 7. API Reference (continued)
 
 ### `LollmsPersonality`
 

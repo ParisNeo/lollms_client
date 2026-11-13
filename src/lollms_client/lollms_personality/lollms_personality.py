@@ -154,6 +154,18 @@ _REPEATABLE_OBSERVATION_TOOLS = {
     "tool_computer_wait",
 }
 
+# Tools that keep their FULL description + parameter signature in COMPACT mode.
+# Everything else is listed as a name only (retrievable via `tool_describe_tools`)
+# so tiny 4B-class models are not drowned in tool chatter.
+_COMPACT_CORE_TOOLS = frozenset({
+    "tool_read_file", "tool_write_file", "tool_list_files",
+    "tool_find_files", "tool_grep_files",
+    "tool_execute_python_code", "tool_execute_python_file",
+    "tool_execute_shell_command",
+    "tool_show_workspace_tree", "tool_describe_tools",
+    "tool_load_skill", "tool_load_tool",
+})
+
 
 def _is_synthetic_agent_response(text: str) -> bool:
     stripped = (text or "").strip()
@@ -4621,6 +4633,178 @@ class LollmsPersonality:
         return " ".join(normalized.split())
 
     @staticmethod
+    def _truncate_artifact_to_last_complete_line(text: str) -> Tuple[str, bool]:
+        """Cut generated artifact text at its LAST COMPLETE LINE.
+
+        Called when an `<artifact>` stream is cut short by the token
+        generation limit. Returns content up to (and including) the final
+        ``\\n``, dropping any trailing fragmentary line so a subsequent
+        ``operation="append"`` starts on a clean line boundary and the
+        resulting file is never corrupted by a half-written line.
+
+        Returns:
+            (safe_text, was_cut):
+                safe_text — input truncated at the last newline (or unchanged
+                            if it already ends with a newline, or has no
+                            newline at all).
+                was_cut   — True when a partial trailing line was dropped.
+        """
+        if not text or text.endswith("\n"):
+            return text, False
+        last_nl = text.rfind("\n")
+        if last_nl == -1:
+            # Single-line content: cannot safely insert a break. Save as-is.
+            return text, False
+        return text[: last_nl + 1], True
+
+    @staticmethod
+    def _normalize_artifact_body_for_write(body_content: str) -> str:
+        """Normalize an artifact body WITHOUT destroying internal indentation.
+
+        The artifact body arrives already wrapped between
+        ``<artifact ...>`` and ``</artifact>``. Some LLMs open a newline right
+        after the opening tag and close on its own line. We strip exactly ONE
+        leading newline (and its immediate blank-line siblings) and ONE
+        trailing newline, but we NEVER strip the leading spaces of the first
+        real code line — doing so corrupts Python/YAML/etc. indentation and
+        produces broken files after an ``operation="append"``.
+
+        Concretely:
+          - ``"\\n    def foo():\\n        pass\\n"``  → ``"    def foo():\\n        pass"``
+          - ``"    x = 1"``                          → ``"    x = 1"``  (untouched)
+          - ``"\\n\\n\\nHello"``                       → ``"Hello"``    (leading blank lines removed)
+        """
+        if not body_content:
+            return body_content
+        stripped_leading = body_content.lstrip("\r\n")
+        return stripped_leading.rstrip("\r\n")
+
+    @staticmethod
+    def _needs_leading_newline(existing_content: str) -> bool:
+        """Return True when an append must insert a ``\\n`` before the chunk.
+
+        A newline separator is inserted ONLY when the existing file does NOT
+        already end with a newline. When the file ends with ``\\n``, the
+        appended chunk is written verbatim so the first appended line keeps
+        its own indentation intact (this is the append-preservation contract).
+        """
+        return bool(existing_content) and not existing_content.endswith(("\n", "\r"))
+
+    def _save_truncated_artifact_partial(
+        self,
+        *,
+        title: str,
+        lang: str,
+        art_type: str,
+        body_content: str,
+        is_append: bool,
+    ) -> Tuple[str, bool, int]:
+        """Persist the partial content of a truncated ``<artifact>`` write.
+
+        When the LLM hits the token-generation limit mid-artifact we MUST
+        keep whatever complete content was already produced. Discarding it
+        (the previous behaviour) forced the model to restart the entire
+        file on the next round — which truncated again — and ultimately
+        drove it into dead-end strategies like raw ``open().write()``.
+
+        This helper:
+          1. Truncates ``body_content`` to its LAST COMPLETE LINE (never
+             stops mid-line — the appended file always has valid syntax
+             up to the truncation point).
+          2. Appends to an existing file when ``is_append=True``, or
+             creates/overwrites when it's a fresh start.
+          3. Persists into the artefact manager so subsequent reads /
+             tree scans see the file.
+          4. Returns a directive telling the model to continue via
+             ``operation="append"`` with the exact tail it must resume
+             after, so the LLM never re-writes from scratch.
+
+        Returns:
+            (message, was_cut, saved_new_lines)
+        """
+        safe_body, was_cut = self._truncate_artifact_to_last_complete_line(body_content)
+        # Preserve indentation of the first real line — never call .strip().
+        safe_body = self._normalize_artifact_body_for_write(safe_body)
+
+        file_path = (
+            self._resolved_workspace / title
+            if self._resolved_workspace
+            else Path(title)
+        )
+
+        if not safe_body.strip():
+            return (
+                f"❌ ARTIFACT TRUNCATED with no complete line produced for '{title}'. "
+                f"The token budget was exhausted at the very start. "
+                f"Retry with a SHORTER opening chunk — e.g. `<artifact name=\"{title}\">` "
+                f"containing only the first 100–200 lines, then use "
+                f"`<artifact name=\"{title}\" operation=\"append\">` for the rest.",
+                False,
+                0,
+            )
+
+        if is_append and file_path.exists():
+            try:
+                existing = file_path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                existing = ""
+            sep = "\n" if self._needs_leading_newline(existing) else ""
+            new_content = existing + sep + safe_body
+            if not new_content.endswith("\n"):
+                new_content += "\n"
+        else:
+            new_content = safe_body
+            if not new_content.endswith("\n"):
+                new_content += "\n"
+
+        try:
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(new_content, encoding="utf-8")
+        except OSError as os_err:
+            return (
+                f"❌ ARTIFACT TRUNCATION SAVE FAILED for '{title}': {os_err}",
+                False,
+                0,
+            )
+
+        if self._artefact_manager:
+            try:
+                self._artefact_manager.add(
+                    title=title,
+                    artefact_type=art_type,
+                    content=new_content,
+                    language=lang,
+                    active=True,
+                )
+            except Exception:
+                pass
+
+        total_lines = new_content.count("\n")
+        new_lines = safe_body.count("\n")
+        cut_note = " (last incomplete line dropped — kept whole lines only)" if was_cut else ""
+        tail_lines = new_content.split("\n")[-5:]
+        tail_preview = "\n".join(tail_lines)
+        if len(tail_preview) > 600:
+            tail_preview = tail_preview[-600:]
+
+        msg = (
+            f"⚠️ ARTIFACT TRUNCATED — Partial content SAVED to `{title}` "
+            f"(+{new_lines} new lines, {total_lines} total lines, {len(new_content)} chars){cut_note}.\n"
+            f"The file currently ENDS with these lines (verbatim, already on disk):\n"
+            f"```\n{tail_preview}\n```\n"
+            f"MANDATORY NEXT STEP — CONTINUE WITH APPEND:\n"
+            f"Emit `<artifact name=\"{title}\" operation=\"append\">` containing ONLY the NEXT portion of the file.\n"
+            f"Rules for the append body:\n"
+            f"- Start EXACTLY on the line AFTER the last line shown above. Do NOT repeat any line already on disk.\n"
+            f"- Your append body is written VERBATIM: keep the leading indentation of its first line exactly as it should appear in the file (spaces/tabs are preserved). Do NOT add a blank first line unless you truly want a blank line in the file.\n"
+            f"- Write clean, whole lines — never split a line mid-way. Do NOT re-emit the `<artifact>` opening tag inside the body.\n"
+            f"- Keep your reply SMALLER than this truncated round (e.g. ~100-150 lines) so it completes before the token limit.\n"
+            f"- Repeat `<artifact ... operation=\"append\">` rounds until the file is complete, then verify with a read and emit `<done/>`.\n"
+            f"NEVER re-write the file from scratch. NEVER retry the whole file. NEVER use raw `open().write()` to assemble it."
+        )
+        return msg, was_cut, new_lines
+
+    @staticmethod
     def _texts_are_repetitive(text_a: str, text_b: str) -> bool:
         clean_a = re.sub(r'<[^>]+>', '', (text_a or "")).strip()
         clean_b = re.sub(r'<[^>]+>', '', (text_b or "")).strip()
@@ -4708,8 +4892,23 @@ class LollmsPersonality:
         if not self._resolved_workspace:
             return ""
 
-        collapsed = self._get_collapsed_folders_from_db()
-        tree_block = _build_workspace_context(self._resolved_workspace, collapsed_folders=collapsed)
+        if getattr(self, 'compact_workspace_tree', False):
+            # COMPACT MODE: do NOT inline the full recursive tree (huge & noisy
+            # for small models). Emit a one-line stub and rely on the on-demand
+            # `tool_show_workspace_tree` tool for scoped inspection.
+            try:
+                top_count = sum(1 for _ in self._resolved_workspace.iterdir())
+            except Exception:
+                top_count = 0
+            tree_block = (
+                f"=== WORKSPACE ===\n"
+                f"Root: ./ ({top_count} top-level items). Full tree is NOT inlined to save context.\n"
+                f"Call `tool_show_workspace_tree(folder='', depth=2)` to inspect any folder on demand.\n"
+                f"=== END WORKSPACE ==="
+            )
+        else:
+            collapsed = self._get_collapsed_folders_from_db()
+            tree_block = _build_workspace_context(self._resolved_workspace, collapsed_folders=collapsed)
 
         loaded_parts = ["=== FULLY LOADED FILE CONTENTS [C] ==="]
         has_loaded = False
@@ -6337,6 +6536,139 @@ JSON:"""
             "callable": tool_unload_tool
         }
 
+        # ── META TOOLS: on-demand workspace tree + tool catalogue ──
+        # Both keep the SYSTEM PROMPT LEAN on small models: the information is
+        # served only when the model actually asks for it.
+        def tool_show_workspace_tree(folder: str = "", depth: int = 2, max_items: int = 40) -> dict:
+            """
+            Inspect the workspace directory tree on demand.
+
+            Args:
+                folder (str, optional): Path relative to the workspace root. Empty = root.
+                depth (int, optional): How many directory levels to descend (1-6, default 2).
+                max_items (int, optional): Maximum files shown per directory (5-200, default 40).
+            """
+            try:
+                depth = int(depth) if depth is not None else 2
+            except (TypeError, ValueError):
+                depth = 2
+            depth = max(1, min(depth, 6))
+            try:
+                max_items = int(max_items) if max_items is not None else 40
+            except (TypeError, ValueError):
+                max_items = 40
+            max_items = max(5, min(max_items, 200))
+
+            ws = self._resolved_workspace
+            if not ws:
+                return {"success": False, "error": "No workspace configured."}
+
+            folder_clean = (folder or "").strip().replace("\\", "/").strip("/")
+            target = ws if not folder_clean else (ws / folder_clean)
+            try:
+                target = target.resolve()
+                target.relative_to(ws)
+            except Exception:
+                return {"success": False, "error": f"Folder '{folder}' is outside the workspace or invalid."}
+            if not target.exists():
+                return {"success": False, "error": f"Folder '{folder}' not found in workspace."}
+            if not target.is_dir():
+                return {"success": False, "error": f"'{folder}' is not a directory. Use tool_read_file for files."}
+
+            collapsed = self._get_collapsed_folders_from_db()
+            entries = _build_workspace_tree_r(
+                directory=target,
+                workspace_root=ws,
+                current_depth=0,
+                collapsed_set=collapsed,
+                max_depth=depth,
+                max_items=max_items,
+            )
+            rel_label = str(target.relative_to(ws)).replace("\\", "/") or "."
+            if not entries:
+                return {"success": True, "output": f"Folder '{rel_label}' is empty (or only ignored files)."}
+            header = f"=== WORKSPACE TREE: {rel_label} (depth={depth}) ==="
+            return {
+                "success": True,
+                "output": f"{header}\n" + "\n".join(entries) + "\n=== END TREE ===",
+            }
+
+        def tool_describe_tools(tool_name: str = "") -> dict:
+            """
+            Get full descriptions and parameter schemas for available tools.
+
+            Args:
+                tool_name (str, optional): Exact (or partial) tool name. Empty = describe ALL tools.
+            """
+            target = (tool_name or "").strip()
+            resolved = None
+            spec = None
+            if target and target in active_tools:
+                resolved, spec = target, active_tools[target]
+            elif target:
+                lowered = target.lower()
+                for k in active_tools:
+                    if lowered in k.lower():
+                        resolved, spec = k, active_tools[k]
+                        break
+
+            if target and resolved is None:
+                return {
+                    "success": False,
+                    "error": f"Tool '{target}' not found. Available: {sorted(active_tools.keys())}",
+                }
+
+            def _fmt_one(name: str, tspec: dict) -> str:
+                lines = [f"### {name}", f"Description: {(tspec.get('description') or '').strip()}"]
+                params = tspec.get("parameters") or []
+                if params:
+                    lines.append("Parameters:")
+                    for p in params:
+                        opt = " (optional)" if p.get("optional") else ""
+                        lines.append(
+                            f"  - {p.get('name')}: {p.get('type', 'any')}{opt}"
+                            f" — {p.get('description', '')}"
+                        )
+                else:
+                    lines.append("Parameters: none")
+                return "\n".join(lines)
+
+            if resolved:
+                return {"success": True, "output": _fmt_one(resolved, spec)}
+
+            out = [f"=== ALL AVAILABLE TOOLS ({len(active_tools)}) ==="]
+            for t_name in sorted(active_tools.keys()):
+                out.append("\n" + _fmt_one(t_name, active_tools[t_name]))
+            out.append("=== END TOOLS ===")
+            return {"success": True, "output": "\n".join(out)}
+
+        active_tools["tool_show_workspace_tree"] = {
+            "name": "tool_show_workspace_tree",
+            "description": (
+                "Show the workspace directory tree on demand. The full tree is NOT "
+                "inlined in the system prompt to save context. Use this to discover "
+                "files and folders, scoped by folder and depth."
+            ),
+            "parameters": [
+                {"name": "folder", "type": "str", "description": "Folder relative to workspace root (empty = root).", "optional": True},
+                {"name": "depth", "type": "int", "description": "Directory levels to descend (1-6, default 2).", "optional": True},
+                {"name": "max_items", "type": "int", "description": "Max files shown per folder (5-200, default 40).", "optional": True},
+            ],
+            "callable": tool_show_workspace_tree,
+        }
+        active_tools["tool_describe_tools"] = {
+            "name": "tool_describe_tools",
+            "description": (
+                "Get full descriptions and parameter schemas for tools. The system "
+                "prompt lists only core tools in detail; this fills in the rest on "
+                "request."
+            ),
+            "parameters": [
+                {"name": "tool_name", "type": "str", "description": "Specific tool name (empty = all tools).", "optional": True},
+            ],
+            "callable": tool_describe_tools,
+        }
+
         # ── 5. SKILLS MANAGER REGISTRATION WITH AUTO-TOOL LOADING ──
         if self.capabilities and self.capabilities.enable_skill_loading and self.skills_manager:
             def _skill_tool_availability_checker(t_name: str) -> bool:
@@ -7071,7 +7403,14 @@ JSON:"""
                 "3. **PASSIVE MEMORY BOUNDARY**: Memories provide passive background facts only. Your active objective is determined exclusively by the latest user message.\n"
                 "4. **SURGICAL PATCHES**: For existing files, use Aider SEARCH/REPLACE patches with exact verbatim lines.\n"
                 "5. **SCRATCHPAD DISCOVERY LOGGING (MANDATORY)**: After every tool call that returns new information, append a concise 1-2 line summary of the key finding to your scratchpad using `<scratchpad_append>`. Old tool outputs are progressively compacted out of your history; the scratchpad is the only durable record of what you discovered.\n"
-                "6. **TURN CHRONICLE AWARENESS**: Your system prompt contains a TURN CHRONICLE listing every action already executed this turn. Consult it before calling any tool — never re-run an action with identical parameters.\n\n"
+                "6. **TURN CHRONICLE AWARENESS**: Your system prompt contains a TURN CHRONICLE listing every action already executed this turn. Consult it before calling any tool — never re-run an action with identical parameters.\n"
+                "7. **FILE WRITING STRATEGY (CHOOSE THE RIGHT ONE)**:\n"
+                "   - **SMALL FILE (fits comfortably in one reply, ~150-200 lines or less):** write it in a SINGLE `<artifact name=\"path/to/file.ext\" type=\"code\">` with the COMPLETE content. This is the preferred, fastest path. Do NOT split a small file into chunks.\n"
+                "   - **LARGE FILE (too big for one reply, or the first attempt was truncated):** build it incrementally:\n"
+                "     a. **Round 1**: `<artifact name=\"path/to/file.ext\" type=\"code\">` with the FIRST portion only, ending at a natural boundary (closing brace, end of function, end of a tag block) — always on a WHOLE line.\n"
+                "     b. **Round N**: `<artifact name=\"path/to/file.ext\" operation=\"append\">` containing ONLY the NEXT portion. The append body is written VERBATIM after the existing content (a single `\\n` separator is inserted only if needed) so the indentation of your first appended line is preserved exactly — start EXACTLY on the line after where the previous round stopped, never repeat lines already on disk, never split a line mid-way, and never re-open a new `<artifact>` tag inside the body.\n"
+                "     c. Repeat append rounds until complete, then verify with a read tool and emit `<done/>`.\n"
+                "   The system AUTOMATICALLY saves every COMPLETE LINE generated when a round is truncated, so each retry makes real progress. NEVER re-write the whole file from scratch after truncation. NEVER use `<tool_execute_python_code>` with raw `open().write()` to assemble large files — always use `operation=\"append\"` on the SAME `<artifact>` name.\n\n"
                 "### FEW-SHOT EXECUTION PATTERNS (MANDATORY DEMONSTRATIONS):\n"
                 "User: \"Execute the migration plan mapping.yaml\"\n"
                 "Assistant:\n"
@@ -7102,37 +7441,107 @@ JSON:"""
         skills_ctx = ""
         has_skills_already = "=== AVAILABLE SKILLS" in sys_prompt or "=== ACTIVE SKILLS" in sys_prompt
         if self.skills_manager and not has_skills_already:
-            active_names = set(active_tools.keys()) if active_tools else None
-            query_hint = getattr(self, '_current_chat_prompt', None)
-            current_r = getattr(self, '_current_round_num', 1)
-            skills_ctx_str = self.skills_manager.build_context(active_tool_names=active_names, current_query=query_hint, round_count=current_r)
-            if skills_ctx_str:
-                skills_ctx = "\n" + skills_ctx_str
+            # COMPACT MODE: emit skill NAMES ONLY (no descriptions / categories /
+            # token-hungry blurbs). The full SKILL.md methodology is loaded on
+            # demand via `tool_load_skill`, whose schema already lives in the
+            # core tool block above. This is the single biggest prompt-size win
+            # for 4B-class models, where ~30 skills × description block would
+            # otherwise consume thousands of tokens every round.
+            compact_skills = getattr(self, 'compact_tool_descriptions', False)
+            if compact_skills:
+                try:
+                    skill_names: List[str] = []
+                    if hasattr(self.skills_manager, "get_unique_skills"):
+                        _uniq = self.skills_manager.get_unique_skills() or []
+                    elif hasattr(self.skills_manager, "skills"):
+                        _uniq = list(getattr(self.skills_manager, "skills").values())
+                    else:
+                        _uniq = []
+                    skill_names = sorted({
+                        str(getattr(_s, "title", "") or "").strip()
+                        for _s in _uniq
+                        if getattr(_s, "title", None)
+                    })
+                    if skill_names:
+                        skills_ctx = (
+                            "\n=== AVAILABLE SKILLS (names only — call "
+                            "`tool_load_skill` with the exact name to load its "
+                            "full methodology) ===\n"
+                            + ", ".join(f"`{_n}`" for _n in skill_names)
+                            + "\n=== END SKILLS ===\n"
+                        )
+                except Exception:
+                    skills_ctx = ""
+            else:
+                active_names = set(active_tools.keys()) if active_tools else None
+                query_hint = getattr(self, '_current_chat_prompt', None)
+                current_r = getattr(self, '_current_round_num', 1)
+                skills_ctx_str = self.skills_manager.build_context(active_tool_names=active_names, current_query=query_hint, round_count=current_r)
+                if skills_ctx_str:
+                    skills_ctx = "\n" + skills_ctx_str
 
         tool_desc = ""
         if active_tools:
+            compact_tools = getattr(self, 'compact_tool_descriptions', False)
             tool_sections = [
                 "\n=== ACTIVE TOOLS (Lean Schema) ===",
                 "Emit on a clean line: `<tool>{\"name\": \"...\", \"parameters\": {...}}</tool>`\n"
             ]
             rendered_count = 0
-            for t_name, t_spec in sorted(active_tools.items()):
-                desc = (t_spec.get("description") or "").strip().split("\n\n")[0].strip()
+
+            def _sig(t_spec: dict) -> str:
                 params_list = t_spec.get("parameters") or []
-                param_sig = ", ".join([f"{p.get('name')}: {p.get('type', 'any')}{'?' if p.get('optional') else ''}" for p in params_list]) if params_list else ""
-                tool_sections.append(f"• **`{t_name}({param_sig})`**: {desc}")
-                rendered_count += 1
+                return ", ".join(
+                    f"{p.get('name')}: {p.get('type', 'any')}{'?' if p.get('optional') else ''}"
+                    for p in params_list
+                ) if params_list else ""
+
+            if compact_tools:
+                # Only CORE tools carry a description + signature. All others are
+                # emitted as bare names to keep the prompt tiny on 4B models.
+                core_lines = []
+                other_names = []
+                for t_name, t_spec in sorted(active_tools.items()):
+                    if t_name in _COMPACT_CORE_TOOLS:
+                        desc = (t_spec.get("description") or "").strip().split("\n\n")[0].strip()
+                        sig = _sig(t_spec)
+                        core_lines.append(
+                            f"• **`{t_name}({sig})`**: {desc}" if desc else f"• **`{t_name}({sig})`**"
+                        )
+                        rendered_count += 1
+                    else:
+                        other_names.append(t_name)
+                tool_sections.extend(core_lines)
+                if other_names:
+                    tool_sections.append(
+                        "\nOther available tools (names only — call "
+                        "`tool_describe_tools(tool_name='<name>')` for details):"
+                    )
+                    tool_sections.append(", ".join(f"`{n}`" for n in other_names))
+            else:
+                for t_name, t_spec in sorted(active_tools.items()):
+                    desc = (t_spec.get("description") or "").strip().split("\n\n")[0].strip()
+                    sig = _sig(t_spec)
+                    tool_sections.append(f"• **`{t_name}({sig})`**: {desc}")
+                    rendered_count += 1
+
             ASCIIColors.debug(
                 f"[{self.name}] Tool schema rendered into system prompt: "
-                f"{rendered_count} tool(s) — "
+                f"{rendered_count} tool(s){' (compact)' if compact_tools else ''} — "
                 f"{sorted(active_tools.keys())}"
             )
 
             loadable_index = getattr(self, "_loadable_tool_index", None)
             if loadable_index:
-                tool_sections.append("\n=== ON-DEMAND TOOLSETS (via `tool_load_tool`) ===")
-                for l_name, l_desc in sorted(loadable_index.items()):
-                    tool_sections.append(f"- `{l_name}`: {l_desc}")
+                if compact_tools:
+                    tool_sections.append(
+                        "\nOn-demand toolsets (call `tool_load_tool('<name>')`): "
+                        + ", ".join(f"`{n}`" for n in sorted(loadable_index.keys()))
+                    )
+                else:
+                    tool_sections.append("\n=== ON-DEMAND TOOLSETS (via `tool_load_tool`) ===")
+                    for l_name, l_desc in sorted(loadable_index.items()):
+                        tool_sections.append(f"- `{l_name}`: {l_desc}")
 
             tool_sections.append("=== END TOOLS ===\n")
             tool_desc = "\n".join(tool_sections)
@@ -8493,17 +8902,40 @@ JSON:"""
                                 is_patch = ("<<<<<<< SEARCH" in body_content) or has_patch_markers
                                 is_append = operation_type == "append"
 
-                                if was_truncated and not is_patch and not is_append:
+                                # ── 🔪 UNIVERSAL TRUNCATION RECOVERY ──
+                                # Save partial content up to the LAST COMPLETE
+                                # LINE (never stop in the middle of a line), then
+                                # mandate an `operation="append"` continuation —
+                                # eliminating the "rewrite from scratch" loop
+                                # that produced corrupt / re-truncated files.
+                                if was_truncated and is_patch:
+                                    # Patches must be complete — reject cleanly.
                                     has_truncated_artifact = True
                                     truncated_artifact_title = title
                                     action_reports.append(
-                                        f"❌ GENERATION TRUNCATED for artifact '{title}'. "
-                                        "You hit the token generation limit before finishing the file. "
-                                        "The file was NOT saved to disk to prevent corruption. "
-                                        "You MUST use `operation=\"append\"` in your next <artifact> tag to add the remaining content to the file, or use a SEARCH/REPLACE patch. "
-                                        "Start your append/patch from the last few lines you managed to generate."
+                                        f"❌ SEARCH/REPLACE PATCH TRUNCATED for '{title}'. "
+                                        f"The patch block was cut before completion. "
+                                        f"Retry with a SMALLER SEARCH/REPLACE patch, or switch to a "
+                                        f"full-file `<artifact>` create + append sequence."
                                     )
                                     continue
+
+                                if was_truncated and not is_patch:
+                                    saved_msg, _, _ = self._save_truncated_artifact_partial(
+                                        title=title,
+                                        lang=lang,
+                                        art_type=resolved_art_type,
+                                        body_content=body_content,
+                                        is_append=is_append,
+                                    )
+                                    action_reports.append(saved_msg)
+                                    has_truncated_artifact = True
+                                    truncated_artifact_title = title
+                                    # TEMPORARILY END THIS ROUND inside the same
+                                    # <done/>-driven block: flush the append
+                                    # directive to the model rather than
+                                    # falling through to other actions.
+                                    break
 
                                 file_path = self._resolved_workspace / title
                                 is_overwrite = file_path.exists()
@@ -8577,15 +9009,18 @@ JSON:"""
                                         action_reports.append(f"[SYSTEM ERROR] File '{title}' not found. Cannot append. Create it first without operation='append'.")
                                         continue
 
-                                    stripped_body = body_content.strip()
-                                    if not stripped_body:
+                                    append_body = self._normalize_artifact_body_for_write(body_content)
+                                    if not append_body.strip():
                                         action_reports.append(f"❌ APPEND BLOCKED for {title}. The body is empty.")
                                         continue
 
                                     original_content = file_path.read_text(encoding="utf-8", errors="ignore")
-                                    # Ensure a newline separation if the original file doesn't end with one
-                                    sep = "" if original_content.endswith("\n") else "\n"
-                                    new_content = original_content + sep + stripped_body + "\n"
+                                    # Preserve the appended chunk verbatim. Insert a newline
+                                    # separator ONLY when the file doesn't already end with one.
+                                    sep = "\n" if self._needs_leading_newline(original_content) else ""
+                                    new_content = original_content + sep + append_body
+                                    if not new_content.endswith("\n"):
+                                        new_content += "\n"
 
                                     file_path.write_text(new_content, encoding="utf-8")
                                     action_reports.append(f"✅ Content appended successfully to {title}.")
@@ -8598,8 +9033,8 @@ JSON:"""
                                     except Exception:
                                         pass
                                 else:
-                                    stripped_body = body_content.strip()
-                                    if not stripped_body:
+                                    write_body = self._normalize_artifact_body_for_write(body_content)
+                                    if not write_body.strip():
                                         action_reports.append(f"❌ FILE WRITE BLOCKED for {title}. Empty artifact body.")
                                         continue
 
@@ -8607,11 +9042,14 @@ JSON:"""
                                         action_reports.append(f"❌ FILE WRITE BLOCKED for {title}. Content contains raw patch markers (=======).")
                                         continue
 
+                                    if not write_body.endswith("\n"):
+                                        write_body += "\n"
+
                                     if self._artefact_manager:
-                                        self._artefact_manager.add(title=title, artefact_type=resolved_art_type, content=body_content, language=lang, active=True)
+                                        self._artefact_manager.add(title=title, artefact_type=resolved_art_type, content=write_body, language=lang, active=True)
                                     file_path = self._resolved_workspace / title
                                     file_path.parent.mkdir(parents=True, exist_ok=True)
-                                    file_path.write_text(body_content, encoding="utf-8")
+                                    file_path.write_text(write_body, encoding="utf-8")
                                     action_reports.append(f"✅ File {title} created/updated successfully.")
                                     actions_executed_count += 1
 
@@ -8828,33 +9266,66 @@ JSON:"""
                     break
 
                 if has_truncated_artifact:
-                    consecutive_artifact_failures = getattr(self, '_consecutive_artifact_failures', 0) + 1
-                    object.__setattr__(self, '_consecutive_artifact_failures', consecutive_artifact_failures)
+                    # ⚠️ Truncation is PROGRESS, not a failure. The partial
+                    # content was already SAVED to disk at the last complete
+                    # line, and the action report instructed the model to
+                    # continue with `operation="append"`. Count only
+                    # NON-PROGRESSING rounds as failures (checked by file
+                    # growth) so a 600-line file can span many appends
+                    # without spuriously terminating.
+                    _fpath = (
+                        self._resolved_workspace / truncated_artifact_title
+                        if truncated_artifact_title and self._resolved_workspace
+                        else None
+                    )
+                    _curr_sz = 0
+                    if _fpath is not None and _fpath.exists():
+                        try:
+                            _curr_sz = _fpath.stat().st_size
+                        except Exception:
+                            _curr_sz = 0
 
-                    if consecutive_artifact_failures >= 3:
-                        ASCIIColors.error(f"[{self.name}] Breaking after {consecutive_artifact_failures} consecutive artifact failures (truncation/empty patch).")
-                        final_response = f"[Task terminated: The agent repeatedly failed to generate a valid artifact for '{truncated_artifact_title}'. Check token limits or patch syntax.]"
-                        if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
-                            try:
-                                streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
-                                    "round_id": round_count,
-                                    "status": "loop_break"
-                                })
-                            except Exception:
-                                pass
-                        break
+                    _prev_sz = getattr(self, '_last_truncation_sz', -1)
+                    object.__setattr__(self, '_last_truncation_sz', _curr_sz)
 
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="user",
-                        content=(
-                            f"[SYSTEM: CRITICAL ERROR. Your previous generation of '{truncated_artifact_title}' was TRUNCATED or FAILED. "
-                            "The file was NOT saved. You MUST rewrite the COMPLETE file from scratch using a standard <artifact> tag (NOT a SEARCH/REPLACE patch). "
-                            "Reproduce the existing content exactly and append the missing ending. Do NOT emit `<done/>` until the file is complete.]"
-                        )
-                    ))
+                    if _curr_sz <= _prev_sz:
+                        # No growth since the previous truncation round → the
+                        # model is not making forward progress (e.g. it keeps
+                        # retrying a full rewrite instead of appending).
+                        _fails = getattr(self, '_consecutive_artifact_failures', 0) + 1
+                        object.__setattr__(self, '_consecutive_artifact_failures', _fails)
+                        if _fails >= 3:
+                            ASCIIColors.error(
+                                f"[{self.name}] Breaking after {_fails} consecutive NON-PROGRESSING "
+                                f"truncation rounds on '{truncated_artifact_title}'."
+                            )
+                            final_response = (
+                                f"[Task terminated: '{truncated_artifact_title}' was repeatedly truncated "
+                                f"without the file growing. The current partial file is preserved on disk. "
+                                f"Consider splitting the file into modules or increasing the model's max_tokens.]"
+                            )
+                            if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                                try:
+                                    streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                                        "round_id": round_count,
+                                        "status": "loop_break"
+                                    })
+                                except Exception:
+                                    pass
+                            break
+                    else:
+                        # Forward progress: reset failure counter and keep going.
+                        object.__setattr__(self, '_consecutive_artifact_failures', 0)
+                        if getattr(self, 'debug_mode', False):
+                            ASCIIColors.info(
+                                f"[{self.name}] 🔪 Artifact truncation made progress "
+                                f"({_prev_sz} → {_curr_sz} bytes). Continuing with append directive."
+                            )
+
                     ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
                     continue
                 object.__setattr__(self, '_consecutive_artifact_failures', 0)
+                object.__setattr__(self, '_last_truncation_sz', -1)
 
                 if not ss.completed_actions and not tool_calls_this_turn and not workspace_changes and not ss.was_done_detected() and round_count == 1:
                     pass
@@ -9187,6 +9658,47 @@ JSON:"""
                             art_type_match = re.search(r'type=["\']([^"\']*)["\']', attrs_str, re.IGNORECASE)
                             resolved_art_type = art_type_match.group(1) if art_type_match else "code"
 
+                            # ── 🔪 TRUNCATION RECOVERY (Block 2) ──
+                            # Handles the case where the LLM did NOT emit
+                            # <done/> and the stream was cut by the token
+                            # limit. Preserve partial content at the last
+                            # complete line and mandate an append round.
+                            _was_truncated_b2 = action.get("was_truncated", False)
+                            if _was_truncated_b2 and is_patch:
+                                action_reports.append(
+                                    f"❌ SEARCH/REPLACE PATCH TRUNCATED for '{title}'. "
+                                    f"Retry with a SMALLER patch, or switch to a full-file "
+                                    f"`<artifact>` create + append sequence."
+                                )
+                                continue
+                            if _was_truncated_b2 and not is_patch:
+                                saved_msg, _, _ = self._save_truncated_artifact_partial(
+                                    title=title,
+                                    lang=lang,
+                                    art_type=resolved_art_type,
+                                    body_content=body_content,
+                                    is_append=is_append,
+                                )
+                                action_reports.append(saved_msg)
+                                actions_executed_count += 1
+                                object.__setattr__(self, '_consecutive_artifact_failures', 0)
+                                if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE) and streaming_callback:
+                                    try:
+                                        streaming_callback("", MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END, {
+                                            "title": title,
+                                            "art_type": resolved_art_type,
+                                            "language": lang,
+                                            "version": 1,
+                                            "is_patch": False,
+                                            "operation": "append" if is_append else "create",
+                                            "success": True,
+                                            "partial": True,
+                                            "error": None,
+                                        })
+                                    except Exception:
+                                        pass
+                                continue
+
                             if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
                                 try:
                                     if streaming_callback:
@@ -9272,14 +9784,16 @@ JSON:"""
                                     action_reports.append(f"[SYSTEM ERROR] File '{title}' not found. Cannot append. Create it first without operation='append'.")
                                     continue
 
-                                stripped_body = body_content.strip()
-                                if not stripped_body:
+                                append_body = self._normalize_artifact_body_for_write(body_content)
+                                if not append_body.strip():
                                     action_reports.append(f"❌ APPEND BLOCKED for {title}. The body is empty.")
                                     continue
 
                                 original_content = file_path.read_text(encoding="utf-8", errors="ignore")
-                                sep = "" if original_content.endswith("\n") else "\n"
-                                new_content = original_content + sep + stripped_body + "\n"
+                                sep = "\n" if self._needs_leading_newline(original_content) else ""
+                                new_content = original_content + sep + append_body
+                                if not new_content.endswith("\n"):
+                                    new_content += "\n"
 
                                 file_path.write_text(new_content, encoding="utf-8")
                                 action_reports.append(f"✅ Content appended successfully to {title}.")
@@ -9292,16 +9806,19 @@ JSON:"""
                                 except Exception:
                                     pass
                             else:
-                                stripped_body = body_content.strip()
-                                if not stripped_body:
+                                write_body = self._normalize_artifact_body_for_write(body_content)
+                                if not write_body.strip():
                                     action_reports.append(f"❌ FILE WRITE BLOCKED for {title}. Empty artifact body.")
                                     continue
 
+                                if not write_body.endswith("\n"):
+                                    write_body += "\n"
+
                                 if self._artefact_manager:
-                                    self._artefact_manager.add(title=title, artefact_type="code", content=body_content, language=lang, active=True)
+                                    self._artefact_manager.add(title=title, artefact_type="code", content=write_body, language=lang, active=True)
                                 file_path = self._resolved_workspace / title
                                 file_path.parent.mkdir(parents=True, exist_ok=True)
-                                file_path.write_text(body_content, encoding="utf-8")
+                                file_path.write_text(write_body, encoding="utf-8")
                                 action_reports.append(f"✅ File {title} created/updated successfully.")
                                 actions_executed_count += 1
 
@@ -10085,6 +10602,32 @@ JSON:"""
                         file_path = self._resolved_workspace / title
                         is_overwrite = file_path.exists()
 
+                        # ── 🔪 TRUNCATION RECOVERY (final flush) ──
+                        # Same multi-round recovery as Blocks 1 & 2 — save
+                        # partial content at the last complete line and
+                        # mandate an append round. Exact copy of Block 2
+                        # because this is the final flush path.
+                        _was_truncated_b3 = action.get("was_truncated", False)
+                        if _was_truncated_b3 and is_patch:
+                            action_reports.append(
+                                f"❌ SEARCH/REPLACE PATCH TRUNCATED for '{title}'. "
+                                f"Retry with a SMALLER patch, or switch to a full-file "
+                                f"`<artifact>` create + append sequence."
+                            )
+                            continue
+                        if _was_truncated_b3 and not is_patch:
+                            _art_type_b3_match = re.search(r'type=["\']([^"\']*)["\']', attrs_str, re.IGNORECASE)
+                            _resolved_art_type_b3 = _art_type_b3_match.group(1) if _art_type_b3_match else "code"
+                            saved_msg, _, _ = self._save_truncated_artifact_partial(
+                                title=title,
+                                lang=lang,
+                                art_type=_resolved_art_type_b3,
+                                body_content=body_content,
+                                is_append=is_append,
+                            )
+                            action_reports.append(saved_msg)
+                            continue
+
                         if not is_append:
                             git_block = self._enforce_git_safety(title, is_overwrite)
                             if git_block:
@@ -10129,25 +10672,31 @@ JSON:"""
                             if not file_path.exists():
                                 action_reports.append(f"[SYSTEM ERROR] File '{title}' not found. Cannot append.")
                                 continue
-                            if not body_content.strip():
+                            append_body = self._normalize_artifact_body_for_write(body_content)
+                            if not append_body.strip():
                                 action_reports.append(f"❌ APPEND BLOCKED for {title}. Empty body.")
                                 continue
                             original_content = file_path.read_text(encoding="utf-8", errors="ignore")
-                            sep = "" if original_content.endswith("\n") else "\n"
-                            new_content = original_content + sep + body_content.strip() + "\n"
+                            sep = "\n" if self._needs_leading_newline(original_content) else ""
+                            new_content = original_content + sep + append_body
+                            if not new_content.endswith("\n"):
+                                new_content += "\n"
                             file_path.write_text(new_content, encoding="utf-8")
                             action_reports.append(f"✅ Content appended successfully to {title}.")
                             if self._artefact_manager:
                                 self._artefact_manager.update(title=title, new_content=new_content, language=lang, bump_version=True, active=True)
                         else:
-                            if not body_content.strip():
+                            write_body = self._normalize_artifact_body_for_write(body_content)
+                            if not write_body.strip():
                                 action_reports.append(f"❌ FILE WRITE BLOCKED for {title}. Empty artifact body.")
                                 continue
+                            if not write_body.endswith("\n"):
+                                write_body += "\n"
                             if self._artefact_manager:
-                                self._artefact_manager.add(title=title, artefact_type="code", content=body_content, language=lang, active=True)
+                                self._artefact_manager.add(title=title, artefact_type="code", content=write_body, language=lang, active=True)
                             file_path = self._resolved_workspace / title
                             file_path.parent.mkdir(parents=True, exist_ok=True)
-                            file_path.write_text(body_content, encoding="utf-8")
+                            file_path.write_text(write_body, encoding="utf-8")
                             action_reports.append(f"✅ File {title} created/updated successfully.")
 
                             try:

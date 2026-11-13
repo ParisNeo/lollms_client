@@ -4318,4 +4318,41 @@ def run_wizard_and_save(cli_env_path: Optional[Union[str, Path]] = None):
 
 
 if __name__ == "__main__":
-    run_wizard_and_save()
+    import argparse
+
+    _parser = argparse.ArgumentParser(
+        description="Lollms Client configuration.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python -m lollms_client.lollms_config_cli_env --simple\n"
+            "      Guided local-LLM setup (recommended for most users).\n"
+            "  python -m lollms_client.lollms_config_cli_env --expert\n"
+            "      Full wizard: every binding, every profile, every modality.\n"
+            "  python -m lollms_client.lollms_config_cli_env\n"
+            "      Interactive prompt asking which experience you want.\n"
+        ),
+    )
+    _mode_group = _parser.add_mutually_exclusive_group()
+    _mode_group.add_argument(
+        "--simple", "-s", action="store_true",
+        help="Run the guided simple wizard (local LLM + optional video).",
+    )
+    _mode_group.add_argument(
+        "--expert", "-e", action="store_true",
+        help="Run the full expert wizard (all bindings and profiles).",
+    )
+    _parser.add_argument(
+        "--config-path", type=str, default=None,
+        help="Explicit path for the configuration file (overrides the default resolution chain).",
+    )
+    _args = _parser.parse_args()
+
+    if getattr(_args, "simple", False):
+        from lollms_client.lollms_config_simple import run_simple_wizard
+        run_simple_wizard()
+    elif getattr(_args, "expert", False):
+        run_wizard_and_save(cli_env_path=getattr(_args, "config_path", None))
+    else:
+        from lollms_client.lollms_config_simple import ensure_configured
+        ensure_configured()

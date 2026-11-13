@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-13 10:26]
+
+- feat(chat): add support for boolean flags in chat configuration
+
 ## [2026-11-12 09:23]
 
 - fix: update agentic spinoff tools, sub-agent spawner, and tool bindings

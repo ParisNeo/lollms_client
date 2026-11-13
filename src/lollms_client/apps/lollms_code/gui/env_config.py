@@ -136,6 +136,138 @@ except ImportError as e:
         raise RuntimeError("lollms_client is not importable in this environment.")
 
 
+def build_quick_setup_ui(store: "EnvStore", *, on_complete=None) -> Optional[Any]:
+    """Returns a NiceGUI card offering the hardware-aware Simple Setup.
+
+    This is the GUI counterpart to the CLI's ``lollms_config_simple`` entry
+    point, exposed as a self-contained widget factory so *any* page (settings,
+    onboarding, first-run wizard) can drop it in with one call:
+
+        from lollms_client.apps.lollms_code.gui.env_config import EnvStore, build_quick_setup_ui
+        store = EnvStore()
+        build_quick_setup_ui(store, on_complete=lambda report: ui.notify(report["ok"]))
+
+    Behaviour:
+      * Detects hardware via ``EnvStore.get_simple_setup_plan()`` (the same
+        scan the CLI uses) and displays the detected tier up-front.
+      * Lists only trusted, curated coding GGUFs from
+        ``lollms_config_simple._LLM_ZOO``; the hardware-recommended one is
+        preselected.
+      * Picking a model and pressing "Install & configure" runs the full
+        runtime install + GGUF download + two-tier registration synchronously
+        inside ``nicegui.run.io_bound`` so the UI stays responsive.
+      * On success, ``on_complete(report)`` is invoked (the settings page
+        typically reloads the surrounding panels here).
+
+    Returns ``None`` when NiceGUI is not importable from this process (e.g.
+    when called from a non-GUI context) so callers can guard with
+    ``if build_quick_setup_ui(...) is None: ...``. Importing this factory
+    never touches the network or the disk; the heavy work only runs on
+    button click.
+    """
+    try:
+        from nicegui import run, ui  # type: ignore
+    except ImportError:
+        return None
+
+    plan = store.get_simple_setup_plan()
+    if not plan.get("ok"):
+        card = ui.card().classes("w-full")
+        with card:
+            ui.label("⚡ Quick local setup").classes("text-lg font-medium")
+            ui.label(plan.get("error", "Simple setup is unavailable in this environment.")) \
+                .classes("text-sm text-orange-600")
+            ui.label("Use the Expert wizard below to configure a model manually.") \
+                .classes("text-xs text-gray-500")
+        return card
+
+    hardware = plan["hardware"]
+    models = plan["models"]
+    recommended_id = plan.get("recommended_id")
+
+    card = ui.card().classes("w-full")
+    with card:
+        ui.label("⚡ Quick local setup (recommended for new users)").classes("text-lg font-medium")
+        ui.label(
+            "Scans your hardware and installs a trusted coding model from Hugging Face. "
+            "No API keys, no server setup."
+        ).classes("text-sm text-gray-600")
+
+        with ui.row().classes("items-center gap-3 mt-2"):
+            ui.badge(
+                f"Detected: {hardware['summary']}",
+                color="green" if hardware["has_cuda"] or hardware["unified_memory"] else "orange",
+            )
+            ui.badge(f"Tier: {hardware['tier']}", color="blue")
+
+        options = {}
+        for m in models:
+            fit_marker = "✓" if m["fits"] else "⚠ offload"
+            vision_tag = " · vision" if m["vision"] else ""
+            options[m["id"]] = (
+                f"{fit_marker}  {m['title']}  "
+                f"(~{m['file_gb']:.1f} GB{vision_tag})"
+            )
+        default_id = recommended_id if recommended_id in options else next(iter(options), None)
+
+        with ui.row().classes("items-center gap-3 w-full mt-2"):
+            selector = ui.select(
+                options,
+                value=default_id,
+                label="Model",
+            ).classes("grow")
+            enable_ttv = ui.checkbox("Also enable video generation (large download)") \
+                .classes("text-xs")
+
+        status_label = ui.label("").classes("text-sm")
+
+        async def _do_install() -> None:
+            chosen = selector.value
+            if not chosen:
+                ui.notify("Pick a model first.", type="warning")
+                return
+            install_button.disable()
+            status_label.text = "Installing runtime and downloading weights… (this can take a while)"
+            try:
+                report = await run.io_bound(
+                    store.apply_simple_setup,
+                    chosen,
+                    enable_ttv=bool(enable_ttv.value),
+                    install_runtime=True,
+                    download=True,
+                )
+            except Exception as exc:  # never let a worker error kill the UI
+                report = {"ok": False, "error": str(exc)}
+            finally:
+                install_button.enable()
+
+            if report.get("ok"):
+                status_label.text = "✅ Configured. Reloading…"
+                ui.notify("Local model installed and configured.", type="positive")
+                store.reload_from_disk()
+                if on_complete is not None:
+                    try:
+                        on_complete(report)
+                    except Exception:
+                        pass
+            else:
+                status_label.text = ""
+                ui.notify(report.get("error", "Setup failed."), type="negative")
+
+        install_button = ui.button(
+            "Install & configure",
+            on_click=_do_install,
+        ).props("color=primary").classes("mt-2")
+
+        if not recommended_id:
+            ui.label(
+                "⚠ No curated model matches your hardware; the guidelines may "
+                "not be optimal for your machine."
+            ).classes("text-xs text-orange-600")
+
+    return card
+
+
 class EnvStore:
     """In-memory config_map + .env persistence, mirroring run_wizard_and_save()."""
 
@@ -179,21 +311,44 @@ class EnvStore:
             self.clean_orphaned_binding_keys()
 
     def clear_settings(self) -> None:
-        """Wipes all in-memory configuration and deletes persisted ~/.lollms_client/ config files."""
-        self.config_map.clear()
-        target_dir = Path.home() / ".lollms_client"
-        for fname in ("config.yaml", ".env"):
-            f = target_dir / fname
-            if f.exists():
-                try:
-                    f.unlink()
-                except Exception:
-                    pass
+        """Wipes all in-memory configuration and deletes every persisted config file.
 
-        # Also purge any local sandbox config files in current workspace if present
-        local_dir = Path.cwd() / ".lollms_code"
-        for fname in ("config.yaml", ".env"):
-            f = local_dir / fname
+        Clears the CANONICAL paths (`~/.lollms/config.yaml`, `./.lollms_code/config.yaml`
+        — the files the wizard and runtime actually use) as well as legacy
+        `~/.lollms_client/` locations, so an upgrade never leaves a stale file
+        behind that silently reconfigures the app.
+        """
+        self.config_map.clear()
+
+        targets: list[Path] = []
+        try:
+            from lollms_client.lollms_config_cli_env import (
+                _get_default_config_file,
+                _get_project_config_file,
+            )
+            targets.append(_get_default_config_file())
+            targets.append(_get_project_config_file())
+        except Exception:
+            pass
+
+        # Legacy pre-canonical locations, kept for backwards compatibility.
+        targets.extend([
+            Path.home() / ".lollms_client" / "config.yaml",
+            Path.home() / ".lollms_client" / ".env",
+            Path.home() / ".lollms-client" / ".env",
+            Path.cwd() / ".lollms_code" / "config.yaml",
+            Path.cwd() / ".lollms_code" / ".env",
+        ])
+
+        seen: set[str] = set()
+        for f in targets:
+            try:
+                key = str(f.resolve())
+            except Exception:
+                key = str(f)
+            if key in seen:
+                continue
+            seen.add(key)
             if f.exists():
                 try:
                     f.unlink()
@@ -201,6 +356,17 @@ class EnvStore:
                     pass
 
         self.load()
+
+    def reload_from_disk(self) -> None:
+        """Reloads ``config_map`` from the canonical config file.
+
+        Used by the GUI's "Quick Local Setup" flow: after ``apply_simple_setup``
+        saves a curated profile, the settings page calls this so all other
+        panels (bindings, profiles) immediately reflect the new state.
+        """
+        self.config_map.clear()
+        self.config_map.update(_load_existing_env_to_map())
+        self.clean_orphaned_binding_keys()
 
     def is_configured(self, require_llm: bool = True, require_tti: bool = False, require_tts: bool = False, require_stt: bool = False, require_ttm: bool = False, require_ttv: bool = False) -> bool:
         """Validates configuration based on required modalities using the Two-Tier Profile System."""
@@ -443,6 +609,103 @@ class EnvStore:
         self.config_map[f"{binding_type.upper()}_PROFILES_{alias}_{key}"] = value
 
     # ---------- resolution for actual client construction ----------
+
+    # ---------- simple (hardware-aware) setup ----------
+
+    def get_simple_setup_plan(self) -> Dict[str, Any]:
+        """Returns the hardware scan + curated catalog plan for the GUI.
+
+        Delegates to ``lollms_config_simple.get_simple_setup_plan`` so the
+        GUI shows the *same* trusted model list and the *same* hardware
+        detection as the CLI's Simple wizard. Returns an ``{ok: False, error}``
+        dict when the simple module is unavailable in this environment so the
+        GUI can fall back to the expert flow.
+        """
+        try:
+            from lollms_client.lollms_config_simple import get_simple_setup_plan
+        except ImportError as exc:
+            return {"ok": False, "error": f"Simple setup module unavailable: {exc}", "models": []}
+        try:
+            plan = get_simple_setup_plan()
+        except Exception as exc:  # hardware detection must never crash the GUI
+            return {"ok": False, "error": f"Hardware detection failed: {exc}", "models": []}
+        return {"ok": True, **plan}
+
+    def apply_simple_setup(
+        self,
+        model_id: str,
+        *,
+        enable_ttv: bool = False,
+        install_runtime: bool = True,
+        download: bool = True,
+    ) -> Dict[str, Any]:
+        """Applies a curated model choice to the live ``config_map`` and saves.
+
+        Reuses ``lollms_config_simple.apply_simple_llm`` for the two-tier
+        registration — so the file written here is byte-for-byte compatible
+        with what the CLI wizard writes. All heavy I/O (runtime install,
+        weight download) runs synchronously: the GUI must call this from a
+        worker task (``nicegui.run.io_bound`` / thread) to avoid blocking.
+
+        Returns a structured report the GUI can render as a success/error
+        card; on save failure the previous on-disk state is restored.
+        """
+        try:
+            from lollms_client.lollms_config_simple import (
+                apply_simple_llm,
+                _register_ttv,
+            )
+        except ImportError as exc:
+            return {"ok": False, "error": f"Simple setup module unavailable: {exc}"}
+
+        # Snapshot for revert.
+        original = dict(self.config_map)
+        try:
+            report = apply_simple_llm(
+                self.config_map,
+                model_id,
+                install_runtime=install_runtime,
+                download=download,
+            )
+        except Exception as exc:
+            self.config_map.clear()
+            self.config_map.update(original)
+            return {"ok": False, "error": f"Failed to apply model: {exc}"}
+
+        if not report.get("ok"):
+            # apply_simple_llm mutates in place only on success; restore anyway
+            # as a safety net for future changes.
+            self.config_map.clear()
+            self.config_map.update(original)
+            return {"ok": False, "error": "; ".join(report.get("errors") or ["Unknown failure"]),
+                    "apply": report}
+
+        if enable_ttv:
+            try:
+                import pathlib as _p
+                ttv_models = _p.Path.home() / ".lollms" / "data" / "models" / "ttv_models" / "sd_cpp"
+                ttv_models.mkdir(parents=True, exist_ok=True)
+                _register_ttv(self.config_map, "master", "master", str(ttv_models))
+            except Exception as exc:
+                # TTV is optional; do not fail the whole setup over it.
+                report.setdefault("errors", []).append(f"TTV registration skipped: {exc}")
+
+        try:
+            self.save()
+        except Exception as exc:
+            self.config_map.clear()
+            self.config_map.update(original)
+            try:
+                self.save()
+            except Exception:
+                pass
+            return {"ok": False, "error": f"Failed to save configuration: {exc}"}
+
+        # Signal to callers (GUI) that a live client refresh is needed.
+        self.config_map.clear()
+        self.config_map.update(original)
+        self.config_map.update(_load_existing_env_to_map()) if "_load_existing_env_to_map" in globals() else None
+        return {"ok": True, "model_id": model_id, "apply": report, "ttv_enabled": bool(enable_ttv)}
 
     def resolve_default_connection(self, binding_type: str = "llm") -> Dict[str, Any]:
         """Mirrors CodeAgentConfig.load()'s default-profile resolution from the

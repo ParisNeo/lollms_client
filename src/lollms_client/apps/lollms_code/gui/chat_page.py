@@ -2296,10 +2296,31 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
             thinking_label = None
 
     def open_python_approval_dialog(source: str, script_label: str, argv: Optional[List[Any]], resp_queue: Any):
-        """Displays an in-app modal authorization dialog for LCP tool execution in safe mode."""
+        """Displays an in-app modal authorization dialog for LCP tool execution in safe mode.
+
+        Hard blocking gate: the modal stays open until the user picks a
+        definitive action (Reject / Allow Once / Always Allow) or presses Stop.
+        Closing the modal via the X button or Escape is treated as REJECT and
+        unblocks the waiting tool thread — nothing else can happen while the
+        prompt is up.
+        """
         dialog = ui.dialog().props("persistent")
         active_approval_dialog_holder["dialog"] = dialog
         active_approval_dialog_holder["resp_queue"] = resp_queue
+
+        # If the dialog is dismissed (Esc/X), treat it as an explicit reject so
+        # the tool thread can never be left waiting indefinitely.
+        def _on_dismiss():
+            if active_approval_dialog_holder.get("resp_queue") is resp_queue:
+                try:
+                    resp_queue.put(("reject", "Authorization dialog dismissed by user."))
+                except Exception:
+                    pass
+                active_approval_dialog_holder["dialog"] = None
+                active_approval_dialog_holder["resp_queue"] = None
+                ui.notify("Execution rejected (dialog dismissed).", type="warning")
+
+        dialog.on("hide", _on_dismiss)
 
         source_lines = source.splitlines()
         line_count = len(source_lines)
@@ -3274,7 +3295,15 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
         _update_input_counter()
 
     prompt_input.on_value_change(_on_input_change)
-    prompt_input.on("keyup", lambda e: refresh_suggestions())
+
+    def _on_prompt_keyup(e):
+        # Only (re)compute slash suggestions when relevant, so multi-line
+        # pastes / normal typing never trigger a redundant widget rebuild.
+        text = prompt_input.value or ""
+        if suggestions_row.visible or text.startswith("/"):
+            refresh_suggestions()
+
+    prompt_input.on("keyup", _on_prompt_keyup)
     prompt_input.on("keydown.tab.prevent", lambda e: accept_first_suggestion())
     prompt_input.on("keydown.up", lambda e: _history_up())
     prompt_input.on("keydown.down", lambda e: _history_down())
@@ -3636,8 +3665,12 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
         return False
 
     async def send_prompt():
-        text = prompt_input.value.strip()
-        if not text or session.busy:
+        # Re-entrancy guard: a stray keydown/click handler must never start a
+        # second turn on the same prompt.
+        if session.busy:
+            return
+        text = (prompt_input.value or "").strip()
+        if not text:
             return
         scroll_state["auto_follow"] = True
         prompt_input.value = ""
@@ -3671,7 +3704,60 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
         )
 
     send_button.on("click", send_prompt)
-    prompt_input.on("keydown.enter.exact.prevent", send_prompt)
+
+    # ── Robust multi-line input handling ───────────────────────────────
+    # Do NOT rely on Quasar's `.exact.prevent` key modifiers inside a
+    # <textarea>: they are unreliable across versions and cause (a) Enter to
+    # fire while Shift is held, (b) paste to be intercepted, and (c) the
+    # send pipeline to re-trigger on every newline the textarea commits —
+    # which is exactly the "repeats at each new line" symptom.
+    #
+    # Instead we bind the raw DOM `keydown` event and inspect the *native*
+    # KeyboardEvent: send ONLY on a plain Enter (no Shift/Ctrl/Alt/Meta, not
+    # IME-composing). Every other case falls through to the browser default,
+    # which inserts a newline — so Shift+Enter and multi-line paste work.
+    def _on_prompt_keydown(e):
+        # NiceGUI surfaces the underlying event on `e.args`; it may be a dict
+        # (JS payload) or the raw event object depending on the frontend glue.
+        key = None
+        shift = ctrl = alt = meta = composing = False
+        args = getattr(e, "args", None)
+        if isinstance(args, dict):
+            key = args.get("key")
+            shift = bool(args.get("shiftKey"))
+            ctrl = bool(args.get("ctrlKey"))
+            alt = bool(args.get("altKey"))
+            meta = bool(args.get("metaKey"))
+            composing = bool(args.get("isComposing"))
+        else:
+            key = getattr(e, "key", None)
+            shift = bool(getattr(e, "shiftKey", False))
+            ctrl = bool(getattr(e, "ctrlKey", False))
+            alt = bool(getattr(e, "altKey", False))
+            meta = bool(getattr(e, "metaKey", False))
+            composing = bool(getattr(e, "isComposing", False))
+
+        if key != "Enter":
+            return
+        # Shift+Enter, Ctrl+Enter, IME composition, etc. → let newline happen.
+        if shift or ctrl or alt or meta or composing:
+            return
+        # Plain Enter → send. `send_prompt` is async; schedule it on the loop.
+        ui.timer(0.01, send_prompt, once=True)
+
+    from nicegui import events as _ng_events
+    prompt_input.on(
+        "keydown",
+        _on_prompt_keydown,
+        args=[
+            "key",
+            "shiftKey",
+            "ctrlKey",
+            "altKey",
+            "metaKey",
+            "isComposing",
+        ],
+    )
 
     # ---------------- Workspace Tree (icons · context menu · open) ----------------
 

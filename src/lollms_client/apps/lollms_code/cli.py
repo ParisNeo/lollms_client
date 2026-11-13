@@ -378,6 +378,9 @@ class CodeAgentConfig:
         self.temperature: float = 0.3
         self.max_tokens_per_turn: int = 8192
         self.context_compaction_threshold: float = 0.85
+        # COMPACT PROMPT: keep the system prompt small for 4B-class models.
+        # Inlines neither the full workspace tree nor non-core tool descriptions.
+        self.compact_system_prompt: bool = True
         self.reasoning_effort: Optional[str] = None
         self.dynamic_effort: bool = False
         self.enable_shell_execution: bool = True
@@ -417,6 +420,20 @@ class CodeAgentConfig:
         return "default"
 
     @property
+    def global_default_profile_alias(self) -> str | None:
+        """The GLOBAL wizard default — the profile flagged ``is_default`` in the
+        canonical config (``~/.lollms/config.yaml``), shared by every lollms app.
+
+        Returns ``None`` when no profile carries the flag. This is Layer 1 of
+        the two-layer selection model; ``active_profile_alias`` (Layer 2, the
+        lollms-code last-used override) resolves on top of it.
+        """
+        for alias, prof in self.llm_model_profiles.items():
+            if isinstance(prof, dict) and prof.get("is_default"):
+                return alias
+        return None
+
+    @property
     def active_model_name(self) -> str:
         alias = self.active_profile_alias
         prof = self.llm_model_profiles.get(alias, {})
@@ -439,42 +456,79 @@ class CodeAgentConfig:
         config = cls()
         APP_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-        PROFILE_KEYS = (
+        # Keys holding actual binding/model profile *data*. These must ALWAYS
+        # come from the canonical YAML (never trusted from the stale JSON cache)
+        # so edits made in the wizard are picked up immediately.
+        #
+        # 🎯 `active_profile` is deliberately NOT in this set: it is lollms-code's
+        # own persisted "last used model" pointer, layered *on top of* the global
+        # wizard default. This gives us the two-layer selection model the user
+        # asked for:
+        #
+        #   Layer 1 — GLOBAL default : profile flagged `is_default` in
+        #                              ~/.lollms/config.yaml. Shared by every
+        #                              lollms app.
+        #   Layer 2 — lollms-code last-used : `active_profile` in
+        #                              ~/.lollms/lollms_code/config.json. Wins
+        #                              *for this app only*, IF still valid.
+        #
+        # `active_profile_alias` implements the resolution (Layer 2 → Layer 1 →
+        # first configured). `global_default_profile_alias` exposes Layer 1.
+        PROFILE_DATA_KEYS = (
             "llm_binding_profiles", "llm_model_profiles",
             "tti_binding_profiles", "tti_model_profiles",
             "tts_binding_profiles", "tts_model_profiles",
             "stt_binding_profiles", "stt_model_profiles",
             "ttv_binding_profiles", "ttv_model_profiles",
             "ttm_binding_profiles", "ttm_model_profiles",
-            "active_profile",
         )
 
-        # 1. Load saved preferences from JSON (preferences only — never profiles)
+        # 1. Load saved preferences from JSON (preferences + last-used model;
+        #    NEVER profile data — that is resolved from the canonical YAML).
         if APP_CONFIG_FILE.exists():
             try:
                 file_config = json.loads(APP_CONFIG_FILE.read_text(encoding="utf-8"))
-                stale_profile_keys = [k for k in file_config if k in PROFILE_KEYS and k != "active_profile"]
+                stale_profile_keys = [k for k in file_config if k in PROFILE_DATA_KEYS]
                 if stale_profile_keys and config.debug:
                     ASCIIColors.warning(
-                        "[CLI] Ignoring stale binding/model profiles found in config.json. "
-                        "Profiles are resolved from ~/.lollms_client/config.yaml (or --config path)."
+                        "[CLI] Ignoring stale binding/model profile data found in config.json. "
+                        "Profiles are resolved from ~/.lollms/config.yaml (or --config path)."
                     )
                 for key, val in file_config.items():
-                    if key in PROFILE_KEYS:
+                    if key in PROFILE_DATA_KEYS:
                         continue
                     if hasattr(config, key):
                         setattr(config, key, val)
+                if config.debug and config.active_profile:
+                    ASCIIColors.info(
+                        f"[CLI] Restored lollms-code last-used LLM profile from config.json: "
+                        f"'{config.active_profile}' (overrides the global wizard default when still valid)."
+                    )
             except (OSError, json.JSONDecodeError) as e:
                 if config.debug:
                     ASCIIColors.warning(f"Failed to read config file: {e}")
 
         # 2. Extract profiles from environment & config files
+        #
+        # 🎯 Delegate path resolution to the SAME canonical loader that the
+        # wizard (`run_wizard_and_save`) and the runtime `LollmsClient`
+        # (`get_client_from_env`) use: `_load_existing_env_to_map`. This honors
+        # `$LOLLMS_CONFIG_FILE`, the project-local `./.lollms_code/config.yaml`,
+        # and `LOLLMS_PROJECT_CONFIG`.
+        #
+        # The previous implementation hardcoded `~/.lollms_client/config.yaml`,
+        # which diverges from the file the wizard actually writes to
+        # (`~/.lollms/config.yaml`). The result was an empty profile registry,
+        # silently falling back to `ollama`/`default`.
         from lollms_client.lollms_config_cli_env import (
             load_env_file,
             load_yaml_file,
+            load_json_file,
+            _descend_into_entry,
             _flatten_dict_to_env,
             _extract_bindings_from_env,
-            _extract_profiles_from_env
+            _extract_profiles_from_env,
+            _load_existing_env_to_map,
         )
 
         resolved_env = dict(os.environ)
@@ -490,30 +544,37 @@ class CodeAgentConfig:
                     "Use --config with an existing .env, .json, or .yaml file."
                 )
             config_sources.append(p)
-        else:
-            home_dir = Path.home() / ".lollms_client"
-            for source in (
-                home_dir / ".env",
-                Path.cwd() / ".lollms_code" / ".env",
-                home_dir / "config.yaml",
-                Path.cwd() / ".lollms_code" / "config.yaml",
-            ):
-                if source.exists():
-                    config_sources.append(source)
-
-        for source in config_sources:
             try:
-                if source.suffix == ".env":
-                    resolved_env.update(load_env_file(source))
-                elif source.suffix == ".json":
-                    from lollms_client.lollms_config_cli_env import _descend_into_entry, load_json_file
-                    data = _descend_into_entry(load_json_file(source), None)
+                if p.suffix == ".env":
+                    resolved_env.update(load_env_file(p))
+                elif p.suffix == ".json":
+                    data = _descend_into_entry(load_json_file(p), None)
                     resolved_env.update(_flatten_dict_to_env(data))
-                elif source.suffix in (".yaml", ".yml"):
-                    resolved_env.update(_flatten_dict_to_env(load_yaml_file(source)))
+                elif p.suffix in (".yaml", ".yml"):
+                    resolved_env.update(_flatten_dict_to_env(load_yaml_file(p)))
             except (OSError, ValueError) as e:
                 if config.debug:
-                    ASCIIColors.warning(f"Failed to parse configuration source {source}: {e}")
+                    ASCIIColors.warning(f"Failed to parse explicit configuration source {p}: {e}")
+        else:
+            # Canonical layered resolution (global + project-local), identical
+            # to what `get_client_from_env` mounts at runtime.
+            canonical_map = _load_existing_env_to_map()
+            resolved_env.update(canonical_map)
+
+            # Populate config_sources purely for diagnostic logging.
+            try:
+                from lollms_client.lollms_config_cli_env import (
+                    _get_default_config_file,
+                    _get_project_config_file,
+                )
+                default_cfg = _get_default_config_file()
+                project_cfg = _get_project_config_file()
+                if default_cfg.exists():
+                    config_sources.append(default_cfg)
+                if project_cfg.exists():
+                    config_sources.append(project_cfg)
+            except Exception:
+                pass
 
         # Extract profiles across all modalities
         _ssl_debug = os.getenv("LOLLMS_DEBUG_SSL", "").lower() in ("1", "true", "yes")
@@ -529,12 +590,37 @@ class CodeAgentConfig:
             setattr(config, f"{modality}_binding_profiles", bindings)
             setattr(config, f"{modality}_model_profiles", profiles)
 
-        # 3. Handle CLI argument overrides
-        if getattr(cli_args, "profile", None):
-            config.active_profile = cli_args.profile.strip()
-            # Flag selected profile as default
-            for p_name, p_data in config.llm_model_profiles.items():
-                p_data["is_default"] = (p_name == config.active_profile)
+        # 3. Handle CLI argument overrides.
+        #    `--llm-profile` is an EXPLICIT per-invocation selection: it wins
+        #    over the persisted last-used pointer for this session AND becomes
+        #    the new last-used on exit (because `main()` calls `config.save()`),
+        #    matching the "last used model persists across sessions" contract.
+        #    Only `/switch_model` and this flag ever move the pointer — never the
+        #    global wizard default, which other apps rely on.
+        explicit_profile = (
+            getattr(cli_args, "llm_profile", None)
+            or getattr(cli_args, "profile", None)
+        )
+        if explicit_profile:
+            selected_alias = str(explicit_profile).strip()
+            if selected_alias and selected_alias not in config.llm_model_profiles:
+                # Case-insensitive fallback so `--llm-profile MY_MODEL` works.
+                lowered = selected_alias.lower()
+                for known in config.llm_model_profiles:
+                    if known.lower() == lowered:
+                        selected_alias = known
+                        break
+            if selected_alias in config.llm_model_profiles:
+                config.active_profile = selected_alias
+                if config.debug:
+                    ASCIIColors.info(
+                        f"[CLI] --llm-profile override: activating '{selected_alias}' for this session."
+                    )
+            else:
+                ASCIIColors.warning(
+                    f"[CLI] --llm-profile '{explicit_profile}' is not a configured profile. "
+                    f"Available: {list(config.llm_model_profiles.keys())}"
+                )
 
         # Apply specific CLI overrides to the active profile
         if cli_args.llm_binding or cli_args.model or cli_args.host or cli_args.api_key or cli_args.context_size:
@@ -626,8 +712,7 @@ class CodeAgentConfig:
             config.temperature = cli_args.temperature
         if cli_args.max_tokens:
             config.max_tokens_per_turn = cli_args.max_tokens
-        if getattr(cli_args, "context_compaction_threshold", None) is not None:
-            config.context_compaction_threshold = cli_args.context_compaction_threshold
+
         if getattr(cli_args, "reasoning_effort", None):
             config.reasoning_effort = cli_args.reasoning_effort
         elif getattr(cli_args, "effort", None):
@@ -685,39 +770,36 @@ class CodeAgentConfig:
     def _resolve_env_map(self, config_path: str | None = None) -> dict[str, str]:
         """Reads ALL universal configuration sources into one flattened env map.
 
-        Merge order (later sources override earlier ones):
-        1. ~/.lollms-client/.env   (GUI wizard)
-        2. ~/.lollms_client/.env   (CLI wizard)
-        3. ~/.lollms_client/config.yaml (CLI wizard, structured format)
+        Delegates to `lollms_config_cli_env._load_existing_env_to_map`, the
+        canonical resolver used by the wizard and by `get_client_from_env`. This
+        honors `$LOLLMS_CONFIG_FILE`, the project-local `./.lollms_code/config.yaml`,
+        and `LOLLMS_PROJECT_CONFIG` — ensuring `is_configured()`,
+        `_resolve_modality_from_env()`, and `CodeAgentConfig.load()` all see the
+        exact same files the wizard persists to.
+
+        An explicit `config_path` still wins for that specific invocation.
         """
         from lollms_client.lollms_config_cli_env import (
             load_env_file,
             load_yaml_file,
             _flatten_dict_to_env,
+            _load_existing_env_to_map,
         )
 
-        env_data: dict[str, str] = {}
         if config_path:
-            sources = [Path(config_path).expanduser()]
-        else:
-            sources = [
-                Path.home() / ".lollms_client" / ".env",
-                Path.cwd() / ".lollms_code" / ".env",
-                Path.home() / ".lollms_client" / "config.yaml",
-                Path.cwd() / ".lollms_code" / "config.yaml",
-            ]
+            p = Path(config_path).expanduser()
+            env_data: dict[str, str] = {}
+            if p.exists():
+                try:
+                    if p.suffix in (".yaml", ".yml"):
+                        env_data.update(_flatten_dict_to_env(load_yaml_file(p)))
+                    else:
+                        env_data.update(load_env_file(p))
+                except (OSError, ValueError) as e:
+                    ASCIIColors.warning(f"Failed to read configuration source {p}: {e}")
+            return env_data
 
-        for source in sources:
-            if not source.exists():
-                continue
-            try:
-                if source.suffix in (".yaml", ".yml"):
-                    env_data.update(_flatten_dict_to_env(load_yaml_file(source)))
-                else:
-                    env_data.update(load_env_file(source))
-            except (OSError, ValueError) as e:
-                ASCIIColors.warning(f"Failed to read configuration source {source}: {e}")
-        return env_data
+        return _load_existing_env_to_map()
 
     def _has_modality_configured(self, env_data: dict[str, str], modality: str) -> bool:
         """Checks if at least one binding and one profile exist for the given modality (e.g., 'llm', 'tti')."""
@@ -1309,6 +1391,93 @@ def build_environment_context(config: CodeAgentConfig) -> str:
 === END ENVIRONMENT CONTEXT ===
 """
 
+def _ensure_active_profile_mounted(config: CodeAgentConfig, client: LollmsClient) -> None:
+    """Aligns the runtime with the *resolved active* profile before the session begins.
+
+    Two-layer selection model recap:
+
+      * Layer 1 — GLOBAL default  : profile flagged ``is_default`` in the
+                                     canonical wizard config (shared by all
+                                     lollms apps). ``LollmsClient`` mounts this
+                                     one at construction time.
+      * Layer 2 — lollms-code last-used : ``config.active_profile`` in
+                                     ``~/.lollms/lollms_code/config.json``.
+                                     ``config.active_profile_alias`` resolves
+                                     Layer 2 over Layer 1.
+
+    ``create_client()`` passes the full two-tier registry to ``LollmsClient``,
+    which (correctly) mounts the global-default profile at construction time.
+    But when a lollms-code last-used override exists AND differs from the
+    global default, the runtime ends up mounting the WRONG model for this
+    session — visible as ``Model: X (⚠ mounted ≠ profile 'Y')`` in the header.
+
+    This helper performs the missing alignment step: when the mounted model
+    does not match the resolved active profile, it explicitly calls
+    ``client.switch_model(active_alias)`` so the header, the personality, and
+    every subsequent turn run on the model the user last selected. If the
+    switch cannot succeed (e.g. binding server unreachable), it leaves the
+    client untouched and emits a single actionable warning — never blocks the
+    session.
+
+    Called from ``main()`` *after* ``create_client()`` and *before*
+    ``create_coding_personality()`` so the welcome HUD reflects reality.
+    """
+    try:
+        mounted_before = getattr(getattr(client, "llm", None), "model_name", None) or ""
+    except Exception:
+        mounted_before = ""
+
+    expected_alias = config.active_profile_alias
+    expected_model = config.active_model_name or ""
+
+    # Fast path: already mounted on the profile the resolver picked.
+    if not expected_model or not mounted_before or mounted_before == expected_model:
+        return
+
+    # Is the active alias even a configured profile the client can switch into?
+    if expected_alias not in config.llm_model_profiles:
+        # Resolver already fell back to the global default — nothing to switch.
+        return
+
+    switch_fn = getattr(client, "switch_model", None)
+    if not callable(switch_fn):
+        # Some bindings/paths don't expose switch_model; surface it once.
+        ASCIIColors.warning(
+            f"[CLI] ⚠️  Session expected model '{expected_model}' "
+            f"(profile '{expected_alias}') but mounted '{mounted_before}'. "
+            f"This client does not expose switch_model(); continuing on the "
+            f"mounted model."
+        )
+        return
+
+    is_override = (
+        config.active_profile
+        and config.active_profile in config.llm_model_profiles
+    )
+    origin = "last-used override" if is_override else "resolved profile"
+    ASCIIColors.info(
+        f"[CLI] 🔄 Restoring {origin} '{expected_alias}' "
+        f"(expected '{expected_model}', currently mounted '{mounted_before}')…"
+    )
+
+    try:
+        ok = bool(switch_fn(expected_alias))
+    except (RuntimeError, ValueError, OSError, ConnectionError) as exc:
+        ASCIIColors.warning(
+            f"[CLI] ⚠️  Could not switch to '{expected_alias}': {exc}. "
+            f"Continuing on mounted model '{mounted_before}'. "
+            f"Use `/switch_model` to retry or `/config` to pick an explicit profile."
+        )
+        return
+
+    if not ok:
+        ASCIIColors.warning(
+            f"[CLI] ⚠️  switch_model('{expected_alias}') returned False. "
+            f"Continuing on mounted model '{mounted_before}'. "
+            f"Use `/switch_model` to retry or `/config` to pick an explicit profile."
+        )
+
+
 def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> LollmsPersonality:
     """Creates a coding personality from the handbag structure, injecting client and capabilities."""
     ASCIIColors.rich_print("\n[bold cyan]🔧 Initializing Agent...[/bold cyan]")
@@ -1387,6 +1556,27 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
             ASCIIColors.rich_print(" [red]✗[/red]")
             ASCIIColors.warning(f"[CLI] Failed to initialize project memory: {e}. Falling back to handbag memory.")
 
+    # ── 🎯 PROFILE ↔ BINDING SANITY CHECK ──
+    # `create_client()` resolves the profile once and passes model_name +
+    # per-profile binding_config to the binding. If the binding ends up
+    # mounting a DIFFERENT model (e.g. a cached llama_cpp_server process for
+    # a previous profile is still registered under the same port, or the
+    # config map still contains a stale default), surface it loudly instead
+    # of letting the interactive header contradict itself. This runs before
+    # the session starts so the fix (e.g. `/config` or a specific
+    # `llama_cpp_server` unload) is offered immediately.
+    _mounted = getattr(getattr(client, "llm", None), "model_name", None) or ""
+    _expected = config.active_model_name or ""
+    if _mounted and _expected and _mounted != _expected:
+        ASCIIColors.warning(
+            f"[CLI] ⚠️  Profile '{config.active_profile_alias}' expects model "
+            f"'{_expected}', but binding mounted '{_mounted}'.\n"
+            f"       This usually means a llama_cpp_server process for the "
+            f"old profile is still running, or the stored profile is stale.\n"
+            f"       Run `/config` → Models & Provider Profiles to reconcile, "
+            f"or `/switch_model` to pick the right profile explicitly."
+        )
+
     # ── 💾 FRESH SESSION INITIATION (LONG-TERM FACTS IN MEMORY DB) ──
     project_history_file = get_workspace_conversation_file(config.workspace_path)
     if not getattr(config, "continue_session", False):
@@ -1420,6 +1610,18 @@ def create_coding_personality(config: CodeAgentConfig, client: LollmsClient) -> 
     personality.capabilities = caps
     personality.max_tokens_per_turn = config.max_tokens_per_turn
     personality.debug_mode = config.debug
+
+    # 🪶 COMPACT PROMPT MODE (default ON for lollms_code):
+    # - Workspace tree is served on demand via `tool_show_workspace_tree`.
+    # - Only core tools keep descriptions; others are names + `tool_describe_tools`.
+    _compact = bool(getattr(config, "compact_system_prompt", True))
+    personality.compact_tool_descriptions = _compact
+    personality.compact_workspace_tree = _compact
+    if _compact:
+        ASCIIColors.rich_print(
+            "  [green]✓[/green] [dim]Compact system prompt mode active "
+            "(tree + tool details on demand via tools)[/dim]"
+        )
 
     # ── Universal Skills Discovery (Bundled + Global + Handbag) ──
     sync_default_skills_to_user_home()
@@ -1659,13 +1861,30 @@ class StreamRenderer:
         self._live_artifact_title = ""
         self._live_artifact_lang = ""
         self._live_artifact_buffer = ""
+        self._live_artifact_started = False
         self._last_stream_artifact_title = None
         self._rendered_artefact_ends = set()
         self._rendered_artefact_starts = set()
         self._first_token_printed = False
-        self._rendered_artefact_ends = set()
-        self._rendered_artefact_starts = set()
-        self._first_token_printed = False
+
+        # ── Markdown fenced-code-block streaming state ──
+        # The LLM streams ``` ... ``` fenced blocks inside its PROSE reply
+        # (not inside <artifact> tags). Raw passthrough would print literal
+        # backticks; instead we detect fences on the fly, buffer the code
+        # body, and render a syntax-highlighted panel once the closing fence
+        # arrives.
+        #
+        #   _md_state  : "text"  → scanning for an opening ```
+        #                "fence_open_line" → seen ``` waiting for the lang line's \n
+        #                "fence_body" → inside a fenced block, buffering code
+        #   _md_partial: at most 2 held-back chars so a ``` split across two
+        #                streamed chunks is correctly recognised
+        #   _md_buffer : accumulated code body while in a fence
+        #   _md_lang   : language token from the opening fence
+        self._md_state = "text"
+        self._md_partial = ""
+        self._md_buffer = ""
+        self._md_lang = ""
 
     def _render_processing_block(self, block_content: str):
         """Parses and renders a <processing> block as a rich panel."""
@@ -1865,22 +2084,23 @@ class StreamRenderer:
                 lang = meta.get("language", "")
                 art_type = meta.get("art_type", "code")
                 is_patch = meta.get("is_patch", False)
-                op_label = "Patching" if is_patch else "Creating"
+                action_word = "Updating artifact" if is_patch else "Creating artifact"
                 op_icon = "🔧" if is_patch else "📄"
 
-                rows = [
-                    ["File", f"[bold yellow]{_clean_str(title)}[/bold yellow]"],
-                    ["Type", f"[magenta]{_clean_str(art_type)}[/magenta]" + (f" [dim]({_clean_str(lang)})[/dim]" if lang else "")],
-                    ["Operation", f"{op_icon} {op_label}"],
-                    ["Status", "[yellow]⏳ Writing to workspace...[/yellow]"]
-                ]
-                table = ASCIIColors.table(
-                    "Field", "Details",
-                    rows=rows,
-                    title=f"[bold magenta]{op_icon} Artifact: {op_label} {_clean_str(title)}[/bold magenta]",
-                    box="round"
+                # Brief SINGLE-LINE marker ONLY. The detailed, boxed view is
+                # rendered once at ARTEFACT_BUILD_END. Emitting a table here
+                # as well as a panel at BUILD_END made every artifact write
+                # appear twice in the terminal and never said the word
+                # "artifact" explicitly in the stream.
+                qualifiers = [q for q in (art_type, lang) if q]
+                qualifier_str = (
+                    f" [dim]({', '.join(_clean_str(q) for q in qualifiers)})[/dim]"
+                    if qualifiers else ""
                 )
-                ASCIIColors.rich_print(table)
+                ASCIIColors.rich_print(
+                    f"{op_icon} [bold magenta]{action_word}:[/bold magenta] "
+                    f"[bold yellow]{_clean_str(title)}[/bold yellow]{qualifier_str} ..."
+                )
                 sys.stdout.flush()
 
             elif _is_type(MSG_TYPE.MSG_TYPE_ARTEFACT_BUILD_END):
@@ -1889,9 +2109,16 @@ class StreamRenderer:
                 version = meta.get("version", 1)
                 error = meta.get("error")
                 content = meta.get("content", "")
+                is_patch = meta.get("is_patch", False)
 
-                status_str = f"[bold green]✅ Saved (v{version})[/bold green]" if success else f"[bold red]❌ Failed: {_clean_str(error)}[/bold red]"
                 border = "green" if success else "red"
+                op_icon = "🔧" if is_patch else "📄"
+                if success:
+                    action_word = "Artifact Updated" if is_patch else "Artifact Created"
+                    status_str = f"[bold green]✅ Saved (v{version})[/bold green]"
+                else:
+                    action_word = "Artifact Update Failed" if is_patch else "Artifact Creation Failed"
+                    status_str = f"[bold red]❌ {_clean_str(error) or 'Unknown error'}[/bold red]"
 
                 content_parts = [
                     f"[cyan]File:[/cyan] [bold yellow]{_clean_str(title)}[/bold yellow] (v{version})",
@@ -1905,9 +2132,13 @@ class StreamRenderer:
                     for cl in preview_content:
                         content_parts.append(f"  [yellow]{_clean_str(cl)}[/yellow]")
 
+                # The ONE boxed renderer per artifact operation. This is the
+                # last event of the create/update cycle, so it is the natural
+                # place to show the summary — and it explicitly says
+                # "Artifact Created/Updated" so the user knows what happened.
                 ASCIIColors.panel(
                     "\n".join(content_parts),
-                    title=f"[bold {border}]📄 Artifact Complete: {_clean_str(title)}[/bold {border}]",
+                    title=f"[bold {border}]{op_icon} {action_word}: {_clean_str(title)}[/bold {border}]",
                     border_style=border
                 )
                 sys.stdout.flush()
@@ -2048,9 +2279,175 @@ class StreamRenderer:
                     ASCIIColors.info(f"  • {k}: {v}")
             sys.stdout.flush()
 
+    def _render_code_block(self, lang: str, code: str) -> None:
+        """Render a fenced Markdown code block as a syntax-highlighted panel.
+
+        Emitted once per fence — replaces the previous behaviour of printing
+        the raw ``` fences verbatim, which made the code look like ordinary
+        prose and broke formatting.
+        """
+        code_clean = (code or "").rstrip("\n")
+        if not code_clean.strip():
+            return
+
+        lang_norm = (lang or "").strip().lower() or "text"
+        _lang_aliases = {
+            "py": "python", "js": "javascript", "ts": "typescript",
+            "sh": "bash", "shell": "bash", "ps1": "powershell",
+            "yml": "yaml", "htm": "html", "c++": "cpp", "c#": "csharp",
+            "rs": "rust",
+        }
+        lexer = _lang_aliases.get(lang_norm, lang_norm)
+
+        try:
+            from rich.syntax import Syntax
+            from rich.panel import Panel
+            from rich.text import Text
+
+            syntax = Syntax(
+                code_clean,
+                lexer,
+                theme="monokai",
+                line_numbers=False,
+                word_wrap=False,
+                padding=(0, 1),
+            )
+            title = Text(f" {lang_norm} ", style="bold cyan")
+            panel = Panel(
+                syntax,
+                title=title,
+                title_align="left",
+                border_style="cyan",
+                padding=(0, 1),
+            )
+            # Terminate any in-progress inline line BEFORE the panel so the
+            # box is not jammed against preceding prose.
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            ASCIIColors.rich_print(panel)
+        except Exception:
+            # Fallback: at least emit the code — never silently swallow it.
+            ASCIIColors.rich_print(code_clean)
+        sys.stdout.flush()
+
+    def _flush_markdown(self) -> None:
+        """Flush any buffered Markdown state at end-of-stream.
+
+        - Held-back partial fence chars are emitted as plain text.
+        - An UNCLOSED fence is CLOSED and rendered — so a truncated stream
+          never swallows code the model already wrote.
+        - A fence whose language line never finished is emitted verbatim.
+        """
+        if self._md_partial:
+            ASCIIColors.rich_print(self._md_partial, end="")
+            sys.stdout.flush()
+            self._md_partial = ""
+
+        if self._md_state == "fence_open_line":
+            # Opening ``` seen but language line never terminated. Emit raw.
+            ASCIIColors.rich_print("```" + self._md_buffer, end="")
+            sys.stdout.flush()
+            self._md_buffer = ""
+            self._md_lang = ""
+            self._md_state = "text"
+            return
+
+        if self._md_state == "fence_body":
+            # Unclosed fence — render the accumulated body as a code panel.
+            self._render_code_block(self._md_lang, self._md_buffer)
+            self._md_buffer = ""
+            self._md_lang = ""
+            self._md_state = "text"
+
+    def _emit_markdown_chunk(self, text: str) -> None:
+        """Emit a streamed Markdown chunk, detecting ``` fenced code blocks.
+
+        Prose outside fences streams chunk-by-chunk for instant feedback.
+        Fences buffer their body and render as a ``rich.syntax.Syntax``
+        panel when the closing ``` arrives.
+
+        Handles a fence delimiter split across two chunks (`` ` `` + `` `` ``)
+        by holding back up to two trailing chars until the sequence resolves.
+        """
+        if not text:
+            return
+        buffer = self._md_partial + text
+        self._md_partial = ""
+
+        i = 0
+        n = len(buffer)
+        while i < n:
+            # ── Inside a fenced code block ──
+            if self._md_state == "fence_body":
+                idx = buffer.find("```", i)
+                if idx == -1:
+                    tail = buffer[i:]
+                    if tail.endswith("``"):
+                        self._md_buffer += tail[:-2]
+                        self._md_partial = tail[-2:]
+                    elif tail.endswith("`"):
+                        self._md_buffer += tail[:-1]
+                        self._md_partial = tail[-1:]
+                    else:
+                        self._md_buffer += tail
+                    return
+                self._md_buffer += buffer[i:idx]
+                self._render_code_block(self._md_lang, self._md_buffer)
+                self._md_buffer = ""
+                self._md_lang = ""
+                self._md_state = "text"
+                i = idx + 3
+                continue
+
+            # ── Waiting for the opening fence's language line (first newline) ──
+            if self._md_state == "fence_open_line":
+                nl = buffer.find("\n", i)
+                if nl == -1:
+                    self._md_buffer += buffer[i:]
+                    return
+                self._md_lang = (self._md_buffer + buffer[i:nl]).strip()
+                self._md_buffer = ""
+                self._md_state = "fence_body"
+                i = nl + 1
+                continue
+
+            # ── Normal prose: scan for an opening fence ──
+            idx = buffer.find("```", i)
+            if idx == -1:
+                tail = buffer[i:]
+                if tail.endswith("``"):
+                    if tail[:-2]:
+                        ASCIIColors.rich_print(tail[:-2], end="")
+                        sys.stdout.flush()
+                    self._md_partial = tail[-2:]
+                elif tail.endswith("`"):
+                    if tail[:-1]:
+                        ASCIIColors.rich_print(tail[:-1], end="")
+                        sys.stdout.flush()
+                    self._md_partial = tail[-1:]
+                elif tail:
+                    ASCIIColors.rich_print(tail, end="")
+                    sys.stdout.flush()
+                return
+
+            before = buffer[i:idx]
+            if before:
+                ASCIIColors.rich_print(before, end="")
+                sys.stdout.flush()
+            self._md_state = "fence_open_line"
+            self._md_buffer = ""
+            self._md_lang = ""
+            i = idx + 3
+
     def flush(self):
-        """Flushes any pending buffers, rendering unclosed tags as raw text."""
+        """Flushes any pending buffers, rendering unclosed tags as raw text.
+
+        Any pending Markdown fence state is finalised first so an unclosed
+        fenced code block is still shown to the user (rather than silently
+        dropped or left as raw backticks).
+        """
         self._stop_live_artifact_panel()
+        self._flush_markdown()
         self._first_token_printed = False
         if self._in_processing and self._processing_buffer:
             ASCIIColors.rich_print(self._processing_buffer, end="")
@@ -2069,6 +2466,13 @@ class StreamRenderer:
         if msg_type == MSG_TYPE.MSG_TYPE_ROUND_START:
             round_id = meta.get("round_id", 1) if meta else 1
             max_r = meta.get("max_rounds", self.config.max_reasoning_steps) if meta else self.config.max_reasoning_steps
+            # Finalise any Markdown fence state from the previous round before
+            # opening a new one, so nothing is silently swallowed.
+            self._flush_markdown()
+            self._md_state = "text"
+            self._md_partial = ""
+            self._md_buffer = ""
+            self._md_lang = ""
             ASCIIColors.rich_print(f"\n[dim]── Round {round_id}/{max_r} ──[/dim]")
             sys.stdout.flush()
             self._rendered_artefact_ends.clear()
@@ -2076,6 +2480,8 @@ class StreamRenderer:
             return True
 
         if msg_type == MSG_TYPE.MSG_TYPE_ROUND_END:
+            # Close any dangling fenced block before the round ends.
+            self._flush_markdown()
             return True
 
         if msg_type in [
@@ -2157,8 +2563,9 @@ class StreamRenderer:
 
                 if not getattr(self, '_first_token_printed', False):
                     self._first_token_printed = True
-                ASCIIColors.rich_print(clean_chunk, end="")
-                sys.stdout.flush()
+                # Defer to the fenced-code-block detector so ```lang…``` is
+                # rendered as a syntax-highlighted panel instead of raw text.
+                self._emit_markdown_chunk(clean_chunk)
         elif msg_type == MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK:
             ASCIIColors.rich_print(f"[dim]{chunk}[/dim]", end="")
             sys.stdout.flush()
@@ -2171,6 +2578,9 @@ class StreamRenderer:
                 return True
             elif meta and meta.get("done_intercepted"):
                 self._stop_live_artifact_panel()
+                # Finalise any open fenced code block BEFORE drawing the
+                # completion rule so the rendered panel is not overwritten.
+                self._flush_markdown()
                 print()
                 ASCIIColors.rule("[bold green]✅ Task Completed (<done/>)[/bold green]")
                 sys.stdout.flush()
@@ -2425,10 +2835,22 @@ def run_single_prompt(personality: LollmsPersonality, client: LollmsClient, prom
 
     steps_disp = "∞ (Infinite ⚠️)" if config.max_reasoning_steps <= 0 else str(config.max_reasoning_steps)
     effort_disp = 'Dynamic (auto)' if config.dynamic_effort else (config.reasoning_effort or 'default')
+    # Same profile ↔ mounted-model consistency contract as the REPL header:
+    # show what the binding actually mounted, and flag divergence from the
+    # profile's declared model so the user never sees a contradictory panel.
+    _mounted_single = getattr(getattr(client, "llm", None), "model_name", None) or ""
+    _expected_single = config.active_model_name or ""
+    if _mounted_single and _expected_single and _mounted_single != _expected_single:
+        _model_line = (
+            f"{_mounted_single}  [bold red](⚠ mounted ≠ profile '{_expected_single}')[/bold red]"
+        )
+    else:
+        _model_line = _mounted_single or _expected_single
     config_panel_content = (
         f"[cyan]Workspace:[/cyan] {config.workspace_path}\n"
         f"[cyan]Handbag:[/cyan]   {personality.name} ({Path(config.handbag_path).name})\n"
-        f"[cyan]Model:[/cyan]      {config.active_model_name}\n"
+        f"[cyan]Profile:[/cyan]    {config.active_profile_alias}\n"
+        f"[cyan]Model:[/cyan]      {_model_line}\n"
         f"[cyan]Binding:[/cyan]    {config.active_binding_name}\n"
         f"[cyan]Max steps:[/cyan]  {steps_disp}\n"
         f"[cyan]Temperature:[/cyan]{config.temperature}\n"
@@ -3177,6 +3599,207 @@ def _handle_instances_command(args) -> int:
         ASCIIColors.red(f"Unknown action: {action}")
         return 1
 
+def _switch_active_model_profile(config: CodeAgentConfig, client: LollmsClient) -> bool:
+    """Interactive REPL helper for the ``/switch_model`` command.
+
+    lollms-code uses a TWO-LAYER model selection model:
+
+      * **Layer 1 — GLOBAL default**: the profile flagged ``is_default`` in the
+        canonical wizard config (``~/.lollms/config.yaml``). Shared by every
+        lollms app (lollms-code, lollms-bot, …).
+
+      * **Layer 2 — lollms-code LAST-USED override**: persisted in
+        ``~/.lollms/lollms_code/config.json`` (``active_profile``). It wins
+        *for this app only* when the alias still exists in the current profile
+        registry, WITHOUT touching the global wizard default.
+
+    This command lists every LLM model profile, marks which one is the global
+    default and which one lollms-code last-used, then lets the user pick one
+    by index or alias. Selecting a profile sets ``config.active_profile`` and
+    persists it via ``config.save()`` so it survives restarts.
+
+    Entering ``default`` (or ``reset``/``global``) clears the override so
+    lollms-code falls back to the global wizard default again.
+
+    Returns:
+        ``True`` when the selection changed (switch or reset succeeded),
+        ``False`` on cancel, invalid selection, an unchanged pick, or failure.
+    """
+    profiles: dict[str, Any] = dict(config.llm_model_profiles or {})
+    if not profiles:
+        ASCIIColors.yellow(
+            "  No LLM model profiles configured. "
+            "Run `/config` → 'Models & Provider Profiles' to add one first."
+        )
+        return False
+
+    aliases: list[str] = list(profiles.keys())
+    current_alias = config.active_profile_alias
+    global_default_alias = config.global_default_profile_alias
+    override_alias = (
+        config.active_profile
+        if config.active_profile and config.active_profile in profiles
+        else None
+    )
+
+    ASCIIColors.rule("[bold cyan]🔄 Switch Active Model Profile[/bold cyan]")
+    ASCIIColors.rich_print(
+        f"[dim]Global wizard default: [bold]{global_default_alias or '(none)'}[/bold]  ·  "
+        f"lollms-code last-used: [bold]{override_alias or '(follows global default)'}[/bold][/dim]"
+    )
+
+    rows: list[list[str]] = []
+    for idx, alias in enumerate(aliases, 1):
+        prof = profiles.get(alias) if isinstance(profiles.get(alias), dict) else {}
+        model_name = (prof or {}).get("model_name") or "(server default)"
+        binding_alias = (
+            (prof or {}).get("binding_profile_name")
+            or (prof or {}).get("binding_alias")
+            or "-"
+        )
+        badges: list[str] = []
+        if alias == global_default_alias:
+            badges.append("[yellow]⭐ global default[/yellow]")
+        if alias == override_alias:
+            badges.append("[bold green]← last used[/bold green]")
+        if not badges and alias == current_alias:
+            badges.append("[bold green]← active[/bold green]")
+        rows.append([str(idx), alias, str(model_name), str(binding_alias), "  ".join(badges)])
+
+    table = ASCIIColors.table(
+        "#", "Alias", "Model", "Binding", "Status",
+        rows=rows,
+        title="[bold]Available LLM Model Profiles[/bold]",
+        box="round",
+    )
+    ASCIIColors.rich_print(table)
+    ASCIIColors.rich_print(
+        "[dim]Tip: enter 'default' to clear the lollms-code override "
+        "and follow the global wizard default again.[/dim]"
+    )
+
+    try:
+        raw = input("  Enter profile # / alias ('default' to reset, 'back' to cancel)> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        ASCIIColors.yellow("  Switch cancelled.")
+        return False
+
+    if not raw or raw.lower() in ("back", "cancel", "q", "quit"):
+        ASCIIColors.yellow("  Switch cancelled.")
+        return False
+
+    # ── Reset: clear the lollms-code last-used override ────────────────────
+    if raw.lower() in ("default", "reset", "global", "follow-default", "follow_default"):
+        if override_alias is None:
+            ASCIIColors.info(
+                "  ℹ️ No lollms-code override is set — already following the global wizard default."
+            )
+            return False
+
+        target_fallback = global_default_alias or current_alias
+        ASCIIColors.info(
+            f"  ⏳ Clearing lollms-code override → following global default '{target_fallback}'..."
+        )
+
+        switch_fn = getattr(client, "switch_model", None)
+        if target_fallback and callable(switch_fn) and target_fallback != current_alias:
+            try:
+                if not switch_fn(target_fallback):
+                    ASCIIColors.error(
+                        f"  ❌ Could not mount global default '{target_fallback}'. "
+                        "The override will still be cleared; run /config to fix the default."
+                    )
+            except (RuntimeError, ValueError, OSError, ConnectionError) as exc:
+                ASCIIColors.error(f"  ❌ Model switch failed: {exc}")
+
+        config.active_profile = None
+        try:
+            config.save()
+        except OSError as conv_err:
+            if config.debug:
+                ASCIIColors.warning(f"[CLI] Could not persist cleared active_profile: {conv_err}")
+
+        ASCIIColors.panel(
+            f"Action:    [bold]Cleared lollms-code last-used model[/bold]\n"
+            f"Following: [bold cyan]{config.active_profile_alias}[/bold cyan] "
+            f"[dim](global wizard default)[/dim]",
+            title="[bold green]✅ Reset to Global Default[/bold green]",
+            border_style="green",
+        )
+        return True
+
+    target_alias: Optional[str] = None
+    if raw.isdigit():
+        pick_idx = int(raw)
+        if 1 <= pick_idx <= len(aliases):
+            target_alias = aliases[pick_idx - 1]
+    else:
+        lowered = raw.lower()
+        for candidate in aliases:
+            if candidate.lower() == lowered:
+                target_alias = candidate
+                break
+
+    if not target_alias:
+        ASCIIColors.red(f"  ❌ Invalid selection: '{raw}'")
+        return False
+
+    # Only skip when the pick is already the *persisted override* — selecting
+    # the global default to make it explicit must remain possible.
+    if target_alias == current_alias and override_alias == target_alias:
+        ASCIIColors.info(
+            f"  ℹ️ Profile '{target_alias}' is already the active last-used profile."
+        )
+        return False
+
+    target_prof = profiles.get(target_alias) if isinstance(profiles.get(target_alias), dict) else {}
+    target_model = (target_prof or {}).get("model_name") or "(server default)"
+    ASCIIColors.info(
+        f"  ⏳ Switching to profile '{target_alias}' (model: {target_model})..."
+    )
+
+    switch_fn = getattr(client, "switch_model", None)
+    if not callable(switch_fn):
+        ASCIIColors.error("  ❌ This LollmsClient instance does not support switch_model().")
+        return False
+
+    try:
+        ok = bool(switch_fn(target_alias))
+    except (RuntimeError, ValueError, OSError, ConnectionError) as exc:
+        ASCIIColors.error(f"  ❌ Model switch failed: {exc}")
+        return False
+
+    if not ok:
+        ASCIIColors.error(
+            f"  ❌ Failed to switch to '{target_alias}'. "
+            "Verify the binding server is reachable and the model exists."
+        )
+        return False
+
+    # Persist the LOLLMS-CODE-ONLY last-used override. The global wizard
+    # default in ~/.lollms/config.yaml is intentionally left untouched so
+    # other lollms apps keep using their shared default.
+    config.active_profile = target_alias
+    try:
+        config.save()
+    except OSError as conv_err:
+        if config.debug:
+            ASCIIColors.warning(f"[CLI] Could not persist active_profile: {conv_err}")
+
+    new_model_name = getattr(getattr(client, "llm", None), "model_name", None) or target_model
+    ASCIIColors.panel(
+        f"Profile:   [bold cyan]{target_alias}[/bold cyan]\n"
+        f"Model:     [bold yellow]{new_model_name}[/bold yellow]\n"
+        f"Binding:   [green]{config.active_binding_name}[/green]\n"
+        f"Persisted: [dim]~/.lollms/lollms_code/config.json "
+        f"(lollms-code only — the global wizard default is unchanged)[/dim]",
+        title="[bold green]✅ Active Model Switched[/bold green]",
+        border_style="green",
+    )
+    return True
+
+
 def run_interactive(personality: LollmsPersonality, client: LollmsClient, config: CodeAgentConfig) -> int:
     _index_workspace_with_progress(personality, client)
 
@@ -3195,7 +3818,7 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
     slash_commands = [
         "/exit", "/quit", "/help", "/plan", "/current", "/scratchpad", "/config",
         "/shell", "/forget", "/skills", "/tools", "/clear-history", "/clear-files",
-        "/clear-scratchpad", "/models", "/files", "/workspace", "/load", "/unload",
+        "/clear-scratchpad", "/models", "/switch_model", "/files", "/workspace", "/load", "/unload",
         "/lock", "/hide", "/unhide", "/subws", "/reference", "/zoo", "/handbag", "/persona",
         "/effort"
     ]
@@ -3210,19 +3833,44 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
         pass # Keep absolute if outside home directory
 
     active_alias = config.active_profile_alias
-    active_model = getattr(getattr(client, "llm", None), "model_name", None) or config.active_model_name
+    # Use the ACTUAL mounted model as ground truth, but always render the
+    # resolved profile's model next to it so any divergence is explicit
+    # rather than silently masked behind a stale header label.
+    mounted_model = getattr(getattr(client, "llm", None), "model_name", None) or ""
+    profile_model = config.active_model_name  # model_name of active_profile_alias
+    if mounted_model and profile_model and mounted_model != profile_model:
+        # Real divergence: warn AND surface both values so the user sees the
+        # mismatch immediately. Common cause: a cached llama_cpp_server process
+        # from a previous profile is still registered against the same port.
+        active_model = f"{mounted_model}  [bold red](⚠ mounted ≠ profile '{profile_model}')[/bold red]"
+    else:
+        active_model = mounted_model or profile_model
+
+    # Two-layer selection origin badge so the user always knows WHY this model
+    # is active: lollms-code last-used override vs global wizard default.
+    _origin_badge = ""
+    _global_default = config.global_default_profile_alias
+    _override = config.active_profile if config.active_profile in config.llm_model_profiles else None
+    if _override:
+        if _override == _global_default:
+            _origin_badge = " [dim](last used = global default)[/dim]"
+        else:
+            _origin_badge = f" [dim](last used; global default is '{_global_default}')[/dim]" if _global_default else " [dim](last used)[/dim]"
+    elif _global_default:
+        _origin_badge = " [dim](global default)[/dim]"
+
     steps_banner = "∞ (Infinite ⚠️)" if config.max_reasoning_steps <= 0 else str(config.max_reasoning_steps)
     effort_disp = 'Dynamic (auto)' if config.dynamic_effort else (config.reasoning_effort or 'default')
     header_lines = [
         f"[cyan]Workspace:[/cyan] {ws_path_display}",
         f"[cyan]Handbag:[/cyan]   {personality.name} [dim]({Path(config.handbag_path).name})[/dim]",
-        f"[cyan]Profile:[/cyan]    {active_alias}",
+        f"[cyan]Profile:[/cyan]    {active_alias}{_origin_badge}",
         f"[cyan]Model:[/cyan]      {active_model}",
         f"[cyan]Binding:[/cyan]    {config.active_binding_name}",
         f"[cyan]Max Steps:[/cyan]  {steps_banner}",
         f"[cyan]Temperature:[/cyan]{config.temperature}",
         f"[cyan]Effort:[/cyan]     {effort_disp}",
-        f"[dim]Commands: 'exit', 'help', 'effort', 'config', 'shell', 'forget', 'skills', 'handbag', 'clear-history', 'clear-files', 'clear-scratchpad', 'workspace', 'files', 'load', 'unload', 'lock', 'hide'[/dim]"
+        f"[dim]Commands: 'exit', 'help', 'effort', 'switch_model', 'config', 'shell', 'forget', 'skills', 'handbag', 'clear-history', 'clear-files', 'clear-scratchpad', 'workspace', 'files', 'load', 'unload', 'lock', 'hide'[/dim]"
     ]
 
     ctx_status = get_context_fill_status(personality, client)
@@ -3683,8 +4331,8 @@ def run_interactive(personality: LollmsPersonality, client: LollmsClient, config
                     ASCIIColors.yellow(f"  Unknown effort level: '{arg}'. Choose from: none, low, medium, high, max, dynamic, default.")
             continue
 
-        if user_input.lower() == "/models":
-            ASCIIColors.yellow("  Model switching is managed via LollmsClient profiles in this version.")
+        if user_input.lower() in ("/switch_model", "/switch-model", "/model", "/models"):
+            _switch_active_model_profile(config, client)
             continue
 
         if user_input.lower() == "/config":
@@ -4429,6 +5077,7 @@ Examples:
     parser.add_argument("--llm-profile", type=str, default=None, help="LLM model profile alias to activate for this session (selects a specific model from the available profiles).")
     parser.add_argument("--export-config", type=str, default=None, metavar="PATH", help="Save the current configuration (Two-Tier profiles) to a YAML file and exit.")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
+    parser.add_argument("--full-prompt", action="store_true", help="Use the FULL verbose system prompt (inline workspace tree + all tool descriptions). Default is COMPACT mode optimized for small models.")
     parser.add_argument("--version", action="version", version=f"lollms_code v{APP_VERSION}")
     subparsers = parser.add_subparsers(dest="command", help="Additional commands")
     subparsers.add_parser("gui", help="Launch the lollms_code GUI (NiceGUI native window).")
@@ -4514,6 +5163,10 @@ def main():
         config = CodeAgentConfig.load(args)
         try:
             client = create_client(config)
+            # Same profile ↔ mounted-model alignment as the interactive path:
+            # `run` is often spawned from `instances spawn` or from a script
+            # that expects a specific model from the last interactive session.
+            _ensure_active_profile_mounted(config, client)
             personality = create_coding_personality(config, client)
             return run_noninteractive(personality, client, args.task, config)
         except (ImportError, RuntimeError, ValueError) as e:
@@ -4526,11 +5179,22 @@ def main():
 
     config = CodeAgentConfig.load(args)
 
-    # First-time configuration gate
+    # First-time configuration gate.
+    #
+    # Delegates to ``lollms_config_simple.ensure_configured()``, which offers
+    # the guided simple wizard first (downloads llama.cpp + a curated GGUF,
+    # optionally sd.cpp) AND lets a power user pick the expert wizard from the
+    # same prompt. This is the biggest UX win for non-experts: they land on a
+    # working local setup in one pass without ever seeing a binding list.
     if not config.is_configured(require_llm=True):
-        ASCIIColors.yellow("⚠️ No LLM model profile configured yet. Opening setup wizard...")
-        from lollms_client.lollms_config_cli_env import run_wizard_and_save
-        run_wizard_and_save(cli_env_path=args.config_path)
+        ASCIIColors.yellow("⚠️ No LLM configured yet. Opening the setup wizard...")
+        try:
+            from lollms_client.lollms_config_simple import ensure_configured
+            ensure_configured()
+        except ImportError:
+            # Older installations may not ship the simple module — fall back.
+            from lollms_client.lollms_config_cli_env import run_wizard_and_save
+            run_wizard_and_save(cli_env_path=args.config_path)
         config = CodeAgentConfig.load(args)
 
     if args.config:
@@ -4581,6 +5245,14 @@ def main():
         trace_exception(e)
         ASCIIColors.red(f"Failed to create LollmsClient: {e}")
         return 1
+
+    # Align the runtime with the *resolved active* profile BEFORE the welcome
+    # HUD is rendered. `create_client()` mounts the global-default profile in
+    # the two-tier registry; a lollms-code last-used override (`config.active_profile`)
+    # must win for this session, otherwise the header shows the mismatch the
+    # user reported (`Model: X (⚠ mounted ≠ profile 'Y')`). This is a no-op
+    # when the resolver already landed on the expected model.
+    _ensure_active_profile_mounted(config, client)
 
     personality = create_coding_personality(config, client)
     if getattr(config, "attach_files", None) or getattr(config, "attach_texts", None):

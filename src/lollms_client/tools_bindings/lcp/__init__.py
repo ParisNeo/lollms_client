@@ -1071,25 +1071,61 @@ sub-attributes must be feature-checked for None.
         return sorted(self._discussion_gates.get(f"discussion:{discussion_id}", set()))
 
     @staticmethod
-    def _confirm_answer_is_always(answer: Any) -> bool:
-        """Interprets a host confirm-handler answer to detect an `always` decision.
+    def _confirm_answer_is_approval(answer: Any) -> bool:
+        """Single source of truth for interpreting a host confirm-handler answer.
 
-        The host UI contract is intentionally permissive to accept every
-        shape already in use (bool, str, tuple, dict). Anything unrecognized
-        is treated as a *once-only* approval — never as "always".
+        Contract (permissive on shape, strict on meaning):
+          - True                                → APPROVE (once)
+          - False / None                        → DENY
+          - str:  "allow" | "yes" | "approve" | "always" | "all" | "permanent"
+                                                  → APPROVE (persistent if always/all/permanent)
+          - tuple/list: head ∈ {allow, always, allow_always, yes, true} with
+                        tail not explicitly False → APPROVE
+          - dict: {"approved": True} | {"allow": True} | {"always": True}
+                                                  → APPROVE (persistent if always)
+        Anything else → DENY. Never "silently approves" on ambiguous input.
         """
         if answer is True:
-            return False  # plain True means this-time-only
+            return True
+        if answer is None or answer is False:
+            return False
+
         if isinstance(answer, str):
-            return answer.strip().lower() in ("always", "all", "permanent", "forever")
+            token = answer.strip().lower()
+            return token in (
+                "allow", "yes", "y", "approve", "approved",
+                "always", "all", "permanent", "forever", "allow_always",
+            )
+
         if isinstance(answer, (tuple, list)) and answer:
             head = str(answer[0]).strip().lower()
             tail = answer[1] if len(answer) > 1 else None
-            if head in ("always", "allow_always") and tail is not False:
+            if head in ("allow", "always", "allow_always", "yes", "true"):
+                return tail is not False
+            return False
+
+        if isinstance(answer, dict):
+            if answer.get("always") is True or answer.get("permanent") is True:
+                return True
+            if answer.get("approved") is True or answer.get("allow") is True:
                 return True
             return False
+
+        return False
+
+    @classmethod
+    def _confirm_answer_is_always(cls, answer: Any) -> bool:
+        """Detects a *persistent* approval signal (subset of approvals)."""
+        if answer is True:
+            return False  # plain True is once-only
+        if isinstance(answer, str):
+            return answer.strip().lower() in ("always", "all", "permanent", "forever", "allow_always")
+        if isinstance(answer, (tuple, list)) and answer:
+            head = str(answer[0]).strip().lower()
+            tail = answer[1] if len(answer) > 1 else None
+            return head in ("always", "allow_always") and tail is not False
         if isinstance(answer, dict):
-            return bool(answer.get("always") or answer.get("permanent"))
+            return bool(answer.get("always") is True or answer.get("permanent") is True)
         return False
 
     def _gated_confirm(
@@ -1140,7 +1176,16 @@ sub-attributes must be feature-checked for None.
             ASCIIColors.error(f"[LCP Gate] Confirm handler failed: {exc}")
             return False
 
-        approved = bool(answer) and answer is not False or self._confirm_answer_is_always(answer)
+        # HOST-CONTRACT NORMALIZATION
+        # The confirm_handler return shape is permissive: bool | str | tuple | dict.
+        # Only these exact shapes mean APPROVE:
+        #   - True                          → this-time-only yes
+        #   - "allow" / "yes" / "approve"   → this-time-only yes
+        #   - "always" / tuple[0]=="always" → persistent yes (records the gate)
+        #   - {"approved": True, ...}       → explicit dict YES
+        # Everything else (None, False, "reject", ("reject", "..."), ("cancel", ...),
+        # malformed payloads) means DENY.
+        approved = self._confirm_answer_is_approval(answer)
         if not approved:
             return False
 

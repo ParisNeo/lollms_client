@@ -246,6 +246,110 @@ def _render_tools_module(
 # Public tools
 # ──────────────────────────────────────────────────────────────────────────────
 
+def write_toolset(
+    name: str,
+    description: str,
+    implementation: str,
+    workspace_root: Path,
+    title: Optional[str] = None,
+    author: str = "Lollms Agent",
+    version: str = "0.1.0",
+    overwrite: bool = False,
+) -> Dict[str, Any]:
+    """Shared write path for authoring an LCP toolset on disk.
+
+    Factored out of ``tool_tool_maker`` so the ``<toolset>`` chat tag and the
+    tool callable share byte-identical sanitization, validation, and disk
+    writes (DRY). Returns a structured result dict; never raises for
+    validation/IO errors (they are reported via ``success=False`` + ``error``).
+    """
+    if not isinstance(implementation, str) or not implementation.strip():
+        return {
+            "success": False,
+            "error": "The 'implementation' parameter is required and must be non-empty Python source.",
+        }
+
+    try:
+        toolset_name = _sanitize_toolset_name(name)
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
+
+    try:
+        toolset_dir = _resolve_toolset_dir(toolset_name, workspace_root)
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
+
+    resolved_title = (title or toolset_name.replace("_", " ").title()).strip()
+    safe_description = (description or f"Generated toolset '{toolset_name}'.").strip()
+
+    tools_source = _render_tools_module(
+        toolset_name=toolset_name,
+        title=resolved_title,
+        description=safe_description,
+        implementation=implementation,
+    )
+    try:
+        _validate_python_source(tools_source, label=f"{toolset_name}/TOOLS.py")
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
+
+    tool_names = _extract_tool_functions(tools_source)
+    if not tool_names:
+        return {
+            "success": False,
+            "error": (
+                "The 'implementation' contains no top-level 'tool_*' function. "
+                "Define at least one function named 'tool_<verb>(...)' at module "
+                "scope so the LCP loader can discover it."
+            ),
+        }
+
+    if toolset_dir.exists() and any(toolset_dir.iterdir()) and not overwrite:
+        return {
+            "success": False,
+            "error": (
+                f"Toolset folder '{toolset_name}' already exists and is not empty. "
+                "Pass overwrite=True to replace it, or choose a different name."
+            ),
+        }
+
+    description_yaml = _render_description_yaml(
+        toolset_name=toolset_name,
+        title=resolved_title,
+        description=safe_description,
+        author=author,
+        version=version,
+    )
+
+    try:
+        toolset_dir.mkdir(parents=True, exist_ok=True)
+        (toolset_dir / "TOOLS.py").write_text(tools_source, encoding="utf-8")
+        (toolset_dir / "description.yaml").write_text(description_yaml, encoding="utf-8")
+    except OSError as exc:
+        return {
+            "success": False,
+            "error": f"Failed to write toolset '{toolset_name}' to disk: {exc}",
+        }
+
+    ASCIIColors.success(
+        f"[tool_maker] Generated toolset '{toolset_name}' with {len(tool_names)} tool(s): "
+        f"{', '.join(tool_names)}"
+    )
+
+    try:
+        relative_path = str(toolset_dir.relative_to(workspace_root))
+    except ValueError:
+        relative_path = str(toolset_dir)
+
+    return {
+        "success": True,
+        "toolset_name": toolset_name,
+        "toolset_dir": toolset_dir,
+        "toolset_path": relative_path,
+        "tool_names": tool_names,
+    }
+
+
 def tool_tool_maker(
     name: str = "",
     description: str = "",
@@ -290,96 +394,25 @@ def tool_tool_maker(
     # Accept legacy spelling. Explicit `overwrite` wins over the legacy flag.
     if overwrite is None:
         overwrite = bool(overcode_if_exists)
-    if not isinstance(implementation, str) or not implementation.strip():
-        return {
-            "success": False,
-            "error": "The 'implementation' parameter is required and must be non-empty Python source.",
-        }
 
-    try:
-        toolset_name = _sanitize_toolset_name(name)
-    except ValueError as exc:
-        return {"success": False, "error": str(exc)}
-
-    workspace_root = _get_workspace_root(env)
-    try:
-        toolset_dir = _resolve_toolset_dir(toolset_name, workspace_root)
-    except ValueError as exc:
-        return {"success": False, "error": str(exc)}
-
-    resolved_title = (title or toolset_name.replace("_", " ").title()).strip()
-    safe_description = (description or f"Generated toolset '{toolset_name}'.").strip()
-
-    tools_source = _render_tools_module(
-        toolset_name=toolset_name,
-        title=resolved_title,
-        description=safe_description,
+    result = write_toolset(
+        name=name,
+        description=description,
         implementation=implementation,
-    )
-    try:
-        _validate_python_source(tools_source, label=f"{toolset_name}/TOOLS.py")
-    except ValueError as exc:
-        return {"success": False, "error": str(exc)}
-
-    tool_names = _extract_tool_functions(tools_source)
-    if not tool_names:
-        return {
-            "success": False,
-            "error": (
-                "The 'implementation' contains no top-level 'tool_*' function. "
-                "Define at least one function named 'tool_<verb>(...)' at module "
-                "scope so the LCP loader can discover it."
-            ),
-        }
-
-    # Refuse silent overwrite of an existing, non-empty folder.
-    if toolset_dir.exists() and any(toolset_dir.iterdir()) and not overwrite:
-        return {
-            "success": False,
-            "error": (
-                f"Toolset folder '{toolset_name}' already exists and is not empty. "
-                "Pass overwrite=True to replace it, or choose a different name."
-            ),
-        }
-
-    description_yaml = _render_description_yaml(
-        toolset_name=toolset_name,
-        title=resolved_title,
-        description=safe_description,
+        workspace_root=_get_workspace_root(env),
+        title=title,
         author=author,
         version=version,
+        overwrite=bool(overwrite),
     )
 
-    try:
-        toolset_dir.mkdir(parents=True, exist_ok=True)
-        (toolset_dir / "TOOLS.py").write_text(tools_source, encoding="utf-8")
-        (toolset_dir / "description.yaml").write_text(description_yaml, encoding="utf-8")
-    except OSError as exc:
-        return {
-            "success": False,
-            "error": f"Failed to write toolset '{toolset_name}' to disk: {exc}",
-        }
-
-    ASCIIColors.success(
-        f"[tool_maker] Generated toolset '{toolset_name}' with {len(tool_names)} tool(s): "
-        f"{', '.join(tool_names)}"
-    )
-
-    try:
-        relative_path = str(toolset_dir.relative_to(workspace_root))
-    except ValueError:
-        relative_path = str(toolset_dir)
-
-    return {
-        "success": True,
-        "toolset_name": toolset_name,
-        "toolset_path": relative_path,
-        "tool_names": tool_names,
-        "message": (
-            f"Created toolset '{toolset_name}' at '{relative_path}'. "
-            f"Call tool_load_generated_toolset(name='{toolset_name}') to hot-load it."
-        ),
-    }
+    if result.get("success"):
+        result.pop("toolset_dir", None)
+        result["message"] = (
+            f"Created toolset '{result['toolset_name']}' at '{result['toolset_path']}'. "
+            f"Call tool_load_generated_toolset(name='{result['toolset_name']}') to hot-load it."
+        )
+    return result
 
 
 def tool_load_generated_toolset(

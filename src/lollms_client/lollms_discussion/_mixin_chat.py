@@ -141,7 +141,7 @@ _TAG_STARTS = [
     "</arg_key>", "<think ",
     "<artifact", "<artefact",
     "<generate_image", "<edit_image", "<generate_video",
-    "<note", "<skill", "<scratchpad",
+    "<note", "<skill", "<toolset", "<scratchpad",
     "<lollms_inline",
     "<lollms_form",
     "<effort",
@@ -169,6 +169,7 @@ _SECONDARY_TAG_MAP = {
     "<artefact":      ("artifact_update",     MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK, MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,    "</artefact>"),
     "<note":          ("note_start",          MSG_TYPE.MSG_TYPE_NOTE_CHUNK,     MSG_TYPE.MSG_TYPE_NOTE_DONE,         "</note>"),
     "<skill":         ("skill_start",         MSG_TYPE.MSG_TYPE_SKILL_CHUNK,    MSG_TYPE.MSG_TYPE_SKILL_DONE,        "</skill>"),
+    "<toolset":       ("toolset_start",       MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</toolset>"),
     "<lollms_inline": ("inline_widget_start", MSG_TYPE.MSG_TYPE_WIDGET_CHUNK,   MSG_TYPE.MSG_TYPE_WIDGET_DONE,       "</lollms_inline>"),
     "<lollms_form":   ("form_start",          MSG_TYPE.MSG_TYPE_FORM_READY,     MSG_TYPE.MSG_TYPE_FORM_READY,        "</lollms_form>"),
     "<mem_new":       ("memory_new",          MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</mem_new>"),
@@ -511,6 +512,19 @@ def _canonicalize_tool_params(params: Any) -> str:
             return {k: _clean(v) for k, v in value.items() if k not in _INERT_TOOL_PARAM_KEYS}
         if isinstance(value, list):
             return [_clean(item) for item in value]
+        if isinstance(value, str):
+            # ── 🛡️ WHITESPACE CANONICALIZATION (LOOP-GUARD HARDENING) ──
+            # Models frequently re-emit the "same" call with cosmetic drift:
+            # trailing newlines, indentation changes, doubled spaces inside
+            # code/netlist/prose payloads. Treating those as *different* keys
+            # resets the identical-call counter on every round and lets a
+            # byte-equivalent retry bypass the loop guard indefinitely. We
+            # collapse runs of whitespace to a single space so the canonical
+            # key of two cosmetically-drifted payloads is IDENTICAL. This does
+            # NOT affect semantic differences (character content is preserved)
+            # and never strips whitespace inside JSON structure (json.dumps
+            # re-serializes the cleaned tree regardless).
+            return re.sub(r"\s+", " ", value).strip()
         return value
 
     try:
@@ -1676,7 +1690,7 @@ class _StreamState:
         if not is_inside_thoughts and not self._is_accumulating_tool and not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_secondary and not self._in_code_fence:
             inline_tag_found = False
             line_start_tag_found = False
-            for tag_prefix in ("<artifact", "<artefact", "<tool", "<note", "<skill", "<scratchpad", "<lollms_form", "<generate_image", "<edit_image", "<generate_video", "<unlock_file", "<lock_file", "<hide_file"):
+            for tag_prefix in ("<artifact", "<artefact", "<tool", "<note", "<skill", "<toolset", "<scratchpad", "<lollms_form", "<generate_image", "<edit_image", "<generate_video", "<unlock_file", "<lock_file", "<hide_file"):
                 idx = self._pending_buffer.find(tag_prefix)
                 if idx == -1:
                     continue
@@ -2281,7 +2295,7 @@ class _StreamState:
         if not is_inside_thoughts and not self._is_accumulating_secondary:
             lower_buffer = self._pending_buffer.lower()
             secondary_entered = False
-            for tag_prefix in ("<agent", "<delegate", "<skill", "<note", "<scratchpad", "<lollms_form", "<generate_image", "<edit_image", "<generate_video"):
+            for tag_prefix in ("<agent", "<delegate", "<skill", "<toolset", "<note", "<scratchpad", "<lollms_form", "<generate_image", "<edit_image", "<generate_video"):
                 pattern = r'(?m)^\s*(?!`)(?!.*\|)' + re.escape(tag_prefix)
                 open_match = re.search(pattern, lower_buffer)
                 if open_match:
@@ -2454,10 +2468,10 @@ class _StreamState:
             # the complete `>` arrives, producing exactly the trailing artefact-tag
             # leak this parser gate exists to prevent.
             tags_to_check = [
-                "<artifact", "<artefact", "<tool", "<think", "<note", "<skill", "<scratchpad", 
+                "<artifact", "<artefact", "<tool", "<think", "<note", "<skill", "<toolset", "<scratchpad", 
                 "<generate_image", "<edit_image", "<generate_video", "<lollms_form", "<unlock_file", "<lock_file", "<hide_file",
                 "<mem_new", "<mem_update", "<mem_tag", "<mem_load", "<mem_delete", "<mem_search",
-                "</artifact", "</artefact", "</tool", "</note", "</skill", "</scratchpad",
+                "</artifact", "</artefact", "</tool", "</note", "</skill", "</toolset", "</scratchpad",
                 "</lollms_form", "</lollms_inline", "</generate_image", "</edit_image", "</generate_video",
                 "</unlock_file", "</lock_file", "</hide_file",
                 "</mem_new", "</mem_update", "</mem_tag", "</mem_load", "</mem_delete", "</mem_search", "</mem_rel",
@@ -2562,8 +2576,33 @@ class _StreamState:
     
     
     def _note_informational_step(self) -> None:
-        """Records an informational step that legitimizes a subsequent scratchpad write."""
+        """Records an informational step that legitimizes a subsequent scratchpad write.
+
+        DESIGN NOTE — the streak is a *budget*, not a verdict.
+        A streak reset to 0 means "one scratchpad write is now permitted".
+        After that write, the streak returns to 1 and the NEXT scratchpad
+        write (with no further informational step) is gated. This is the
+        intended two-writes-need-a-step doctrine: it prevents a model from
+        burning the whole round budget rewriting the same planning file.
+
+        The historical pathology — "agent permanently stuck on scratchpad
+        after the first write" — was NOT caused by the streak itself. It was
+        caused by the *artifact-tag* entry point (`<artifact type="scratchpad">`)
+        bypassing the streak gate that the dedicated `<scratchpad>` tag
+        enforced, so the two dispatchers disagreed on what was lawful and the
+        model oscillated between them, each attempt being rejected by one
+        path or the other. See the unified gate in `_dispatch_closed_tag`
+        (`_scratchpad_guard`), which now runs for BOTH tag shapes.
+        """
         object.__setattr__(self.discussion, "_scratchpad_write_streak", 0)
+        # Clearing the last-write fingerprint alongside the streak is what
+        # makes an informational step a full reset: the byte-identical
+        # duplicate check (`_is_identical_scratchpad_retry`) must NOT fire
+        # against a write that was subsequently legitimised by a tool call /
+        # context change, otherwise a legitimate "re-apply the same plan after
+        # inspecting a file" round is falsely rejected as a hallucinated
+        # duplicate. State is reset as one unit: streak AND fingerprint.
+        object.__setattr__(self.discussion, "_last_scratchpad_write", None)
 
     def _ensure_processing_block_open(
         self,
@@ -2893,25 +2932,27 @@ class _StreamState:
             if _office_ext in (".pptx", ".pptm", ".docx", ".docm", ".xlsx", ".xlsm") and not is_patch:
                 return self._dispatch_office_artifact(title, atype, body)
 
-            if is_scratchpad_target and self._is_identical_scratchpad_retry(title, body):
-                self._last_dispatch_failed = True
-                self._last_failure_kind = "scratchpad_duplicate"
-                ASCIIColors.warning(
-                    f"[StreamState] Identical consecutive scratchpad write blocked: '{title}' "
-                    f"(content unchanged from the previous dispatch)."
-                )
-                if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
-                    proc_close = (
-                        f"\n* ⚠️ Scratchpad write blocked: '{title}' was already written with EXACTLY this content "
-                        f"on the previous round. Re-emitting identical content is a loop error. Change the content "
-                        f"(fix the SEARCH block, add new findings, or alter the update), or move on to another action.\n"
-                        f"<!-- status:failure -->\n</processing>\n"
-                    )
-                    self.ai_message.content += proc_close
-                    _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                return True
-
             if is_scratchpad_target:
+                # ── UNIFIED ADMISSION GATE (SAME AS <scratchpad> TAG) ──
+                # <artifact type="scratchpad"> and <scratchpad> are two spellings
+                # of the same operation. Both MUST consult _scratchpad_guard so a
+                # model cannot dodge the streak by switching tag shapes.
+                _block_reason = self._scratchpad_guard(title, body)
+                if _block_reason is not None:
+                    self._last_dispatch_failed = True
+                    self._last_failure_kind = "scratchpad_duplicate"
+                    ASCIIColors.warning(
+                        f"[StreamState] Scratchpad artifact write blocked: {_block_reason}"
+                    )
+                    if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                        proc_close = (
+                            f"\n* ⚠️ Scratchpad write blocked: {_block_reason}\n"
+                            f"<!-- status:failure -->\n</processing>\n"
+                        )
+                        self.ai_message.content += proc_close
+                        _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        self._processing_block_open = False
+                    return True
                 self._register_scratchpad_write(title, body)
 
             if is_new is False and is_patch is False:
@@ -2930,6 +2971,15 @@ class _StreamState:
                     ).hexdigest()
                     if new_body_hash == existing_hash:
                         self._last_dispatch_failed = True
+                        # Tag the failure kind as scratchpad_duplicate when the
+                        # target is the scratchpad, so the chat loop's runaway
+                        # breaker can count and eventually end the turn. Without
+                        # this, a redundant scratchpad rewrite via
+                        # <artifact type="scratchpad"> produced an UNKNOWN
+                        # failure kind, the breaker never counted it, and the
+                        # agent could spin indefinitely on this shape.
+                        if is_scratchpad_target:
+                            self._last_failure_kind = "scratchpad_duplicate"
                         ASCIIColors.warning(
                             f"[StreamState] Redundant full-rewrite of '{title}' rejected "
                             f"(content identical to active version)."
@@ -3307,26 +3357,16 @@ class _StreamState:
             is_patch = "<<<<<<< SEARCH" in body
             existing_scratchpad = self.discussion.artefacts.get(title)
 
-            if self._is_identical_scratchpad_retry(title, body):
-                self._last_dispatch_failed = True
-                self._last_failure_kind = "scratchpad_duplicate"
-                ASCIIColors.warning(
-                    f"[StreamState] Identical consecutive scratchpad write blocked: '{title}' "
-                    f"(content unchanged from the previous dispatch)."
-                )
-                if self._processing_block_open:
-                    proc_close = (
-                        f"* ⚠️ Scratchpad write blocked: '{title}' was already written with EXACTLY this content "
-                        f"on the previous round. Re-emitting identical content is a loop error. Change the content "
-                        f"(fix the SEARCH block, add new findings, or alter the update), or move on to another action.\n"
-                        f"<!-- status:failure -->\n</processing>\n"
-                    )
-                    self.ai_message.content += proc_close
-                    _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                    self._processing_block_open = False
-                return True
-
-            if not is_patch and existing_scratchpad is not None:
+            # ── UNIFIED ADMISSION GATE ──
+            # Both the dedicated <scratchpad> tag and <artifact type="scratchpad">
+            # funnel through _scratchpad_guard(), so their verdicts are identical
+            # and a model cannot bypass the streak by switching tag shapes.
+            _block_reason = self._scratchpad_guard(title, body)
+            # Redundant-rewrite check (NOT byte-identical to the last dispatch,
+            # but byte-identical to the CURRENT stored content) is folded in
+            # here too: re-writing the stored content changes nothing and is a
+            # loop error regardless of the streak.
+            if _block_reason is None and not is_patch and existing_scratchpad is not None:
                 existing_raw = existing_scratchpad.get("content") if isinstance(existing_scratchpad, dict) else None
                 if isinstance(existing_raw, (bytes, bytearray)):
                     existing_content = existing_raw.decode("utf-8", errors="ignore")
@@ -3337,35 +3377,17 @@ class _StreamState:
                 new_body_hash = hashlib.sha256(body.strip().encode("utf-8", errors="ignore")).hexdigest()
                 existing_hash = hashlib.sha256(existing_content.strip().encode("utf-8", errors="ignore")).hexdigest()
                 if new_body_hash == existing_hash:
-                    self._last_dispatch_failed = True
-                    self._last_failure_kind = "scratchpad_duplicate"
-                    ASCIIColors.warning(
-                        f"[StreamState] Redundant scratchpad rewrite rejected: '{title}' already "
-                        f"contains exactly this content."
-                    )
-                    if self._processing_block_open:
-                        proc_close = (
-                            f"* ⚠️ Redundant rewrite rejected: scratchpad '{title}' already contains "
-                            f"exactly this content.\n"
-                            f"<!-- status:failure -->\n</processing>\n"
-                        )
-                        self.ai_message.content += proc_close
-                        _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                        self._processing_block_open = False
-                    return True
+                    _block_reason = f"scratchpad '{title}' already contains exactly this content."
 
-            if self._scratchpad_write_streak() >= 1:
+            if _block_reason is not None:
                 self._last_dispatch_failed = True
-                self._last_failure_kind = "scratchpad_streak"
+                self._last_failure_kind = "scratchpad_duplicate"
                 ASCIIColors.warning(
-                    "[StreamState] Consecutive scratchpad write blocked "
-                    "(no intervening informational step)."
+                    f"[StreamState] Scratchpad write blocked: {_block_reason}"
                 )
                 if self._processing_block_open:
                     proc_close = (
-                        f"* ⚠️ Scratchpad write blocked: the scratchpad was already written on the previous round "
-                        f"without any intervening informational step. Perform a tool call, document read, or memory "
-                        f"search first, then patch the scratchpad.\n"
+                        f"* ⚠️ Scratchpad write blocked: {_block_reason}\n"
                         f"<!-- status:failure -->\n</processing>\n"
                     )
                     self.ai_message.content += proc_close
@@ -4739,6 +4761,48 @@ class _StreamState:
             return False
         body_hash = hashlib.sha256(body.strip().encode("utf-8", errors="ignore")).hexdigest()
         return last_write == (title, body_hash)
+
+    def _scratchpad_guard(self, title: str, body: str) -> Optional[str]:
+        """Unified scratchpad admission gate shared by BOTH dispatch shapes.
+
+        Returns ``None`` when the write is admitted (the caller then calls
+        ``_register_scratchpad_write`` exactly once), or a human-readable
+        failure reason string when it must be blocked.
+
+        Rationale: the dedicated ``<scratchpad>`` tag and the
+        ``<artifact type="scratchpad">`` tag address the SAME planning
+        resource. Before this helper, only the first ran the streak check,
+        so a model that flip-flopped between the two shapes could write
+        without an intervening informational step by picking the ungated
+        path. That asymmetry is what produced the observed
+        "scratchpad write accepted, then every further attempt — including
+        legitimate ones — blocked, agent stuck" pathology. Both entry points
+        now consult this single function so their verdicts are identical.
+
+        The gate enforces two independent rules, in order:
+          1. IDENTICAL-RETRY: reject a byte-identical re-emission of the
+             immediately preceding write (a hallucinated duplicate).
+          2. STREAK: reject a second write with no intervening informational
+             step (tool call, context change, memory search).
+
+        A pure patch (``<<<<<<< SEARCH``) is NOT exempt from the streak: a
+        patch is still a write, and re-emitting patches round after round
+        without reading anything is exactly the loop this protects against.
+        """
+        if self._is_identical_scratchpad_retry(title, body):
+            return (
+                f"'{title}' was already written with EXACTLY this content on the "
+                f"previous round. Re-emitting identical content is a loop error. "
+                f"Change the content (fix the SEARCH block, add new findings, or "
+                f"alter the update), or move on to another action."
+            )
+        if self._scratchpad_write_streak() >= 1:
+            return (
+                "the scratchpad was already written on the previous round without "
+                "any intervening informational step. Perform a tool call, document "
+                "read, or memory search first, then patch the scratchpad."
+            )
+        return None
 
     def _register_scratchpad_write(self, title: str, body: str) -> None:
         """Records the last scratchpad dispatch and bumps the consecutive-write streak."""
@@ -7407,6 +7471,7 @@ class ChatMixin:
         dynamic_effort:               bool = False,
         enforce_end_tag:              bool = False,
         builtin_tools_activation_list: Optional[List[str]] = None,
+        compact_workspace_tree:       bool = False,
 
         **kwargs
     ) -> Dict[str, Any]:
@@ -7593,6 +7658,16 @@ class ChatMixin:
         object.__setattr__(self, "allow_dynamic_tools", allow_dynamic_tools)
         object.__setattr__(self, "remove_thinking_blocks", remove_thinking_blocks)
         object.__setattr__(self, "_orchestrator_mode", orchestrator_mode)
+
+        # ── 🌳 WORKSPACE TREE COMPACTION (ON-DEMAND TREE VIA TOOL) ──
+        # When True, the full recursive workspace tree is NOT inlined into the
+        # system prompt. Instead, the model receives a one-line stub and can
+        # summon the tree on demand via `tool_show_workspace_tree(...)`. This is
+        # the mitigation for huge/git-polluted workspaces (hundreds of files,
+        # .versions bloat), where inlining the tree trashes the context budget
+        # and confuses the LLM. Small sessions (few files) SHOULD keep the flag
+        # False (the default) so the tree stays inline — it is genuinely useful.
+        object.__setattr__(self, "compact_workspace_tree", bool(compact_workspace_tree))
 
         # 🛡️ SECURITY: Store the arbitrary code execution flag.
         object.__setattr__(self, "enable_code_execution", enable_code_execution)
@@ -7957,8 +8032,57 @@ class ChatMixin:
         # ── 5. Active Artifacts & Memories Injection (CONDITIONAL) ──
         # Only inject artifact context if artifacts are enabled
         if enable_artefacts:
+            # ── 🌳 COMPACT WORKSPACE TREE GATE ──
+            # When `compact_workspace_tree` is active, the artifact manager is
+            # asked to suppress the inline tree (it may also do so itself if it
+            # reads the attribute from the discussion). We complement the
+            # suppression with a hard post-strip on the produced zone, so the
+            # flag is honoured even on artifact managers that predate the
+            # feature. The tree stays reachable via tool_show_workspace_tree().
+            _compact_tree = bool(getattr(self, "compact_workspace_tree", False))
+            try:
+                object.__setattr__(self.artefacts, "compact_workspace_tree", _compact_tree)
+            except Exception:
+                pass
             artefacts_zone = self.artefacts.build_artefacts_context_zone()
-            if artefacts_zone:
+            if _compact_tree and artefacts_zone:
+                # Defense-in-depth: strip any residual inlined workspace tree
+                # marker blocks produced by managers that ignored the flag.
+                artefacts_zone = re.sub(
+                    r'=== WORKSPACE TREE ===.*?=== END WORKSPACE TREE ===',
+                    '',
+                    artefacts_zone,
+                    flags=re.DOTALL,
+                )
+                # Strip a common alternate marker form (short tree header used
+                # inside artifact zones by some managers).
+                artefacts_zone = re.sub(
+                    r'=== (?:WORKSPACE|DIRECTORY) TREE[\s\S]*?=== END (?:WORKSPACE|DIRECTORY) TREE ===',
+                    '',
+                    artefacts_zone,
+                    flags=re.DOTALL,
+                ).strip()
+
+                _ws_root = Path(self.workspace_data_path) if getattr(self, "workspace_data_path", None) else None
+                _top_count = 0
+                if _ws_root is not None and _ws_root.exists():
+                    try:
+                        _top_count = sum(1 for _ in _ws_root.iterdir())
+                    except Exception:
+                        _top_count = 0
+                compact_stub = (
+                    "\n=== WORKSPACE (COMPACT TREE) ===\n"
+                    f"Root: ./ ({_top_count} top-level items). The recursive tree is NOT inlined in this session "
+                    "to preserve context budget (large project / git presence).\n"
+                    "Use the `tool_show_workspace_tree(folder='', depth=2, max_items=40)` tool to inspect any folder on demand. "
+                    "The tool accepts a relative folder path, a depth (1-6), and per-directory item cap (5-200).\n"
+                    "=== END WORKSPACE (COMPACT TREE) ===\n"
+                )
+                if artefacts_zone:
+                    full_system_prompt += "\n=== ACTIVE ARTIFACTS ===\n" + artefacts_zone + "\n" + compact_stub
+                else:
+                    full_system_prompt += compact_stub
+            elif artefacts_zone:
                 full_system_prompt += "\n=== ACTIVE ARTIFACTS ===\n" + artefacts_zone + "\n"
 
         # Only inject memory context if memory is enabled AND memory manager exists
@@ -8053,7 +8177,63 @@ class ChatMixin:
             except Exception as ex:
                 trace_exception(ex)
 
-        # 5. Mount VLM Query Tool (Conditional Fallback)
+        # ── 5b. Mount Workspace Tools When Compact Tree Is Active ──
+        # `compact_workspace_tree=True` implies the LLM must reach the tree on
+        # demand. That requires `tool_show_workspace_tree` to be callable, so
+        # the `workspace_tools` library MUST be mounted for this turn — even
+        # when `enable_workspace_tools` (the read/write/grep family) is off.
+        # We mount the full library because the LLM may also need to inspect
+        # files once it sees the tree.
+        if getattr(self, "compact_workspace_tree", False) and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
+            try:
+                lcp_binding.mount_tool_library_if_absent("workspace_tools")
+                lcp_tools = lcp_binding.to_chat_tool_specs(
+                    discussion_instance=self,
+                    lollms_client_instance=self.lollmsClient,
+                )
+                _workspace_admitted = 0
+                for t_name, t_spec in lcp_tools.items():
+                    if t_name in (
+                        "tool_show_workspace_tree",
+                        "tool_list_files",
+                        "tool_find_files",
+                        "tool_grep_files",
+                        "tool_read_file",
+                        "tool_read_lines",
+                        "tool_read_chars",
+                        "tool_grep_file",
+                    ) and t_name not in active_tools:
+                        active_tools[t_name] = t_spec
+                        _workspace_admitted += 1
+                if _workspace_admitted:
+                    ASCIIColors.info(
+                        f"[ChatMixin] compact_workspace_tree=True — mounted "
+                        f"'workspace_tools' and admitted {_workspace_admitted} on-demand "
+                        f"workspace inspection tool(s)."
+                    )
+                else:
+                    _all_ws_specs = lcp_binding.to_chat_tool_specs(
+                        discussion_instance=self,
+                        lollms_client_instance=self.lollmsClient,
+                    )
+                    if "tool_show_workspace_tree" not in _all_ws_specs:
+                        ASCIIColors.error(
+                            "[ChatMixin] compact_workspace_tree=True but 'tool_show_workspace_tree' "
+                            "is not available — check that the 'workspace_tools' LCP library is "
+                            "discoverable. The model will be told to call a tool that does not exist."
+                        )
+            except Exception as _ws_mount_ex:
+                trace_exception(_ws_mount_ex)
+                ASCIIColors.warning(
+                    f"[ChatMixin] Failed to mount workspace tools for compact tree mode: {_ws_mount_ex}"
+                )
+        elif getattr(self, "compact_workspace_tree", False):
+            ASCIIColors.warning(
+                "[ChatMixin] compact_workspace_tree=True but no LCP binding is available — "
+                "the model will be told to call tool_show_workspace_tree, which cannot be mounted."
+            )
+
+        # ── 6. Mount VLM Query Tool (Conditional Fallback) ──
         if enable_vlm_query and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
             def _active_llm_has_vision() -> bool:
                 active_llm = getattr(self.lollmsClient, "llm", None)
@@ -8467,6 +8647,30 @@ class ChatMixin:
                 "Optionally pass `file_name` to `tool_computer_screenshot` to KEEP a specific frame "
                 "(e.g. `photo.png`) instead of overwriting the default.\n"
                 "=== END COMPUTER USE PROTOCOL ===\n"
+            )
+
+        # ── 🌳 COMPACT WORKSPACE TREE DOCTRINE ──
+        # When the tree is compacted, the model MUST know (a) the tree is not
+        # inlined, (b) which tool opens it, and (c) it must call it BEFORE
+        # inventing file names. Without this block, models tend to hallucinate
+        # files that "should exist" instead of consulting the actual tree.
+        if getattr(self, "compact_workspace_tree", False) and not orchestrator_persona:
+            feature_rules += (
+                "\n=== WORKSPACE TREE IS COMPACTED (ON-DEMAND) ===\n"
+                "The full recursive workspace tree is NOT inlined in this session — it was omitted "
+                "to preserve the context budget (typical for large projects and repositories).\n"
+                "1. **DISCOVER FIRST**: Before referencing, reading, editing, or claiming the existence "
+                "of any workspace file, call the tool `tool_show_workspace_tree`:\n"
+                "   `<tool>{\"name\": \"tool_show_workspace_tree\", \"parameters\": {\"folder\": \"\", \"depth\": 2}}</tool>`\n"
+                "   - `folder`: relative path to explore (empty = workspace root).\n"
+                "   - `depth`: 1-6 levels of descent (start at 2, increase only when needed).\n"
+                "   - `max_items`: maximum files shown per directory (default 40).\n"
+                "2. **NEVER HALLUCINATE PATHS**: Do not invent filenames, folder names, or subfolder "
+                "structures. If you have not seen a path in the tree tool's output or in the "
+                "active artifacts zone, it does not (yet) exist.\n"
+                "3. **DRILL DOWN INCREMENTALLY**: Explore the root first, then pass a `folder` to "
+                "descend only into the directories relevant to the current task.\n"
+                "=== END WORKSPACE TREE COMPACTED ===\n"
             )
 
         # Inject feature rules into the full system prompt
@@ -8883,6 +9087,11 @@ class ChatMixin:
         object.__setattr__(self, '_pending_memory_searches', [])
         object.__setattr__(self, "_last_scratchpad_write", None)
         object.__setattr__(self, "_scratchpad_write_streak", 0)
+        # Per-turn runaway counter for the scratchpad-block path. Reset here
+        # (NOT in __init__) so every turn starts with a fresh budget: a
+        # previous turn's blocks must never prematurely trip the breaker on
+        # a clean new turn.
+        object.__setattr__(self, "_scratchpad_block_count", 0)
 
         def _bump_environment_epoch() -> None:
             nonlocal environment_epoch
@@ -10529,6 +10738,46 @@ class ChatMixin:
             if ss.was_action_dispatched() and not ss.tool_trigger and not ss.affected_artefacts and not ss.context_unlock_requested:
                 if ss.was_last_dispatch_failed():
                     noncompliance_streak += 1
+                    # ── 🛑 SCRATCHPAD RUNAWAY BREAK ──
+                    # When a scratchpad write is blocked, we inject a correction
+                    # and let the model retry. But if the model has NO informational
+                    # step available to reset the streak (its only tool is broken,
+                    # or no tools are mounted), it will re-emit the same scratchpad
+                    # write every round and the streak can never clear — a
+                    # deterministic reproduction of the same block. After a bounded
+                    # number of blocked scratchpad attempts, END THE TURN instead
+                    # of burning the round budget on a loop that cannot resolve.
+                    if getattr(ss, "_last_failure_kind", None) in ("scratchpad_duplicate", "scratchpad_streak"):
+                        object.__setattr__(
+                            self, "_scratchpad_block_count",
+                            int(getattr(self, "_scratchpad_block_count", 0)) + 1,
+                        )
+                        _SCRATCHPAD_RUNAWAY_LIMIT = 3
+                        if self._scratchpad_block_count >= _SCRATCHPAD_RUNAWAY_LIMIT:
+                            ASCIIColors.error(
+                                f"[ChatMixin] Scratchpad blocked {self._scratchpad_block_count} "
+                                f"times with no intervening informational step available. "
+                                f"Breaking loop to conserve the round budget."
+                            )
+                            _hard_break_block = (
+                                '\n<processing type="scratchpad" title="Scratchpad write permanently blocked">\n'
+                                f"* ❌ Scratchpad write blocked {self._scratchpad_block_count} times. "
+                                f"No intervening informational step (tool call, document read, memory "
+                                f"search) is available to reset the write budget, so the turn is being "
+                                f"ended to prevent an infinite loop. Change your approach or tell the "
+                                f"user the task cannot proceed this way.\n"
+                                f"<!-- status:failure -->\n</processing>\n\n"
+                            )
+                            if event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                                ai_msg.content += _hard_break_block
+                                _cb(callback, _hard_break_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                            _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="loop_break")
+                            _persist_round_state(status_override="loop_break")
+                            break
+                    else:
+                        # A new, non-scratchpad failure kind: the previous
+                        # scratchpad block count no longer predicts the future.
+                        object.__setattr__(self, "_scratchpad_block_count", 0)
                     correction_body = ""
                     if getattr(ss, "_last_failure_kind", None) == "agent_tag":
                         ASCIIColors.warning("[ChatMixin] <agent> tag malformed. Injecting agent-syntax correction.")
@@ -11245,11 +11494,56 @@ class ChatMixin:
                         and consecutive_identical_calls[canonical_call_key] >= 2
                     ):
                         noncompliance_streak += 1
+                        _repeat_attempt = consecutive_identical_calls[canonical_call_key]
                         ASCIIColors.warning(
                             f"[ChatMixin] Repetitive identical tool call blocked: '{tool_name}' "
-                            f"(attempt {consecutive_identical_calls[canonical_call_key]}, "
-                            f"no intervening action)."
+                            f"(attempt {_repeat_attempt}, no intervening action)."
                         )
+                        # ── 🛑 HARD BREAK ON RUNAWAY REPETITION ──
+                        # The first blocked repeat injects an escalation-ladder
+                        # correction and lets the model try a materially
+                        # different approach. But small models frequently ignore
+                        # the correction and re-emit the SAME call again. After
+                        # a bounded number of blocked repeats of one identical
+                        # signature, the loop must TERMINATE — otherwise the
+                        # turn burns its entire round budget on a deterministic
+                        # reproduction of the same failure (the observed
+                        # "stuck agent" pathology). We break AFTER surfacing the
+                        # failure block so the transcript records the final
+                        # blocked attempt, and set a synthetic turn-status so
+                        # the UI shows the turn ended on a loop break rather
+                        # than a silent max-rounds exit.
+                        _RUNAWAY_REPEAT_LIMIT = 3
+                        if _repeat_attempt >= _RUNAWAY_REPEAT_LIMIT:
+                            ASCIIColors.error(
+                                f"[ChatMixin] Runaway repetition: '{tool_name}' blocked "
+                                f"{_repeat_attempt} times with an identical signature and "
+                                f"no intervening action. Breaking loop to conserve the "
+                                f"round budget."
+                            )
+                            _hard_break_block = (
+                                f'\n<processing type="tool" title="Tool Execution: {tool_name}">\n'
+                                f"* ❌ Tool call permanently blocked: this exact call has "
+                                f"failed {_repeat_attempt - 1} times and been blocked "
+                                f"unchanged {_repeat_attempt - 1} times. The turn is being "
+                                f"ended to prevent an infinite loop. Address the error "
+                                f"above, change your approach, or tell the user the task "
+                                f"cannot be completed.\n"
+                                f"<!-- status:failure -->\n</processing>\n\n"
+                            )
+                            if event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                                ai_msg.content += _hard_break_block
+                                _cb(callback, _hard_break_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                            if event_mode in (EventMode.FULL_CALLBACK_MODE, EventMode.MIXED_MODE):
+                                _cb(callback, "", MSG_TYPE.MSG_TYPE_TOOL_END, {
+                                    "tool_name": tool_name,
+                                    "success": False,
+                                    "output": "",
+                                    "error": "Runaway repetition: identical failing call blocked repeatedly.",
+                                })
+                            _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_END, status="loop_break")
+                            _persist_round_state(status_override="loop_break")
+                            break
                         status_err_line = f"* Tool call blocked to prevent loop.\n"
                         details_block = (
                             f"Loop Intercepted:\n"
@@ -11358,11 +11652,11 @@ class ChatMixin:
                         ))
                         continue
 
-                    if context_aware_signature in successful_tool_signatures and not _is_observation_tool:
+                    if canonical_call_key in successful_tool_signatures and not _is_observation_tool:
                         noncompliance_streak += 1
                         ASCIIColors.warning(
                             f"[ChatMixin] Repetitive SUCCESS loop blocked for '{tool_name}'. "
-                            f"Signature recorded and workspace state unchanged since last success."
+                            f"An identical call already succeeded this turn; re-running it is a loop error."
                         )
                         status_err_line = f"* Tool call blocked to prevent success loop.\n"
                         details_block = f"Loop Intercepted:\nRepetitive successful tool call blocked (workspace state unchanged)\n<!-- status:failure -->\n</processing>\n\n"
@@ -11910,8 +12204,20 @@ class ChatMixin:
                         clean_result_str = clean_result_str.strip()
 
                     if tool_success and not _is_observation_tool:
-                        successful_tool_signatures.add(context_aware_signature)
-                        _dbg(f"[ChatMixin] Recorded successful signature for '{tool_name}'. Total successful: {len(successful_tool_signatures)}")
+                        # ── SUCCESS-REPEAT GUARD IS EPOCH-INDEPENDENT ──
+                        # A tool that already SUCCEEDED with identical (canonicalised)
+                        # parameters cannot produce a different result by being called
+                        # again — the workspace has not lost that result. Keying this
+                        # set on the raw `context_aware_signature` (which embeds the
+                        # environment epoch) made the guard unreachable: every artifact
+                        # write / file-producing tool bumps the epoch, so a byte-identical
+                        # successful retry never matched and small models happily repeated
+                        # it forever. We key on `canonical_call_key` (epoch-free, whitespace-
+                        # normalised) so the guard actually fires. The FAILURE guard above
+                        # remains epoch-gated on purpose: a failure CAN be legitimately
+                        # retried once the environment genuinely changes.
+                        successful_tool_signatures.add(canonical_call_key)
+                        _dbg(f"[ChatMixin] Recorded successful call key for '{tool_name}'. Total successful: {len(successful_tool_signatures)}")
                         
                         # Ingest any artifacts produced by tools (e.g. spinoff sub-agents)
                         if isinstance(tool_res, dict) and (tool_res.get("artefacts") or tool_res.get("artifacts_created")):
@@ -11931,7 +12237,24 @@ class ChatMixin:
 
                             self.touch()
                             self.commit()
-                    else:
+                    # ── 🛑 CRITICAL FIX: DO NOT BUMP THE EPOCH ON TOOL FAILURE ──
+                    # A tool failure does NOT mutate the workspace: no file was
+                    # created, modified, or deleted. Bumping `environment_epoch`
+                    # on failure falsely signals "the environment changed since
+                    # the last failure" and DEFEATS the epoch-gated failure-loop
+                    # guard below — an identical failing retry then sees a
+                    # different epoch and is allowed to re-execute forever. The
+                    # epoch advances ONLY on genuine, observable state changes:
+                    # successful tool side effects (file writes), artifact
+                    # dispatches, and context-visibility updates. Failure is NOT
+                    # such a change.
+                    #
+                    # EXCEPTION — observation tools: a SUCCESSFUL observation
+                    # (e.g. a fresh screenshot) IS an observable state change
+                    # and MUST advance the epoch so the OBSERVE→ACT→VERIFY loop
+                    # correctly re-enables the next action. A FAILED observation
+                    # (no screen captured) is still a failure and does NOT bump.
+                    if _is_observation_tool and tool_success:
                         _bump_environment_epoch()
 
                     tool_calls_this_turn.append({
