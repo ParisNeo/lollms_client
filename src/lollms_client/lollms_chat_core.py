@@ -1746,9 +1746,14 @@ def format_user_view(text: str, event_mode: Any = None) -> str:
     # Strip any residual artefact wrappers or orphan closing tags that
     # slipped past _apply_artefact_xml (streaming split, malformed tag,
     # or a scratchpad body containing literal `</artefact` text).
-    cleaned = re.sub(
-        r'</art[ei]fact\s*>', '', cleaned, flags=re.IGNORECASE
-    )
+    # 1) Complete closers: </artefact...> / </artifact...>
+    #    Word boundary after 'fact' protects unrelated tokens like </artefactX>.
+    cleaned = re.sub(r'</art[ei]fact\b[^>]*>', '', cleaned, flags=re.IGNORECASE)
+    # 2) Truncated closers at end-of-buffer (no closing '>'):
+    cleaned = re.sub(r'</art[ei]fact\b[^>]*$', '', cleaned, flags=re.IGNORECASE)
+    # 3) Stray openers with no remaining closer in the buffer:
+    if not re.search(r'</art[ei]fact\b', cleaned, flags=re.IGNORECASE):
+        cleaned = re.sub(r'<art[ei]fact\b[^>]*>', '', cleaned, flags=re.IGNORECASE)
     cleaned = sanitize_host_paths(cleaned).strip()
     return cleaned
 

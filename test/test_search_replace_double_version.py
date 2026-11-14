@@ -114,10 +114,10 @@ The bug is now fixed.
         csv_bytes = b"id,name\n1,Alice\n2,Bob\n"
         lam_content = "# CSV Schema: phantom_test.csv\nColumns: id (int), name (str)"
 
-        # 1. Add the data artifact (v1)
+        # 1. Add the data artifact (v1) — data files are FILE artefacts (no DATA type)
         self.discussion.artefacts.add(
             title=title,
-            artefact_type=ArtefactType.DATA,
+            artefact_type=ArtefactType.FILE,
             content=lam_content,
             logical_content=lam_content,
             physical_data=csv_bytes,

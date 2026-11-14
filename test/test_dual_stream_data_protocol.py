@@ -45,7 +45,7 @@ class TestDualStreamDataProtocol(unittest.TestCase):
         
         self.discussion.artefacts.add(
             title="users.csv",
-            artefact_type=ArtefactType.DATA,
+            artefact_type=ArtefactType.FILE,
             content="Columns: name (str), age (int)",
             file_ext=".csv",
             physical_data=raw_bytes,
@@ -67,7 +67,7 @@ class TestDualStreamDataProtocol(unittest.TestCase):
         
         self.discussion.artefacts.add(
             title="employees.csv",
-            artefact_type=ArtefactType.DATA,
+            artefact_type=ArtefactType.FILE,
             content="### Data File: employees.csv\nColumns: name, age",
             file_ext=".csv",
             physical_data=csv_content.encode('utf-8'),

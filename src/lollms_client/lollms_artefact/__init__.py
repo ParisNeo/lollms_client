@@ -10,6 +10,8 @@ from .lollms_artefact import (
     _is_ignored_path,
     _IGNORED_ARTEFACT_DIRS,
     _IGNORED_ARTEFACT_EXTS,
+    format_user_view,
+    _residual_artefact_scrub,
 )
 from .file_import import FileImportMixin, ALL_IMPORT_MODES, IMPORT_MODE_AS_IS
 from .internet_import import InternetImportMixin
@@ -27,6 +29,8 @@ __all__ = [
     "_is_ignored_path",
     "_IGNORED_ARTEFACT_DIRS",
     "_IGNORED_ARTEFACT_EXTS",
+    "format_user_view",
+    "_residual_artefact_scrub",
     "FileImportMixin",
     "ALL_IMPORT_MODES",
     "IMPORT_MODE_AS_IS",

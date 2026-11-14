@@ -21,7 +21,7 @@ All artefacts are strictly confined to a workspace root directory (e.g., `data_w
 
 ### C. Single-Stream vs Dual-Stream (`.lam` Protocol)
 * **Single-Stream (Text, Code, Documents)**: For text-based files (`.py`, `.md`, `.pdf`, `.docx`, `.txt`), the system reads directly from the active file in the workspace root when building the LLM context. The database acts as a lightweight index (`content_source: "disk"`) and does not store the raw text to prevent memory bloat.
-* **Dual-Stream (`.lam` Protocol for Binary & Structured Data)**: For structured data files (`.csv`, `.db`, `.sqlite`, `.xlsx`), the system uses a Dual-Stream approach:
+* **Dual-Stream (`.lam` Protocol for Data Files)**: Data files (`.csv`, `.db`, `.sqlite`, `.xlsx`) are registered as plain **`FILE`** artefacts (there is no dedicated `DATA` type). To keep the LLM context lean, they use a Dual-Stream approach: the raw bytes live on disk as the physical file, and a sibling `.lam` schema-descriptor (itself a `FILE` artefact) is co-written inside `.versions/`:
   * **Physical Twin**: Saved at `workspace_data/{title}.{ext}`. Contains the raw bytes (e.g., raw CSV rows, SQLite binary). Consumed by local tools.
   * **Logical Twin (`.lam`)**: Saved inside `workspace_data/.versions/{id}/{name}.lam`. Contains a high-density, text-based abstraction of the file's structure (column names, inferred data types, sample values). Consumed by the LLM context zone.
   * **🛑 The `.lam` is version-folder-only**: It must NEVER be written to the workspace root or be allowed to overwrite the physical twin it describes (see *The .lam Invariant* in Section 7.2).
@@ -41,7 +41,7 @@ To maintain clean and token-efficient context budgets, every registered artifact
 
 | Visibility Tier | Symbol | Prompt Context Behavior |
 | :--- | :--- | :--- |
-| **`FULL`** | `[C]` | The content (for text) or `.lam` schema (for data) is fully injected verbatim into the active context zone. **Permanent** — stays loaded until explicitly demoted. |
+| **`FULL`** | `[C]` | The content (for text) or `.lam` schema (for data files) is fully injected verbatim into the active context zone. **Permanent** — stays loaded until explicitly demoted. |
 | **`SINGLE_ROUND`** | `[C]` | Fully injected for **exactly one turn**, then auto-demoted to `TREE_UNLOCKABLE` by `build_artefacts_context_zone()`. **This is the default for generated images.** |
 | **`METADATA`** | `[M]` | Only the basic metadata (such as filename, size, and type) is injected, withholding the full schema description. |
 | **`TREE_UNLOCKABLE`**| `[U]` | The file is listed only in the directory index. It is excluded from the active context but can be loaded dynamically. |
@@ -173,8 +173,8 @@ When `disable_artefact_versioning=True` is active, the `ArtefactManager` employs
 
 This architecture transforms the database into a lightweight relational index (tracking visibility, status, and physical paths) while delegating blob storage entirely to the filesystem, significantly reducing memory usage for long-running autonomous agents.
 
-### The Content-First Update Doctrine (DATA Artifacts)
-When updating a `DATA` artifact (like a CSV or Excel file) where the raw bytes (`physical_data`) are not explicitly provided in the function call, the `ArtefactManager` enforces a strict **Content-First Update Doctrine**:
+### The Content-First Update Doctrine (Data Files)
+When updating a data file (a `FILE` artefact such as a CSV or Excel file) where the raw bytes (`physical_data`) are not explicitly provided in the function call, the `ArtefactManager` enforces a strict **Content-First Update Doctrine**:
 1. If the new string content differs from the logical schema, the manager assumes the raw data itself is being updated. It encodes the new string to UTF-8 bytes and writes it as the new physical twin.
 2. If the artifact is a binary database (`.db`, `.sqlite`) and raw bytes are missing, the manager **refuses** to encode the string schema as binary data (which would corrupt the database header). Instead, it automatically rehydrates the physical bytes from the existing file on disk before applying the schema update.
 
@@ -247,15 +247,15 @@ Every artifact in the system is represented as a dictionary (record) with a spec
 | :--- | :--- | :--- |
 | `title` | `str` | **The primary logical key.** This is the high-level metadata name used by the LLM and the database to reference the artifact. It may contain subfolder paths (e.g., `My_subfolder/SKILL.md`). It is sanitized via `_sanitize_path_segments` to ensure cross-platform safety. |
 | `physical_path` | `str` | **The unique disk location & retrieval key.** This stores the exact relative path (including subfolders and extension) where the physical twin resides in `workspace_data/`. If not explicitly provided during `add()` or `update()`, it defaults to the `title`. **CRITICAL**: The `get()` and `remove()` methods prioritize matching by `physical_path` over `title` to prevent ambiguity when multiple artifacts share similar titles. File-reading tools should be passed the `physical_path` to ensure they open the correct file on disk. |
-| `type` | `str` | The category of the artifact (e.g., `ArtefactType.CODE`, `ArtefactType.DATA`). Determines how the artifact is rendered in the context zone and which tools can operate on it. |
-| `content` | `str` | The logical text content. For text/code files, this is the verbatim source code. For `DATA` artifacts, this holds the `.lam` schema description, **NOT** the raw binary bytes. |
+| `type` | `str` | The category of the artifact (e.g., `ArtefactType.CODE`, `ArtefactType.FILE`). Data files are `FILE` artefacts. Determines how the artifact is rendered in the context zone and which tools can operate on it. |
+| `content` | `str` | The logical text content. For text/code files, this is the verbatim source code. For data-file (`FILE`) artefacts, this holds the `.lam` schema description, **NOT** the raw binary bytes. |
 | `version` | `int` | The version number. Incremented automatically on `update()` if `bump_version=True`. The `get()` method returns the highest version by default. |
 | `visibility` | `str` | The context tier (`FULL`, `SINGLE_ROUND`, `TREE_UNLOCKABLE`, `METADATA`, `TREE_LOCKED`, `HIDDEN`). Controls how the artifact appears in the LLM's prompt. See [Section 2: Multi-Tier Visibility Control](#-2-multi-tier-visibility-control). |
 | `active` | `bool` | A legacy boolean flag that mirrors `visibility in (FULL, SINGLE_ROUND)`. It is `True` if the artifact is fully loaded in context (permanently or for the current single-round window), `False` otherwise. |
 | `language` | `str` | The programming or markup language (e.g., `python`, `html`). Used for syntax highlighting in the context zone and to infer file extensions. |
-| `file_ext` | `str` | The explicit file extension (e.g., `.csv`, `.db`). **CRITICAL for DATA artifacts**: This determines how the physical file is written to disk and prevents binary corruption. |
-| `logical_content` | `str` | Explicit storage for the `.lam` schema text of `DATA` artifacts. While usually mirrored in `content`, this field is the authoritative source for the logical twin during Dual-Stream sync operations. |
-| `physical_data` | `bytes` | The raw binary bytes of a `DATA` or `IMAGE` artifact. **CRITICAL**: This field is stripped from the database record by `_get_all_raw()` to prevent JSON serialization crashes. It is only present in the dictionary returned directly by `add()` or `update()`. Never assume `art.get("physical_data")` will return bytes from a database query; rehydrate from disk if needed. |
+| `file_ext` | `str` | The explicit file extension (e.g., `.csv`, `.db`). **CRITICAL for data-file (`FILE`) artefacts**: This determines how the physical file is written to disk and prevents binary corruption. |
+| `logical_content` | `str` | Explicit storage for the `.lam` schema text of data-file (`FILE`) artefacts. While usually mirrored in `content`, this field is the authoritative source for the logical twin during Dual-Stream sync operations. |
+| `physical_data` | `bytes` | The raw binary bytes of a data-file (`FILE`) or `IMAGE` artifact. **CRITICAL**: This field is stripped from the database record by `_get_all_raw()` to prevent JSON serialization crashes. It is only present in the dictionary returned directly by `add()` or `update()`. Never assume `art.get("physical_data")` will return bytes from a database query; rehydrate from disk if needed. |
 | `token_count` | `int` | The estimated token count of the `content`. Used by the Context Budget Guard to prevent context overflow. |
 | `content_source` | `str` | Indicates where the content is stored. `disk` means the database is acting as an index and the filesystem is the source of truth. `db` means the content is stored in the database metadata. |
 
@@ -269,15 +269,15 @@ The architecture decouples the logical database key (`title`) from the unique di
 *   **Retrieval (`get`)**: You may query an artifact by passing either `title="README.md"` OR `physical_path="My_subfolder/README.md"`, but not both. Passing both raises a `ValueError`.
 *   **Deletion (`remove`)**: The `remove()` method uses the `physical_path` to calculate the exact metadata directory UUID and purge all physical files (active, versioned, and `.lam` twins) from disk. This guarantees that deleting an artifact removes all traces, preventing the workspace heal scan from resurrecting orphaned files as inactive artifacts.
 
-#### 2. Data Artifact Safety & The .lam Invariant (Binary Corruption Prevention)
+#### 2. Data-File Safety & The .lam Invariant (Binary Corruption Prevention)
 
 **🛑 THE .LAM INVARIANT (ABSOLUTE RULE — NEVER VIOLATE):**
 > The `.lam` logical twin (schema/metadata Markdown) **MUST NEVER replace a created physical artefact** (`.docx`, `.xlsx`, `.db`, `.pdf`, images, or any generated binary). The `.lam` is saved **exclusively** into the version folder (`.versions/{uuid}/{name}.lam`). If `physical_data` is absent but a non-empty physical file already exists at the target workspace path, that file **is the artefact** and is preserved byte-for-byte; only the `.lam` snapshot in `.versions/` is refreshed. Any code path that writes string `content`/`logical_content` over an existing physical file of a binary/rich type is a critical bug and must be rejected.
 
-`DATA` artifacts (like SQLite databases or CSVs) use the Dual-Stream protocol.
+Data files (FILE artefacts, like SQLite databases or CSVs) use the `.lam` schema-descriptor protocol.
 *   **Never write string `content` to a binary file**: The `_sync_to_disk_workspace` method explicitly refuses to write string `content` to `.db`/`.sqlite` files if `physical_data` is missing. This prevents the database header from being overwritten with `.lam` schema text.
 *   **Physical file preservation (all types)**: When a sync is requested without raw bytes but the physical file already exists on disk (e.g., a tool just generated `rapport_final.docx` and the LLM context card is being synced), the existing physical file is never touched. The `.lam` metadata is written only to `.versions/`.
-*   **Rehydration**: When updating a `DATA` artifact's schema, the `update()` method automatically rehydrates `physical_data` by reading the existing bytes from disk *before* calling `add()`. This ensures the raw binary data is preserved across schema updates.
+*   **Rehydration**: When updating a data-file (`FILE`) artefact's schema, the `update()` method automatically rehydrates `physical_data` by reading the existing bytes from disk *before* calling `add()`. This ensures the raw binary data is preserved across schema updates.
 
 #### 3. Visibility and Context Budget
 *   **Tool-Generated Files**: By default, tool-generated files >100KB are registered with `visibility=TREE_UNLOCKABLE` and `active=False` to prevent context bloat.
@@ -305,7 +305,7 @@ The `.laa` (Lollms Artefact Archive) format bundles all versions, content, physi
 The `.lab` (Lollms Artefact Bundle) format allows exporting and importing *multiple* files or entire directories at once.
 
 *   **Export**: `export_artefact_bundle(paths, output_path, include_versions)` takes a list of file/directory paths from the `workspace_data` directory and zips them together. If `include_versions=True`, it also bundles the historical version files inside a `_versions/` directory.
-*   **Import**: `import_artefact_bundle(lab_path, activate)` extracts the `.lab` archive directly into the active `workspace_data` directory. It automatically classifies each file by extension (e.g., `.py` -> `CODE`, `.csv` -> `DATA`), reads text or physical bytes accordingly, and registers them as new artifacts. Binary files (like `.db` or `.png`) are read as raw bytes, while text files are injected directly into the artifact's `content`.
+*   **Import**: `import_artefact_bundle(lab_path, activate)` extracts the `.lab` archive directly into the active `workspace_data` directory. It automatically classifies each file by extension (e.g., `.py` -> `CODE`, `.csv` -> `FILE`), reads text or physical bytes accordingly, and registers them as new artifacts. Binary files (like `.db` or `.png`) are read as raw bytes, while text files are injected directly into the artifact's `content`.
 
 ### C. JSON Export/Import
 For lightweight, text-only integrations (such as passing an artifact via an API payload), the manager also supports standard JSON serialization:
@@ -368,7 +368,7 @@ The reverse direction is covered too: the index sync (`_sync_index_with_disk`) r
 
 ## 🛠️ 9. Class Reference
 
-*   **`ArtefactType`**: Registry defining the supported categories (`DATA`, `CODE`, `DOCUMENT`, `IMAGE`, `PRESENTATION`, `NOTE`, `SKILL`, `TOOL`, `SCRATCHPAD`).
+*   **`ArtefactType`**: Registry defining the supported categories (`FILE`, `SEARCH_RESULT`, `NOTE`, `SKILL`, `CODE`, `DOCUMENT`, `IMAGE`, `PRESENTATION`, `TOOL`, `SCRATCHPAD`). Data files (`.csv`, `.db`, `.xlsx`, …) are `FILE` artefacts.
     *   `SKILL`: Represents persistent knowledge or behavior capsules. When created in a discussion with a Handbag personality, skills are routed to `handbag/skills/<name>/SKILL.md`. For manual/stateless personalities, they are versioned and stored directly as discussion artefacts.
 *   **`ArtefactVisibility`**: Enum-like class defining the context tiers (`FULL`, `SINGLE_ROUND`, `TREE_UNLOCKABLE`, `METADATA`, `TREE_LOCKED`, `HIDDEN`).
 *   **`ArtefactStatus`**: Enum-like class defining the lifecycle states (`DRAFTING`, `STABLE`, `REVISING`, `ERROR`).

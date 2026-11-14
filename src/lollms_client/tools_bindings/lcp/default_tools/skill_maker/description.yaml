@@ -1,0 +1,51 @@
+name: "LCP SkillMaker (Basic skills + RSI Self-Enhancement)"
+author: "ParisNeo"
+version: 1.0
+category: "meta"
+description: |
+  Mirror of ``tool_maker`` but for LLM *skills* (SKILL.md files). Provides a
+  safe read → modify → test → revert/discard → commit cycle for skills, gated
+  through the SAME two-tier split as the toolsmith.
+
+  BASIC TIER — always available, gated only by code_execution modal:
+    - tool_read_skill_source      : read the on-disk SKILL.md of a live skill.
+    - tool_write_skill_source     : write / patch SKILL.md (auto-snapshot).
+    - tool_test_skill_source      : parse YAML frontmatter + structural shape.
+    - tool_list_skill_versions    : enumerate skill snapshots + release manifests.
+    - tool_revert_skill           : restore one prior snapshot (undo last write).
+    - tool_discard_skill_changes  : hard reset to last release / oldest snapshot.
+
+  RSI ACT-PHASE — requires enable_skillmaker=True:
+    - tool_run_skill_test_agent   : spawn a CONSTRAINED child agent equipped
+                                    ONLY with the candidate skill's declared
+                                    tools. Hard-capped rounds, hard timeout,
+                                    transcript returned for the operator.
+    - tool_commit_skill           : record a file-system release (no git
+                                    required), optionally git commit + skill
+                                    remount on the personality.
+
+  Visibility:
+    LCPBinding.discover_tools() hides the two RSI tools when enable_skillmaker
+    is falsy. The basic tier is always available.
+
+  Safety invariants:
+    * Path containment: skills must be inside a configured skills_dir AND
+      registered in the personality's skills_manager.
+    * YAML frontmatter must parse AND declare `name` + `description`.
+    * `.rsi_backup/` + `.rsi/commits/` are the canonical revert/commit store.
+    * HALT-aware: every mutating tool checks `_HALT_REQUESTED`.
+    * Child-test agent refuses skills whose declared tools include shell /
+      python / sub-agent / computer-use toolsets.
+
+tools:
+  - name: tool_read_skill_source
+  - name: tool_write_skill_source
+  - name: tool_test_skill_source
+  - name: tool_list_skill_versions
+  - name: tool_revert_skill
+  - name: tool_discard_skill_changes
+  - name: tool_run_skill_test_agent
+    requires_flag: enable_skillmaker
+  - name: tool_commit_skill
+    requires_flag: enable_skillmaker
+visibility: loadable

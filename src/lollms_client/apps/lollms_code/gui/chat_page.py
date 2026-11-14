@@ -2015,16 +2015,16 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
                     ui.button("Refresh", icon="refresh", on_click=_refresh_plan).props("flat size=sm no-caps")
                     ui.button("Close", icon="close", on_click=dialog.close).props("flat size=sm no-caps")
 
-            plan_md_view = ui.markdown("").classes(
-                f"flex-1 overflow-auto p-4 bg-slate-100 dark:bg-slate-900 rounded border {BORDER} text-sm leading-relaxed"
-            )
-            plan_editor = ui.textarea().classes(
-                f"flex-1 w-full bg-slate-100 dark:bg-slate-900 text-xs font-mono rounded border {BORDER} p-2"
-            ).props(':dark="Quasar.Dark.isActive" outlined autogrow')
-            plan_editor.visible = False
+                    plan_md_view = ui.markdown("").classes(
+                        f"flex-1 overflow-auto p-4 bg-slate-100 dark:bg-slate-900 rounded border {BORDER} text-sm leading-relaxed"
+                    )
+                    plan_editor = ui.textarea().classes(
+                        f"flex-1 w-full bg-slate-100 dark:bg-slate-900 text-xs font-mono rounded border {BORDER} p-2"
+                    ).props(':dark="Quasar.Dark.isActive" outlined autogrow')
+                    plan_editor.visible = False
 
-            _refresh_plan()
-        dialog.open()
+                    _refresh_plan()
+                dialog.open()
 
     def open_scratchpad_dialog():
         dialog = ui.dialog().props("maximized")
@@ -2311,14 +2311,16 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
         # If the dialog is dismissed (Esc/X), treat it as an explicit reject so
         # the tool thread can never be left waiting indefinitely.
         def _on_dismiss():
+            # Escape / X / hide = explicit REJECT with HALT sentinel so the
+            # agentic loop cannot silently continue on a dismissed gate.
             if active_approval_dialog_holder.get("resp_queue") is resp_queue:
                 try:
-                    resp_queue.put(("reject", "Authorization dialog dismissed by user."))
+                    resp_queue.put(("reject", "Authorization dialog dismissed by user. [HALT]"))
                 except Exception:
                     pass
                 active_approval_dialog_holder["dialog"] = None
                 active_approval_dialog_holder["resp_queue"] = None
-                ui.notify("Execution rejected (dialog dismissed).", type="warning")
+                ui.notify("Execution rejected (dialog dismissed) — agent halting.", type="warning")
 
         dialog.on("hide", _on_dismiss)
 
@@ -2358,29 +2360,46 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
 
             with ui.row().classes("w-full items-center justify-between pt-2 border-t border-slate-200 dark:border-slate-800"):
                 def _do_reject():
-                    dialog.close()
                     fb = (feedback_input.value or "").strip()
-                    if resp_queue:
-                        resp_queue.put(("reject", fb or "User declined execution."))
-                    active_approval_dialog_holder["dialog"] = None
-                    active_approval_dialog_holder["resp_queue"] = None
-                    ui.notify("Execution rejected.", type="warning")
+                    # Hard-halt sentinel: any toolset that inspects the reason can short-circuit the entire turn.
+                    reason = (fb or "User declined execution.") + " [HALT]"
+                    try:
+                        if resp_queue:
+                            resp_queue.put(("reject", reason))
+                    finally:
+                        active_approval_dialog_holder["dialog"] = None
+                        active_approval_dialog_holder["resp_queue"] = None
+                        try:
+                            dialog.close()
+                        except Exception:
+                            pass
+                    ui.notify("Execution rejected — agent halting turn.", type="warning")
 
                 def _do_allow():
-                    dialog.close()
-                    if resp_queue:
-                        resp_queue.put(("allow", ""))
-                    active_approval_dialog_holder["dialog"] = None
-                    active_approval_dialog_holder["resp_queue"] = None
+                    try:
+                        if resp_queue:
+                            resp_queue.put(("allow", ""))
+                    finally:
+                        active_approval_dialog_holder["dialog"] = None
+                        active_approval_dialog_holder["resp_queue"] = None
+                        try:
+                            dialog.close()
+                        except Exception:
+                            pass
                     ui.notify("Authorized single execution.", type="positive")
 
                 def _do_always():
-                    dialog.close()
-                    if resp_queue:
-                        resp_queue.put(("always", ""))
-                    prefs.auto_approve_python = True
-                    active_approval_dialog_holder["dialog"] = None
-                    active_approval_dialog_holder["resp_queue"] = None
+                    try:
+                        if resp_queue:
+                            resp_queue.put(("always", ""))
+                    finally:
+                        prefs.auto_approve_python = True
+                        active_approval_dialog_holder["dialog"] = None
+                        active_approval_dialog_holder["resp_queue"] = None
+                        try:
+                            dialog.close()
+                        except Exception:
+                            pass
                     ui.notify("Auto-approval enabled for this active session.", type="positive")
 
                 ui.button("Reject", icon="cancel", on_click=_do_reject).props(
@@ -2397,11 +2416,32 @@ def build_chat_page(env: EnvStore, prefs: GuiPrefs, tools_toggle=None, session: 
 
             dialog.open()
 
-        def open_user_interaction_dialog(request: Dict[str, Any], resp_queue: Any):
-            """Displays an in-app modal input dialog for LCP tool user-interaction requests."""
+    def open_user_interaction_dialog(request: Dict[str, Any], resp_queue: Any):
+            """Displays an in-app modal input dialog for LCP tool user-interaction requests.
+
+            HOISTED from open_python_approval_dialog — it was previously a nested
+            local function and therefore never callable from drain_queue, which
+            is why `user_interaction_handler` calls silently fell back to None
+            and let the agentic loop continue without an answer.
+
+            Dismissal (Esc / X) = explicit cancel (None response) so the tool
+            thread can never hang forever.
+            """
             dialog = ui.dialog().props("persistent")
             active_interaction_dialog_holder["dialog"] = dialog
             active_interaction_dialog_holder["resp_queue"] = resp_queue
+
+            def _on_dismiss_interaction():
+                if active_interaction_dialog_holder.get("resp_queue") is resp_queue:
+                    try:
+                        resp_queue.put(None)
+                    except Exception:
+                        pass
+                    active_interaction_dialog_holder["dialog"] = None
+                    active_interaction_dialog_holder["resp_queue"] = None
+                    ui.notify("User interaction cancelled.", type="warning")
+
+            dialog.on("hide", _on_dismiss_interaction)
 
             kind = request.get("type", "text")
             title = request.get("title", "Input required")

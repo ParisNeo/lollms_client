@@ -219,29 +219,13 @@ class LollmsToolBinding(LollmsBaseBinding):
         pass
 
     @abstractmethod
-    def execute_tool(self,
-                        tool_name: str,
-                        params: Dict[str, Any],
-                        **kwargs) -> Dict[str, Any]:
+    def execute_tool(self, tool_name: str, params: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+        """Executes a tool on the underlying binding.
+
+        Subclasses must override this in order to actually run tools. Base
+        implementation raises so misuse is loud, not silently broken.
         """
-        Execute a specified tool with the given parameters.
-
-        The single context carrier is ``kwargs["env"]`` (an :class:`Env`),
-        always provided by the dispatch seam. All host context — client,
-        discussion, tool context, and app-owned custom data — is accessed
-        through it (``env.client`` / ``env.get_client()``,
-        ``env.discussion`` / ``env.get_discussion()``,
-        ``env.tool_context`` / ``env.get_tool_context()``,
-        ``env.custom`` / ``env.get_custom()``). Implementations should read
-        it defensively (``kwargs.get("env")``) and never assume specific
-        entries are non-None.
-        """
-        pass
-
-    # ------------------------------------------------------------------
-    # Conversion helper
-    # ------------------------------------------------------------------
-
+        raise NotImplementedError(f"'{self.__class__.__name__}' does not implement execute_tool().")
     def to_chat_tool_specs(self, **discover_kwargs) -> Dict[str, Dict[str, Any]]:
         """
         Convert this binding's tools into the ``tools`` dict format expected by

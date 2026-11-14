@@ -1355,6 +1355,13 @@ def run_agent_turn_in_thread(
     # Register GUI validation handler with execute_python and system_shell across all tool modules
     gui_user_interaction_handler = make_gui_user_interaction_handler(event_queue)
 
+    # The chat_page drain_queue handler needs a callable named exactly
+    # `open_user_interaction_dialog` to dispatch `user_interaction_request`
+    # events. The chat_page defines it at module scope (after the fix) so no
+    # additional wiring is required here — but the older "nested local"
+    # version silently made user-interaction requests return None after a
+    # fatal NameError. This comment marks the invariant.
+
     if client and hasattr(client, "tools") and client.tools:
         if hasattr(client.tools, "set_confirm_handler"):
             client.tools.set_confirm_handler(gui_confirm_handler)
@@ -1375,9 +1382,29 @@ def run_agent_turn_in_thread(
 
     callback = QueueStreamingCallback(event_queue)
 
+    the_enable_toolsmith = bool(getattr(prefs, "enable_toolsmith", False))
+    the_enable_skillmaker = bool(getattr(prefs, "enable_skillmaker", False))
+
     def _worker():
         nonlocal prompt
         try:
+            # ── HARD-HALT WATCHDOG ──
+            # Before legacy resume/prompt plumbing, clear any leaked HALT flags
+            # from a previous turn so a stale rejection in a prior toolset
+            # cannot poison this fresh turn.
+            try:
+                import sys as _sys
+                for _mn, _m in list(_sys.modules.items()):
+                    if _m is None:
+                        continue
+                    if hasattr(_m, "_HALT_REQUESTED"):
+                        try:
+                            setattr(_m, "_HALT_REQUESTED", False)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
             chat_kwargs: Dict[str, Any] = {}
 
             # If resuming a turn from checkpoint, restore virtual history & prompt
@@ -1395,6 +1422,23 @@ def run_agent_turn_in_thread(
                     chat_kwargs["resume_virtual_history"] = vh_raw
                     chat_kwargs["starting_round"] = chk.get("round_count", 1)
                     ASCIIColors.success(f"[AgentBridge] Resuming turn from checkpoint (Round {chk.get('round_count', 1)}).")
+
+            # ── RSI FLAG PROPAGATION (toolsmith + skillmaker) ──
+            # Both RSI features are fail-closed; the discovery layer hides the
+            # heavy act-phase tools when their flags are off, while the basic
+            # tier stays reachable. Propagate both every turn to guarantee a
+            # fresh session sees the operator's current intent.
+            try:
+                if client is not None and getattr(client, "tools", None) is not None \
+                        and hasattr(client.tools, "set_session_flags"):
+                    current_flags = dict(getattr(client.tools, "session_flags", {}) or {})
+                    current_flags["enable_toolsmith"] = the_enable_toolsmith
+                    current_flags["enable_skillmaker"] = the_enable_skillmaker
+                    client.tools.set_session_flags(current_flags)
+            except Exception as ex_flags:
+                ASCIIColors.warning(
+                    f"[AgentBridge] Could not propagate RSI flags: {ex_flags}"
+                )
 
             result = personality.chat(
                 prompt=prompt,
@@ -1420,6 +1464,10 @@ def run_agent_turn_in_thread(
                 debug_export=prefs.debug,
                 reasoning_effort=getattr(prefs, "reasoning_effort", None),
                 dynamic_effort=getattr(prefs, "dynamic_effort", False),
+                # RSI flags — pass through to any chat implementation that
+                # honours them (see _mixin_chat.chat() for the canonical flags).
+                enable_toolsmith=the_enable_toolsmith,
+                enable_skillmaker=the_enable_skillmaker,
                 **chat_kwargs
             )
             event_queue.put(AgentEvent("done", result=result))

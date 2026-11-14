@@ -262,16 +262,52 @@ sub-attributes must be feature-checked for None.
         self._discover_local_tools()
 
     def set_session_flags(self, flags: Optional[Dict[str, Any]]) -> None:
-        """Registers session feature flags and re-runs discovery so office- and
-        document-family libraries are admitted/excluded per the new flag state.
+        """Registers session feature flags and re-runs discovery.
 
-        The workspace is re-scanned first because document-family admission is
-        driven by file presence (e.g. a .pdf in the workspace auto-mounts the
-        PDF-capable document toolset).
+        On flag change we:
+          * Re-scan the workspace (document-family gating is file-type-driven).
+          * Re-run discovery so office-/document-family libraries mount/unmount.
+          * Enforce the RSI toolsmith split: ``tool_maker`` is ALWAYS mounted
+            so the vital tools-manipulation surface (read/write/test/revert/
+            discard/list_versions) stays available without any flag. Only the
+            heavy RSI act-phase tools (``tool_run_test_agent``) and the
+            promotion tool (``tool_commit_toolset``) are hidden when
+            ``enable_toolsmith`` is falsy — the tools themselves are still
+            callable via ``execute_tool`` for tests and the GUI, they just
+            never leak into the LLM's auto-discovered tool-spec list.
+
+        Implementation detail: no more force-unmount on True→False. The
+        visibility split happens inside ``discover_tools()`` based on
+        ``session_flags["enable_toolsmith"]``.
         """
         self.session_flags = dict(flags) if isinstance(flags, dict) else {}
         self._refresh_workspace_file_types()
         self._discover_local_tools()
+        # Spec memo must be dropped whenever flags change, since the visible
+        # tool set can now be filtered by the toolsmith flag.
+        try:
+            self.invalidate_chat_specs_cache()
+        except Exception:
+            pass
+
+    def _force_unmount_toolmaker(self) -> None:
+        """Drops every ``tool_maker`` tool from ``discovered_tools`` (fail-closed).
+
+        Called from set_session_flags when ``enable_toolsmith`` transitions
+        from True to False, and from mount_tool_library when an explicit
+        mount is attempted without the flag. Never raises.
+        """
+        try:
+            self.discovered_tools = [
+                t for t in self.discovered_tools
+                if not (
+                    t.get("_library_name") == "tool_maker"
+                    or (t.get("_python_file_path") or "").replace("\\", "/").find("/tool_maker/") != -1
+                )
+            ]
+            self.invalidate_chat_specs_cache()
+        except Exception:
+            pass
 
     def refresh_workspace_file_types(self) -> None:
         """Public hook: re-scans the workspace and re-runs discovery so newly
@@ -895,6 +931,11 @@ sub-attributes must be feature-checked for None.
         return self.mount_tool_library(library_name)
 
     def mount_tool_library(self, library_name: str) -> bool:
+        # NOTE: ``tool_maker`` is intentionally NOT refused here. The basic
+        # tools-manipulation surface (read / write / test / revert / discard /
+        # list_versions) must always be mountable; only the heavy RSI tools
+        # (run_test_agent / commit_toolset) are hidden when enable_toolsmith
+        # is falsy. The hide/allow decision happens inside ``discover_tools``.
         resolved_name = self._resolve_library_name(library_name)
         _gate_dir = self._find_library_dir(resolved_name or library_name)
         _gate_entry = resolve_library_entry(_gate_dir) if _gate_dir and _gate_dir.is_dir() else None
@@ -966,6 +1007,86 @@ sub-attributes must be feature-checked for None.
         else:
             ASCIIColors.warning(f"[LCP Mount] ⚠️ Library '{library_name}' mounted but no tools discovered.")
             return False
+
+    def _remount_toolset_after_change(self, library_name: str) -> bool:
+        """Hot-remounts a toolset after its on-disk source was mutated.
+
+        Called by the RSI toolsmith (``tool_commit_toolset`` and any other
+        caller) after:
+          * Writing a new version of a toolset file.
+          * Committing the change to git.
+
+        Steps:
+          1. Drop every currently-registered tool for that toolset from
+             ``discovered_tools`` (so we don't accumulate stale names).
+          2. Purge the toolset's module from ``sys.modules`` so Python
+             re-imports the fresh source.
+          3. Re-run discovery scoped to the toolset folder.
+          4. Invalidate the chat-specs memo so the next prompt sees the
+             updated set.
+
+        Returns True when at least one tool was discovered after the reload.
+        """
+        clean = (library_name or "").strip()
+        if not clean:
+            return False
+
+        # Resolve the toolset directory (must exist on disk).
+        lib_dir = self._find_library_dir(clean)
+        if lib_dir is None or not lib_dir.is_dir():
+            ASCIIColors.warning(
+                f"[LCP Remount] Toolset directory '{clean}' not found — remount aborted."
+            )
+            return False
+
+        # 1. Drop stale tool entries for this toolset only.
+        self.discovered_tools = [
+            t for t in self.discovered_tools
+            if not (
+                t.get("_library_name") == clean
+                or Path(t.get("_python_file_path") or "").parent.name == clean
+            )
+        ]
+
+        # 2. Purge the cached toolset module(s).
+        entry = resolve_library_entry(lib_dir)
+        stem = entry.stem if entry else clean
+        stale_module_names = [
+            m_name for m_name in list(sys.modules.keys())
+            if m_name == f"lollms_client.tools_bindings.lcp.persistent_{stem}"
+            or m_name.startswith(f"lollms_client.tools_bindings.lcp.persistent_{clean}")
+        ]
+        for mod_name in stale_module_names:
+            try:
+                del sys.modules[mod_name]
+            except Exception:
+                pass
+
+        # 3. Re-run discovery for the reloaded toolset only.
+        before = len(self.discovered_tools)
+        if entry:
+            self._load_tool_file(entry)
+        for sibling in iter_sibling_modules(lib_dir, entry):
+            self._load_tool_file(sibling)
+        after = len(self.discovered_tools)
+
+        # 4. Invalidate the spec cache.
+        try:
+            self.invalidate_chat_specs_cache()
+        except Exception:
+            pass
+
+        reloaded = after > before
+        if reloaded:
+            ASCIIColors.success(
+                f"[LCP Remount] ✅ Toolset '{clean}' remounted: "
+                f"{after - before} tool(s) registered."
+            )
+        else:
+            ASCIIColors.warning(
+                f"[LCP Remount] Toolset '{clean}' reloaded but no tools found."
+            )
+        return reloaded
 
     def _extract_tool_names_from_file(self, py_file: Path) -> set:
         names: set = set()
@@ -1187,6 +1308,18 @@ sub-attributes must be feature-checked for None.
         # malformed payloads) means DENY.
         approved = self._confirm_answer_is_approval(answer)
         if not approved:
+            # ── HARD-HALT PROPAGATION ──
+            # Any "reject" answer must irrevocably set a per-invocation halt
+            # flag on the current tool module so downstream dispatch layers can
+            # short-circuit the whole agentic turn — not just the one tool.
+            # The GUI handler additionally embeds "[HALT]" in the reason string;
+            # we honour BOTH signals so no handler implementation can bypass.
+            reason_text = ""
+            if isinstance(answer, (tuple, list)) and len(answer) > 1:
+                reason_text = str(answer[1] or "")
+            elif isinstance(answer, str):
+                reason_text = answer
+            self._raise_per_invocation_halt(reason_text)
             return False
 
         if task_category and self._confirm_answer_is_always(answer):
@@ -1197,6 +1330,43 @@ sub-attributes must be feature-checked for None.
             )
 
         return True
+
+    def _raise_per_invocation_halt(self, reason_text: str) -> None:
+        """Best-effort propagation of a HALT signal to every already-loaded tool module.
+
+        Toolsets that opt-in by reading ``_HALT_REQUESTED`` (execute_python,
+        system_shell, workspace_tools, ...) will immediately short-circuit.
+        Toolsets that don't read it are unaffected — nothing worse happens
+        than the normal "tool returned an error" flow. The point is to give
+        the agentic dispatcher, the toolset, and the operator a shared
+        invariant: after a rejected confirmation, the turn must NOT continue
+        as if nothing happened.
+        """
+        try:
+            should_halt = "[HALT]" in (reason_text or "")
+        except Exception:
+            should_halt = True  # defensive: any reject is a halt
+        if not should_halt:
+            # Even without the explicit sentinel, a reject means the specific
+            # tool call must not proceed. Record it so tools that check the
+            # flag after `confirm(...)` returns False see it too.
+            should_halt = True
+        for mod_name, mod in list(sys.modules.items()):
+            if mod is None:
+                continue
+            if not (
+                "execute_python" in mod_name
+                or "system_shell" in mod_name
+                or "workspace_tools" in mod_name
+                or "document_editor" in mod_name
+                or "git_manager" in mod_name
+                or "file_organizer" in mod_name
+            ):
+                continue
+            try:
+                setattr(mod, "_HALT_REQUESTED", True)
+            except Exception:
+                pass
 
     def set_confirm_handler(self, handler: Optional[Callable]) -> None:
         """Registers a confirmation callback on LCPBinding and propagates it to all loaded tool modules."""
@@ -1352,10 +1522,91 @@ sub-attributes must be feature-checked for None.
                     tool_def["description"] = dynamic_desc
         return specs
 
+    # RSI act-phase tools hidden from auto-discovery when the respective flag is off.
+    _TOOLSMITH_FLAG_GATED_TOOL_NAMES: frozenset = frozenset({
+        "tool_run_test_agent",
+        "tool_commit_toolset",
+    })
+
+    # Skill RSI act-phase tools (same split pattern, separate flag).
+    _SKILLMAKER_FLAG_GATED_TOOL_NAMES: frozenset = frozenset({
+        "tool_run_skill_test_agent",
+        "tool_commit_skill",
+    })
+
+    def _is_toolsmith_flag_on(self) -> bool:
+        try:
+            return bool(self.session_flags.get("enable_toolsmith"))
+        except Exception:
+            return False
+
+    def _is_skillmaker_flag_on(self) -> bool:
+        try:
+            return bool(self.session_flags.get("enable_skillmaker"))
+        except Exception:
+            return False
+
+    def _filter_toolsmith_visibility(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Drops RSI-gated tools from the auto-discovery list when the flag is off.
+
+        Rationale: ``tool_maker`` is ALWAYS mounted so the basic manipulation
+        surface (read/write/test/revert/discard/list_versions) stays available.
+        The heavy act-phase tool (``tool_run_test_agent`` — child subprocess
+        spawn with a model) and the promotion tool (``tool_commit_toolset``)
+        are the parts that actually consume non-trivial operator resources and
+        therefore justify the flag. They are still callable via ``execute_tool``
+        directly (for tests, GUI paths), they just never appear in the LLM's
+        tool-spec list without enable_toolsmith=True.
+
+        Uses ``_python_file_path`` to detect tools that live inside the
+        ``tool_maker`` folder — no hardcoded path matching, uses the
+        discovered metadata the loader already records.
+        """
+        if self._is_toolsmith_flag_on():
+            return tools
+        filtered: List[Dict[str, Any]] = []
+        for t in tools:
+            name = t.get("name") or ""
+            if name not in self._TOOLSMITH_FLAG_GATED_TOOL_NAMES:
+                filtered.append(t)
+                continue
+            # Only filter RSI tools that actually live inside tool_maker — this
+            # keeps any future toolset that legitimately reuses those names
+            # (unlikely, but possible) mountable. The discovery loader already
+            # records _library_name for TOOLS.py layouts.
+            lib = t.get("_library_name") or ""
+            if lib == "tool_maker":
+                continue
+            filtered.append(t)
+        return filtered
+
+    def _filter_skillmaker_visibility(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Drops skill RSI act-phase tools from auto-discovery when the flag is off.
+
+        ``skill_maker`` is ALWAYS mounted (basic read/write/test/list/revert/
+        discard tier), so skills can be manipulated without any flag. The heavy
+        child-agent test tool and the promotion tool require
+        ``enable_skillmaker`` to be visible to the LLM.
+        """
+        if self._is_skillmaker_flag_on():
+            return tools
+        filtered: List[Dict[str, Any]] = []
+        for t in tools:
+            name = t.get("name") or ""
+            if name not in self._SKILLMAKER_FLAG_GATED_TOOL_NAMES:
+                filtered.append(t)
+                continue
+            lib = t.get("_library_name") or ""
+            if lib == "skill_maker":
+                continue
+            filtered.append(t)
+        return filtered
+
     def discover_tools(self, specific_tool_names: Optional[List[str]] = None, **kwargs) -> List[Dict[str, Any]]:
         if kwargs.get("force_refresh", False) or not self.discovered_tools:
              self._discover_local_tools()
-        tools = self.discovered_tools
+        tools = self._filter_toolsmith_visibility(self.discovered_tools)
+        tools = self._filter_skillmaker_visibility(tools)
         if specific_tool_names:
             tools = [t for t in tools if t.get("name") in specific_tool_names]
         for t in tools:

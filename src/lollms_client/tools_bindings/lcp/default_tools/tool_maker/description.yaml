@@ -1,0 +1,59 @@
+name: "LCP ToolMaker (Basic tools + RSI Toolsmith)"
+author: "ParisNeo"
+version: 1.4
+category: "meta"
+description: |
+  Split tools-manipulation tools into two tiers so the vital manipulation
+  surface stays always-available while the heavy RSI act-phase is opt-in.
+
+  BASIC TIER — always available, gated only by code_execution modal:
+    - tool_read_tool_source       : read the on-disk source of an active toolset.
+    - tool_write_tool_source      : write / patch toolset source (auto-snapshot).
+    - tool_test_tool_source       : AST + isolated import smoke test.
+    - tool_list_tool_versions     : enumerate snapshots + release manifests.
+    - tool_revert_tool_source     : restore one prior snapshot (undo last write).
+    - tool_discard_changes        : hard reset to last release / oldest snapshot.
+
+  RSI ACT-PHASE — requires enable_toolsmith=True:
+    - tool_run_test_agent         : spawn a CONSTRAINED child agent with the
+                                    candidate toolset in a fresh subprocess,
+                                    hard-capped rounds, hard timeout, transcript
+                                    returned for the operator's audit trail.
+    - tool_commit_toolset         : record a file-system release (no git
+                                    required), optionally git commit when git
+                                    is present, hot-remount on the binding.
+
+  Visibility:
+    The auto-discovery layer in LCPBinding.discover_tools() hides the two
+    RSI act-phase tools from the LLM's spec list when enable_toolsmith is
+    falsy. The basic tier always appears (subject to the code_execution
+    confirmation modal).
+
+  v1.3 additions (kept in this build):
+    - File-system release manifests under .rsi/commits/<epoch>.json make
+      tool_commit_toolset work without git. git add/commit still runs
+      opportunistically when git is available and the toolset folder is
+      tracked, but its absence never blocks a release.
+    - Revert/discard preference order: (1) latest release manifest, then
+      (2) .rsi_backup/ snapshot chain, then (3) opportunistic git HEAD.
+
+  v1.4 (current):
+    - Split basic vs. RSI tiers as above.
+    - tool_maker is always mountable; only the RSI act-phase tools check
+      the enable_toolsmith flag inside the tool body (defence in depth
+      against a bypass via a direct execute_tool call).
+    - Removed the True→False force-unmount: basic tools stay reachable
+      across session flag toggles.
+
+tools:
+  - name: tool_read_tool_source
+  - name: tool_write_tool_source
+  - name: tool_test_tool_source
+  - name: tool_list_tool_versions
+  - name: tool_revert_tool_source
+  - name: tool_discard_changes
+  - name: tool_run_test_agent
+    requires_flag: enable_toolsmith
+  - name: tool_commit_toolset
+    requires_flag: enable_toolsmith
+visibility: loadable

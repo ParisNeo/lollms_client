@@ -125,6 +125,59 @@ _ARTEFACT_IMAGE_TAG_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Residual artefact tag fragment matching, reused by the `_apply_artefact_xml`
+# scrub pass and by the module-level `format_user_view` presenter. Handles
+# complete closers, truncated closers (no trailing '>'), and stray openers.
+_ARTEFACT_RESIDUAL_OPENER_RE = re.compile(r'<art[ei]fact\b[^>]*>', re.IGNORECASE)
+_ARTEFACT_RESIDUAL_CLOSER_RE = re.compile(r'</art[ei]fact\b[^>]*>', re.IGNORECASE)
+_ARTEFACT_RESIDUAL_TRUNC_RE  = re.compile(r'</art[ei]fact\b[^>]*$', re.IGNORECASE)
+_ARTEFACT_RESIDUAL_ANY_RE    = re.compile(r'</?art[ei]fact\b', re.IGNORECASE)
+
+# Residual artefact tag fragment matching, reused by the `_apply_artefact_xml`
+# scrub pass and by the module-level `format_user_view` presenter. Handles
+# complete closers, truncated closers, and stray openers.
+_ARTEFACT_RESIDUAL_OPENER_RE = re.compile(r'<art[ei]fact\b[^>]*>', re.IGNORECASE)
+_ARTEFACT_RESIDUAL_CLOSER_RE = re.compile(r'</art[ei]fact\b[^>]*>', re.IGNORECASE)
+_ARTEFACT_RESIDUAL_TRUNC_RE  = re.compile(r'</art[ei]fact\b[^>]*$', re.IGNORECASE)
+_ARTEFACT_RESIDUAL_ANY_RE    = re.compile(r'</?art[ei]fact\b', re.IGNORECASE)
+
+# Residual artefact tag fragment matching (module-scope, reused by
+# `_residual_artefact_scrub` and `format_user_view`). Handles complete
+# closers, truncated closers, and stray openers.
+_ARTEFACT_RESIDUAL_OPENER_RE  = re.compile(r'<art[ei]fact\b[^>]*>', re.IGNORECASE)
+_ARTEFACT_RESIDUAL_CLOSER_RE  = re.compile(r'</art[ei]fact\b[^>]*>', re.IGNORECASE)
+_ARTEFACT_RESIDUAL_TRUNC_RE   = re.compile(r'</art[ei]fact\b[^>]*$', re.IGNORECASE)
+_ARTEFACT_RESIDUAL_ANY_RE     = re.compile(r'</?art[ei]fact\b', re.IGNORECASE)
+
+
+def _residual_artefact_scrub(text: str) -> str:
+    """Remove any residual or truncated artefact tag fragments from surface text.
+
+    Handles three leak shapes:
+      - Complete closers:  ``</artefact>`` / ``</artifact>``
+      - Truncated closers: ``</artefact`` at end-of-buffer (no closing ``>``)
+      - Stray openers:     ``<artefact ...>`` with no matching closer
+    """
+    if not text:
+        return text
+    text = _ARTEFACT_RESIDUAL_CLOSER_RE.sub('', text)
+    text = _ARTEFACT_RESIDUAL_TRUNC_RE.sub('', text)
+    if not re.search(r'</art[ei]fact\b', text, flags=re.IGNORECASE):
+        text = _ARTEFACT_RESIDUAL_OPENER_RE.sub('', text)
+    return text
+
+
+def format_user_view(text: str) -> str:
+    """Final surface sanitiser for text shipped to the user.
+
+    Strips any residual artefact tag fragments left behind by a streaming
+    split, a truncated closing tag, or a scratchpad body that contained the
+    literal text ``</artefact``. Intended to be idempotent.
+    """
+    if not text:
+        return text
+    return _residual_artefact_scrub(text)
+
 
 def _extract_code_signatures(content: str, language: Optional[str]) -> str:
     lang = (language or "").lower()
@@ -3071,6 +3124,9 @@ class ArtefactManager:
                         except Exception:
                             pass
                 tag_name = "artifact" if "artifact" in match.group(0).lower() else "artefact"
+                # Scratchpads are hidden helper artefacts: strip from surface entirely.
+                if _raw_atype == ArtefactType.SCRATCHPAD:
+                    return ""
                 if _route_err:
                     err_block = (
                         f"[SYSTEM ERROR: <{tag_name} type=\"{_raw_atype}\"> could not be "
@@ -3132,6 +3188,8 @@ class ArtefactManager:
                 art = self.get(resolved_title)
                 if art: affected.append(art)
                 tag_name = "artifact" if "artifact" in match.group(0).lower() else "artefact"
+                if atype == ArtefactType.SCRATCHPAD:
+                    return ""
                 return f'<{tag_name} {match.group(1)}>\n[content stripped, refer to the artefact for details]\n</{tag_name}>'
             
             is_new = False
@@ -3280,21 +3338,22 @@ class ArtefactManager:
                     pass
 
             tag_name = "artifact" if "artifact" in match.group(0).lower() else "artefact"
+            if atype == ArtefactType.SCRATCHPAD:
+                return ""
             return f'<{tag_name} {match.group(1)}>\n[content stripped, refer to the artefact for details]\n</{tag_name}>'
 
         cleaned = artefact_pattern.sub(handle_artefact, cleaned)
 
-        # ── ORPHAN CLOSING-TAG GUARD ─────────────────────────────────────
-        # If the model emitted a closing tag without a matched opening tag
-        # (streaming split, malformed tag, or a scratchpad body that happens
-        # to contain the literal text `</artefact`), strip the orphan closer
-        # so it can never leak to the user-visible surface.
-        orphan_close_re = re.compile(r'</art[ei]fact\s*>', re.IGNORECASE)
-        if orphan_close_re.search(cleaned):
+        # ── RESIDUAL ARTEFACT SCRUB ───────────────────────────────────────
+        # If the model emitted a closing tag (or a truncated fragment) without
+        # a matched opening tag — streaming split, malformed tag, or a
+        # scratchpad body that happens to contain the literal text `</artefact`
+        # — strip every residual fragment so it can never reach the surface.
+        if _ARTEFACT_RESIDUAL_ANY_RE.search(cleaned):
             ASCIIColors.warning(
-                "[ArtefactManager] Stripping orphan artefact closing tag leaked to surface."
+                "[ArtefactManager] Stripping orphan artefact tag fragment leaked to surface."
             )
-            cleaned = orphan_close_re.sub('', cleaned)
+            cleaned = _residual_artefact_scrub(cleaned)
 
         revert_pattern = re.compile(r'^[ \t]*<revert_art[ei]fact\s([^>]+)/?>', re.IGNORECASE | re.MULTILINE)
 
@@ -3318,6 +3377,25 @@ class ArtefactManager:
 
         cleaned = revert_pattern.sub(handle_revert, cleaned)
         return cleaned.strip(), affected
+
+    def _residual_artefact_scrub(self, text: str) -> str:
+        """Remove any residual/truncated artefact tag fragments from surface text.
+
+        Handles:
+          - Complete closers:  ``</artefact>`` / ``</artifact>``
+          - Truncated closers: ``</artefact`` at end-of-buffer (no closing ``>``)
+          - Stray openers:     ``<artefact ...>`` with no matching closer
+        """
+        if not text:
+            return text
+        # Complete closers
+        text = re.sub(r'</art[ei]fact\b[^>]*>', '', text, flags=re.IGNORECASE)
+        # Truncated closers (no closing '>')
+        text = re.sub(r'</art[ei]fact\b[^>]*$', '', text, flags=re.IGNORECASE)
+        # Stray opener with no remaining closer in the buffer
+        if not re.search(r'</art[ei]fact\b', text, flags=re.IGNORECASE):
+            text = re.sub(r'<art[ei]fact\b[^>]*>', '', text, flags=re.IGNORECASE)
+        return text
 
     def add_artefact(self, title, content="", images=None, audios=None, videos=None, zip_content=None, version=1, **extra_data) -> Dict:
         atype = extra_data.pop('artefact_type', ArtefactType.DOCUMENT)
@@ -3787,8 +3865,11 @@ class ArtefactManager:
 
         content = ""
         if artefact_type == ArtefactType.FILE and ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3", ".sqlconn", ".ttl", ".rdf", ".parquet"):
-            # Data file → store as-is FILE. Schema descriptor is generated
-            # alongside as a '.lam' companion (import pipeline handles it).
+            # Data file → stored as-is as a plain FILE artefact. The raw bytes
+            # already live on disk (physical_data); the human/LLM-facing
+            # descriptor is generated inline — no dedicated DATA type, no
+            # schema-extraction sidecar. Data-scouting tools inspect the file
+            # at execution time.
             file_size = path.stat().st_size if path.exists() else 0
             content = (
                 f"# Data File: {title}\n"
@@ -3797,16 +3878,6 @@ class ArtefactManager:
                 f"- **Size**: {file_size:,} bytes\n\n"
                 f"> Use data-scouting tools (`execute_sql_query`, `execute_python_data_query`) to inspect."
             )
-            if parse_data_schema:
-                try:
-                    from lollms_client.lollms_artefact.data_files import _parse_data_file
-                    schema_result = _parse_data_file(path, title, version=1, skip_sidecar_write=True)
-                    if len(schema_result) == 3:
-                        content, _, _ = schema_result
-                    else:
-                        content, _ = schema_result
-                except Exception:
-                    pass
         elif artefact_type == ArtefactType.IMAGE:
             content = f"### Image: `{title}{ext}`\n\n<artefact_image id=\"{title}{ext}::0\" />"
         elif ext == ".pdf":
@@ -3930,3 +4001,62 @@ class ArtefactManager:
                     self.activate(f"{title}::images")
 
         return self.get(title)
+
+
+def _residual_artefact_scrub(text: str) -> str:
+    """Remove any residual or truncated artefact tag fragments from surface text.
+
+    Handles three leak shapes:
+      - Complete closers:  ``</artefact>`` / ``</artifact>``
+      - Truncated closers: ``</artefact`` at end-of-buffer (no closing ``>``)
+      - Stray openers:     ``<artefact ...>`` with no matching closer
+    Idempotent.
+    """
+    if not text:
+        return text
+    text = _ARTEFACT_RESIDUAL_CLOSER_RE.sub('', text)
+    text = _ARTEFACT_RESIDUAL_TRUNC_RE.sub('', text)
+    if not re.search(r'</art[ei]fact\b', text, flags=re.IGNORECASE):
+        text = _ARTEFACT_RESIDUAL_OPENER_RE.sub('', text)
+    return text
+
+
+def format_user_view(text: str) -> str:
+    """Final surface sanitiser for text shipped to the user.
+
+    Strips any residual artefact tag fragments left behind by a streaming
+    split, a truncated closing tag, or a scratchpad body that contained the
+    literal text ``</artefact``. Idempotent.
+    """
+    if not text:
+        return text
+    return _residual_artefact_scrub(text)
+
+
+def _residual_artefact_scrub(text: str) -> str:
+    """Remove any residual or truncated artefact tag fragments from surface text.
+
+    Handles three leak shapes:
+      - Complete closers:  ``</artefact>`` / ``</artifact>``
+      - Truncated closers: ``</artefact`` at end-of-buffer (no closing ``>``)
+      - Stray openers:     ``<artefact ...>`` with no matching closer
+    """
+    if not text:
+        return text
+    text = _ARTEFACT_RESIDUAL_CLOSER_RE.sub('', text)
+    text = _ARTEFACT_RESIDUAL_TRUNC_RE.sub('', text)
+    if not re.search(r'</art[ei]fact\b', text, flags=re.IGNORECASE):
+        text = _ARTEFACT_RESIDUAL_OPENER_RE.sub('', text)
+    return text
+
+
+def format_user_view(text: str) -> str:
+    """Final surface sanitiser for text shipped to the user.
+
+    Strips any residual artefact tag fragments left behind by a streaming
+    split, a truncated closing tag, or a scratchpad body that contained the
+    literal text ``</artefact``. Idempotent.
+    """
+    if not text:
+        return text
+    return _residual_artefact_scrub(text)

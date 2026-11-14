@@ -426,7 +426,7 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
 
         self.discussion.artefacts.add(
             title=self.csv_filename,
-            artefact_type="data",
+            artefact_type=ArtefactType.FILE,
             content="Columns: product_name (str), category (str), revenue (float)",
             file_ext=".csv",
             version=1,

@@ -203,11 +203,43 @@ zone, artifact instructions in the system prompt, and image tag dispatch.
 ### `auto_activate_artefacts: bool = True`
 
 **What it does**: Newly created or patched artifacts become active immediately —
-their content is loaded into the model's context (Active Artifacts zone).
+their content is loaded into the model's context (Active Artifacts zone) on the
+very next round. This is the default "the model can immediately see what it
+just wrote" behavior.
 
-**What to expect**: with `False`, artifacts are created with
-`TREE_UNLOCKABLE` visibility — the model must `<unlock_file>` them to read the
-content. Useful for large files to protect the context budget.
+**What to expect**:
+- **Sub-flag of `enable_artefacts`** (master). Inert when the master switch is
+  off.
+- `True` (default): after creation/patching, the model can read the artifact's
+  content directly — no `<unlock_file>` needed. This is what makes
+  iterative editing (`SEARCH/REPLACE` hunks against a file the model just
+  authored) work smoothly.
+- `False`: artifacts are created with `TREE_UNLOCKABLE` visibility — the
+  model must `<unlock_file>` them explicitly to read content. Use this for
+  large files where context budget is at risk of being blown by the model
+  re-seeding its own output into the prompt.
+- **Interaction with `active_images`**: images embedded in artefacts obey their
+  own default `SINGLE_ROUND` visibility (see `enable_image_generation`), NOT
+  this flag. `auto_activate_artefacts=False` does *not* prevent the pixel
+  payload of a freshly created image from being seen on the next round — it
+  only withholds *text* content. See `BRANCHING.md` §3 for `active_images`
+  as a **message-level** field, not a `chat()` parameter.
+- **Cost / latency**: `True` materially increases context size on successive
+  rounds as artefacts accumulate. With `True` and no compaction, expect
+  per-round prompt growth proportional to the sum of active artefact sizes up
+  to `context_compaction_threshold`. Turn it off (per-file `<lock_file>` tags
+  or `auto_activate_artefacts=False` globally) when the workspace contains
+  larger artefacts than the model will actually edit.
+- Per-message vs. per-turn: `auto_activate_artefacts` is **per-turn** (a
+  `chat()` parameter). It cannot be toggled mid-turn. Use per-file
+  `<unlock_file>` / `<lock_file>` tags or `active_images` dispositions if you
+  need finer granularity on individual artefacts.
+
+**Recovering generated stuff**: fetched via `discussion.artefacts.get(title)`
+either way — the flag only governs whether the model *sees* content during the
+turn, not whether the artefact exists. See
+[`flags/auto_activate_artefacts.md`](flags/auto_activate_artefacts.md) for the
+full semantics and worked examples.
 
 ### `enable_notes: bool = True`
 
@@ -519,10 +551,35 @@ the `confirm_handler` (if provided) is consulted before dangerous executions.
 ### `allow_dynamic_tools: bool = False`
 
 **What it does**: Security gate for tool-authored tools. With `False`, artifacts
-of `type="tool"` are **not** registered as executable LCP tools.
+of `type="tool"` are **not** registered as executable LCP tools. With `True`,
+the model may author a `.py` artifact declaring `tool_*` functions, and that
+file becomes an LCP-registrable Python toolset on subsequent rounds.
 
-**What to expect**: enable only if you explicitly trust the model to author and
-run its own tools.
+**What to expect**:
+- **Security-sensitive.** This is a code-execution surface — the model writes
+  arbitrary Python that the runtime will import. It MUST be paired with
+  `enable_code_execution=True` and a `confirm_handler` in any non-isolated
+  deployment. Without the flag, tool artifacts still exist as filesystem
+  content — they just never register into the tool registry.
+- **Tool runtime context.** Dynamic `tool_*` functions run with the standard
+  LCP `env` (`env.llm`, `env.tti`, their `*_model_profiles`, `*_switch`
+  functions). They may declare reserved parameters `lollms_client_instance` /
+  `discussion_instance` to receive injected instances at call time.
+- Companion to (but independent from) `enable_toolsmith`. `enable_toolsmith`
+  gates the **act-phase** of editing a *registered* toolset (read/write/test/
+  commit via `tool_maker`). `allow_dynamic_tools` gates registering a **brand-
+  new tool** authored as an artifact. Neither implies the other.
+- Silent skip: if the LCP binding cannot import the artifact (syntax error,
+  violation of the tool signature contract), registration is skipped with a
+  console warning and the tool-creation attempt is reported back to the model.
+  The turn is **not** aborted.
+
+**Recovering generated stuff**: the tool artifact lives at
+`discussion.artefacts.get("<title>")`. Once registered, it appears in
+`client.tools.discovered_tools` and is callable exactly like any other LCP
+tool. See [`flags/allow_dynamic_tools.md`](flags/allow_dynamic_tools.md) for
+the full enablement recipe, the enable_code_execution interaction matrix, and
+failure-mode table.
 
 ### `enable_vlm_query: bool = False`
 
@@ -532,6 +589,45 @@ client.
 
 **What to expect**: with a native vision model active, this mounts nothing (the
 fallback is unnecessary).
+
+### `enable_toolsmith: bool = False` / `enable_skillmaker: bool = False`
+
+**What they do**: Activate the **heavy RSI act-phase** of the `tool_maker` and
+`skill_maker` toolsets respectively. The basic manipulation surface (read /
+write / test / revert / discard / list_versions) for toolsets and skills is
+**always available** and independent of these flags — the flags gate ONLY the
+act-phase tools and the promotion tool:
+
+| Flag | Enables (LLM-visible) | Basic tier (always available) |
+|---|---|---|
+| `enable_toolsmith` | `tool_run_test_agent`, `tool_commit_toolset` | `tool_read_tool_source`, `tool_write_tool_source`, `tool_test_tool_source`, `tool_list_tool_versions`, `tool_revert_tool_source`, `tool_discard_changes` |
+| `enable_skillmaker` | `tool_run_skill_test_agent`, `tool_commit_skill` | `tool_read_skill_source`, `tool_write_skill_source`, `tool_test_skill_source`, `tool_list_skill_versions`, `tool_revert_skill`, `tool_discard_skill_changes` |
+
+**What to expect**:
+- Both flags are **fail-closed** and **independent**: `enable_toolsmith` does
+  not enable skill RSI and vice versa. `LCPBinding.discover_tools()` chains
+  `_filter_toolsmith_visibility()` then `_filter_skillmaker_visibility()`.
+- When a flag is off, its two act-phase tools are **hidden from auto-discovery**
+  — the LLM's spec list does not contain them. Direct `execute_tool` calls are
+  still possible for tests / GUI paths, but each act-phase tool body re-checks
+  the flag and returns `{"success": False, "requires_flag": "..."}` when it is
+  off (defence in depth).
+- The basic tier is **never** hidden — a session without these flags can still
+  edit toolsets and skills. Only the heavy subprocess-swap-and-commit cycle is
+  gated.
+- The `code_execution` confirmation modal still fires on every `tool_maker` /
+  `skill_maker` tool regardless of these flags — the flags govern **exposure**,
+  not **approval**.
+- `enable_toolsmith` spawns a constrained child LLM as part of
+  `tool_run_test_agent` — expect latency and additional model calls. `commit_*`
+  records a file-system release manifest under `.rsi/commits/<epoch>.json`
+  (no git required) and, when git is available, opportunistically runs
+  `git add/commit` scoped to the toolset/skill folder.
+
+**Recovering generated stuff**: releases are recoverable on disk under
+`<toolset_or_skill_dir>/.rsi/commits/<epoch>.json` (embedded `source`);
+rollback snapshots under `.rsi_backup/`. Both are surfaced to the model via
+`tool_list_tool_versions` / `tool_list_skill_versions`.
 
 ### `enable_computer_use: bool = False`
 
@@ -769,6 +865,25 @@ end-of-turn JSON context dump.
    on-demand tool mount fire even when `enable_artefacts=False`, because the
    workspace tree is a discovery concern, not an artefact concern. The stub is
    injected regardless, and the tool family is mounted regardless.
+10. **RSI flags are independent of everything else**: `enable_toolsmith` and
+    `enable_skillmaker` gate ONLY the heavy act-phase tools; they do not mount
+    or unmount their parent toolsets. `tool_maker` and `skill_maker` remain
+    mountable and their basic tier remains callable without either flag. A
+    session that never sets these flags can still read, patch, test, revert,
+    and manually commit toolset/skill source — only the automatic
+    child-test-agent + commit cycle is hidden. Never enable either flag in a
+    session whose operator has not ALSO enabled a `confirm_handler` — the
+    act-phase tools spawn child models that will prompt for approval through
+    the standard `code_execution` gate, and a missing handler turns each
+    child-step into a silent skip.
+11. **Capability gates can silently downgrade a flag**: `enable_computer_use`
+    requires a vision-capable active model; `enable_image_generation` and
+    `enable_image_editing` require a TTI binding. When the gate is unmet, the
+    flag is effectively inert, but the model correctly reports the missing
+    capability (it is never told the tools exist). This is the correct
+    "instructions + dispatch + hydration" behavior of the three-layer model
+    described at the top of this document. If a flag appears to do nothing,
+    check the gate first — never assume the model "forgot" the tag.
 
 ---
 

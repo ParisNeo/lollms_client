@@ -286,6 +286,51 @@ def _sanitise_tool_ident(raw: str, *, fallback: str = "store") -> str:
     return s or fallback
 
 
+def _resolve_store_identity_path(store: Any) -> Optional[str]:
+    """Return the normalized resolved `.db` path backing a store-like object.
+
+    Accepts a ``SafeStoreRAGBinding`` (``.db_path``), a deferred config dict
+    (``{"db_path": ...}``), or a raw path/str. Returns ``None`` when no
+    filesystem identity can be derived. Used for store-identity deduplication.
+    """
+    if store is None:
+        return None
+    raw: Any = None
+    if isinstance(store, dict):
+        raw = store.get("db_path") or store.get("path")
+    else:
+        raw = getattr(store, "db_path", None) or getattr(store, "path", None)
+    if not raw:
+        return None
+    try:
+        return str(Path(str(raw)).expanduser().resolve())
+    except Exception:
+        return str(raw)
+
+
+def _resolve_store_identity_path(store: Any) -> Optional[str]:
+    """Return the normalized resolved ``.db`` path backing a store-like object.
+
+    Accepts a ``SafeStoreRAGBinding`` (``.db_path``), a deferred config dict
+    (``{"db_path": ...}``), or a raw path/str. Returns ``None`` when no
+    filesystem identity can be derived. Used for store-identity deduplication
+    so the same physical datastore is never registered twice.
+    """
+    if store is None:
+        return None
+    raw: Any = None
+    if isinstance(store, dict):
+        raw = store.get("db_path") or store.get("path")
+    else:
+        raw = getattr(store, "db_path", None) or getattr(store, "path", None)
+    if not raw:
+        return None
+    try:
+        return str(Path(str(raw)).expanduser().resolve())
+    except Exception:
+        return str(raw)
+
+
 def _resolve_rag_tool_identity(store: Any, idx: int) -> "tuple[str, str]":
     """
     Resolve (tool_name, tool_description) for a handbag SafeStore binding.
@@ -2537,12 +2582,16 @@ class LollmsPersonality:
                 if _kb.suffix.lower() == ".db":
                     _key = _kb.stem.lower()
                     if str(_kb) not in _existing_store_paths:
+                        # Prefer a real declared/display name over the bare stem so the
+                        # promoted store is always named meaningfully (never a
+                        # ``store_N`` placeholder when a yaml name exists).
                         self.extra_safe_stores.append({
                             "name": _key,
                             "db_path": str(_kb),
                             "vectorizer_name": "st",
                             "description": f"Knowledge base '{_key}' (from {_kb.name}).",
                         })
+                        _existing_store_paths.add(str(_kb))
                         _promoted += 1
                         try:
                             ASCIIColors.info(
@@ -2975,8 +3024,35 @@ class LollmsPersonality:
                 trace_exception(tool_load_err)
 
         # Merge handbag-declared KBs/stores with any caller-supplied ones.
-        merged_kbs = list(hb.extra_knowledge_bases) + [Path(p) for p in (extra_knowledge_bases or [])]
         merged_safe_stores = list(hb.extra_safe_stores) + list(extra_safe_stores or [])
+
+        # Collect the resolved .db paths already covered by explicit safe stores so
+        # the same physical store is never fed down BOTH channels (which would
+        # produce a duplicate nameless ``store_N`` datasource downstream).
+        _covered_store_paths: set = set()
+        for _s in merged_safe_stores:
+            _p = _resolve_store_identity_path(_s)
+            if _p is not None:
+                _covered_store_paths.add(_p)
+
+        _raw_kbs = list(hb.extra_knowledge_bases) + [Path(p) for p in (extra_knowledge_bases or [])]
+        merged_kbs: List[Path] = []
+        for _kb in _raw_kbs:
+            if _kb.suffix.lower() == ".db":
+                try:
+                    _resolved_kb = str(Path(_kb).expanduser().resolve())
+                except Exception:
+                    _resolved_kb = str(_kb)
+                if _resolved_kb in _covered_store_paths:
+                    try:
+                        ASCIIColors.info(
+                            f"[Handbag.from_handbag] Dropped duplicated .db KB path '{_kb}' "
+                            f"(already present in extra_safe_stores)."
+                        )
+                    except Exception:
+                        pass
+                    continue
+            merged_kbs.append(_kb)
 
         try:
             ASCIIColors.info(
@@ -3142,9 +3218,48 @@ class LollmsPersonality:
         if query_rag_callback and not self.data_sources:
             self._register_data_source_item(query_rag_callback, default_name="rag_callback")
 
+    def _is_duplicate_data_source(self, candidate: RAGDataSource) -> bool:
+        """True when ``candidate`` duplicates an already-registered data source.
+
+        Two sources are duplicates when they share the SAME NAME (legacy
+        behaviour, preserved) OR when they reference the SAME underlying
+        physical store (same resolved ``.db`` path), regardless of display
+        name. The store-identity check is what prevents the same handbag `.db`
+        being registered twice — once under its declared name and once under
+        an auto-promoted ``store_N`` placeholder.
+        """
+        candidate_store_path = _resolve_store_identity_path(candidate.store)
+        for existing in self.data_sources:
+            if existing.name == candidate.name:
+                return True
+            if candidate_store_path is not None:
+                existing_store_path = _resolve_store_identity_path(existing.store)
+                if existing_store_path == candidate_store_path:
+                    return True
+        return False
+
+    def _is_duplicate_data_source(self, candidate: RAGDataSource) -> bool:
+        """True when ``candidate`` duplicates an already-registered data source.
+
+        Two sources are duplicates when they share the SAME NAME (legacy
+        behaviour, preserved) OR when they reference the SAME underlying
+        physical store (same resolved ``.db`` path), regardless of display
+        name. The store-identity check is what prevents the same handbag ``.db``
+        being registered twice — once under its declared name and once under
+        an auto-promoted ``store_N`` placeholder.
+        """
+        candidate_store_path = _resolve_store_identity_path(candidate.store)
+        for existing in self.data_sources:
+            if existing.name == candidate.name:
+                return True
+            if candidate_store_path is not None:
+                if _resolve_store_identity_path(existing.store) == candidate_store_path:
+                    return True
+        return False
+
     def _register_data_source_item(self, item: Any, default_name: Optional[str] = None) -> Optional[RAGDataSource]:
         if isinstance(item, RAGDataSource):
-            if not any(ds.name == item.name for ds in self.data_sources):
+            if not self._is_duplicate_data_source(item):
                 self.data_sources.append(item)
             return item
 
@@ -3161,7 +3276,7 @@ class LollmsPersonality:
                 query_fn = lambda q: static_text
 
             ds = RAGDataSource(name=name, description=desc, query_fn=query_fn, store=store, auto_query=auto_q, metadata=meta)
-            if not any(existing.name == ds.name for existing in self.data_sources):
+            if not self._is_duplicate_data_source(ds):
                 self.data_sources.append(ds)
             return ds
 
@@ -3172,7 +3287,7 @@ class LollmsPersonality:
             doc = getattr(item, "__doc__", "") or ""
             desc = doc.strip().split("\n")[0] if doc else "RAG query engine"
             ds = RAGDataSource(name=name, description=desc, query_fn=item, auto_query=True)
-            if not any(existing.name == ds.name for existing in self.data_sources):
+            if not self._is_duplicate_data_source(ds):
                 self.data_sources.append(ds)
             return ds
 
@@ -3180,7 +3295,7 @@ class LollmsPersonality:
             name = default_name or "static_knowledge"
             static_text = item
             ds = RAGDataSource(name=name, description="Static knowledge base", query_fn=lambda q: static_text, auto_query=True)
-            if not any(existing.name == ds.name for existing in self.data_sources):
+            if not self._is_duplicate_data_source(ds):
                 self.data_sources.append(ds)
             return ds
 
@@ -3345,6 +3460,31 @@ class LollmsPersonality:
                     )
                 except Exception:
                     pass
+                # Store-identity dedupe: skip any store whose resolved .db path is
+                # already covered by a previously-registered (named) entry. This is
+                # what removes the redundant ``store_N`` when the same physical
+                # datastore is present both as a declarative data source and as a
+                # promoted safe store.
+                _store_path = _resolve_store_identity_path(store)
+                if _store_path is not None:
+                    _already_covered = any(
+                        _resolve_store_identity_path(_ds.store) == _store_path
+                        for _ds in self.data_sources
+                    )
+                    if not _already_covered:
+                        _already_covered = any(
+                            _resolve_store_identity_path(_existing_store) == _store_path
+                            for _existing_store in safe_store_map.values()
+                        )
+                    if _already_covered:
+                        try:
+                            ASCIIColors.info(
+                                f"[RAG-DBG] Skipping duplicate safe store '{_store_path}' "
+                                f"(already represented in data_sources / safe_store_map)."
+                            )
+                        except Exception:
+                            pass
+                        continue
                 tool_name, tool_desc = _resolve_rag_tool_identity(store, idx)
                 db_label = tool_name[4:] if tool_name.startswith("rag_") else tool_name
                 # de-dupe against data-source names
@@ -3375,6 +3515,27 @@ class LollmsPersonality:
                 pass
             for kb in getattr(self, "extra_knowledge_bases", []):
                 p = Path(kb)
+                # Skip a .db path already covered by a registered safe store or a
+                # declarative data source configured with the same physical store
+                # (it would otherwise surface as a second database catalog entry).
+                _kb_identity = _resolve_store_identity_path(p)
+                if _kb_identity is not None:
+                    _covered_in_stores = any(
+                        _resolve_store_identity_path(_st) == _kb_identity
+                        for _st in safe_store_map.values()
+                    ) or any(
+                        _resolve_store_identity_path(_ds.store) == _kb_identity
+                        for _ds in self.data_sources
+                    )
+                    if _covered_in_stores:
+                        try:
+                            ASCIIColors.info(
+                                f"[RAG-DBG] Skipping duplicate KB path '{_kb_identity}' "
+                                f"(already covered by a safe store / data source)."
+                            )
+                        except Exception:
+                            pass
+                        continue
                 label = p.stem or p.name
                 base_label, n = label, 1
                 while label in safe_store_map or label in kb_path_map or any(ds.name == label for ds in self.data_sources):
