@@ -1461,8 +1461,13 @@ def run_in_sandboxed_child(
     stderr_fh = None
     proc = None
     try:
-        stdout_fh = _tf.TemporaryFile(delete=False, mode="w+b")
-        stderr_fh = _tf.TemporaryFile(delete=False, mode="w+b")
+        # NOTE: `TemporaryFile()` has NO `delete` kwarg (that belongs to
+        # `NamedTemporaryFile`). A plain anonymous `TemporaryFile` is already
+        # unlinked on close (POSIX) or process exit (Windows), which is
+        # exactly the lifetime we need here: the file exists only while we
+        # drain the child's output and is discarded immediately after.
+        stdout_fh = _tf.TemporaryFile(mode="w+b")
+        stderr_fh = _tf.TemporaryFile(mode="w+b")
         stdout_path = stdout_fh.name
         stderr_path = stderr_fh.name
         proc = _sp.Popen(
@@ -1609,6 +1614,10 @@ def run_in_sandboxed_child(
             _fh.close()
         except Exception:
             pass
+    # `TemporaryFile` is auto-unlinked on close, but these may point at a real
+    # path on some platforms (e.g. Windows anonymous files use a real temp
+    # name under the hood). Best-effort cleanup is harmless when the path is
+    # already gone.
     for _p in (stdout_path, stderr_path):
         try:
             os.unlink(_p)

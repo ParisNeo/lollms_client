@@ -8312,6 +8312,16 @@ JSON:"""
                     if imported:
                         resolved.append(imported.get("title", target))
                     else:
+                        # `import_file` returned None: usually the path is on
+                        # the artefact manager's "ignored" list (binary /
+                        # cache artefacts) OR the file was already indexed
+                        # under a different title. Surface the exact reason so
+                        # operators debugging `[ArtefactManager] Skipped import
+                        # of ignored path` recover the target on the next turn.
+                        _reason = self._explain_unlock_target(target)
+                        ASCIIColors.warning(
+                            f"[{self.name}] Cannot import '{target}' into artefact index: {_reason}"
+                        )
                         resolved.append(target)
                 except Exception as import_err:
                     ASCIIColors.warning(f"[{self.name}] Failed to import '{target}' into artefact index: {import_err}")
@@ -8321,6 +8331,70 @@ JSON:"""
             resolved.append(target)
 
         return resolved
+
+    def _explain_unlock_target(self, target: str) -> str:
+        """Return a short, actionable reason why `target` could not be unlocked.
+
+        Called only when a context-visibility operation reported the target
+        under `not_found` (i.e. the artefact index AND the on-disk workspace
+        both lacked it). The explanation helps the LLM self-correct instead of
+        blindly re-emitting the same wrong path — the observed failure
+        (`build/keys/character_human.png.png`) is the classic doubled-extension
+        case where a small model concatenates the extension onto a filename
+        that already carries it.
+        """
+        try:
+            cleaned = str(target or "").strip().replace("\\", "/")
+            if not cleaned:
+                return "Target path is empty."
+
+            # Never dereference outside the workspace during a diagnostic —
+            # a malformed `<unlock_file>..\..\..\etc\passwd</unlock_file>`
+            # must not traverse.
+            if not self._resolved_workspace:
+                return "No workspace configured — cannot resolve the file."
+
+            candidate = self._resolved_workspace / cleaned
+            try:
+                # Raises ValueError if `cleaned` escapes the workspace root.
+                candidate_resolved = candidate.resolve()
+                candidate_resolved.relative_to(self._resolved_workspace.resolve())
+            except Exception:
+                return f"'{target}' resolves outside the workspace root."
+
+            if candidate_resolved.is_file():
+                return "File exists on disk but could not be indexed as an artefact."
+
+            # Doubled-extension detection: `X.png.png` where `X.png` exists.
+            suffix = candidate_resolved.suffix.lower()
+            if suffix and suffix.startswith("."):
+                doubled_suffix = suffix + suffix
+                if candidate_resolved.name.lower().endswith(doubled_suffix):
+                    stripped = candidate_resolved.with_name(candidate_resolved.name[: -len(suffix)])
+                    if stripped.is_file():
+                        rel = stripped.relative_to(self._resolved_workspace.resolve())
+                        return (
+                            f"Doubled file extension detected ('{target}'). "
+                            f"The actual file is '{rel.as_posix()}' — retry the unlock with that exact path."
+                        )
+
+            parent = candidate_resolved.parent
+            if parent.exists() and parent.is_dir():
+                try:
+                    siblings = [p.name for p in parent.iterdir() if p.is_file()][:20]
+                except Exception:
+                    siblings = []
+                if siblings:
+                    sample = ", ".join(siblings[:8])
+                    return (
+                        f"File not found in '{parent.relative_to(self._resolved_workspace.resolve()).as_posix() or '.'}'. "
+                        f"Existing files there: {sample}. Use one of those exact names."
+                    )
+                return f"Parent folder exists but is empty: '{parent}'."
+
+            return "File does not exist in the workspace (check spelling and path)."
+        except Exception as diag_err:
+            return f"Could not diagnose target '{target}': {diag_err}"
 
     def _execute_context_visibility(self, tag_name: str, body: str) -> Dict[str, Any]:
         if getattr(self, '_artefact_manager', None) is None and (self._resolved_workspace or self.workspace_path):
@@ -8356,7 +8430,7 @@ JSON:"""
             except Exception as e:
                 ASCIIColors.warning(f"Sub-workspace visibility handling failed: {e}")
 
-        return _core_execute_context_visibility(
+        result = _core_execute_context_visibility(
             tag_name=tag_name,
             body=body,
             artefact_manager=getattr(self, '_artefact_manager', None),
@@ -8364,9 +8438,51 @@ JSON:"""
             client=self.lollms_client,
             state_db_path=getattr(self, '_state_db_path', None)
         )
-        
-          
-        
+        return self._enrich_visibility_result(result, tag_name)
+
+    def _enrich_visibility_result(self, result: Any, tag_name: str) -> Any:
+        """Attach an actionable `error`/reason to a context-visibility result.
+
+        The core resolver returns `not_found` and `blocked_files` lists but not
+        a human-readable reason — the UI then renders a bare "Status: failure"
+        with an empty message, and the LLM has no signal to self-correct on the
+        next round. This helper:
+          1. Runs `_explain_unlock_target` on every entry in `not_found` and
+             `blocked_files` so the reason includes the DOUBLED-EXTENSION /
+             parent-folder / sibling-listing diagnosis.
+          2. Stores it under both `error` (structured) and a per-target map
+             `failure_reasons` (so a caller can render each cleanly).
+          3. Appends a "Reason:" block to `status_str` — the string the
+             streaming `CONTEXT_UPDATE` callback currently forwards to the UI
+             verbatim, so users SEE it without any frontend changes.
+        """
+        if not isinstance(result, dict):
+            return result
+
+        missing = list(result.get("not_found") or [])
+        blocked = list(result.get("blocked_files") or [])
+        if not missing and not blocked:
+            return result
+
+        reasons: Dict[str, str] = {}
+        for t in missing:
+            reasons[str(t)] = self._explain_unlock_target(str(t))
+        for t in blocked:
+            reasons[str(t)] = f"Blocked by sandbox/policy: {t}"
+
+        detail_lines = [f"- {t}: {r}" for t, r in reasons.items()]
+        detail = "Context visibility failed for:\n" + "\n".join(detail_lines)
+
+        result["failure_reasons"] = reasons
+        if not result.get("error"):
+            result["error"] = detail
+
+        status_str = str(result.get("status_str") or "").strip()
+        if "Reason:" not in status_str:
+            result["status_str"] = (status_str + "\nReason:\n" + detail).strip()
+
+        return result
+
     def _inject_tool_images_for_vlm(self, tool_result: Dict[str, Any]) -> List[Dict[str, str]]:
         return _inject_tool_images_for_vlm_core(tool_result, self.lollms_client)
 

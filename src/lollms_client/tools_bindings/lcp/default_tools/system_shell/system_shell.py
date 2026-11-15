@@ -1,19 +1,375 @@
 import os
 import sys
 import re
+import time
+import uuid
+import signal
+import threading
 import subprocess
 import platform
 import shlex
+from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 from ascii_colors import ASCIIColors
 
 TOOL_LIBRARY_NAME = "System Shell"
-TOOL_LIBRARY_DESC = "Executes shell commands (bash, cmd, powershell) with adjustable autonomy levels for environment management and tooling."
+TOOL_LIBRARY_DESC = "Executes shell commands (bash, cmd, powershell) with adjustable autonomy levels for environment management and tooling. Supports long-running background jobs with polling."
 TOOL_LIBRARY_ICON = "⚙️"
 
 AUTONOMY_LEVEL: str = "safe"
 _CONFIRM_HANDLER: Optional[Any] = None
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Long-running job support (background execution with polling)
+#
+# Problem: a shell tool call cannot distinguish a 3-second `dir` from a
+# 20-minute compile or a `ffmpeg` encode. A single hard timeout inevitably
+# either kills legitimate work or blocks the agent round for too long.
+#
+# Solution: a bounded background-job manager. The LLM is instructed (in the
+# tool description) to:
+#   1. Launch the task with `background=true` → receives a `job_id`.
+#   2. Call `tool_poll_shell_job(job_id, wait_seconds=N)` → blocks for at
+#      most N seconds, returns the current status + output tail.
+#   3. Repeat polling until `status == "completed"|"failed"|"killed"`.
+#
+# Guardrails preserve the DoS protection the hard timeout provided:
+#   - `_MAX_BACKGROUND_JOBS` : concurrent job cap.
+#   - `_MAX_JOB_LIFETIME`    : absolute wall-clock cap (auto-kill).
+#   - `_MAX_CAPTURE_BYTES`   : bounded per-stream capture (ring-buffer).
+#   - `_MAX_POLL_WAIT`       : bounded poll wait so the agent round never hangs.
+#   - Process-tree kill on request and on lifetime expiry.
+#   - Every launch passes through the SAME autonomy classifier as foreground.
+# ──────────────────────────────────────────────────────────────────────────────
+
+_MAX_BACKGROUND_JOBS: int = 8
+_MAX_JOB_LIFETIME: float = 1800.0            # 30 minutes hard cap per job
+_MAX_CAPTURE_BYTES: int = 512 * 1024         # 512 KiB per stream
+_KEEP_FINISHED_JOBS: int = 32                # retained completed/failed jobs
+_MAX_POLL_WAIT: float = 60.0                 # cap on tool_poll_shell_job wait
+_FOREGROUND_DEFAULT_TIMEOUT: float = 120.0
+_FOREGROUND_MAX_TIMEOUT: float = 600.0       # 10 minutes absolute foreground cap
+
+
+class _ShellJob:
+    """In-memory record for a background shell job with a bounded output ring."""
+
+    __slots__ = (
+        "job_id", "command", "proc", "started_at", "finished_at",
+        "stdout_buf", "stderr_buf", "stdout_total", "stderr_total",
+        "return_code", "error_msg", "status",
+        "_lock", "_done_event", "_stdout_thread", "_stderr_thread",
+        "_killed_by", "_killed_at",
+    )
+
+    def __init__(self, job_id: str, command: str, proc: subprocess.Popen):
+        self.job_id = job_id
+        self.command = command
+        self.proc = proc
+        self.started_at = time.time()
+        self.finished_at: Optional[float] = None
+        # Bounded ring buffers: keep the LAST N bytes so the tail is what the
+        # LLM needs when it polls (early output of a long task is usually noise,
+        # whereas the last lines are what the model has to react to).
+        self.stdout_buf: deque = deque(maxlen=_MAX_CAPTURE_BYTES)
+        self.stderr_buf: deque = deque(maxlen=_MAX_CAPTURE_BYTES)
+        self.stdout_total: int = 0
+        self.stderr_total: int = 0
+        self.return_code: Optional[int] = None
+        self.error_msg: Optional[str] = None
+        self.status: str = "running"   # running | completed | failed | killed
+        self._lock = threading.Lock()
+        self._done_event = threading.Event()
+        self._stdout_thread: Optional[threading.Thread] = None
+        self._stderr_thread: Optional[threading.Thread] = None
+        self._killed_by: Optional[str] = None
+        self._killed_at: Optional[float] = None
+
+
+_JOBS: Dict[str, _ShellJob] = {}
+_JOBS_LOCK = threading.Lock()
+
+
+def _bounded_append(buf: deque, total_attr_ref: List[int], chunk: str) -> None:
+    """Appends `chunk` to a bounded ring buffer, tracking bytes-in for truncation flags."""
+    if not chunk:
+        return
+    total_attr_ref[0] += len(chunk)
+    # Split into characters-safe chunks: `deque(maxlen=N)` elements, one per char,
+    # would waste memory. Instead, keep short string blocks. When the buffer is
+    # near the cap, drop oldest blocks until under the cap.
+    buf.append(chunk)
+    current = sum(len(b) for b in buf)
+    while current > _MAX_CAPTURE_BYTES and len(buf) > 1:
+        dropped = buf.popleft()
+        current -= len(dropped)
+
+
+def _join_bounded(buf: deque) -> str:
+    return "".join(buf)
+
+
+def _trim_jobs_locked() -> None:
+    """Retains at most `_KEEP_FINISHED_JOBS` finished jobs (oldest first removal)."""
+    finished = [
+        (jid, job) for jid, job in _JOBS.items()
+        if job.status in ("completed", "failed", "killed")
+    ]
+    if len(finished) <= _KEEP_FINISHED_JOBS:
+        return
+    finished.sort(key=lambda kv: kv[1].finished_at or kv[1].started_at)
+    to_remove = len(finished) - _KEEP_FINISHED_JOBS
+    for jid, _job in finished[:to_remove]:
+        _JOBS.pop(jid, None)
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Terminates a process AND its children (cross-platform best-effort)."""
+    if proc is None:
+        return
+    try:
+        if proc.poll() is not None:
+            return
+    except Exception:
+        return
+
+    if platform.system() == "Windows":
+        # `taskkill /F /T` kills the whole tree rooted at the PID. The command
+        # is invoked DIRECTLY (not via shell) so it cannot be intercepted yet
+        # again by our own classifier — that would block cleanup.
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True, check=False, timeout=10,
+            )
+            return
+        except Exception:
+            pass
+
+    # POSIX / fallback: try process group, then terminate/kill.
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=3)
+    except Exception:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+def _drain_stream(stream, job: _ShellJob, buf: deque, total_ref: List[int], label: str) -> None:
+    """Background reader: pumps one stream into the job's bounded buffer."""
+    try:
+        for raw_line in iter(stream.readline, ""):
+            if not raw_line:
+                break
+            _bounded_append(buf, total_ref, raw_line)
+    except Exception as exc:
+        with job._lock:
+            if not job.error_msg:
+                job.error_msg = f"{label} read error: {exc}"
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
+def _finalize_job(job: _ShellJob, return_code: Optional[int], killed_by: Optional[str] = None) -> None:
+    """Marks a job as finished exactly once and records its return code."""
+    with job._lock:
+        if job.status != "running":
+            return  # already finalized by kill or lifespan thread
+        job.finished_at = time.time()
+        job.return_code = return_code
+        if killed_by:
+            job._killed_by = killed_by
+            job._killed_at = job.finished_at
+            job.status = "killed"
+            job.error_msg = job.error_msg or f"Job terminated: {killed_by}"
+        elif return_code == 0:
+            job.status = "completed"
+        else:
+            job.status = "failed"
+    job._done_event.set()
+
+    # Trim finished-job retention outside the lock (best-effort).
+    with _JOBS_LOCK:
+        _trim_jobs_locked()
+
+
+def _lifespan_watchdog(job: _ShellJob) -> None:
+    """Auto-kills a running job that exceeds `_MAX_JOB_LIFETIME`."""
+    try:
+        while not job._done_event.wait(timeout=5.0):
+            if time.time() - job.started_at >= _MAX_JOB_LIFETIME:
+                ASCIIColors.warning(
+                    f"[system_shell] Job {job.job_id} exceeded {_MAX_JOB_LIFETIME:.0f}s — auto-killing."
+                )
+                _kill_process_tree(job.proc)
+                _finalize_job(job, None, killed_by=f"lifetime exceeded ({_MAX_JOB_LIFETIME:.0f}s)")
+                return
+    except Exception as exc:
+        ASCIIColors.warning(f"[system_shell] Lifespan watchdog error for {job.job_id}: {exc}")
+
+
+def _start_background_job(command: str, env: Dict[str, str]) -> Dict[str, Any]:
+    """Launches a command detached, returns the initial job response."""
+    with _JOBS_LOCK:
+        running = sum(1 for j in _JOBS.values() if j.status == "running")
+        if running >= _MAX_BACKGROUND_JOBS:
+            return {
+                "success": False,
+                "error": (
+                    f"Background job limit reached ({running}/{_MAX_BACKGROUND_JOBS}). "
+                    f"Poll or kill an existing job before launching another."
+                ),
+            }
+        job_id = f"job_{uuid.uuid4().hex[:10]}"
+        # Reserve the slot NOW before releasing the lock so a concurrent
+        # launch cannot race past the cap.
+        _JOBS[job_id] = None  # type: ignore[assignment]
+
+    proc: Optional[subprocess.Popen] = None
+    try:
+        creationflags = 0
+        popen_kwargs: Dict[str, Any] = {}
+        if platform.system() == "Windows":
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+            )
+        else:
+            # New session → own process group → tree-killable via killpg.
+            popen_kwargs["start_new_session"] = True
+
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=os.getcwd(),
+            env=env,
+            bufsize=1,
+            creationflags=creationflags,
+            **popen_kwargs,
+        )
+    except Exception as exc:
+        with _JOBS_LOCK:
+            _JOBS.pop(job_id, None)
+        return {"success": False, "error": f"Failed to launch background job: {exc}"}
+
+    job = _ShellJob(job_id, command, proc)
+    with _JOBS_LOCK:
+        _JOBS[job_id] = job
+
+    st_ref: List[int] = [0]
+    se_ref: List[int] = [0]
+    t_out = threading.Thread(
+        target=_drain_stream,
+        args=(proc.stdout, job, job.stdout_buf, st_ref, "stdout"),
+        daemon=True,
+        name=f"shelljob-{job_id}-out",
+    )
+    t_err = threading.Thread(
+        target=_drain_stream,
+        args=(proc.stderr, job, job.stderr_buf, se_ref, "stderr"),
+        daemon=True,
+        name=f"shelljob-{job_id}-err",
+    )
+    job._stdout_thread = t_out
+    job._stderr_thread = t_err
+    t_out.start()
+    t_err.start()
+
+    # Wait a zero-touch moment so we can report a fast crash immediately.
+    # But never block: if still running after 0.5s, return and let the model
+    # decide to poll. The job remains supervised by the lifespan watchdog.
+    try:
+        rc = proc.wait(timeout=0.5)
+        t_out.join(timeout=2.0)
+        t_err.join(timeout=2.0)
+        with job._lock:
+            job.stdout_total = st_ref[0]
+            job.stderr_total = se_ref[0]
+        _finalize_job(job, rc)
+    except subprocess.TimeoutExpired:
+        # Still running — this is the expected path for real long tasks.
+        watchdog = threading.Thread(
+            target=_lifespan_watchdog, args=(job,),
+            daemon=True, name=f"shelljob-{job_id}-wdt",
+        )
+        watchdog.start()
+
+    resp = _job_status_payload(job, include_tail=True)
+    resp["success"] = True
+    resp["output"] = (
+        f"✅ Background job launched: {job_id}\n"
+        f"Command: {command}\n"
+        f"Status: {resp['status']}\n\n"
+        f"Poll with: `tool_poll_shell_job(job_id=\"{job_id}\", wait_seconds=30)`"
+    )
+    return resp
+
+
+def _job_status_payload(job: _ShellJob, include_tail: bool = True) -> Dict[str, Any]:
+    """Builds a serialisable status snapshot for one job."""
+    with job._lock:
+        finished = job.status != "running"
+        # Completed drain-join (best effort) once the process exits so we
+        # capture the very last flushed bytes.
+        if finished and job._stdout_thread and job._stdout_thread.is_alive():
+            job._stdout_thread.join(timeout=1.0)
+        if finished and job._stderr_thread and job._stderr_thread.is_alive():
+            job._stderr_thread.join(timeout=1.0)
+
+        stdout_text = _join_bounded(job.stdout_buf)
+        stderr_text = _join_bounded(job.stderr_buf)
+        stdout_trunc = len(stdout_text) < job.stdout_total
+        stderr_trunc = len(stderr_text) < job.stderr_total
+
+        payload: Dict[str, Any] = {
+            "job_id": job.job_id,
+            "command": job.command,
+            "status": job.status,
+            "running": not finished,
+            "return_code": job.return_code,
+            "started_at": job.started_at,
+            "finished_at": job.finished_at,
+            "elapsed_seconds": round(
+                (job.finished_at or time.time()) - job.started_at, 2
+            ),
+            "stdout_bytes_total": job.stdout_total,
+            "stderr_bytes_total": job.stderr_total,
+            "stdout_truncated": stdout_trunc,
+            "stderr_truncated": stderr_trunc,
+            "error": job.error_msg,
+        }
+        if include_tail:
+            # Cap tail per poll so a huge single poll response cannot blow the
+            # agent context window.
+            tail_cap = 32 * 1024
+            if len(stdout_text) > tail_cap:
+                stdout_text = stdout_text[-tail_cap:]
+                payload["stdout_truncated"] = True
+            if len(stderr_text) > tail_cap:
+                stderr_text = stderr_text[-tail_cap:]
+                payload["stderr_truncated"] = True
+            payload["stdout_tail"] = stdout_text
+            payload["stderr_tail"] = stderr_text
+        return payload
 
 
 def set_confirm_handler(handler: Optional[Any]) -> None:
@@ -255,7 +611,7 @@ def tool_execute_shell_command_prompt() -> str:
     os_name = platform.system()
     os_release = platform.release()
     os_arch = platform.machine()
-    cwd = os.getcwd()   
+    cwd = os.getcwd()
     py_exec = sys.executable
 
     safe_cmds_str = ", ".join(sorted(_get_safe_commands()))
@@ -317,100 +673,91 @@ Use this for environment management (pip install), running tests, or interacting
 
 {shell_info}
 
-{autonomy_desc}"""
+{autonomy_desc}
+
+LONG-RUNNING TASKS (COMPILATION, ENCODING, DEEP SCANS):
+- A foreground call blocks the agent round and is capped at a fixed timeout
+  (default {_FOREGROUND_DEFAULT_TIMEOUT:.0f}s). A shorter cap safely prevents a hang
+  from DoS-ing the agent.
+- For any task likely to exceed ~{_FOREGROUND_DEFAULT_TIMEOUT/2:.0f}s (compiling, video encoding,
+  large scans, downloads, model training, package installs), use BACKGROUND MODE:
+    1. Launch: `tool_execute_shell_command(command="...", background=true)`
+       → returns a `job_id` immediately.
+    2. Poll periodically: `tool_poll_shell_job(job_id="...", wait_seconds=30)`
+       → blocks at most `wait_seconds` (cap {_MAX_POLL_WAIT:.0f}s), returns
+       status + output tail. Repeat until status is `completed`/`failed`/`killed`.
+    3. Retrieve result: `tool_get_shell_job_result(job_id="...")` (final tail).
+    4. Terminate early : `tool_kill_shell_job(job_id="...")`.
+    5. Inspect all: `tool_list_shell_jobs()`.
+    6. Free memory: `tool_cleanup_shell_jobs()`.
+- Background jobs are auto-killed after {_MAX_JOB_LIFETIME/60:.0f} minutes (lifetime cap) and
+  are capped at {_MAX_BACKGROUND_JOBS} concurrent jobs. Output is truncated to the last
+  {_MAX_CAPTURE_BYTES//1024} KiB per stream; the tail is what you receive."""
 
 
 def tool_execute_shell_command(
     command: str,
-    env: Optional[Any] = None
+    env: Optional[Any] = None,
+    background: bool = False,
+    wait_timeout_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
-    Executes a shell command in the current workspace directory with live output streaming.
-    Use this for environment management (e.g., pip install), running tests, or interacting with the OS.
+    Executes a shell command in the current workspace directory.
+
+    Use this for environment management (e.g., pip install), running tests, or
+    interacting with the OS.
 
     Args:
         command (str): The shell command to execute.
         env: Host-injected unified runtime context; its tool_context (when present)
             streams output lines live to the terminal/UI.
+        background (bool): When True, the command is launched detached and a
+            `job_id` is returned immediately. Use `tool_poll_shell_job` to
+            monitor it. Recommended for compilation, encoding, downloads, and
+            any long-running task.
+        wait_timeout_seconds (float, optional): In foreground mode, overrides
+            the default {_FOREGROUND_DEFAULT_TIMEOUT:.0f}s timeout for this call (capped at
+            {_FOREGROUND_MAX_TIMEOUT:.0f}s). In background mode this parameter is honored as
+            an initial wait (bounded to 5s) before returning the job id.
     """
     global AUTONOMY_LEVEL
     tool_ctx = getattr(env, "tool_context", None) if env else None
     is_windows = platform.system() == "Windows"
     autonomy_level = AUTONOMY_LEVEL
 
-    env = os.environ.copy()
-    env["PYTHONUTF8"] = "1"
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUNBUFFERED"] = "1"
-
-    def _execute_streaming(cmd_str: str, timeout_sec: int) -> Tuple[int, str, str]:
-        proc = subprocess.Popen(
-            cmd_str,
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            cwd=os.getcwd(),
-            env=env,
-            bufsize=1
-        )
-        stdout_lines: List[str] = []
-        stderr_lines: List[str] = []
-
-        import threading
-
-        def _drain_stdout():
-            if proc.stdout:
-                for line in iter(proc.stdout.readline, ''):
-                    stdout_lines.append(line)
-                    clean_line = line.rstrip('\r\n')
-                    if clean_line and tool_ctx and hasattr(tool_ctx, "emit_progress"):
-                        tool_ctx.emit_progress(clean_line, {"stream": "stdout"})
-                proc.stdout.close()
-
-        def _drain_stderr():
-            if proc.stderr:
-                for line in iter(proc.stderr.readline, ''):
-                    stderr_lines.append(line)
-                    clean_line = line.rstrip('\r\n')
-                    if clean_line and tool_ctx and hasattr(tool_ctx, "emit_progress"):
-                        tool_ctx.emit_progress(clean_line, {"stream": "stderr"})
-                proc.stderr.close()
-
-        t_out = threading.Thread(target=_drain_stdout, daemon=True)
-        t_err = threading.Thread(target=_drain_stderr, daemon=True)
-        t_out.start()
-        t_err.start()
-
+    # ── Foreground timeout resolution (bounded) ──────────────────────────────
+    fg_timeout = _FOREGROUND_DEFAULT_TIMEOUT
+    if wait_timeout_seconds is not None:
         try:
-            returncode = proc.wait(timeout=timeout_sec)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            raise
+            fg_timeout = float(wait_timeout_seconds)
+        except (TypeError, ValueError):
+            fg_timeout = _FOREGROUND_DEFAULT_TIMEOUT
+        if fg_timeout <= 0:
+            fg_timeout = _FOREGROUND_DEFAULT_TIMEOUT
+        if fg_timeout > _FOREGROUND_MAX_TIMEOUT:
+            fg_timeout = _FOREGROUND_MAX_TIMEOUT
 
-        t_out.join(timeout=2.0)
-        t_err.join(timeout=2.0)
-        return returncode, "".join(stdout_lines), "".join(stderr_lines)
+    base_env = os.environ.copy()
+    base_env["PYTHONUTF8"] = "1"
+    base_env["PYTHONIOENCODING"] = "utf-8"
+    base_env["PYTHONUNBUFFERED"] = "1"
 
+    # ── Autonomy gate (identical for foreground and background) ──────────────
     try:
-        if autonomy_level == "full_access":
-            retcode, out_raw, err_raw = _execute_streaming(command, timeout_sec=120)
-        else:
-            if is_windows:
-                stripped_cmd = command.strip()
-                rmdir_match = re.match(r'^(rmdir|rd)\s+(/[sS]\s+/[qQ]|/[qQ]\s+/[sS])\s+(.+)$', stripped_cmd)
-                if rmdir_match:
-                    cmd_name = rmdir_match.group(1)
-                    cmd_flags = rmdir_match.group(2)
-                    raw_dirs = rmdir_match.group(3).strip()
-                    parts = shlex.split(raw_dirs, posix=False)
-                    if len(parts) > 1:
-                        command = " & ".join(f'{cmd_name} {cmd_flags} "{d}"' for d in parts)
+        gate_command = command
+        if is_windows:
+            stripped_cmd = command.strip()
+            rmdir_match = re.match(r'^(rmdir|rd)\s+(/[sS]\s+/[qQ]|/[qQ]\s+/[sS])\s+(.+)$', stripped_cmd)
+            if rmdir_match:
+                cmd_name = rmdir_match.group(1)
+                cmd_flags = rmdir_match.group(2)
+                raw_dirs = rmdir_match.group(3).strip()
+                parts = shlex.split(raw_dirs, posix=False)
+                if len(parts) > 1:
+                    gate_command = " & ".join(f'{cmd_name} {cmd_flags} "{d}"' for d in parts)
 
-            is_safe, risky_reason = _classify_shell_command(command)
-
+        if autonomy_level != "full_access":
+            is_safe, risky_reason = _classify_shell_command(gate_command)
             if not is_safe or autonomy_level == "strict":
                 prompt_label = f"shell: {command}"
                 if autonomy_level == "strict":
@@ -419,7 +766,6 @@ def tool_execute_shell_command(
                     prompt_label = f"[RISKY: {risky_reason}] shell: {command}"
 
                 decision, rejection_reason = _prompt_user_validation(command, prompt_label)
-
                 if decision in ("allow", "always"):
                     if decision == "always":
                         AUTONOMY_LEVEL = "full_access"
@@ -428,15 +774,15 @@ def tool_execute_shell_command(
                     reason_msg = rejection_reason or f"Restricted shell operation ({risky_reason or 'unwhitelisted command'}) denied by operator."
                     allowed_list = ", ".join(sorted(_get_safe_commands()))
                     hint = ""
-                    stripped_cmd = command.strip().lower()
+                    stripped_l = command.strip().lower()
                     if is_windows:
-                        if stripped_cmd.startswith("rm ") or stripped_cmd == "rm":
+                        if stripped_l.startswith("rm ") or stripped_l == "rm":
                             hint = "\n\n💡 HINT: You are on Windows (cmd.exe). Use 'del <file>' to delete files or 'rmdir /s /q <dir>' to delete directories. 'rm' does not exist."
-                        elif stripped_cmd.startswith("cat ") or stripped_cmd == "cat":
+                        elif stripped_l.startswith("cat ") or stripped_l == "cat":
                             hint = "\n\n💡 HINT: You are on Windows (cmd.exe). Use 'type <file>' to view files. 'cat' does not exist."
-                        elif stripped_cmd.startswith("ls ") or stripped_cmd == "ls":
+                        elif stripped_l.startswith("ls ") or stripped_l == "ls":
                             hint = "\n\n💡 HINT: You are on Windows (cmd.exe). Use 'dir' or 'dir /b' to list files. 'ls' does not exist."
-                        elif stripped_cmd.startswith("touch "):
+                        elif stripped_l.startswith("touch "):
                             hint = "\n\n💡 HINT: You are on Windows (cmd.exe). Use 'type nul > <file>' or create it using an <artifact> tag. 'touch' does not exist."
 
                     return {
@@ -451,8 +797,74 @@ def tool_execute_shell_command(
                         ),
                         "error": f"Blocked by sandbox ({autonomy_level} mode): {reason_msg}{hint}"
                     }
+    except Exception as gate_err:
+        return {"success": False, "error": f"Autonomy gate error: {gate_err}"}
 
-            retcode, out_raw, err_raw = _execute_streaming(command, timeout_sec=120)
+    # ── Background branch ────────────────────────────────────────────────────
+    if background:
+        return _start_background_job(command, base_env)
+
+    # ── Foreground branch (bounded) ──────────────────────────────────────────
+    def _execute_streaming(cmd_str: str, timeout_sec: float) -> Tuple[int, str, str]:
+        proc = subprocess.Popen(
+            cmd_str,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=os.getcwd(),
+            env=base_env,
+            bufsize=1,
+        )
+        stdout_chunks: List[str] = []
+        stderr_chunks: List[str] = []
+
+        def _drain_stdout():
+            if proc.stdout:
+                for line in iter(proc.stdout.readline, ''):
+                    stdout_chunks.append(line)
+                    clean_line = line.rstrip('\r\n')
+                    if clean_line and tool_ctx and hasattr(tool_ctx, "emit_progress"):
+                        tool_ctx.emit_progress(clean_line, {"stream": "stdout"})
+                proc.stdout.close()
+
+        def _drain_stderr():
+            if proc.stderr:
+                for line in iter(proc.stderr.readline, ''):
+                    stderr_chunks.append(line)
+                    clean_line = line.rstrip('\r\n')
+                    if clean_line and tool_ctx and hasattr(tool_ctx, "emit_progress"):
+                        tool_ctx.emit_progress(clean_line, {"stream": "stderr"})
+                proc.stderr.close()
+
+        t_out = threading.Thread(target=_drain_stdout, daemon=True)
+        t_err = threading.Thread(target=_drain_stderr, daemon=True)
+        t_out.start()
+        t_err.start()
+
+        try:
+            returncode = proc.wait(timeout=timeout_sec)
+        except subprocess.TimeoutExpired:
+            _kill_process_tree(proc)
+            t_out.join(timeout=2.0)
+            t_err.join(timeout=2.0)
+            partial_out = "".join(stdout_chunks)
+            partial_err = "".join(stderr_chunks)
+            raise subprocess.TimeoutExpired(
+                cmd=cmd_str,
+                timeout=timeout_sec,
+                output=partial_out,
+                stderr=partial_err,
+            )
+
+        t_out.join(timeout=2.0)
+        t_err.join(timeout=2.0)
+        return returncode, "".join(stdout_chunks), "".join(stderr_chunks)
+
+    try:
+        retcode, out_raw, err_raw = _execute_streaming(command, fg_timeout)
 
         error_msg = None
         if retcode != 0:
@@ -474,12 +886,28 @@ def tool_execute_shell_command(
             "output": formatted_output,
             "stderr": err_raw,
             "error": error_msg,
-            "return_code": retcode
+            "return_code": retcode,
+            "mode": "foreground",
+            "timeout_seconds": fg_timeout,
         }
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as te:
+        partial_out = te.output or ""
+        partial_err = te.stderr or ""
         return {
             "success": False,
-            "error": "Command execution timed out."
+            "mode": "foreground",
+            "command": command,
+            "timeout_seconds": fg_timeout,
+            "output": f"$ {command}\n{partial_out}",
+            "stderr": partial_err,
+            "error": (
+                f"Foreground execution exceeded the {fg_timeout:.0f}s timeout and was terminated. "
+                f"The task may still be running — install-runs, compilations, video encoding, deep scans "
+                f"and downloads routinely exceed this. If this was a legitimate long task, RE-RUN it "
+                f"in BACKGROUND MODE: call `tool_execute_shell_command(command=..., background=true)` "
+                f"to obtain a `job_id`, then poll it with `tool_poll_shell_job(job_id=..., wait_seconds=30)`. "
+                f"DO NOT simply retry in foreground — that will time out again."
+            ),
         }
     except UnicodeDecodeError as ude:
         return {
@@ -491,3 +919,161 @@ def tool_execute_shell_command(
             "success": False,
             "error": str(e)
         }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Background job control tools
+# ──────────────────────────────────────────────────────────────────────────────
+
+def tool_poll_shell_job(job_id: str, wait_seconds: float = 30.0) -> Dict[str, Any]:
+    """
+    Polls a background shell job. Blocks up to `wait_seconds` (capped at
+    `_MAX_POLL_WAIT`) waiting for the job to complete, then returns the current
+    status with output tail. Call this repeatedly until the status is
+    `completed`, `failed`, or `killed`.
+
+    Args:
+        job_id (str): The ID returned by `tool_execute_shell_command(background=true)`.
+        wait_seconds (float): Maximum blocking seconds for this poll (default 30,
+            capped at 60). Use 0 for a non-blocking status check.
+    """
+    try:
+        wait_s = float(wait_seconds) if wait_seconds is not None else 30.0
+    except (TypeError, ValueError):
+        wait_s = 30.0
+    if wait_s < 0:
+        wait_s = 0.0
+    if wait_s > _MAX_POLL_WAIT:
+        wait_s = _MAX_POLL_WAIT
+
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+    if job is None:
+        return {"success": False, "error": f"Unknown job_id '{job_id}'. Use tool_list_shell_jobs() to see active jobs."}
+
+    if wait_s > 0 and job.status == "running":
+        job._done_event.wait(timeout=wait_s)
+
+    payload = _job_status_payload(job, include_tail=True)
+    payload["success"] = True
+    payload["mode"] = "background"
+    return payload
+
+
+def tool_get_shell_job_result(job_id: str) -> Dict[str, Any]:
+    """
+    Retrieves the final result of a background shell job (or the current
+    snapshot when still running). Equivalent to `tool_poll_shell_job` with
+    zero wait; handy for a terminal read once the model has already polled
+    until completion.
+
+    Args:
+        job_id (str): The job ID.
+    """
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+    if job is None:
+        return {"success": False, "error": f"Unknown job_id '{job_id}'."}
+    payload = _job_status_payload(job, include_tail=True)
+    payload["success"] = True
+    payload["mode"] = "background"
+    return payload
+
+
+def tool_list_shell_jobs() -> Dict[str, Any]:
+    """
+    Lists all tracked background shell jobs (running, completed, failed, killed)
+    with their status, elapsed time, and exit code. Use this when you need to
+    decide which job to poll or kill.
+    """
+    with _JOBS_LOCK:
+        jobs_snapshot = list(_JOBS.values())
+
+    entries: List[Dict[str, Any]] = []
+    for job in jobs_snapshot:
+        if job is None:
+            continue
+        with job._lock:
+            entries.append({
+                "job_id": job.job_id,
+                "command": job.command,
+                "status": job.status,
+                "return_code": job.return_code,
+                "started_at": job.started_at,
+                "elapsed_seconds": round(
+                    (job.finished_at or time.time()) - job.started_at, 2
+                ),
+                "stdout_bytes_total": job.stdout_total,
+                "stderr_bytes_total": job.stderr_total,
+            })
+    entries.sort(key=lambda e: e["started_at"])
+    return {
+        "success": True,
+        "count": len(entries),
+        "running_count": sum(1 for e in entries if e["status"] == "running"),
+        "max_concurrent": _MAX_BACKGROUND_JOBS,
+        "jobs": entries,
+    }
+
+
+def tool_kill_shell_job(job_id: str) -> Dict[str, Any]:
+    """
+    Terminates a background shell job AND its process tree. Safe to call on
+    an already-finished job (no-op).
+
+    Args:
+        job_id (str): The job ID to terminate.
+    """
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+    if job is None:
+        return {"success": False, "error": f"Unknown job_id '{job_id}'."}
+
+    if job.status != "running":
+        payload = _job_status_payload(job, include_tail=True)
+        payload["success"] = True
+        payload["output"] = f"Job '{job_id}' is already {job.status}; nothing to kill."
+        return payload
+
+    _kill_process_tree(job.proc)
+    _finalize_job(job, None, killed_by="operator requested")
+
+    payload = _job_status_payload(job, include_tail=True)
+    payload["success"] = True
+    payload["output"] = f"🛑 Job '{job_id}' terminated."
+    return payload
+
+
+def tool_cleanup_shell_jobs(keep_last: int = 8) -> Dict[str, Any]:
+    """
+    Removes FINISHED background jobs from memory (running jobs are never
+    touched). Keeps the most recent `keep_last` finished jobs when they exceed
+    the retention cap.
+
+    Args:
+        keep_last (int): Number of most recent finished jobs to retain (>=0).
+    """
+    try:
+        keep_last_int = int(keep_last) if keep_last is not None else 8
+    except (TypeError, ValueError):
+        keep_last_int = 8
+    if keep_last_int < 0:
+        keep_last_int = 0
+
+    with _JOBS_LOCK:
+        finished = [
+            (jid, job) for jid, job in _JOBS.items()
+            if job is not None and job.status in ("completed", "failed", "killed")
+        ]
+        finished.sort(key=lambda kv: kv[1].finished_at or kv[1].started_at)
+        remove_count = max(0, len(finished) - keep_last_int)
+        removed_ids = [jid for jid, _ in finished[:remove_count]]
+        for jid in removed_ids:
+            _JOBS.pop(jid, None)
+
+    return {
+        "success": True,
+        "removed_count": len(removed_ids),
+        "removed_job_ids": removed_ids,
+        "remaining_jobs": len(_JOBS),
+    }

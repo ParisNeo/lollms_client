@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-15 15:10]
+
+- chore: update version and refine sandbox and system shell tools
+
 ## [2026-11-15 02:15]
 
 - feat: add Handbag functionality to lollms_personality and update version
