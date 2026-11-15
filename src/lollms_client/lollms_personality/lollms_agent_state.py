@@ -403,6 +403,117 @@ def _sanitize_tool_result(tool_res: Any, max_chars: Optional[int] = None, client
         text = text[:max_chars] + f"\n... [truncated, {len(text) - max_chars} more chars]"
     return text
 
+_STREAM_REPETITION_MIN_BLOCK_CHARS = 120
+_STREAM_REPETITION_MIN_REPEATS = 3
+
+
+def _collapse_stream_repetition(text: str, final: bool = False) -> str:
+    """Collapse adjacent repeated line-blocks in *streamed* assistant text.
+
+    Detects the classic small-model "echo loop": the same paragraph (2–4
+    consecutive non-empty lines, or the same long single line) emitted 3+ times
+    back to back. This can happen *inside one stream*, which the round-level
+    `_texts_are_repetitive` guard never sees.
+
+    Rules:
+      * Blocks must be > ``_STREAM_REPETITION_MIN_BLOCK_CHARS`` chars total
+        (short repeated words like "yes yes yes" are left alone).
+      * At least ``_STREAM_REPETITION_MIN_REPEATS`` consecutive identical
+        blocks are required before collapsing.
+      * Only ADJACENT (back-to-back) repeats are collapsed; distinct lines
+        further apart are untouched.
+      * In non-final mode the trailing block is kept as-is so we can wait for
+        the next chunk to determine whether it repeats.
+
+    Returns the collapsed text. On non-final calls the input is only modified
+    when a *completed* run of repeats is detected (>= min block chars).
+    """
+    if not text or len(text) < _STREAM_REPETITION_MIN_BLOCK_CHARS * 2:
+        return text
+
+    try:
+        lines = text.split("\n")
+    except Exception:
+        return text
+
+    if len(lines) < 4:
+        return text
+
+    changed = False
+    output: List[str] = []
+    i = 0
+    n = len(lines)
+
+    # Try block sizes from largest to smallest so we collapse whole paragraphs
+    # rather than single lines of a paragraph.
+    for block_size in (4, 3, 2, 1):
+        if block_size > (n // _STREAM_REPETITION_MIN_REPEATS):
+            continue
+        i = 0
+        new_lines: List[str] = []
+        while i < n:
+            # Gather up to block_size non-empty lines as candidate block.
+            if not lines[i].strip():
+                new_lines.append(lines[i])
+                i += 1
+                continue
+            end = i
+            non_empty_seen = 0
+            while end < n and non_empty_seen < block_size:
+                if lines[end].strip():
+                    non_empty_seen += 1
+                end += 1
+            if non_empty_seen < block_size:
+                new_lines.extend(lines[i:])
+                i = n
+                break
+            candidate = lines[i:end]
+            candidate_txt = "\n".join(candidate)
+            if len(candidate_txt.strip()) < _STREAM_REPETITION_MIN_BLOCK_CHARS:
+                new_lines.extend(candidate)
+                i = end
+                continue
+            # Count consecutive repeats.
+            repeats = 1
+            probe = end
+            while probe < n:
+                probe_end = probe
+                pe_seen = 0
+                while probe_end < n and pe_seen < block_size:
+                    if lines[probe_end].strip():
+                        pe_seen += 1
+                    probe_end += 1
+                if pe_seen < block_size:
+                    break
+                if lines[probe:probe_end] == candidate:
+                    repeats += 1
+                    probe = probe_end
+                else:
+                    break
+            if repeats >= _STREAM_REPETITION_MIN_REPEATS:
+                # Non-final mode: if the run reaches the very end, defer — the
+                # next chunk might extend it or diverge.
+                if not final and probe >= n and block_size > 1:
+                    new_lines.extend(candidate)
+                    i = end
+                    continue
+                new_lines.extend(candidate)
+                changed = True
+                i = probe
+            else:
+                new_lines.extend(candidate)
+                i = end
+        lines = new_lines
+        n = len(lines)
+
+    if not changed:
+        return text
+    try:
+        return "\n".join(lines)
+    except Exception:
+        return text
+
+
 def _detect_structural_symbols(buffer: str, language: Optional[str] = None, art_type: str = "code") -> List[Dict[str, Any]]:
     if not buffer:
         return []
@@ -1479,13 +1590,15 @@ class _AgentStreamState:
         if partial_idx != -1:
             text_before = self._pending_buffer[:partial_idx]
             if text_before:
+                text_before = _collapse_stream_repetition(text_before)
                 self.content += text_before
                 self._cb(text_before)
             self._pending_buffer = self._pending_buffer[partial_idx:]
             return True
 
-        self.content += self._pending_buffer
-        self._cb(self._pending_buffer)
+        clean_chunk = _collapse_stream_repetition(self._pending_buffer)
+        self.content += clean_chunk
+        self._cb(clean_chunk)
         self._pending_buffer = ""
         return True
 
@@ -2058,7 +2171,13 @@ class _AgentStreamState:
                 self._cb(cleaned_buffer)
             self._pending_buffer = ""
 
-
+        # ── 🧹 POST-STREAM INTRA-CONTENT REPETITION COLLAPSE ──
+        # The LLM sometimes emits the SAME paragraph or line-block two or more
+        # times *inside a single stream* (not across rounds). The round-level
+        # `_texts_are_repetitive` guard only catches inter-round repetition.
+        # Collapse repeated multi-line blocks here so the final answer text is
+        # clean even when the model loops on its own output mid-generation.
+        self.content = _collapse_stream_repetition(self.content, final=True)
 
     def was_done_detected(self) -> bool:
         return self._done_intercepted
@@ -2109,6 +2228,11 @@ class _AgentStreamState:
             cleaned = cleaned.replace(ph, orig)
 
         cleaned = re.sub(r'[`>]{1,4}\s*$', '', cleaned).strip()
+        # Final defensive pass: collapse any intra-stream echo loop the
+        # streaming-level guard may have missed (e.g. when the LLM emits a
+        # 2-line block 10+ times in a NON-adjacent pattern that the incremental
+        # detector deferred on).
+        cleaned = _collapse_stream_repetition(cleaned, final=True)
         return cleaned.strip()
     
      

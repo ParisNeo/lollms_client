@@ -38,7 +38,12 @@ from ascii_colors import ASCIIColors, trace_exception
 from .skills_manager import SkillsManager
 from .handbag import Handbag
 from .doc_navigator import DocNavigator, build_doc_tools, build_docs_scope_block
-from .lollms_agent_state import _AgentStreamState, _sanitize_tool_result, _ToolsManager
+from .lollms_agent_state import (
+    _AgentStreamState,
+    _sanitize_tool_result,
+    _ToolsManager,
+    _collapse_stream_repetition,
+)
 
 from lollms_client.lollms_chat_core import (
     calculate_dynamic_tool_char_limit as _calculate_dynamic_tool_char_limit,
@@ -9432,6 +9437,7 @@ JSON:"""
 
             if ss.was_done_detected():
                 final_response = re.sub(r'(?i)</?(?:done|end)\s*/?>', '', ss.get_clean_text()).strip()
+                final_response = _collapse_stream_repetition(final_response, final=True)
 
                 if ss.completed_actions:
                     virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text()))
@@ -11017,26 +11023,52 @@ JSON:"""
             if not text_is_repetitive and stripped_round_text:
                 lines_in_response = stripped_round_text.splitlines()
                 non_empty_lines = [l.strip() for l in lines_in_response if l.strip()]
-                if len(non_empty_lines) >= 4:
+                if len(non_empty_lines) >= 3:
                     from collections import Counter as _Counter
                     line_counts = _Counter(non_empty_lines)
                     most_common_line, most_common_count = line_counts.most_common(1)[0]
-                    # Only treat as true repetition if identical multi-sentence blocks are looping
-                    if most_common_count >= 3 and len(most_common_line) > 30:
-                        repetition_ratio = most_common_count / len(non_empty_lines)
-                        if repetition_ratio >= 0.6:
-                            text_is_repetitive = True
-                            deduplicated_lines = []
-                            seen_lines = set()
-                            for l in non_empty_lines:
-                                if l not in seen_lines:
-                                    deduplicated_lines.append(l)
-                                    seen_lines.add(l)
-                            if deduplicated_lines:
-                                stripped_round_text = "\n".join(deduplicated_lines)
-                                raw_round_text = stripped_round_text
-                                ss.content = stripped_round_text
-                            ASCIIColors.warning(f"[{self.name}] Intra-round text duplication detected ({most_common_count}x). Deduplicated.")
+                    # Detect BOTH single-line loops AND 2-line-block echo loops.
+                    # The old ratio>=0.6 threshold missed the very common case
+                    # where the model echoes a PAIR of lines N times: each
+                    # distinct line has count N/(2N)=0.5, so the loop slipped
+                    # through and streamed verbatim. We now flag:
+                    #   (a) one line repeating >=3x and covering >=40% of
+                    #       non-empty lines (single-line loop), OR
+                    #   (b) a pair of adjacent lines repeating >=3x.
+                    is_single_line_loop = (
+                        most_common_count >= 3
+                        and len(most_common_line) > 30
+                        and (most_common_count / len(non_empty_lines)) >= 0.40
+                    )
+                    is_line_pair_loop = False
+                    if not is_single_line_loop and len(non_empty_lines) >= 6:
+                        # Count consecutive (a,b) pairs that repeat back-to-back.
+                        pair_counts = _Counter()
+                        for idx in range(len(non_empty_lines) - 1):
+                            pair_counts[(non_empty_lines[idx], non_empty_lines[idx + 1])] += 1
+                        if pair_counts:
+                            (pair_a, pair_b), pair_count = pair_counts.most_common(1)[0]
+                            if pair_count >= 3 and len(pair_a) > 30 and len(pair_b) > 30:
+                                pair_line_share = (2 * pair_count) / len(non_empty_lines)
+                                if pair_line_share >= 0.40:
+                                    is_line_pair_loop = True
+
+                    if is_single_line_loop or is_line_pair_loop:
+                        text_is_repetitive = True
+                        deduplicated_lines = []
+                        seen_lines = set()
+                        for l in non_empty_lines:
+                            if l not in seen_lines:
+                                deduplicated_lines.append(l)
+                                seen_lines.add(l)
+                        if deduplicated_lines:
+                            stripped_round_text = "\n".join(deduplicated_lines)
+                            raw_round_text = stripped_round_text
+                            ss.content = stripped_round_text
+                        kind = "line-pair" if is_line_pair_loop else "single-line"
+                        ASCIIColors.warning(
+                            f"[{self.name}] Intra-round {kind} text duplication detected. Deduplicated."
+                        )
 
             if text_is_repetitive:
                 consecutive_stall_count = getattr(self, '_consecutive_stall_count', 0) + 1
