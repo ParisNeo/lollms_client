@@ -34,13 +34,145 @@ class Handbag:
 
         self.tool_files: List[Path] = self._load_tools()
         self.skills_dirs: List[Path] = [self._skills_dir.resolve()] if self._skills_dir.exists() else []
+        # Diagnostic: log EXACTLY which rag/ folder is being scanned, whether
+        # it exists, and every file discovered — BEFORE the .db split. Without
+        # this the "no RAG database" symptom is untraceable when the user has
+        # the wrong handbag open (JML vs Ltspice_design_optimizer) or a path
+        # mismatch between the on-screen tree and disk.
+        try:
+            _rag_dir_exists = self.rag_dir.exists()
+            _rag_scan_preview = []
+            if _rag_dir_exists:
+                try:
+                    _rag_scan_preview = [
+                        str(p.relative_to(self.path))
+                        for p in self.rag_dir.rglob("*") if p.is_file()
+                    ][:20]
+                except Exception:
+                    _rag_scan_preview = ["<scan failed>"]
+            ASCIIColors.info(
+                f"[Handbag-SCAN] handbag='{self.path.name}' "
+                f"rag_dir='{self.rag_dir}' exists={_rag_dir_exists} "
+                f"files_found={len(_rag_scan_preview)} preview={_rag_scan_preview}"
+            )
+        except Exception:
+            pass
         self.rag_files: List[Path] = self._load_rag_files()
+
+        # ── AUTO-DISCOVER .db DATASTORES FROM <handbag>/rag/ ──
+        # A `.db` file lying anywhere under `<handbag>/rag/` (e.g.
+        # `rag/ltspice/ltspice.db`) is a safe_store datastore. It has NOTHING
+        # to do with plain-text RAG documents (which are `.md`/`.txt`/etc.),
+        # and pretending it is one causes `read_text()` to silently fail on
+        # the binary blob — the store then never reaches the catalog and the
+        # agent correctly-but-uselessly reports "no RAG database". Auto-classify
+        # every `.db` under `rag/` as a SafeStore so a handbag shipping a
+        # datastore Just Works without ANY handbag.yaml entry.
+        _DB_LIKE_SUFFIXES = {".db", ".sqlite", ".sqlite3"}
+        _rag_db_files: List[Path] = [
+            f for f in self.rag_files if f.suffix.lower() in _DB_LIKE_SUFFIXES
+        ]
+        # Leave rag_files containing ONLY non-datastore files for the
+        # plain-text pipeline (which is what `_load_rag_files()` conceptually
+        # returns). Every recognised datastore suffix is routed to SafeStore.
+        self.rag_files = [
+            f for f in self.rag_files if f.suffix.lower() not in _DB_LIKE_SUFFIXES
+        ]
+
+        # Merge the auto-discovered .db entries into the raw extra list so the
+        # unified classification loop below handles them identically to a
+        # yaml-declared store (dedup by resolved path, deferred fallback if
+        # safe_store can't be imported, named by the .db's stem).
+        _all_extra_from_yaml = self._load_extra_knowledge_bases_rich()
+        _auto_rag_entries: List[Dict[str, Any]] = [
+            {
+                "path": f,
+                "name": f.stem,
+                "description": f"Knowledge base '{f.stem}' (auto-discovered at {f.relative_to(self.path)}).",
+            }
+            for f in _rag_db_files
+        ]
+        # Rebuild unified list, keeping yaml entries first (highest priority)
+        # and appending auto entries not already covered by yaml.
+        _seen_paths = {str(e.get("path")) for e in _all_extra_from_yaml if e.get("path")}
+        _all_extra = list(_all_extra_from_yaml)
+        for _a in _auto_rag_entries:
+            if str(_a["path"]) not in _seen_paths:
+                _all_extra.append(_a)
+                _seen_paths.add(str(_a["path"]))
+
+        if _rag_db_files:
+            try:
+                ASCIIColors.success(
+                    f"[Handbag] Auto-discovered {len(_rag_db_files)} .db datastore(s) "
+                    f"under rag/: {[str(f.relative_to(self.path)) for f in _rag_db_files]}"
+                )
+            except Exception:
+                pass
+        else:
+            # Belt-and-suspenders: if NO .db was found under rag/ but the folder
+            # exists, emit a clear diagnostic. This is the exact scenario the
+            # user hits when looking at the WRONG agent's file tree (e.g. viewing
+            # `Ltspice_design_optimizer/rag/ltspice/Ltspice.db` in the editor but
+            # chatting with `JML`, whose handbag has no rag/ folder at all).
+            try:
+                if self.rag_dir.exists():
+                    _rag_files_all = list(self.rag_files)  # non-.db (already filtered)
+                    if _rag_files_all:
+                        ASCIIColors.info(
+                            f"[Handbag] rag/ contains {len(_rag_files_all)} plain-text "
+                            f"document(s) but ZERO .db datastores: "
+                            f"{[str(f.relative_to(self.path)) for f in _rag_files_all][:10]}"
+                        )
+                    else:
+                        ASCIIColors.warning(
+                            f"[Handbag] rag/ exists at '{self.rag_dir}' but contains "
+                            f"NO files (no .db datastores, no plain-text documents). "
+                            f"The agent will report 'no RAG database' — check that the "
+                            f".db is really in THIS handbag, not another one."
+                        )
+                else:
+                    # ── SIBLING-AGENT CROSS-REFERENCE ──
+                    # The single most common cause of "my agent has no RAG" is
+                    # loading the wrong agent. When our own `rag/` is empty, scan
+                    # the PARENT directory (the agents folder) for sibling agent
+                    # handbags that DO contain `.db` files, and name them in the
+                    # warning. Turns a 30-minute debug into a 2-second fix: the
+                    # user immediately sees "JML has no rag/, but
+                    # Ltspice_design_optimizer/rag/ltspice/Ltspice.db exists".
+                    sibling_hits: List[str] = []
+                    try:
+                        parent = self.path.parent
+                        if parent.exists():
+                            for sib in sorted(parent.iterdir()):
+                                if (not sib.is_dir() or sib == self.path):
+                                    continue
+                                sib_rag = sib / "rag"
+                                if not sib_rag.exists():
+                                    continue
+                                try:
+                                    sib_dbs = [
+                                        str(p.relative_to(parent))
+                                        for p in sib_rag.rglob("*")
+                                        if p.is_file() and p.suffix.lower() in (".db", ".sqlite", ".sqlite3")
+                                    ]
+                                except Exception:
+                                    sib_dbs = []
+                                if sib_dbs:
+                                    sibling_hits.append(f"{sib.name} → {sib_dbs[0]}")
+                    except Exception:
+                        sibling_hits = []
+
+            except Exception:
+                pass
 
         # Split extra KBs: plain files/dirs vs. safe_store .db datastores.
         # Classification is driven by the DECLARED suffix (intent), not disk state,
         # so a missing .db is reported (warning) instead of being silently demoted
         # to a plain KB path. A broken/missing .db never crashes the handbag build.
-        _all_extra = self._load_extra_knowledge_bases_rich()
+        # NOTE: `_all_extra` was already built above (yaml entries + auto-discovered
+        # rag/ .db entries, deduped by resolved path). Do NOT re-load here — that
+        # would re-introduce the "yaml-only, no auto-db" bug.
         try:
             ASCIIColors.info(
                 f"[Handbag-DBG] _load_extra_knowledge_bases_rich() returned "
@@ -55,15 +187,26 @@ class Handbag:
             p = entry["path"]
             declared_name = entry.get("name")
             declared_desc = entry.get("description")
+            _is_db = self._is_safe_store_db(p)
 
             try:
                 ASCIIColors.info(
-                    f"[Handbag-DBG] Classifying entry path='{p}' "
-                    f"suffix='{p.suffix}' is_safe_store_db={self._is_safe_store_db(p)} "
-                    f"exists_on_disk={p.exists()}"
+                    f"[Handbag-DBG] Classifying KB entry path='{p}' "
+                    f"suffix='{p.suffix}' declared_name={declared_name!r} "
+                    f"is_safe_store_db={_is_db} exists_on_disk={p.exists()} "
+                    f"→ routing to {'extra_safe_stores' if _is_db else 'extra_knowledge_bases'}"
                 )
             except Exception:
                 pass
+
+            # A declared path that does NOT exist as a readable text file but
+            # IS a data-store suffix (or named after one) is still treated as a
+            # SafeStore so its deferred-config fallback is registered — the
+            # catalog then surfaces it to the LLM by declared name, even when
+            # safe_store cannot be loaded eagerly. This closes the "declared
+            # but silently demoted to plain .db KB path" gap that made an
+            # LTspice-style store invisible to the agent.
+
 
             if self._is_safe_store_db(p):
                 binding = self._open_safe_store(p)
@@ -125,6 +268,29 @@ class Handbag:
                 f"plain path(s) + extra_safe_stores={len(self.extra_safe_stores)} "
                 f"auto-instantiated SafeStore(s) — handbag='{self.path.name}'"
             )
+            # Detail: log the final store list so the user can visually confirm
+            # each `.db` under rag/ was registered (by name + resolved path).
+            if self.extra_safe_stores:
+                _store_summary = []
+                for _s in self.extra_safe_stores:
+                    if isinstance(_s, dict):
+                        _store_summary.append(f"{_s.get('name')!r}→{_s.get('db_path')}")
+                    else:
+                        _store_summary.append(
+                            f"{getattr(_s, '_handbag_label', getattr(_s, 'db_path', '?'))}"
+                        )
+                ASCIIColors.success(
+                    f"[Handbag] ✅ RAG SafeStores registered: {_store_summary} — "
+                    f"the agent WILL see these databases in its system prompt."
+                )
+            elif self.rag_dir.exists():
+                _db_lookaround = [str(p.relative_to(self.path)) for p in self.rag_dir.rglob("*.db")]
+                if _db_lookaround:
+                    ASCIIColors.warning(
+                        f"[Handbag] ⚠️ Found .db file(s) under rag/ but ZERO stores were "
+                        f"registered: {_db_lookaround}. This means the auto-discovery "
+                        f"failed — please report this state."
+                    )
         except Exception:
             pass
 
@@ -276,25 +442,92 @@ class Handbag:
         """Back-compat wrapper: returns only the resolved paths (drops name/description)."""
         return [entry["path"] for entry in self._load_extra_knowledge_bases_rich()]
 
+    # YAML keys accepted for knowledge-base declarations. The canonical key is
+    # ``extra_knowledge_bases`` (backward compat), but users frequently write
+    # ``rag_databases`` / ``knowledge_bases`` / ``rag`` / ``knowledge`` — those
+    # were previously SILENTLY IGNORED, producing an agent that "has no RAG
+    # database" despite a declaration in handbag.yaml. All accepted keys are
+    # merged (deduplicated by resolved path). See [Handbag] DBG logs at load.
+    _KB_MANIFEST_KEYS = (
+        "extra_knowledge_bases",
+        "rag_databases",
+        "knowledge_bases",
+        "knowledge",
+        "rag",
+    )
+
     def _load_extra_knowledge_bases_rich(self) -> List[Dict[str, Any]]:
         """
-        Reads `extra_knowledge_bases` from handbag.yaml. Each yielded item is a
+        Reads knowledge-base declarations from handbag.yaml. Every accepted YAML
+        key (see ``_KB_MANIFEST_KEYS``) is merged. Each yielded item is a
         normalised dict: {"path": Path, "name": str|None, "description": str|None}.
 
-        Accepted yaml shapes (BOTH keep working):
+        Accepted yaml shapes (ALL forms work):
             extra_knowledge_bases:
               - "Auto design.db"                    # bare string  → name = stem
               - "docs/notes.txt"
               - path: "Auto design.db"              # dict form    → honours name/description
                 name: "auto_design"
                 description: "ASIC project specs."
+
+            rag_databases:                          # ALIAS — same semantics
+              - path: "LTspice.lib.db"
+                name: "ltspice"
+                description: "LTspice component models."
+
+            knowledge_bases: [...]                  # ALIAS
+            rag:            [...]                  # ALIAS
+            knowledge:      [...]                  # ALIAS
+
+        Also accepts a mapping form where the KEY is the display name:
+            rag_databases:
+              "ltspice": {path: "LTspice.lib.db", description: "..."}
+              "asic": "asic_specs.db"              # shorthand
         """
-        declared = self.manifest.get("extra_knowledge_bases") if isinstance(self.manifest, dict) else None
-        if not declared:
+        if not isinstance(self.manifest, dict):
             return []
-        if isinstance(declared, (str, Path)):
-            declared = [declared]
-        if not isinstance(declared, (list, tuple)):
+
+        # Gather every declared key with a dual-form normalisation:
+        #   * list items → {"path", "name", "description"}
+        #   * mapping form → {"path", "name": <key>, "description"}
+        declared: List[Any] = []
+        _found_keys: List[str] = []
+        for key in self._KB_MANIFEST_KEYS:
+            val = self.manifest.get(key)
+            if not val:
+                continue
+            _found_keys.append(key)
+            if isinstance(val, (str, Path)):
+                declared.append(val)
+            elif isinstance(val, dict):
+                # Mapping form: {display_name: path_or_dict}
+                for disp_name, inner in val.items():
+                    if isinstance(inner, dict):
+                        merged = dict(inner)
+                        merged.setdefault("name", disp_name)
+                        declared.append(merged)
+                    else:
+                        declared.append({"path": inner, "name": disp_name})
+            elif isinstance(val, (list, tuple)):
+                declared.extend(val)
+            else:
+                try:
+                    ASCIIColors.warning(
+                        f"[Handbag] Ignored manifest key '{key}': expected list/mapping, "
+                        f"got {type(val).__name__}."
+                    )
+                except Exception:
+                    pass
+
+        try:
+            ASCIIColors.info(
+                f"[Handbag-DBG] KB manifest keys found={_found_keys or '(none)'} "
+                f"→ {len(declared)} candidate(s) to normalise."
+            )
+        except Exception:
+            pass
+
+        if not declared:
             return []
 
         out: List[Dict[str, Any]] = []
@@ -317,7 +550,7 @@ class Handbag:
                     declared_desc = None
                 else:
                     ASCIIColors.warning(
-                        f"[Handbag] Skipped malformed extra_knowledge_bases entry: {item!r}"
+                        f"[Handbag] Skipped malformed KB declaration entry: {item!r}"
                     )
                     continue
 
@@ -339,7 +572,7 @@ class Handbag:
             except Exception as e:
                 try:
                     ASCIIColors.warning(
-                        f"[Handbag] Skipped malformed extra_knowledge_bases entry: {item!r} ({e})"
+                        f"[Handbag] Skipped malformed KB declaration entry: {item!r} ({e})"
                     )
                 except Exception:
                     pass
@@ -355,7 +588,7 @@ class Handbag:
         routed to the SafeStore auto-instantiation path, where it is reported with
         a clear warning instead of being silently demoted to a plain KB path.
         """
-        return path.suffix.lower() == ".db"
+        return path.suffix.lower() in (".db", ".sqlite", ".sqlite3")
 
     @staticmethod
     def _open_safe_store(db_path: Path) -> Optional[Any]:

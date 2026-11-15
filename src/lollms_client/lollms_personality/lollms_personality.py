@@ -335,23 +335,38 @@ def _resolve_rag_tool_identity(store: Any, idx: int) -> "tuple[str, str]":
     """
     Resolve (tool_name, tool_description) for a handbag SafeStore binding.
 
-    Priority:
-      1. Provenance written by Handbag  (store._handbag_label / store._handbag_description)
-      2. Host-app-set attributes        (store.name / store.description)
-      3. Fallback                       (db_path stem + generic description)
+    Understands BOTH:
+      * A live ``SafeStoreRAGBinding`` (attribute access on the object), and
+      * A deferred config dict produced by Handbag when the ``.db`` could not
+        be opened eagerly (``{"name","db_path","vectorizer_name","description"}``).
 
-    The name is normalised into a snake_case identifier and prefixed with 'rag_' so
-    multiple stores never collide and the LLM sees a stable, greppable tool name.
+    For deferred dicts, attribute access (``getattr(store, "name", ...)``) always
+    returns ``None`` because dict KEYS are not attributes. That bug previously
+    caused EVERY deferred store to be labeled ``store_0`` / ``store_1`` — losing
+    the human-authored name/description and making the catalog entry opaque to
+    the LLM. The dict branch now reads the keys directly.
+
+    Priority:
+      1. Provenance written by Handbag  (_handbag_label / _handbag_description)
+      2. Host-app-set attributes        (store.name / store.description)
+      3. Dict keys                      (store["name"] / store["description"])
+      4. Fallback                       (db_path stem + generic description)
     """
+    def _get(key: str) -> Any:
+        if isinstance(store, dict):
+            return store.get(key)
+        return getattr(store, key, None)
+
     raw_name = (
-        getattr(store, "_handbag_label", None)
-        or getattr(store, "name", None)
+        _get("_handbag_label")
+        or _get("name")
         or getattr(getattr(store, "db_path", None), "stem", None)
+        or (Path(store["db_path"]).stem if isinstance(store, dict) and store.get("db_path") else None)
         or f"store_{idx}"
     )
     raw_desc = (
-        getattr(store, "_handbag_description", None)
-        or getattr(store, "description", None)
+        _get("_handbag_description")
+        or _get("description")
         or f"Search the '{raw_name}' knowledge base for relevant excerpts."
     )
     slug = _sanitise_tool_ident(str(raw_name), fallback=f"store_{idx}")
@@ -2579,7 +2594,7 @@ class LollmsPersonality:
                 else:
                     _existing_store_paths.add(str(getattr(_s, "db_path", "")))
             for _kb in list(self.extra_knowledge_bases):
-                if _kb.suffix.lower() == ".db":
+                if _kb.suffix.lower() in (".db", ".sqlite", ".sqlite3"):
                     _key = _kb.stem.lower()
                     if str(_kb) not in _existing_store_paths:
                         # Prefer a real declared/display name over the bare stem so the
@@ -2964,10 +2979,22 @@ class LollmsPersonality:
             
 
 
-        # Initialize RAG data sources from handbag rag/ folder
+        # Initialize RAG data sources from handbag rag/ folder.
+        #
+        # IMPORTANT: `hb.rag_files` now contains ONLY plain-text documents.
+        # Any `.db` under `<handbag>/rag/` has been auto-promoted into
+        # `hb.extra_safe_stores` (see Handbag.__init__), so calling
+        # `read_text()` on a binary datastore is now impossible by construction.
+        # The defensive `.db` skip below exists only for handbags built by an
+        # older Handbag implementation whose `rag_files` still carried them.
         rag_data_sources: List[RAGDataSource] = []
         if hb.rag_files:
             for rf in hb.rag_files:
+                if rf.suffix.lower() in (".db", ".sqlite", ".sqlite3"):
+                    # Defensive: old Handbag builds did not split .db out.
+                    # The modern Handbag.__init__ already routed this file into
+                    # extra_safe_stores; skip it here so we don't double-register.
+                    continue
                 try:
                     content = rf.read_text(encoding="utf-8", errors="ignore")
                     doc_title = rf.stem.replace("_", " ").title()
@@ -3037,8 +3064,9 @@ class LollmsPersonality:
 
         _raw_kbs = list(hb.extra_knowledge_bases) + [Path(p) for p in (extra_knowledge_bases or [])]
         merged_kbs: List[Path] = []
+
         for _kb in _raw_kbs:
-            if _kb.suffix.lower() == ".db":
+            if _kb.suffix.lower() in (".db", ".sqlite", ".sqlite3"):
                 try:
                     _resolved_kb = str(Path(_kb).expanduser().resolve())
                 except Exception:
@@ -3061,6 +3089,60 @@ class LollmsPersonality:
                 f"extra_safe_stores={len(hb.extra_safe_stores)} "
                 f"(merged: kbs={len(merged_kbs)}, stores={len(merged_safe_stores)})"
             )
+            # Detail diagnostic: list each merged store and KB by its identity so
+            # the user can confirm (e.g.) that 'ltspice' survived the merge.
+            _store_ids = []
+            for _s in merged_safe_stores:
+                if isinstance(_s, dict):
+                    _store_ids.append(f"{_s.get('name') or _s.get('db_path') or '<unnamed>'}")
+                else:
+                    _store_ids.append(
+                        getattr(_s, "_handbag_label", None)
+                        or getattr(_s, "db_path", None)
+                        or type(_s).__name__
+                    )
+            ASCIIColors.info(
+                f"[Handbag.from_handbag] merged_safe_stores → {_store_ids}"
+            )
+            ASCIIColors.info(
+                f"[Handbag.from_handbag] merged_kbs → {[str(p) for p in merged_kbs]}"
+            )
+            # IDENTITY CHECK: if the merged store list is EMPTY, log the exact
+            # handbag folder so the user can compare it against the folder path
+            # they are inspecting in the editor. The #1 cause of "my RAG
+            # database is invisible" is a mismatch between agent name and folder
+            # (e.g. chatting with `JML` while the `.db` lives in
+            # `Ltspice_design_optimizer/rag/ltspice/`).
+            if not merged_safe_stores and not merged_kbs:
+                # Distinguish "genuinely RAG-free handbag" (a normal, valid
+                # state — e.g. JML with an empty/no rag/) from "a datastore was
+                # declared but failed to resolve" (a real bug). The former is a
+                # quiet INFO; the latter is a loud ERROR. This stops spam for
+                # agents that legitimately carry no knowledge base while
+                # preserving the alarm when something was expected.
+                _rag_dir = hb.path / "rag"
+                _has_rag_dir = _rag_dir.exists() and _rag_dir.is_dir()
+                _has_declared_kb = bool(hb.manifest.get("extra_knowledge_bases")
+                                        or hb.manifest.get("rag_databases")
+                                        or hb.manifest.get("knowledge_bases")
+                                        or hb.manifest.get("knowledge")
+                                        or hb.manifest.get("rag"))
+                if _has_rag_dir or _has_declared_kb:
+                    ASCIIColors.error(
+                        f"[Handbag.from_handbag] ⚠️ ZERO RAG databases resolved from "
+                        f"handbag '{hb.path}' DESPITE a rag/ folder or a KB declaration. "
+                        f"This is a real bug — the handbag intended to have a datastore "
+                        f"but it was not registered. Check the [Handbag-SCAN] and "
+                        f"[Handbag-DBG] lines above for the exact failure."
+                    )
+                else:
+                    ASCIIColors.info(
+                        f"[Handbag.from_handbag] handbag '{hb.path.name}' is a "
+                        f"RAG-free agent (no rag/ folder, no KB declaration). "
+                        f"The agent will correctly report 'no RAG database'. "
+                        f"If you EXPECTED a database, you are loading the WRONG "
+                        f"handbag — check sibling agent folders for a rag/*.db."
+                    )
         except Exception:
             pass
 
@@ -3380,6 +3462,18 @@ class LollmsPersonality:
                 except Exception as e:
                     trace_exception(e)
                     return {"success": False, "sources": [], "count": 0, "query": query, "error": str(e)}
+
+            # ── HANDBAG FALLBACK ──
+            # A personality loaded from a handbag may carry SafeStore bindings
+            # (extra_safe_stores) and/or plain KB paths (extra_knowledge_bases)
+            # WITHOUT any declarative data_source. Without this fallback,
+            # pre-hydration in chat() returns 0 hits and the agent — despite
+            # owning a datastore — believes it has no RAG database. Route the
+            # query to the first available handbag store/KB path.
+            handbag_source = self._query_handbag_rag_sources(query, top_k=top_k,
+                                                             threshold=threshold, method=method)
+            if handbag_source is not None:
+                return handbag_source
             return {"success": False, "sources": [], "count": 0, "query": query}
 
         if datasource_name:
@@ -3413,24 +3507,310 @@ class LollmsPersonality:
             "query": query
         }
 
+    def _query_handbag_rag_sources(
+        self,
+        query: str,
+        top_k: int = 5,
+        threshold: float = 0.0,
+        method: str = "dense",
+        **kwargs,
+    ) -> Optional[Dict[str, Any]]:
+        """Query handbag-provided RAG sources (SafeStores + plain KB paths).
+
+        Returns a normalised ``query_data``-shaped dict, or ``None`` when no
+        handbag source is configured (so the caller can return the empty
+        result). Never raises — individual store errors are logged and skipped
+        so one broken store does not poison the whole query.
+        """
+        stores = list(getattr(self, "extra_safe_stores", []) or [])
+        kb_paths = list(getattr(self, "extra_knowledge_bases", []) or [])
+        if not stores and not kb_paths:
+            return None
+
+        all_sources: List[Dict[str, Any]] = []
+
+        # 1) Query each SafeStore binding (materialising deferred dict configs).
+        for idx, store in enumerate(stores):
+            try:
+                if isinstance(store, dict):
+                    deferred_db = store.get("db_path")
+                    if not deferred_db:
+                        continue
+                    resolved = _get_or_create_safestore_binding(Path(deferred_db))
+                    if resolved is None:
+                        continue
+                    stores[idx] = resolved
+                    store = resolved
+
+                label, _desc = _resolve_rag_tool_identity(store, idx)
+                db_label = label[4:] if label.startswith("rag_") else label
+                # Prefer the human-authored display name from a deferred dict over
+                # the snake_case fallback so hits cite e.g. "ltspice", not "store_0".
+                if isinstance(store, dict) and store.get("name"):
+                    db_label = store["name"]
+
+                try:
+                    raw = store.query(
+                        query, top_k=top_k,
+                        min_relevance_percent=threshold, method=method,
+                    )
+                except TypeError:
+                    raw = store.query(query, top_k=top_k)
+
+                normalised = _normalise_raw(raw, query, db_label)
+                for src in normalised.get("sources", []) or []:
+                    src.setdefault("datasource_name", db_label)
+                    all_sources.append(src)
+            except Exception as store_err:
+                ASCIIColors.warning(
+                    f"[{self.name}] Handbag SafeStore query failed for entry {idx}: {store_err}"
+                )
+
+        # 2) Query plain KB paths via the existing data-source query engine.
+        for kb in kb_paths:
+            try:
+                kb_path = Path(kb)
+                label = kb_path.stem or kb_path.name
+                if kb_path.suffix.lower() in (".db", ".sqlite", ".sqlite3"):
+                    binding = _get_or_create_safestore_binding(kb_path)
+                    if binding is None:
+                        continue
+                    try:
+                        raw = binding.query(
+                            query, top_k=top_k,
+                            min_relevance_percent=threshold, method=method,
+                        )
+                    except TypeError:
+                        raw = binding.query(query, top_k=top_k)
+                    normalised = _normalise_raw(raw, query, label)
+                    for src in normalised.get("sources", []) or []:
+                        src.setdefault("datasource_name", label)
+                        all_sources.append(src)
+            except Exception as kb_err:
+                ASCIIColors.warning(
+                    f"[{self.name}] Handbag KB path query failed for '{kb}': {kb_err}"
+                )
+
+        return {
+            "success": bool(all_sources),
+            "sources": all_sources,
+            "count": len(all_sources),
+            "query": query,
+        }
+
+    def _build_rag_catalog(self) -> List[Dict[str, Any]]:
+        """Build the authoritative, deduplicated catalogue of RAG databases.
+
+        This is the SINGLE source of truth consumed by BOTH the system-prompt
+        ``build_rag_system_block()`` and the ``tool_query_rag`` description, so
+        the LLM always sees the exact same set of ``datasource_name`` values in
+        both places. Historically the two diverged: ``build_rag_system_block()``
+        only listed declarative ``data_sources`` while ``build_rag_tools()``
+        listed handbag SafeStores and KB paths too — that divergence is why an
+        agent asked "do you have a RAG database?" answered "no" even though its
+        handbag shipped one.
+
+        Each entry is a normalised dict:
+            {"name", "description", "kind", "path"}
+        where ``kind`` is one of:
+            "data_source"  — declarative RAGDataSource
+            "safe_store"   — handbag SafeStore binding (or deferred config dict)
+            "kb_path"      — plain file/dir knowledge base (incl. .db fallbacks)
+
+        Deduplication is by resolved physical ``.db`` path so the same datastore
+        is never listed twice under two names.
+        """
+        catalog: List[Dict[str, Any]] = []
+        seen_store_paths: set = set()
+
+        # 1) Declarative data sources (highest priority — user-declared).
+        for ds in self.data_sources:
+            catalog.append({
+                "name": ds.name,
+                "description": ds.description or f"Data source '{ds.name}'",
+                "kind": "data_source",
+                "path": _resolve_store_identity_path(ds.store),
+            })
+            _ds_store_path = _resolve_store_identity_path(ds.store)
+            if _ds_store_path is not None:
+                seen_store_paths.add(_ds_store_path)
+
+        # 2) Handbag SafeStore bindings (names normalised to snake_case identifiers).
+        existing_names = {entry["name"] for entry in catalog}
+        for idx, store in enumerate(getattr(self, "extra_safe_stores", []) or []):
+            store_path = _resolve_store_identity_path(store)
+            if store_path is not None and store_path in seen_store_paths:
+                continue
+            tool_name, tool_desc = _resolve_rag_tool_identity(store, idx)
+            base_label = tool_name[4:] if tool_name.startswith("rag_") else tool_name
+            label, n = base_label, 1
+            while label in existing_names:
+                n += 1
+                label = f"{base_label}_{n}"
+            catalog.append({
+                "name": label,
+                "description": tool_desc,
+                "kind": "safe_store",
+                "path": store_path,
+            })
+            existing_names.add(label)
+            if store_path is not None:
+                seen_store_paths.add(store_path)
+
+        # 3) Plain knowledge-base paths (files/dirs, plus .db fallbacks).
+        #
+        # SAFETY NET: a datastore declaration that reached this layer as a
+        # plain ``extra_knowledge_bases`` path (e.g. because the yaml declared
+        # it under a non-canonical key, or a host-app passed it through the
+        # ``extra_knowledge_bases=`` argument) is still surfaced. Datastore
+        # suffixes (.db / .sqlite / .sqlite3) route to safe_store kind so the
+        # tool description and system prompt agree with the tool's actual
+        # query path; plain text files/dirs stay as kb_path.
+        _DB_LIKE_EXTS = {".db", ".sqlite", ".sqlite3"}
+        for kb in getattr(self, "extra_knowledge_bases", []) or []:
+            kb_path = Path(kb)
+            kb_identity = _resolve_store_identity_path(kb_path)
+            if kb_identity is not None and kb_identity in seen_store_paths:
+                continue
+            base_label = kb_path.stem or kb_path.name
+            label, n = base_label, 1
+            while label in existing_names:
+                n += 1
+                label = f"{base_label}_{n}"
+            _is_db_like = kb_path.suffix.lower() in _DB_LIKE_EXTS
+            catalog.append({
+                "name": label,
+                "description": getattr(kb_path, "_handbag_description", None)
+                               or f"Knowledge base '{label}'.",
+                "kind": "safe_store" if _is_db_like else "kb_path",
+                "path": str(kb_path),
+            })
+            existing_names.add(label)
+            if kb_identity is not None:
+                seen_store_paths.add(kb_identity)
+
+        # 4) Client-level RAG binding (``self.lollms_client.rag``).
+        # ``has_data`` returns True for a client RAG binding but the binding
+        # lives NOWHERE in the personality's own attributes, so this entry
+        # is the ONLY way the system prompt and tool description can mention
+        # it. Without it, the agent truthfully reports "no RAG database"
+        # whenever the personality carries no local store but a working
+        # client binding exists.
+        _client_rag = getattr(self.lollms_client, "rag", None) if self.lollms_client else None
+        if _client_rag is not None and not hasattr(_client_rag, "_mock_return_value"):
+            _client_store_name = (
+                getattr(_client_rag, "store_name", None)
+                or getattr(_client_rag, "binding_name", None)
+                or "rag_binding"
+            )
+            if str(_client_store_name) not in existing_names:
+                catalog.append({
+                    "name": str(_client_store_name),
+                    "description": (
+                        f"Client-level RAG binding '{_client_store_name}' "
+                        f"(the active client datastore)."
+                    ),
+                    "kind": "client_rag",
+                    "path": None,
+                })
+                existing_names.add(str(_client_store_name))
+
+        return catalog
+
+    def get_rag_databases_info(self) -> Dict[str, Any]:
+        """Return a structured, read-only report of ALL RAG databases wired to
+        this personality — both internal (handbag-declared / promoted) and
+        extra (caller-supplied) sources.
+
+        Unlike the raw ``extra_safe_stores`` / ``extra_knowledge_bases``
+        attributes, this method returns plain serialisable data with stable
+        ``datasource_name`` values that match exactly what the LLM is told by
+        the system prompt and ``tool_query_rag`` description.
+
+        Returns:
+            {
+              "has_any_data": bool,          # honest signal for probing callers
+              "total": int,                  # number of distinct databases
+              "databases": [
+                {
+                  "name": str,               # exact datasource_name for tool_query_rag
+                  "description": str,
+                  "kind": "data_source" | "safe_store" | "kb_path",
+                  "db_path": str | None,     # resolved .db path when applicable
+                },
+                ...
+              ],
+            }
+
+        Never raises; on internal error returns a ``has_any_data=False`` shell.
+        """
+        try:
+            catalog = self._build_rag_catalog()
+            databases = [
+                {
+                    "name": entry["name"],
+                    "description": entry["description"],
+                    "kind": entry["kind"],
+                    "db_path": entry.get("path"),
+                }
+                for entry in catalog
+            ]
+            return {
+                "has_any_data": bool(databases),
+                "total": len(databases),
+                "databases": databases,
+            }
+        except Exception as exc:  # pragma: no cover - defensive
+            trace_exception(exc)
+            return {"has_any_data": False, "total": 0, "databases": []}
+
     def build_rag_system_block(self) -> str:
-        if not self.has_data:
+        # The catalog is the SINGLE source of truth — do NOT gate on ``has_data``.
+        # ``has_data`` is a coarse any-RAG-indicator flag; the catalog reflects the
+        # ACTUAL queryable databases. Gating on ``has_data`` previously caused the
+        # block to be silently dropped even when a working catalog existed (e.g.
+        # a client RAG binding not in the personality's own attributes), producing
+        # an agent that truthfully denied owning a database.
+        catalog = self._build_rag_catalog()
+        if not catalog:
             return ""
         lines = ["=== RAG KNOWLEDGE BASES ==="]
-        lines.append("You have access to the following RAG knowledge base data source(s):")
-        for ds in self.data_sources:
-            desc = f": {ds.description}" if ds.description else ""
-            lines.append(f"- **{ds.name}**{desc}")
+        lines.append("You HAVE access to the following RAG knowledge base(s):")
+        for entry in catalog:
+            desc = f": {entry['description']}" if entry.get("description") else ""
+            lines.append(f"- **{entry['name']}**{desc}")
         lines.append(
             "Relevant excerpts are automatically pre-hydrated into your context under "
             "'=== RETRIEVED RAG CONTEXT ==='.\n"
-            "You can also query specific data sources on demand using `tool_query_rag`."
+            "You can also query a specific knowledge base on demand using "
+            "`tool_query_rag` by passing its exact name as `datasource_name`.\n"
+            "IMPORTANT: When the user asks whether you have a RAG database, you "
+            "MUST answer YES and cite the name(s) above. Do NOT claim to lack RAG "
+            "capabilities — this block is authoritative and overrides any prior "
+            "assumption about your tooling."
         )
         lines.append("=== END RAG KNOWLEDGE BASES ===\n")
-        return "\n".join(lines)
+        block = "\n".join(lines)
+        # DEBUG visibility: dump the exact block that will reach the model, so
+        # if it STILL claims "no RAG database" you can prove the block was
+        # present in the prompt (and the failure is model-side, not catalog-side).
+        if getattr(self, 'debug_mode', False):
+            try:
+                ASCIIColors.info(f"[{self.name}] === RAG BLOCK (verbatim) ===\n{block}")
+            except Exception:
+                pass
+        return block
 
     def build_rag_tools(self) -> Dict[str, Dict[str, Any]]:
-            if not self.has_data:
+            # Never gate on the coarse ``has_data`` flag — the catalog is
+            # authoritative. If ANY database is present (declarative source,
+            # handbag SafeStore, plain KB, or client RAG binding), the tools
+            # must be built; the description and system prompt then stay in
+            # perfect sync through the shared catalog. A previous ``has_data``
+            # gate silently returned {} in edge cases where the catalog was
+            # populated but ``has_data`` was False — which is exactly the class
+            # of bug that produces a database-less agent.
+            if not self._build_rag_catalog() and not self.has_data:
                 return {}
 
             # --- Build a "name: description" catalog covering EVERY RAG source ---
@@ -3501,7 +3881,29 @@ class LollmsPersonality:
                 except Exception:
                     pass
 
-            # 3) Plain knowledge-base paths (files/dirs — resolved via self.query_data)
+            # 3) Client-level RAG binding (``self.lollms_client.rag``).
+            # Mirrors the catalog's client_rag entry so the tool description and
+            # the system prompt enumerate the SAME set. ``has_data`` returns True
+            # for a client binding but it lives nowhere in the personality's
+            # attributes; without this entry the LLM was told "(no databases
+            # configured)" while a fully working client RAG was live.
+            _client_rag = getattr(self.lollms_client, "rag", None) if self.lollms_client else None
+            _client_rag_name: Optional[str] = None
+            if _client_rag is not None and not hasattr(_client_rag, "_mock_return_value"):
+                _client_rag_name = (
+                    getattr(_client_rag, "store_name", None)
+                    or getattr(_client_rag, "binding_name", None)
+                    or "rag_binding"
+                )
+                if _client_rag_name not in safe_store_map and _client_rag_name not in kb_path_map \
+                        and not any(ds.name == _client_rag_name for ds in self.data_sources):
+                    catalog_lines.append(
+                        f"{_client_rag_name}: Client-level RAG binding "
+                        f"(the active client datastore; queries route to "
+                        f"``lollms_client.query_rag``)."
+                    )
+
+            # 4) Plain knowledge-base paths (files/dirs — resolved via self.query_data)
             #    This is the ONLY way a .db that failed to open as a SafeStore still
             #    appears in the prompt (e.g. app-level fallback path).
             #    The catalog line exposes the EXACT `datasource_name` the LLM must pass,
@@ -3560,8 +3962,29 @@ class LollmsPersonality:
             else:
                 ds_list_str = "\n".join(catalog_lines)  # ← NEWLINES, per user request
 
+            # Sanity-check that the tool description and the system-prompt block
+            # enumerate the SAME databases. Both derive from the same underlying
+            # state (data_sources + extra_safe_stores + extra_knowledge_bases);
+            # this log surfaces any future divergence immediately.
+            try:
+                _catalog_names = sorted(
+                    [ds.name for ds in self.data_sources]
+                    + list(safe_store_map.keys())
+                    + list(kb_path_map.keys())
+                )
+                _prompt_names = sorted(e["name"] for e in self._build_rag_catalog())
+                if _catalog_names != _prompt_names:
+                    ASCIIColors.warning(
+                        f"[{self.name}] RAG catalogue drift detected between "
+                        f"tool_query_rag and system prompt: tool={_catalog_names} "
+                        f"prompt={_prompt_names}"
+                    )
+            except Exception:
+                pass
+
             _ds_options = ", ".join(
-                list(safe_store_map.keys())
+                ([_client_rag_name] if _client_rag_name else [])
+                + list(safe_store_map.keys())
                 + list(kb_path_map.keys())
                 + [ds.name for ds in self.data_sources]
             ) or "default"
@@ -3724,6 +4147,36 @@ class LollmsPersonality:
 
                 # Branch 2: path-based KB or default — with .db auto-routing
                 try:
+                    # Client-level RAG binding target: route to the client binding
+                    # directly, since it isn't in ``data_sources``. This is the ONLY
+                    # path that lets the LLM query a client binding by its catalogue
+                    # name after it was surfaced in the system prompt.
+                    if datasource_name and datasource_name == _client_rag_name and _client_rag is not None:
+                        try:
+                            try:
+                                res = self.lollms_client.query_rag(
+                                    query, top_k=top_k,
+                                    min_relevance_percent=threshold, method=method,
+                                )
+                            except TypeError:
+                                res = self.lollms_client.query_rag(query, top_k=top_k)
+                            if not res:
+                                return {"success": True, "output": f"No relevant content found in client RAG for '{query}'."}
+                            _parts = []
+                            for _i, _item in enumerate(res, 1):
+                                _title = _item.get("source") or _item.get("title") or "Document"
+                                _score = _item.get("relevance_percent", _item.get("score"))
+                                _score_str = f" (Score: {_score:.1f})" if isinstance(_score, (int, float)) else ""
+                                _parts.append(f"[{_i}] {_title}{_score_str}:\n{_item.get('content', '')}")
+                            return {
+                                "success": True,
+                                "sources_count": len(res),
+                                "sources": res,
+                                "output": "\n\n".join(_parts),
+                            }
+                        except Exception as _cr_err:
+                            return {"success": False, "error": f"Client RAG query failed: {_cr_err}"}
+
                     # NEW: if the target path is a .db, auto-instantiate a SafeStore
                     # and query it directly (query_data has no .db handler).
                     _kb_path = kb_path_map.get(datasource_name) if datasource_name else None
@@ -3735,7 +4188,7 @@ class LollmsPersonality:
                         )
                     except Exception:
                         pass
-                    if _kb_path is not None and Path(_kb_path).suffix.lower() == ".db":
+                    if _kb_path is not None and Path(_kb_path).suffix.lower() in (".db", ".sqlite", ".sqlite3"):
                         ASCIIColors.info(
                             f"[RAG-DIAG] BRANCH=db-auto datasource_name='{datasource_name}' "
                             f"path='{_kb_path}' (kb_path_map had a .db — routing through SafeStoreRAGBinding)"
@@ -3878,7 +4331,7 @@ class LollmsPersonality:
                     return _st
                 if datasource_name and datasource_name in kb_path_map:
                     _p = kb_path_map[datasource_name]
-                    if Path(_p).suffix.lower() == ".db":
+                    if Path(_p).suffix.lower() in (".db", ".sqlite", ".sqlite3"):
                         return _get_or_create_safestore_binding(Path(_p))
                     return None
                 if datasource_name:
@@ -4214,7 +4667,7 @@ class LollmsPersonality:
             for _st in safe_store_map.values():
                 _probe_stores.append(_st)
             for _kb in kb_path_map.values():
-                if Path(_kb).suffix.lower() == ".db":
+                if Path(_kb).suffix.lower() in (".db", ".sqlite", ".sqlite3"):
                     _probe_stores.append(_kb)
             _probe_stores.extend(self.data_sources)
             if self.lollms_client and getattr(self.lollms_client, "rag", None):
@@ -4343,6 +4796,20 @@ class LollmsPersonality:
             or bool(getattr(self, "extra_safe_stores", []))
             or (self.lollms_client is not None and (getattr(self.lollms_client, "rag", None) is not None or bool(getattr(self.lollms_client, "rag_model_profiles_registry", None))))
         )
+
+    @property
+    def has_rag_databases(self) -> bool:
+        """True when this personality has at least one usable RAG database.
+
+        Unlike ``has_data`` (which also counts ``data_files`` / ``query_rag_callback``
+        / client RAG bindings), this reflects ONLY queryable databases exposed
+        through ``get_rag_databases_info()``. Use it to answer "do I have a RAG
+        database?" honestly.
+        """
+        try:
+            return bool(self._build_rag_catalog())
+        except Exception:
+            return False
 
     @property
     def workspace_path(self) -> Optional[Path]:
@@ -7134,7 +7601,13 @@ JSON:"""
             "tool_expand_rag_context",
             "tool_list_rag_documents",
         )
-        if any(t not in active_tools for t in _RAG_TOOL_NAMES) and (self.has_data or _safe_stores or _kb_paths):
+        _client_rag_present = (
+            self.lollms_client is not None
+            and getattr(self.lollms_client, "rag", None) is not None
+        )
+        if any(t not in active_tools for t in _RAG_TOOL_NAMES) and (
+            self.has_data or _safe_stores or _kb_paths or _client_rag_present
+        ):
             try:
                 _rag_toolset = self.build_rag_tools()
                 for _rt in _RAG_TOOL_NAMES:
@@ -8135,13 +8608,31 @@ JSON:"""
         stable_system_prompt = self._build_system_prompt(active_tools, dynamic_effort=dynamic_effort)
         stable_system_prompt += self._build_user_profile_context()
 
-        # Pre-hydrate RAG knowledge base context into prompt
+        # Pre-hydrate RAG knowledge base context into prompt.
+        #
+        # The system-prompt block is emitted UNCONDITIONALLY when the catalog is
+        # non-empty (do NOT gate on ``has_data``; a working catalog is proof of a
+        # queryable database, while ``has_data`` is a coarse any-RAG-indicator
+        # that previously masked real databases). A loud diagnostic makes any
+        # "catalog is empty while stores/KBs are configured" state immediately
+        # visible, so a broken handbag build cannot silently produce a
+        # database-less agent.
         collected_sources: List[Dict[str, Any]] = []
-        if self.has_data:
-            rag_sys_block = self.build_rag_system_block()
-            if rag_sys_block:
-                stable_system_prompt += "\n" + rag_sys_block
+        _rag_block = self.build_rag_system_block()
+        if _rag_block:
+            stable_system_prompt += "\n" + _rag_block
 
+        try:
+            _rag_catalog_diag = self._build_rag_catalog()
+            if _rag_catalog_diag:
+                ASCIIColors.success(
+                    f"[{self.name}] RAG block INJECTED — databases: "
+                    f"{[e['name'] for e in _rag_catalog_diag]}"
+                )
+        except Exception:
+            pass
+
+        if self.has_data:
             try:
                 rag_res = self.query_data(cleaned_prompt)
                 if rag_res and rag_res.get("success") and rag_res.get("sources"):

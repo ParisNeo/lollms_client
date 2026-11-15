@@ -1,0 +1,1 @@
+"""lollms_shell — Autonomous shell companion CLI."""

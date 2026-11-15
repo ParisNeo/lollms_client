@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-15 02:15]
+
+- feat: add Handbag functionality to lollms_personality and update version
+
 ## [2026-11-14 22:27]
 
 - feat: enhance chat boolean flags documentation and artifact auto-activation logic
