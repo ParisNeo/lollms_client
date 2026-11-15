@@ -1973,13 +1973,25 @@ def main() -> int:
     )
     if not has_llm and not config.llm_model_profiles:
         ASCIIColors.yellow("⚠️ No LLM configured yet. Opening the setup wizard...")
+        configured_ok = False
         try:
             from lollms_client.lollms_config_simple import ensure_configured
-            ensure_configured()
+            configured_ok = bool(ensure_configured())
         except ImportError:
             from lollms_client.lollms_config_cli_env import run_wizard_and_save
             run_wizard_and_save(cli_env_path=args.config_path)
+            configured_ok = True
         config = ShellAgentConfig.load(args)
+        # Same abort contract as lollms-code: never proceed to create_client()
+        # on an unconfigured LLM — the user gets a clear retry instruction
+        # instead of a downstream binding error.
+        if not configured_ok and not config.llm_model_profiles:
+            ASCIIColors.red(
+                "\n❌ Setup did not complete — no LLM is configured.\n"
+                "   Run `lollms-config` (default: guided simple wizard) or\n"
+                "   `lollms-config --expert` to finish configuration, then retry."
+            )
+            return 1
 
     # 1. Ensure the handbag directory (and its tools/) exists BEFORE the client
     #    is created — `create_client` registers the handbag tools folder with

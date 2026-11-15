@@ -5188,14 +5188,26 @@ def main():
     # working local setup in one pass without ever seeing a binding list.
     if not config.is_configured(require_llm=True):
         ASCIIColors.yellow("⚠️ No LLM configured yet. Opening the setup wizard...")
+        configured_ok = False
         try:
             from lollms_client.lollms_config_simple import ensure_configured
-            ensure_configured()
+            configured_ok = bool(ensure_configured())
         except ImportError:
             # Older installations may not ship the simple module — fall back.
             from lollms_client.lollms_config_cli_env import run_wizard_and_save
             run_wizard_and_save(cli_env_path=args.config_path)
+            configured_ok = True  # legacy wizard raises on hard failure
         config = CodeAgentConfig.load(args)
+        # Honor the wizard's failure signal. Launching the client on an empty
+        # config produces the misleading "[CLI] No TTI binding configured…"
+        # cascade instead of telling the user setup was not completed.
+        if not configured_ok and not config.is_configured(require_llm=True):
+            ASCIIColors.red(
+                "\n❌ Setup did not complete — no LLM is configured.\n"
+                "   Run `lollms-config` (default: guided simple wizard) or\n"
+                "   `lollms-config --expert` to finish configuration, then retry."
+            )
+            return 1
 
     if args.config:
         run_lollms_code_config_menu(config, cli_env_path=args.config_path)

@@ -1146,41 +1146,88 @@ def suggest_flow(hw: Optional[HardwareProfile] = None) -> str:
         return "simple"
     if raw in ("2", "expert", "e"):
         return "expert"
-    return "cancel"
+    if raw in ("0", "q", "quit", "cancel", "exit"):
+        return "cancel"
+    # Anything else is an unrecognised keystroke; defaulting to "cancel"
+    # silently dropped users out of setup on a typo. Fall back to the
+    # recommendation instead — the caller still owns the final decision.
+    ASCIIColors.warning(f"  Unrecognised choice '{raw}', defaulting to Simple mode.")
+    return "simple"
 
 
-def ensure_configured() -> bool:
-    """Idempotent entry point: return True when an LLM is already configured.
-
-    Otherwise, offer the Simple/Expert choice (with hardware detection shown
-    up-front) and run the chosen wizard. This is what ``lollms-code`` calls at
-    startup instead of jumping straight into the expert wizard.
-    """
-    config_map = _load_existing_env_to_map()
-    if any(
+def _llm_is_configured(config_map: Dict[str, str]) -> bool:
+    """True when at least one LLM binding AND one LLM profile are present."""
+    has_binding = any(
         k.upper().startswith("LLM_BINDINGS_")
         and k.upper().endswith("_BINDING_NAME")
         and v
         for k, v in config_map.items()
-    ) and any(
+    )
+    has_profile = any(
         k.upper().startswith("LLM_PROFILES_")
         and k.upper().endswith("_BINDING_ALIAS")
         and v
         for k, v in config_map.items()
-    ):
+    )
+    return has_binding and has_profile
+
+
+def ensure_configured() -> bool:
+    """Idempotent entry point guaranteeing an LLM is configured on return.
+
+    Contract (honoured by ``lollms-code`` at startup):
+
+      * ``True``  — an LLM is configured on disk (either it already was, or the
+                    chosen wizard persisted one).
+      * ``False`` — the user cancelled, or the wizard exited without persisting
+                    an LLM. Callers MUST treat ``False`` as "abort setup" and
+                    must NOT proceed to ``create_client()``.
+
+    The previous implementation returned ``True`` unconditionally after the
+    expert branch, and logged "Configuration cancelled." on the expert path
+    even when the user had explicitly selected it — causing ``lollms-code`` to
+    launch on an empty config. Both are fixed here: the expert wizard's real
+    outcome is verified against the on-disk state, and cancellation is only
+    reported when the user actually cancelled.
+    """
+    config_map = _load_existing_env_to_map()
+    if _llm_is_configured(config_map):
         return True
 
     choice = suggest_flow()
     if choice == "cancel":
         ASCIIColors.info("Configuration cancelled.")
         return False
-    if choice == "simple":
-        return run_simple_wizard()
 
+    if choice == "simple":
+        configured = run_simple_wizard()
+        # `run_simple_wizard` already returns True only when it persisted —
+        # trust it, but re-verify against disk to stay robust to future edits.
+        if configured and _llm_is_configured(_load_existing_env_to_map()):
+            return True
+        if configured:
+            ASCIIColors.warning(
+                "Simple wizard reported success but no LLM binding/profile was "
+                "found on disk. Configuration is incomplete."
+            )
+        return False
+
+    # ── Expert path ──
+    # Run the full wizard, then VERIFY the on-disk result. The wizard may
+    # legitimately return without saving (user backed out of every menu), and
+    # that must be surfaced as a failure — not reported as "cancelled before
+    # we even tried", and never treated as success.
     from lollms_client.lollms_config_cli_env import run_wizard_and_save
     run_wizard_and_save()
-    # Recheck: expert wizard may still have been cancelled.
-    return True
+
+    if _llm_is_configured(_load_existing_env_to_map()):
+        return True
+
+    ASCIIColors.warning(
+        "Expert wizard finished without persisting an LLM binding/profile. "
+        "Run `lollms-config --expert` (or re-run this setup) to finish config."
+    )
+    return False
 
 
 __all__ = [
