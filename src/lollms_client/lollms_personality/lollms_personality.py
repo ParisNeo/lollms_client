@@ -3145,42 +3145,6 @@ class LollmsPersonality:
             ASCIIColors.info(
                 f"[Handbag.from_handbag] merged_kbs → {[str(p) for p in merged_kbs]}"
             )
-            # IDENTITY CHECK: if the merged store list is EMPTY, log the exact
-            # handbag folder so the user can compare it against the folder path
-            # they are inspecting in the editor. The #1 cause of "my RAG
-            # database is invisible" is a mismatch between agent name and folder
-            # (e.g. chatting with `JML` while the `.db` lives in
-            # `Ltspice_design_optimizer/rag/ltspice/`).
-            if not merged_safe_stores and not merged_kbs:
-                # Distinguish "genuinely RAG-free handbag" (a normal, valid
-                # state — e.g. JML with an empty/no rag/) from "a datastore was
-                # declared but failed to resolve" (a real bug). The former is a
-                # quiet INFO; the latter is a loud ERROR. This stops spam for
-                # agents that legitimately carry no knowledge base while
-                # preserving the alarm when something was expected.
-                _rag_dir = hb.path / "rag"
-                _has_rag_dir = _rag_dir.exists() and _rag_dir.is_dir()
-                _has_declared_kb = bool(hb.manifest.get("extra_knowledge_bases")
-                                        or hb.manifest.get("rag_databases")
-                                        or hb.manifest.get("knowledge_bases")
-                                        or hb.manifest.get("knowledge")
-                                        or hb.manifest.get("rag"))
-                if _has_rag_dir or _has_declared_kb:
-                    ASCIIColors.error(
-                        f"[Handbag.from_handbag] ⚠️ ZERO RAG databases resolved from "
-                        f"handbag '{hb.path}' DESPITE a rag/ folder or a KB declaration. "
-                        f"This is a real bug — the handbag intended to have a datastore "
-                        f"but it was not registered. Check the [Handbag-SCAN] and "
-                        f"[Handbag-DBG] lines above for the exact failure."
-                    )
-                else:
-                    ASCIIColors.info(
-                        f"[Handbag.from_handbag] handbag '{hb.path.name}' is a "
-                        f"RAG-free agent (no rag/ folder, no KB declaration). "
-                        f"The agent will correctly report 'no RAG database'. "
-                        f"If you EXPECTED a database, you are loading the WRONG "
-                        f"handbag — check sibling agent folders for a rag/*.db."
-                    )
         except Exception:
             pass
 

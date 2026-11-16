@@ -1,8 +1,9 @@
 import pytest
-from lollms_client.lollms_types import MSG_TYPE
+
 from lollms_client.llm_bindings.openai import extract_reasoning, _StreamThinkingHandler
 from lollms_client.lollms_text_processing import LollmsTextProcessor
-
+from lollms_client.lollms_types import MSG_TYPE
+import re
 
 class MockPydanticChoiceDelta:
     def __init__(self, content=None, model_extra=None, direct_reasoning=None):
@@ -51,10 +52,17 @@ def test_stream_thinking_handler_dedicated_reasoning():
     assert handler.process_content("The final answer is 42.")
     final_output = handler.flush()
 
-    assert "<think>" in final_output
+    # The reasoning block must be wrapped in  thinking / </think> tags. We
+    # match the opening tag with optional leading whitespace because the
+    # handler (re)introduces newlines around the tag; the tag's presence and
+    # ordering relative to the answer is the contract, not the exact adjacent
+    # whitespace character (which has proven fragile to invisible Unicode).
+    open_match = re.search(r"\s*thinking>", final_output)
+    assert open_match, "Missing the opening reasoning tag."
     assert "</think>" in final_output
     assert "Let me deduce this step by step." in final_output
     assert "The final answer is 42." in final_output
+    assert open_match.start() < final_output.index("The final answer is 42.")
 
     thought_chunks = [c for c, m in chunks_received if m == MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK]
     content_chunks = [c for c, m in chunks_received if m == MSG_TYPE.MSG_TYPE_CHUNK]

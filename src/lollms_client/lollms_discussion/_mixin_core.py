@@ -973,15 +973,6 @@ class CoreMixin:
             rel_str = str(rel_parts).replace("\\", "/")
             file_ext = f_path.suffix.lower()
 
-            # Honor the visible-dotfile whitelist: allow .gitignore/.env/... through,
-            # reject hidden infra dirs/files. _is_ignored_path already encodes this
-            # policy; trusting our local basename prefix check here was dropping
-            # legitimate visible dotfiles the policy explicitly allows.
-            from lollms_client.lollms_artefact import _VISIBLE_DOTFILES
-            base_name = Path(rel_str).name
-            if base_name.startswith(".") and base_name.lower() not in _VISIBLE_DOTFILES:
-                continue
-
             existing_art = self.artefacts.get(rel_str) or self.artefacts.get(f_path.name) or self.artefacts.get(f_path.stem)
             if existing_art and _is_ignored_path(existing_art.get("title", "")):
                 continue

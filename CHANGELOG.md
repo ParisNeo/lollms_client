@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-16 02:05]
+
+- fix: remove redundant dot-file check causing ImportError during workspace sync
+
 ## [2026-11-15 16:44]
 
 - fix: memory and personality module

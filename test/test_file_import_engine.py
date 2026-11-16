@@ -89,14 +89,20 @@ class TestFileImportEngine(unittest.TestCase):
         self.assertEqual(art["file_ext"], ".md")
 
     def test_data_mode_csv_import(self):
-        """Verify CSV imported in DATA mode triggers the .lam Dual-Stream system."""
+        """Verify CSV imported in DATA mode produces a FILE artefact with a .lam twin.
+
+        Note: ``ArtefactType.DATA`` was intentionally removed. Data files are now
+        ordinary FILE artefacts whose schema descriptor lives in a sibling ``.lam``
+        file; the dual-stream contract is expressed through ``physical_data`` +
+        ``logical_content`` on the same FILE artefact.
+        """
         csv_path = self._create_dummy_file("schema.csv", "id,name\n1,Alice")
 
         res = self.discussion.import_file(csv_path, mode="data")
         art = res["text_artefact"]
 
         self.assertIsNotNone(art)
-        self.assertEqual(art["type"], "data")
+        self.assertEqual(art["type"], "file")
         self.assertEqual(art.get("file_ext"), ".csv", "file_ext MUST be injected for data imports.")
         self.assertIsNotNone(art.get("logical_content"), "DATA mode must produce a logical twin (.lam).")
         self.assertIsNotNone(art.get("physical_data"), "DATA mode must retain raw physical bytes.")

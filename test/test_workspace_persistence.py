@@ -111,12 +111,17 @@ class TestWorkspacePathPersistence(unittest.TestCase):
             f"Workspace path was lost after restart. Expected: {expected_resolved}, Got: {actual_path}"
         )
         
-        # 4. Verify the workspace_data_path is correctly derived from the restored path
-        expected_data_path = str((new_folder / "workspace_data").resolve())
+        # 4. Verify the workspace_data_path is correctly derived from the restored path.
+        # Per the project doctrine (see _mixin_core.__init__/set_workspace_path): a
+        # user-supplied workspace path IS the workspace data root. We must NOT inject
+        # a nested "workspace_data/" subfolder inside a custom directory — only the
+        # auto-generated default tree keeps that isolated layout.
+        expected_data_path = str(new_folder.resolve())
         self.assertEqual(
             reloaded_discussion.workspace_data_path,
             expected_data_path,
-            "workspace_data_path was not correctly derived from the restored workspace_path."
+            "For a custom workspace, workspace_data_path must equal the custom root "
+            "(no nested 'workspace_data/' subfolder)."
         )
 
         reloaded_discussion.close()
