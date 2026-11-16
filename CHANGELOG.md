@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-16 02:33]
+
+- `feat: lollms_client - update version to 1.22.10`
+
 ## [2026-11-16 02:05]
 
 - fix: remove redundant dot-file check causing ImportError during workspace sync
