@@ -60,7 +60,7 @@ class _ShellJob:
         "stdout_buf", "stderr_buf", "stdout_total", "stderr_total",
         "return_code", "error_msg", "status",
         "_lock", "_done_event", "_stdout_thread", "_stderr_thread",
-        "_killed_by", "_killed_at",
+        "_killed_by", "_killed_at", "progress_cb",
     )
 
     def __init__(self, job_id: str, command: str, proc: subprocess.Popen):
@@ -85,6 +85,9 @@ class _ShellJob:
         self._stderr_thread: Optional[threading.Thread] = None
         self._killed_by: Optional[str] = None
         self._killed_at: Optional[float] = None
+        # Optional per-line callback (line, metadata) for live host streaming.
+        # Foreground calls set it; background calls leave it None.
+        self.progress_cb: Optional[Any] = None
 
 
 _JOBS: Dict[str, _ShellJob] = {}
@@ -174,6 +177,19 @@ def _drain_stream(stream, job: _ShellJob, buf: deque, total_ref: List[int], labe
             if not raw_line:
                 break
             _bounded_append(buf, total_ref, raw_line)
+            # Mirror the live byte total so polling a RUNNING job reports an
+            # accurate count instead of zero until finalize.
+            with job._lock:
+                if label == "stdout":
+                    job.stdout_total = total_ref[0]
+                else:
+                    job.stderr_total = total_ref[0]
+            cb = job.progress_cb
+            if cb is not None:
+                try:
+                    cb(raw_line, {"stream": label})
+                except Exception:
+                    pass
     except Exception as exc:
         with job._lock:
             if not job.error_msg:
@@ -223,15 +239,30 @@ def _lifespan_watchdog(job: _ShellJob) -> None:
         ASCIIColors.warning(f"[system_shell] Lifespan watchdog error for {job.job_id}: {exc}")
 
 
-def _start_background_job(command: str, env: Dict[str, str]) -> Dict[str, Any]:
-    """Launches a command detached, returns the initial job response."""
+def _launch_job(
+    command: str,
+    env: Dict[str, str],
+    progress_cb: Optional[Any] = None,
+) -> Tuple[Optional[_ShellJob], Optional[Dict[str, Any]]]:
+    """Launches a supervised job. Returns (job, None) or (None, error_dict).
+
+    The single launch path shared by BOTH modes:
+      * background mode ("fire and poll"), and
+      * foreground mode, which waits on the same job and — on timeout — adopts
+        the still-running process instead of killing it (no work is lost).
+
+    A brief 0.5s probe reports immediate crashes synchronously; if the process
+    is still alive, the lifespan watchdog is armed and the live job is returned.
+    """
     with _JOBS_LOCK:
-        running = sum(1 for j in _JOBS.values() if j.status == "running")
+        running = sum(
+            1 for j in _JOBS.values() if j is not None and j.status == "running"
+        )
         if running >= _MAX_BACKGROUND_JOBS:
-            return {
+            return None, {
                 "success": False,
                 "error": (
-                    f"Background job limit reached ({running}/{_MAX_BACKGROUND_JOBS}). "
+                    f"Concurrent job limit reached ({running}/{_MAX_BACKGROUND_JOBS}). "
                     f"Poll or kill an existing job before launching another."
                 ),
             }
@@ -240,7 +271,6 @@ def _start_background_job(command: str, env: Dict[str, str]) -> Dict[str, Any]:
         # launch cannot race past the cap.
         _JOBS[job_id] = None  # type: ignore[assignment]
 
-    proc: Optional[subprocess.Popen] = None
     try:
         creationflags = 0
         popen_kwargs: Dict[str, Any] = {}
@@ -269,9 +299,10 @@ def _start_background_job(command: str, env: Dict[str, str]) -> Dict[str, Any]:
     except Exception as exc:
         with _JOBS_LOCK:
             _JOBS.pop(job_id, None)
-        return {"success": False, "error": f"Failed to launch background job: {exc}"}
+        return None, {"success": False, "error": f"Failed to launch command: {exc}"}
 
     job = _ShellJob(job_id, command, proc)
+    job.progress_cb = progress_cb
     with _JOBS_LOCK:
         _JOBS[job_id] = job
 
@@ -294,9 +325,9 @@ def _start_background_job(command: str, env: Dict[str, str]) -> Dict[str, Any]:
     t_out.start()
     t_err.start()
 
-    # Wait a zero-touch moment so we can report a fast crash immediately.
-    # But never block: if still running after 0.5s, return and let the model
-    # decide to poll. The job remains supervised by the lifespan watchdog.
+    # Brief probe: report an immediate crash synchronously. If the process is
+    # still running after 0.5s we arm the lifespan watchdog and hand the live
+    # job back — the caller decides whether to keep waiting or poll.
     try:
         rc = proc.wait(timeout=0.5)
         t_out.join(timeout=2.0)
@@ -306,20 +337,30 @@ def _start_background_job(command: str, env: Dict[str, str]) -> Dict[str, Any]:
             job.stderr_total = se_ref[0]
         _finalize_job(job, rc)
     except subprocess.TimeoutExpired:
-        # Still running — this is the expected path for real long tasks.
         watchdog = threading.Thread(
             target=_lifespan_watchdog, args=(job,),
             daemon=True, name=f"shelljob-{job_id}-wdt",
         )
         watchdog.start()
 
+    return job, None
+
+
+def _start_background_job(command: str, env: Dict[str, str]) -> Dict[str, Any]:
+    """Launches a command detached and returns the initial job response."""
+    job, error = _launch_job(command, env, progress_cb=None)
+    if error is not None:
+        return error
+    if job is None:
+        return {"success": False, "error": "Internal error: job launch returned no job."}
+
     resp = _job_status_payload(job, include_tail=True)
     resp["success"] = True
     resp["output"] = (
-        f"✅ Background job launched: {job_id}\n"
+        f"✅ Background job launched: {job.job_id}\n"
         f"Command: {command}\n"
         f"Status: {resp['status']}\n\n"
-        f"Poll with: `tool_poll_shell_job(job_id=\"{job_id}\", wait_seconds=30)`"
+        f"Poll with: `tool_poll_shell_job(job_id=\"{job.job_id}\", wait_seconds=30)`"
     )
     return resp
 
@@ -675,12 +716,16 @@ Use this for environment management (pip install), running tests, or interacting
 
 {autonomy_desc}
 
-LONG-RUNNING TASKS (COMPILATION, ENCODING, DEEP SCANS):
-- A foreground call blocks the agent round and is capped at a fixed timeout
-  (default {_FOREGROUND_DEFAULT_TIMEOUT:.0f}s). A shorter cap safely prevents a hang
-  from DoS-ing the agent.
+LONG-RUNNING TASKS (COMPILATION, ENCODING, DEEP SCANS, VIDEO GENERATION):
+- A foreground call blocks the agent round and is capped at a wait window
+  (default {_FOREGROUND_DEFAULT_TIMEOUT:.0f}s).
+- AUTO-PROMOTION SAFETY NET: if a foreground command exceeds its wait window it
+  is NOT killed. The still-running process is promoted to a background job and
+  you receive its `job_id` (with `auto_promoted: true`). No work is lost — just
+  poll that job_id. You should STILL use background mode up-front for known
+  long tasks, to avoid a wasted foreground wait.
 - For any task likely to exceed ~{_FOREGROUND_DEFAULT_TIMEOUT/2:.0f}s (compiling, video encoding,
-  large scans, downloads, model training, package installs), use BACKGROUND MODE:
+  large scans, downloads, model training, package installs, media renders), use BACKGROUND MODE:
     1. Launch: `tool_execute_shell_command(command="...", background=true)`
        → returns a `job_id` immediately.
     2. Poll periodically: `tool_poll_shell_job(job_id="...", wait_seconds=30)`
@@ -716,9 +761,10 @@ def tool_execute_shell_command(
             monitor it. Recommended for compilation, encoding, downloads, and
             any long-running task.
         wait_timeout_seconds (float, optional): In foreground mode, overrides
-            the default {_FOREGROUND_DEFAULT_TIMEOUT:.0f}s timeout for this call (capped at
-            {_FOREGROUND_MAX_TIMEOUT:.0f}s). In background mode this parameter is honored as
-            an initial wait (bounded to 5s) before returning the job id.
+            the default {_FOREGROUND_DEFAULT_TIMEOUT:.0f}s wait window for this call (capped
+            at {_FOREGROUND_MAX_TIMEOUT:.0f}s). If the command exceeds it, the process is
+            auto-promoted to a background job (its job_id is returned). Ignored
+            when background=True — background mode returns immediately.
     """
     global AUTONOMY_LEVEL
     tool_ctx = getattr(env, "tool_context", None) if env else None
@@ -804,121 +850,81 @@ def tool_execute_shell_command(
     if background:
         return _start_background_job(command, base_env)
 
-    # ── Foreground branch (bounded) ──────────────────────────────────────────
-    def _execute_streaming(cmd_str: str, timeout_sec: float) -> Tuple[int, str, str]:
-        proc = subprocess.Popen(
-            cmd_str,
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            cwd=os.getcwd(),
-            env=base_env,
-            bufsize=1,
+    # ── Foreground branch — runs as a job, self-promotes on timeout ───────────
+    # Foreground execution uses the SAME supervised-job machinery as background
+    # mode. This is what lets a timeout "adopt" the still-running process
+    # instead of killing it: a legitimate long task (video render, model
+    # warm-up, large install) is never destroyed — the caller simply receives a
+    # pollable job_id and keeps its work.
+    def _emit_progress(line: str, meta: Dict[str, Any]) -> None:
+        clean = line.rstrip("\r\n")
+        if clean and tool_ctx and hasattr(tool_ctx, "emit_progress"):
+            try:
+                tool_ctx.emit_progress(clean, meta)
+            except Exception:
+                pass
+
+    progress_cb = _emit_progress if tool_ctx is not None else None
+
+    job, launch_err = _launch_job(command, base_env, progress_cb=progress_cb)
+    if launch_err is not None:
+        return launch_err
+    if job is None:
+        return {"success": False, "error": "Internal error: job launch returned no job."}
+
+    finished = job._done_event.wait(timeout=fg_timeout)
+
+    if not finished:
+        # Timed out → PROMOTE the still-running process to a background job.
+        # Do NOT kill it: the caller polls job_id and recovers the result.
+        payload = _job_status_payload(job, include_tail=True)
+        payload["success"] = True
+        payload["mode"] = "background"
+        payload["auto_promoted"] = True
+        payload["adopted_from"] = "foreground_timeout"
+        payload["timeout_seconds"] = fg_timeout
+        payload["output"] = (
+            f"⏳ Foreground wait exceeded {fg_timeout:.0f}s — the command is still "
+            f"running and has been promoted to background job '{job.job_id}'. "
+            f"Its work is NOT lost.\n"
+            f"Command: {command}\n\n"
+            f"Poll with: `tool_poll_shell_job(job_id=\"{job.job_id}\", wait_seconds=30)` "
+            f"until status is 'completed'/'failed'/'killed'."
         )
-        stdout_chunks: List[str] = []
-        stderr_chunks: List[str] = []
+        return payload
 
-        def _drain_stdout():
-            if proc.stdout:
-                for line in iter(proc.stdout.readline, ''):
-                    stdout_chunks.append(line)
-                    clean_line = line.rstrip('\r\n')
-                    if clean_line and tool_ctx and hasattr(tool_ctx, "emit_progress"):
-                        tool_ctx.emit_progress(clean_line, {"stream": "stdout"})
-                proc.stdout.close()
+    # Completed within the foreground window — format the classic result shape.
+    payload = _job_status_payload(job, include_tail=True)
+    retcode = job.return_code if job.return_code is not None else -1
+    out_raw = payload.get("stdout_tail", "") or ""
+    err_raw = payload.get("stderr_tail", "") or ""
 
-        def _drain_stderr():
-            if proc.stderr:
-                for line in iter(proc.stderr.readline, ''):
-                    stderr_chunks.append(line)
-                    clean_line = line.rstrip('\r\n')
-                    if clean_line and tool_ctx and hasattr(tool_ctx, "emit_progress"):
-                        tool_ctx.emit_progress(clean_line, {"stream": "stderr"})
-                proc.stderr.close()
-
-        t_out = threading.Thread(target=_drain_stdout, daemon=True)
-        t_err = threading.Thread(target=_drain_stderr, daemon=True)
-        t_out.start()
-        t_err.start()
-
-        try:
-            returncode = proc.wait(timeout=timeout_sec)
-        except subprocess.TimeoutExpired:
-            _kill_process_tree(proc)
-            t_out.join(timeout=2.0)
-            t_err.join(timeout=2.0)
-            partial_out = "".join(stdout_chunks)
-            partial_err = "".join(stderr_chunks)
-            raise subprocess.TimeoutExpired(
-                cmd=cmd_str,
-                timeout=timeout_sec,
-                output=partial_out,
-                stderr=partial_err,
+    error_msg = None
+    if retcode != 0:
+        if err_raw and err_raw.strip():
+            error_msg = err_raw
+        elif "2>nul" in command or "2>/dev/null" in command:
+            error_msg = (
+                f"Command failed with exit code {retcode} (stderr was suppressed "
+                f"by 2>nul redirection; target path or file likely does not exist)."
             )
+        else:
+            error_msg = f"Command failed with exit code {retcode}"
 
-        t_out.join(timeout=2.0)
-        t_err.join(timeout=2.0)
-        return returncode, "".join(stdout_chunks), "".join(stderr_chunks)
-
-    try:
-        retcode, out_raw, err_raw = _execute_streaming(command, fg_timeout)
-
-        error_msg = None
-        if retcode != 0:
-            if err_raw and err_raw.strip():
-                error_msg = err_raw
-            else:
-                if "2>nul" in command or "2>/dev/null" in command:
-                    error_msg = f"Command failed with exit code {retcode} (stderr was suppressed by 2>nul redirection; target path or file likely does not exist)."
-                else:
-                    error_msg = f"Command failed with exit code {retcode}"
-
-        cmd_banner = f"$ {command}\n"
-        raw_stdout = out_raw or ("(Command executed successfully with no stdout output)" if retcode == 0 else "")
-        formatted_output = f"{cmd_banner}{raw_stdout}"
-
-        return {
-            "success": retcode == 0,
-            "command": command,
-            "output": formatted_output,
-            "stderr": err_raw,
-            "error": error_msg,
-            "return_code": retcode,
-            "mode": "foreground",
-            "timeout_seconds": fg_timeout,
-        }
-    except subprocess.TimeoutExpired as te:
-        partial_out = te.output or ""
-        partial_err = te.stderr or ""
-        return {
-            "success": False,
-            "mode": "foreground",
-            "command": command,
-            "timeout_seconds": fg_timeout,
-            "output": f"$ {command}\n{partial_out}",
-            "stderr": partial_err,
-            "error": (
-                f"Foreground execution exceeded the {fg_timeout:.0f}s timeout and was terminated. "
-                f"The task may still be running — install-runs, compilations, video encoding, deep scans "
-                f"and downloads routinely exceed this. If this was a legitimate long task, RE-RUN it "
-                f"in BACKGROUND MODE: call `tool_execute_shell_command(command=..., background=true)` "
-                f"to obtain a `job_id`, then poll it with `tool_poll_shell_job(job_id=..., wait_seconds=30)`. "
-                f"DO NOT simply retry in foreground — that will time out again."
-            ),
-        }
-    except UnicodeDecodeError as ude:
-        return {
-            "success": False,
-            "error": f"Unicode decoding error while reading command output: {ude}. Try setting PYTHONIOENCODING=utf-8 or filtering binary output."
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
+    cmd_banner = f"$ {command}\n"
+    raw_stdout = out_raw or (
+        "(Command executed successfully with no stdout output)" if retcode == 0 else ""
+    )
+    return {
+        "success": retcode == 0,
+        "command": command,
+        "output": f"{cmd_banner}{raw_stdout}",
+        "stderr": err_raw,
+        "error": error_msg,
+        "return_code": retcode,
+        "mode": "foreground",
+        "timeout_seconds": fg_timeout,
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────────────

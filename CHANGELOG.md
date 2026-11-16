@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-16 18:33]
+
+- fix(system_shell): update system shell tool logic
+
 ## [2026-11-16 18:09]
 
 - chore: modernize type hints to use builtin generics
