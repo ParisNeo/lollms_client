@@ -39,7 +39,31 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
-import pytest
+try:
+    import pytest  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - analysis-time fallback only
+    # Pylance/static analyzers may run without pytest installed in the active
+    # interpreter. Provide a minimal shim so the module still parses cleanly;
+    # the real pytest is always present when the suite actually runs.
+    class _PytestShim:  # type: ignore[no-redef]
+        class _Mark:
+            @staticmethod
+            def parametrize(*_a, **_kw):
+                def _decorator(fn):
+                    return fn
+                return _decorator
+
+        mark = _Mark()
+
+        class MonkeyPatch:  # type: ignore[no-redef]
+            def setattr(self, *_a, **_kw):
+                return None
+
+            def undo(self):
+                return None
+
+    pytest = _PytestShim()  # type: ignore[assignment]
+    pytest.MonkeyPatch = _PytestShim.MonkeyPatch  # type: ignore[attr-defined]
 
 # ──────────────────────────────── imports ────────────────────────────────
 

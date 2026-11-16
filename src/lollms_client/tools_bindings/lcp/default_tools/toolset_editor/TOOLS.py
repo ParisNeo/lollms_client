@@ -590,7 +590,7 @@ def tool_edit_toolset_activate(
     toolset_folder: Optional[str] = None,
     env: Optional[Any] = None,
 ) -> Dict[str, Any]:
-        """Open a live editing session against one target LCP toolset.
+    """Open a live editing session against one target LCP toolset.
 
     Loads the toolset's TOOLS.py into the session's editing area and pins the
     target folder. Every subsequent patch/rewrite writes to this exact TOOLS.py.

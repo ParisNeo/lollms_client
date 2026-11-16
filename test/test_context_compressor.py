@@ -15,13 +15,16 @@ payload total EQUAL to `context_threshold_chars` does NOT trigger. Every
 "should trigger" test keeps its total strictly ABOVE the threshold.
 """
 
-from lollms_client.lollms_discussion._context_compressor import (
-    ContextCompressor,
-    HistoryMessage,
-    ImageRef,
-    PinnedFile,
-    apply_plan,
-)
+try:
+    from lollms_client.lollms_discussion._context_compressor import (
+        ContextCompressor,
+        HistoryMessage,
+        ImageRef,
+        PinnedFile,
+        apply_plan,
+    )
+except ImportError:  # pragma: no cover - allows static analysis without the package
+    ContextCompressor = HistoryMessage = ImageRef = PinnedFile = apply_plan = None  # type: ignore
 
 
 def _mk_compressor(**over):
