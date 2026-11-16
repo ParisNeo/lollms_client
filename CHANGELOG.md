@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-16 18:09]
+
+- chore: modernize type hints to use builtin generics
+
 ## [2026-11-16 18:04]
 
 - fix: correct docstring indentation and add import shims for static analysis

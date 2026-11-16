@@ -102,9 +102,9 @@ _SESSION_FILENAME = "session.json"
 _MAX_SOURCE_CHARS = 2_000_000
 
 
-def init_tools_library(config: Optional[dict] = None) -> None:
+def init_tools_library(config: dict | None = None) -> None:
     """No global state to initialize. Sessions are per-workspace on disk."""
-    return None
+    _ = config
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +157,7 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _load_session(workspace: Path) -> Optional[Dict[str, Any]]:
+def _load_session(workspace: Path) -> dict[str, Any] | None:
     path = _session_path(workspace)
     if not path.is_file():
         return None
@@ -461,7 +461,7 @@ def _resolve_toolset_folder(
         }
     target = toolset_name.strip()
 
-    matches: List[Path] = []
+    matches: list[Path] = []
     for candidate in workspace.rglob(_ENTRYPOINT):
         if candidate.parent.name == target:
             matches.append(candidate.parent)
@@ -513,8 +513,10 @@ def _validate_source(source: str) -> Tuple[bool, str, List[str]]:
     if not tool_names:
         return (
             False,
-            "Source defines no top-level 'def tool_*(...)' function. "
-            "Every LCP toolset must expose at least one.",
+            (
+                "Source defines no top-level 'def tool_*(...)' function. "
+                "Every LCP toolset must expose at least one."
+            ),
             [],
         )
     return True, "", tool_names
@@ -526,9 +528,9 @@ def _validate_source(source: str) -> Tuple[bool, str, List[str]]:
 
 def _parse_aider_patches(
     text: str,
-) -> Tuple[Optional[List[Tuple[str, str]]], Optional[str]]:
+) -> tuple[list[tuple[str, str]] | None, str | None]:
     """Return (blocks, error). Each block is (search, replace)."""
-    blocks: List[Tuple[str, str]] = []
+    blocks: list[tuple[str, str]] = []
     for match in _PATCH_BLOCK_RE.finditer(text or ""):
         search = match.group(1)
         replace = match.group(2)
@@ -690,6 +692,7 @@ def tool_edit_toolset_read(env: Optional[Any] = None) -> Dict[str, Any]:
         validation_error, tools, source -- or an error dict on failure.
     """
     session, _workspace, err = _require_session(env)
+    _ = _workspace
     if err is not None:
         return err
     source = session.get("draft", "")
