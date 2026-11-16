@@ -35,8 +35,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 TOOL_LIBRARY_NAME = "skill_maker"
 TOOL_LIBRARY_DESCRIPTION = (
-    "RSI toolset for skills: read, write, test, revert, discard and commit "
-    "SKILL.md files. RSI act-phase requires enable_skillmaker=True."
+    "RSI toolset for skills: list, read, write, test, revert, discard and commit "
+    "SKILL.md files. Auto-bootstraps against the sole workspace skill when one "
+    "candidate exists. RSI act-phase requires enable_skillmaker=True."
 )
 # Skill content dictates tool permissions — treat as code_execution gate.
 GATED_TASK_CATEGORY = "code_execution"
@@ -139,6 +140,181 @@ def _iter_registered_skills(personality: Any) -> List[Dict[str, Any]]:
     return []
 
 
+def _get_personality_from_env(env: Any) -> Any:
+    """Best-effort duck-typed lookup of the active personality on ``env``.
+
+    Mirrors the editor toolset's strategy: check env.personality, env.client's
+    active personality, and the discussion's personality handle — first hit
+    wins.
+    """
+    if env is None:
+        return None
+    personality = (
+        getattr(env, "personality", None)
+        or getattr(env, "host_personality", None)
+    )
+    if personality is not None:
+        return personality
+    client = getattr(env, "client", None)
+    if client is not None:
+        personality = (
+            getattr(client, "_active_personality", None)
+            or getattr(client, "personality", None)
+        )
+        if personality is not None:
+            return personality
+    disc = getattr(env, "discussion", None)
+    if disc is not None:
+        personality = getattr(disc, "_personality", None)
+        if personality is not None:
+            return personality
+    return None
+
+
+def _candidate_skill_roots(env: Any) -> List[Path]:
+    """Return every directory that may contain a skill subfolder.
+
+    Ordered most-authoritative-first:
+      1. The personality's registered skills (their parent folders).
+      2. Standard fallback roots (``~/.lollms_client/skills``,
+         ``<cwd>/.lollms_code/skills``) when no personality is attached.
+    """
+    roots: List[Path] = []
+    seen: set = set()
+    personality = _get_personality_from_env(env)
+    for entry in _iter_registered_skills(personality):
+        fp = entry.get("file_path") or ""
+        if not fp:
+            continue
+        try:
+            p = Path(fp).resolve()
+        except (OSError, ValueError):
+            continue
+        parent = p.parent
+        if str(parent) in seen:
+            continue
+        seen.add(str(parent))
+        roots.append(parent)
+    if not roots:
+        for candidate in (
+            Path.home() / ".lollms_client" / "skills",
+            Path.cwd() / ".lollms_code" / "skills",
+        ):
+            if candidate.exists():
+                try:
+                    resolved = candidate.resolve()
+                except (OSError, ValueError):
+                    continue
+                if str(resolved) in seen:
+                    continue
+                seen.add(str(resolved))
+                roots.append(resolved)
+    return roots
+
+
+def _list_skill_candidates(env: Any) -> List[Dict[str, Any]]:
+    """Enumerate every SKILL.md folder visible to the current session.
+
+    Each candidate includes slug, path, title, description, and source
+    provenance. Ordering is by source (registered → fallback root) then slug.
+    """
+    candidates: List[Dict[str, Any]] = []
+    seen_paths: set = set()
+
+    personality = _get_personality_from_env(env)
+    registered = _iter_registered_skills(personality)
+    for entry in registered:
+        fp = entry.get("file_path") or ""
+        if not fp:
+            continue
+        try:
+            p = Path(fp).resolve()
+        except (OSError, ValueError):
+            continue
+        if p.name != "SKILL.md" or str(p) in seen_paths:
+            continue
+        seen_paths.add(str(p))
+        candidates.append({
+            "slug": p.parent.name,
+            "skill_file": str(p),
+            "title": entry.get("title") or p.parent.name,
+            "description": entry.get("description") or "",
+            "source": "registered",
+        })
+
+    for root in _candidate_skill_roots(env):
+        try:
+            children = list(root.iterdir())
+        except (OSError, ValueError):
+            continue
+        for child in children:
+            if not child.is_dir():
+                continue
+            sfile = child / "SKILL.md"
+            if not sfile.exists():
+                continue
+            try:
+                resolved = sfile.resolve()
+            except (OSError, ValueError):
+                continue
+            if str(resolved) in seen_paths:
+                continue
+            seen_paths.add(str(resolved))
+            title = child.name
+            description = ""
+            try:
+                content = sfile.read_text(encoding="utf-8", errors="ignore")
+                fm, _err = _parse_frontmatter(content)
+                if fm:
+                    title = str(fm.get("name") or title)
+                    description = str(fm.get("description") or "")
+            except Exception:
+                pass
+            candidates.append({
+                "slug": child.name,
+                "skill_file": str(resolved),
+                "title": title,
+                "description": description,
+                "source": "discovered",
+            })
+
+    candidates.sort(key=lambda c: (c["source"] != "registered", c["slug"]))
+    return candidates
+
+
+def _try_auto_resolve_skill(
+    env: Any,
+) -> Tuple[Optional[str], Optional[Path], Optional[str]]:
+    """Auto-pick the sole visible skill when the caller did not supply one.
+
+    Returns (slug, skill_file, error). When exactly ONE candidate is visible,
+    it is chosen. Zero or multiple candidates yield a structured error listing
+    the available skills so the agent can pick.
+    """
+    candidates = _list_skill_candidates(env)
+    if not candidates:
+        return None, None, (
+            "No SKILL.md was found in any registered skill root or fallback "
+            "location. Register a skill or place one under "
+            "~/.lollms_client/skills/<slug>/SKILL.md."
+        )
+    if len(candidates) > 1:
+        listed = ", ".join(
+            f"'{c['slug']}'" + (f" ({c['title']})" if c['title'] != c['slug'] else "")
+            for c in candidates
+        )
+        return None, None, (
+            f"{len(candidates)} skills are visible; auto-selection is ambiguous. "
+            f"Call tool_list_skills() and pass skill_name_or_path explicitly. "
+            f"Available: {listed}."
+        )
+    sole = candidates[0]
+    try:
+        return sole["slug"], Path(sole["skill_file"]).resolve(), None
+    except (OSError, ValueError) as exc:
+        return None, None, f"Could not resolve skill path: {exc}"
+
+
 def _resolve_skill_file(env: Any, skill_name_or_path: str) -> Tuple[str, Path]:
     """Resolve a skill name (or slug) to (canonical_slug, SKILL.md path).
 
@@ -147,66 +323,80 @@ def _resolve_skill_file(env: Any, skill_name_or_path: str) -> Tuple[str, Path]:
          personality's skills_manager skill list (canonical identity).
       2. The resolved file MUST be named ``SKILL.md``.
     Arbitrary user-supplied absolute paths never resolve.
+
+    When ``skill_name_or_path`` is empty AND exactly one skill is visible,
+    auto-selection kicks in — matching the ``toolset_editor`` ergonomics.
     """
     needle = (skill_name_or_path or "").strip()
     if not needle:
-        raise ValueError("skill_name_or_path is required.")
+        slug, path, err = _try_auto_resolve_skill(env)
+        if err is not None:
+            raise ValueError(err)
+        # Auto-selection guarantees non-None path already.
+        assert path is not None and slug is not None
+        return slug, path
 
-    personality = None
-    client = getattr(env, "client", None) if env is not None else None
-    if client is not None:
-        personality = getattr(client, "_active_personality", None) or getattr(client, "personality", None)
-
-    # Best-effort: prefer skills_manager from env.discussion if present
-    if personality is None and env is not None:
-        disc = getattr(env, "discussion", None)
-        personality = getattr(disc, "_personality", None)
-
+    personality = _get_personality_from_env(env)
     skills = _iter_registered_skills(personality)
-    if not skills:
-        # Fallback: scan the standard skills roots so a bare CLI/test path
-        # still functions (no personality attached). Files must still be
-        # *somewhere recognised*.
-        candidate_roots: List[Path] = []
-        for p in [
-            Path.home() / ".lollms_client" / "skills",
-            Path.cwd() / ".lollms_code" / "skills",
-        ]:
-            if p.exists():
-                candidate_roots.append(p.resolve())
-        for root in candidate_roots:
-            for child in root.iterdir():
-                if not child.is_dir():
-                    continue
-                sfile = child / "SKILL.md"
-                if sfile.exists() and (child.name == needle or sfile.name == needle):
-                    return child.name, sfile.resolve()
-        raise ValueError(
-            f"No skill matching '{needle}' is registered in this session and no "
-            f"standard skill root contains it."
-        )
 
-    normalized = re.sub(r"[\s\-]+", "_", needle).lower()
-    for s in skills:
-        title = (s.get("title") or "").strip()
-        fp = s.get("file_path") or ""
-        if not fp:
+    if skills:
+        normalized = re.sub(r"[\s\-]+", "_", needle).lower()
+        for s in skills:
+            title = (s.get("title") or "").strip()
+            fp = s.get("file_path") or ""
+            if not fp:
+                continue
+            p = Path(fp).resolve()
+            if p.name != "SKILL.md":
+                continue
+            slug = p.parent.name
+            variants = {
+                title.lower(),
+                slug.lower(),
+                re.sub(r"[\s\-]+", "_", title).lower(),
+                re.sub(r"[\s\-]+", "_", slug).lower(),
+            }
+            if needle in (str(p), title, slug) or normalized in variants:
+                return slug, p
+
+    # Fallback: scan the standard + registered skill roots so a bare CLI/test
+    # path (no personality attached) still resolves when the slug/title matches.
+    normalized_needle = re.sub(r"[\s\-]+", "_", needle).lower()
+    for root in _candidate_skill_roots(env):
+        try:
+            children = list(root.iterdir())
+        except (OSError, ValueError):
             continue
-        p = Path(fp).resolve()
-        if p.name != "SKILL.md":
-            continue
-        slug = p.parent.name
-        variants = {
-            title.lower(),
-            slug.lower(),
-            re.sub(r"[\s\-]+", "_", title).lower(),
-            re.sub(r"[\s\-]+", "_", slug).lower(),
-        }
-        if needle in (str(p), title, slug) or normalized in variants:
-            return slug, p
+        for child in children:
+            if not child.is_dir():
+                continue
+            sfile = child / "SKILL.md"
+            if not sfile.exists():
+                continue
+            variants = {
+                child.name.lower(),
+                re.sub(r"[\s\-]+", "_", child.name).lower(),
+            }
+            title = child.name
+            try:
+                content = sfile.read_text(encoding="utf-8", errors="ignore")
+                fm, _err = _parse_frontmatter(content)
+                if fm:
+                    title = str(fm.get("name") or title).strip()
+                    variants.add(title.lower())
+                    variants.add(re.sub(r"[\s\-]+", "_", title).lower())
+            except Exception:
+                pass
+            if (
+                needle in (str(sfile.resolve()), child.name, title)
+                or normalized_needle in variants
+            ):
+                return child.name, sfile.resolve()
 
     raise ValueError(
-        f"Skill '{needle}' matched none of the {len(skills)} registered skills."
+        f"Skill '{needle}' matched none of the {len(skills) or 'visible'} "
+        "registered skills or standard skill roots. Call tool_list_skills() "
+        "to enumerate the candidates."
     )
 
 
@@ -449,6 +639,62 @@ def _git_commit_scoped_optional(skill_dir: Path, message: str) -> Optional[Dict[
 # ── Child runner (spawn subprocess; mirrors tool_maker) ──
 
 
+def _discover_toolset_folders_for_declared_tools(
+    env: Any, declared_tools: List[str],
+) -> Tuple[List[str], List[str]]:
+    """Resolve each declared tool name to its owning toolset folder.
+
+    Returns (resolved_folders, unresolved_names). The child runner needs the
+    *folder path* for each declared tool because a bare name cannot be resolved
+    to a loadable toolset without knowing where it lives on disk — that
+    knowledge only exists in the parent's live LCP binding.
+
+    A tool's owning folder is the parent directory of its ``_python_file_path``
+    when the file is ``TOOLS.py`` (folder-layout toolset), else the file itself.
+
+    Unresolvable names are returned separately and reported as a hard error by
+    the caller: spawning a child with a subset of the declared tools would
+    test a skill the candidate author never wrote.
+    """
+    if not declared_tools or env is None:
+        return [], list(declared_tools or [])
+    try:
+        binding = _get_binding(env)
+    except Exception:
+        return [], list(declared_tools)
+
+    # Build a name -> py_file index once. ``discovered_tools`` entries expose
+    # ``_python_file_path`` (absolute) and ``_library_name``.
+    name_to_pyfile: Dict[str, str] = {}
+    for t in getattr(binding, "discovered_tools", []) or []:
+        n = t.get("name")
+        p = t.get("_python_file_path")
+        if n and p and n not in name_to_pyfile:
+            name_to_pyfile[n] = p
+
+    folders: List[str] = []
+    seen: set = set()
+    unresolved: List[str] = []
+    for name in declared_tools:
+        py = name_to_pyfile.get(name)
+        if not py:
+            unresolved.append(name)
+            continue
+        try:
+            p = Path(py).resolve()
+        except (OSError, ValueError):
+            unresolved.append(name)
+            continue
+        # Folder-layout toolsets use TOOLS.py; the parent folder is the mount
+        # target. Single-file toolsets pass the file path itself.
+        folder = str(p.parent) if p.name == "TOOLS.py" else str(p)
+        if folder in seen:
+            continue
+        seen.add(folder)
+        folders.append(folder)
+    return folders, unresolved
+
+
 def _run_child_skill_agent(
     *,
     skill_file: Path,
@@ -462,6 +708,23 @@ def _run_child_skill_agent(
     runner = here / "_isolated_skill_runner.py"
     if not runner.exists():
         return {"ok": False, "error": f"Child runner missing: {runner}"}
+
+    # Resolve declared tool names -> toolset folders. Without this, the child
+    # has no way to mount them: a single name is meaningless without its
+    # on-disk location, which only the parent binding knows.
+    resolved_folders, unresolved = _discover_toolset_folders_for_declared_tools(
+        env, declared_tools
+    )
+    if unresolved:
+        return {
+            "ok": False,
+            "error": (
+                f"Cannot spawn the child agent — these declared tools are not "
+                f"provided by any active toolset in this session: {unresolved}. "
+                "Either the toolset is not mounted or the skill's 'tools:' "
+                "frontmatter names a tool that does not exist."
+            ),
+        }
 
     client = getattr(env, "client", None) if env is not None else None
     llm_bp: Dict[str, Any] = {}
@@ -478,6 +741,7 @@ def _run_child_skill_agent(
     payload = {
         "skill_file": str(skill_file),
         "declared_tools": declared_tools,
+        "resolved_toolset_folders": resolved_folders,
         "candidate_skills_dirs": [str(skill_file.parent.parent)],
         "test_task": (test_task or "").strip(),
         "max_steps": max(1, min(int(max_steps or 6), 12)),
@@ -540,18 +804,61 @@ def _run_child_skill_agent(
 # ──────────────────────────────── tools ────────────────────────────────
 
 
+def tool_list_skills(env: Any = None, **kwargs: Any) -> Dict[str, Any]:
+    """Enumerate every skill visible to the current session.
+
+    Use this first when the target skill slug is unknown. Each entry provides
+    ``slug``, ``skill_file`` (absolute path), ``title``, ``description`` and
+    ``source`` ("registered" for skills on the personality's skills_manager,
+    "discovered" for skills found on disk via a standard skill root).
+
+    When exactly one skill is visible, every read/write/test/revert/discard/
+    commit tool will auto-select it — you don't even need to call this tool.
+
+    Args:
+        env: Host tool-context handle (injected by LCP).
+
+    Returns:
+        dict: {"success": bool, "count": int, "skills": [...]}
+    """
+    try:
+        candidates = _list_skill_candidates(env)
+        return {
+            "success": True,
+            "count": len(candidates),
+            "skills": candidates,
+            "next_step": (
+                "Pass skill_name_or_path=<slug> to any tool_read_skill_source / "
+                "tool_write_skill_source / tool_test_skill_source / "
+                "tool_revert_skill / tool_discard_skill_changes / "
+                "tool_commit_skill / tool_list_skill_versions call. "
+                "Auto-selection kicks in when only one skill is visible."
+            ),
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Failed to list skills: {e}"}
+
+
 def tool_read_skill_source(
-    skill_name_or_path: str,
+    skill_name_or_path: str = "",
     env: Any = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
-    """Read the SKILL.md of a registered skill.
+    """Read the full SKILL.md of a registered skill.
+
+    No external file tools are required — the full source text is returned
+    directly in the ``source`` field. When ``skill_name_or_path`` is empty
+    (the default) AND exactly one skill is visible, that skill is auto-picked
+    — the same ergonomics as ``tool_edit_toolset_read``.
 
     Args:
-        skill_name_or_path: Skill slug, title, or its SKILL.md path (must be registered).
+        skill_name_or_path: Skill slug, title, or its SKILL.md path. Empty
+            (default) → auto-select the sole visible skill.
+        env: Host tool-context handle (injected by LCP).
 
     Returns:
-        dict: {"success": bool, "slug": str, "path": str, "source": str, "line_count": int}
+        dict: {"success": bool, "slug": str, "path": str, "source": str,
+               "line_count": int, "size_chars": int}
     """
     try:
         slug, skill_file = _resolve_skill_file(env, skill_name_or_path)
@@ -571,8 +878,8 @@ def tool_read_skill_source(
 
 
 def tool_write_skill_source(
-    skill_name_or_path: str,
-    new_source: str,
+    skill_name_or_path: str = "",
+    new_source: str = "",
     reason: str = "",
     env: Any = None,
     **kwargs: Any,
@@ -580,12 +887,16 @@ def tool_write_skill_source(
     """Write new SKILL.md content for a registered skill.
 
     Supports FULL content or Aider-style SEARCH/REPLACE patches. Applied in
-    memory; validates the resulting SKILL.md before touching disk.
+    memory; validates the resulting SKILL.md before touching disk. When
+    ``skill_name_or_path`` is empty AND exactly one skill is visible, that
+    skill is auto-picked.
 
     Args:
-        skill_name_or_path: Skill slug, title, or SKILL.md path.
+        skill_name_or_path: Skill slug, title, or SKILL.md path. Empty →
+            auto-select the sole visible skill.
         new_source: New SKILL.md content or SEARCH/REPLACE block.
         reason: Rationale recorded in the response (audit trail).
+        env: Host tool-context handle (injected by LCP).
 
     Returns:
         dict: {"success": bool, "slug": str, "path": str, "mode": "full"|"patch"}
@@ -641,14 +952,19 @@ def tool_write_skill_source(
 
 
 def tool_test_skill_source(
-    skill_name_or_path: str,
+    skill_name_or_path: str = "",
     env: Any = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """Validate the SKILL.md frontmatter + structural shape. No execution.
 
+    When ``skill_name_or_path`` is empty AND exactly one skill is visible, that
+    skill is auto-picked.
+
     Args:
-        skill_name_or_path: Skill slug, title, or SKILL.md path.
+        skill_name_or_path: Skill slug, title, or SKILL.md path. Empty →
+            auto-select the sole visible skill.
+        env: Host tool-context handle (injected by LCP).
 
     Returns:
         dict: {"success": bool, "slug": str, "frontmatter_ok": bool,
@@ -692,8 +1008,8 @@ def tool_test_skill_source(
 
 
 def tool_run_skill_test_agent(
-    skill_name_or_path: str,
-    test_task: str,
+    skill_name_or_path: str = "",
+    test_task: str = "",
     max_steps: int = 6,
     timeout_sec: int = 120,
     env: Any = None,
@@ -707,11 +1023,16 @@ def tool_run_skill_test_agent(
       * Executed in a fresh subprocess with a hard ``timeout_sec`` (ceiling 300).
       * Refused if the skill declares any tool from ``_FORBIDDEN_TEST_SKILL_TOOLS``.
 
+    When ``skill_name_or_path`` is empty AND exactly one skill is visible, that
+    skill is auto-picked.
+
     Args:
-        skill_name_or_path: Skill slug, title, or SKILL.md path.
+        skill_name_or_path: Skill slug, title, or SKILL.md path. Empty →
+            auto-select the sole visible skill.
         test_task: Natural-language directive for the child.
         max_steps: Reasoning budget (1..12, default 6).
         timeout_sec: Subprocess timeout (10..300, default 120).
+        env: Host tool-context handle (injected by LCP).
 
     Returns:
         dict: {"success": bool, "ok": bool, "verdict": str|null, "transcript": [...],
@@ -771,6 +1092,7 @@ def tool_run_skill_test_agent(
             env=env,
         )
         envelope["slug"] = slug
+        envelope["declared_tools"] = declared_tools
         envelope["success"] = bool(envelope.get("ok"))
         return envelope
     except Exception as e:
@@ -778,14 +1100,19 @@ def tool_run_skill_test_agent(
 
 
 def tool_list_skill_versions(
-    skill_name_or_path: str,
+    skill_name_or_path: str = "",
     env: Any = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """List every available revert target for a registered skill.
 
+    When ``skill_name_or_path`` is empty AND exactly one skill is visible, that
+    skill is auto-picked.
+
     Args:
-        skill_name_or_path: Skill slug, title, or SKILL.md path.
+        skill_name_or_path: Skill slug, title, or SKILL.md path. Empty →
+            auto-select the sole visible skill.
+        env: Host tool-context handle (injected by LCP).
 
     Returns:
         dict: {"success": bool, "slug": str, "releases": [...], "backups": [...],
@@ -844,7 +1171,7 @@ def tool_list_skill_versions(
 
 
 def tool_revert_skill(
-    skill_name_or_path: str,
+    skill_name_or_path: str = "",
     backup_index: int = 0,
     env: Any = None,
     **kwargs: Any,
@@ -855,9 +1182,14 @@ def tool_revert_skill(
     Post-restore validation runs and a broken snapshot is auto-rolled-back to
     the pre-revert state (never leaves a broken skill on disk).
 
+    When ``skill_name_or_path`` is empty AND exactly one skill is visible, that
+    skill is auto-picked.
+
     Args:
-        skill_name_or_path: Skill slug, title, or SKILL.md path.
+        skill_name_or_path: Skill slug, title, or SKILL.md path. Empty →
+            auto-select the sole visible skill.
         backup_index: 0 = most recent backup; use tool_list_skill_versions for others.
+        env: Host tool-context handle (injected by LCP).
 
     Returns:
         dict: {"success": bool, "slug": str, "restored_from": str, "test_ok": bool}
@@ -943,14 +1275,19 @@ def tool_revert_skill(
 
 
 def tool_discard_skill_changes(
-    skill_name_or_path: str,
+    skill_name_or_path: str = "",
     env: Any = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """Hard-abort the current experiment: reset skill to last committed state.
 
+    When ``skill_name_or_path`` is empty AND exactly one skill is visible, that
+    skill is auto-picked.
+
     Args:
-        skill_name_or_path: Skill slug, title, or SKILL.md path.
+        skill_name_or_path: Skill slug, title, or SKILL.md path. Empty →
+            auto-select the sole visible skill.
+        env: Host tool-context handle (injected by LCP).
 
     Returns:
         dict: {"success": bool, "slug": str, "restored_from": str, "purged_backups": int}
@@ -1009,7 +1346,7 @@ def tool_discard_skill_changes(
 
 
 def tool_commit_skill(
-    skill_name_or_path: str,
+    skill_name_or_path: str = "",
     commit_message: str = "",
     env: Any = None,
     **kwargs: Any,
@@ -1017,9 +1354,14 @@ def tool_commit_skill(
     """Record a release of the skill (git-free), opportunistically git-commit,
     then remount the personality's skill so the next LLM round sees the update.
 
+    When ``skill_name_or_path`` is empty AND exactly one skill is visible, that
+    skill is auto-picked.
+
     Args:
-        skill_name_or_path: Skill slug, title, or SKILL.md path.
+        skill_name_or_path: Skill slug, title, or SKILL.md path. Empty →
+            auto-select the sole visible skill.
         commit_message: Optional commit message.
+        env: Host tool-context handle (injected by LCP).
 
     Returns:
         dict: {"success": bool, "slug": str, "release_id": str, "commit_sha": str|null,
@@ -1061,13 +1403,10 @@ def tool_commit_skill(
                 "already_committed": False,
             }
 
-        # Hot-remount the skill on the personality if reachable.
+        # Hot-remount the skill on the hosting personality so the next LLM
+        # round sees the newly released content (mirrors tool_maker).
         remount_ok = False
-        client = getattr(env, "client", None) if env is not None else None
-        personality = getattr(client, "_active_personality", None) if client else None
-        if personality is None:
-            disc = getattr(env, "discussion", None) if env is not None else None
-            personality = getattr(disc, "_personality", None)
+        personality = _get_personality_from_env(env)
         if personality is not None and hasattr(personality, "skills_manager"):
             try:
                 personality.skills_manager.reload()

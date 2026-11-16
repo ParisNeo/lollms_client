@@ -1,0 +1,37 @@
+name: skill_editor
+description: >-
+  In-place live editor for a single SKILL.md. Activates an editing area over a
+  target skill folder, applies one or more Aider SEARCH/REPLACE blocks or a
+  full rewrite, validates the frontmatter and body, writes directly to disk,
+  and hot-reloads the personality's skills_manager so the edited skill is
+  immediately visible. Designed for an agent update -> validate -> re-edit
+  loop. Distinct from `skill_maker`, which is the heavier RSI surface (patch,
+  revert, discard, commit, test-agent) behind the enable_skillmaker flag.
+  Every per-skill tool reports the three distinct states of a SKILL.md
+  (`in_tree`, `registered`, `loaded`) so the agent never conflates "read the
+  source" with "activate the skill".
+icon: "📝"
+author: lollms-client
+version: "0.3.0"
+category: developer
+tools:
+  - name: tool_edit_skill_list
+    description: Enumerate every editable skill folder — workspace-resident plus externally registered on the live skills_manager (source="workspace"|"external").
+  - name: tool_edit_skill_activate
+    description: Open a live editing session against a target skill folder (workspace OR externally registered skill); auto-bootstraps when exactly one candidate exists. Reports in_tree/registered/loaded.
+  - name: tool_edit_skill_read
+    description: Return the current editing-area source (mirrors disk SKILL.md). Auto-bootstraps on first call. Reports in_tree/registered/loaded so read != activate.
+  - name: tool_edit_skill_load_status
+    description: Report whether the target SKILL.md is in_tree / registered / loaded, plus a one-line actionable guidance for the caller's intent.
+  - name: tool_edit_skill_patch
+    description: Apply one or more Aider SEARCH/REPLACE blocks atomically and hot-reload the skills_manager.
+  - name: tool_edit_skill_rewrite
+    description: Replace the entire target SKILL.md with new validated source and hot-reload.
+  - name: tool_edit_skill_reload
+    description: Explicitly rebuild the skills index from the target SKILL.md (calls skills_manager.reload).
+  - name: tool_edit_skill_test
+    description: Validate the current draft SKILL.md (frontmatter + body) without touching disk.
+  - name: tool_edit_skill_status
+    description: Return the current editing session state (no side effects).
+  - name: tool_edit_skill_close
+    description: Delete the editing session file (the edited SKILL.md is left intact).

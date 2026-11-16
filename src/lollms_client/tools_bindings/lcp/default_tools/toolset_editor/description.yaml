@@ -1,0 +1,30 @@
+name: toolset_editor
+description: >-
+  In-place live editor for a single LCP toolset. Activates an editing area over
+  a target TOOLS.py, applies one or more Aider SEARCH/REPLACE blocks or a full
+  rewrite, validates the result, writes directly to disk, and hot-reloads the
+  live tool binding so the freshly edited tool_* functions are immediately
+  callable. Designed for an agent update -> test -> re-edit loop.
+icon: "✏️"
+author: lollms-client
+version: "0.1.0"
+category: developer
+tools:
+  - name: tool_edit_toolset_list
+    description: Enumerate every toolset folder (with TOOLS.py) under the workspace.
+  - name: tool_edit_toolset_activate
+    description: Open a live editing session against a target toolset folder (auto-bootstraps when exactly one candidate exists).
+  - name: tool_edit_toolset_read
+    description: Return the current editing-area source (mirrors disk TOOLS.py). Auto-bootstraps on first call.
+  - name: tool_edit_toolset_patch
+    description: Apply one or more Aider SEARCH/REPLACE blocks atomically and hot-reload.
+  - name: tool_edit_toolset_rewrite
+    description: Replace the entire target TOOLS.py with new validated source and hot-reload.
+  - name: tool_edit_toolset_reload
+    description: Explicitly rebuild the live tool binding from the target TOOLS.py.
+  - name: tool_edit_toolset_test
+    description: Execute a tool_* function directly from the on-disk TOOLS.py for validation.
+  - name: tool_edit_toolset_status
+    description: Return the current editing session state (no side effects).
+  - name: tool_edit_toolset_close
+    description: Delete the editing session file (the edited TOOLS.py is left intact).

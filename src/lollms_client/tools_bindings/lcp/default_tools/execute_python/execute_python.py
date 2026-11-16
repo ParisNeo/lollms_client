@@ -179,6 +179,14 @@ _RISK_CATEGORY_SIGNALS: Dict[str, Tuple[str, ...]] = {
     "system": (
         "psutil", "webbrowser", "ctypes", "winreg",
     ),
+    # Process-environment mutation. Detected by `_detect_env_mutation_ops`
+    # below; also matched here so a caller that passes a reason string
+    # mentioning "os.environ" (legacy callers / future detectors) classifies
+    # correctly. Consent is enforced at RUNTIME in
+    # `sandbox_kernel._gated_putenv` / `_gated_unsetenv`.
+    "env": (
+        "environment variable", "os.environ", "os.putenv", "os.unsetenv",
+    ),
     # Filesystem access OUTSIDE the workspace (reads of site-packages, listing
     # the venv, probing an interpreter install, etc.). This category exists so
     # the operator can say "always allow filesystem reads" and — crucially —
@@ -266,6 +274,84 @@ def _detect_deletion_ops(source: str) -> List[str]:
             # Bare `remove(...)` when `from os import remove` was used.
             if func_name in _DELETION_OS_ATTRS:
                 found.add(f"{func_name}()")
+    return sorted(found)
+
+
+def _detect_env_mutation_ops(source: str) -> List[str]:
+    """Returns the sorted list of process-environment mutations in `source`.
+
+    Symmetric with `_detect_deletion_ops`: a PROMPTING heuristic (not the
+    security boundary — the runtime gate in `sandbox_kernel` is) that names
+    the exact operations the operator is about to consent to. Detects:
+
+      - ``os.environ["X"] = "Y"``       (subtarget of `os.environ`)
+      - ``del os.environ["X"]``
+      - ``os.environ.update/setdefault/pop/popitem/clear(...)``
+      - ``os.putenv(...)`` / ``os.unsetenv(...)``
+      - the same forms via ``from os import environ`` / ``from os import putenv``
+
+    Never raises; a syntax error yields an empty list (nothing to prompt on
+    for source that cannot compile anyway).
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    def _is_os_environ(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr == "environ"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "os"
+        )
+
+    def _is_bare_environ(node: ast.AST) -> bool:
+        return isinstance(node, ast.Name) and node.id == "environ"
+
+    found: set = set()
+    for node in ast.walk(tree):
+        # 1. Assignment / augmented assignment to a subscript of `os.environ`
+        if isinstance(node, (ast.Assign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for t in targets:
+                if isinstance(t, ast.Subscript):
+                    if _is_os_environ(t.value):
+                        found.add("os.environ[...] =")
+                    elif _is_bare_environ(t.value):
+                        found.add("environ[...] =")
+        # 2. `del os.environ["X"]`
+        elif isinstance(node, ast.Delete):
+            for t in node.targets:
+                if isinstance(t, ast.Subscript):
+                    if _is_os_environ(t.value):
+                        found.add("del os.environ[...]")
+                    elif _is_bare_environ(t.value):
+                        found.add("del environ[...]")
+        # 3. Method / function calls
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute):
+                # `os.putenv(...)` / `os.unsetenv(...)`
+                if (
+                    isinstance(func.value, ast.Name)
+                    and func.value.id == "os"
+                    and func.attr in ("putenv", "unsetenv")
+                ):
+                    found.add(f"os.{func.attr}()")
+                # `os.environ.update(...)` / `.setdefault` / `.pop` / `.popitem` / `.clear`
+                elif _is_os_environ(func.value) and func.attr in (
+                    "update", "setdefault", "pop", "popitem", "clear",
+                    "__setitem__", "__delitem__",
+                ):
+                    found.add(f"os.environ.{func.attr}()")
+                # `environ.update(...)` (from-import style)
+                elif _is_bare_environ(func.value) and func.attr in (
+                    "update", "setdefault", "pop", "popitem", "clear",
+                ):
+                    found.add(f"environ.{func.attr}()")
+            elif isinstance(func, ast.Name) and func.id in ("putenv", "unsetenv"):
+                found.add(f"{func.id}()")
     return sorted(found)
 
 
@@ -443,6 +529,8 @@ def _categories_for(source: str, workspace_root: Optional[Path] = None) -> froze
     # is "ask before you delete anything", and this is where we honour it.
     if _detect_deletion_ops(source):
         categories.add("delete")
+    if _detect_env_mutation_ops(source):
+        categories.add("env")
     return frozenset(categories)
 
 
@@ -464,6 +552,12 @@ def _is_category_approved(risky_reason: Optional[str], source: Optional[str] = N
     categories = set(_classify_risk_categories(risky_reason))
     if source is not None and _detect_deletion_ops(source):
         categories.add("delete")
+    # Environment mutation is detected independently (like deletion): a
+    # snippet whose ONLY unusual surface is `os.environ[...] = ...` carries no
+    # risk reason, but MUST still be confirmed — the runtime gate in
+    # `sandbox_kernel._gated_putenv` refuses it without an `env` approval.
+    if source is not None and _detect_env_mutation_ops(source):
+        categories.add("env")
     if not categories:
         return True  # benign — no category, no prompt
     # ── Deletion always forces the prompt. ──
@@ -897,6 +991,9 @@ def _prompt_user_validation(source: str, script_label: str, argv: Optional[List[
         deletion_ops = _detect_deletion_ops(source)
         if deletion_ops:
             risk_categories.add("delete")
+        env_ops = _detect_env_mutation_ops(source)
+        if env_ops:
+            risk_categories.add("env")
         cats_hint = ", ".join(sorted(risk_categories)) if risk_categories else "none"
         deletion_note = ""
         if deletion_ops:
@@ -905,6 +1002,11 @@ def _prompt_user_validation(source: str, script_label: str, argv: Optional[List[
                 f"{', '.join(deletion_ops)}.\n"
                 f"  Deletion confirmation is per-execution: a previous "
                 f"'always' does not auto-approve it."
+            )
+        if env_ops:
+            deletion_note += (
+                f"\n  ℹ️  This snippet MUTATES process environment variables: "
+                f"{', '.join(env_ops)}."
             )
         while True:
             try:
@@ -1425,18 +1527,22 @@ def _run_python_source(
     # consulted before anything is deleted).
     _deletion_ops = _detect_deletion_ops(source)
     _has_deletion = bool(_deletion_ops)
+    _env_ops = _detect_env_mutation_ops(source)
+    _has_env = bool(_env_ops)
 
     if not pre_authorized and not auto_approved:
         if AUTONOMY_LEVEL == "strict":
             requires_user_prompt = True
             prompt_label = f"[STRICT] {script_label}"
-        elif AUTONOMY_LEVEL == "safe" and (_has_deletion or risky_reason):
+        elif AUTONOMY_LEVEL == "safe" and (_has_deletion or _has_env or risky_reason):
             requires_user_prompt = True
             label_parts: List[str] = []
             if risky_reason:
                 label_parts.append(f"RISKY: {risky_reason}")
             if _has_deletion:
                 label_parts.append(f"DELETES: {', '.join(_deletion_ops)}")
+            if _has_env:
+                label_parts.append(f"ENV: {', '.join(_env_ops)}")
             prompt_label = f"[{' | '.join(label_parts)}] {script_label}"
 
     if requires_user_prompt:
@@ -1459,6 +1565,8 @@ def _run_python_source(
             # every future deletion prompts the operator again, matching the
             # "ask before you delete" contract.
             approved_now = _classify_risk_categories(risky_reason)
+            if _has_env:
+                approved_now = approved_now | {"env"}
             _approve_categories(approved_now)
             # If the operator authorized filesystem access, widen the runtime
             # path guard to the interpreter's installation roots so a
@@ -1734,6 +1842,24 @@ def _run_python_source(
     def _on_exec_timeout(elapsed: float) -> str:
         return _timeout_decision_prompt(script_label, elapsed)
 
+    # ── Operator consent → child process ───────────────────────────────────
+    # The child is a fresh process that re-imports `sandbox_kernel` from
+    # disk; the parent's process-wide sys mirror does NOT reach it
+    # automatically. Serialize the persistent approval set here, PLUS the
+    # current snippet's categories whenever the operator authorized *this
+    # specific execution* (yes / pre_authorized / auto_approved). The `env`
+    # category is what unlocks `_gated_putenv`/`_gated_unsetenv` in the child,
+    # so an approved environment mutation runs instead of silently hitting
+    # "BLOCKED BY SANDBOX".
+    granted_categories = set(_get_approved_categories())
+    if user_authorized_risky:
+        if risky_reason:
+            granted_categories |= set(_classify_risk_categories(risky_reason))
+        if _has_env:
+            granted_categories.add("env")
+        if _has_deletion:
+            granted_categories.add("delete")
+
     envelope = _run_in_sandboxed_child(
         source=source,
         workspace_root=workspace_root,
@@ -1744,6 +1870,7 @@ def _run_python_source(
         persist_df_name=None,
         hard_timeout=_DEFAULT_EXECUTION_TIMEOUT_SECONDS,
         timeout_decision_cb=_on_exec_timeout,
+        approved_categories=frozenset(granted_categories),
     )
 
     progress_tc = tool_ctx if (tool_ctx is not None and hasattr(tool_ctx, "emit_progress")) else None
@@ -2216,17 +2343,21 @@ def tool_create_and_execute_python_file(
     # "ask before deleting" contract as the inline tool.
     _deletion_ops = _detect_deletion_ops(code_str)
     _has_deletion = bool(_deletion_ops)
+    _env_ops = _detect_env_mutation_ops(code_str)
+    _has_env = bool(_env_ops)
     if not _is_category_approved(risky_reason, source=code_str):
         if AUTONOMY_LEVEL == "strict":
             requires_user_prompt = True
             prompt_label = f"[STRICT] {clean_name}"
-        elif AUTONOMY_LEVEL == "safe" and (_has_deletion or risky_reason):
+        elif AUTONOMY_LEVEL == "safe" and (_has_deletion or _has_env or risky_reason):
             requires_user_prompt = True
             label_parts: List[str] = []
             if risky_reason:
                 label_parts.append(f"RISKY: {risky_reason}")
             if _has_deletion:
                 label_parts.append(f"DELETES: {', '.join(_deletion_ops)}")
+            if _has_env:
+                label_parts.append(f"ENV: {', '.join(_env_ops)}")
             prompt_label = f"[{' | '.join(label_parts)}] {clean_name}"
 
     if requires_user_prompt:
@@ -2252,6 +2383,8 @@ def tool_create_and_execute_python_file(
             # category from the classifier, plus the `filesystem` widening
             # that unlocks interpreter-tree reads.
             approved_now = _classify_risk_categories(risky_reason)
+            if _has_env:
+                approved_now = approved_now | {"env"}
             _approve_categories(approved_now)
             if "filesystem" in approved_now:
                 _sync_approved_path_roots(workspace_root)

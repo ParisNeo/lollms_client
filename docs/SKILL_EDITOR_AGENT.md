@@ -9,6 +9,278 @@ of `LollmsPersonality`, `Handbag`, `SkillsManager`, and the `skill_maker` LCP to
 > are new to handbag-based editor personas — the wiring pattern is the same, but the
 > **hooks, persistence, and refresh callbacks differ** in important, verifiable ways. This
 > document only advocates behaviors the codebase implements.
+>
+> **Preferred workflow (read §0 first)**: use the **`skill_editor` LCP toolset** shipped
+> at `src/lollms_client/tools_bindings/lcp/default_tools/skill_editor/`. It encapsulates
+> activate → Aider-patch/rewrite → validate → **hot-reload via `skills_manager.reload()`**
+> → test in a single set of `tool_edit_skill_*` calls, so the agent can live-edit and
+> immediately re-validate the SKILL.md inside one turn. The `skill_maker` RSI toolset
+> (§8) remains the heavy act-phase surface (commit / revert / test-agent) and is now
+> optional; the older `_extra_skills_dirs.append(...) + refresh_tools_and_skills()`
+> recipe (§7.4) is the fallback host-side refresh path.
+
+---
+
+## 0. Preferred workflow — the `skill_editor` toolset
+
+`skill_editor` is a small, focused LCP toolset whose job is to make the
+**read → edit → validate → hot-reload** loop work *inside* an agent turn. It
+does not shadow `skill_maker`: it edits the real `SKILL.md` on disk and calls
+the personality's live `skills_manager.reload()`, so whatever the agent
+validates is exactly what the SkillsManager will surface on the next round.
+
+### 0.0 — VERIFIED WIRING (read this before everything else)
+
+The editor toolset MUST be present on disk at the moment `from_handbag` (or
+`LCPBinding`) is constructed. `from_handbag(extra_tools=[...])` **silently drops
+any path that does not exist** on disk at construction time. If you point at
+`skill_editor` before that folder exists, the editor tools will never appear
+in the agent's registry — no error, no warning, just a missing toolset.
+
+**Checklist**
+
+1. Confirm the editor toolset folder exists **and contains `TOOLS.py`**:
+   ```
+   python -c "from pathlib import Path; p = Path('src/lollms_client/tools_bindings/lcp/default_tools/skill_editor'); print(p.is_dir(), (p / 'TOOLS.py').is_file())"
+   ```
+   Both must print `True`.
+
+2. Add it to `extra_tools` **alongside** the skills root:
+   ```python
+   editor = LollmsPersonality.from_handbag(
+       handbag_path=Path("skills_editor_handbag"),
+       lollms_client=client,
+       extra_skills_dirs=[SKILLS_ROOT],   # the target skills root
+       extra_tools=[SKILL_EDITOR_TOOLSET],  # the editor LCP toolset
+       workspace_path=WORKSPACE,
+   )
+   ```
+
+3. After construction, assert the editor tools landed:
+   ```python
+   tool_names = {t["name"] for t in editor.list_tools_structured()}
+   assert "tool_edit_skill_read" in tool_names, (
+       "skill_editor is NOT mounted — check that SKILL_EDITOR_TOOLSET existed "
+       "when from_handbag ran, and that it was passed in extra_tools."
+   )
+   ```
+
+**Anti-patterns that silently fail**
+
+- `extra_tools=[]` or a *different* toolset — the editor tools will not appear.
+  The agent has a skills root hooked via `extra_skills_dirs`, but no way to
+  read/patch source without extra help.
+- `extra_tools=[skill_editor]` where the folder was created **after** the
+  `LollmsPersonality` was constructed (e.g. you build the persona at app
+  startup, then unpack the editor toolset later). The path is dropped.
+  Either create the folder first or append to
+  `editor._extra_tool_files` and call `editor.refresh_tools_and_skills()` —
+  see §7.4.
+- Relying on `skill_maker`'s `tool_run_skill_test_agent` to read source. That
+  tool spawns a **constrained child** with only the skill's declared `tools:`
+  — the child has **no file-reading tool**. It cannot read `SKILL.md`. Use
+  `skill_editor`'s `tool_edit_skill_read` instead (it returns the source
+  directly, no file tools needed).
+
+### 0.6 — Skill ≠ file ≠ loaded skill (why "load" is ambiguous)
+
+The word **"load"** means three different things in this codebase, and the LLM
+must not conflate them. Every call to `tool_edit_skill_read`,
+`tool_edit_skill_activate`, or the new `tool_edit_skill_load_status` now
+reports three independent booleans:
+
+| Field | Meaning | Which tool changes it |
+|-------|---------|-----------------------|
+| `in_tree` | A `SKILL.md` exists at the reported path on disk. | Nothing — it's just filesystem presence. |
+| `registered` | The path is inside a skills root that the personality's **`SkillsManager`** has scanned. Only registered skills are discoverable by `tool_load_skill`. | `extra_skills_dirs` (host) + `refresh_tools_and_skills()` (host/agent). |
+| `loaded` | The skill is currently promoted into the **`=== ACTIVE SKILLS ===`** prompt section — its body reaches the LLM every turn. | `tool_load_skill(title=...)` / `tool_unload_skill(title=...)`. |
+
+**Common failure mode** — "load that skill into memory":
+- The `SKILL.md` exists in the workspace tree → `in_tree: true`.
+- But the workspace tree is **not** in `extra_skills_dirs` → `registered: false`.
+- So `tool_load_skill(title=...)` returns **not found**.
+- And `tool_edit_skill_read()` returns source text — which is **not** the same
+  as loading anything.
+
+The `load_status_guidance` field on `tool_edit_skill_read` /
+`tool_edit_skill_activate` / `tool_edit_skill_load_status` says exactly which
+of these is false and what the caller should do next. Example flow:
+
+```text
+tool_edit_skill_load_status()                       # → in_tree=true, registered=false
+# Guidance: "Not registered with the personality's SkillsManager. tool_load_skill
+#            will not find it. Either place the skill under one of the personality's
+#            skills roots (handbag/skills or an extra_skills_dirs entry) and reload,
+#            or treat it as a plain editable source file."
+```
+
+If the answer is "root not hooked", the caller must add the root and reload:
+
+```python
+editor._extra_skills_dirs.append(SKILLS_ROOT.resolve())
+editor.refresh_tools_and_skills()
+# Now tool_edit_skill_load_status() reports registered=true.
+# tool_load_skill(title="csv_inspector") can now promote it into ACTIVE SKILLS.
+```
+
+**Reading source never registers and never loads.** This is intentional: the
+toolset edits *any* `SKILL.md` in the workspace, including ones that were
+never registered. Registration and loading are separate, deliberate steps.
+
+### 0.7 — The `extra_skills_dirs` exception — editing skills outside the workspace
+
+The same exception that `toolset_editor` gives to `extra_tools` applies here
+symmetrically to `extra_skills_dirs`. If you wire a skill root that lives
+**outside** the workspace:
+
+```python
+editor = LollmsPersonality.from_handbag(
+    handbag_path=Path("skills_editor_handbag"),
+    lollms_client=client,
+    extra_skills_dirs=[EXTERNAL_SKILLS_ROOT],   # e.g. ~/.aitiana_studio/skills
+    extra_tools=[SKILL_EDITOR_TOOLSET],
+    workspace_path=WORKSPACE,                    # unrelated to EXTERNAL_SKILLS_ROOT
+)
+```
+
+…then `tool_edit_skill_list()` returns candidates from **both** sources:
+
+| source | what it means |
+|--------|---------------|
+| `workspace` | A `<slug>/SKILL.md` folder under `workspace_path`. Enumerated by `_list_workspace_skills`. |
+| `external` | A `<slug>/SKILL.md` folder registered on the live `skills_manager` (i.e. inside `EXTERNAL_SKILLS_ROOT`), even though its absolute path is outside the workspace. Enumerated by `_list_external_skills`, which walks `skills_manager.list_skills()`. |
+
+The auto-bootstrap resolver (`_try_auto_activate`) sees this combined list — so
+with exactly one external skill and no workspace skills, this works with **no
+`skill_edit_skill_activate` call at all**:
+
+```text
+tool_edit_skill_read()      # → returns EXTERNAL_SKILLS_ROOT/my_skill/SKILL.md source
+tool_edit_skill_patch(...)  # → writes EXTERNAL_SKILLS_ROOT/my_skill/SKILL.md
+```
+
+And if `tool_edit_skill_activate(skill_name="my_skill")` is called explicitly,
+`_resolve_skill_folder` resolves it against the live `skills_manager` (fallback
+#3) so an external skill name is enough — no absolute path needed.
+
+**Why this matters**: it eliminates exactly the "useless deduplication step" the
+old workflow required — copying a skill folder into the workspace so the editor
+could see it. `extra_skills_dirs` already declares the folder as a first-class
+part of the running agent's skills; the editor now honours that declaration
+directly.
+
+**The dedup invariant**: `_list_external_skills` skips any folder already
+returned by `_list_workspace_skills` (matching on the resolved folder path), so
+a skill under `WORKSPACE/skills/<slug>/SKILL.md` that is *also* registered
+appears exactly once — as `source: "workspace"`.
+
+**The one boundary that does NOT change**: the `loaded` state still requires
+the skill to be in `=== ACTIVE SKILLS ===` (via `tool_load_skill`). The
+`extra_skills_dirs` exception only widens the **editable** set; it does not
+auto-promote a skill into the prompt. See §0.6.
+
+### 0.1 — Wire it in from the caller app
+
+The caller builds the handbag (or handbag-less personality) with **two hooks**:
+`extra_skills_dirs` for the skills root and `extra_tools` for the editor
+toolset.
+
+```python
+from pathlib import Path
+import lollms_client
+from lollms_client.lollms_personality.lollms_personality import LollmsPersonality
+
+SKILL_EDITOR_TOOLSET = (
+    Path(lollms_client.__file__).parent
+    / "tools_bindings" / "lcp" / "default_tools" / "skill_editor"
+).resolve()
+SKILLS_ROOT = Path("workspace/skills").resolve()   # scanned for <slug>/SKILL.md
+WORKSPACE   = Path("workspace").resolve()
+
+editor = LollmsPersonality.from_handbag(
+    handbag_path=Path("skills_editor_handbag"),
+    lollms_client=client,
+    extra_skills_dirs=[SKILLS_ROOT],       # <-- the target skills root
+    extra_tools=[SKILL_EDITOR_TOOLSET],    # <-- the editor LCP toolset
+    workspace_path=WORKSPACE,
+    max_tokens_per_turn=8192,
+)
+```
+
+Once bound, the agent sees nine `tool_edit_skill_*` tools alongside any
+skills it can already see through the manager.
+
+### 0.2 — The loop, tool by tool
+
+| Step | Tool | What it does |
+|------|------|--------------|
+| Discover | `tool_edit_skill_list()` | Enumerates every editable skill folder — workspace-resident (`source: "workspace"`) plus externally registered on the live `skills_manager` (`source: "external"`, the `extra_skills_dirs` exception). Use when the target's exact name is unknown. |
+| Activate | `tool_edit_skill_activate(skill_name="csv_inspector", skill_folder=None)` | Reads `SKILL.md` into a session editing area, validates it, attempts a live reload. Returns the parsed `declared_tools`. **Optional when exactly one skill exists** — every editing tool auto-bootstraps against the sole candidate. |
+| Inspect | `tool_edit_skill_read()` | Returns the current editing-area source (always mirrors disk after a write). Auto-bootstraps on first call if no session exists. **Also reports `in_tree`/`registered`/`loaded`** so "read source" ≠ "activate skill". |
+| Diagnose | `tool_edit_skill_load_status()` | Reports only the three states (`in_tree`, `registered`, `loaded`) plus a one-line actionable `guidance`. No side effects. Use when the user asks *"why can't I load this skill?"* |
+| Edit 1/N | `tool_edit_skill_patch(patches="<<<<<<< SEARCH\\n...\\n=======\\n...\\n>>>>>>> REPLACE\\n...")` | Applies **one or more** Aider blocks **atomically** (all succeed or none), validates the frontmatter + body, writes to disk and hot-reloads. |
+| Edit N/N | `tool_edit_skill_rewrite(new_source="...")` | Full-file replacement; same validation + hot-reload path. |
+| Test | `tool_edit_skill_test()` | Validates the CURRENT DRAFT (frontmatter present, required fields, non-trivial body) without touching disk. |
+| Re-reload | `tool_edit_skill_reload()` | Explicit rebuild (only needed when reload was deferred because `env` had no personality handle). |
+| Status | `tool_edit_skill_status()` | Inspects the current session; no side effects. |
+| Close | `tool_edit_skill_close()` | Deletes the session file; **the edited SKILL.md stays on disk**. |
+
+### 0.3 — Example agent prompt
+
+```text
+You have the `skill_editor` tools. Your job:
+
+1. tool_edit_skill_list      — see what skills exist (skip if you already
+                               know the target name)
+2. tool_edit_skill_read      — RETURNS THE FULL SKILL.md SOURCE. You do NOT
+                               need a file-reading tool; this tool returns
+                               the source directly. Auto-bootstraps on the
+                               sole candidate.
+3. tool_edit_skill_test      — confirm the CURRENT draft is valid before you
+                               change anything.
+4. Edit with tool_edit_skill_patch (Aider blocks) — keep every other skill
+   invariant unchanged. If a full rewrite is needed, use tool_edit_skill_rewrite.
+5. tool_edit_skill_test      — must still be valid.
+6. Repeat 4–5 until valid. Then summarise the final diff and stop.
+
+Hard rules:
+- Read the source with tool_edit_skill_read. Do NOT try to use a sub-agent
+  or an external tool to read SKILL.md — you have no file tools, and any
+  child spawned by tool_run_skill_test_agent does not either.
+- Never edit files outside the target skill folder.
+- Never write a broken SKILL.md; the toolset rejects invalid frontmatter.
+- The edited SKILL.md on disk IS the deliverable — do not copy it elsewhere.
+- Reload happens automatically after every tool_edit_skill_patch/rewrite.
+  If the tool reports `reloaded: false`, call tool_edit_skill_reload once.
+```
+
+### 0.4 — Caller-side commit
+
+Because the toolset writes to the real `SKILL.md`, the caller app can commit
+the folder directly after the loop ends — nothing is hidden in a shadow copy:
+
+```python
+import shutil, subprocess
+shutil.copytree(SKILLS_ROOT / "csv_inspector", "my_repo/skills/csv_inspector", dirs_exist_ok=True)
+subprocess.run(["git", "add", "my_repo/skills/csv_inspector"], check=True)
+subprocess.run(["git", "commit", "-m", "Update csv_inspector via editor agent"], check=True)
+```
+
+### 0.5 — Building a fresh agent that uses the *new* skill
+
+After the loop, if you want to spin up an agent to exercise the freshly edited
+skill on its own, use the standard pattern — the target folder is now the
+committed truth:
+
+```python
+runner = LollmsPersonality.from_handbag(
+    handbag_path=Path("agent_handbag"),
+    lollms_client=client,
+    extra_skills_dirs=[SKILLS_ROOT],   # the (now-updated) skills root
+    workspace_path=WORKSPACE,
+)
+result = runner.chat(prompt="Use the csv_inspector skill on data.csv.")
+```
 
 ---
 
@@ -500,6 +772,14 @@ hard PASS/FAIL.
 
 `skill_maker` is the RSI toolset that mirrors `tool_maker` for `SKILL.md` files.
 
+> **Preferred alternative**: for a normal read/write/validate loop, prefer the
+> `skill_editor` LCP toolset (§0). `skill_maker` (below) is heavier — every
+> call is routed through the host confirmation modal
+> (`GATED_TASK_CATEGORY = "code_execution"`), and the act-phase tools
+> (`tool_commit_skill`, `tool_run_skill_test_agent`) additionally require
+> `enable_skillmaker=True`. Use `skill_maker` for the promotion/revert/test-agent
+> lifecycle, `skill_editor` for the inner edit-validate loop.
+
 ### 8.1 — Module constants and gating (verified)
 
 ```python
@@ -795,5 +1075,30 @@ Source symbols and files this document was checked against:
     auto-snapshot before write
 - `Handbag.skills_dirs` / `Handbag.tool_files` — invoked by `refresh_tools_and_skills`
   (see `src/lollms_client/lollms_personality/handbag.py`)
+- `skill_editor` toolset — `src/lollms_client/tools_bindings/lcp/default_tools/skill_editor/TOOLS.py`
+  - `tool_edit_skill_list` (workspace enumeration of `<slug>/SKILL.md` PLUS
+    externally registered skills via `_list_external_skills` — the
+    `extra_skills_dirs` exception; each entry carries `source` =
+    "workspace"|"external")
+  - `_list_workspace_skills` / `_list_external_skills` / `_list_candidate_skills`
+    (workspace-first enumeration; `_list_external_skills` walks
+    `personality.skills_manager.list_skills()` and dedups by resolved folder)
+  - `_resolve_skill_folder` (resolution order: explicit path → workspace name →
+    live `skills_manager` name; the third step is the cross-workspace escape)
+  - `tool_edit_skill_activate` (session init + validation + reload attempt)
+  - `tool_edit_skill_read` (returns source directly — no file tools required;
+    enriched with in_tree/registered/loaded + load_status_guidance)
+  - `tool_edit_skill_load_status` (three-state diagnostic: in_tree / registered / loaded)
+  - `_resolve_skill_status` / `_status_guidance` (duck-typed status resolver
+    against `skills_manager.list_skills()`; `loaded` ⇔ `visibility == "loadable"`)
+  - `tool_edit_skill_patch` / `tool_edit_skill_rewrite` (atomic Aider blocks /
+    full replacement; auto-validate before write; auto-reload after write)
+  - `tool_edit_skill_reload` (calls `personality.skills_manager.reload()` via
+    the same duck-typed resolver used by `toolset_editor`)
+  - `tool_edit_skill_test` (frontmatter + body validation of the current draft)
+  - `tool_edit_skill_status` / `tool_edit_skill_close`
+  - Frontmatter validation via `_parse_frontmatter` + `_validate_source`
+    (name + description required; body ≥ 30 non-whitespace chars)
 - Companion doc: `docs/TOOL_EDITOR_AGENT.md` (the same `refresh_tools_and_skills()`
-  invariant, the same `tool_files=` kwarg warning, the same handbag-layout contract).
+  invariant, the same `tool_files=` kwarg warning, the same handbag-layout contract,
+  and the sibling `toolset_editor` toolset this skill editor mirrors).

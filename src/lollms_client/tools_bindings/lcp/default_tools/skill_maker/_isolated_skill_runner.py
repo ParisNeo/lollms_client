@@ -9,6 +9,14 @@ Invocation contract (stdin JSON):
     {
         "skill_file":       "/abs/path/to/SKILL.md",
         "declared_tools":   ["tool_load_skill", "tool_list_skills", ...],
+        # ``resolved_toolset_folders`` is the list of toolset montage targets
+        # the parent resolved from ``declared_tools`` against its live binding.
+        # Each entry is either a folder containing TOOLS.py or a single-file
+        # toolset .py path. The child mounts these IN ADDITION to the shipped
+        # default_tools root so that a bare tool name can resolve to its
+        # owning toolset. Without this, the child sees only shipped defaults
+        # and its declared-tools filter yields nothing.
+        "resolved_toolset_folders": ["/abs/default_tools/websearch", ...],
         "candidate_skills_dirs": ["/abs/skills/dir/1", ...],
         "test_task":        "natural-language directive",
         "max_steps":        6,
@@ -191,6 +199,9 @@ def main() -> None:
 
     skill_file = Path(payload["skill_file"]).resolve()
     declared_tools = list(payload.get("declared_tools") or [])
+    resolved_toolset_folders = [
+        str(Path(p).resolve()) for p in (payload.get("resolved_toolset_folders") or [])
+    ]
     test_task = str(payload.get("test_task") or "").strip()
     max_steps = min(int(payload.get("max_steps", 6) or 6), _HARD_MAX_STEPS)
     skills_dirs = [Path(p).resolve() for p in (payload.get("candidate_skills_dirs") or [])]
@@ -212,6 +223,20 @@ def main() -> None:
     except Exception:
         _pkg_root = None
 
+    # Compose the toolset folder list: shipped default_tools root PLUS every
+    # toolset folder resolved by the parent from the skill's declared tools.
+    # Order matters only for collision resolution (defaults win), which is
+    # correct because the caller already validated there is no collision
+    # beyond the name filter applied below.
+    default_tools_root = (
+        Path(__import__("lollms_client").__file__).resolve().parent
+        / "tools_bindings" / "lcp" / "default_tools"
+    )
+    toolset_folders: List[str] = [str(default_tools_root)]
+    for f in resolved_toolset_folders:
+        if f not in toolset_folders:
+            toolset_folders.append(f)
+
     try:
         _CHILD_CLIENT = LollmsClient(
             system_dir=payload.get("system_dir"),
@@ -219,7 +244,7 @@ def main() -> None:
             llm_model_profiles=payload.get("llm_model_profiles") or {},
             tools_binding_name="lcp",
             tools_binding_config={
-                "tools_folders": [str(Path(__import__("lollms_client").__file__).resolve().parent / "tools_bindings" / "lcp" / "default_tools")],
+                "tools_folders": toolset_folders,
                 "host_tool_configs": {},
                 "system_dir": payload.get("system_dir"),
                 "cwd": str(skill_file.parent),
@@ -242,9 +267,25 @@ def main() -> None:
         sys.exit(2)
 
     if not available:
+        # With parent-side resolution this should not happen, but if it does
+        # the child must say exactly which folders were mounted and which
+        # names remained undiscovered so the mismatch is diagnosable.
+        try:
+            discovered_names = sorted(
+                t.get("name") for t in _CHILD_CLIENT.tools.discover_tools()
+                if t.get("name")
+            )
+        except BaseException:
+            discovered_names = []
         print(json.dumps({
             "ok": False,
-            "error": f"None of the declared tools {sorted(declared_set)} are available in this environment.",
+            "error": (
+                f"None of the declared tools {sorted(declared_set)} were "
+                "discovered after mounting the requested toolset folders."
+            ),
+            "mounted_toolset_folders": toolset_folders,
+            "declared_tools": sorted(declared_set),
+            "discovered_tool_names": discovered_names,
         }))
         sys.exit(0)
 

@@ -554,6 +554,28 @@ def _rehydrate_extra_roots_from_sys() -> None:
 _rehydrate_extra_roots_from_sys()
 
 
+def _get_approved_categories_from_sys() -> frozenset:
+    """Returns the operator-approved risk categories leaked to this process.
+
+    Mirrors `execute_python._get_approved_categories()`. The categories are
+    published on `sys.__lollms_execute_python_approved_categories__` by the
+    parent process, then transported through the spawn config (`sandbox_state`)
+    so the child (a fresh process) can honour the operator's consent the same
+    way the parent does.
+
+    Only the `env` category changes RUNTIME behaviour today: it lifts the
+    hard block on `os.putenv` / `os.unsetenv` / `os.environ[...]`. The
+    `filesystem` widening is handled through the extra-roots API instead;
+    every other category is prompt-only.
+    """
+    cached = getattr(sys, "__lollms_execute_python_approved_categories__", None)
+    if isinstance(cached, frozenset):
+        return cached
+    if isinstance(cached, (set, list, tuple)):
+        return frozenset(cached)
+    return frozenset()
+
+
 def _compute_sandbox_cache_root(workspace_root: Path) -> Path:
     """Returns the per-workspace sandbox cache directory: `<workspace>/.sandbox_cache/`.
 
@@ -1032,13 +1054,40 @@ _CHILD_HARD_TIMEOUT_DEFAULT = 120.0
 _CHILD_BOOTSTRAP_SOURCE = r'''
 import sys, json, base64, os
 
-_config = json.loads(sys.stdin.buffer.read().decode("utf-8"))
-sys.path[:] = _config["sys_path"]
+_CONFIG = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+sys.path[:] = _CONFIG["sys_path"]
+
+# ── Publish operator-consent state BEFORE importing the kernel ──
+# `_rehydrate_extra_roots_from_sys()` runs at kernel import time and reads
+# `sys.__lollms_sandbox_extra_*_roots__`; the approved-category set is read
+# by `_get_approved_categories_from_sys()` inside `_gated_putenv` /
+# `_gated_unsetenv`. Both must be present on `sys` BEFORE the import below,
+# because the child is a *fresh* process that never saw the parent's mirror.
+# `_CONFIG` is the canonical name for the parsed spawn config in this
+# bootstrap (assigned a few lines above). Use it directly and consistently;
+# a lowercase `_config` reference here previously raised NameError in every
+# spawned child.
+_SANDBOX_STATE = _CONFIG.get("sandbox_state") or {}
+try:
+    setattr(sys, "__lollms_execute_python_approved_categories__",
+            frozenset(_SANDBOX_STATE.get("approved_categories") or ()))
+except Exception:
+    pass
+try:
+    setattr(sys, "__lollms_sandbox_extra_read_roots__",
+            frozenset(_SANDBOX_STATE.get("extra_read_roots") or ()))
+except Exception:
+    pass
+try:
+    setattr(sys, "__lollms_sandbox_extra_write_roots__",
+            frozenset(_SANDBOX_STATE.get("extra_write_roots") or ()))
+except Exception:
+    pass
 
 # Fresh import in the child: no reload shadows, no stale sys.modules entries.
 from lollms_client.tools_bindings.lcp.default_tools.execute_python import sandbox_kernel as _sk
 
-_payload = _config["payload"]
+_payload = _CONFIG["payload"]
 
 # ── Bind seed modules by IMPORT, never by pickle ──
 #    `seed_imports = {alias: import_path}`. Modules are imported through the
@@ -1199,7 +1248,11 @@ def _sandbox_child_worker(conn, payload: Dict[str, Any]) -> None:
         # NOTE: the sandbox's cache-env redirection into `<workspace>/.sandbox_cache`
         # is *also* process-local; the child scrub resets everything on exit
         # because it dies before the parent resumes.
-        with SandboxContext(workspace_root=workspace_root, profile=profile) as _sbx:
+        with SandboxContext(
+            workspace_root=workspace_root,
+            profile=profile,
+            user_frame_label=script_label,
+        ) as _sbx:
             local_vars: Dict[str, Any] = dict(seed_locals)
             local_vars.setdefault("__builtins__", __builtins__)
             local_vars.setdefault("__file__", script_label)
@@ -1309,8 +1362,17 @@ def run_in_sandboxed_child(
     hard_timeout: float = _CHILD_HARD_TIMEOUT_DEFAULT,
     seed_imports: Optional[Dict[str, str]] = None,
     timeout_decision_cb: Optional[Callable[[float], str]] = None,
+    approved_categories: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     """Executes `source` in a sandboxed child process. Returns the envelope.
+
+    `approved_categories` is the operator-consent set granted to *this*
+    execution. It is serialized into the spawn config and re-published on the
+    child's `sys.__lollms_execute_python_approved_categories__` before the
+    kernel is imported, so `_gated_putenv`/`_gated_unsetenv` can honour the
+    consent that was solicited in the parent process. Without this, every
+    authorized environment mutation would still be blocked in the child
+    ("I clicked yes but it still says BLOCKED BY SANDBOX").
 
     `seed_imports` is a `{alias: import_path}` map: for each entry the child
     imports `import_path` via its own raw `__import__` (before the sandbox is
@@ -1432,9 +1494,23 @@ def run_in_sandboxed_child(
         "seed_imports": dict(seed_imports or {}),
         "persist_df_name": persist_df_name,
     }
+    # Operator-consent state → child. Transported via the spawn config so
+    # the *fresh* child process can reproduce the parent's decision (see
+    # `_CHILD_BOOTSTRAP_SOURCE`). The extra roots are read from the sys
+    # mirror that `set_extra_read_roots` / `set_extra_write_roots` maintain.
+    _sandbox_state_config = {
+        "approved_categories": sorted(set(approved_categories or ())),
+        "extra_read_roots": sorted(
+            getattr(sys, "__lollms_sandbox_extra_read_roots__", ()) or ()
+        ),
+        "extra_write_roots": sorted(
+            getattr(sys, "__lollms_sandbox_extra_write_roots__", ()) or ()
+        ),
+    }
     config_blob = _json.dumps({
         "sys_path": list(sys.path),
         "payload": payload,
+        "sandbox_state": _sandbox_state_config,
     }).encode("utf-8")
 
     # ── Launch the child as an isolated subprocess ─────────────────────────
@@ -1703,8 +1779,18 @@ _USER_FRAME_FILENAMES: frozenset[str] = frozenset({
 })
 
 
-def _caller_is_user_code() -> bool:
+def _caller_is_user_code(extra_label: Optional[str] = None) -> bool:
     """True if the *immediate* Python caller is inside a sandboxed exec frame.
+
+    Recognises two sources of "user frame":
+      1. The legacy pseudo-names in `_USER_FRAME_FILENAMES` (tools that
+         `exec(code, ..., "<execute_python>")` directly).
+      2. `extra_label` — the *actual* `co_filename` the active sandbox
+         compiled its user code under. This is the authoritative signal for
+         `run_in_sandboxed_child`, which compiles with whatever
+         `script_label` the caller passed (e.g. a workspace file name or a
+         test label). Without it, the guards would silently pass through and
+         the sandbox would not sandbox at all.
 
     Libraries called FROM user code (pandas.read_csv, matplotlib.savefig)
     eventually reach Python-level path ops through their own frames — those
@@ -1721,10 +1807,28 @@ def _caller_is_user_code() -> bool:
     for _ in range(3):
         if frame is None:
             return False
-        if frame.f_code.co_filename in _USER_FRAME_FILENAMES:
+        co_name = frame.f_code.co_filename
+        if co_name in _USER_FRAME_FILENAMES:
+            return True
+        if extra_label is not None and co_name == extra_label:
             return True
         frame = frame.f_back
     return False
+
+
+def _active_user_frame_label() -> Optional[str]:
+    """Returns the `co_filename` of the innermost active SandboxContext, if any.
+
+    SandboxContext pushes itself onto a module-level stack on `__enter__` and
+    pops on `__exit__`. The innermost (top of stack) label is the authoritative
+    one for the CURRENT execution: nested sandboxes are rare, and the top of
+    the stack is the one that compiled the code being run right now.
+    """
+    return _ACTIVE_SANDBOX_LABELS[-1] if _ACTIVE_SANDBOX_LABELS else None
+
+
+# Stack of active user-frame labels (one entry per live SandboxContext).
+_ACTIVE_SANDBOX_LABELS: List[str] = []
 
 
 def _resolve_within(root: Path, target: Any, allow_trusted_read: bool = False) -> Path:
@@ -1834,6 +1938,14 @@ class SandboxContext:
     """
     workspace_root: Path
     profile: str = "standard"
+    # The `co_filename` under which the sandboxed user code is compiled/exec'd.
+    # `_caller_is_user_code()` uses this to recognise user frames, so the gate
+    # works for ANY script label — not just the three hardcoded pseudo-names in
+    # `_USER_FRAME_FILENAMES`. Without this, a caller of `run_in_sandboxed_child`
+    # that passes e.g. `script_label="<env_test>"` compiles user code under that
+    # name and the guards never see a "user frame" → the sandbox silently
+    # permits everything (the exact defect these tests caught).
+    user_frame_label: Optional[str] = None
     _originals: Dict[str, Any] = field(default_factory=dict, init=False, repr=False)
     # Exposed after `__enter__` so callers (the data-query tool) can obtain the
     # filtered `__import__` without re-entering the sandbox via `import builtins`.
@@ -1882,6 +1994,8 @@ class SandboxContext:
             "os.killpg": getattr(os, "killpg", None),
             "os.putenv": getattr(os, "putenv", None),
             "os.unsetenv": getattr(os, "unsetenv", None),
+            "os.environ.__setitem__": getattr(type(os.environ), "__setitem__", None),
+            "os.environ.__delitem__": getattr(type(os.environ), "__delitem__", None),
             "os.symlink": getattr(os, "symlink", None),
             "os.link": getattr(os, "link", None),
             "os.chdir": getattr(os, "chdir", None),
@@ -1940,6 +2054,22 @@ class SandboxContext:
                 setattr(Path, method_name, orig_method)
             except Exception:
                 pass
+
+        # `os.environ.__setitem__` / `__delitem__` are DUNDER METHODS ON THE
+        # `_Environ` CLASS, not attributes of the `os` module — the generic
+        # `setattr(os, attr, orig)` path below cannot restore them (the attr
+        # name `environ.__setitem__` has no such slot). Handle them explicitly
+        # first so the host's `_Environ` class is never left patched.
+        for _env_key, _env_method in (
+            ("os.environ.__setitem__", "__setitem__"),
+            ("os.environ.__delitem__", "__delitem__"),
+        ):
+            _env_orig = self._originals.pop(_env_key, None)
+            if _env_orig is not None:
+                try:
+                    setattr(type(os.environ), _env_method, _env_orig)
+                except Exception:
+                    pass
 
         for key, orig in self._originals.items():
             if orig is None:
@@ -2093,6 +2223,10 @@ class SandboxContext:
         # matplotlib/pandas/pip cache writes to land inside the workspace, so
         # the (frame-free) guards see them as legitimate paths.
         self._redirect_cache_env()
+        # Register this context's user-frame label so the guards can recognise
+        # user code compiled under ANY script name (not just the legacy set).
+        if self.user_frame_label:
+            _ACTIVE_SANDBOX_LABELS.append(self.user_frame_label)
         try:
             self._install()
         except BaseException:
@@ -2100,12 +2234,28 @@ class SandboxContext:
             # everything snapshot before re-raising so we never corrupt host
             # state if `_install()` fails half-way (e.g. exotic platform
             # without `os.fork`).
+            if self.user_frame_label and _ACTIVE_SANDBOX_LABELS:
+                _ACTIVE_SANDBOX_LABELS.pop()
             self._restore()
             raise
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self._restore()
+        if self.user_frame_label and _ACTIVE_SANDBOX_LABELS:
+            try:
+                _ACTIVE_SANDBOX_LABELS.pop()
+            except IndexError:
+                pass
+
+    def _user_code(self) -> bool:
+        """Frame check bound to THIS context's user-frame label.
+
+        Resolves the label from the context's own field, falling back to the
+        active-stack top so guards installed by an outer context still see a
+        nested inner execution correctly.
+        """
+        return _caller_is_user_code(self.user_frame_label)
 
     def _install(self) -> None:
         root = self.workspace_root.resolve()
@@ -2135,7 +2285,7 @@ class SandboxContext:
         # "importing 'importlib' is forbidden" error and safe data analysis
         # would be impossible.
         def _filtered_import(name, globals=None, locals=None, fromlist=(), level=0):
-            if _caller_is_user_code():
+            if self._user_code():
                 root_mod = name.split(".")[0].lower()
                 # "authorized" profile: permit AUTHORIZED_MODULES (user consented
                 # to network / subprocess) but STILL block the truly-unsafe set.
@@ -2159,7 +2309,7 @@ class SandboxContext:
             return orig_import(name, globals, locals, fromlist, level)
 
         def _filtered_import_module(name, package=None):
-            if _caller_is_user_code():
+            if self._user_code():
                 root_mod = name.split(".")[0].lower()
                 if is_authorized:
                     if root_mod in AUTHORIZED_STILL_FORBIDDEN_MODULES:
@@ -2180,7 +2330,7 @@ class SandboxContext:
             return orig_import_module(name, package)
 
         def _filtered_reload(module):
-            if _caller_is_user_code():
+            if self._user_code():
                 mod_name = getattr(module, "__name__", "")
                 root_mod = mod_name.split(".")[0].lower()
                 if root_mod in FORBIDDEN_MODULES:
@@ -2225,14 +2375,14 @@ class SandboxContext:
         true_eval_orig = self._originals["builtins.eval"]
 
         def _gated_compile(source, filename, mode, *a, **kw):
-            if _caller_is_user_code():
+            if self._user_code():
                 raise SandboxPermissionError(
                     "🛑 BLOCKED BY SANDBOX: 'compile' is forbidden in user code."
                 )
             return true_compile_orig(source, filename, mode, *a, **kw)
 
         def _gated_exec(codestr, *a, **kw):
-            if _caller_is_user_code():
+            if self._user_code():
                 raise SandboxPermissionError(
                     "🛑 BLOCKED BY SANDBOX: 'exec' is forbidden in user code."
                 )
@@ -2256,7 +2406,7 @@ class SandboxContext:
         # it during import are not — the same policy enforced for `exec` and
         # `compile`.
         def _gated_eval(expr, *a, **kw):
-            if _caller_is_user_code():
+            if self._user_code():
                 raise SandboxPermissionError(
                     "🛑 BLOCKED BY SANDBOX: 'eval' is forbidden in user code."
                 )
@@ -2337,22 +2487,61 @@ class SandboxContext:
         _orig_unsetenv = self._originals.get("os.unsetenv")
         if _orig_putenv is not None:
             def _gated_putenv(name, value, *a, **kw):
-                if _caller_is_user_code():
-                    raise SandboxPermissionError(
-                        "🛑 BLOCKED BY SANDBOX: setting environment variables "
-                        "is forbidden in user code."
-                    )
+                if self._user_code():
+                    if "env" not in _get_approved_categories_from_sys():
+                        raise SandboxPermissionError(
+                            "🛑 BLOCKED BY SANDBOX: setting environment "
+                            "variables requires operator authorization. The "
+                            "operator must approve the 'env' risk category at "
+                            "the execute_python prompt (choose 'yes' for this "
+                            "execution or 'always' to persist the consent)."
+                        )
                 return _orig_putenv(name, value, *a, **kw)
             os.putenv = _gated_putenv
         if _orig_unsetenv is not None:
             def _gated_unsetenv(name, *a, **kw):
-                if _caller_is_user_code():
-                    raise SandboxPermissionError(
-                        "🛑 BLOCKED BY SANDBOX: unsetting environment variables "
-                        "is forbidden in user code."
-                    )
+                if self._user_code():
+                    if "env" not in _get_approved_categories_from_sys():
+                        raise SandboxPermissionError(
+                            "🛑 BLOCKED BY SANDBOX: unsetting environment "
+                            "variables requires operator authorization. The "
+                            "operator must approve the 'env' risk category at "
+                            "the execute_python prompt."
+                        )
                 return _orig_unsetenv(name, *a, **kw)
             os.unsetenv = _gated_unsetenv
+
+        # ── Also gate `os.environ.__setitem__` / `__delitem__` directly ──
+        # `os.environ["X"] = "Y"` on CPython routes through
+        # `os._Environ.__setitem__`, which may reach the *original* `putenv`
+        # (captured at class-definition time) rather than the module attribute
+        # we just patched — depending on Python version. Patching the dunder
+        # methods on the `_Environ` class closes that gap: an approved `env`
+        # mutation is honoured, an unapproved one is blocked, regardless of how
+        # `_Environ` binds `putenv` internally.
+        _env_cls = type(os.environ)
+        _orig_env_setitem = self._originals.get("os.environ.__setitem__")
+        _orig_env_delitem = self._originals.get("os.environ.__delitem__")
+        if _orig_env_setitem is not None:
+            def _gated_env_setitem(env_self, key, value):
+                if self._user_code() and "env" not in _get_approved_categories_from_sys():
+                    raise SandboxPermissionError(
+                        "🛑 BLOCKED BY SANDBOX: setting environment variables "
+                        "requires operator authorization (approve the 'env' risk "
+                        "category at the execute_python prompt)."
+                    )
+                return _orig_env_setitem(env_self, key, value)
+            setattr(_env_cls, "__setitem__", _gated_env_setitem)
+        if _orig_env_delitem is not None:
+            def _gated_env_delitem(env_self, key):
+                if self._user_code() and "env" not in _get_approved_categories_from_sys():
+                    raise SandboxPermissionError(
+                        "🛑 BLOCKED BY SANDBOX: unsetting environment variables "
+                        "requires operator authorization (approve the 'env' risk "
+                        "category at the execute_python prompt)."
+                    )
+                return _orig_env_delitem(env_self, key)
+            setattr(_env_cls, "__delitem__", _gated_env_delitem)
 
         # NOTE: `os.symlink` / `os.link` remain hard-blocked. Those are genuine
         # filesystem mutations that could escape the workspace path guard

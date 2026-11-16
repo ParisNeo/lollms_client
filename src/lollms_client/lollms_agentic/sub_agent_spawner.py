@@ -454,6 +454,117 @@ def build_report_envelope(config: SubAgentConfig, worker_result: Dict[str, Any],
     )
 
 
+def _build_worker_capabilities() -> Any:
+    """Return the locked-down CapabilityFlags that EVERY sub-agent must carry.
+
+    Sub-agents are leaf executors: they may inspect, edit, and run things in
+    their workspace, but they MUST NOT:
+      * spawn further sub-agents (recursion is the orchestrator's job),
+      * switch models,
+      * create skills,
+      * define their own sub-agent depth.
+
+    This is the single source of truth for sub-agent capability confinement.
+    Kept in a factory so both ``run_sub_agent`` (the <agent> tag path) and any
+    future spawn site produce the *same* flags — preventing the class of bug
+    where one spawn path forgot to pass ``capabilities=`` and silently
+    inherited the defaults (``enable_sub_agents=True``), causing an infinite
+    spawn chain.
+    """
+    from lollms_client.lollms_personality.lollms_personality import CapabilityFlags
+
+    return CapabilityFlags(
+        enable_sub_agents=False,       # ⛔ MANDATORY: no nested spawning
+        enable_model_switching=False,
+        enable_skill_creation=False,
+        enable_skill_loading=True,     # workers may load composed skills
+        max_sub_agent_depth=0,
+        max_sub_agents_per_turn=0,
+        skills_mode="loadable",
+        # Safe defaults preserved:
+        enable_workspace_tools=True,
+        enable_image_generation=False,
+        enable_image_editing=False,
+        enable_computer_use=False,
+        enable_networking=False,
+        enable_external_file_access=False,
+    )
+
+
+def _build_worker_capabilities() -> Any:
+    """Return the locked-down CapabilityFlags that EVERY sub-agent must carry.
+
+    Sub-agents are LEAF executors: they may inspect, edit, and run things in
+    their isolated workspace, but they MUST NOT:
+      * spawn further sub-agents (that is the orchestrator's exclusive job),
+      * switch models,
+      * create skills,
+      * define their own sub-agent depth headroom.
+
+    This is the SINGLE source of truth for sub-agent capability confinement.
+    Both spawn paths — the ``<agent>`` tag path (``run_sub_agent``) and the
+    in-process ``SubAgentSpawner.spawn`` path — MUST call this factory so
+    their confinement flags can never diverge again. Divergence between the
+    two was the root cause of the infinite spawn chain bug (one path forgot
+    ``enable_sub_agents=False`` and silently inherited the defaults).
+    """
+    from lollms_client.lollms_personality.lollms_personality import CapabilityFlags
+
+    return CapabilityFlags(
+        enable_sub_agents=False,        # ⛔ MANDATORY: no nested spawning
+        enable_model_switching=False,
+        enable_skill_creation=False,
+        enable_skill_loading=True,      # workers may load composed skills
+        max_sub_agent_depth=0,
+        max_sub_agents_per_turn=0,
+        skills_mode="loadable",
+        # Preserve safe defaults:
+        enable_workspace_tools=True,
+        enable_image_generation=False,
+        enable_image_editing=False,
+        enable_computer_use=False,
+        enable_networking=False,
+        enable_external_file_access=False,
+    )
+
+
+def _build_worker_capabilities() -> Any:
+    """Return the locked-down CapabilityFlags that EVERY sub-agent must carry.
+
+    Sub-agents are LEAF executors: they may inspect, edit, and run things in
+    their isolated workspace, but they MUST NOT:
+      * spawn further sub-agents (that is the orchestrator's exclusive job),
+      * switch models,
+      * create skills,
+      * define their own sub-agent depth headroom.
+
+    This is the SINGLE source of truth for sub-agent capability confinement.
+    Both spawn paths -- the ``<agent>`` tag path (``run_sub_agent``) and the
+    in-process ``SubAgentSpawner.spawn`` path -- MUST call this factory so
+    their confinement flags can never diverge again. Divergence between the
+    two was the root cause of the infinite spawn chain bug (one path forgot
+    ``enable_sub_agents=False`` and silently inherited the defaults).
+    """
+    from lollms_client.lollms_personality.lollms_personality import CapabilityFlags
+
+    return CapabilityFlags(
+        enable_sub_agents=False,        # MANDATORY: no nested spawning
+        enable_model_switching=False,
+        enable_skill_creation=False,
+        enable_skill_loading=True,      # workers may load composed skills
+        max_sub_agent_depth=0,
+        max_sub_agents_per_turn=0,
+        skills_mode="loadable",
+        # Preserve safe defaults:
+        enable_workspace_tools=True,
+        enable_image_generation=False,
+        enable_image_editing=False,
+        enable_computer_use=False,
+        enable_networking=False,
+        enable_external_file_access=False,
+    )
+
+
 def run_sub_agent(
     discussion,
     config: SubAgentConfig,
@@ -464,6 +575,47 @@ def run_sub_agent(
 ) -> Dict[str, Any]:
     """
     Runs one worker through the standard discussion.chat() engine.
+
+    The worker is a LEAF executor: it is constructed with the locked-down
+    ``_build_worker_capabilities()`` flags, so it cannot spawn further
+    sub-agents regardless of what the ``<agent>`` tag body asks for.
+
+    Streams to the user:
+      1. <processing type="agent_spawn"> block announcing the spawn.
+      2. The worker's live chunks (relayed verbatim through the callback).
+      3. A closing status block with the sealed report digest.
+
+    Returns the sealed run record:
+      {"agent_tag": str, "report_envelope": str, "files": [...], "success": bool}
+    """
+    from lollms_client.lollms_agentic.prompts import WORKER_SYSTEM_PROMPT
+    from lollms_client.lollms_personality.lollms_personality import LollmsPersonality
+) -> Dict[str, Any]:
+    """
+    Runs one worker through the standard discussion.chat() engine.
+
+    The worker is a LEAF executor: it is constructed with the locked-down
+    ``_build_worker_capabilities()`` flags, so it cannot spawn further
+    sub-agents regardless of what the ``<agent>`` tag body asks for.
+
+    Streams to the user:
+      1. <processing type="agent_spawn"> block announcing the spawn.
+      2. The worker's live chunks (relayed verbatim through the callback).
+      3. A closing status block with the sealed report digest.
+
+    Returns the sealed run record:
+      {"agent_tag": str, "report_envelope": str, "files": [...], "success": bool}
+    """
+    from lollms_client.lollms_agentic.prompts import WORKER_SYSTEM_PROMPT
+    from lollms_client.lollms_personality.lollms_personality import LollmsPersonality
+) -> Dict[str, Any]:
+    """
+    Runs one worker through the standard discussion.chat() engine.
+
+    The worker is a LEAF executor: it receives the locked-down
+    ``_build_worker_capabilities()`` flags, which disable sub-agent spawning
+    entirely. A sub-agent therefore cannot recursively spawn more sub-agents,
+    regardless of what the <agent> tag body asks for.
 
     Streams to the user:
       1. <processing type="agent_spawn"> block announcing the spawn.
@@ -501,11 +653,21 @@ def run_sub_agent(
     system_prompt = WORKER_SYSTEM_PROMPT
     if config.system_prompt:
         system_prompt = config.system_prompt + "\n\n" + WORKER_SYSTEM_PROMPT
+
+    # ⛔ HARD CONFINEMENT: workers are LEAF executors. They MUST NOT be able
+    # to spawn further sub-agents. Without this explicit ``capabilities=``,
+    # LollmsPersonality would fall back to ``CapabilityFlags()`` defaults
+    # (enable_sub_agents=True) and, because lollms_client is passed, the
+    # chat() loop would automatically register ``tool_spawn_sub_agent`` on
+    # the worker — yielding the infinite spawn chain: worker → sub-worker →
+    # sub-sub-worker → ...
     worker_persona = LollmsPersonality(
         name=config.name,
         system_prompt=system_prompt,
         lollms_client=discussion.lollmsClient,
         workspace_path=worker_workspace,
+        capabilities=_build_worker_capabilities(),
+        _parent_depth=1,  # mark as depth 1 so any accidental spawner refuses
     )
 
     context_body = build_worker_context(discussion, config)
@@ -578,6 +740,18 @@ def run_sub_agent(
             enable_skills=False,
             enable_forms=False,
             orchestrator_mode=False,
+            # ⛔ Defence-in-depth: even if a future refactor loosens the
+            # personality's capabilities, this call-time flag keeps the
+            # sub-agent's tool registry free of sub-agent spawning tools.
+            enable_computer_use=False,
+            enable_forms=False,
+            orchestrator_mode=False,
+            # Defence-in-depth: even if a future refactor loosens the worker
+            # persona's capabilities, these call-time flags keep the
+            # sub-agent's registry free of sub-agent spawning tools.
+            enable_computer_use=False,
+            allow_computer_use=False,
+            builtin_tools_activation_list=None,
             event_mode=event_mode,
             streaming_callback=worker_stream_relay,
             reasoning_effort=config.reasoning_effort,

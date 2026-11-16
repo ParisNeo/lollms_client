@@ -1219,18 +1219,25 @@ class SubAgentSpawner:
             if self.parent.is_generation_cancelled():
                 return {"success": False, "error": "Operation cancelled before sub-agent execution."}
 
-            child_caps = CapabilityFlags(
-                enable_code_execution=self.parent.capabilities.enable_code_execution if self.parent.capabilities else True,
-                enable_image_generation=False,
-                enable_image_editing=False,
-                enable_sub_agents=False,  # Prevent infinite recursion
-                enable_model_switching=False,
-                enable_skill_loading=self.parent.capabilities.enable_skill_loading if self.parent.capabilities else True,
-                enable_skill_creation=False,
-                enable_workspace_tools=True,
-                skills_mode="loadable",
-                max_sub_agent_depth=0,
+            # ⛔ SINGLE SOURCE OF TRUTH for sub-agent capabilities.
+            # Both the <agent> tag path (sub_agent_spawner.run_sub_agent) and
+            # this in-process spawner path MUST produce identical confinement
+            # flags. Divergence between the two was the root cause of the
+            # infinite spawn chain bug (one path forgot enable_sub_agents=False).
+            from lollms_client.lollms_agentic.sub_agent_spawner import (
+                _build_worker_capabilities,
             )
+
+            child_caps = _build_worker_capabilities()
+            # Preserve the parent's code-execution grant (needed for real work)
+            # but still refuse sub-agents / model switching / skill creation.
+            if self.parent.capabilities is not None:
+                child_caps.enable_code_execution = bool(
+                    self.parent.capabilities.enable_code_execution
+                )
+                child_caps.enable_skill_loading = bool(
+                    self.parent.capabilities.enable_skill_loading
+                )
 
             # Authoritative Worker Sub-Agent Doctrine
             base_worker_prompt = (
@@ -7817,7 +7824,22 @@ JSON:"""
                     active_tools["tool_annotate_document"]["description"] += user_annotation_rule
 
         # ── 6. MOUNT SUB-AGENTS & MODEL SWITCHING WHEN ENABLED IN CAPABILITIES ──
-        if self.capabilities and self.capabilities.enable_sub_agents and self._sub_agent_spawner:
+        #
+        # ⛔ LEAF-EXECUTOR GUARD (defence-in-depth against spawn recursion):
+        # A persona is allowed to expose `tool_spawn_sub_agent` ONLY when BOTH
+        # the capability flag is on AND it has spawner headroom left. The
+        # depth check here mirrors `SubAgentSpawner.can_spawn()` so the tool
+        # never even APPEARS in the registry when the agent is already at (or
+        # beyond) its configured depth ceiling. Without this, a leaf that was
+        # hand-constructed with `enable_sub_agents=True` but `max_sub_agent_depth=0`
+        # would still advertise the tool — small models would then call it and
+        # burn rounds on a guaranteed "spawn limit reached" failure.
+        _can_actually_spawn = bool(
+            self._sub_agent_spawner
+            and getattr(self._sub_agent_spawner, "_current_depth", 0)
+                < getattr(self.capabilities, "max_sub_agent_depth", 0)
+        )
+        if self.capabilities and self.capabilities.enable_sub_agents and _can_actually_spawn:
             avail_profiles = []
             if self.lollms_client and hasattr(self.lollms_client, "llm_model_profiles_registry"):
                 avail_profiles = list(self.lollms_client.llm_model_profiles_registry.keys())

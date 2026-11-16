@@ -1,51 +1,33 @@
-name: "LCP SkillMaker (Basic skills + RSI Self-Enhancement)"
-author: "ParisNeo"
-version: 1.0
-category: "meta"
-description: |
-  Mirror of ``tool_maker`` but for LLM *skills* (SKILL.md files). Provides a
-  safe read → modify → test → revert/discard → commit cycle for skills, gated
-  through the SAME two-tier split as the toolsmith.
-
-  BASIC TIER — always available, gated only by code_execution modal:
-    - tool_read_skill_source      : read the on-disk SKILL.md of a live skill.
-    - tool_write_skill_source     : write / patch SKILL.md (auto-snapshot).
-    - tool_test_skill_source      : parse YAML frontmatter + structural shape.
-    - tool_list_skill_versions    : enumerate skill snapshots + release manifests.
-    - tool_revert_skill           : restore one prior snapshot (undo last write).
-    - tool_discard_skill_changes  : hard reset to last release / oldest snapshot.
-
-  RSI ACT-PHASE — requires enable_skillmaker=True:
-    - tool_run_skill_test_agent   : spawn a CONSTRAINED child agent equipped
-                                    ONLY with the candidate skill's declared
-                                    tools. Hard-capped rounds, hard timeout,
-                                    transcript returned for the operator.
-    - tool_commit_skill           : record a file-system release (no git
-                                    required), optionally git commit + skill
-                                    remount on the personality.
-
-  Visibility:
-    LCPBinding.discover_tools() hides the two RSI tools when enable_skillmaker
-    is falsy. The basic tier is always available.
-
-  Safety invariants:
-    * Path containment: skills must be inside a configured skills_dir AND
-      registered in the personality's skills_manager.
-    * YAML frontmatter must parse AND declare `name` + `description`.
-    * `.rsi_backup/` + `.rsi/commits/` are the canonical revert/commit store.
-    * HALT-aware: every mutating tool checks `_HALT_REQUESTED`.
-    * Child-test agent refuses skills whose declared tools include shell /
-      python / sub-agent / computer-use toolsets.
-
+name: skill_maker
+description: >-
+  RSI toolset for skills (SKILL.md files). Enumerate, read, write, test,
+  revert, discard and commit skill sources. Every per-skill tool
+  auto-selects the sole visible skill when the caller does not supply a
+  name, matching the toolset_editor ergonomics. Full content or Aider
+  SEARCH/REPLACE patches are supported; edits are validated before write,
+  backups and release manifests live under .rsi_backup/ and .rsi/commits/
+  so the workflow is fully reversible and git-free. Act-phase tools
+  (run_test_agent, commit_skill) require enable_skillmaker=True.
+icon: "📚"
+author: lollms-client
+version: "0.2.0"
+category: developer
 tools:
+  - name: tool_list_skills
+    description: Enumerate every skill visible to the session (registered skills first, then standard skill roots). Call this first when the target slug is unknown.
   - name: tool_read_skill_source
+    description: Return the full SKILL.md source. Auto-selects the sole visible skill when called without an argument.
   - name: tool_write_skill_source
+    description: Write new SKILL.md content (full or Aider SEARCH/REPLACE). Validates before touching disk. Auto-selects the sole visible skill when unnamed.
   - name: tool_test_skill_source
-  - name: tool_list_skill_versions
-  - name: tool_revert_skill
-  - name: tool_discard_skill_changes
+    description: Validate the SKILL.md frontmatter and structure. Auto-selects the sole visible skill when unnamed.
   - name: tool_run_skill_test_agent
-    requires_flag: enable_skillmaker
+    description: Spawn a CONSTRAINED child agent equipped with the skill's declared tools and run it. Refused for code-execution skills. Requires enable_skillmaker=True.
+  - name: tool_list_skill_versions
+    description: List every revert target (releases, backups, git HEAD status). Auto-selects the sole visible skill when unnamed.
+  - name: tool_revert_skill
+    description: Revert the skill to a prior snapshot (0 = undo last write). Post-validation auto-rolls-back broken snapshots. Auto-selects the sole visible skill when unnamed.
+  - name: tool_discard_skill_changes
+    description: Hard-abort the current experiment (reset to last committed state). Auto-selects the sole visible skill when unnamed.
   - name: tool_commit_skill
-    requires_flag: enable_skillmaker
-visibility: loadable
+    description: Record a release (git-free manifest), opportunistically git-commit, then remount the skill. Auto-selects the sole visible skill when unnamed. Requires enable_skillmaker=True.

@@ -7,6 +7,206 @@ mechanics of `LollmsPersonality`, `Handbag`, and `LCPBinding`.
 > **Scope**: This document describes *how to wire* the editor agent and *how the hot-reload
 > actually works*. It intentionally forbids claiming behaviors the codebase does not
 > implement (notably: `tool_load_generated_toolset` does **not** hot-load).
+>
+> **Preferred workflow (read §0 first)**: use the **`toolset_editor` LCP toolset** shipped
+> at `src/lollms_client/tools_bindings/lcp/default_tools/toolset_editor/`. It encapsulates
+> activate → Aider-patch/rewrite → validate → **hot-reload** → test in a single set of
+> `tool_edit_toolset_*` calls, so the agent can live-edit and immediately validate the
+> toolset inside one turn. The older `_extra_tool_files.append(...) +
+> refresh_tools_and_skills()` recipe (§6.4) remains valid but is now only a fallback.
+
+---
+
+## 0. Preferred workflow — the `toolset_editor` toolset
+
+`toolset_editor` is a new default LCP toolset whose job is to make the
+**update → test → validate** loop work *inside* an agent turn. It does not shadow
+the target toolset: it edits the real `TOOLS.py` on disk and re-scans the live
+binding, so whatever the agent validates is exactly what will be committed.
+
+### 0.0 — VERIFIED WIRING (read this before everything else)
+
+The editor toolset MUST be present on disk at the moment `from_handbag` (or
+`LCPBinding`) is constructed. `from_handbag(extra_tools=[...])` **silently drops
+any path that does not exist** on disk at construction time. If you point at
+`toolset_editor` before that folder exists, the editor tools will never appear
+in the agent's registry — no error, no warning, just a missing toolset.
+
+**Checklist**
+
+1. Confirm the editor toolset folder exists **and contains `TOOLS.py`**:
+   ```
+   python -c "from pathlib import Path; p = Path('src/lollms_client/tools_bindings/lcp/default_tools/toolset_editor'); print(p.is_dir(), (p / 'TOOLS.py').is_file())"
+   ```
+   Both must print `True`.
+
+2. Add it to `extra_tools` **alongside** the target toolset:
+   ```python
+   editor = LollmsPersonality.from_handbag(
+       handbag_path=Path("editor_handbag"),
+       lollms_client=client,
+       extra_tools=[EDITOR_TOOLSET, TARGET_TOOLSET],  # BOTH required
+       workspace_path=WORKSPACE,
+   )
+   ```
+
+3. After construction, assert the editor tools landed:
+   ```python
+   tool_names = {t["name"] for t in editor.list_tools_structured()}
+   assert "tool_edit_toolset_read" in tool_names, (
+       "toolset_editor is NOT mounted — check that EDITOR_TOOLSET existed when "
+       "from_handbag ran, and that it was passed in extra_tools."
+   )
+   ```
+
+**Anti-patterns that silently fail**
+
+- `extra_tools=[TARGET_TOOLSET]` only — the editor tools will not appear.
+  The agent has the target toolset but no way to read/patch its source.
+- `extra_tools=[editor, target]` where `editor` was created **after** the
+  `LollmsPersonality` was constructed (e.g. you build the persona at app
+  startup, then unpack the editor toolset later). The path is dropped.
+  Either create the folder first or append to `editor._extra_tool_files` and
+  call `editor.refresh_tools_and_skills()` — see §6.4.
+- Relying on `tool_maker`'s `tool_spawn_test_agent` to read source. That tool
+  mounts a **constrained child** with only the target toolset's tools — the
+  child has **no file-reading tool**. It cannot read `TOOLS.py`. Use the
+  `toolset_editor` toolset's `tool_edit_toolset_read` instead (it returns the
+  source directly, no file tools needed).
+
+**Good news (v0.2.0+) — the workspace constraint is relaxed for `extra_tools`**
+
+The `toolset_editor` toolset now recognises **external toolsets**: any folder
+that is mounted on the live LCP binding (via `extra_tools` or the handbag's
+`tools/`) but lives **outside** `workspace_path` is a legitimate editing
+target. `tool_edit_toolset_list()` returns it with `source: "external"`, and
+both `tool_edit_toolset_activate(toolset_name=...)` (name-based) and the
+auto-bootstrap resolver accept it.
+
+This means: **if you wired `TARGET_TOOLSET` via `extra_tools=[EDITOR,
+TARGET]`, you can edit `TARGET` without copying it into the workspace.**
+
+- `_list_workspace_toolsets(workspace)` → folders under `workspace_path`
+  (`source: "workspace"`).
+- `_list_external_toolsets(env, workspace)` → additional folders discovered
+  by walking `env.client.tools.discovered_tools`, each entry's
+  `_python_file_path` parent (when the file is `TOOLS.py`) being a candidate
+  (`source: "external"`).
+- `_list_candidate_toolsets(workspace, env)` concatenates them,
+  workspace-first, and dedups by resolved folder path.
+- `_resolve_toolset_folder(..., env=env)` uses the combined list as a
+  fallback when a name is not found in the workspace.
+
+Boundaries that are **still enforced**:
+- A folder not mounted via `extra_tools` **and** not under `workspace_path` is
+  not visible to the editor. You still need to wire it.
+- The `toolset_editor` folder itself is excluded from the result (no
+  self-editing).
+- Single-file toolsets (`.py` file not named `TOOLS.py`) are not enumerated —
+  the editor works on **folders** with a `TOOLS.py` entrypoint.
+
+### 0.1 — Wire it in from the caller app
+
+The caller builds the handbag (or handbag-less personality) with **two** `extra_tools`
+entries: the target toolset and the editor toolset.
+
+```python
+from pathlib import Path
+from lollms_client.lollms_personality.lollms_personality import LollmsPersonality
+
+EDITOR_TOOLSET = (
+    Path("src/lollms_client/tools_bindings/lcp/default_tools/toolset_editor").resolve()
+)
+TARGET_TOOLSET = Path("workspace/file_tools").resolve()   # contains TOOLS.py
+WORKSPACE      = Path("workspace").resolve()
+
+editor = LollmsPersonality.from_handbag(
+    handbag_path=Path("editor_handbag"),
+    lollms_client=client,
+    extra_tools=[EDITOR_TOOLSET, TARGET_TOOLSET],   # <-- both
+    workspace_path=WORKSPACE,
+    max_tokens_per_turn=8192,
+)
+```
+
+Once bound, the agent sees eight `tool_edit_toolset_*` tools alongside the
+target toolset's own `tool_*` functions.
+
+### 0.2 — The loop, tool by tool
+
+| Step | Tool | What it does |
+|------|------|--------------|
+| Discover | `tool_edit_toolset_list()` | Enumerates every editable toolset folder — workspace-resident (`source: "workspace"`) plus externally mounted via `extra_tools` on the live binding (`source: "external"`). Use when the target's exact name is unknown. |
+| Activate | `tool_edit_toolset_activate(toolset_name="file_tools", toolset_folder=None)` | Reads `TOOLS.py` into a session editing area, validates it, attempts a live reload. Returns the discovered `tool_*` names. **Optional when exactly one toolset exists** — every editing tool auto-bootstraps against the sole candidate. |
+| Inspect | `tool_edit_toolset_read()` | Returns the current editing-area source (always mirrors disk after a write). Auto-bootstraps on first call if no session exists. |
+| Edit 1/N | `tool_edit_toolset_patch(patches="<<<<<<< SEARCH\\n...\\n=======\\n...\\n>>>>>>> REPLACE\\n...")` | Applies **one or more** Aider blocks **atomically** (all succeed or none), validates with `ast.parse`, requires ≥1 `def tool_*(`. Writes to disk and hot-reloads. |
+| Edit N/N | `tool_edit_toolset_rewrite(new_source="...")` | Full-file replacement; same validation + hot-reload path. |
+| Test | `tool_edit_toolset_test(tool_name="tool_count_rows", arguments_json='{"file_name": "x.csv"}')` | Imports the **current disk** `TOOLS.py` in a fresh module and calls the function directly — a true independent test. |
+| Re-reload | `tool_edit_toolset_reload()` | Explicit rebuild (only needed when reload was deferred because `env` had no personality handle). |
+| Status | `tool_edit_toolset_status()` | Inspects the current session; no side effects. |
+| Close | `tool_edit_toolset_close()` | Deletes the session file; **the edited TOOLS.py stays on disk**. |
+
+### 0.3 — Example agent prompt
+
+```text
+You have the `toolset_editor` tools. Your job:
+
+1. tool_edit_toolset_list      — see what toolsets exist (skip if you already
+                                 know the target name)
+2. tool_edit_toolset_read      — RETURNS THE FULL TOOLS.py SOURCE. You do NOT
+                                 need a file-reading tool; this tool returns
+                                 the source directly. Auto-bootstraps on the
+                                 sole candidate.
+3. tool_edit_toolset_test(tool_name="tool_echo", arguments_json='{"message":"hi"}')
+   — confirm the CURRENT behavior before you change anything.
+4. Edit with tool_edit_toolset_patch (Aider blocks) — keep every other tool_*
+   unchanged. If a full rewrite is needed, use tool_edit_toolset_rewrite.
+5. tool_edit_toolset_test the edited tool_* with the SAME inputs.
+   Compare to the pre-edit output. Explicitly state PASS or FAIL.
+6. Repeat 4–5 until PASS. Then summarise the final diff and stop.
+
+Hard rules:
+- Read the source with tool_edit_toolset_read. Do NOT try to use a sub-agent
+  or an external tool to read TOOLS.py — you have no file tools, and the
+  sub-agent does not either.
+- Never edit files outside the target toolset folder.
+- Never write a broken TOOLS.py; the toolset rejects invalid Python.
+- The edited TOOLS.py on disk IS the deliverable — do not copy it elsewhere.
+- Reload happens automatically after every tool_edit_toolset_patch/rewrite.
+  If the tool reports `reloaded: false`, call tool_edit_toolset_reload once.
+```
+
+### 0.4 — Caller-side commit
+
+Because the toolset writes to the real `TOOLS.py`, the caller app can commit the
+folder directly after the loop ends — nothing is hidden in a shadow copy:
+
+```python
+import shutil, subprocess
+shutil.copytree(TARGET_TOOLSET, "my_repo/tools/file_tools", dirs_exist_ok=True)
+subprocess.run(["git", "add", "my_repo/tools/file_tools"], check=True)
+subprocess.run(["git", "commit", "-m", "Update file_tools via editor agent"], check=True)
+```
+
+### 0.5 — Building a fresh agent that uses the *new* toolset
+
+After the loop, if you want to spin up an agent to exercise the freshly edited
+toolset on its own, use the standard pattern — the target folder is now the
+committed truth:
+
+```python
+runner = LollmsPersonality.from_handbag(
+    handbag_path=Path("agent_handbag"),
+    lollms_client=client,
+    extra_tools=[TARGET_TOOLSET],   # only the (now-updated) toolset
+    workspace_path=WORKSPACE,
+)
+result = runner.chat(prompt="Use tool_count_rows on data.csv and report the result.")
+```
+
+The caller builds the handbag with the target toolset as `extra_tools`; the
+persona is confined to that toolset's `tool_*` functions plus its file tools,
+exactly the update/test/validate environment the editor just produced.
 
 ---
 
@@ -528,6 +728,38 @@ Do **not** write code or documentation that promises:
 
 ---
 
+## 10.5 — The "tool_spawn_test_agent has no file tools" trap (observed in production)
+
+An editor agent that has **only** the target toolset (LTspice, SQL, etc.) plus
+`tool_maker`'s `tool_spawn_test_agent` will produce this pattern on the first
+turn:
+
+```
+tool_spawn_test_agent(task="Read TOOLS.py and report the function bodies")
+  → child agent has ONLY the target toolset's tools
+  → child tries tool_list_available_symbols, gets symbols, cannot read files
+  → child reports "I have no file-reading capability"
+  → tool_spawn_test_agent returns SUCCESS but with a garbage report
+```
+
+This is **not** a bug in `tool_spawn_test_agent` — that child is deliberately
+constrained (see `tool_maker/TOOLS.py`, `_FORBIDDEN_TEST_TARGETS` and
+`_isolated_child_runner.py`). It is a **wiring bug**: the editor agent was
+given `tool_maker` but not `toolset_editor`, so it has no way to read the
+target's source directly.
+
+**Fix**: add `toolset_editor` to `extra_tools` (alongside the target toolset).
+The editor agent then calls `tool_edit_toolset_read()`, which returns the
+full `TOOLS.py` source as a tool result — no file tools, no sub-agent required.
+
+If you must keep using `tool_maker` for legacy reasons, remember:
+`tool_spawn_test_agent` is for **behavioural testing of live tools**, never for
+**reading source**. Reading source belongs to `tool_edit_toolset_read` (or, if
+you insist, to a handbag `workspace_tools` grant — but then the child agent
+still cannot inherit it).
+
+---
+
 ## 11. Minimal end-to-end example
 
 A self-contained script: build the handbag, write a sample `TOOLS.py`, construct the
@@ -727,3 +959,15 @@ Source symbols and files this document was checked against:
   - `TOOLS_ENTRYPOINT` (= `"TOOLS.py"`) and the folder / `<folder>.py` / first-`.py`
     fallbacks live in `src/lollms_client/tools_bindings/lcp/tool_layout.py`.
   - Office / PDF gate via `set_session_flags()`.
+- `toolset_editor` toolset — `src/lollms_client/tools_bindings/lcp/default_tools/toolset_editor/TOOLS.py`
+  - `tool_edit_toolset_list` — combined workspace + external enumeration;
+    each entry carries `source` = "workspace"|"external".
+  - `_list_workspace_toolsets` (workspace rglob for `TOOLS.py`)
+  - `_list_external_toolsets` (live-binding `discovered_tools` walk; the
+    `extra_tools` exception that lets an editor edit a folder outside
+    `workspace_path`.)
+  - `_list_candidate_toolsets` (workspace-first concatenation, dedup by
+    resolved folder path).
+  - `_resolve_toolset_folder` (resolution order: explicit `toolset_folder` →
+    workspace name → live-binding name; the third step is the cross-workspace
+    escape).
